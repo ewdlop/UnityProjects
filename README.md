@@ -1,6 +1,8 @@
 # Unity Projects
 Personal Unity Projects
 
+WebGL builds deploy to [itch.io](ewdlop.itch.io/)
+
 ## SpaceProjectXL
 
 [GamePlay Link](legav.itch.io/spaceprojectdemo)
