@@ -13,9 +13,35 @@ Personal Unity Projects
 ![Screenshot 4](https://cdn.discordapp.com/attachments/329460036684218373/727533211462271076/test.PNG)
 
 ## Backpack-Simulator-EX]
+
 [Backpack-Simulator-EX](https://dev.azure.com/ray810815/Backpack-Simulator-EX)
 
 ## 3DMaze
 
 Few Unity + C# port of Maze Generation Algorithm
+
 [mazes-for-programmers](https://pragprog.com/titles/jbmaze/mazes-for-programmers/)
+
+### AldousBroder:
+
+![Screenshot 0](AldousBroder.PNG)
+
+### BinaryTree
+
+![Screenshot 1](BinaryTree.PNG)
+
+### HuntAndKill
+
+![ScreenShot 2](HuntAndKill.PNG)
+
+### RecursiveBackTracker
+
+![ScreenShot 3](RecursiveBackTracker.PNG)
+
+### Sidewinder
+
+![ScreenShot 4](Sidewinder.PNG)
+
+### Wilson
+
+![ScreenShot 5](Wilson.PNG)
