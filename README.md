@@ -19,10 +19,11 @@ Procedural Generated Hex Grid + Perlin Noise
 [Backpack-Simulator-EX](https://dev.azure.com/ray810815/Backpack-Simulator-EX)
 
 ### HexGrid
+![Screenshot 0](Zoom.PNG)
 ![Screenshot 0](Grid.PNG)
 
 ## Color Distance
-![Screenshot 0](Zoom.PNG)
+
 ![Screenshot 1](HeartTexture.jpg)
 ![ScreenShot 2](ColorDistance2.PNG)
 ![ScreenShot 3](TileTexture.png)
