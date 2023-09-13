@@ -61,3 +61,7 @@ Few Unity + C# port of Maze Generation Algorithm
 
 ## This is Not Mario 2
 
+### GamePlay
+![ScreeShot 0](Stage1.PNG)
+![ScreeShot 1](Stage1-1.PNG)
+![ScreeShot 2](Stage1-2.PNG)
