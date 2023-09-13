@@ -1,11 +1,11 @@
-# UnityProjects
+# Unity Projects
 Personal Unity Projects
 
 ## SpaceProjectXL
 
 [GamePlay Link](legav.itch.io/spaceprojectdemo)
 
-### Gameplay ScreenShots
+### Gameplay Screenshots
 ![Screenshot 0](https://cdn.discordapp.com/attachments/329460036684218373/727618106737950901/sceenshot.PNG)
 ![Screenshot 1](https://cdn.discordapp.com/attachments/329460036684218373/727616393763094599/screenshot3.PNG)
 ![Screenshot 2](https://cdn.discordapp.com/attachments/329460036684218373/727616397760397394/screenshot2.PNG)
@@ -35,7 +35,7 @@ Few Unity + C# port of Maze Generation Algorithm
 
 [Mazes for Programmers](https://pragprog.com/titles/jbmaze/mazes-for-programmers/)
 
-### AldousBroder:
+### Aldous-Broder:
 
 ![Screenshot 0](AldousBroder.PNG)
 
@@ -43,11 +43,11 @@ Few Unity + C# port of Maze Generation Algorithm
 
 ![Screenshot 1](BinaryTree.PNG)
 
-### HuntAndKill
+### Hunt And Kill
 
 ![ScreenShot 2](HuntAndKill.PNG)
 
-### RecursiveBackTracker
+### Recursive BackTracker
 
 ![ScreenShot 3](RecursiveBackTracker.PNG)
 
@@ -61,7 +61,7 @@ Few Unity + C# port of Maze Generation Algorithm
 
 ## This is Not Mario 2
 
-### GamePlay
+### Gameplay
 ![ScreeShot 0](Stage1.PNG)
 ![ScreeShot 1](Stage1-1.PNG)
 ![ScreeShot 2](Stage1-2.PNG)
