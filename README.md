@@ -18,7 +18,7 @@ WebGL builds deploy to [itch.io](ewdlop.itch.io/)
 
 Procedural Generated Hex Grid + Perlin Noise 
 
-[Backpack-Simulator-EX](https://dev.azure.com/ray810815/Backpack-Simulator-EX)
+[Backpack-Simulator-EX]([https://dev.azure.com/ray810815/Backpack-Simulator-EX](https://dev.azure.com/ray810815/LD42-Backpack-Simulator))
 
 ### HexGrid
 ![Screenshot 0](Zoom.PNG)
