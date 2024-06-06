@@ -5,7 +5,7 @@ WebGL builds deploy to [itch.io](https://ewdlop.itch.io/)
 
 ## SpaceProjectXL
 
-Fixing Links
+[SpaceProjectXL](https://github.com/ewdlop/SpaceProjectXL/tree/master?tab=readme-ov-file)
 
 ## Backpack-Simulator-EX
 
