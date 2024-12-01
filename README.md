@@ -1,4 +1,11 @@
 # Unity Projects
+
+[catlikecoding - Unity](https://catlikecoding.com/unity/tutorials/)
+
+[red-blob-games](https://www.redblobgames.com/)
+
+[Brackeys](https://www.youtube.com/@Brackeys)
+
 Personal Unity Projects
 
 WebGL builds deploy to [itch.io](https://ewdlop.itch.io/)
