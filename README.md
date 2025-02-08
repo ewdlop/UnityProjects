@@ -32,6 +32,10 @@ WebGL builds deploy to [itch.io](https://ewdlop.itch.io/)
 
 #### Backpack-Simulator
 
+~[LD42-Backpack-Simulator](https://dev.azure.com/ray810815/LD42-Backpack-Simulator/_git/LD42-Backpack-Simulator)~
+
+~[Backpack-Simulator](https://github.com/danhuynh0803/Backpack-Simulator/tree/master)~
+
 Injured contributed the dad jokes and I followed up with more.
 
 Injured is the one that - 啞巴吃黃蓮，有苦難說。
@@ -45,6 +49,10 @@ Injured is the one that - 啞巴吃黃蓮，有苦難說。
 ~[Chicken-Dinner-GGJ-Azure Devops](https://dev.azure.com/ray810815/_git/GGJ)~
 
 #### Help-desk
+
+## Legav and Injured(MyAlias?)
+
+#### Help-desk - Phone
 
 ~### Dyson Sphere~
 
