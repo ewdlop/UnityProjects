@@ -1,0 +1,56 @@
+ if self.indent_level(ts) >= other.indent_level(ts):
+                return False
+        return True
+
+    # return a list of tuples (ts, i1, i2) such that
+    # i1 == self.indent_level(ts) >= other.indent_level(ts) == i2.
+    # Intended to be used after not self.less(other) is known, in which
+    # case it will return at least one witnessing tab size.
+    def not_less_witness(self, other):
+        n = max(self.longest_run_of_spaces(),
+                other.longest_run_of_spaces()) + 1
+        a = []
+        for ts in range(1, n+1):
+            if self.indent_level(ts) >= other.indent_level(ts):
+                a.append( (ts,
+                           self.indent_level(ts),
+                           other.indent_level(ts)) )
+        return a
+
+def format_witnesses(w):
+    firsts = map(lambda tup: str(tup[0]), w)
+    prefix = "at tab size"
+    if len(w) > 1:
+        prefix = prefix + "s"
+    return prefix + " " + ', '.join(firsts)
+
+def process_tokens(tokens):
+    INDENT = tokenize.INDENT
+    DEDENT = tokenize.DEDENT
+    NEWLINE = tokenize.NEWLINE
+    JUNK = tokenize.COMMENT, tokenize.NL
+    indents = [Whitespace("")]
+    check_equal = 0
+
+    for (type, token, start, end, line) in tokens:
+        if type == NEWLINE:
+            # a program statement, or ENDMARKER, will eventually follow,
+            # after some (possibly empty) run of tokens of the form
+            #     (NL | COMMENT)* (INDENT | DEDENT+)?
+            # If an INDENT appears, setting check_equal is wrong, and will
+            # be undone when we see the INDENT.
+            check_equal = 1
+
+        elif type == INDENT:
+            check_equal = 0
+            thisguy = Whitespace(token)
+            if not indents[-1].less(thisguy):
+                witness = indents[-1].not_less_witness(thisguy)
+                msg = "indent not greater e.g. " + format_witnesses(witness)
+                raise NannyNag(start[0], msg, line)
+            indents.append(thisguy)
+
+        elif type == DEDENT:
+            # there's nothing we need to check here!  what's important is
+            # that when the run of DEDENTs ends, the indentation of the
+            # program state

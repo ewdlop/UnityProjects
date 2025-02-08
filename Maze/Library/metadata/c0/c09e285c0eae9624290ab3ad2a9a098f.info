@@ -1,0 +1,389 @@
+ectionManager.RemoveTimelineSelection();
+                foreach (var item in duplicatedItems)
+                    SelectionManager.Add(item);
+            }
+
+            var tracks = SelectionManager.SelectedTracks().ToArray();
+            if (tracks.Length > 0)
+                TrackAction.Invoke<DuplicateTracks>(state, tracks);
+
+            state.Refresh();
+            return true;
+        }
+
+        static double CalculateDuplicateTime(IEnumerable<ItemsPerTrack> duplicatedItems, Func<ITimelineItem, ITimelineItem, double> gapBetweenItems)
+        {
+            //Find the end time of the rightmost item
+            var itemsOnTracks = duplicatedItems.SelectMany(i => i.targetTrack.GetItems()).ToList();
+            var time = itemsOnTracks.Max(i => i.end);
+
+            //From all the duplicated items, select the leftmost items
+            var firstDuplicatedItems = duplicatedItems.Select(i => i.leftMostItem);
+            var leftMostDuplicatedItems = firstDuplicatedItems.OrderBy(i => i.start).GroupBy(i => i.start).FirstOrDefault();
+            if (leftMostDuplicatedItems == null) return 0.0;
+
+            foreach (var leftMostItem in leftMostDuplicatedItems)
+            {
+                var siblings = leftMostItem.parentTrack.GetItems();
+                var rightMostSiblings = siblings.OrderByDescending(i => i.end).GroupBy(i => i.end).FirstOrDefault();
+                if (rightMostSiblings == null) continue;
+
+                foreach (var sibling in rightMostSiblings)
+                    time = Math.Max(time, sibling.end + gapBetweenItems(leftMostItem, sibling));
+            }
+
+            return time;
+        }
+    }
+
+    [DisplayName("Delete")]
+    [Shortcut("Main Menu/Edit/Delete", EventCommandNames.Delete)]
+    [ShortcutPlatformOverride(RuntimePlatform.OSXEditor, KeyCode.Backspace, ShortcutModifiers.Action)]
+    [ActiveInMode(TimelineModes.Default)]
+    class DeleteAction : TimelineAction
+    {
+        public override MenuActionDisplayState GetDisplayState(WindowState state)
+        {
+            return CanDelete(state) ? MenuActionDisplayState.Visible : MenuActionDisplayState.Disabled;
+        }
+
+        static bool CanDelete(WindowState state)
+        {
+            if (state.editSequence.isReadOnly)
+                return false;
+            // All() returns true when empty
+            return SelectionManager.SelectedTracks().All(x => !x.lockedInHierarchy) &&
+                SelectionManager.SelectedItems().All(x => x.parentTrack == null || !x.parentTrack.lockedInHierarchy);
+        }
+
+        public override bool Execute(WindowState state)
+        {
+            if (SelectionManager.GetCurrentInlineEditorCurve() != null)
+                return false;
+
+            if (!CanDelete(state))
+                return false;
+
+            var selectedItems = SelectionManager.SelectedItems();
+            DeleteItems(selectedItems);
+
+            var tracks = SelectionManager.SelectedTracks().ToArray();
+            if (tracks.Any())
+                TrackAction.Invoke<DeleteTracks>(state, tracks);
+
+            state.Refresh();
+            return selectedItems.Any() ||  tracks.Length > 0;
+        }
+
+        internal static void DeleteItems(IEnumerable<ITimelineItem> items)
+        {
+            var tracks = items.GroupBy(c => c.parentTrack);
+
+            foreach (var track in tracks)
+                TimelineUndo.PushUndo(track.Key, "Delete Items");
+
+            TimelineAnimationUtilities.UnlinkAnimationWindowFromClips(items.OfType<ClipItem>().Select(i => i.clip));
+
+            EditMode.PrepareItemsDelete(ItemsUtils.ToItemsPerTrack(items));
+            EditModeUtils.Delete(items);
+
+            SelectionManager.RemoveAllClips();
+        }
+    }
+
+    [DisplayName("Match Content")]
+    [Shortcut(Shortcuts.Timeline.matchContent)]
+    class MatchContent : TimelineAction
+    {
+        public override MenuActionDisplayState GetDisplayState(WindowState state)
+        {
+            var clips = SelectionManager.SelectedClips().ToArray();
+
+            if (!clips.Any() || SelectionManager.GetCurrentInlineEditorCurve() != null)
+                return MenuActionDisplayState.Hidden;
+
+            return clips.Any(TimelineHelpers.HasUsableAssetDuration)
+                ? MenuActionDisplayState.Visible
+                : MenuActionDisplayState.Disabled;
+        }
+
+        public override bool Execute(WindowState state)
+        {
+            if (SelectionManager.GetCurrentInlineEditorCurve() != null)
+                return false;
+
+            var clips = SelectionManager.SelectedClips().ToArray();
+            return clips.Length > 0 && ClipModifier.MatchContent(clips);
+        }
+    }
+
+    [HideInMenu]
+    [Shortcut(Shortcuts.Timeline.play)]
+    [ActiveInMode(TimelineModes.Default | TimelineModes.ReadOnly)]
+    class PlayTimelineAction : TimelineAction
+    {
+        public override bool Execute(WindowState state)
+        {
+            var currentState = state.playing;
+            state.SetPlaying(!currentState);
+            return true;
+        }
+    }
+
+    [HideInMenu]
+    [ActiveInMode(TimelineModes.Default | TimelineModes.ReadOnly)]
+    class SelectAllAction : TimelineAction
+    {
+        public override bool Execute(WindowState state)
+        {
+            // otherwise select all tracks.
+            SelectionManager.Clear();
+            state.GetWindow().allTracks.ForEach(x => SelectionManager.Add(x.track));
+
+            return true;
+        }
+    }
+
+    [HideInMenu]
+    [Shortcut(Shortcuts.Timeline.previousFrame)]
+    [ActiveInMode(TimelineModes.Default | TimelineModes.ReadOnly)]
+    class PreviousFrameAction : TimelineAction
+    {
+        public override bool Execute(WindowState state)
+        {
+            state.editSequence.frame--;
+            return true;
+        }
+    }
+
+    [HideInMenu]
+    [Shortcut(Shortcuts.Timeline.nextFrame)]
+    [ActiveInMode(TimelineModes.Default | TimelineModes.ReadOnly)]
+    class NextFrameAction : TimelineAction
+    {
+        public override bool Execute(WindowState state)
+        {
+            state.editSequence.frame++;
+            return true;
+        }
+    }
+
+    [HideInMenu]
+    [Shortcut(Shortcuts.Timeline.frameAll)]
+    [ActiveInMode(TimelineModes.Default | TimelineModes.ReadOnly)]
+    class FrameAllAction : TimelineAction
+    {
+        public override bool Execute(WindowState state)
+        {
+            var inlineCurveEditor = SelectionManager.GetCurrentInlineEditorCurve();
+            if (inlineCurveEditor != null && inlineCurveEditor.inlineCurvesSelected)
+            {
+                FrameSelectedAction.FrameInlineCurves(inlineCurveEditor, state, false);
+                return true;
+            }
+
+            if (state.IsEditingASubItem())
+                return false;
+
+            var w = state.GetWindow();
+            if (w == null || w.treeView == null)
+                return false;
+
+            var visibleTracks = w.treeView.visibleTracks.ToList();
+            if (state.editSequence.asset != null && state.editSequence.asset.markerTrack != null)
+                visibleTracks.Add(state.editSequence.asset.markerTrack);
+
+            if (visibleTracks.Count == 0)
+                return false;
+
+            var startTime = float.MaxValue;
+            var endTime = float.MinValue;
+
+            foreach (var t in visibleTracks)
+            {
+                if (t == null)
+                    continue;
+
+                double trackStart, trackEnd;
+                t.GetItemRange(out trackStart, out trackEnd);
+                startTime = Mathf.Min(startTime, (float)trackStart);
+                endTime = Mathf.Max(endTime, (float)(trackEnd));
+            }
+
+            if (startTime != float.MinValue)
+            {
+                FrameSelectedAction.FrameRange(startTime, endTime, state);
+                return true;
+            }
+
+            return false;
+        }
+    }
+
+    [HideInMenu]
+    [ActiveInMode(TimelineModes.Default | TimelineModes.ReadOnly)]
+    class FrameSelectedAction : TimelineAction
+    {
+        public static void FrameRange(float startTime, float endTime, WindowState state)
+        {
+            if (startTime > endTime)
+            {
+                return;
+            }
+
+            var halfDuration = endTime - Math.Max(0.0f, startTime);
+
+            if (halfDuration > 0.0f)
+            {
+                state.SetTimeAreaShownRange(Mathf.Max(-10.0f, startTime - (halfDuration * 0.1f)),
+                    endTime + (halfDuration * 0.1f));
+            }
+            else
+            {
+                // start == end
+                // keep the zoom level constant, only pan the time area to center the item
+                var currentRange = state.timeAreaShownRange.y - state.timeAreaShownRange.x;
+                state.SetTimeAreaShownRange(startTime - currentRange / 2, startTime + currentRange / 2);
+            }
+
+            TimelineZoomManipulator.InvalidateWheelZoom();
+            state.Evaluate();
+        }
+
+        public override bool Execute(WindowState state)
+        {
+            var inlineCurveEditor = SelectionManager.GetCurrentInlineEditorCurve();
+            if (inlineCurveEditor != null && inlineCurveEditor.inlineCurvesSelected)
+            {
+                FrameInlineCurves(inlineCurveEditor, state, true);
+                return true;
+            }
+
+            if (state.IsEditingASubItem())
+                return false;
+
+            if (SelectionManager.Count() == 0)
+                return false;
+
+            var startTime = float.MaxValue;
+            var endTime = float.MinValue;
+
+            var clips = SelectionManager.SelectedClipGUI();
+            var markers = SelectionManager.SelectedMarkers();
+            if (!clips.Any() && !markers.Any())
+                return false;
+
+            foreach (var c in clips)
+            {
+                startTime = Mathf.Min(startTime, (float)c.clip.start);
+                endTime = Mathf.Max(endTime, (float)c.clip.end);
+                if (c.clipCurveEditor != null)
+                {
+                    c.clipCurveEditor.FrameClip();
+                }
+            }
+
+            foreach (var marker in markers)
+            {
+                startTime = Mathf.Min(startTime, (float)marker.time);
+                endTime = Mathf.Max(endTime, (float)marker.time);
+            }
+
+            FrameRange(startTime, endTime, state);
+
+            return true;
+        }
+
+        public static void FrameInlineCurves(IClipCurveEditorOwner curveEditorOwner, WindowState state, bool selectionOnly)
+        {
+            var curveEditor = curveEditorOwner.clipCurveEditor.curveEditor;
+            var frameBounds = selectionOnly ? curveEditor.GetSelectionBounds() : curveEditor.GetClipBounds();
+
+            var clipGUI = curveEditorOwner as TimelineClipGUI;
+            var areaOffset = 0.0f;
+
+            if (clipGUI != null)
+            {
+                areaOffset = (float)Math.Max(0.0, clipGUI.clip.FromLocalTimeUnbound(0.0));
+
+                var timeScale = (float)clipGUI.clip.timeScale;  // Note: The getter for clip.timeScale is guaranteed to never be zero.
+
+                // Apply scaling
+                var newMin = frameBounds.min.x / timeScale;
+                var newMax = (frameBounds.max.x - frameBounds.min.x) / timeScale + newMin;
+
+                frameBounds.SetMinMax(
+                    new Vector3(newMin, frameBounds.min.y, frameBounds.min.z),
+                    new Vector3(newMax, frameBounds.max.y, frameBounds.max.z));
+            }
+
+            curveEditor.Frame(frameBounds, true, true);
+
+            var area = curveEditor.shownAreaInsideMargins;
+            area.x += areaOffset;
+
+            FrameRange(area.x, area.x + area.width, state);
+        }
+    }
+
+    [HideInMenu]
+    [Shortcut(Shortcuts.Timeline.previousKey)]
+    [ActiveInMode(TimelineModes.Default | TimelineModes.ReadOnly)]
+    class PrevKeyAction : TimelineAction
+    {
+        public override bool Execute(WindowState state)
+        {
+            var keyTraverser = new Utilities.KeyTraverser(state.editSequence.asset, 0.01f / state.referenceSequence.frameRate);
+            var time = keyTraverser.GetPrevKey((float)state.editSequence.time, state.dirtyStamp);
+            if (time != state.editSequence.time)
+            {
+                state.editSequence.time = time;
+            }
+
+            return true;
+        }
+    }
+
+    [HideInMenu]
+    [Shortcut(Shortcuts.Timeline.nextKey)]
+    [ActiveInMode(TimelineModes.Default | TimelineModes.ReadOnly)]
+    class NextKeyAction : TimelineAction
+    {
+        public override bool Execute(WindowState state)
+        {
+            var keyTraverser = new Utilities.KeyTraverser(state.editSequence.asset, 0.01f / state.referenceSequence.frameRate);
+            var time = keyTraverser.GetNextKey((float)state.editSequence.time, state.dirtyStamp);
+            if (time != state.editSequence.time)
+            {
+                state.editSequence.time = time;
+            }
+
+            return true;
+        }
+    }
+
+    [HideInMenu]
+    [Shortcut(Shortcuts.Timeline.goToStart)]
+    [ActiveInMode(TimelineModes.Default | TimelineModes.ReadOnly)]
+    class GotoStartAction : TimelineAction
+    {
+        public override bool Execute(WindowState state)
+        {
+            state.editSequence.time = 0.0f;
+            state.EnsurePlayHeadIsVisible();
+
+            return true;
+        }
+    }
+
+    [HideInMenu]
+    [Shortcut(Shortcuts.Timeline.goToEnd)]
+    [ActiveInMode(TimelineModes.Default | TimelineModes.ReadOnly)]
+    class GotoEndAction : TimelineAction
+    {
+        public override bool Execute(WindowState state)
+        {
+            state.editSequence.time = state.editSequence.duration;
+            state.EnsurePlayHeadIsVisible();
+
+           

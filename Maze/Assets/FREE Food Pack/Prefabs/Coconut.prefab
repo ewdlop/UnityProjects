@@ -1,0 +1,70 @@
+alse;
+				for ( int32 PastIndex = 0; PastIndex < Index; ++PastIndex )
+				{
+					if (Scene->GetActor(PastIndex)->IsA(EDatasmithElementType::EnvironmentLight))
+					{
+						TSharedPtr< IDatasmithEnvironmentElement > PreviousEnvElement = StaticCastSharedPtr< IDatasmithEnvironmentElement >( Scene->GetActor(PastIndex) );
+						if (PreviousEnvElement->GetIsIlluminationMap() == bIsIlluminationMap)
+						{
+							bIsADuplicate = true;
+							break;
+						}
+					}
+				}
+
+				if ( bIsADuplicate )
+				{
+					UE_LOG(LogDatasmith, Warning, TEXT("Environment %s removed because only one environment of its type is supported"), EnvironmentElement->GetName());
+					Scene->RemoveActor( EnvironmentElement, EDatasmithActorRemovalRule::RemoveChildren );
+				}
+			}
+		}
+	}
+
+	const FString TexturePrefix( TEXT( "Texture." ) );
+	const FString MaterialPrefix( TEXT( "Material." ) );
+	const FString MeshPrefix( TEXT( "Mesh." ) );
+
+	struct FDatasmithSceneCleaner
+	{
+		TSet<TSharedPtr<IDatasmithMeshElement>> ReferencedMeshes;
+		TSet<TSharedPtr<IDatasmithBaseMaterialElement>> ReferencedMaterials;
+		TSet<TSharedPtr<IDatasmithBaseMaterialElement>> FunctionMaterials;
+		TSet<FString> ReferencedTextures;
+		TSet<FString> ActorsInScene;
+
+		TMap<FString, TSharedPtr<IDatasmithElement>> AssetElementMapping;
+
+		TSharedPtr<IDatasmithScene> Scene;
+
+		FDatasmithSceneCleaner(TSharedPtr<IDatasmithScene> InScene)
+			: Scene(InScene)
+		{
+		}
+
+		void ScanMaterialIDElement(const IDatasmithMaterialIDElement* MaterialIDElement)
+		{
+			if (MaterialIDElement)
+			{
+				if (TSharedPtr<IDatasmithElement>* MaterialElementPtr = AssetElementMapping.Find(MaterialPrefix + MaterialIDElement->GetName()))
+				{
+					TSharedPtr<IDatasmithBaseMaterialElement> MaterialElement = StaticCastSharedPtr<IDatasmithBaseMaterialElement>(*MaterialElementPtr);
+
+					ReferencedMaterials.Add(MaterialElement);
+				}
+			}
+		}
+
+		void ScanMeshActorElement(IDatasmithMeshActorElement* MeshActorElement)
+		{
+			if (FCString::Strlen(MeshActorElement->GetStaticMeshPathName()) == 0)
+			{
+				return;
+			}
+
+			FString StaticMeshPathName(MeshActorElement->GetStaticMeshPathName());
+
+			// If mesh actor refers to a UE asset, nothing to do
+			if (StaticMeshPathName[0] == '/')
+			{
+		

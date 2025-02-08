@@ -1,0 +1,400 @@
+->dim, isl_dim_all);
+	div_eq = n_pure_div_eq(bmap);
+	if (div_eq == 0)
+		return bmap;
+
+	if (div_eq < bmap->n_eq) {
+		B = isl_mat_sub_alloc6(bmap->ctx, bmap->eq, div_eq,
+					bmap->n_eq - div_eq, 0, 1 + total);
+		C = isl_mat_variable_compression(B, &C2);
+		if (!C || !C2)
+			goto error;
+		if (C->n_col == 0) {
+			bmap = isl_basic_map_set_to_empty(bmap);
+			isl_mat_free(C);
+			isl_mat_free(C2);
+			goto done;
+		}
+	}
+
+	d = isl_vec_alloc(bmap->ctx, div_eq);
+	if (!d)
+		goto error;
+	for (i = 0, j = bmap->n_div-1; i < div_eq; ++i) {
+		while (j >= 0 && isl_int_is_zero(bmap->eq[i][1 + total + j]))
+			--j;
+		isl_int_set(d->block.data[i], bmap->eq[i][1 + total + j]);
+	}
+	B = isl_mat_sub_alloc6(bmap->ctx, bmap->eq, 0, div_eq, 0, 1 + total);
+
+	if (C) {
+		B = isl_mat_product(B, C);
+		C = NULL;
+	}
+
+	T = isl_mat_parameter_compression(B, d);
+	if (!T)
+		goto error;
+	if (T->n_col == 0) {
+		bmap = isl_basic_map_set_to_empty(bmap);
+		isl_mat_free(C2);
+		isl_mat_free(T);
+		goto done;
+	}
+	isl_int_init(v);
+	for (i = 0; i < T->n_row - 1; ++i) {
+		isl_int_fdiv_q(v, T->row[1 + i][0], T->row[1 + i][1 + i]);
+		if (isl_int_is_zero(v))
+			continue;
+		isl_mat_col_submul(T, 0, v, 1 + i);
+	}
+	isl_int_clear(v);
+	pos = isl_alloc_array(bmap->ctx, int, T->n_row);
+	if (!pos)
+		goto error;
+	/* We have to be careful because dropping equalities may reorder them */
+	dropped = 0;
+	for (j = bmap->n_div - 1; j >= 0; --j) {
+		for (i = 0; i < bmap->n_eq; ++i)
+			if (!isl_int_is_zero(bmap->eq[i][1 + total + j]))
+				break;
+		if (i < bmap->n_eq) {
+			bmap = isl_basic_map_drop_div(bmap, j);
+			isl_basic_map_drop_equality(bmap, i);
+			++dropped;
+		}
+	}
+	pos[0] = 0;
+	needed = 0;
+	for (i = 1; i < T->n_row; ++i) {
+		if (isl_int_is_one(T->row[i][i]))
+			pos[i] = i;
+		else
+			needed++;
+	}
+	if (needed > dropped) {
+		bmap = isl_basic_map_extend_space(bmap, isl_space_copy(bmap->dim),
+				needed, needed, 0);
+		if (!bmap)
+			goto error;
+	}
+	for (i = 1; i < T->n_row; ++i) {
+		if (isl_int_is_one(T->row[i][i]))
+			continue;
+		k = isl_basic_map_alloc_div(bmap);
+		pos[i] = 1 + total + k;
+		isl_seq_clr(bmap->div[k] + 1, 1 + total + bmap->n_div);
+		isl_int_set(bmap->div[k][0], T->row[i][i]);
+		if (C2)
+			isl_seq_cpy(bmap->div[k] + 1, C2->row[i], 1 + total);
+		else
+			isl_int_set_si(bmap->div[k][1 + i], 1);
+		for (j = 0; j < i; ++j) {
+			if (isl_int_is_zero(T->row[i][j]))
+				continue;
+			if (pos[j] < T->n_row && C2)
+				isl_seq_submul(bmap->div[k] + 1, T->row[i][j],
+						C2->row[pos[j]], 1 + total);
+			else
+				isl_int_neg(bmap->div[k][1 + pos[j]],
+								T->row[i][j]);
+		}
+		j = isl_basic_map_alloc_equality(bmap);
+		isl_seq_neg(bmap->eq[j], bmap->div[k]+1, 1+total+bmap->n_div);
+		isl_int_set(bmap->eq[j][pos[i]], bmap->div[k][0]);
+	}
+	free(pos);
+	isl_mat_free(C2);
+	isl_mat_free(T);
+
+	if (progress)
+		*progress = 1;
+done:
+	ISL_F_SET(bmap, ISL_BASIC_MAP_NORMALIZED_DIVS);
+
+	return bmap;
+error:
+	free(pos);
+	isl_mat_free(C);
+	isl_mat_free(C2);
+	isl_mat_free(T);
+	return bmap;
+}
+
+static __isl_give isl_basic_map *set_div_from_lower_bound(
+	__isl_take isl_basic_map *bmap, int div, int ineq)
+{
+	unsigned total = 1 + isl_space_dim(bmap->dim, isl_dim_all);
+
+	isl_seq_neg(bmap->div[div] + 1, bmap->ineq[ineq], total + bmap->n_div);
+	isl_int_set(bmap->div[div][0], bmap->ineq[ineq][total + div]);
+	isl_int_add(bmap->div[div][1], bmap->div[div][1], bmap->div[div][0]);
+	isl_int_sub_ui(bmap->div[div][1], bmap->div[div][1], 1);
+	isl_int_set_si(bmap->div[div][1 + total + div], 0);
+
+	return bmap;
+}
+
+/* Check whether it is ok to define a div based on an inequality.
+ * To avoid the introduction of circular definitions of divs, we
+ * do not allow such a definition if the resulting expression would refer to
+ * any other undefined divs or if any known div is defined in
+ * terms of the unknown div.
+ */
+static isl_bool ok_to_set_div_from_bound(__isl_keep isl_basic_map *bmap,
+	int div, int ineq)
+{
+	int j;
+	unsigned total = 1 + isl_space_dim(bmap->dim, isl_dim_all);
+
+	/* Not defined in terms of unknown divs */
+	for (j = 0; j < bmap->n_div; ++j) {
+		if (div == j)
+			continue;
+		if (isl_int_is_zero(bmap->ineq[ineq][total + j]))
+			continue;
+		if (isl_int_is_zero(bmap->div[j][0]))
+			return isl_bool_false;
+	}
+
+	/* No other div defined in terms of this one => avoid loops */
+	for (j = 0; j < bmap->n_div; ++j) {
+		if (div == j)
+			continue;
+		if (isl_int_is_zero(bmap->div[j][0]))
+			continue;
+		if (!isl_int_is_zero(bmap->div[j][1 + total + div]))
+			return isl_bool_false;
+	}
+
+	return isl_bool_true;
+}
+
+/* Would an expression for div "div" based on inequality "ineq" of "bmap"
+ * be a better expression than the current one?
+ *
+ * If we do not have any expression yet, then any expression would be better.
+ * Otherwise we check if the last variable involved in the inequality
+ * (disregarding the div that it would define) is in an earlier position
+ * than the last variable involved in the current div expression.
+ */
+static isl_bool better_div_constraint(__isl_keep isl_basic_map *bmap,
+	int div, int ineq)
+{
+	unsigned total = 1 + isl_space_dim(bmap->dim, isl_dim_all);
+	int last_div;
+	int last_ineq;
+
+	if (isl_int_is_zero(bmap->div[div][0]))
+		return isl_bool_true;
+
+	if (isl_seq_last_non_zero(bmap->ineq[ineq] + total + div + 1,
+				  bmap->n_div - (div + 1)) >= 0)
+		return isl_bool_false;
+
+	last_ineq = isl_seq_last_non_zero(bmap->ineq[ineq], total + div);
+	last_div = isl_seq_last_non_zero(bmap->div[div] + 1,
+					 total + bmap->n_div);
+
+	return last_ineq < last_div;
+}
+
+/* Given two constraints "k" and "l" that are opposite to each other,
+ * except for the constant term, check if we can use them
+ * to obtain an expression for one of the hitherto unknown divs or
+ * a "better" expression for a div for which we already have an expression.
+ * "sum" is the sum of the constant terms of the constraints.
+ * If this sum is strictly smaller than the coefficient of one
+ * of the divs, then this pair can be used define the div.
+ * To avoid the introduction of circular definitions of divs, we
+ * do not use the pair if the resulting expression would refer to
+ * any other undefined divs or if any known div is defined in
+ * terms of the unknown div.
+ */
+static __isl_give isl_basic_map *check_for_div_constraints(
+	__isl_take isl_basic_map *bmap, int k, int l, isl_int sum,
+	int *progress)
+{
+	int i;
+	unsigned total = 1 + isl_space_dim(bmap->dim, isl_dim_all);
+
+	for (i = 0; i < bmap->n_div; ++i) {
+		isl_bool set_div;
+
+		if (isl_int_is_zero(bmap->ineq[k][total + i]))
+			continue;
+		if (isl_int_abs_ge(sum, bmap->ineq[k][total + i]))
+			continue;
+		set_div = better_div_constraint(bmap, i, k);
+		if (set_div >= 0 && set_div)
+			set_div = ok_to_set_div_from_bound(bmap, i, k);
+		if (set_div < 0)
+			return isl_basic_map_free(bmap);
+		if (!set_div)
+			break;
+		if (isl_int_is_pos(bmap->ineq[k][total + i]))
+			bmap = set_div_from_lower_bound(bmap, i, k);
+		else
+			bmap = set_div_from_lower_bound(bmap, i, l);
+		if (progress)
+			*progress = 1;
+		break;
+	}
+	return bmap;
+}
+
+__isl_give isl_basic_map *isl_basic_map_remove_duplicate_constraints(
+	__isl_take isl_basic_map *bmap, int *progress, int detect_divs)
+{
+	struct isl_constraint_index ci;
+	int k, l, h;
+	unsigned total = isl_basic_map_total_dim(bmap);
+	isl_int sum;
+
+	if (!bmap || bmap->n_ineq <= 1)
+		return bmap;
+
+	if (create_constraint_index(&ci, bmap) < 0)
+		return bmap;
+
+	h = isl_seq_get_hash_bits(bmap->ineq[0] + 1, total, ci.bits);
+	ci.index[h] = &bmap->ineq[0];
+	for (k = 1; k < bmap->n_ineq; ++k) {
+		h = hash_index(&ci, bmap, k);
+		if (!ci.index[h]) {
+			ci.index[h] = &bmap->ineq[k];
+			continue;
+		}
+		if (progress)
+			*progress = 1;
+		l = ci.index[h] - &bmap->ineq[0];
+		if (isl_int_lt(bmap->ineq[k][0], bmap->ineq[l][0]))
+			swap_inequality(bmap, k, l);
+		isl_basic_map_drop_inequality(bmap, k);
+		--k;
+	}
+	isl_int_init(sum);
+	for (k = 0; k < bmap->n_ineq-1; ++k) {
+		isl_seq_neg(bmap->ineq[k]+1, bmap->ineq[k]+1, total);
+		h = hash_index(&ci, bmap, k);
+		isl_seq_neg(bmap->ineq[k]+1, bmap->ineq[k]+1, total);
+		if (!ci.index[h])
+			continue;
+		l = ci.index[h] - &bmap->ineq[0];
+		isl_int_add(sum, bmap->ineq[k][0], bmap->ineq[l][0]);
+		if (isl_int_is_pos(sum)) {
+			if (detect_divs)
+				bmap = check_for_div_constraints(bmap, k, l,
+								 sum, progress);
+			continue;
+		}
+		if (isl_int_is_zero(sum)) {
+			/* We need to break out of the loop after these
+			 * changes since the contents of the hash
+			 * will no longer be valid.
+			 * Plus, we probably we want to regauss first.
+			 */
+			if (progress)
+				*progress = 1;
+			isl_basic_map_drop_inequality(bmap, l);
+			isl_basic_map_inequality_to_equality(bmap, k);
+		} else
+			bmap = isl_basic_map_set_to_empty(bmap);
+		break;
+	}
+	isl_int_clear(sum);
+
+	constraint_index_free(&ci);
+	return bmap;
+}
+
+/* Detect all pairs of inequalities that form an equality.
+ *
+ * isl_basic_map_remove_duplicate_constraints detects at most one such pair.
+ * Call it repeatedly while it is making progress.
+ */
+__isl_give isl_basic_map *isl_basic_map_detect_inequality_pairs(
+	__isl_take isl_basic_map *bmap, int *progress)
+{
+	int duplicate;
+
+	do {
+		duplicate = 0;
+		bmap = isl_basic_map_remove_duplicate_constraints(bmap,
+								&duplicate, 0);
+		if (progress && duplicate)
+			*progress = 1;
+	} while (duplicate);
+
+	return bmap;
+}
+
+/* Eliminate knowns divs from constraints where they appear with
+ * a (positive or negative) unit coefficient.
+ *
+ * That is, replace
+ *
+ *	floor(e/m) + f >= 0
+ *
+ * by
+ *
+ *	e + m f >= 0
+ *
+ * and
+ *
+ *	-floor(e/m) + f >= 0
+ *
+ * by
+ *
+ *	-e + m f + m - 1 >= 0
+ *
+ * The first conversion is valid because floor(e/m) >= -f is equivalent
+ * to e/m >= -f because -f is an integral expression.
+ * The second conversion follows from the fact that
+ *
+ *	-floor(e/m) = ceil(-e/m) = floor((-e + m - 1)/m)
+ *
+ *
+ * Note that one of the div constraints may have been eliminated
+ * due to being redundant with respect to the constraint that is
+ * being modified by this function.  The modified constraint may
+ * no longer imply this div constraint, so we add it back to make
+ * sure we do not lose any information.
+ *
+ * We skip integral divs, i.e., those with denominator 1, as we would
+ * risk eliminating the div from the div constraints.  We do not need
+ * to handle those divs here anyway since the div constraints will turn
+ * out to form an equality and this equality can then be used to eliminate
+ * the div from all constraints.
+ */
+static __isl_give isl_basic_map *eliminate_unit_divs(
+	__isl_take isl_basic_map *bmap, int *progress)
+{
+	int i, j;
+	isl_ctx *ctx;
+	unsigned total;
+
+	if (!bmap)
+		return NULL;
+
+	ctx = isl_basic_map_get_ctx(bmap);
+	total = 1 + isl_space_dim(bmap->dim, isl_dim_all);
+
+	for (i = 0; i < bmap->n_div; ++i) {
+		if (isl_int_is_zero(bmap->div[i][0]))
+			continue;
+		if (isl_int_is_one(bmap->div[i][0]))
+			continue;
+		for (j = 0; j < bmap->n_ineq; ++j) {
+			int s;
+
+			if (!isl_int_is_one(bmap->ineq[j][total + i]) &&
+			    !isl_int_is_negone(bmap->ineq[j][total + i]))
+				continue;
+
+			*progress = 1;
+
+			s = isl_int_sgn(bmap->ineq[j][total + i]);
+			isl_int_set_si(bmap->ineq[j][total + i], 0);
+			if (s < 0)
+				isl_seq_c

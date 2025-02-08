@@ -1,0 +1,98 @@
+// Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+// See the LICENSE file in the project root for more information.
+
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Runtime.CompilerServices;
+using System.Threading;
+using Debug = System.Diagnostics.Debug;
+
+namespace Internal.TypeSystem
+{
+    /// <summary>
+    /// A hash table which is lock free for readers and up to 1 writer at a time.
+    /// It must be possible to compute the key's hashcode from a value.
+    /// All values must be reference types.
+    /// It must be possible to perform an equality check between a key and a value.
+    /// It must be possible to perform an equality check between a value and a value.
+    /// A LockFreeReaderKeyValueComparer must be provided to perform these operations.
+    /// </summary>
+    /// <typeparam name="TKey"></typeparam>
+    /// <typeparam name="TValue"></typeparam>
+    abstract public class LockFreeReaderHashtable<TKey, TValue> where TValue : class
+    {
+        private const int _initialSize = 16;
+        private const int _fillPercentageBeforeResize = 60;
+
+        /// <summary>
+        /// _hashtable is the currently visible underlying array for the hashtable
+        /// Any modifications to this array must be additive only, and there must
+        /// never be a situation where the visible _hashtable has less data than
+        /// it did at an earlier time. This value is initialized to an array of size
+        /// 1. (That array is never mutated as any additions will trigger an Expand 
+        /// operation, but we don't use an empty array as the
+        /// initial step, as this approach allows the TryGetValue logic to always
+        /// succeed without needing any length or null checks.)
+        /// </summary>
+        private volatile TValue[] _hashtable = new TValue[_initialSize];
+
+        /// <summary>
+        /// Tracks the hashtable being used by expansion. Used as a sentinel
+        /// to threads trying to add to the old hashtable that an expansion is
+        /// in progress.
+        /// </summary>
+        private volatile TValue[] _newHashTable;
+
+        /// <summary>
+        /// _count represents the current count of elements in the hashtable
+        /// _count is used in combination with _resizeCount to control when the 
+        /// hashtable should expand
+        /// </summary>
+        private volatile int _count = 0;
+
+        /// <summary>
+        /// Represents _count plus the number of potential adds currently happening.
+        /// If this reaches _hashTable.Length-1, an expansion is required (because
+        /// one slot must always be null for seeks to complete).
+        /// </summary>
+        private int _reserve = 0;
+
+        /// <summary>
+        /// _resizeCount represents the size at which the hashtable should resize.
+        /// While this doesn't strictly need to be volatile, having threads read stale values
+        /// triggers a lot of unneeded attempts to expand.
+        /// </summary>
+        private volatile int _resizeCount = _initialSize * _fillPercentageBeforeResize / 100;
+
+        /// <summary>
+        /// Get the underlying array for the hashtable at this time. 
+        /// </summary>
+        private TValue[] GetCurrentHashtable()
+        {
+            return _hashtable;
+        }
+
+        /// <summary>
+        /// Set the newly visible hashtable underlying array. Used by writers after
+        /// the new array is fully constructed. The volatile write is used to ensure
+        /// that all writes to the contents of hashtable are completed before _hashtable
+        /// is visible to readers.
+        /// </summary>
+        private void SetCurrentHashtable(TValue[] hashtable)
+        {
+            _hashtable = hashtable;
+        }
+
+        /// <summary>
+        /// Used to ensure that the hashtable can function with
+        /// fairly poor initial hash codes.
+        /// </summary>
+        public static int HashInt1(int key)
+        {
+            unchecked
+            {
+                int a = (int)0x9e3779b9 + key;
+                int b = (int)0x9e3779b9;
+                i

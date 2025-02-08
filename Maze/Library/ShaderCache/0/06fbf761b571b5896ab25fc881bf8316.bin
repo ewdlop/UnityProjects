@@ -1,0 +1,173 @@
+ Path="$(IntermediateOutputPath)" Files="@(_CleanPriorFileWrites)">
+      <Output TaskParameter="InPath" ItemName="_CleanPriorFileWritesInIntermediate" />
+    </FindUnderPath>
+
+    <!-- Delete those files. -->
+    <Delete Files="@(_CleanPriorFileWritesInOutput);@(_CleanPriorFileWritesInIntermediate)" TreatErrorsAsWarnings="true">
+      <Output TaskParameter="DeletedFiles" ItemName="_CleanPriorFileWritesDeleted" />
+    </Delete>
+
+    <!-- Create a list of everything that wasn't deleted. -->
+    <CreateItem Include="@(_CleanPriorFileWrites)" Exclude="@(_CleanPriorFileWritesDeleted)">
+      <Output TaskParameter="Include" ItemName="_CleanRemainingFileWritesAfterClean" />
+    </CreateItem>
+
+    <!-- Remove duplicates. -->
+    <RemoveDuplicates Inputs="@(_CleanRemainingFileWritesAfterClean)">
+      <Output TaskParameter="Filtered" ItemName="_CleanUniqueRemainingFileWrites" />
+    </RemoveDuplicates>
+
+    <!-- Make sure the directory exists. -->
+    <MakeDir Directories="$(IntermediateOutputPath)" />
+
+    <!-- Write new list of current files back to disk. -->
+    <WriteLinesToFile File="$(IntermediateOutputPath)$(CleanFile)" Lines="@(_CleanUniqueRemainingFileWrites)" Overwrite="true" />
+
+  </Target>
+
+  <!--
+  ==================================================================================================
+  _CleanRecordFileWrites
+
+    Save the list of all files written to disk so that it can be used for "Clean" later.
+    Files written in prior builds are not removed from Clean cache.
+  ==================================================================================================
+  -->
+  <Target
+    Name="_CleanRecordFileWrites"
+    DependsOnTargets="_CleanGetCurrentAndPriorFileWrites">
+
+    <!-- Merge list of files from prior builds with the current build and then remove duplicates. -->
+    <RemoveDuplicates Inputs="@(_CleanPriorFileWrites);@(_CleanCurrentFileWrites)">
+      <Output TaskParameter="Filtered" ItemName="_CleanUniqueFileWrites" />
+    </RemoveDuplicates>
+
+    <!-- Make sure the directory exists. -->
+    <MakeDir Directories="$(IntermediateOutputPath)" />
+
+    <!-- Write merged file list back to disk, replacing existing contents. -->
+    <WriteLinesToFile
+        File="$(IntermediateOutputPath)$(CleanFile)"
+        Lines="@(_CleanUniqueFileWrites)"
+        Overwrite="true" />
+
+  </Target>
+
+  <!--
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  PostBuildEvent Targets
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  -->
+
+  <!--
+  ==================================================================================================
+  PostBuildEvent
+
+    Run the post-build event. This step is driven by two parameters:
+
+    1) $(RunPostBuildEvent) is set by the user through the IDE and can be one of four values:
+       1) OnBuildSuccess: In this case, every step of the build must succeed for the post-build
+          step to run.
+       2) <Blank>: This is the same as OnBuildSuccess.
+       3) OnOutputUpdated: In this case, the post-build step will run only if the main output was
+          actually updated.
+       4) Always: The post-build step is always run.
+
+    2) $(_TargetOutputTimestampBeforeCompileAndLink) and $(_TargetOutputTimestampAfterCompileAndLink)
+       are set by the _TimeStampBeforeCompileAndLink and _TimeStampAfterCompileAndLink targets. If
+       the output was actually rebuilt during this build, then the two values will be different.
+  ==================================================================================================
+  -->
+  <PropertyGroup>
+    <PostBuildEventDependsOn>GetTargetPath</PostBuildEventDependsOn>
+  </PropertyGroup>
+  <Target
+    Name="PostBuildEvent"
+    Condition=" '$(PostBuildEvent)' != '' and
+      ( '$(RunPostBuildEvent)' != 'OnOutputUpdated' or '$(_TargetOutputTimestampBeforeCompileAndLink)' != '$(_TargetOutputTimestampAfterCompileAndLink)' )"
+    DependsOnTargets="$(PostBuildEventDependsOn)">
+
+    <ReplaceString
+      Text="$(PostBuildEvent)"
+      OldValue="!(TargetPath)"
+      NewValue="$(TargetPath)">
+      
+      <Output TaskParameter="Text" PropertyName="ExpandedPostBuildEvent" />
+    </ReplaceString>
+
+    <ReplaceString
+      Text="$(ExpandedPostBuildEvent)"
+      OldValue="!(TargetPdbPath)"
+      NewValue="$(TargetPdbPath)">
+      
+      <Output TaskParameter="Text" PropertyName="ExpandedPostBuildEvent" />
+    </ReplaceString>
+
+    <Exec WorkingDirectory="$(OutDir)" Command="$(ExpandedPostBuildEvent)" />
+  </Target>
+
+  <!--
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  AllProjectOutputGroups Section
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  -->
+
+  <!--
+  ==================================================================================================
+  AllProjectOutputGroups
+
+    The targets below drive output groups, which provide generic information about a
+    project's inputs (e.g., content files, compilation sources, etc.) and built outputs
+    (e.g., built EXE/DLL, PDB, XML documentation files, etc.)
+
+    Each target may produce two kinds of items:  outputs and dependencies. Outputs are
+    items from the current project; dependencies are items that are brought into the
+    current project as a result of referencing other projects or components.
+
+    For both outputs and dependencies, the Include attribute
+    specifies the location of the output/dependency; it must be a full path. Any number
+    of additional attributes may be placed on an output/dependency item.
+  ==================================================================================================
+  -->
+  <Target
+    Name="AllProjectOutputGroups"
+    DependsOnTargets="
+      BuiltProjectOutputGroup;
+      DebugSymbolsProjectOutputGroup;
+      DocumentationProjectOutputGroup;
+      SatelliteDllsProjectOutputGroup;
+      SourceFilesProjectOutputGroup;
+      ContentFilesProjectOutputGroup;
+      SGenFilesOutputGroup" />
+
+  <!-- 
+  This is the key output for the BuiltProjectOutputGroup and is meant to be read directly from the IDE.
+  Reading an item is faster than invoking a target.
+  -->
+  <ItemGroup>
+    <BuiltProjectOutputGroupKeyOutput Include="$(TargetPath)">
+      <IsKeyOutput>true</IsKeyOutput>
+      <FinalOutputPath>$(TargetPath)</FinalOutputPath>
+      <TargetPath>$(TargetFileName)</TargetPath>
+    </BuiltProjectOutputGroupKeyOutput>
+  </ItemGroup>
+
+  <!--
+  ==================================================================================================
+  BuiltProjectOutputGroup
+  ==================================================================================================
+  -->
+  <PropertyGroup>
+    <BuiltProjectOutputGroupDependsOn>PrepareForBuild;AssignCultures</BuiltProjectOutputGroupDependsOn>
+    <AddAppConfigToBuildOutputs Condition="('$(AddAppConfigToBuildOutputs)' == '') and ('$(OutputType)' != 'library')">true</AddAppConfigToBuildOutputs>
+  </PropertyGroup>
+  <Target
+    Name="BuiltProjectOutputGroup"
+    Outputs="@(BuiltProjectOutputGroupOutput)"
+    DependsOnTargets="$(BuiltProjectOutputGroupDependsOn)">
+
+    <!-- Don't add BuiltProjectOutputGroupKeyOutput - to avoid duplicates, we only

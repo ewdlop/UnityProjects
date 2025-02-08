@@ -1,0 +1,78 @@
+to a more human-readable one for ensures
+	FCString::Strcpy(SignalDescription, UE_ARRAY_COUNT(SignalDescription) - 1, EnsureMessage);
+
+	// only need the first string
+	for (int Idx = 0; Idx < UE_ARRAY_COUNT(SignalDescription); ++Idx)
+	{
+		if (SignalDescription[Idx] == TEXT('\n'))
+		{
+			SignalDescription[Idx] = 0;
+			break;
+		}
+	}
+}
+
+volatile sig_atomic_t GEnteredSignalHandler = 0;
+
+/**
+ * Handles graceful termination. Gives time to exit gracefully, but second signal will quit immediately.
+ */
+void GracefulTerminationHandler(int32 Signal, siginfo_t* Info, void* Context)
+{
+	GEnteredSignalHandler = 1;
+
+	// do not flush logs at this point; this can result in a deadlock if the signal was received while we were holding lock in the malloc (flushing allocates memory)
+	if( !IsEngineExitRequested() )
+	{
+		FPlatformMisc::RequestExitWithStatus(false, 128 + Signal);	// Keeping the established shell practice of returning 128 + signal for terminations by signal. Allows to distinguish SIGINT/SIGTERM/SIGHUP.
+	}
+	else
+	{
+		FPlatformMisc::RequestExit(true);
+	}
+
+	GEnteredSignalHandler = 0;
+}
+
+void CreateExceptionInfoString(int32 Signal, siginfo_t* Info, ucontext_t *Context)
+{
+	FString ErrorString = TEXT("Unhandled Exception: ");
+	ErrorString += DescribeSignal(Signal, Info, Context);
+	FCString::Strncpy(GErrorExceptionDescription, *ErrorString, FMath::Min(ErrorString.Len() + 1, (int32)UE_ARRAY_COUNT(GErrorExceptionDescription)));
+}
+
+namespace
+{
+	/** 
+	 * Write a line of UTF-8 to a file
+	 */
+	void WriteLine(FArchive* ReportFile, const ANSICHAR* Line = NULL)
+	{
+		if( Line != NULL )
+		{
+			int64 StringBytes = FCStringAnsi::Strlen(Line);
+			ReportFile->Serialize(( void* )Line, StringBytes);
+		}
+
+		// use Windows line terminator
+		static ANSICHAR WindowsTerminator[] = "\r\n";
+		ReportFile->Serialize(WindowsTerminator, 2);
+	}
+
+	/**
+	 * Serializes UTF string to UTF-16
+	 */
+	void WriteUTF16String(FArchive* ReportFile, const TCHAR * UTFString4BytesChar, uint32 NumChars)
+	{
+		check(UTFString4BytesChar != NULL || NumChars == 0);
+
+		for (uint32 Idx = 0; Idx < NumChars; ++Idx)
+		{
+			ReportFile->Serialize(const_cast< TCHAR* >( &UTFString4BytesChar[Idx] ), 2);
+		}
+	}
+
+	/** 
+	 * Writes UTF-16 line to a file
+	 */
+	vo

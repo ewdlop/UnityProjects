@@ -1,0 +1,623 @@
+// Copyright 2018 The Go Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package jsonrpc2 is a minimal implementation of the JSON RPC 2 spec.
+// https://www.jsonrpc.org/specification
+// It is intended to be compatible with other implementations at the wire level.
+package jsonrpc2
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"sync"
+	"sync/atomic"
+)
+
+// Conn is a JSON RPC 2 client server connection.
+// Conn is bidirectional; it does not have a designated server or client end.
+type Conn struct {
+	seq        int64 // must only be accessed using atomic operations
+	handlers   []Handler
+	stream     Stream
+	err        error
+	pendingMu  sync.Mutex // protects the pending map
+	pending    map[ID]chan *WireResponse
+	handlingMu sync.Mutex // protects the handling map
+	handling   map[ID]*Request
+}
+
+type requestState int
+
+const (
+	requestWaiting = requestState(iota)
+	requestSerial
+	requestParallel
+	requestReplied
+	requestDone
+)
+
+// Request is sent to a server to represent a Call or Notify operaton.
+type Request struct {
+	conn        *Conn
+	cancel      context.CancelFunc
+	state       requestState
+	nextRequest chan struct{}
+
+	// The Wire values of the request.
+	WireRequest
+}
+
+// NewErrorf builds a Error struct for the supplied message and code.
+// If args is not empty, message and args will be passed to Sprintf.
+func NewErrorf(code int64, format string, args ...interface{}) *Error {
+	return &Error{
+		Code:    code,
+		Message: fmt.Sprintf(format, args...),
+	}
+}
+
+// NewConn creates a new connection object around the supplied stream.
+// You must call Run for the connection to be active.
+func NewConn(s Stream) *Conn {
+	conn := &Conn{
+		handlers: []Handler{defaultHandler{}},
+		stream:   s,
+		pending:  make(map[ID]chan *WireResponse),
+		handling: make(map[ID]*Request),
+	}
+	return conn
+}
+
+// AddHandler adds a new handler to the set the connection will invoke.
+// Handlers are invoked in the reverse order of how they were added, this
+// allows the most recent addition to be the first one to attempt to handle a
+// message.
+func (c *Conn) AddHandler(handler Handler) {
+	// prepend the new handlers so we use them first
+	c.handlers = append([]Handler{handler}, c.handlers...)
+}
+
+// Cancel cancels a pending Call on the server side.
+// The call is identified by its id.
+// JSON RPC 2 does not specify a cancel message, so cancellation support is not
+// directly wired in. This method allows a higher level protocol to choose how
+// to propagate the cancel.
+func (c *Conn) Cancel(id ID) {
+	c.handlingMu.Lock()
+	handling, found := c.handling[id]
+	c.handlingMu.Unlock()
+	if found {
+		handling.cancel()
+	}
+}
+
+// Notify is called to send a notification request over the connection.
+// It will return as soon as the notification has been sent, as no response is
+// possible.
+func (c *Conn) Notify(ctx context.Context, method string, params interface{}) (err error) {
+	jsonParams, err := marshalToRaw(params)
+	if err != nil {
+		return fmt.Errorf("marshalling notify parameters: %v", err)
+	}
+	request := &WireRequest{
+		Method: method,
+		Params: jsonParams,
+	}
+	data, err := json.Marshal(request)
+	if err != nil {
+		return fmt.Errorf("marshalling notify request: %v", err)
+	}
+	for _, h := range c.handlers {
+		ctx = h.Request(ctx, c, Send, request)
+	}
+	defer func() {
+		for _, h := range c.handlers {
+			h.Done(ctx, err)
+		}
+	}()
+	n, err := c.stream.Write(ctx, data)
+	for _, h := range c.handlers {
+		ctx = h.Wrote(ctx, n)
+	}
+	return err
+}
+
+// Call sends a request over the connection and then waits for a response.
+// If the response is not an error, it will be decoded into result.
+// result must be of a type you an pass to json.Unmarshal.
+func (c *Conn) Call(ctx context.Context, method string, params, result interface{}) (err error) {
+	// generate a new request identifier
+	id := ID{Number: atomic.AddInt64(&c.seq, 1)}
+	jsonParams, err := marshalToRaw(params)
+	if err != nil {
+		return fmt.Errorf("marshalling call parameters: %v", err)
+	}
+	request := &WireRequest{
+		ID:     &id,
+		Method: method,
+		Params: jsonParams,
+	}
+	// marshal the request now it is complete
+	data, err := json.Marshal(request)
+	if err != nil {
+		return fmt.Errorf("marshalling call request: %v", err)
+	}
+	for _, h := range c.handlers {
+		ctx = h.Request(ctx, c, Send, request)
+	}
+	// we have to add ourselves to the pending map before we send, otherwise we
+	// are racing the response
+	rchan := make(chan *WireResponse)
+	c.pendingMu.Lock()
+	c.pending[id] = rchan
+	c.pendingMu.Unlock()
+	defer func() {
+		// clean up the pending response handler on the way out
+		c.pendingMu.Lock()
+		delete(c.pending, id)
+		c.pendingMu.Unlock()
+		for _, h := range c.handlers {
+			h.Done(ctx, err)
+		}
+	}()
+	// now we are ready to send
+	n, err := c.stream.Write(ctx, data)
+	for _, h := range c.handlers {
+		ctx = h.Wrote(ctx, n)
+	}
+	if err != nil {
+		// sending failed, we will never get a response, so don't leave it pending
+		return err
+	}
+	// now wait for the response
+	select {
+	case response := <-rchan:
+		for _, h := range c.handlers {
+			ctx = h.Response(ctx, c, Receive, response)
+		}
+		// is it an error response?
+		if response.Error != nil {
+			return response.Error
+		}
+		if result == nil || response.Result == nil {
+			return nil
+		}
+		if err := json.Unmarshal(*response.Result, result); err != nil {
+			return fmt.Errorf("unmarshalling result: %v", err)
+		}
+		return nil
+	case <-ctx.Done():
+		// allow the handler to propagate the cancel
+		cancelled := false
+		for _, h := range c.handlers {
+			if h.Cancel(ctx, c, id, cancelled) {
+				cancelled = true
+			}
+		}
+		return ctx.Err()
+	}
+}
+
+// Conn returns the connection that created this request.
+func (r *Request) Conn() *Conn { return r.conn }
+
+// IsNotify returns true if this request is a notification.
+func (r *Request) IsNotify() bool {
+	return r.ID == nil
+}
+
+// Parallel indicates that the system is now allowed to process other requests
+// in parallel with this one.
+// It is safe to call any number of times, but must only be called from the
+// request handling go routine.
+// It is implied by both reply and by the handler returning.
+func (r *Request) Parallel() {
+	if r.state >= requestParallel {
+		return
+	}
+	r.state = requestParallel
+	close(r.nextRequest)
+}
+
+// Reply sends a reply to the given request.
+// It is an error to call this if request was not a call.
+// You must call this exactly once for any given request.
+// It should only be called from the handler go routine.
+// If err is set then result will be ignored.
+// If the request has not yet dropped into parallel mode
+// it will be before this function returns.
+func (r *Request) Reply(ctx context.Context, result interface{}, err error) error {
+	if r.state >= requestReplied {
+		return fmt.Errorf("reply invoked more than once")
+	}
+	if r.IsNotify() {
+		return fmt.Errorf("reply not invoked with a valid call")
+	}
+	// reply ends the handling phase of a call, so if we are not yet
+	// parallel we should be now. The go routine is allowed to continue
+	// to do work after replying, which is why it is important to unlock
+	// the rpc system at this point.
+	r.Parallel()
+	r.state = requestReplied
+
+	var raw *json.RawMessage
+	if err == nil {
+		raw, err = marshalToRaw(result)
+	}
+	response := &WireResponse{
+		Result: raw,
+		ID:     r.ID,
+	}
+	if err != nil {
+		if callErr, ok := err.(*Error); ok {
+			response.Error = callErr
+		} else {
+			response.Error = NewErrorf(0, "%s", err)
+		}
+	}
+	data, err := json.Marshal(response)
+	if err != nil {
+		return err
+	}
+	for _, h := range r.conn.handlers {
+		ctx = h.Response(ctx, r.conn, Send, response)
+	}
+	n, err := r.conn.stream.Write(ctx, data)
+	for _, h := range r.conn.handlers {
+		ctx = h.Wrote(ctx, n)
+	}
+
+	if err != nil {
+		// TODO(iancottrell): if a stream write fails, we really need to shut down
+		// the whole stream
+		return err
+	}
+	return nil
+}
+
+func (c *Conn) setHandling(r *Request, active bool) {
+	if r.ID == nil {
+		return
+	}
+	r.conn.handlingMu.Lock()
+	defer r.conn.handlingMu.Unlock()
+	if active {
+		r.conn.handling[*r.ID] = r
+	} else {
+		delete(r.conn.handling, *r.ID)
+	}
+}
+
+// combined has all the fields of both Request and Response.
+// We can decode this and then work out which it is.
+type combined struct {
+	VersionTag VersionTag       `json:"jsonrpc"`
+	ID         *ID              `json:"id,omitempty"`
+	Method     string           `json:"method"`
+	Params     *json.RawMessage `json:"params,omitempty"`
+	Result     *json.RawMessage `json:"result,omitempty"`
+	Error      *Error           `json:"error,omitempty"`
+}
+
+// Run blocks until the connection is terminated, and returns any error that
+// caused the termination.
+// It must be called exactly once for each Conn.
+// It returns only when the reader is closed or there is an error in the stream.
+func (c *Conn) Run(runCtx context.Context) error {
+	// we need to make the next request "lock" in an unlocked state to allow
+	// the first incoming request to proceed. All later requests are unlocked
+	// by the preceding request going to parallel mode.
+	nextRequest := make(chan struct{})
+	close(nextRequest)
+	for {
+		// get the data for a message
+		data, n, err := c.stream.Read(runCtx)
+		if err != nil {
+			// the stream failed, we cannot continue
+			return err
+		}
+		// read a combined message
+		msg := &combined{}
+		if err := json.Unmarshal(data, msg); err != nil {
+			// a badly formed message arrived, log it and continue
+			// we trust the stream to have isolated the error to just this message
+			for _, h := range c.handlers {
+				h.Error(runCtx, fmt.Errorf("unmarshal failed: %v", err))
+			}
+			continue
+		}
+		// work out which kind of message we have
+		switch {
+		case msg.Method != "":
+			// if method is set it must be a request
+			reqCtx, cancelReq := context.WithCancel(runCtx)
+			thisRequest := nextRequest
+			nextRequest = make(chan struct{})
+			req := &Request{
+				conn:        c,
+				cancel:      cancelReq,
+				nextRequest: nextRequest,
+				WireRequest: WireRequest{
+					VersionTag: msg.VersionTag,
+					Method:     msg.Method,
+					Params:     msg.Params,
+					ID:         msg.ID,
+				},
+			}
+			for _, h := range c.handlers {
+				reqCtx = h.Request(reqCtx, c, Receive, &req.WireRequest)
+				reqCtx = h.Read(reqCtx, n)
+			}
+			c.setHandling(req, true)
+			go func() {
+				<-thisRequest
+				req.state = requestSerial
+				defer func() {
+					c.setHandling(req, false)
+					if !req.IsNotify() && req.state < requestReplied {
+						req.Reply(reqCtx, nil, NewErrorf(CodeInternalError, "method %q did not reply", req.Method))
+					}
+					req.Parallel()
+					for _, h := range c.handlers {
+						h.Done(reqCtx, err)
+					}
+					cancelReq()
+				}()
+				delivered := false
+				for _, h := range c.handlers {
+					if h.Deliver(reqCtx, req, delivered) {
+						delivered = true
+					}
+				}
+			}()
+		case msg.ID != nil:
+			// we have a response, get the pending entry from the map
+			c.pendingMu.Lock()
+			rchan := c.pending[*msg.ID]
+			if rchan != nil {
+				delete(c.pending, *msg.ID)
+			}
+			c.pendingMu.Unlock()
+			// and send the reply to the channel
+			response := &WireResponse{
+				Result: msg.Result,
+				Error:  msg.Error,
+				ID:     msg.ID,
+			}
+			rchan <- response
+			close(rchan)
+		default:
+			for _, h := range c.handlers {
+				h.Error(runCtx, fmt.Errorf("message not a call, notify or response, ignoring"))
+			}
+		}
+	}
+}
+
+func marshalToRaw(obj interface{}) (*json.RawMessage, error) {
+	data, err := json.Marshal(obj)
+	if err != nil {
+		return nil, err
+	}
+	raw := json.RawMessage(data)
+	return &raw, nil
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                      Ö¶JaëÖà!u}¹äîºáåZ~çö‚šÕ!ªm /%Û~74Nñ(ƒ
+¾c¯¹d=‚$é¢ˆzºri=VæİX{õéıhôI@uò²mı£Ç2	:å²ÓŞXkV®Šp¢dî)4Š5'¶òUCyX…[Ä„fT–ĞÖ?âM-˜MÜd¢Å1Ø0Zã –ûa¶ÏàB£yèu a(W_Y†hdk7ëçˆC ¢ÒŠ$ ’cWu¯º„SSiø€WJùÌQ1öªN½ÿ>0½’(Íø¤C°üö§Ê çğë6dhGß”<'ä¦qw|í°.›˜D¼Æ¥ê‹ªõ(HjFnº½TºrvMOü²Ô!kùª‹ËîWàx\¾ÜÕŠWÍl<©±¤öËÛ_Úÿ^Y¢èÇåşù©í®	ªi[ÄñÍ¢A}¿Çèl™ƒ¢0ó˜¬Á¿ç¶Tü+‡[Gv@Óp¿”Hx m‡{]˜}mGvÏ¸èÚT˜º`5VtÊnÖğÅq5ç¶+ô|L5x b’’ihÌ„¹‚èõ-cÕùi?¨‹>="&å{¯m›M‡Rƒ4mzÃÓ†Àï7Õg\sûéõıÍÕE´Q@’ì¸‰¦cµ;I=¶.XyZdpíHİŠ¼¨Ğ2î”rc–}V‹¦f¯Éwn^nò^Wõj´ùp1Œ~÷UKhÅT#ãôpÁÿ¡ ÄÄÿÅd‹Ö/yì¹so÷gÙ¨àåB;qø!‚Q/wÙßeİºğºkÍwrK¤Ä<†ŠIÛ†ó÷£êP+¯Yÿ·¾­8Í¼&'ah3[„Šx¬øª_ƒÏ¨†>úìVåb¿,8Šü„ô©–…¯:VÈzøHk†Áu×:KÚgFü\úp"rØl,q	Í…ßV—Úœ†/ı®\ô]í Aå ş0ë	ÀŸÚÀeğ‘ÎGô¥³6ú¼è yoâÉ¤×€ÛMg»rOw©$”İä÷<Èı¥­ˆßÈãj½í‚s‡ ¿r¿q1Y˜	‡‡³í.¤HÇ¾2a —Ä¯@ŸôF¹„ X÷Äü‡fèÒ’»‚ã85[J,—Àöí›Gh¶sËÚ<uÀT¦¶K@¬+OÜIBĞ|\B¢¼¾¸7ÄåÉÌc|V×}Ş'­èT,AmÓÃT9ûÖ¢L&'ƒ!Š"ZrÁv$$<ˆš(çXË.Şê½3
+yè’ÜÉ¢ú–¿P"mçïR_
+lâ¹›şT'LZ’å3¸½THªÿå‘À¦“Øåúî©,OÏcà2+v?Åªth$k"ó‘$]ÆµÙ©·^]—SÅ®æÖ
+;§	„·€«)÷#$ç~(iQòÉÌ „w„”7p²ıï3k‡íA×Âáë`½…´ÕeıĞ•“ªœ'‚®Ú ;–oAŠš?;†ú?l ?|9ñx(¶¶cKä\¬µ)Sâf}ÉŒQdAÚĞW+«€Yg—YvêùT+šNÜ~&Vë3‹)Ù<|‹0ïxùa´–•Â¢†S‹¾¾H;´§ªÄU]£'ï-Ãè-ÎñF):°sök¦“vgU—˜dÄ°2ïür@ÓaT}¥Âë…³…C@×XX#íï$3¨A@Ëò•­ñ”>&¿¸®'ÙÛ-ÂÃô3ğÄ0„Ş:Áşc›êã…/r•w bœ3rfËç,5ıvãT]áƒõı¸£İpG[Dˆ+µhûÅ³òe¥ß¿XV¿÷‰üc‰ùÒdóÀ\·Ëç)ğo¿\B¬n^ğÕ5aâÜÜ"Ü	[¤o2âØ¤£A"ŞÿJ	z­twpKÓıMG¬yx’wáÄ>>dYÃBjÄS•—úºzÙ¥kt™Gì92q¸t§±¼~ÕÊ®ŸA¼‘;’”íø«ÌÁuæÈF¥ûÂ‘Ú‹ß©›ã&NÖÎ‚~I€ìµıºc&@ı¼æ£„3q¥çöwL{0ÿ¹•“;‡ñp*8.iu/6ïä­’z8)£ôŞ÷à# Kr.LÀ‚M)ô!#¼iµÔÚ[+qÔŒZl«xQ‡¨b’ÀT8Ñ'ïµFw$ëŒMÒc!*æõvYÃ%ºà·¥Q–Â3©×\‰dÕ°SÆOEæş·ïV©TÒ¤¸b´á†ø»	$÷}°áÊÅØÉœŞ)„Ò™6`—×à-³Æ„M¼+±eØ^I²À›lä»Ç¿	ÁÍnALÑ_Û:Ã¨P”šÔ
+i˜É‚õl1Zv1ÖÃÉì½Ğßxqç[à”qµØÆÎÜBo	P“Z¦“CuĞ}¥~c–Q¾K5‡ôÄ–nÚµ#¬¦‚+®ãİÃw\¬âYÂ:V<j•š^b{£ãsÙ·`#´qÇ
+L³'Şñ>6˜Å‹ãøX#K—º®ÆH€—¸Ë
+Ëš Íôƒ¤áîƒm>âù°ÒœÃóH2½IÇğ*35ª¡£©yÿLĞtp0oA¦PYƒ8;Å<şèÌî-¿™Ç¯©£Ä€Ä˜PA#•å_sîlé­ÈVƒRwO£şQİe#öú¹ë–¦/¯ÙHúŠèyŸ¿ÊlXÃÄ}1æL{2”	Ñ!ğÚyÎ¡°Ãy¥%-ÚB{¹!óqÁilƒ×ÂP4ñõñ20ÁÑZó45+shªûÌÓŒõC¼ºŞ!ã—k¿´ã¦ı­2ŞÅ0%À¦}‡ÏkU»±I7Š†¶	%É90-¤ î1ÿ|®/Ë÷`°vç±Çû$ÿoÁĞ3p¾v@˜rõÏ¦«—ëénÜš¼].,©+-Ï"ÀÅC]_a‰“×<ïÇV“Èòü ØuÇ?]¤°3^jšå\™ÅEÆš¥ğ¶Dx®ñ!é>˜AşåÄàp¾«ƒHã’Íµ~ ‹õv u€P®ENs@øá ¨ä·ìíç®ºd9`äfæ²`$¹”€ËQzëÃëpj »õíCğÉB2¹a ½"“µ¢z~!é¼vÔëÎàœqmP)ON^c‘˜,©q%h'Ü6g»uS©uÕ"¾¶øíÀƒÄÕùı¯%!âİ³ûhGbãÏŒ™İ	>3óÒÀßÍ>¹9÷—·£RíS/Mª¤¾Ôƒu„mCóñ	½â9©_ñã«ĞìDğÍ$Vê-a®í3¿ïŠÛüĞ2X®*	¦Dhà$ÎÅ¹Òw5«¿÷#­"xöùİ˜C"úğ/4UgøùâäÍ×Øºòw&ŞâÅTìuXÖoXªÂZ.¦s2‚óœ¨×èk@±*=(·¸«T
+h‰KFÌŠåš–õŠ,‘LGsİÂT£ş„/È8?l™Å´I½{úk¾ºì	vnÙÂ+ŞÍ#Pİ,ŞO™Ú37ƒ$é[qW2O "Ö—vc-P—¡	ÊµÀ(eõ«pL:,„‹­ŠÂœÖj </aa=-—ß{‹ÿ
+|B×=˜cqèÜµ¨^üvÛŒ"'ffºƒj™ÎŠ	ÚoâXÃ?ıîÇ©dó6FZâåoß”9Më£Jé5Ô”‰
+ŠğÑGÔÖí]òË(†ÁL‚› ›ù1B+ó"Ó&-Ëón;ªÆ£g<”c4ÊSù5f"ã{pâ¬Šã9q’·rÛ>ğä÷E¼¾s®nâ¢ˆùh+ûƒÊ—v|Ø,:é&‡ qŒoz0laÃj–n’¯I1Ù>{r °Œ=Æ¿RÍGü^#•Õo0ûÎÊ/Óª/Œd&‚ÇûÈK*:«¥×IÈâJd¡ÿòŞ4™üp×q‚ş,Hâªì@çø²*Á¢ Y—ÌnÒqı€L7hùÙ-ÖêCn"’cÏø&Ï±3Tš1Ù«k$Iç€¤u¡œôRªıwğ´–||}¯Ü–jPû¥<qëåHsÏ|v`º¶™{ R,-EškúÔ!c]sHÀ‘ÏÚ·z*·’æiĞ¨¦d‚Ğ7’#©È›Óf»Ä“Ï©»k§<:e¥#;¿á
+±'0á2£`27ôÌ19£& `>›P¯I‘øÏbÏO­Å+Ù£Ø(Auó6÷äLj ²¸ı;¬ü^¿âZ¬‚Ô«ù´"ÄğY{ŞE´²dB^¤¶q	ª}",yl® ×¾}ô;‚÷?p™®ÕşÁ
+Ğ=¨8‚¸»¶Ø²ÇÑ‹•¨Sª	¦ejbSpg¾QÍÈF%I¨Œéï¢¼åVÜ-è¨Öä‚ÂŒ£`¶Œç$İ«Û…Ju I}ùŞClvØÃÏiB÷­4€C¼§.¦;ìğ¶fõã¶8êáÉs»¹2Ô“•¿ÊÙ"ŸÏD§$‹mÚJ ÌQ_Ñ*&¾éê&ˆF9Šâ@mfÊG–`cÂ*+Ê¥İUãm"EV«Û¥§U”sşÈ§Z˜†3‚Š¥Ùv×F˜vÑë½ÓIfx2Hº‚GêHc¥t£¤­"1Ú^U´ã3áiÜå(KK\®Á;‰3Y?dòÍ6›ãærkìEÏÒ'—‹vye$ƒ\Eg
+·ıêN¬åŞûÅ(|sÆŸ“ÎªÇéA«y íÈ\8·ªEòœÛ.ûŠÏ>öÉì›Á<9ª„--"Cl0¤ì6Á¬¬æGZ&V„|Ly›hükè¿àş&$æ¹]üü•?b-D>w\ºSÂB(étº4\{# makefile for libpng
+# Copyright (C) 2002, 2006 Glenn Randers-Pehrson
+# Copyright (C) 1995 Guy Eric Schalnat, Group 42, Inc.
+#
+# This code is released under the libpng license.
+# For conditions of distribution and use, see the disclaimer
+# and license in png.h
+
+# where make install puts libpng.a and png.h
+prefix=/usr/local
+INCPATH=$(prefix)/include
+LIBPATH=$(prefix)/lib
+
+# override DESTDIR= on the make install command line to easily support
+# installing into a temporary location.  Example:
+#
+#    make install DESTDIR=/tmp/build/libpng
+#
+# If you're going to install into a temporary location
+# via DESTDIR, $(DESTDIR)$(prefix) must already exist before
+# you execute make install.
+DESTDIR=
+
+# Where the zlib library and include files are located
+#ZLIBLIB=/usr/local/lib
+#ZLIBINC=/usr/local/include
+ZLIBLIB=../zlib
+ZLIBINC=../zlib
+
+CC=cc
+AR_RC=ar rc
+MKDIR_P=mkdir
+LN_SF=ln -sf
+RANLIB=ranlib
+RM_F=rm -f
+AWK = awk
+SED = sed
+CPP = $(CC) -E
+ECHO = echo
+
+DFNFLAGS = # DFNFLAGS contains -D options to use in the libpng build
+CFLAGS=-I$(ZLIBINC) -O # -g -DPNG_DEBUG=5
+LDFLAGS=-L. -L$(ZLIBLIB) -lpng -lz -lm
+
+OBJS = png.o pngset.o pngget.o pngrutil.o pngtrans.o pngwutil.o \
+	pngread.o pngrio.o pngwio.o pngwrite.o pngrtran.o \
+	pngwtran.o pngmem.o pngerror.o pngpread.o
+
+all: libpng.a pngtest
+
+# The standard pnglibconf.h exists as scripts/pnglibconf.h.prebuilt,
+# copy this if the following doesn't work.
+pnglibconf.dfn: scripts/pnglibconf.dfa scripts/options.awk
+	$(RM_F) $@ dfn?.out
+	$(AWK) -f scripts/options.awk out=dfn1.out\
+	    scripts/pnglibconf.dfa $(DFA_XTRA) 1>&2
+	$(AWK) -f scripts/options.awk out=dfn2.out dfn1.out 1>&2
+	cp dfn2.out $@
+	$(RM_F) dfn?.out
+
+pnglibconf.h: pnglibconf.dfn
+	$(RM_F) $@ dfn.c dfn?.out
+	$(ECHO) '#include "pnglibconf.dfn"' >dfn.c
+	$(CPP) $(DFNFLAGS) dfn.c >dfn1.out
+	$(SED) -n -e 's|^.*PNG_DEFN_MAGIC-\(.*\)-PNG_DEFN_END.*$$|\1|p'\
+	    dfn1.out >dfn2.out
+	$(SED) -e 's| *@@@ *||g' -e 's| *$$||' dfn2.out >dfn3.out
+	cp dfn3.out $@
+	$(RM_F) dfn.c dfn?.out
+
+libpng.a: $(OBJS)
+	$(AR_RC) $@  $(OBJS)
+	$(RANLIB) $@
+
+pngtest: pngtest.o libpng.a
+	$(CC) -o pngtest $(CFLAGS) pngtest.o $(LDFLAGS)
+
+test: pngtest
+	./pngtest
+
+install: libpng.a pnglibconf.h
+	-@$(MKDIR_P) $(DESTDIR)$(INCPATH)
+	-@$(MKDIR_P) $(DESTDIR)$(INCPATH)/libpng
+	-@$(MKDIR_P) $(DESTDIR)$(LIBPATH)
+	-@$(RM_F) $(DESTDIR)$(INCPATH)/png.h
+	-@$(RM_F) $(DESTDIR)$(INCPATH)/pngconf.h
+	-@$(RM_F) $(DESTDIR)$(INCPATH)/pnglibconf.h
+	cp png.h $(DESTDIR)$(INCPATH)/libpng
+	cp pngconf.h $(DESTDIR)$(INCPATH)/libpng
+	cp pnglibconf.h $(DESTDIR)$(INCPATH)/libpng
+	chmod 644 $(DESTDIR)$(INCPATH)/libpng/png.h
+	chmod 644 $(DESTDIR)$(INCPATH)/libpng/pngconf.h
+	chmod 644 $(DESTDIR)$(INCPATH)/libpng/pnglibconf.h
+	(cd $(DESTDIR)$(INCPATH); ln -f -s libpng/* .)
+	cp libpng.a $(DESTDIR)$(LIBPATH)
+	chmod 644 $(DESTDIR)$(LIBPATH)/libpng.a
+
+clean:
+	$(RM_F) *.o libpng.a pngtest pngout.png pnglibconf.* dfn.c dfn?.out
+
+DOCS = ANNOUNCE CHANGES INSTALL KNOWNBUG LICENSE README TODO Y2KINFO
+writelock:
+	chmod a-w *.[ch35] $(DOCS) scripts/*
+
+# DO NOT DELETE THIS LINE -- make depend depends on it.
+
+png.o: png.h pngconf.h pnglibconf.h pngpriv.h pngstruct.h pnginfo.h pngdebug.h
+pngerror.o: png.h pngconf.h pnglibconf.h pngpriv.h pngstruct.h pnginfo.h pngdebug.h
+pngrio.o: png.h pngconf.h pnglibconf.h pngpriv.h pngstruct.h pnginfo.h pngdebug.h
+pngwio.o: png.h pngconf.h pnglibconf.h pngpriv.h pngstruct.h pnginfo.h pngdebug.h
+pngmem.o: png.h pngconf.h pnglibconf.h pngpriv.h pngstruct.h pnginfo.h pngdebug.h
+pngset.o: png.h pngconf.h pnglibconf.h pngpriv.h pngstruct.h pnginfo.h pngdebug.h
+pngget.o: png.h pngconf.h pnglibconf.h pngpriv.h pngstruct.h pnginfo.h pngdebug.h
+pngread.o: png.h pngconf.h pnglibconf.h pngpriv.h pngstruct.h pnginfo.h pngdebug.h
+pngrtran.o: png.h pngconf.h pnglibconf.h pngpriv.h pngstruct.h pnginfo.h pngdebug.h
+pngrutil.o: png.h pngconf.h pnglibconf.h pngpriv.h pngstruct.h pnginfo.h pngdebug.h
+pngtrans.o: png.h pngconf.h pnglibconf.h pngpriv.h pngstruct.h pnginfo.h pngdebug.h
+pngwrite.o: png.h pngconf.h pnglibconf.h pngpriv.h pngstruct.h pnginfo.h pngdebug.h
+pngwtran.o: png.h pngconf.h pnglibconf.h pngpriv.h pngstruct.h pnginfo.h pngdebug.h
+pngwutil.o: png.h pngconf.h pnglibconf.h pngpriv.h pngstruct.h pnginfo.h pngdebug.h
+pngpread.o: png.h pngconf.h pnglibconf.h pngpriv.h pngstruct.h pnginfo.h pngdebug.h
+
+pngtest.o: png.h pngconf.h pnglibconf.h
+                                                                                                                                   n-4ÁWÑ@e*(£/X’×¤"zWÈsÿ4ôiF†/P›OskD "´Ò['¥’ûfşåè|ã9ìÛÒı¶xšœ¿¼·¶Á¢VÄœ{zV´R¹ş…^øÃì1®â ®YMıg$Ù¥°Z‘‡(^“à>£‘òØŒ”«Ï©q—rQs;6Â‡ĞH_!xÏ’/ğõÄ’ªf!±eº3,¹+3t;ÂXÍ$Ç@#¦ÏA¡ìŞ¼Õ Õ(“¤äÃy—qjÄé%»ğ¶¾İö€ˆtøŒêfîŸOáëê!ÕDkWn.-¯+pif˜bÉÆ¤I!œu[â\ lA †CWŸ	©şmò»ÓG‡×¨ öú˜­g´ã
+Ã ‹Ë¯,óğ&ÔÒmÆõ¹ûZØ@4·2”õ>ßP*QaLôø£j"KšÃzNP]XU/,¯œÅÙ]ó9UñdnXåÒ7ÁïsudSÏåUgÂæ´#OˆÔFs4“ä;k©îÕš¢¬¸nèwÌ˜2rÙ5ù‰÷ÇÏO©ê•Oeº°Ë( ìO–+¾½Zî%ooÓğÒj
+ä$"³GmÀ‘ÓößUÄ¦`K:¤ßÿ±Ûíü dÊ2ÏÊ¢÷¹´O=°†	|ˆİd\nä½ô]äm‰´™+Î}¢ãÅ“ú‰1`ÚU™ïièéÂ+ei9_R‰™ñ÷)t¯‡'‘wŞ&í÷!ÆA¦ók:E´O/ûU²×™ğÔWxı–•¥ñığÂdmfÀó¿K) Ğ¨t6*³ØuíıË;q·hå†Ø\—ÕŸhIùŞWóˆ¤àIdr/úA·wË‰<’f„Óá%ÑdÕàÈfŒùùgêŞ†]›zMâ…È|èH°Ö‰Ñ‰p±M`¨æñÊw†ë(}ŸÚ(ù~8\Z’æ{jƒD\ÀÁ¨0ÇG"Ù+¸…üN¢·ë’Ã`æ£"ŸãÕ²ß™*Xë¯ZÚª¼‚6¯l ¸öƒş>SıÔVÏ· VGj*tÏYÌ|€2oæ¥[¿¯6ÂùÙöf­¿ô¶‚Ÿ(«4È÷x~uëÛ~k‹Ç],0õâ°à¨ı£˜p£8ƒW$·@´eïÂƒ<ÁJô5A¼\ç:¦ª+ç±È<K´ªˆªJ•pn9Ş<qü¯ºc¯Œ?¼M±Bûg=t\Ó à8?ø]*#ÊÇŸx²˜ãübëwWüs×|X¢1œqæÈ"?#ùuÄ²î1;rƒDë1
+0Ÿ²Ä@U™DkR~~–vÔ§&bIUª‘—ªÄU±ë4E • ½¬õ!Ój4×w½C¶XZ”ecøÃèºf:Ó‰`„iq¬Ïºs*ZeÖ‘µq¸é¹päŠÎA2IüOrmj±Ørˆ0çú‘ÿ^äV s âÀ²t«Òª ŒfÚ†ŞXN •K!&!İÁØ€~ «{uÿ>y€™q7PP\T{…6Rdø‰pL²XªwwvÂÁŞ®+™ô×I$}m’ |‚… ÜÈEF‰l©ùÀÖä¢6BÇÌ:ùÿr]1Å©^Å¦ =¡`N8*"†Î3–V¼*¿Ş?ªÎI/BÅ fTA0ÂÑ%”ğ³‹9SêP¢~¿ºÈÜO±:Ãµ½¯~2ùk´ÿÃHf’DõúÆÁ¢ƒãz¢ f¨—\5é¢ö‡ê{_!–lÃ>ÏÂ%ñ®ã§/]ÊŞwZ÷Uİ2‡.¸ˆ¬~è=|ã4|Î}s(ù»•&Ågr”™ìmÊÁÈ+G>¥è}§à¢èPó†× Íğ*Å§Ã‘À9 %Ûµm×ábZÆ‡y^E¨&FœşÉ³Xø &9ÉªÇ“®­Ÿ¦¯Ò»Ê„¦Û#ª4û1ĞÓëµ"zÚC/9C¢»ãèí&#WC5eš«DÕ¬„,íq¡Lº¿>hºÔz<w|úÉàÎ%&ÙÎg–3CAÊ K¨NæÛtD“½¸'¹9G[Âo!|×@ØH‰Áj+Ó˜"½ëjè†#¸é˜8Ï;ÂıêiqçôØ×Eã¹5-†ˆñ_SUî¤³Ì xK@#·›Vê.Ş½B©â·‚jhöè¦’âÀû•ïßhõÛ¢m²øµ&%jàÍÈ¼V
+ÊÔéiJ¿O"{\YU[I@D1l„İÀIš£øleö˜ Şqp×8Œ+PDàÃ­¨n‘†tÙö‘4Ö_=QÉvÅK‰ûx­>fT\P…Fhn¤\ßuHÖB)yû€,‰fF• Ï\AÖ_‹XDõäéAçˆfã¯°lCÁqi¹¿õÄ0ÁM|Ç Üòd|NåM= ¬ÌÌŸfg¨.øıiàjİjÙ¨ vğçf÷Û›ÿ·äûÚùâ‰‰KšŸ´¸T2{Àòwr*Fé5Âê¹p«/Š˜iÂIÅÏ3ãĞšVúr‡cŞ)¸ËJŸÀwAƒ€ÀÿÏêãLMÊ€	|5ç¥ğ!Ìò¶@Q:&9+õ¿ëù»= ãØ]"v&ÍX}øíÇ•~w¹¡¶ùc˜Â¥Öm äŒÔ\ŞN¢ScXcĞúâíºëÒ±×U:õœğ	ê±)®ıŒÎG¢ß ùfw$9gÊû‹WDÕóÂ	YFÎ`•lÖaÏŠ×âTHbw5ÑÒO˜ŠbÅNt7î›É¹íN¯ø¥ÙoÃ3Æk`ÕvÃãÇªè©©ÆUÄU-jF€(× zïòH£Ğ¹d[˜àå¯ã¼_alRÆ/h-,şg.´‘[ø†”_¾Q=ŠÍm°|-CgxvOPiÜeË=-ò#k™ZŠú5 T:Ó’M‹É?Å•³n›Šs ÏÃí3~M÷ì#ChÛæ:Õ¿ªâc‡YÉø]Zj€V÷Ì¬Ï©§‰pC]}c‡HÕmï¹Ì`V×Ğu×¿©ô+¶VW57¥‚Fâ>
+E§è EÈ€fµûØ³À!2É¢Q K,ÛTJnõ»õDnƒĞ¯ºÎf¬ó=èJ»–…¬ò1—Sœ€ıiøh­@Bc‚¸Ï»ÊãßüqchK9C²Æeæ’.•I¾9L½rè›(ÁkÉä%;çñ‹¼ŸZÿåDò¿Bu8&AØ©Îò–Ë¤…Ïš²šú§\pØ©Ø»©4/'eÓÈÕ—Tƒ=(VJ€àNdõñ´ŞMwbMb?}úècàá©-'"EZ´·^›[l¿¨3ÚôÒÒáRRéµ9¼‘{şØ/iÒ¶q€¡;£<bXö-¡,o¡Zà"û™ÜxLQ8ñ´_•på°^Ç¡õ¨My­>1ËÆK_|+_¡ùòSp­_¨%Wğ
+ó]>ùäRYŸxÑX—ÖH32çL²C–V[¹Š78ázGmÜJªa\€ÖÜİ–Òş¢×·LÙï¢#Ö_)vĞÕ ÷ÜÄÔ!€È\ ¬qV£“!=sy'Ì˜SîöñA»oh±K(-ßaŒ¹i5Ø7&ª!´’¦+‰Û$ŞB^Õdè4æ°»ï'Óí´W‹²µÆ4,‚§z}Sñ°	ˆ¶ˆÈ5lˆª<#ØyíR)¬J{¥çN-zÖòá,s¿¿ÁÅèæŒL$‡:­ÿöùÃ,7Ï ^›¥kô1¥ˆ‰h{±üEíıÄÄšŒ†˜i¸ÄôF†ô›ÉÏÑÅ´T3³å¾?ğú¯C"Ğ ÜzoC•/›?ì’Ò?¿‡9%ŠRƒ—»&s" ´Àƒ¢C¤O´Ä;nägí|X€¦!Æy¾“3v/•î
+c¥ˆÎ”øã‹×o hâ©±Ãâ®IÚFÁd·ê?4c[ÔÈÃ§Ôü¹=f{û'Ôä1¿ƒ!J§HÖ;°#/¸ùÿœµ¢Í³Š<¾¹çk;_vk;9¥‰­•GÂXî¤v‡³Ş‘õ¹N‡cˆ4}Çı7¦ËIwoQ(X°´z‚·ëì$¯œßí¥‹2BbÈ…ÉÏR(f˜	Âï·Ä
+i4‡åVÃØ¬í{¯?ßà7®î…7M°>Üo..i±Æ9	¯í4Vx¢£«Â"bÔ©˜è3M(¶¶êöËd!ûpİ‹AàEš©—T(ÿœL¥^ø mgñqğãeëıxÀtºƒ.Ïı(VÖçøæ§ÑÕ8Xw¢º¯J.|	O_Ì…í7ù1•?öÈ˜©Á·ÿ6
+1¥c/%„…]ÒÍÊãNïiO|×ı”~S‚,F€õ-á‰Qá)ë<—–òÚ}Âû÷Esöøu+¸EtF¦ùGÛøæSc¸áŠ›ı‡çÙ<Ğ³Áë±ØîÜîî÷=ğ›Uø:RuÓU.tÏXÊnz†[¶fuxo1Ísn<i…£R9†Jc"8uSmÉ*Tõ~è>?=_Tt
+úšŒ£eú:á;-¼óllş?Q†qˆ
+b:4ôï”Õ:µÉFÁ„y/ùŞ_Ó_r.ÅıÂï‘*v¦|_v±Ÿöád#DeQ,‰ ~†1ñâé—Qyî6ª'Œí®^öı—k88Ó•ôıACx…µ>¸)IHÚ2:(êø|‘ÂÌ~{Xä¥r9ÿ`˜=‡ òhxS:şa.ÂŒWí„%âÛ>?8 ^¨ØŒ¾×(ÃÙï.İ™Cjöˆ¥Ú˜R=‘åˆ<Õ-—’Ø  Ú'      ResB             ƒ  ¥ß 	   œ  œ  V    ¥ß:  	Èª      
+  !  '  )            J  1  !  0  .  /  1  0  1  :   :  :  -/  /  !,  !6  =:  /:  m y m r   '<.  ..  /  17  6  !=2  !1.  !:  !-/  6 :  !1, :  )/:  /:  17   :;  !<,8  17:  1, <,  !:9+  $-:  B   H : m m   c c c 17  d / M J  E   { 0 }  :   /10    /10   6+:  :9,  $117  /61:  ¤   0  /1  0-/:  .:,  ..!.8  :17   ¤   0 :8  ;
+:86  />:  ,
+7:  !08</  !/:,  !6;,8  !,8 ,8  $!;-:   <,18  /908  ¤   0 0  /1  ¤   0  1,-  ¤   0 1,:   ::,  :+.  -/:,  -/81  d    d   M M M   d / M / y J  E   v   a   h : m m   ¤   0 -:8  :>:  .8=,8   :<:  :>:  : :+  !.-/;.  6 :/ 
+1  :9=1  =:8
+7:  ¤    /10 0 0   v   a   h      h   y J  d   M M M M   ¤   0 1,:8  :.-:  0 =2;,8  :! 9,  :!<16  !</68/6  $1, <,17  $!:9+17  ,
+7:>:  B   H H : m m : s s   11,:+.  !1, :-/,  ¤    /10 0 0 0   G   y J  M M M   d    -/:9,  .:9 1  ,/68<,8  --9,:  !,8!1, :  !1, :!!/6  :81+:6  ¤    /10 :8  { 0 }   !=:8  $:9,17  //68:  M M M M   d   E 17  v   a   h : m m : s s   { 0 } >7:{ 1 }   ,/68<,8  
+,
+=>:<,8  /6<::  <--::   :::  ; :<:,  !
+:8>/68  { 0 } >7:  { 1 }     /68:  $ <,1817  ¤    /10 -:8  $/90817  <.827
+7:  :8:9 1  9.! 9,  :
+=>:<,8  /  /68:  !1- ::  -  /68:  z z z z   H H : m m : s s   { 0 }    :!=:8  ¤    /10 1,:8  ,
+7:  117  $:9=117  :8/:1,  G   y J  M M M   d J  E   G G G G G   d d / M M / Y   [ J  K            ]   { 0 }   >7:! :  ,/68:9 1  /  .:8:  /:1,:; :  /-  /68:  { 0 }   ,.!=:8  { 0 }   >:!=:8  G   d   M M M   y   E 17  !1+:
+=>:<,8  { 0 }   !/:<1, :  ;:   :180  =1 <18:9 1   :/68:9 1  :.  ( -/8,)   %1,   :180  /9  /68:  { 0 }   -:!=:8  /6>-::9 1  M M M M   d    :  E 17  y J  M M M M   d J  E E E E   1:: :180  ;:    ! 9,  /:<:/::  :
+,  
+=>:<,8  ,
+7:  /68:  !,-    :180  ,
+7:  1, <,17  ,
+7:  !:9+17  Y   /  w   :<1, :   7::/68<:8  /61:  -/:.  ,
+7:  .:8:  { 0 }    9 7:!=:8  <.827
+7:  { 0 }     ,
+7:  :9,17  { 0 }   -/7/:  { 1 }    =:;0, :180  ;.)1<.  :9 1  ,/68<,8 = ::  :.  ( -/8>:8)   !1- :   :180  <.827
+7:  117  ,
+7:   <,1817  ,
+7:  /90817  <.8271,/68:  G G G G G   d d / M M / y   E 17  G G G G G   y - M M      y - M M     M M M M     W   :<1, :  /:-/8,  18:  /66>7:   = ::  08 :  ( -/7)   ,8  1,:8<1,:8=1,  !>17!,>   :180  1, :,
+7:/68:  <.827
+7:  { 0 }   :  <.827
+7:  { 0 }    :  ,
+7:  :9=117  M M M   d J  E      M M M   d J  E   d / M   E 17     d / M   E 17  y J  M M M   d      y J  M M M   d   !1+:!1, :
+=>:<,8  >181,:8   :180  !1, :!,>   :180  <.827
+7:  { 0 }   ,.  <.827
+7:  { 0 }   >:  !:9+  { 0 }   :!=:8  :1,:  1+:.>:  <.827
+7:  /68:  :!=:8>-!/: :  :9,  { 0 }   :!=:8  <.827
+7:  { 0 }   -:  <.827
+7:  1, <,17  <.827
+7:  !:9+17  d / M J  E E E E      d / M J  E E E E   -9,:  ( -/7)   ,  <.827
+7:  .:8:  < :: :  0 =2/66  < :!<
+7:  0 =2/66   9,  ( -/7)   :9 1   <,18  { 0 }   :!=:8  :!=:8>-.:8:  <.827
+7:  :9,17  /908  { 0 }   :!=:8  /68: ,  { 0 }   !=:8  !6= :!
+=>:8<! 9,  !6-7:<7:!>:!,8  <.827
+7:  { 0 }    9 7:  G   y   M M M   d   E      y   M M M   d   E   { 0 }   :<1, :  .:8:  :9=1  { 0 }   :!=:8  <.827
+7:   <,1817  <.827
+7:  /90817  d   M M M   E 17     d   M M M   E 17  !>171,:!,>   :180  !</68/6  ( -/7)   0/:  <.827
+7:  :9=117  G   y   M M M   d      G   y   M M M   d         ;	:8-/  ( -/7)   ;	:8 :  !>17!:-/:8   :180  d / M / y J  E E E E      d / M / y J  E E E E   .8=,8<:8  ( -/7)   1,  :>:!=:8   :1= :/6  <.827
+7:  !:9+  { 0 }   :  G G G G G   y - M M      G G G G G   y - M M         <.827
+7:  :9,  { 0 }   :  <.827
+7:   <,18  { 0 }   :  <.827
+7:  /908  { 0 }   :  y J  M M M   d J  E E E E      M M M   d J  E E E E   <.827
+7:  1  { 0 }   :!=:8  G G G G G   d / M / y   E 17     d / M / y   E 17  <.827
+7:  :9=1  { 0 }   :  y J  M M M   d J  E E E E      y J  M M M   d J  E E E E   <.827
+7:  1, <,  { 0 }   :!=:8  0. /:/68  ! 9,!180 =2/66  <.827
+7:  /68: ,  { 0 }   /!=:8  ,Ü[ \ -   ,   .   %   0   +   0 @  1 A  2 B  3 C  4 D  5 E  6 F  7 G  8 H  9 I]   EÜ[                    	  
+                                               !]   QÜ[ @  A‘  B’  C“  D”  E•  F–  G—  H˜  I™  u  Z  }  ~  P  Q  e  (  "  R  S  T  U  3  V  W  X  Y  4  b  †  d  ˆ  Š  ]   yÜ[                    	  
+                                               !  #  O  $  %  &  '  )  *  ,  +  -  .  /  0  1  2  6  ?  ;  <  =  >  9  :  7  8]    $ / <  * 7 9>2e_0 ¿ Í Õ Ü aºä\€ ë ü Y4yË JTá J^ä JÌã Jıâ JÀà JBá Jùá J•â JZä JÈã Jùâ JKá JRá Jâ Jšá Jæà J¾à J@á J÷á J“â JXä JÆã J÷â JIá JTá J^ä JÌã Jıâ JÀà JBá Jùá J‘à J˜à JÊã Jûâ JKá ßñúÿ/
+  ‚ä Ä) Æ× J=å JŠà ü 7yË´B ×ßëñú›ÿ¥¡¡
+NN ¼ßM ‚ä Ä)P   <ä?ärâuàéyîy‹»D^* ª°µ­¯´º¾öÃÇÌÏÕİä»¿ïõı¦±!$Ç	ÄÈ0éæëñù$,vk´3‰Ü4)¤ß©€6Æs†å‹»j	.4Ã¯¢è>è'ãÔ‰Õ‰»§¼5¿3ÑÆÆ!»›çs†åS‹»äB/ EÇ	&j EÇ	éh
+N
+N äÿ äé¥B¥B äé¶M¶M ä* ï¬N ï$—è—è ï¡n ï$‡ë‡ë ï$‘†á ï$bb $Ö4 Ç	ÌS Ç	éşvÔ3Ô3 Ç	é!†ÄMÄM Ç	à3" éz ïé½h½h ï$éIíIíIí ïé-h-h ï$éëëë ïénù† ï$éE†²Nyª ï$é««« /àßá /àßá /àßá <ä?ärâuà×åâ¶èJ^ ¤ JÁç Jiæ ãá¦àgà7á.á`àÓß ÅåÅå¬ßºßäà}á¦ß ãá¦àgà7á.á`àÓß ãá¦àgà7á.á`àÓß ãá¦àgà7á.á`àÓß ÅåÅå¬ßºßäà}á¦ß ãá¦àgà7á.á`àÓß ãá¦àgà7á.á`àÓß òı/Yàßáëâ/àªßíá òı/Yàßáëâ/àªßíá òı/Yàßáëâ/àªßíá òÔı/Yà/àßáëâ/àªßíáßá òÔı/Yà/àßáëâ/àªßíáßá òÔı/Yà/àßáëâ/àªßíáßá à à ÖàØà :é£á ‹æ¶à EÇ	&j EÇ	éh
+N
+N Gé:z Gïéì3†®ç Gï$é

@@ -1,0 +1,950 @@
+ Util::uint32_t numSamples = *( (Util::uint32_t *)( &buf[pos] ) );
+        pos += 4;
+
+        std::vector< chrono_t > sampleTimes( numSamples );
+        memcpy( &( sampleTimes.front() ), &buf[pos],
+                sizeof( chrono_t ) * numSamples );
+        pos += sizeof( chrono_t ) * numSamples;
+
+        AbcA::TimeSamplingType::AcyclicFlag acf =
+            AbcA::TimeSamplingType::kAcyclic;
+
+        AbcA::TimeSamplingType tst( acf );
+        if ( tpc != AbcA::TimeSamplingType::AcyclicTimePerCycle() )
+        {
+            tst = AbcA::TimeSamplingType( numSamples, tpc );
+        }
+
+        AbcA::TimeSamplingPtr tptr(
+            new AbcA::TimeSampling( tst, sampleTimes ) );
+
+        oTimeSamples.push_back( tptr );
+    }
+}
+
+//-*****************************************************************************
+void
+ReadObjectHeaders( Ogawa::IGroupPtr iGroup,
+                   size_t iIndex,
+                   size_t iThreadId,
+                   const std::string & iParentName,
+                   const std::vector< AbcA::MetaData > & iMetaDataVec,
+                   std::vector< ObjectHeaderPtr > & oHeaders )
+{
+    Ogawa::IDataPtr data = iGroup->getData( iIndex, iThreadId );
+    ABCA_ASSERT( data, "ReadObjectHeaders Invalid data at index " << iIndex );
+
+    if ( data->getSize() <= 32 )
+    {
+        return;
+    }
+
+    // skip the last 32 bytes which contains the hashes
+    std::vector< char > buf( data->getSize() - 32 );
+    if ( buf.empty() )
+    {
+        return;
+    }
+
+    data->read( buf.size(), &( buf.front() ), 0, iThreadId );
+    std::size_t pos = 0;
+    while ( pos < buf.size() )
+    {
+        Util::uint32_t nameSize = *( (Util::uint32_t *)( &buf[pos] ) );
+        pos += 4;
+
+        std::string name( &buf[pos], nameSize );
+        pos += nameSize;
+
+        Util::uint8_t metaDataIndex = buf[pos++];
+
+        ObjectHeaderPtr objPtr( new AbcA::ObjectHeader() );
+        objPtr->setName( name );
+        objPtr->setFullName( iParentName + "/" + name );
+
+        if ( metaDataIndex == 0xff )
+        {
+            Util::uint32_t metaDataSize = *( (Util::uint32_t *)( &buf[pos] ) );
+            pos += 4;
+
+            std::string metaData( &buf[pos], metaDataSize );
+            pos += metaDataSize;
+
+            objPtr->getMetaData().deserialize( metaData );
+        }
+        else
+        {
+            objPtr->getMetaData() = iMetaDataVec[metaDataIndex];
+        }
+
+        oHeaders.push_back( objPtr );
+    }
+}
+
+//-*****************************************************************************
+Util::uint32_t GetUint32WithHint(const std::vector< char > & iBuf,
+                           Util::uint32_t iSizeHint,
+                           std::size_t & ioPos)
+{
+    Util::uint32_t retVal = 0;
+
+    if ( iSizeHint == 0 )
+    {
+        retVal = ( Util::uint32_t ) ( ( Util::uint8_t ) iBuf[ioPos] );
+        ioPos ++;
+    }
+    else if ( iSizeHint == 1 )
+    {
+        retVal = ( Util::uint32_t )( *( (Util::uint16_t *)( &iBuf[ioPos] ) ) );
+        ioPos += 2;
+    }
+    else if ( iSizeHint == 2 )
+    {
+        retVal = *( ( Util::uint32_t * )( &iBuf[ioPos] ) );
+        ioPos += 4;
+    }
+    return retVal;
+}
+
+//-*****************************************************************************
+void
+ReadPropertyHeaders( Ogawa::IGroupPtr iGroup,
+                     size_t iIndex,
+                     size_t iThreadId,
+                     AbcA::ArchiveReader & iArchive,
+                     const std::vector< AbcA::MetaData > & iMetaDataVec,
+                     PropertyHeaderPtrs & oHeaders )
+{
+
+    // Our bitmasks look like this:
+    //
+    // Property Type mask (Scalar, Array, or Compound) 0x0003
+    // 0000 0000 0000 0000 0000 0000 0000 0011
+    //
+    // Our Pod type mask 0x003c
+    // 0000 0000 0000 0000 0000 0000 0011 1100
+    //
+    // Has a time sampling index mask 0x0040
+    // 0000 0000 0000 0000 0000 0000 0100 0000
+    //
+    // no repeats mask 0x0080
+    // 0000 0000 0000 0000 0000 0000 1000 0000
+    //
+    // Extent value mask 0xff00
+    // 0000 0000 0000 0000 1111 1111 0000 0000
+    //
+    // Our bitmasks look like this:
+    //
+    // Property Type mask (Scalar, Array, or Compound) 0x0003
+    // 0000 0000 0000 0000 0000 0000 0000 0011
+    //
+    // Byte size hint for first/last non repeated sample 0x000c
+    // 0000 0000 0000 0000 0000 0000 0000 1100
+    //
+    // Our Pod type mask 0x00f0
+    // 0000 0000 0000 0000 0000 0000 1111 0000
+    //
+    // Has a time sampling index mask 0x0100
+    // 0000 0000 0000 0000 0000 0001 0000 0000
+    //
+    // Whether the first/last index exists mask 0x200
+    // 0000 0000 0000 0000 0000 0010 0000 0000
+    //
+    // Whether the size of the data changes from sample to sample mask 0x400
+    // 0000 0000 0000 0000 0000 0100 0000 0000
+    //
+    // Mask for whether the data is the same over all samples 0x800
+    // 0000 0000 0000 0000 0000 1000 0000 0000
+    //
+    // Extent value mask 0xff000
+    // 0000 0000 0000 1111 1111 0000 0000 0000
+    //
+    // Meta data index mask 0xff00000
+    // 0000 1111 1111 0000 0000 0000 0000 0000
+
+    Ogawa::IDataPtr data = iGroup->getData( iIndex, iThreadId );
+    ABCA_ASSERT( data, "ReadObjectHeaders Invalid data at index " << iIndex );
+
+    if ( data->getSize() == 0 )
+    {
+        return;
+    }
+
+    std::vector< char > buf( data->getSize() );
+    data->read( data->getSize(), &( buf.front() ), 0, iThreadId );
+    std::size_t pos = 0;
+    while ( pos < buf.size() )
+    {
+        PropertyHeaderPtr header( new PropertyHeaderAndFriends() );
+
+        // first 4 bytes is always info
+        Util::uint32_t info =  *( (Util::uint32_t *)( &buf[pos] ) );
+        pos += 4;
+
+        Util::uint32_t ptype = info & 0x0003;
+        header->isScalarLike = ptype & 1;
+        if ( ptype == 0 )
+        {
+            header->header.setPropertyType( AbcA::kCompoundProperty );
+        }
+        else if ( ptype == 1 )
+        {
+            header->header.setPropertyType( AbcA::kScalarProperty );
+        }
+        else
+        {
+            header->header.setPropertyType( AbcA::kArrayProperty );
+        }
+
+        Util::uint32_t sizeHint = ( info & 0x000c ) >> 2;
+
+        // if we aren't a compound we may need to do a bunch of other work
+        if ( !header->header.isCompound() )
+        {
+            // Read the pod type out of bits 4-7
+            char podt = ( char )( ( info &  0x00f0 ) >> 4 );
+            if ( podt != ( char )Alembic::Util::kBooleanPOD &&
+                 podt != ( char )Alembic::Util::kUint8POD &&
+                 podt != ( char )Alembic::Util::kInt8POD &&
+                 podt != ( char )Alembic::Util::kUint16POD &&
+                 podt != ( char )Alembic::Util::kInt16POD &&
+                 podt != ( char )Alembic::Util::kUint32POD &&
+                 podt != ( char )Alembic::Util::kInt32POD &&
+                 podt != ( char )Alembic::Util::kUint64POD &&
+                 podt != ( char )Alembic::Util::kInt64POD &&
+                 podt != ( char )Alembic::Util::kFloat16POD &&
+                 podt != ( char )Alembic::Util::kFloat32POD &&
+                 podt != ( char )Alembic::Util::kFloat64POD &&
+                 podt != ( char )Alembic::Util::kStringPOD &&
+                 podt != ( char )Alembic::Util::kWstringPOD )
+            {
+                ABCA_THROW(
+                    "Read invalid POD type: " << ( Util::int32_t )podt );
+            }
+
+            Util::uint8_t extent = ( info & 0xff000 ) >> 12;
+            header->header.setDataType( AbcA::DataType(
+                ( Util::PlainOldDataType ) podt, extent ) );
+
+            header->isHomogenous = ( info & 0x400 ) != 0;
+
+            header->nextSampleIndex = GetUint32WithHint( buf, sizeHint, pos );
+
+            if ( ( info & 0x0200 ) != 0 )
+            {
+                header->firstChangedIndex =
+                    GetUint32WithHint( buf, sizeHint, pos );
+
+                header->lastChangedIndex =
+                    GetUint32WithHint( buf, sizeHint, pos );
+            }
+            else if ( ( info & 0x800 ) != 0 )
+            {
+                header->firstChangedIndex = 0;
+                header->lastChangedIndex = 0;
+            }
+            else
+            {
+                header->firstChangedIndex = 1;
+                header->lastChangedIndex = header->nextSampleIndex - 1;
+            }
+
+            if ( ( info & 0x0100 ) != 0 )
+            {
+                header->timeSamplingIndex =
+                    GetUint32WithHint( buf, sizeHint, pos );
+
+                header->header.setTimeSampling(
+                    iArchive.getTimeSampling( header->timeSamplingIndex ) );
+            }
+            else
+            {
+                header->header.setTimeSampling( iArchive.getTimeSampling( 0 ) );
+            }
+        }
+
+        Util::uint32_t nameSize = GetUint32WithHint( buf, sizeHint, pos );
+
+        std::string name( &buf[pos], nameSize );
+        header->header.setName( name );
+        pos += nameSize;
+
+        Util::uint32_t metaDataIndex = ( info & 0xff00000 ) >> 20;
+
+        if ( metaDataIndex == 0xff )
+        {
+            Util::uint32_t metaDataSize =
+                GetUint32WithHint( buf, sizeHint, pos );
+
+            std::string metaData( &buf[pos], metaDataSize );
+            pos += metaDataSize;
+
+            AbcA::MetaData md;
+            md.deserialize( metaData );
+            header->header.setMetaData( md );
+        }
+        else
+        {
+            header->header.setMetaData( iMetaDataVec[metaDataIndex] );
+        }
+
+        oHeaders.push_back( header );
+
+    }
+}
+
+void
+ReadIndexedMetaData( Ogawa::IDataPtr iData,
+                     std::vector< AbcA::MetaData > & oMetaDataVec )
+{
+    // add the default empty meta data
+    oMetaDataVec.push_back( AbcA::MetaData() );
+
+    std::vector< char > buf( iData->getSize() );
+
+    if ( buf.empty() )
+    {
+        return;
+    }
+
+    // read as part of opening the archive so threadid 0 is ok
+    iData->read( iData->getSize(), &( buf.front() ), 0, 0 );
+    std::size_t pos = 0;
+    while ( pos < buf.size() )
+    {
+        // these are all small (less than 256 byte) meta data strings
+        Util::uint8_t metaDataSize = buf[pos++];
+        std::string metaData( &buf[pos], metaDataSize );
+        pos += metaDataSize;
+        AbcA::MetaData md;
+        md.deserialize( metaData );
+        oMetaDataVec.push_back( md );
+    }
+}
+
+} // End namespace ALEMBIC_VERSION_NS
+} // End namespace AbcCoreOgawa
+} // End namespace Alembic
+                             ≥t'¸û<hy¡∆˛íªx}â◊∏@	;Á∆|ﬁq˜ò4w¬«ÆÉ·≠"(Nj°9FKW-„@iE6∂Ùˇ∞C∞aîïˆQÒ≥®Ä5íM
+Œ)´='∞.‚ë-‹«≠¶ Òé†÷ç2M†r2≥Í√AÿÜ(()‡Ã>¬1»dåS∑î˚[ô;&äŒ®L°]I.Ÿ”H/¨|Za]‹∏j3/gi 2&ÊÈ±/T+5÷)ì¯ú‰%,ÕÜahAÄ¸ò[Ã≥úy™ı≠˚9ÒQKŸèxñˆsP	dœÅÃ]x7¢‘ØºIhaÅπÕpYÍaBî…qA«≠lVùº…^ËÜÑ¶°Zón{ªSçzpZHœ3NÀ˘C·∞ÓÉAù1ãˇÎ≥¿πe∆ŒgLvÌµÆ‘â‹R˜háË≠dmiq|B˝´¨=jÜ€\Ö√`HCÿ|ãπ6iOÉUúw}.˙ó»YÒÚ:≠Uÿæêõ?C¸˛Æ[cÓœØƒläîÖ¯&1ÊÒõ(ËåâeqqÄ‘t@º¬æyÇv4h¬:YÄÜdM˚D-êy—›ü?÷·~IR?ıgZ/WÏßáe`ÙâÈ
+’·ç™¢uÁB˝'µ√˝·ñENŸâ^¥{§œ#EKÄãØ™]}3M∫¶cùeE∞EÔ≤¨XÄ2§˜p†∞vÓ
+ì±E_Ω,„c:Ò◊¶‚∂àµ«˝§o…∞q5À
+ñ`ÿ)¨5≤’3⁄Œ7ù∂-Á'∑≠"Å\CÎÂ»¶ìÜTpˆ≥iü∆¯=áŒéOR±_5j˜‚èÌπ´Êl∆–7ÅØà(±OÏw•8J'≈≤É˛tê0¶{ÒZ∆6UÛX±–>?‘/Õ{t21◊A»¢>=«∂J,'·yë®~‹±ë=÷wÇE>”}Ωtód'<;*9¶zÁe∞Í´óÑlèdÕAè¬cÌ˙C€∂4ˇ»{	_!K<ÈR0^ÅZã”±Rœ›œı≤w_¡À#%õˆ\∏˘Ü≠ } òè≥dò∏)ÁŸ§[◊›Ø™2~a⁄ó∏∞ª[“¢ñ≥rËjûT}∫[z>=øaõN3`é1ˆJ]ñ.ÊH‡z7}‰s4»*Xt/çÉ;+9Fa◊ˇå≤¢ö“§fΩ≠èõá˜üCΩ,qNÏ}¯NÖ"Ö†ì!Î‘¢Ò« ØŸW
+»ı∏Ú˛YÓjÔYí]CìAy~^S∏aKòZ≠©†£Ewù±Ÿˆ©—∂‰ÕΩÛ_Q Z—IÃÒÃóó®Ù*ØÜzŒ»è!+ømG˚’GJZÅæ‰`u¬	¸øΩô’àè¢7¨‡ó8ŒàØ•Ì'j∏óÌ”f„Í˚ïâ˝ã~lV6⁄ º6Oø
+$(§#%8#ÉˆÍ«uHÇ&WÑ]jYÏıy≈åíêÿ¯ç∏e	Z˙c&≈hé^i„Ë.≤~gt°F€8bÃ/fagíIyVÙfö‹[‘≠Î˛&ÂÒ5rEô2#&iF≤“’ñp·sÀ¡]Œ:ﬁ1£◊≥ π{.c„≠g•ÍÊ´xvΩî∏}ÿdz("ΩKÛ•€§Ô'm◊ËfnÑ√⁄ÃÎg!â9>c`X©πÙÓÜ…a`ÈUùπl áΩ·∫:…u∫“O≥c ã›kQf◊—#TmHüáVÓ"'ûæπÂ’8Ú¥#U…˙Ämgó¸á«\ÖÎ˛,A,c¯ÕœÇÓˇ°¨à∞SFgà›ö¬ª•{£©˝î5±Ωv:˙ÈSç"Œ∞qc—üë„†*∑~Ü¥⁄Åb‚¥c÷‚Xç_à
+Ñ™¯¶ûÚ±dΩj√Ìƒ4¿ ÜÜÌaàˆÛE©Dµ√·Ø\•E¿3_ÖÚõÖøWw'2%›Rå}*ﬂπŒ∂r¿y©Á_Ìiæ{qÙÊK¡fFw§†Ócå¨a⁄€ﬁèùx:† ª¥≤ÒQ¶±Ñ@Á{»(›In±2íktB∞åÖFùÖ.f|¶
+êvÊ¯ªÔúl∑€∞omÿxı˚J
+å‹√ˆ±_Ï÷iH»Ì$zNÀCˆ@π◊ÓmRÍ†uMZê       ˇˇ  ∏       @                                   Ä   ∫ ¥	Õ!∏LÕ!This program cannot be run in DOS mode.
+$       PE  L e¸±        ‡ " 0           R;       @                           Ä          @Ö                            ;  O    @  ∏                   `     ‰:                                                               H           .text   X                           `.rsrc   ∏   @                    @  @.reloc      `      $              @  B                4;      H     P     	               d:  Ä                                   BSJB         v4.0.30319     l   T	  #~  ¿	  Ù  #Strings    ¥     #US ∏     #GUID   »  L  #Blob         T  â    ˙3                           ç     õ      x „e ò   "U ÏU ¯U áU (U EU ”U ˜U x ;x FE kE …¬    Æ       	    !  )  1  9  A  I  Q  Y  a  i  y  Å  ' s '.  f.  o.  x. # ã. + …. 3 …. ; Ò. C Ò. K ˛. S …. [ '. c ,  ∆ Ä            $ π              ∑                 ª            ª	         Äª	         ù ª	         
+(	         '(	         ›(	         Ù(	         _(	         P(	         !(	         u(	         ?(	         â
+(	         I
+(	         K(	         j(	          (	         W(	         Z(	         ±(	         û(	         Y(	         î
+(	         œ(	         (	         ú (	         |(	         (	         (	         O(	         ¯(	         Ô(	         „(	         ](	         (	         (	         ?(	         ÿ(	         Ô(	         1 (	         ‰ (	         ;
+(	         ,
+(	         è(	         ˙(	         ≈(	         ˘	(	         Á	(	         a(	         ß(	         ©(	         æ(	         p(	         “(	         (	          ª	         í  ‚            ‚         }  ‚         ÿ  ‚         dª	         ¯ª	         ‘ª	         ∂ª	         Sª	         		         m			         Œ
+		         Å			         ∆		         ˆ
+		         		         ª
+		         ©			         ,			         g		         é		         T			         £		         í			         ·		         ¿			         		         ?			         Ñ		         0		         6W
+	         W
+	         $W
+	         W
+	         v
+W
+	         £
+W
+	         9W
+	          W
+	         QW
+	         pª	         
+ª	         “ª	         8ª	         Õª	         ãª	         ¿ ª	         ºª	         Õª	         g ª	         €	ª	         @ª	         0ª	         ∞ª	         lª	         Äª	         à ª	         C ª	         P ª	         ≠ª	         √ª	         àª	         §ª	         5ª	         x ª	         ñª	         ﬁª	         _ª	         ª	         °ª	         Ï ª	         Rª	         üª	         †•	         Û•	         ∂•	         g•	         à•	         ◊ ª	         ‹ª	         {ª	         oª	         ª	           ª	         ˆª	         6ª	      ChannelBase`1 ClientBase`1 ChannelFactoryBase`1 ISessionChannel`1 IExtension`1 IExtensionCollection`1 FaultException`1 MessageHeader`1 IExtensibleObject`1 IChannelFactory`1 <Module> mscorlib FaultCode TransferMode SecurityMode Message OperationFormatStyle DispatchRuntime ClientRuntime OperationContextScope MessageCredentialType ChannelBase ChannelManagerBase ChannelFactoryBase EndOperationDelegate BeginOperationDelegate MessageState CommunicationState UnverifiableCodeAttribute DebuggableAttribute AssemblyTitleAttribute ServiceKnownTypeAttribute AssemblyFileVersionAttribute AssemblyInformationalVersionAttribute SecurityPermissionAttribute AssemblyDescriptionAttribute MessageContractMemberAttribute MessageBodyMemberAttribute MessageParameterAttribute AssemblyDefaultAliasAttribute CompilationRelaxationsAttribute XmlSerializerFormatAttribute DataContractFormatAttribute ServiceContractAttribute MessageContractAttribute OperationContractAttribute FaultContractAttribute AssemblyProductAttribute AssemblyCopyrightAttribute ReferenceAssemblyAttribute AssemblyCompanyAttribute RuntimeCompatibilityAttribute CustomBinding UserNamePasswordClientCredential WindowsClientCredential HttpDigestClientCredential System.ServiceModel IChannel IRequestSessionChannel IInputSessionChannel IOutputSessionChannel IDuplexSessionChannel IClientChannel IRequestChannel IInputChannel IOutputChannel IContextChannel IDuplexChannel ExceptionDetail System.ServiceModel.Primitives.dll MessageVersion EnvelopeVersion AddressingVersion ISession IInputSession IOutputSession IDuplexSession DispatchOperation ClientOperation SecurityAction System.Reflection MessageDescriptionCollection OperationDescriptionCollection MessageHeaderDescriptionCollection FaultDescriptionCollection MessagePartDescriptionCollection MessagePropertyDescriptionCollection AddressHeaderCollection BindingParameterCollection ChannelParameterCollection BindingElementCollection MessageDirection QuotaExceededException SecurityAccessDeniedException CommunicationObjectFaultedException CommunicationObjectAbortedException ActionNotSupportedException EndpointNotFoundException ProtocolException CommunicationException ServiceActivationException MessageHeaderException InvalidMessageContractException FaultException ServerTooBusyException MessageSecurityException System.ServiceModel.Description MessageDescription OperationDescription MessageHeaderDescription ContractDescription FaultDescription MessagePartDescription MessageBodyDescription MessagePropertyDescription FaultReason MessageHeaderInfo MessageHeader AddressHeader EndpointAddressBuilder MessageEncoder MessageBuffer BufferManager System.ServiceModel.Dispatcher EndpointDispatcher BodyWriter FaultConverter IClientMessageFormatter IOperationBehavior DataContractSerializerOperationBehavior IContractBehavior IEndpointBehavior .ctor IClientOperationSelector IClientMessageInspector IParameterInspector System.Diagnostics System.Runtime.CompilerServices DebuggingModes MessageProperties System.ServiceModel.Primitives InvokeAsyncCompletedEventArgs UnknownMessageReceivedEventArgs ClientCredentials System.ServiceModel.Channels System.Security.Permissions MessageHeaders EndpointAddress IDefaultCommunicationTimeouts CompressionFormat ICommunicationObject MessageFault TextMessageEncodingBindingElement BinaryMessageEncodingBindingElement TransportBindingElement ServiceEndpoint FaultReasonText BindingContext OperationContext RequestContext IChannelFactory MessageEncoderFactory System.ServiceModel.Security System.Security EndpointIdentity IMessageProperty     Èﬂ‚`b‰ÂF•ÆBK1Œ#       9∑z\V4‡âÄ† $  Ä  î      $  RSA1     —˙WƒÆŸ£.Ñ™Æ˝ÈË˝jÏèá˚vlÉLôí≤;ÁöŸ’‹¡›ö“6!êr<˘Äïƒ·wè∆wO)Ë2íÍÏ‰Ë!¿•ÔËÒd\Lì¡´ô(]b,™e,˙÷=t]o-ÂÒ~^Øƒñ=&äCe m¿ì4MZ“ìÄû.ÄÑSystem.Security.Permissions.SecurityPermissionAttribute, mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089TSkipVerification             Xamarin, Inc.  = 8Copyright (c) 2013 Xamarin Inc. (http://www.xamarin.com)  ' "System.ServiceModel.Primitives.dll   4.0.0.0  ( #Mono Common Language Infrastructure       TWrapNonExceptionThrows                                                                                                                                                            (;          B;                          4;            _CorDllMain mscoree.dll     ˇ%                                                                                                                                                                                               Ä                  0  Ä                   H   X@  \          \4   V S _ V E R S I O N _ I N F O     ΩÔ˛                 ?                         D    V a r F i l e I n f o     $    T r a n s l a t i o n       ∞º   S t r i n g F i l e I n f o   ò   0 0 0 0 0 4 b 0   ^ #  C o m m e n t s   S y s t e m . S e r v i c e M o d e l . P r i m i t i v e s . d l l     <   C o m p a n y N a m e     X a m a r i n ,   I n c .   n #  F i l e D e s c r i p t i o n     S y s t e m . S e r v i c e M o d e l . P r i m i t i v e s . d l l     0   F i l e V e r s i o n     4 . 0 . 0 . 0   f #  I n t e r n a l N a m e   S y s t e m . S e r v i c e M o d e l . P r i m i t i v e s . d l l     ñ 9  L e g a l C o p y r i g h t   C o p y r i g h t   ( c )   2 0 1 3   X a m a r i n   I n c .   ( h t t p : / / w w w . x a m a r i n . c o m )     n #  O r i g i n a l F i l e n a m e   S y s t e m . S e r v i c e M o d e l . P r i m i t i v e s . d l l     h $  P r o d u c t N a m e     M o n o   C o m m o n   L a n g u a g e   I n f r a s t r u c t u r e   4   P r o d u c t V e r s i o n   4 . 0 . 0 . 0   8   A s s e m b l y   V e r s i o n   4 . 0 . 0 . 0                                                                                                                                                                                                                                                                                                                                                0     T;                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      ; RUN: llc < %s -mtriple=arm64-eabi -aarch64-neon-syntax=apple -mattr=-fullfp16 | FileCheck %s
+; RUN: llc < %s -mtriple=arm64-eabi -aarch64-neon-syntax=apple -mattr=+fullfp16 | FileCheck %s --check-prefix=CHECK-FP16
+
+;;; Float vectors
+
+%v2f32 = type <2 x float>
+%v4f16 = type <4 x half>
+%v8f16 = type <8 x half>
+
+; CHECK-LABEL: test_v2f32.sqrt:
+define %v2f32 @test_v2f32.sqrt(%v2f32 %a) {
+  ; CHECK: fsqrt.2s
+  %1 = call %v2f32 @llvm.sqrt.v2f32(%v2f32 %a)
+  ret %v2f32 %1
+}
+define %v4f16 @test_v4f16.sqrt(%v4f16 %a) {
+; CHECK-LABEL: test_v4f16.sqrt:
+; CHECK:       fsqrt s{{.}}, s{{.}}
+; CHECK:       fsqrt s{{.}}, s{{.}}
+; CHECK:       fsqrt s{{.}}, s{{.}}
+; CHECK:       fsqrt s{{.}}, s{{.}}
+
+; CHECK-FP16-LABEL: test_v4f16.sqrt:
+; CHECK-FP16-NOT:   fcvt
+; CHECK-FP16:       fsqrt.4h
+; CHECK-FP16-NEXT:  ret
+  %1 = call %v4f16 @llvm.sqrt.v4f16(%v4f16 %a)
+  ret %v4f16 %1
+}
+define %v8f16 @test_v8f16.sqrt(%v8f16 %a) {
+; Filechecks are unwieldy with 16 fcvt and 8 fsqrt tests, so skipped for -fullfp16.
+
+; CHECK-FP16-LABEL: test_v8f16.sqrt:
+; CHECK-FP16-NOT:   fcvt
+; CHECK-FP16:       fsqrt.8h
+; CHECK-FP16-NEXT:  ret
+  %1 = call %v8f16 @llvm.sqrt.v8f16(%v8f16 %a)
+  ret %v8f16 %1
+}
+; CHECK: test_v2f32.powi:
+define %v2f32 @test_v2f32.powi(%v2f32 %a, i32 %b) {
+  ; CHECK: pow
+  %1 = call %v2f32 @llvm.powi.v2f32(%v2f32 %a, i32 %b)
+  ret %v2f32 %1
+}
+; CHECK: test_v2f32.sin:
+define %v2f32 @test_v2f32.sin(%v2f32 %a) {
+  ; CHECK: sin
+  %1 = call %v2f32 @llvm.sin.v2f32(%v2f32 %a)
+  ret %v2f32 %1
+}
+; CHECK: test_v2f32.cos:
+define %v2f32 @test_v2f32.cos(%v2f32 %a) {
+  ; CHECK: cos
+  %1 = call %v2f32 @llvm.cos.v2f32(%v2f32 %a)
+  ret %v2f32 %1
+}
+; CHECK: test_v2f32.pow:
+define %v2f32 @test_v2f32.pow(%v2f32 %a, %v2f32 %b) {
+  ; CHECK: pow
+  %1 = call %v2f32 @llvm.pow.v2f32(%v2f32 %a, %v2f32 %b)
+  ret %v2f32 %1
+}
+; CHECK: test_v2f32.exp:
+define %v2f32 @test_v2f32.exp(%v2f32 %a) {
+  ; CHECK: exp
+  %1 = call %v2f32 @llvm.exp.v2f32(%v2f32 %a)
+  ret %v2f32 %1
+}
+; CHECK: test_v2f32.exp2:
+define %v2f32 @test_v2f32.exp2(%v2f32 %a) {
+  ; CHECK: exp
+  %1 = call %v2f32 @llvm.exp2.v2f32(%v2f32 %a)
+  ret %v2f32 %1
+}
+; CHECK: test_v2f32.log:
+define %v2f32 @test_v2f32.log(%v2f32 %a) {
+  ; CHECK: log
+  %1 = call %v2f32 @llvm.log.v2f32(%v2f32 %a)
+  ret %v2f32 %1
+}
+; CHECK: test_v2f32.log10:
+define %v2f32 @test_v2f32.log10(%v2f32 %a) {
+  ; CHECK: log
+  %1 = call %v2f32 @llvm.log10.v2f32(%v2f32 %a)
+  ret %v2f32 %1
+}
+; CHECK: test_v2f32.log2:
+define %v2f32 @test_v2f32.log2(%v2f32 %a) {
+  ; CHECK: log
+  %1 = call %v2f32 @llvm.log2.v2f32(%v2f32 %a)
+  ret %v2f32 %1
+}
+; CHECK-LABEL: test_v2f32.fma:
+define %v2f32 @test_v2f32.fma(%v2f32 %a, %v2f32 %b, %v2f32 %c) {
+  ; CHECK: fmla.2s
+  %1 = call %v2f32 @llvm.fma.v2f32(%v2f32 %a, %v2f32 %b, %v2f32 %c)
+  ret %v2f32 %1
+}
+define %v4f16 @test_v4f16.fma(%v4f16 %a, %v4f16 %b, %v4f16 %c) {
+; CHECK-LABEL: test_v4f16.fma:
+; CHECK:       fmadd s{{.}}, s{{.}}, s{{.}}, s{{.}}
+; CHECK:       fmadd s{{.}}, s{{.}}, s{{.}}, s{{.}}
+; CHECK:       fmadd s{{.}}, s{{.}}, s{{.}}, s{{.}}
+; CHECK:       fmadd s{{.}}, s{{.}}, s{{.}}, s{{.}}
+
+; CHECK-FP16-LABEL: test_v4f16.fma:
+; CHECK-FP16-NOT:   fcvt
+; CHECK-FP16:       fmla.4h
+  %1 = call %v4f16 @llvm.fma.v4f16(%v4f16 %a, %v4f16 %b, %v4f16 %c)
+  ret %v4f16 %1
+}
+define %v8f16 @test_v8f16.fma(%v8f16 %a, %v8f16 %b, %v8f16 %c) {
+; Filechecks are unwieldy with 16 fcvt and 8 fma tests, so skipped for -fullfp16.
+
+; CHECK-FP16-LABEL: test_v8f16.fma:
+; CHECK-FP16-NOT:   fcvt
+; CHECK-FP16:       fmla.8h
+  %1 = call %v8f16 @llvm.fma.v8f16(%v8f16 %a, %v8f16 %b, %v8f16 %c)
+  ret %v8f16 %1
+}
+; CHECK-LABEL: test_v2f32.fabs:
+define %v2f32 @test_v2f32.fabs(%v2f32 %a) {
+  ; CHECK: fabs.2s
+  %1 = call %v2f32 @llvm.fabs.v2f32(%v2f32 %a)
+  ret %v2f32 %1
+}
+define %v4f16 @test_v4f16.fabs(%v4f16 %a) {
+; CHECK-LABEL: test_v4f16.fabs:
+; CHECK:       fabs s{{.}}, s{{.}}
+; CHECK:       fabs s{{.}}, s{{.}}
+; CHECK:       fabs s{{.}}, s{{.}}
+; CHECK:       fabs s{{.}}, s{{.}}
+
+; CHECK-FP16-LABEL: test_v4f16.fabs:
+; CHECK-FP16-NOT:   fcvt
+; CHECK-FP16:       fabs.4h
+; CHECK-FP16-NEXT:  ret
+  %1 = call %v4f16 @llvm.fabs.v4f16(%v4f16 %a)
+  ret %v4f16 %1
+}
+define %v8f16 @test_v8f16.fabs(%v8f16 %a) {
+; Filechecks are unwieldy with 16 fcvt and 8 fabs tests, so skipped for -fullfp16.
+
+; CHECK-FP16-LABEL: test_v8f16.fabs:
+; CHECK-FP16-NOT:   fcvt
+; CHECK-FP16:       fabs.8h
+; CHECK-FP16-NEXT:  ret
+  %1 = call %v8f16 @llvm.fabs.v8f16(%v8f16 %a)
+  ret %v8f16 %1
+}
+; CHECK-LABEL: test_v2f32.floor:
+define %v2f32 @test_v2f32.floor(%v2f32 %a) {
+  ; CHECK: frintm.2s
+  %1 = call %v2f32 @llvm.floor.v2f32(%v2f32 %a)
+  ret %v2f32 %1
+}
+define %v4f16 @test_v4f16.floor(%v4f16 %a) {
+; CHECK-LABEL: test_v4f16.floor:
+; CHECK:       frintm s{{.}}, s{{.}}
+; CHECK:       frintm s{{.}}, s{{.}}
+; CHECK:       frintm s{{.}}, s{{.}}
+; CHECK:       frintm s{{.}}, s{{.}}
+
+; CHECK-FP16-LABEL: test_v4f16.floor:
+; CHECK-FP16-NOT:   fcvt
+; CHECK-FP16:       frintm.4h
+; CHECK-FP16-NEXT:  ret
+  %1 = call %v4f16 @llvm.floor.v4f16(%v4f16 %a)
+  ret %v4f16 %1
+}
+define %v8f16 @test_v8f16.floor(%v8f16 %a) {
+; Filechecks are unwieldy with 16 fcvt and 8 frintm tests, so skipped for -fullfp16.
+
+; CHECK-FP16-LABEL: test_v8f16.floor:
+; CHECK-FP16-NOT:   fcvt
+; CHECK-FP16:       frintm.8h
+; CHECK-FP16-NEXT:  ret
+  %1 = call %v8f16 @llvm.floor.v8f16(%v8f16 %a)
+  ret %v8f16 %1
+}
+; CHECK-LABEL: test_v2f32.ceil:
+define %v2f32 @test_v2f32.ceil(%v2f32 %a) {
+  ; CHECK: frintp.2s
+  %1 = call %v2f32 @llvm.ceil.v2f32(%v2f32 %a)
+  ret %v2f32 %1
+}
+define %v4f16 @test_v4f16.ceil(%v4f16 %a) {
+; CHECK-LABEL: test_v4f16.ceil:
+; CHECK:       frintp s{{.}}, s{{.}}
+; CHECK:       frintp s{{.}}, s{{.}}
+; CHECK:       frintp s{{.}}, s{{.}}
+; CHECK:       frintp s{{.}}, s{{.}}
+
+; CHECK-FP16-LABEL: test_v4f16.ceil:
+; CHECK-FP16-NOT:   fcvt
+; CHECK-FP16:       frintp.4h
+; CHECK-FP16-NEXT:  ret
+  %1 = call %v4f16 @llvm.ceil.v4f16(%v4f16 %a)
+  ret %v4f16 %1
+}
+define %v8f16 @test_v8f16.ceil(%v8f16 %a) {
+; Filechecks are unwieldy with 16 fcvt and 8 frint tests, so skipped for -fullfp16.
+
+; CHECK-FP16-LABEL: test_v8f16.ceil:
+; CHECK-FP16-NOT:   fcvt
+; CHECK-FP16:       frintp.8h
+; CHECK-FP16-NEXT:  ret
+  %1 = call %v8f16 @llvm.ceil.v8f16(%v8f16 %a)
+  ret %v8f16 %1
+}
+; CHECK-LABEL: test_v2f32.trunc:
+define %v2f32 @test_v2f32.trunc(%v2f32 %a) {
+  ; CHECK: frintz.2s
+  %1 = call %v2f32 @llvm.trunc.v2f32(%v2f32 %a)
+  ret %v2f32 %1
+}
+define %v4f16 @test_v4f16.trunc(%v4f16 %a) {
+; CHECK-LABEL: test_v4f16.trunc:
+; CHECK:       frintz s{{.}}, s{{.}}
+; CHECK:       frintz s{{.}}, s{{.}}
+; CHECK:       frintz s{{.}}, s{{.}}
+; CHECK:       frintz s{{.}}, s{{.}}
+
+; CHECK-FP16-LABEL: test_v4f16.trunc:
+; CHECK-FP16:       frintz.4h
+; CHECK-FP16-NEXT:  ret
+  %1 = call %v4f16 @llvm.trunc.v4f16(%v4f16 %a)
+  ret %v4f16 %1
+}
+define %v8f16 @test_v8f16.trunc(%v8f16 %a) {
+; Filechecks are unwieldy with 16 fcvt and 8 frint tests, so skipped for -fullfp16.
+
+; CHECK-FP16-LABEL: test_v8f16.trunc:
+; CHECK-FP16-NOT:   fcvt
+; CHECK-FP16:       frintz.8h
+; CHECK-FP16-NEXT:  ret
+  %1 = call %v8f16 @llvm.trunc.v8f16(%v8f16 %a)
+  ret %v8f16 %1
+}
+; CHECK-LABEL: test_v2f32.rint:
+define %v2f32 @test_v2f32.rint(%v2f32 %a) {
+  ; CHECK: frintx.2s
+  %1 = call %v2f32 @llvm.rint.v2f32(%v2f32 %a)
+  ret %v2f32 %1
+}
+define %v4f16 @test_v4f16.rint(%v4f16 %a) {
+; CHECK-LABEL: test_v4f16.rint:
+; CHECK:       frintx s{{.}}, s{{.}}
+; CHECK:       frintx s{{.}}, s{{.}}
+; CHECK:       frintx s{{.}}, s{{.}}
+; CHECK:       frintx s{{.}}, s{{.}}
+
+; CHECK-FP16-LABEL: test_v4f16.rint:
+; CHECK-FP16-NOT:   fcvt
+; CHECK-FP16:       frintx.4h
+; CHECK-FP16-NEXT:  ret
+  %1 = call %v4f16 @llvm.rint.v4f16(%v4f16 %a)
+  ret %v4f16 %1
+}
+define %v8f16 @test_v8f16.rint(%v8f16 %a) {
+; Filechecks are unwieldy with 16 fcvt and 8 frint tests, so skipped for -fullfp16.
+
+; CHECK-FP16-LABEL: test_v8f16.rint:
+; CHECK-FP16:       frintx.8h
+; CHECK-FP16-NEXT:  ret
+  %1 = call %v8f16 @llvm.rint.v8f16(%v8f16 %a)
+  ret %v8f16 %1
+}
+; CHECK-LABEL: test_v2f32.nearbyint:
+define %v2f32 @test_v2f32.nearbyint(%v2f32 %a) {
+  ; CHECK: frinti.2s
+  %1 = call %v2f32 @llvm.nearbyint.v2f32(%v2f32 %a)
+  ret %v2f32 %1
+}
+define %v4f16 @test_v4f16.nearbyint(%v4f16 %a) {
+; CHECK-LABEL: test_v4f16.nearbyint:
+; CHECK:       frinti s{{.}}, s{{.}}
+; CHECK:       frinti s{{.}}, s{{.}}
+; CHECK:       frinti s{{.}}, s{{.}}
+; CHECK:       frinti s{{.}}, s{{.}}
+
+; CHECK-FP16-LABEL: test_v4f16.nearbyint:
+; CHECK-FP16-NOT:   fcvt
+; CHECK-FP16:       frinti.4h
+; CHECK-FP16-NEXT:  ret
+  %1 = call %v4f16 @llvm.nearbyint.v4f16(%v4f16 %a)
+  ret %v4f16 %1
+}
+define %v8f16 @test_v8f16.nearbyint(%v8f16 %a) {
+; Filechecks are unwieldy with 16 fcvt and 8 frint tests, so skipped for -fullfp16.
+
+; CHECK-FP16-LABEL: test_v8f16.nearbyint:
+; CHECK-FP16-NOT:   fcvt
+; CHECK-FP16:       frinti.8h
+; CHECK-FP16-NEXT:  ret
+  %1 = call %v8f16 @llvm.nearbyint.v8f16(%v8f16 %a)
+  ret %v8f16 %1
+}
+
+declare %v2f32 @llvm.sqrt.v2f32(%v2f32) #0
+declare %v4f16 @llvm.sqrt.v4f16(%v4f16) #0
+declare %v8f16 @llvm.sqrt.v8f16(%v8f16) #0
+
+declare %v2f32 @llvm.powi.v2f32(%v2f32, i32) #0
+declare %v2f32 @llvm.sin.v2f32(%v2f32) #0
+declare %v2f32 @llvm.cos.v2f32(%v2f32) #0
+declare %v2f32 @llvm.pow.v2f32(%v2f32, %v2f32) #0
+declare %v2f32 @llvm.exp.v2f32(%v2f32) #0
+declare %v2f32 @llvm.exp2.v2f32(%v2f32) #0
+declare %v2f32 @llvm.log.v2f32(%v2f32) #0
+declare %v2f32 @llvm.log10.v2f32(%v2f32) #0
+declare %v2f32 @llvm.log2.v2f32(%v2f32) #0
+
+declare %v2f32 @llvm.fma.v2f32(%v2f32, %v2f32, %v2f32) #0
+declare %v4f16 @llvm.fma.v4f16(%v4f16, %v4f16, %v4f16) #0
+declare %v8f16 @llvm.fma.v8f16(%v8f16, %v8f16, %v8f16) #0
+
+declare %v2f32 @llvm.fabs.v2f32(%v2f32) #0
+declare %v4f16 @llvm.fabs.v4f16(%v4f16) #0
+declare %v8f16 @llvm.fabs.v8f16(%v8f16) #0
+
+declare %v2f32 @llvm.floor.v2f32(%v2f32) #0
+declare %v4f16 @llvm.floor.v4f16(%v4f16) #0
+declare %v8f16 @llvm.floor.v8f16(%v8f16) #0
+
+declare %v2f32 @llvm.ceil.v2f32(%v2f32) #0
+declare %v4f16 @llvm.ceil.v4f16(%v4f16) #0
+declare %v8f16 @llvm.ceil.v8f16(%v8f16) #0
+
+declare %v2f32 @llvm.trunc.v2f32(%v2f32) #0
+declare %v4f16 @llvm.trunc.v4f16(%v4f16) #0
+declare %v8f16 @llvm.trunc.v8f16(%v8f16) #0
+
+declare %v2f32 @llvm.rint.v2f32(%v2f32) #0
+declare %v4f16 @llvm.rint.v4f16(%v4f16) #0
+declare %v8f16 @llvm.rint.v8f16(%v8f16) #0
+
+declare %v2f32 @llvm.nearbyint.v2f32(%v2f32) #0
+declare %v4f16 @llvm.nearbyint.v4f16(%v4f16) #0
+declare %v8f16 @llvm.nearbyint.v8f16(%v8f16) #0
+
+;;;
+
+%v4f32 = type <4 x float>
+; CHECK: test_v4f32.sqrt:
+define %v4f32 @test_v4f32.sqrt(%v4f32 %a) {
+  ; CHECK: fsqrt.4s
+  %1 = call %v4f32 @llvm.sqrt.v4f32(%v4f32 %a)
+  ret %v4f32 %1
+}
+; CHECK: test_v4f32.powi:
+define %v4f32 @test_v4f32.powi(%v4f32 %a, i32 %b) {
+  ; CHECK: pow
+  %1 = call %v4f32 @llvm.powi.v4f32(%v4f32 %a, i32 %b)
+  ret %v4f32 %1
+}
+; CHECK: test_v4f32.sin:
+define %v4f32 @test_v4f32.sin(%v4f32 %a) {
+  ; CHECK: sin
+  %1 = call %v4f32 @llvm.sin.v4f32(%v4f32 %a)
+  ret %v4f32 %1
+}
+; CHECK: test_v4f32.cos:
+define %v4f32 @test_v4f32.cos(%v4f32 %a) {
+  ; CHECK: cos
+  %1 = call %v4f32 @llvm.cos.v4f32(%v4f32 %a)
+  ret %v4f32 %1
+}
+; CHECK: test_v4f32.pow:
+define %v4f32 @test_v4f32.pow(%v4f32 %a, %v4f32 %b) {
+  ; CHECK: pow
+  %1 = call %v4f32 @llvm.pow.v4f32(%v4f32 %a, %v4f32 %b)
+  ret %v4f32 %1
+}
+; CHECK: test_v4f32.exp:
+define %v4f32 @test_v4f32.exp(%v4f32 %a) {
+  ; CHECK: exp
+  %1 = call %v4f32 @llvm.exp.v4f32(%v4f32 %a)
+  ret %v4f32 %1
+}
+; CHECK: test_v4f32.exp2:
+define %v4f32 @test_v4f32.exp2(%v4f32 %a) {
+  ; CHECK: exp
+  %1 = call %v4f32 @llvm.exp2.v4f32(%v4f32 %a)
+  ret %v4f32 %1
+}
+; CHECK: test_v4f32.log:
+define %v4f32 @test_v4f32.log(%v4f32 %a) {
+  ; CHECK: log
+  %1 = call %v4f32 @llvm.log.v4f32(%v4f32 %a)
+  ret %v4f32 %1
+}
+; CHECK: test_v4f32.log10:
+define %v4f32 @test_v4f32.log10(%v4f32 %a) {
+  ; CHECK: log
+  %1 = call %v4f32 @llvm.log10.v4f32(%v4f32 %a)
+  ret %v4f32 %1
+}
+; CHECK: test_v4f32.log2:
+define %v4f32 @test_v4f32.log2(%v4f32 %a) {
+  ; CHECK: log
+  %1 = call %v4f32 @llvm.log2.v4f32(%v4f32 %a)
+  ret %v4f32 %1
+}
+; CHECK: test_v4f32.fma:
+define %v4f32 @test_v4f32.fma(%v4f32 %a, %v4f32 %b, %v4f32 %c) {
+  ; CHECK: fma
+  %1 = call %v4f32 @llvm.fma.v4f32(%v4f32 %a, %v4f32 %b, %v4f32 %c)
+  ret %v4f32 %1
+}
+; CHECK: test_v4f32.fabs:
+define %v4f32 @test_v4f32.fabs(%v4f32 %a) {
+  ; CHECK: fabs
+  %1 = call %v4f32 @llvm.fabs.v4f32(%v4f32 %a)
+  ret %v4f32 %1
+}
+; CHECK: test_v4f32.floor:
+define %v4f32 @test_v4f32.floor(%v4f32 %a) {
+  ; CHECK: frintm.4s
+  %1 = call %v4f32 @llvm.floor.v4f32(%v4f32 %a)
+  ret %v4f32 %1
+}
+; CHECK: test_v4f32.ceil:
+define %v4f32 @test_v4f32.ceil(%v4f32 %a) {
+  ; CHECK: frintp.4s
+  %1 = call %v4f32 @llvm.ceil.v4f32(%v4f32 %a)
+  ret %v4f32 %1
+}
+; CHECK: test_v4f32.trunc:
+define %v4f32 @test_v4f32.trunc(%v4f32 %a) {
+  ; CHECK: frintz.4s
+  %1 = call %v4f32 @llvm.trunc.v4f32(%v4f32 %a)
+  ret %v4f32 %1
+}
+; CHECK: test_v4f32.rint:
+define %v4f32 @test_v4f32.rint(%v4f32 %a) {
+  ; CHECK: frintx.4s
+  %1 = call %v4f32 @llvm.rint.v4f32(%v4f32 %a)
+  ret %v4f32 %1
+}
+; CHECK: test_v4f32.nearbyint:
+define %v4f32 @test_v4f32.nearbyint(%v4f32 %a) {
+  ; CHECK: frinti.4s
+  %1 = call %v4f32 @llvm.nearbyint.v4f32(%v4f32 %a)
+  ret %v4f32 %1
+}
+
+declare %v4f32 @llvm.sqrt.v4f32(%v4f32) #0
+declare %v4f32 @llvm.powi.v4f32(%v4f32, i32) #0
+declare %v4f32 @llvm.sin.v4f32(%v4f32) #0
+declare %v4f32 @llvm.cos.v4f32(%v4f32) #0
+declare %v4f32 @llvm.pow.v4f32(%v4f32, %v4f32) #0
+declare %v4f32 @llvm.exp.v4f32(%v4f32) #0
+declare %v4f32 @llvm.exp2.v4f32(%v4f32) #0
+declare %v4f32 @llvm.log.v4f32(%v4f32) #0
+declare %v4f32 @llvm.log10.v4f32(%v4f32) #0
+declare %v4f32 @llvm.log2.v4f32(%v4f32) #0
+declare %v4f32 @llvm.fma.v4f32(%v4f32, %v4f32, %v4f32) #0
+declare %v4f32 @llvm.fabs.v4f32(%v4f32) #0
+declare %v4f32 @llvm.floor.v4f32(%v4f32) #0
+declare %v4f32 @llvm.ceil.v4f32(%v4f32) #0
+declare %v4f32 @llvm.trunc.v4f32(%v4f32) #0
+declare %v4f32 @llvm.rint.v4f32(%v4f32) #0
+declare %v4f32 @llvm.nearbyint.v4f32(%v4f32) #0
+
+;;; Double vector
+
+%v2f64 = type <2 x double>
+; CHECK: test_v2f64.sqrt:
+define %v2f64 @test_v2f64.sqrt(%v2f64 %a) {
+  ; CHECK: fsqrt.2d
+  %1 = call %v2f64 @llvm.sqrt.v2f64(%v2f64 %a)
+  ret %v2f64 %1
+}
+; CHECK: test_v2f64.powi:
+define %v2f64 @test_v2f64.powi(%v2f64 %a, i32 %b) {
+  ; CHECK: pow
+  %1 = call %v2f64 @llvm.powi.v2f64(%v2f64 %a, i32 %b)
+  ret %v2f64 %1
+}
+; CHECK: test_v2f64.sin:
+define %v2f64 @test_v2f64.sin(%v2f64 %a) {
+  ; CHECK: sin
+  %1 = call %v2f64 @llvm.sin.v2f64(%v2f64 %a)
+  ret %v2f64 %1
+}
+; CHECK: test_v2f64.cos:
+define %v2f64 @test_v2f64.cos(%v2f64 %a) {
+  ; CHECK: cos
+  %1 = call %v2f64 @llvm.cos.v2f64(%v2f64 %a)
+  ret %v2f64 %1
+}
+; CHECK: test_v2f64.pow:
+define %v2f64 @test_v2f64.pow(%v2f64 %a, %v2f64 %b) {
+  ; CHECK: pow
+  %1 = call %v2f64 @llvm.pow.v2f64(%v2f64 %a, %v2f64 %b)
+  ret %v2f64 %1
+}
+; CHECK: test_v2f64.exp:
+define %v2f64 @test_v2f64.exp(%v2f64 %a) {
+  ; CHECK: exp
+  %1 = call %v2f64 @llvm.exp.v2f64(%v2f64 %a)
+  ret %v2f64 %1
+}
+; CHECK: test_v2f64.exp2:
+define %v2f64 @test_v2f64.exp2(%v2f64 %a) {
+  ; CHECK: exp
+  %1 = call %v2f64 @llvm.exp2.v2f64(%v2f64 %a)
+  ret %v2f64 %1
+}
+; CHECK: test_v2f64.log:
+define %v2f64 @test_v2f64.log(%v2f64 %a) {
+  ; CHECK: log
+  %1 = call %v2f64 @llvm.log.v2f64(%v2f64 %a)
+  ret %v2f64 %1
+}
+; CHECK: test_v2f64.log10:
+define %v2f64 @test_v2f64.log10(%v2f64 %a) {
+  ; CHECK: log
+  %1 = call %v2f64 @llvm.log10.v2f64(%v2f64 %a)
+  ret %v2f64 %1
+}
+; CHECK: test_v2f64.log2:
+define %v2f64 @test_v2f64.log2(%v2f64 %a) {
+  ; CHECK: log
+  %1 = call %v2f64 @llvm.log2.v2f64(%v2f64 %a)
+  ret %v2f64 %1
+}
+; CHECK: test_v2f64.fma:
+define %v2f64 @test_v2f64.fma(%v2f64 %a, %v2f64 %b, %v2f64 %c) {
+  ; CHECK: fma
+  %1 = call %v2f64 @llvm.fma.v2f64(%v2f64 %a, %v2f64 %b, %v2f64 %c)
+  ret %v2f64 %1
+}
+; CHECK: test_v2f64.fabs:
+define %v2f64 @test_v2f64.fabs(%v2f64 %a) {
+  ; CHECK: fabs
+  %1 = call %v2f64 @llvm.fabs.v2f64(%v2f64 %a)
+  ret %v2f64 %1
+}
+; CHECK: test_v2f64.floor:
+define %v2f64 @test_v2f64.floor(%v2f64 %a) {
+  ; CHECK: frintm.2d
+  %1 = call %v2f64 @llvm.floor.v2f64(%v2f64 %a)
+  ret %v2f64 %1
+}
+; CHECK: test_v2f64.ceil:
+define %v2f64 @test_v2f64.ceil(%v2f64 %a) {
+  ; CHECK: frintp.2d
+  %1 = call %v2f64 @llvm.ceil.v2f64(%v2f64 %a)
+  ret %v2f64 %1
+}
+; CHECK: test_v2f64.trunc:
+define %v2f64 @test_v2f64.trunc(%v2f64 %a) {
+  ; CHECK: frintz.2d
+  %1 = call %v2f64 @llvm.trunc.v2f64(%v2f64 %a)
+  ret %v2f64 %1
+}
+; CHECK: test_v2f64.rint:
+define %v2f64 @test_v2f64.rint(%v2f64 %a) {
+  ; CHECK: frintx.2d
+  %1 = call %v2f64 @llvm.rint.v2f64(%v2f64 %a)
+  ret %v2f64 %1
+}
+; CHECK: test_v2f64.nearbyint:
+define %v2f64 @test_v2f64.nearbyint(%v2f64 %a) {
+  ; CHECK: frinti.2d
+  %1 = call %v2f64 @llvm.nearbyint.v2f64(%v2f64 %a)
+  ret %v2f64 %1
+}
+
+declare %v2f64 @llvm.sqrt.v2f64(%v2f64) #0
+declare %v2f64 @llvm.powi.v2f64(%v2f64, i32) #0
+declare %v2f64 @llvm.sin.v2f64(%v2f64) #0
+declare %v2f64 @llvm.cos.v2f64(%v2f64) #0
+declare %v2f64 @llvm.pow.v2f64(%v2f64, %v2f64) #0
+declare %v2f64 @llvm.exp.v2f64(%v2f64) #0
+declare %v2f64 @llvm.exp2.v2f64(%v2f64) #0
+declare %v2f64 @llvm.log.v2f64(%v2f64) #0
+declare %v2f64 @llvm.log10.v2f64(%v2f64) #0
+declare %v2f64 @llvm.log2.v2f64(%v2f64) #0
+declare %v2f64 @llvm.fma.v2f64(%v2f64, %v2f64, %v2f64) #0
+declare %v2f64 @llvm.fabs.v2f64(%v2f64) #0
+declare %v2f64 @llvm.floor.v2f64(%v2f64) #0
+declare %v2f64 @llvm.ceil.v2f64(%v2f64) #0
+declare %v2f64 @llvm.trunc.v2f64(%v2f64) #0
+declare %v2f64 @llvm.rint.v2f64(%v2f64) #0
+declare %v2f64 @llvm.nearbyint.v2f64(%v2f64) #0
+
+attributes #0 = { nounwind readonly }
+                                                                                                                                                                                                                                                                                                                                                                                            

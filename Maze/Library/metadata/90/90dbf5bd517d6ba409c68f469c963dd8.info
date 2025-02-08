@@ -1,0 +1,145 @@
+ng), false);
+                    break;
+
+                default:
+                    Debug.Assert(false);
+                    break;
+            }
+
+            return ndProp;
+        }
+
+        /// <summary>
+        /// Find physical query plan for QilNodeType.TypeAssert.
+        /// </summary>
+        protected override QilNode VisitTypeAssert(QilTargetType ndTypeAssert) {
+            if (!ndTypeAssert.Source.XmlType.IsSingleton && ndTypeAssert.XmlType.IsSingleton && !this.iterCurr.HasLabelNext) {
+                // This case occurs when a non-singleton expression is treated as cardinality One.
+                // The trouble is that the expression will branch to an end label when it's done iterating, so
+                // an end label must be provided.  But there is no next label in the current iteration context,
+                // so we've got to create a dummy label instead (IL requires it).  This creates an infinite loop,
+                // but since it's known statically that the expression is cardinality One, this branch will never
+                // be taken.
+                Label lblDummy = this.helper.DefineLabel();
+                this.helper.MarkLabel(lblDummy);
+                NestedVisit(ndTypeAssert.Source, lblDummy);
+            }
+            else {
+                // Generate code for child expression
+                Visit(ndTypeAssert.Source);
+            }
+
+            this.iterCurr.EnsureItemStorageType(ndTypeAssert.Source.XmlType, GetItemStorageType(ndTypeAssert));
+            return ndTypeAssert;
+        }
+
+        /// <summary>
+        /// Generate code for QilNodeType.IsType.
+        /// </summary>
+        protected override QilNode VisitIsType(QilTargetType ndIsType) {
+            XmlQueryType typDerived, typBase;
+            XmlTypeCode codeBase;
+
+            typDerived = ndIsType.Source.XmlType;
+            typBase = ndIsType.TargetType;
+            Debug.Assert(!typDerived.NeverSubtypeOf(typBase), "Normalizer should have eliminated IsType where source can never be a subtype of destination type.");
+
+            // Special Case: Test whether singleton item is a Node
+            if (typDerived.IsSingleton && (object) typBase == (object) TypeFactory.Node) {
+                NestedVisitEnsureStack(ndIsType.Source);
+                Debug.Assert(this.iterCurr.Storage.ItemStorageType == typeof(XPathItem), "If !IsNode, then storage type should be Item");
+
+                // if (item.IsNode op true) goto LabelBranch;
+                this.helper.Call(XmlILMethods.ItemIsNode);
+                ZeroCompare(QilNodeType.Ne, true);
+
+                return ndIsType;
+            }
+
+            // Special Case: Source value is a singleton Node, and we're testing whether it is an Element, Attribute, PI, etc.
+            if (MatchesNodeKinds(ndIsType, typDerived, typBase))
+                return ndIsType;
+
+            // Special Case: XmlTypeCode is sufficient to describe destination type
+            if ((object) typBase == (object) TypeFactory.Double) codeBase = XmlTypeCode.Double;
+            else if ((object) typBase == (object) TypeFactory.String) codeBase = XmlTypeCode.String;
+            else if ((object) typBase == (object) TypeFactory.Boolean) codeBase = XmlTypeCode.Boolean;
+            else if ((object) typBase == (object) TypeFactory.Node) codeBase = XmlTypeCode.Node;
+            else codeBase = XmlTypeCode.None;
+
+            if (codeBase != XmlTypeCode.None) {
+                // if (runtime.MatchesXmlType(value, code) op true) goto LabelBranch;
+                this.helper.LoadQueryRuntime();
+                NestedVisitEnsureStack(ndIsType.Source, typeof(XPathItem), !typDerived.IsSingleton);
+                this.helper.LoadInteger((int) codeBase);
+                this.helper.Call(typDerived.IsSingleton ? XmlILMethods.ItemMatchesCode : XmlILMethods.SeqMatchesCode);
+                ZeroCompare(QilNodeType.Ne, true);
+
+                return ndIsType;
+            }
+
+            // if (runtime.MatchesXmlType(value, idxType) op true) goto LabelBranch;
+            this.helper.LoadQueryRuntime();
+            NestedVisitEnsureStack(ndIsType.Source, typeof(XPathItem), !typDerived.IsSingleton);
+            this.helper.LoadInteger(this.helper.StaticData.DeclareXmlType(typBase));
+            this.helper.Call(typDerived.IsSingleton ? XmlILMethods.ItemMatchesType : XmlILMethods.SeqMatchesType);
+            ZeroCompare(QilNodeType.Ne, true);
+
+            return ndIsType;
+        }
+
+        /// <summary>
+        /// Faster code can be generated if type test is just a node kind test.  If this special case is detected, then generate code and return true.
+        /// Otherwise, return false, and a call to MatchesXmlType will be generated instead.
+        /// </summary>
+        private bool MatchesNodeKinds(QilTargetType ndIsType, XmlQueryType typDerived, XmlQueryType typBase) {
+            XmlNodeKindFlags kinds;
+            bool allowKinds = true;
+            XPathNodeType kindsRuntime;
+            int kindsUnion;
+
+            // If not checking whether typDerived is some kind of singleton node, then fallback to MatchesXmlType
+            if (!typBase.IsNode || !typBase.IsSingleton)
+                return false;
+
+            // If typDerived is not statically guaranteed to be a singleton node (and not an rtf), then fallback to MatchesXmlType
+            if (!typDerived.IsNode || !typDerived.IsSingleton || !typDerived.IsNotRtf)
+                return false;
+
+            // Now we are guaranteed that typDerived is a node, and typBase is a node, so check node kinds
+            // Ensure that typBase is only composed of kind-test prime types (no name-test, no schema-test, etc.)
+            kinds = XmlNodeKindFlags.None;
+            foreach (XmlQueryType typItem in typBase) {
+                if ((object) typItem == (object) TypeFactory.Element) kinds |= XmlNodeKindFlags.Element;
+                else if ((object) typItem == (object) TypeFactory.Attribute) kinds |= XmlNodeKindFlags.Attribute;
+                else if ((object) typItem == (object) TypeFactory.Text) kinds |= XmlNodeKindFlags.Text;
+                else if ((object) typItem == (object) TypeFactory.Document) kinds |= XmlNodeKindFlags.Document;
+                else if ((object) typItem == (object) TypeFactory.Comment) kinds |= XmlNodeKindFlags.Comment;
+                else if ((object) typItem == (object) TypeFactory.PI) kinds |= XmlNodeKindFlags.PI;
+                else if ((object) typItem == (object) TypeFactory.Namespace) kinds |= XmlNodeKindFlags.Namespace;
+                else return false;
+            }
+
+            Debug.Assert((typDerived.NodeKinds & kinds) != XmlNodeKindFlags.None, "Normalizer should have taken care of case where node kinds are disjoint.");
+
+            kinds = typDerived.NodeKinds & kinds;
+
+            // Attempt to allow or disallow exactly one kind
+            if (!Bits.ExactlyOne((uint) kinds)) {
+                // Not possible to allow one kind, so try to disallow one kind
+                kinds = ~kinds & XmlNodeKindFlags.Any;
+                allowKinds = !allowKinds;
+            }
+
+            switch (kinds) {
+                case XmlNodeKindFlags.Element: kindsRuntime = XPathNodeType.Element; break;
+                case XmlNodeKindFlags.Attribute: kindsRuntime = XPathNodeType.Attribute; break;
+                case XmlNodeKindFlags.Namespace: kindsRuntime = XPathNodeType.Namespace; break;
+                case XmlNodeKindFlags.PI: kindsRuntime = XPathNodeType.ProcessingInstruction; break;
+                case XmlNodeKindFlags.Comment: kindsRuntime = XPathNodeType.Comment; break;
+                case XmlNodeKindFlags.Document: kindsRuntime = XPathNodeType.Root; break;
+
+                default:
+                    // Union of several types (when testing for Text, we need to test for Whitespace as well)
+
+                    // if (((1 << navigator.NodeType) & nodesDisallow) 

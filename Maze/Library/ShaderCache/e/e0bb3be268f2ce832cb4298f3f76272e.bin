@@ -1,0 +1,163 @@
+alizer == null)
+                {
+                    throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgumentNull("serializer");
+                }
+                return this.standardsManager.TrustDriver.GetAppliesTo<T>(this, serializer);
+            }
+            else
+            {
+                return (T)this.appliesTo;
+            }
+        }
+
+        internal void SetBinaryNegotiation(BinaryNegotiation negotiation)
+        {
+            if (negotiation == null)
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgumentNull("negotiation");
+            if (this.IsReadOnly)
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new InvalidOperationException(SR.GetString(SR.ObjectIsReadOnly)));
+            this.negotiationData = negotiation;
+        }
+
+        internal BinaryNegotiation GetBinaryNegotiation()
+        {
+            if (this.isReceiver)
+                return this.standardsManager.TrustDriver.GetBinaryNegotiation(this);
+            else
+                return this.negotiationData;
+        }
+
+        internal void SetAuthenticator(byte[] authenticator)
+        {
+            if (authenticator == null)
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgumentNull("authenticator");
+            if (this.IsReadOnly)
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new InvalidOperationException(SR.GetString(SR.ObjectIsReadOnly)));
+            this.authenticator = DiagnosticUtility.Utility.AllocateByteArray(authenticator.Length);
+            Buffer.BlockCopy(authenticator, 0, this.authenticator, 0, authenticator.Length);
+        }
+
+        internal byte[] GetAuthenticator()
+        {
+            if (this.isReceiver)
+                return this.standardsManager.TrustDriver.GetAuthenticator(this);
+            else
+            {
+                if (this.authenticator == null)
+                    return null;
+                else 
+                {
+                    byte[] result = DiagnosticUtility.Utility.AllocateByteArray(this.authenticator.Length);
+                    Buffer.BlockCopy(this.authenticator, 0, result, 0, this.authenticator.Length);
+                    return result;
+                }
+            }
+        }
+
+        void OnWriteTo(XmlWriter w)
+        {
+            if (this.isReceiver)
+            {
+                this.rstrXml.WriteTo(w);
+            }
+            else
+            {
+                this.standardsManager.TrustDriver.WriteRequestSecurityTokenResponse(this, w);
+            }
+        }
+
+        public void WriteTo(XmlWriter writer)
+        {
+            if (writer == null)
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgumentNull("writer");
+            if (this.IsReadOnly)
+            {
+                // cache the serialized bytes to ensure repeatability
+                if (this.cachedWriteBuffer == null)
+                {
+                    MemoryStream stream = new MemoryStream();
+                    using (XmlDictionaryWriter binaryWriter = XmlDictionaryWriter.CreateBinaryWriter(stream, XD.Dictionary))
+                    {
+                        this.OnWriteTo(binaryWriter);
+                        binaryWriter.Flush();
+                        stream.Flush();
+                        stream.Seek(0, SeekOrigin.Begin);
+                        this.cachedWriteBuffer = stream.GetBuffer();
+                        this.cachedWriteBufferLength = (int)stream.Length;
+                    }
+                }
+                writer.WriteNode(XmlDictionaryReader.CreateBinaryReader(this.cachedWriteBuffer, 0, this.cachedWriteBufferLength, XD.Dictionary, XmlDictionaryReaderQuotas.Max), false);
+            }
+            else
+                this.OnWriteTo(writer);
+        }
+
+        public static RequestSecurityTokenResponse CreateFrom(XmlReader reader)
+        {
+            return CreateFrom(SecurityStandardsManager.DefaultInstance, reader);
+        }
+
+        public static RequestSecurityTokenResponse CreateFrom(XmlReader reader, MessageSecurityVersion messageSecurityVersion, SecurityTokenSerializer securityTokenSerializer)
+        {
+            return CreateFrom(SecurityUtils.CreateSecurityStandardsManager(messageSecurityVersion, securityTokenSerializer), reader);
+        }
+
+        internal static RequestSecurityTokenResponse CreateFrom(SecurityStandardsManager standardsManager, XmlReader reader)
+        {
+            return standardsManager.TrustDriver.CreateRequestSecurityTokenResponse(reader);
+        }
+
+        protected override void OnWriteBodyContents(XmlDictionaryWriter writer)
+        {
+            WriteTo(writer);
+        }
+
+        public void MakeReadOnly()
+        {
+            if (!this.isReadOnly)
+            {
+                this.isReadOnly = true;
+                this.OnMakeReadOnly();
+            }
+        }
+
+        public GenericXmlSecurityToken GetIssuedToken(SecurityTokenResolver resolver, IList<SecurityTokenAuthenticator> allowedAuthenticators, SecurityKeyEntropyMode keyEntropyMode, byte[] requestorEntropy, string expectedTokenType,
+            ReadOnlyCollection<IAuthorizationPolicy> authorizationPolicies)
+        {
+            return this.GetIssuedToken(resolver, allowedAuthenticators, keyEntropyMode, requestorEntropy, expectedTokenType, authorizationPolicies, 0, false);
+        }
+
+        public virtual GenericXmlSecurityToken GetIssuedToken(SecurityTokenResolver resolver, IList<SecurityTokenAuthenticator> allowedAuthenticators, SecurityKeyEntropyMode keyEntropyMode, byte[] requestorEntropy, string expectedTokenType,
+            ReadOnlyCollection<IAuthorizationPolicy> authorizationPolicies, int defaultKeySize, bool isBearerKeyType)
+        {
+            if (!this.isReceiver)
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new InvalidOperationException(SR.GetString(SR.ItemAvailableInDeserializedRSTROnly, "GetIssuedToken")));
+
+            return this.standardsManager.TrustDriver.GetIssuedToken(this, resolver, allowedAuthenticators, keyEntropyMode, requestorEntropy, expectedTokenType, authorizationPolicies, defaultKeySize, isBearerKeyType);
+        }
+
+        public virtual GenericXmlSecurityToken GetIssuedToken(string expectedTokenType, ReadOnlyCollection<IAuthorizationPolicy> authorizationPolicies, RSA clientKey)
+        {
+            if (!this.isReceiver)
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new InvalidOperationException(SR.GetString(SR.ItemAvailableInDeserializedRSTROnly, "GetIssuedToken")));
+
+            return this.standardsManager.TrustDriver.GetIssuedToken(this, expectedTokenType, authorizationPolicies, clientKey);
+        }
+
+        protected internal virtual void OnWriteCustomAttributes(XmlWriter writer)
+        { }
+
+        protected internal virtual void OnWriteCustomElements(XmlWriter writer) 
+        { }
+
+        protected virtual void OnMakeReadOnly() { }
+
+        public static byte[] ComputeCombinedKey(byte[] requestorEntropy, byte[] issuerEntropy, int keySizeInBits)
+        {
+            if (requestorEntropy == null)
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgumentNull("requestorEntropy");
+            if (issuerEntropy == null)
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgumentNull("issuerEntropy");
+            // Do a sanity check here. We don't want to allow invalid keys or keys that are too
+            // large.
+            if ((keySizeInBits < minSaneKeySizeInBits) || (keySizeInBits > maxSaneKeySizeInBits))

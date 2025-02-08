@@ -1,0 +1,70 @@
+ Not explicit - we want to use RTCErrorOr<T> as a return
+  // value, so it is convenient and sensible to be able to do 'return
+  // RTCError(...)' when the return type is RTCErrorOr<T>.
+  //
+  // REQUIRES: !error.ok(). This requirement is DCHECKed.
+  RTCErrorOr(RTCError&& error) : error_(std::move(error)) {  // NOLINT
+    RTC_DCHECK(!error.ok());
+  }
+
+  // Constructs a new RTCErrorOr with the given value. After calling this
+  // constructor, calls to value() will succeed, and calls to error() will
+  // return a default-constructed RTCError.
+  //
+  // NOTE: Not explicit - we want to use RTCErrorOr<T> as a return type
+  // so it is convenient and sensible to be able to do 'return T()'
+  // when the return type is RTCErrorOr<T>.
+  RTCErrorOr(T&& value) : value_(std::move(value)) {}  // NOLINT
+
+  // Delete the copy constructor and assignment operator; there aren't any use
+  // cases where you should need to copy an RTCErrorOr, as opposed to moving
+  // it. Can revisit this decision if use cases arise in the future.
+  RTCErrorOr(const RTCErrorOr& other) = delete;
+  RTCErrorOr& operator=(const RTCErrorOr& other) = delete;
+
+  // Move constructor and move-assignment operator.
+  //
+  // Visual Studio doesn't support "= default" with move constructors or
+  // assignment operators (even though they compile, they segfault), so define
+  // them explicitly.
+  RTCErrorOr(RTCErrorOr&& other)
+      : error_(std::move(other.error_)), value_(std::move(other.value_)) {}
+  RTCErrorOr& operator=(RTCErrorOr&& other) {
+    error_ = std::move(other.error_);
+    value_ = std::move(other.value_);
+    return *this;
+  }
+
+  // Conversion constructor and assignment operator; T must be copy or move
+  // constructible from U.
+  template <typename U>
+  RTCErrorOr(RTCErrorOr<U> other)  // NOLINT
+      : error_(std::move(other.error_)), value_(std::move(other.value_)) {}
+  template <typename U>
+  RTCErrorOr& operator=(RTCErrorOr<U> other) {
+    error_ = std::move(other.error_);
+    value_ = std::move(other.value_);
+    return *this;
+  }
+
+  // Returns a reference to our error. If this contains a T, then returns
+  // default-constructed RTCError.
+  const RTCError& error() const { return error_; }
+
+  // Moves the error. Can be useful if, say "CreateFoo" returns an
+  // RTCErrorOr<Foo>, and internally calls "CreateBar" which returns an
+  // RTCErrorOr<Bar>, and wants to forward the error up the stack.
+  RTCError MoveError() { return std::move(error_); }
+
+  // Returns this->error().ok()
+  bool ok() const { return error_.ok(); }
+
+  // Returns a reference to our current value, or DCHECK-fails if !this->ok().
+  //
+  // Can be convenient for the implementation; for example, a method may want
+  // to access the value in some way before returning it to the next method on
+  // the stack.
+  const T& value() const {
+    RTC_DCHECK(ok());
+    return value_;
+  }

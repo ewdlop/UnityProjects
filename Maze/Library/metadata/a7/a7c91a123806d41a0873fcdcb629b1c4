@@ -1,0 +1,338 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+D3D12Adapter.cpp:D3D12 Adapter implementation.
+=============================================================================*/
+
+#include "D3D12RHIPrivate.h"
+#include "Misc/CommandLine.h"
+#include "Misc/EngineVersion.h"
+#include "Misc/OutputDeviceRedirector.h"
+#include "Windows/AllowWindowsPlatformTypes.h"
+#if PLATFORM_WINDOWS
+#include "Windows/WindowsPlatformMisc.h"
+#endif
+
+#if !PLATFORM_CPU_ARM_FAMILY && (PLATFORM_WINDOWS)
+	#include "amd_ags.h"
+#endif
+#include "Windows/HideWindowsPlatformTypes.h"
+
+#if ENABLE_RESIDENCY_MANAGEMENT
+bool GEnableResidencyManagement = true;
+static TAutoConsoleVariable<int32> CVarResidencyManagement(
+	TEXT("D3D12.ResidencyManagement"),
+	1,
+	TEXT("Controls whether D3D12 resource residency management is active (default = on)."),
+	ECVF_ReadOnly
+);
+#endif // ENABLE_RESIDENCY_MANAGEMENT
+
+#if D3D12_SUBMISSION_GAP_RECORDER
+int32 GEnableGapRecorder = 0;
+bool GGapRecorderActiveOnBeginFrame = false;
+static FAutoConsoleVariableRef CVarEnableGapRecorder(
+	TEXT("D3D12.EnableGapRecorder"),
+	GEnableGapRecorder,
+	TEXT("Controls whether D3D12 gap recorder (cpu bubbles) is active (default = on)."),
+	ECVF_RenderThreadSafe
+);
+
+int32 GGapRecorderUseBlockingCall = 0;
+static FAutoConsoleVariableRef CVarGapRecorderUseBlockingCall(
+	TEXT("D3D12.GapRecorderUseBlockingCall"),
+	GGapRecorderUseBlockingCall,
+	TEXT("Controls whether D3D12 gap recorder (cpu bubbles) uses a blocking call or not."),
+	ECVF_RenderThreadSafe
+);
+#endif
+
+#if PLATFORM_WINDOWS || PLATFORM_HOLOLENS
+
+// Enabled in debug and development mode while sorting out D3D12 stability issues
+#if UE_BUILD_SHIPPING || UE_BUILD_TEST
+static int32 GD3D12GPUCrashDebuggingMode = 0;
+#else
+static int32 GD3D12GPUCrashDebuggingMode = 1;
+#endif // UE_BUILD_SHIPPING || UE_BUILD_TEST
+
+static TAutoConsoleVariable<int32> CVarD3D12GPUCrashDebuggingMode(
+	TEXT("r.D3D12.GPUCrashDebuggingMode"),
+	GD3D12GPUCrashDebuggingMode,
+	TEXT("Enable GPU crash debugging: tracks the current GPU state and logs information what operations the GPU executed last.\n")
+	TEXT("Optionally generate a GPU crash dump as well (on nVidia hardware only)):\n")
+	TEXT(" 0: GPU crash debugging disabled (default in shipping and test builds)\n")
+	TEXT(" 1: Minimal overhead GPU crash debugging (default in development builds)\n")
+	TEXT(" 2: Enable all available GPU crash debugging options (DRED, Aftermath, ...)\n"),
+	ECVF_RenderThreadSafe | ECVF_ReadOnly
+);
+
+static bool CheckD3DStoredMessages()
+{
+	bool bResult = false;
+
+	TRefCountPtr<ID3D12Debug> d3dDebug;
+	if (SUCCEEDED(D3D12GetDebugInterface(__uuidof(ID3D12Debug), (void**)d3dDebug.GetInitReference())))
+	{
+		FD3D12DynamicRHI* D3D12RHI = FD3D12DynamicRHI::GetD3DRHI();
+		TRefCountPtr<ID3D12InfoQueue> d3dInfoQueue;
+		if (SUCCEEDED(D3D12RHI->GetAdapter().GetD3DDevice()->QueryInterface(__uuidof(ID3D12InfoQueue), (void**)d3dInfoQueue.GetInitReference())))
+		{
+			D3D12_MESSAGE* d3dMessage = nullptr;
+			SIZE_T AllocateSize = 0;
+
+			int StoredMessageCount = d3dInfoQueue->GetNumStoredMessagesAllowedByRetrievalFilter();
+			for (int MessageIndex = 0; MessageIndex < StoredMessageCount; MessageIndex++)
+			{
+				SIZE_T MessageLength = 0;
+				HRESULT hr = d3dInfoQueue->GetMessage(MessageIndex, nullptr, &MessageLength);
+
+				// Ideally the exception handler should not allocate any memory because it could fail
+				// and can cause another exception to be triggered and possible even cause a deadlock.
+				// But for these D3D error message it should be fine right now because they are requested
+				// exceptions when making an error against the API.
+				// Not allocating memory for the messages is easy (cache memory in Adapter), but ANSI_TO_TCHAR
+				// and UE_LOG will also allocate memory and aren't that easy to fix.
+
+				// realloc the message
+				if (MessageLength > AllocateSize)
+				{
+					if (d3dMessage)
+					{
+						FMemory::Free(d3dMessage);
+						d3dMessage = nullptr;
+						AllocateSize = 0;
+					}
+
+					d3dMessage = (D3D12_MESSAGE*)FMemory::Malloc(MessageLength);
+					AllocateSize = MessageLength;
+				}
+
+				if (d3dMessage)
+				{
+					// get the actual message data from the queue
+					hr = d3dInfoQueue->GetMessage(MessageIndex, d3dMessage, &MessageLength);
+
+					if (d3dMessage->Severity == D3D12_MESSAGE_SEVERITY_ERROR)
+					{
+						UE_LOG(LogD3D12RHI, Error, TEXT("%s"), ANSI_TO_TCHAR(d3dMessage->pDescription));
+					}
+					else if (d3dMessage->Severity == D3D12_MESSAGE_SEVERITY_WARNING)
+					{
+						UE_LOG(LogD3D12RHI, Warning, TEXT("%s"), ANSI_TO_TCHAR(d3dMessage->pDescription));
+					}
+					else 
+					{
+						UE_LOG(LogD3D12RHI, Log, TEXT("%s"), ANSI_TO_TCHAR(d3dMessage->pDescription));
+					}
+				}
+
+				// we got messages
+				bResult = true;
+			}
+
+			if (AllocateSize > 0)
+			{
+				FMemory::Free(d3dMessage);
+			}
+		}
+	}
+
+	return bResult;
+}
+
+/** Handle d3d messages and write them to the log file **/
+static LONG __stdcall D3DVectoredExceptionHandler(EXCEPTION_POINTERS* InInfo)
+{
+	// Only handle D3D error codes here
+	if (InInfo->ExceptionRecord->ExceptionCode == _FACDXGI)
+	{
+		if (CheckD3DStoredMessages())
+		{
+			// when we get here, then it means that BreakOnSeverity was set for this error message, so request the debug break here as well
+			UE_DEBUG_BREAK();
+		}
+
+		// Handles the exception
+		return EXCEPTION_CONTINUE_EXECUTION;
+	}
+
+	// continue searching
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+#endif // #if PLATFORM_WINDOWS || PLATFORM_HOLOLENS
+
+
+FD3D12Adapter::FD3D12Adapter(FD3D12AdapterDesc& DescIn)
+	: OwningRHI(nullptr)
+	, bDepthBoundsTestSupported(false)
+	, bHeapNotZeroedSupported(false)
+	, bDebugDevice(false)
+	, GPUCrashDebuggingMode(ED3D12GPUCrashDebugginMode::Disabled)
+	, bDeviceRemoved(false)
+	, Desc(DescIn)
+	, RootSignatureManager(this)
+	, PipelineStateCache(this)
+	, FenceCorePool(this)
+	, DeferredDeletionQueue(this)
+	, DefaultContextRedirector(this, true, false)
+	, DefaultAsyncComputeContextRedirector(this, true, true)
+	, FrameCounter(0)
+	, DebugFlags(0)
+{
+	FMemory::Memzero(&UploadHeapAllocator, sizeof(UploadHeapAllocator));
+	FMemory::Memzero(&Devices, sizeof(Devices));
+
+	uint32 MaxGPUCount = 1; // By default, multi-gpu is disabled.
+#if WITH_MGPU
+	if (!FParse::Value(FCommandLine::Get(), TEXT("MaxGPUCount="), MaxGPUCount))
+	{
+		// If there is a mode token in the command line, enable multi-gpu.
+		if (FParse::Param(FCommandLine::Get(), TEXT("AFR")))
+		{
+			MaxGPUCount = MAX_NUM_GPUS;
+		}
+	}
+	if (FParse::Param(FCommandLine::Get(), TEXT("VMGPU")))
+	{
+		GVirtualMGPU = 1;
+		UE_LOG(LogD3D12RHI, Log, TEXT("Enabling virtual multi-GPU mode"), Desc.NumDeviceNodes);
+	}
+#endif
+
+	if (GVirtualMGPU)
+	{
+		Desc.NumDeviceNodes = FMath::Min<uint32>(MaxGPUCount, MAX_NUM_GPUS);
+	}
+	else
+	{
+		Desc.NumDeviceNodes = FMath::Min3<uint32>(Desc.NumDeviceNodes, MaxGPUCount, MAX_NUM_GPUS);
+	}
+}
+
+void FD3D12Adapter::Initialize(FD3D12DynamicRHI* RHI)
+{
+	OwningRHI = RHI;
+}
+
+
+void FD3D12Adapter::CreateRootDevice(bool bWithDebug)
+{
+	const bool bAllowVendorDevice = !FParse::Param(FCommandLine::Get(), TEXT("novendordevice"));
+
+	CreateDXGIFactory(bWithDebug);
+
+	// QI for the Adapter
+	TRefCountPtr<IDXGIAdapter> TempAdapter;
+	DxgiFactory->EnumAdapters(Desc.AdapterIndex, TempAdapter.GetInitReference());
+	VERIFYD3D12RESULT(TempAdapter->QueryInterface(IID_PPV_ARGS(DxgiAdapter.GetInitReference())));
+
+#if PLATFORM_WINDOWS || (PLATFORM_HOLOLENS && !UE_BUILD_SHIPPING && D3D12_PROFILING_ENABLED)
+	
+	// Two ways to enable GPU crash debugging, command line or the r.GPUCrashDebugging variable
+	// Note: If intending to change this please alert game teams who use this for user support.
+	// GPU crash debugging will enable DRED and Aftermath if available
+	if (FParse::Param(FCommandLine::Get(), TEXT("gpucrashdebugging")))
+	{
+		GPUCrashDebuggingMode = ED3D12GPUCrashDebugginMode::Full;
+	}
+	else
+	{
+		static IConsoleVariable* GPUCrashDebugging = IConsoleManager::Get().FindConsoleVariable(TEXT("r.GPUCrashDebugging"));
+		if (GPUCrashDebugging)
+		{
+			GPUCrashDebuggingMode = (GPUCrashDebugging->GetInt() > 0) ? ED3D12GPUCrashDebugginMode::Full : ED3D12GPUCrashDebugginMode::Disabled;
+		}
+
+		// Still disabled then check the D3D specific cvar for minimal tracking
+		if (GPUCrashDebuggingMode == ED3D12GPUCrashDebugginMode::Disabled)
+		{
+			auto* GPUCrashDebuggingModeVar = IConsoleManager::Get().FindTConsoleVariableDataInt(TEXT("r.D3D12.GPUCrashDebuggingMode"));
+			int32 GPUCrashDebuggingModeValue = GPUCrashDebuggingModeVar ? GPUCrashDebuggingModeVar->GetValueOnAnyThread() : -1;
+			if (GPUCrashDebuggingModeValue >= 0 && GPUCrashDebuggingModeValue <= (int)ED3D12GPUCrashDebugginMode::Full)
+				GPUCrashDebuggingMode = (ED3D12GPUCrashDebugginMode)GPUCrashDebuggingModeValue;
+		}
+	}
+
+	bool bD3d12gpuvalidation = false;
+	if (bWithDebug)
+	{
+		TRefCountPtr<ID3D12Debug> DebugController;
+		if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(DebugController.GetInitReference()))))
+		{
+			DebugController->EnableDebugLayer();
+			bDebugDevice = true;
+
+			if (FParse::Param(FCommandLine::Get(), TEXT("d3d12gpuvalidation")) || FParse::Param(FCommandLine::Get(), TEXT("gpuvalidation")))
+			{
+				TRefCountPtr<ID3D12Debug1> DebugController1;
+				VERIFYD3D12RESULT(DebugController->QueryInterface(IID_PPV_ARGS(DebugController1.GetInitReference())));
+				DebugController1->SetEnableGPUBasedValidation(true);
+
+				SetEmitDrawEvents(true);
+				bD3d12gpuvalidation = true;
+			}
+		}
+		else
+		{
+			bWithDebug = false;
+			UE_LOG(LogD3D12RHI, Fatal, TEXT("The debug interface requires the D3D12 SDK Layers. Please install the Graphics Tools for Windows. See: https://docs.microsoft.com/en-us/windows/uwp/gaming/use-the-directx-runtime-and-visual-studio-graphics-diagnostic-features"));
+		}
+	}
+		
+	// Setup DRED if requested
+	if (GPUCrashDebuggingMode == ED3D12GPUCrashDebugginMode::Minimal || GPUCrashDebuggingMode == ED3D12GPUCrashDebugginMode::Full || FParse::Param(FCommandLine::Get(), TEXT("dred")))
+	{
+		ID3D12DeviceRemovedExtendedDataSettings* DredSettings = nullptr;
+		HRESULT hr = D3D12GetDebugInterface(IID_PPV_ARGS(&DredSettings));
+
+		// Can fail if not on correct Windows Version - needs 1903 or newer
+		if (SUCCEEDED(hr))
+		{
+			// Turn on AutoBreadcrumbs and Page Fault reporting
+			DredSettings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+			DredSettings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+
+			UE_LOG(LogD3D12RHI, Log, TEXT("[DRED] Dred enabled"));
+		}
+		else
+		{
+			UE_LOG(LogD3D12RHI, Log, TEXT("[DRED] DRED requested but interface was not found, hresult: %x. DRED only works on Windows 10 1903+."), hr);
+		}
+
+#ifdef __ID3D12DeviceRemovedExtendedDataSettings1_INTERFACE_DEFINED__
+		TRefCountPtr<ID3D12DeviceRemovedExtendedDataSettings1> DredSettings1;
+		hr = D3D12GetDebugInterface(IID_PPV_ARGS(DredSettings1.GetInitReference()));
+		if (SUCCEEDED(hr))
+		{
+			DredSettings1->SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+			UE_LOG(LogD3D12RHI, Log, TEXT("[DRED] Dred breadcrumb context enabled"));
+		}
+#endif
+	}
+
+	UE_LOG(LogD3D12RHI, Log, TEXT("InitD3DDevice: -D3DDebug = %s -D3D12GPUValidation = %s"), bWithDebug ? TEXT("on") : TEXT("off"), bD3d12gpuvalidation ? TEXT("on") : TEXT("off"));
+
+#endif // PLATFORM_WINDOWS || (PLATFORM_HOLOLENS && !UE_BUILD_SHIPPING && D3D12_PROFILING_ENABLED)
+
+#if USE_PIX
+	UE_LOG(LogD3D12RHI, Log, TEXT("Emitting draw events for PIX profiling."));
+	SetEmitDrawEvents(true);
+#endif
+
+	bool bDeviceCreated = false;
+#if !PLATFORM_CPU_ARM_FAMILY && (PLATFORM_WINDOWS)
+	if (IsRHIDeviceAMD() && OwningRHI->GetAmdAgsContext())
+	{
+		auto* CVarShaderDevelopmentMode = IConsoleManager::Get().FindTConsoleVariableDataInt(TEXT("r.ShaderDevelopmentMode"));
+		auto* CVarDisableEngineAndAppRegistration = IConsoleManager::Get().FindTConsoleVariableDataInt(TEXT("r.DisableEngineAndAppRegistration"));
+
+		const bool bDisableEngineRegistration = (CVarShaderDevelopmentMode && CVarShaderDevelopmentMode->GetValueOnAnyThread() != 0) ||
+			(CVarDisableEngineAndAppRegistration && CVarDisableEngineAndAppRegistration->GetValueOnAnyThread() != 0);
+		const bool bDisableAppRegistration = bDisableEngineRegistration || !FApp::HasProjectName();
+
+		// Creating the Direct3D device with AGS registration and extensions.
+		AGSDX12DeviceCreationParams AmdDeviceCreationParams = {
+			GetAdapter(),											// IDXGIAdapter*               pAdapter;
+			__uuidof(**(RootDevice.GetInitReference())),			// IID                        

@@ -1,0 +1,46 @@
+urve with no intention matching.");
+		}
+		else
+		{
+			NotificationText = LOCTEXT("MatchedBufferedCurvesByIndex", "Applied buffered curves with no intention matching. Order not guranteed.");
+		}
+
+		FNotificationInfo Info(NotificationText);
+		Info.ExpireDuration = 6.f;
+		Info.bUseLargeFont = false;
+		Info.bUseSuccessFailIcons = false;
+		FSlateNotificationManager::Get().AddNotification(Info);
+
+		// Early out
+		return true;
+	}
+
+	// If we got this far, we have no idea what to do. They're trying to match a bunch of curves with no intention and different amounts. 
+	// Warn of failure and give up.
+	{
+		const FText FailedNotificationText = LOCTEXT("NoBufferedCurvesMatched", "Failed to apply buffered curves, apply them one at a time instead.");
+
+		FNotificationInfo FailInfo(FailedNotificationText);
+		FailInfo.ExpireDuration = 6.f;
+		FailInfo.bUseLargeFont = false;
+		FailInfo.bUseSuccessFailIcons = true;
+		FSlateNotificationManager::Get().AddNotification(FailInfo);
+	}
+
+	// No need to make a entry in the Undo/Redo buffer if it didn't apply anything.
+	Transaction.Cancel();
+	return false;
+}
+
+void FCurveEditor::PostUndo(bool bSuccess)
+{
+	if (WeakPanel.IsValid())
+	{
+		WeakPanel.Pin()->PostUndo();
+	}
+
+	// If you create keys and then undo them the selection set still thinks there's keys selected.
+	// This presents issues with context menus and other things that are activated when there is a selection set.
+	// To fix this, we have to loop through all of our curve models, and re-select only the key handles that were
+	// previously selected that still exist. Ugly, but reasonably functional.
+	TMap<FCurveModelID, FKeyHandleSet> Sele

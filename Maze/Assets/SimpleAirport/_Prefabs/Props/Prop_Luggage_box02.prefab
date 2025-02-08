@@ -1,0 +1,64 @@
+               }
+                    }
+                }
+            }
+        }
+
+        private bool VerifySignature(
+            CmsSignature signatureProcessor,
+            X509Certificate2 certificate,
+            bool compatMode)
+        {
+            using (IncrementalHash hasher = PrepareDigest(compatMode))
+            {
+                if (hasher == null)
+                {
+                    Debug.Assert(compatMode, $"{nameof(PrepareDigest)} returned null for the primary check");
+                    return false;
+                }
+
+#if netcoreapp
+                // SHA-2-512 is the biggest digest type we know about.
+                Span<byte> digestValue = stackalloc byte[512 / 8];
+                ReadOnlySpan<byte> digest = digestValue;
+                ReadOnlyMemory<byte> signature = _signature;
+
+                if (hasher.TryGetHashAndReset(digestValue, out int bytesWritten))
+                {
+                    digest = digestValue.Slice(0, bytesWritten);
+                }
+                else
+                {
+                    digest = hasher.GetHashAndReset();
+                }
+#else
+                byte[] digest = hasher.GetHashAndReset();
+                byte[] signature = _signature.ToArray();
+#endif
+
+                return signatureProcessor.VerifySignature(
+                    digest,
+                    signature,
+                    DigestAlgorithm.Value,
+                    hasher.AlgorithmName,
+                    _signatureAlgorithmParameters,
+                    certificate);
+            }
+        }
+
+        private HashAlgorithmName GetDigestAlgorithm()
+        {
+            return Helpers.GetDigestAlgorithm(DigestAlgorithm.Value);
+        }
+
+        internal static CryptographicAttributeObjectCollection MakeAttributeCollection(AttributeAsn[] attributes)
+        {
+            var coll = new CryptographicAttributeObjectCollection();
+
+            if (attributes == null)
+                return coll;
+
+            foreach (AttributeAsn attribute in attributes)
+            {
+                coll.AddWithoutMerge(MakeAttribute(attribute));
+          

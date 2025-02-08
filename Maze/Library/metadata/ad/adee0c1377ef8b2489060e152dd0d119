@@ -1,0 +1,129 @@
+TypeAttributes.ExplicitLayout: layoutKind = LayoutKind.Explicit; break;
+                case TypeAttributes.AutoLayout: layoutKind = LayoutKind.Auto; break;
+                case TypeAttributes.SequentialLayout: layoutKind = LayoutKind.Sequential; break;
+                default: Contract.Assume(false); break;
+            }
+
+            CharSet charSet = CharSet.None;
+            switch (type.Attributes & TypeAttributes.StringFormatMask)
+            {
+                case TypeAttributes.AnsiClass: charSet = CharSet.Ansi; break;
+                case TypeAttributes.AutoClass: charSet = CharSet.Auto; break;
+                case TypeAttributes.UnicodeClass: charSet = CharSet.Unicode; break;
+                default: Contract.Assume(false); break;
+            }
+
+#if MONO
+            type.GetPacking (out pack, out size);
+#else
+            type.GetRuntimeModule().MetadataImport.GetClassLayout(type.MetadataToken, out pack, out size);
+#endif
+
+            // Metadata parameter checking should not have allowed 0 for packing size.
+            // The runtime later converts a packing size of 0 to 8 so do the same here
+            // because it's more useful from a user perspective. 
+            if (pack == 0)
+                pack = DEFAULT_PACKING_SIZE;
+
+            return new StructLayoutAttribute(layoutKind, pack, size, charSet);
+        }
+
+        internal static bool IsDefined(RuntimeType type)
+        {
+            if (type.IsInterface || type.HasElementType || type.IsGenericParameter)
+                return false;
+
+            return true;
+        }
+
+        internal LayoutKind _val;
+
+        internal StructLayoutAttribute(LayoutKind layoutKind, int pack, int size, CharSet charSet)
+        {
+            _val = layoutKind;
+            Pack = pack;
+            Size = size;
+            CharSet = charSet;
+        }
+
+        public StructLayoutAttribute(LayoutKind layoutKind)
+        {
+            _val = layoutKind;
+        }
+        public StructLayoutAttribute(short layoutKind)
+        {
+            _val = (LayoutKind)layoutKind;
+        }
+        public LayoutKind Value { get { return _val; } }
+        public int Pack;
+        public int Size;
+        public CharSet CharSet;
+    }
+
+    [AttributeUsage(AttributeTargets.Field, Inherited = false)]
+    [System.Runtime.InteropServices.ComVisible(true)]
+    public unsafe sealed class FieldOffsetAttribute : Attribute
+    {
+        [System.Security.SecurityCritical]  // auto-generated
+        internal static Attribute GetCustomAttribute(RuntimeFieldInfo field)
+        {
+            int fieldOffset;
+
+            if (field.DeclaringType != null &&
+#if MONO
+                (fieldOffset = field.GetFieldOffset ()) >= 0)
+#else
+                field.GetRuntimeModule().MetadataImport.GetFieldOffset(field.DeclaringType.MetadataToken, field.MetadataToken, out fieldOffset))
+#endif
+                return new FieldOffsetAttribute(fieldOffset);
+
+            return null;
+        }
+
+        [System.Security.SecurityCritical]  // auto-generated
+        internal static bool IsDefined(RuntimeFieldInfo field)
+        {
+            return GetCustomAttribute(field) != null;
+        }
+
+        internal int _val;
+        public FieldOffsetAttribute(int offset)
+        {
+            _val = offset;
+        }
+        public int Value { get { return _val; } }
+    }
+
+#if FEATURE_COMINTEROP || MOBILE_LEGACY
+    [AttributeUsage(AttributeTargets.Parameter | AttributeTargets.Field | AttributeTargets.Property | AttributeTargets.ReturnValue, Inherited = false)] 
+    [System.Runtime.InteropServices.ComVisible(true)]
+    public sealed class ComAliasNameAttribute : Attribute
+    {
+        internal String _val;
+        public ComAliasNameAttribute(String alias)
+        {
+            _val = alias;
+        }
+        public String Value { get {return _val;} }  
+    }    
+
+    [AttributeUsage(AttributeTargets.Assembly | AttributeTargets.Class | AttributeTargets.Interface, Inherited = false)] 
+    [System.Runtime.InteropServices.ComVisible(true)]
+    public sealed class AutomationProxyAttribute : Attribute
+    {
+        internal bool _val;
+        public AutomationProxyAttribute(bool val)
+        {
+            _val = val;
+        }
+        public bool Value { get {return _val;} }
+    }
+
+    [AttributeUsage(AttributeTargets.Assembly, Inherited = false, AllowMultiple = true)] 
+    [System.Runtime.InteropServices.ComVisible(true)]
+    public sealed class PrimaryInteropAssemblyAttribute : Attribute
+    {
+        internal int _major;
+        internal int _minor;
+        
+        pub

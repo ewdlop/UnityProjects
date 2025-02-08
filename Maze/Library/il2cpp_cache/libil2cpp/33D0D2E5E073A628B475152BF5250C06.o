@@ -1,0 +1,387 @@
+ universe map in the same space and free "drop".
+ */
+static __isl_give isl_map *replace_by_universe(__isl_take isl_map *map,
+	__isl_take isl_map *drop)
+{
+	isl_map *res;
+
+	res = isl_map_universe(isl_map_get_space(map));
+	isl_map_free(map);
+	isl_map_free(drop);
+	return res;
+}
+
+/* Return a map that has the same intersection with "context" as "map"
+ * and that is as "simple" as possible.
+ *
+ * If "map" is already the universe, then we cannot make it any simpler.
+ * Similarly, if "context" is the universe, then we cannot exploit it
+ * to simplify "map"
+ * If "map" and "context" are identical to each other, then we can
+ * return the corresponding universe.
+ *
+ * If either "map" or "context" consists of multiple disjuncts,
+ * then check if "context" happens to be a subset of "map",
+ * in which case all constraints can be removed.
+ * In case of multiple disjuncts, the standard procedure
+ * may not be able to detect that all constraints can be removed.
+ *
+ * If none of these cases apply, we have to work a bit harder.
+ * During this computation, we make use of a single disjunct context,
+ * so if the original context consists of more than one disjunct
+ * then we need to approximate the context by a single disjunct set.
+ * Simply taking the simple hull may drop constraints that are
+ * only implicitly available in each disjunct.  We therefore also
+ * look for constraints among those defining "map" that are valid
+ * for the context.  These can then be used to simplify away
+ * the corresponding constraints in "map".
+ */
+static __isl_give isl_map *map_gist(__isl_take isl_map *map,
+	__isl_take isl_map *context)
+{
+	int equal;
+	int is_universe;
+	int single_disjunct_map, single_disjunct_context;
+	isl_bool subset;
+	isl_basic_map *hull;
+
+	is_universe = isl_map_plain_is_universe(map);
+	if (is_universe >= 0 && !is_universe)
+		is_universe = isl_map_plain_is_universe(context);
+	if (is_universe < 0)
+		goto error;
+	if (is_universe) {
+		isl_map_free(context);
+		return map;
+	}
+
+	equal = isl_map_plain_is_equal(map, context);
+	if (equal < 0)
+		goto error;
+	if (equal)
+		return replace_by_universe(map, context);
+
+	single_disjunct_map = isl_map_n_basic_map(map) == 1;
+	single_disjunct_context = isl_map_n_basic_map(context) == 1;
+	if (!single_disjunct_map || !single_disjunct_context) {
+		subset = isl_map_is_subset(context, map);
+		if (subset < 0)
+			goto error;
+		if (subset)
+			return replace_by_universe(map, context);
+	}
+
+	context = isl_map_compute_divs(context);
+	if (!context)
+		goto error;
+	if (single_disjunct_context) {
+		hull = isl_map_simple_hull(context);
+	} else {
+		isl_ctx *ctx;
+		isl_map_list *list;
+
+		ctx = isl_map_get_ctx(map);
+		list = isl_map_list_alloc(ctx, 2);
+		list = isl_map_list_add(list, isl_map_copy(context));
+		list = isl_map_list_add(list, isl_map_copy(map));
+		hull = isl_map_unshifted_simple_hull_from_map_list(context,
+								    list);
+	}
+	return isl_map_gist_basic_map(map, hull);
+error:
+	isl_map_free(map);
+	isl_map_free(context);
+	return NULL;
+}
+
+__isl_give isl_map *isl_map_gist(__isl_take isl_map *map,
+	__isl_take isl_map *context)
+{
+	return isl_map_align_params_map_map_and(map, context, &map_gist);
+}
+
+struct isl_basic_set *isl_basic_set_gist(struct isl_basic_set *bset,
+						struct isl_basic_set *context)
+{
+	return bset_from_bmap(isl_basic_map_gist(bset_to_bmap(bset),
+						bset_to_bmap(context)));
+}
+
+__isl_give isl_set *isl_set_gist_basic_set(__isl_take isl_set *set,
+	__isl_take isl_basic_set *context)
+{
+	return set_from_map(isl_map_gist_basic_map(set_to_map(set),
+					bset_to_bmap(context)));
+}
+
+__isl_give isl_set *isl_set_gist_params_basic_set(__isl_take isl_set *set,
+	__isl_take isl_basic_set *context)
+{
+	isl_space *space = isl_set_get_space(set);
+	isl_basic_set *dom_context = isl_basic_set_universe(space);
+	dom_context = isl_basic_set_intersect_params(dom_context, context);
+	return isl_set_gist_basic_set(set, dom_context);
+}
+
+__isl_give isl_set *isl_set_gist(__isl_take isl_set *set,
+	__isl_take isl_set *context)
+{
+	return set_from_map(isl_map_gist(set_to_map(set), set_to_map(context)));
+}
+
+/* Compute the gist of "bmap" with respect to the constraints "context"
+ * on the domain.
+ */
+__isl_give isl_basic_map *isl_basic_map_gist_domain(
+	__isl_take isl_basic_map *bmap, __isl_take isl_basic_set *context)
+{
+	isl_space *space = isl_basic_map_get_space(bmap);
+	isl_basic_map *bmap_context = isl_basic_map_universe(space);
+
+	bmap_context = isl_basic_map_intersect_domain(bmap_context, context);
+	return isl_basic_map_gist(bmap, bmap_context);
+}
+
+__isl_give isl_map *isl_map_gist_domain(__isl_take isl_map *map,
+	__isl_take isl_set *context)
+{
+	isl_map *map_context = isl_map_universe(isl_map_get_space(map));
+	map_context = isl_map_intersect_domain(map_context, context);
+	return isl_map_gist(map, map_context);
+}
+
+__isl_give isl_map *isl_map_gist_range(__isl_take isl_map *map,
+	__isl_take isl_set *context)
+{
+	isl_map *map_context = isl_map_universe(isl_map_get_space(map));
+	map_context = isl_map_intersect_range(map_context, context);
+	return isl_map_gist(map, map_context);
+}
+
+__isl_give isl_map *isl_map_gist_params(__isl_take isl_map *map,
+	__isl_take isl_set *context)
+{
+	isl_map *map_context = isl_map_universe(isl_map_get_space(map));
+	map_context = isl_map_intersect_params(map_context, context);
+	return isl_map_gist(map, map_context);
+}
+
+__isl_give isl_set *isl_set_gist_params(__isl_take isl_set *set,
+	__isl_take isl_set *context)
+{
+	return isl_map_gist_params(set, context);
+}
+
+/* Quick check to see if two basic maps are disjoint.
+ * In particular, we reduce the equalities and inequalities of
+ * one basic map in the context of the equalities of the other
+ * basic map and check if we get a contradiction.
+ */
+isl_bool isl_basic_map_plain_is_disjoint(__isl_keep isl_basic_map *bmap1,
+	__isl_keep isl_basic_map *bmap2)
+{
+	struct isl_vec *v = NULL;
+	int *elim = NULL;
+	unsigned total;
+	int i;
+
+	if (!bmap1 || !bmap2)
+		return isl_bool_error;
+	isl_assert(bmap1->ctx, isl_space_is_equal(bmap1->dim, bmap2->dim),
+			return isl_bool_error);
+	if (bmap1->n_div || bmap2->n_div)
+		return isl_bool_false;
+	if (!bmap1->n_eq && !bmap2->n_eq)
+		return isl_bool_false;
+
+	total = isl_space_dim(bmap1->dim, isl_dim_all);
+	if (total == 0)
+		return isl_bool_false;
+	v = isl_vec_alloc(bmap1->ctx, 1 + total);
+	if (!v)
+		goto error;
+	elim = isl_alloc_array(bmap1->ctx, int, total);
+	if (!elim)
+		goto error;
+	compute_elimination_index(bmap1, elim);
+	for (i = 0; i < bmap2->n_eq; ++i) {
+		int reduced;
+		reduced = reduced_using_equalities(v->block.data, bmap2->eq[i],
+							bmap1, elim);
+		if (reduced && !isl_int_is_zero(v->block.data[0]) &&
+		    isl_seq_first_non_zero(v->block.data + 1, total) == -1)
+			goto disjoint;
+	}
+	for (i = 0; i < bmap2->n_ineq; ++i) {
+		int reduced;
+		reduced = reduced_using_equalities(v->block.data,
+						bmap2->ineq[i], bmap1, elim);
+		if (reduced && isl_int_is_neg(v->block.data[0]) &&
+		    isl_seq_first_non_zero(v->block.data + 1, total) == -1)
+			goto disjoint;
+	}
+	compute_elimination_index(bmap2, elim);
+	for (i = 0; i < bmap1->n_ineq; ++i) {
+		int reduced;
+		reduced = reduced_using_equalities(v->block.data,
+						bmap1->ineq[i], bmap2, elim);
+		if (reduced && isl_int_is_neg(v->block.data[0]) &&
+		    isl_seq_first_non_zero(v->block.data + 1, total) == -1)
+			goto disjoint;
+	}
+	isl_vec_free(v);
+	free(elim);
+	return isl_bool_false;
+disjoint:
+	isl_vec_free(v);
+	free(elim);
+	return isl_bool_true;
+error:
+	isl_vec_free(v);
+	free(elim);
+	return isl_bool_error;
+}
+
+int isl_basic_set_plain_is_disjoint(__isl_keep isl_basic_set *bset1,
+	__isl_keep isl_basic_set *bset2)
+{
+	return isl_basic_map_plain_is_disjoint(bset_to_bmap(bset1),
+					      bset_to_bmap(bset2));
+}
+
+/* Does "test" hold for all pairs of basic maps in "map1" and "map2"?
+ */
+static isl_bool all_pairs(__isl_keep isl_map *map1, __isl_keep isl_map *map2,
+	isl_bool (*test)(__isl_keep isl_basic_map *bmap1,
+		__isl_keep isl_basic_map *bmap2))
+{
+	int i, j;
+
+	if (!map1 || !map2)
+		return isl_bool_error;
+
+	for (i = 0; i < map1->n; ++i) {
+		for (j = 0; j < map2->n; ++j) {
+			isl_bool d = test(map1->p[i], map2->p[j]);
+			if (d != isl_bool_true)
+				return d;
+		}
+	}
+
+	return isl_bool_true;
+}
+
+/* Are "map1" and "map2" obviously disjoint, based on information
+ * that can be derived without looking at the individual basic maps?
+ *
+ * In particular, if one of them is empty or if they live in different spaces
+ * (ignoring parameters), then they are clearly disjoint.
+ */
+static isl_bool isl_map_plain_is_disjoint_global(__isl_keep isl_map *map1,
+	__isl_keep isl_map *map2)
+{
+	isl_bool disjoint;
+	isl_bool match;
+
+	if (!map1 || !map2)
+		return isl_bool_error;
+
+	disjoint = isl_map_plain_is_empty(map1);
+	if (disjoint < 0 || disjoint)
+		return disjoint;
+
+	disjoint = isl_map_plain_is_empty(map2);
+	if (disjoint < 0 || disjoint)
+		return disjoint;
+
+	match = isl_space_tuple_is_equal(map1->dim, isl_dim_in,
+				map2->dim, isl_dim_in);
+	if (match < 0 || !match)
+		return match < 0 ? isl_bool_error : isl_bool_true;
+
+	match = isl_space_tuple_is_equal(map1->dim, isl_dim_out,
+				map2->dim, isl_dim_out);
+	if (match < 0 || !match)
+		return match < 0 ? isl_bool_error : isl_bool_true;
+
+	return isl_bool_false;
+}
+
+/* Are "map1" and "map2" obviously disjoint?
+ *
+ * If one of them is empty or if they live in different spaces (ignoring
+ * parameters), then they are clearly disjoint.
+ * This is checked by isl_map_plain_is_disjoint_global.
+ *
+ * If they have different parameters, then we skip any further tests.
+ *
+ * If they are obviously equal, but not obviously empty, then we will
+ * not be able to detect if they are disjoint.
+ *
+ * Otherwise we check if each basic map in "map1" is obviously disjoint
+ * from each basic map in "map2".
+ */
+isl_bool isl_map_plain_is_disjoint(__isl_keep isl_map *map1,
+	__isl_keep isl_map *map2)
+{
+	isl_bool disjoint;
+	isl_bool intersect;
+	isl_bool match;
+
+	disjoint = isl_map_plain_is_disjoint_global(map1, map2);
+	if (disjoint < 0 || disjoint)
+		return disjoint;
+
+	match = isl_map_has_equal_params(map1, map2);
+	if (match < 0 || !match)
+		return match < 0 ? isl_bool_error : isl_bool_false;
+
+	intersect = isl_map_plain_is_equal(map1, map2);
+	if (intersect < 0 || intersect)
+		return intersect < 0 ? isl_bool_error : isl_bool_false;
+
+	return all_pairs(map1, map2, &isl_basic_map_plain_is_disjoint);
+}
+
+/* Are "map1" and "map2" disjoint?
+ * The parameters are assumed to have been aligned.
+ *
+ * In particular, check whether all pairs of basic maps are disjoint.
+ */
+static isl_bool isl_map_is_disjoint_aligned(__isl_keep isl_map *map1,
+	__isl_keep isl_map *map2)
+{
+	return all_pairs(map1, map2, &isl_basic_map_is_disjoint);
+}
+
+/* Are "map1" and "map2" disjoint?
+ *
+ * They are disjoint if they are "obviously disjoint" or if one of them
+ * is empty.  Otherwise, they are not disjoint if one of them is universal.
+ * If the two inputs are (obviously) equal and not empty, then they are
+ * not disjoint.
+ * If none of these cases apply, then check if all pairs of basic maps
+ * are disjoint after aligning the parameters.
+ */
+isl_bool isl_map_is_disjoint(__isl_keep isl_map *map1, __isl_keep isl_map *map2)
+{
+	isl_bool disjoint;
+	isl_bool intersect;
+
+	disjoint = isl_map_plain_is_disjoint_global(map1, map2);
+	if (disjoint < 0 || disjoint)
+		return disjoint;
+
+	disjoint = isl_map_is_empty(map1);
+	if (disjoint < 0 || disjoint)
+		return disjoint;
+
+	disjoint = isl_map_is_empty(map2);
+	if (disjoint < 0 || disjoint)
+		return disjoint;
+
+	intersect = isl_map_plain_is_universe(map1);
+	if (intersect < 0 || intersect)
+		return intersect < 0 ? isl_bool_error : isl_bool_false;
+
+	intersect = isl_map_plain_is_universe

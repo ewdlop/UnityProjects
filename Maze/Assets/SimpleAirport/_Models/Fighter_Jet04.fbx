@@ -1,0 +1,1569 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	D3D12Util.h: D3D RHI utility definitions.
+	=============================================================================*/
+
+#pragma once
+
+#include "CoreMinimal.h"
+#include "Containers/Queue.h"
+#include "RenderUtils.h"
+
+#if WINVER == 0x0502
+// Windows XP uses Win7 sdk, and in that one winerror.h doesn't include them
+#ifndef DXGI_ERROR_INVALID_CALL
+#define DXGI_ERROR_INVALID_CALL                 MAKE_DXGI_HRESULT(1)
+#define DXGI_ERROR_NOT_FOUND                    MAKE_DXGI_HRESULT(2)
+#define DXGI_ERROR_MORE_DATA                    MAKE_DXGI_HRESULT(3)
+#define DXGI_ERROR_UNSUPPORTED                  MAKE_DXGI_HRESULT(4)
+#define DXGI_ERROR_DEVICE_REMOVED               MAKE_DXGI_HRESULT(5)
+#define DXGI_ERROR_DEVICE_HUNG                  MAKE_DXGI_HRESULT(6)
+#define DXGI_ERROR_DEVICE_RESET                 MAKE_DXGI_HRESULT(7)
+#define DXGI_ERROR_WAS_STILL_DRAWING            MAKE_DXGI_HRESULT(10)
+#define DXGI_ERROR_FRAME_STATISTICS_DISJOINT    MAKE_DXGI_HRESULT(11)
+#define DXGI_ERROR_GRAPHICS_VIDPN_SOURCE_IN_USE MAKE_DXGI_HRESULT(12)
+#define DXGI_ERROR_DRIVER_INTERNAL_ERROR        MAKE_DXGI_HRESULT(32)
+#define DXGI_ERROR_NONEXCLUSIVE                 MAKE_DXGI_HRESULT(33)
+#define DXGI_ERROR_NOT_CURRENTLY_AVAILABLE      MAKE_DXGI_HRESULT(34)
+#define DXGI_ERROR_REMOTE_CLIENT_DISCONNECTED   MAKE_DXGI_HRESULT(35)
+#define DXGI_ERROR_REMOTE_OUTOFMEMORY           MAKE_DXGI_HRESULT(36)
+#endif
+
+#endif
+
+namespace D3D12RHI
+{
+	/**
+	 * Dump & Log all the information we have on a GPU crash (NvAfterMath, DRED, Breadcrumbs, ...) and force quit
+	 */
+	extern void TerminateOnGPUCrash(ID3D12Device* InDevice, const void* InGPUCrashDump, const size_t InGPUCrashDumpSize);
+
+	/**
+	 * Checks that the given result isn't a failure.  If it is, the application exits with an appropriate error message.
+	 * @param	Result - The result code to check
+	 * @param	Code - The code which yielded the result.
+	 * @param	Filename - The filename of the source file containing Code.
+	 * @param	Line - The line number of Code within Filename.
+	 */
+	extern void VerifyD3D12Result(HRESULT Result, const ANSICHAR* Code, const ANSICHAR* Filename, uint32 Line, ID3D12Device* Device, FString Message = FString());
+
+	/**
+	* Checks that the given result isn't a failure.  If it is, the application exits with an appropriate error message.
+	* @param	Result - The result code to check
+	* @param	Code - The code which yielded the result.
+	* @param	Filename - The filename of the source file containing Code.
+	* @param	Line - The line number of Code within Filename.
+	*/
+	extern void VerifyD3D12CreateTextureResult(HRESULT D3DResult, const ANSICHAR* Code, const ANSICHAR* Filename, uint32 Line, const D3D12_RESOURCE_DESC& TextureDesc, ID3D12Device* Device);
+
+	/**
+	 * A macro for using VERIFYD3D12RESULT that automatically passes in the code and filename/line.
+	 */
+#define VERIFYD3D12RESULT_LAMBDA(x, Device, Lambda)	{HRESULT hres = x; if (FAILED(hres)) { VerifyD3D12Result(hres, #x, __FILE__, __LINE__, Device, Lambda()); }}
+#define VERIFYD3D12RESULT_EX(x, Device)	{HRESULT hres = x; if (FAILED(hres)) { VerifyD3D12Result(hres, #x, __FILE__, __LINE__, Device); }}
+#define VERIFYD3D12RESULT(x)			{HRESULT hres = x; if (FAILED(hres)) { VerifyD3D12Result(hres, #x, __FILE__, __LINE__, nullptr); }}
+#define VERIFYD3D12CREATETEXTURERESULT(x, Desc, Device) {HRESULT hres = x; if (FAILED(hres)) { VerifyD3D12CreateTextureResult(hres, #x, __FILE__, __LINE__, Desc, Device); }}
+
+	/**
+	 * Checks that a COM object has the expected number of references.
+	 */
+	extern void VerifyComRefCount(IUnknown* Object, int32 ExpectedRefs, const TCHAR* Code, const TCHAR* Filename, int32 Line);
+#define checkComRefCount(Obj,ExpectedRefs) VerifyComRefCount(Obj,ExpectedRefs,TEXT(#Obj),TEXT(__FILE__),__LINE__)
+
+	/** Returns a string for the provided DXGI format. */
+	const TCHAR* GetD3D12TextureFormatString(DXGI_FORMAT TextureFormat);
+}
+
+using namespace D3D12RHI;
+
+class FD3D12Resource;
+
+void SetName(ID3D12Object* const Object, const TCHAR* const Name);
+void SetName(FD3D12Resource* const Resource, const TCHAR* const Name);
+
+enum EShaderVisibility
+{
+	SV_Vertex,
+	SV_Pixel,
+	SV_Hull,
+	SV_Domain,
+	SV_Geometry,
+	SV_All,
+	SV_ShaderVisibilityCount
+};
+
+enum ERTRootSignatureType
+{
+	RS_Raster,
+	RS_RayTracingGlobal,
+	RS_RayTracingLocal,
+};
+
+struct FShaderRegisterCounts
+{
+	uint8 SamplerCount;
+	uint8 ConstantBufferCount;
+	uint8 ShaderResourceCount;
+	uint8 UnorderedAccessCount;
+};
+
+struct FD3D12QuantizedBoundShaderState
+{
+	FShaderRegisterCounts RegisterCounts[SV_ShaderVisibilityCount];
+	ERTRootSignatureType RootSignatureType = RS_Raster;
+	bool bAllowIAInputLayout;
+
+	inline bool operator==(const FD3D12QuantizedBoundShaderState& RHS) const
+	{
+		return 0 == FMemory::Memcmp(this, &RHS, sizeof(RHS));
+	}
+
+	friend uint32 GetTypeHash(const FD3D12QuantizedBoundShaderState& Key);
+
+	static void InitShaderRegisterCounts(const D3D12_RESOURCE_BINDING_TIER& ResourceBindingTier, const FShaderCodePackedResourceCounts& Counts, FShaderRegisterCounts& Shader, bool bAllowUAVs = false);
+};
+
+/**
+* Creates a discrete bound shader state object from a collection of graphics pipeline shaders.
+*/
+
+class FD3D12BoundShaderState;
+extern void QuantizeBoundShaderState(
+	const D3D12_RESOURCE_BINDING_TIER& ResourceBindingTier,
+	const FD3D12BoundShaderState* const BSS,
+	FD3D12QuantizedBoundShaderState &OutQBSS);
+
+class FD3D12ComputeShader;
+extern void QuantizeBoundShaderState(
+	const D3D12_RESOURCE_BINDING_TIER& ResourceBindingTier,
+	const FD3D12ComputeShader* const ComputeShader,
+	FD3D12QuantizedBoundShaderState &OutQBSS);
+
+#if D3D12_RHI_RAYTRACING
+class FD3D12RayTracingShader;
+FD3D12QuantizedBoundShaderState GetRayTracingGlobalRootSignatureDesc();
+extern void QuantizeBoundShaderState(
+	EShaderFrequency ShaderFrequency,
+	const D3D12_RESOURCE_BINDING_TIER& ResourceBindingTier,
+	const FD3D12RayTracingShader* const Shader,
+	FD3D12QuantizedBoundShaderState &OutQBSS);
+#endif
+
+/**
+* Convert from ECubeFace to D3DCUBEMAP_FACES type
+* @param Face - ECubeFace type to convert
+* @return D3D cube face enum value
+*/
+FORCEINLINE uint32 GetD3D12CubeFace(ECubeFace Face)
+{
+	switch (Face)
+	{
+	case CubeFace_PosX:
+	default:
+		return 0;//D3DCUBEMAP_FACE_POSITIVE_X;
+	case CubeFace_NegX:
+		return 1;//D3DCUBEMAP_FACE_NEGATIVE_X;
+	case CubeFace_PosY:
+		return 2;//D3DCUBEMAP_FACE_POSITIVE_Y;
+	case CubeFace_NegY:
+		return 3;//D3DCUBEMAP_FACE_NEGATIVE_Y;
+	case CubeFace_PosZ:
+		return 4;//D3DCUBEMAP_FACE_POSITIVE_Z;
+	case CubeFace_NegZ:
+		return 5;//D3DCUBEMAP_FACE_NEGATIVE_Z;
+	};
+}
+
+/**
+* Calculate a subresource index for a texture
+*/
+FORCEINLINE uint32 CalcSubresource(uint32 MipSlice, uint32 ArraySlice, uint32 MipLevels)
+{
+	return MipSlice + ArraySlice * MipLevels;
+}
+
+/**
+ * Keeps track of Locks for D3D12 objects
+ */
+class FD3D12LockedKey
+{
+public:
+	void* SourceObject;
+	uint32 Subresource;
+
+public:
+	FD3D12LockedKey() : SourceObject(NULL)
+		, Subresource(0)
+	{}
+	FD3D12LockedKey(FD3D12Resource* source, uint32 subres = 0) : SourceObject((void*)source)
+		, Subresource(subres)
+	{}
+	FD3D12LockedKey(class FD3D12ResourceLocation* source, uint32 subres = 0) : SourceObject((void*)source)
+		, Subresource(subres)
+	{}
+
+	template<class ClassType>
+	FD3D12LockedKey(ClassType* source, uint32 subres = 0) : SourceObject((void*)source)
+		, Subresource(subres)
+	{}
+	bool operator==(const FD3D12LockedKey& Other) const
+	{
+		return SourceObject == Other.SourceObject && Subresource == Other.Subresource;
+	}
+	bool operator!=(const FD3D12LockedKey& Other) const
+	{
+		return SourceObject != Other.SourceObject || Subresource != Other.Subresource;
+	}
+	FD3D12LockedKey& operator=(const FD3D12LockedKey& Other)
+	{
+		SourceObject = Other.SourceObject;
+		Subresource = Other.Subresource;
+		return *this;
+	}
+	uint32 GetHash() const
+	{
+		return PointerHash(SourceObject);
+	}
+
+	/** Hashing function. */
+	friend uint32 GetTypeHash(const FD3D12LockedKey& K)
+	{
+		return K.GetHash();
+	}
+};
+
+class FD3D12RenderTargetView;
+class FD3D12DepthStencilView;
+
+/**
+ * Class for retrieving render targets currently bound to the device context.
+ */
+class FD3D12BoundRenderTargets
+{
+public:
+	/** Initialization constructor: requires the state cache. */
+	explicit FD3D12BoundRenderTargets(FD3D12RenderTargetView** RTArray, uint32 NumActiveRTs, FD3D12DepthStencilView* DSView);
+
+	/** Destructor. */
+	~FD3D12BoundRenderTargets();
+
+	/** Accessors. */
+	FORCEINLINE int32 GetNumActiveTargets() const { return NumActiveTargets; }
+	FORCEINLINE FD3D12RenderTargetView* GetRenderTargetView(int32 TargetIndex) { return RenderTargetViews[TargetIndex]; }
+	FORCEINLINE FD3D12DepthStencilView* GetDepthStencilView() { return DepthStencilView; }
+
+private:
+	/** Active render target views. */
+	FD3D12RenderTargetView* RenderTargetViews[MaxSimultaneousRenderTargets];
+
+	/** Active depth stencil view. */
+	FD3D12DepthStencilView* DepthStencilView;
+
+	/** The number of active render targets. */
+	int32 NumActiveTargets;
+};
+
+void LogExecuteCommandLists(uint32 NumCommandLists, ID3D12CommandList *const *ppCommandLists);
+FString ConvertToResourceStateString(uint32 ResourceState);
+void LogResourceBarriers(uint32 NumBarriers, D3D12_RESOURCE_BARRIER *pBarriers, ID3D12CommandList *const pCommandList);
+
+
+// Custom resource states
+// To Be Determined (TBD) means we need to fill out a resource barrier before the command list is executed.
+#define D3D12_RESOURCE_STATE_TBD (D3D12_RESOURCE_STATES)-1
+#define D3D12_RESOURCE_STATE_CORRUPT (D3D12_RESOURCE_STATES)-2
+
+static bool IsValidD3D12ResourceState(D3D12_RESOURCE_STATES InState)
+{
+	return (InState != D3D12_RESOURCE_STATE_TBD && InState != D3D12_RESOURCE_STATE_CORRUPT);
+}
+
+//==================================================================================================================================
+// CResourceState
+// Tracking of per-resource or per-subresource state
+//==================================================================================================================================
+class CResourceState
+{
+public:
+	void Initialize(uint32 SubresourceCount);
+
+	bool AreAllSubresourcesSame() const;
+	bool CheckResourceState(D3D12_RESOURCE_STATES State) const;
+	bool CheckResourceStateInitalized() const;
+	D3D12_RESOURCE_STATES GetSubresourceState(uint32 SubresourceIndex) const;
+	void SetResourceState(D3D12_RESOURCE_STATES State);
+	void SetSubresourceState(uint32 SubresourceIndex, D3D12_RESOURCE_STATES State);
+
+private:
+	// Only used if m_AllSubresourcesSame is 1.
+	// Bits defining the state of the full resource, bits are from D3D12_RESOURCE_STATES
+	D3D12_RESOURCE_STATES m_ResourceState : 31;
+
+	// Set to 1 if m_ResourceState is valid.  In this case, all subresources have the same state
+	// Set to 0 if m_SubresourceState is valid.  In this case, each subresources may have a different state (or may be unknown)
+	uint32 m_AllSubresourcesSame : 1;
+
+	// Only used if m_AllSubresourcesSame is 0.
+	// The state of each subresources.  Bits are from D3D12_RESOURCE_STATES.
+	TArray<D3D12_RESOURCE_STATES, TInlineAllocator<4>> m_SubresourceState;
+};
+
+//==================================================================================================================================
+// FD3D12ShaderBytecode
+// Encapsulates D3D12 shader bytecode and creates a hash for the shader bytecode
+//==================================================================================================================================
+struct ShaderBytecodeHash
+{
+	uint64 Hash[2];
+
+	bool operator ==(const ShaderBytecodeHash &b) const
+	{
+		return (Hash[0] == b.Hash[0] && Hash[1] == b.Hash[1]);
+	}
+
+	bool operator !=(const ShaderBytecodeHash &b) const
+	{
+		return (Hash[0] != b.Hash[0] || Hash[1] != b.Hash[1]);
+	}
+};
+
+class FD3D12ShaderBytecode
+{
+public:
+	FD3D12ShaderBytecode()
+	{
+		FMemory::Memzero(Shader);
+		FMemory::Memzero(Hash);
+	}
+
+	FD3D12ShaderBytecode(const D3D12_SHADER_BYTECODE &InShader)
+		: Shader(InShader)
+	{
+		HashShader();
+	}
+
+	void SetShaderBytecode(const D3D12_SHADER_BYTECODE &InShader)
+	{
+		Shader = InShader;
+		HashShader();
+	}
+
+	const D3D12_SHADER_BYTECODE& GetShaderBytecode() const { return Shader; }
+	const ShaderBytecodeHash& GetHash() const { return Hash; }
+
+private:
+	void HashShader()
+	{
+		if (Shader.pShaderBytecode && Shader.BytecodeLength > 0)
+		{
+			// D3D shader bytecode contains a 128bit checksum in DWORD 1-4. We can just use that directly instead of hashing the whole shader bytecode ourselves.
+			check(Shader.BytecodeLength >= sizeof(uint32) + sizeof(Hash));
+			FMemory::Memcpy(&Hash, ((uint32*) Shader.pShaderBytecode) + 1, sizeof(Hash));
+		}
+		else
+		{
+			FMemory::Memzero(Hash);
+		}
+	}
+
+private:
+	ShaderBytecodeHash Hash;
+	D3D12_SHADER_BYTECODE Shader;
+};
+
+/**
+ * The base class of threadsafe reference counted objects.
+ */
+template <class Type>
+struct FThreadsafeQueue
+{
+private:
+	mutable FCriticalSection	SynchronizationObject; // made this mutable so this class can have const functions and still be thread safe
+	TQueue<Type>				Items;
+	uint32						Size = 0;
+public:
+
+	inline const uint32 GetSize() const { return Size; }
+
+	void Enqueue(const Type& Item)
+	{
+		FScopeLock ScopeLock(&SynchronizationObject);
+		Items.Enqueue(Item);
+		Size++;
+	}
+
+	bool Dequeue(Type& Result)
+	{
+		FScopeLock ScopeLock(&SynchronizationObject);
+		Size--;
+		return Items.Dequeue(Result);
+	}
+
+	template <typename CompareFunc>
+	bool Dequeue(Type& Result, const CompareFunc& Func)
+	{
+		FScopeLock ScopeLock(&SynchronizationObject);
+
+		if (Items.Peek(Result))
+		{
+			if (Func(Result))
+			{
+				Items.Dequeue(Result);
+				Size--;
+
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	template <typename CompareFunc>
+	bool BatchDequeue(TQueue<Type>* Result, const CompareFunc& Func, uint32 MaxItems)
+	{
+		FScopeLock ScopeLock(&SynchronizationObject);
+
+		uint32 i = 0;
+		Type Item;
+		while (Items.Peek(Item) && i <= MaxItems)
+		{
+			if (Func(Item))
+			{
+				Items.Dequeue(Item);
+				Size--;
+				Result->Enqueue(Item);
+
+				i++;
+			}
+			else
+			{
+				break;
+			}
+		}
+
+		return i > 0;
+	}
+
+	bool Peek(Type& Result)
+	{
+		FScopeLock ScopeLock(&SynchronizationObject);
+		return Items.Peek(Result);
+	}
+
+	bool IsEmpty()
+	{
+		FScopeLock ScopeLock(&SynchronizationObject);
+		return Items.IsEmpty();
+	}
+
+	void Empty()
+	{
+		FScopeLock ScopeLock(&SynchronizationObject);
+
+		Type Result;
+		while (Items.Dequeue(Result)) {}
+	}
+};
+
+inline bool IsCPUWritable(D3D12_HEAP_TYPE HeapType, const D3D12_HEAP_PROPERTIES *pCustomHeapProperties = nullptr)
+{
+	check(HeapType == D3D12_HEAP_TYPE_CUSTOM ? pCustomHeapProperties != nullptr : true);
+	return HeapType == D3D12_HEAP_TYPE_UPLOAD ||
+		(HeapType == D3D12_HEAP_TYPE_CUSTOM &&
+			(pCustomHeapProperties->CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE || pCustomHeapProperties->CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
+}
+
+inline bool IsCPUInaccessible(D3D12_HEAP_TYPE HeapType, const D3D12_HEAP_PROPERTIES *pCustomHeapProperties = nullptr)
+{
+	check(HeapType == D3D12_HEAP_TYPE_CUSTOM ? pCustomHeapProperties != nullptr : true);
+	return HeapType == D3D12_HEAP_TYPE_DEFAULT ||
+		(HeapType == D3D12_HEAP_TYPE_CUSTOM &&
+		(pCustomHeapProperties->CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE));
+}
+
+inline D3D12_RESOURCE_STATES DetermineInitialResourceState(D3D12_HEAP_TYPE HeapType, const D3D12_HEAP_PROPERTIES *pCustomHeapProperties = nullptr)
+{
+	if (HeapType == D3D12_HEAP_TYPE_DEFAULT || IsCPUWritable(HeapType, pCustomHeapProperties))
+	{
+		return D3D12_RESOURCE_STATE_GENERIC_READ;
+	}
+	else
+	{
+		check(HeapType == D3D12_HEAP_TYPE_READBACK);
+		return D3D12_RESOURCE_STATE_COPY_DEST;
+	}
+}
+
+class FD3D12Fence;
+class FD3D12SyncPoint
+{
+public:
+	explicit FD3D12SyncPoint()
+		: Fence(nullptr)
+		, Value(0)
+	{
+	}
+
+	explicit FD3D12SyncPoint(FD3D12Fence* InFence, uint64 InValue)
+		: Fence(InFence)
+		, Value(InValue)
+	{
+	}
+
+	bool IsValid() const;
+	bool IsComplete() const;
+	void WaitForCompletion() const;
+
+private:
+	FD3D12Fence* Fence;
+	uint64 Value;
+};
+
+static bool IsBlockCompressFormat(DXGI_FORMAT Format)
+{
+	// Returns true if BC1, BC2, BC3, BC4, BC5, BC6, BC7
+	return (Format >= DXGI_FORMAT_BC1_TYPELESS && Format <= DXGI_FORMAT_BC5_SNORM) ||
+		(Format >= DXGI_FORMAT_BC6H_TYPELESS && Format <= DXGI_FORMAT_BC7_UNORM_SRGB);
+}
+
+static inline uint64 GetTilesNeeded(uint32 Width, uint32 Height, uint32 Depth, const D3D12_TILE_SHAPE& Shape)
+{
+	return uint64((Width + Shape.WidthInTexels - 1) / Shape.WidthInTexels) *
+		((Height + Shape.HeightInTexels - 1) / Shape.HeightInTexels) *
+		((Depth + Shape.DepthInTexels - 1) / Shape.DepthInTexels);
+}
+
+static uint32 GetWidthAlignment(DXGI_FORMAT Format)
+{
+	switch (Format)
+	{
+	case DXGI_FORMAT_R8G8_B8G8_UNORM: return 2;
+	case DXGI_FORMAT_G8R8_G8B8_UNORM: return 2;
+	case DXGI_FORMAT_NV12: return 2;
+	case DXGI_FORMAT_P010: return 2;
+	case DXGI_FORMAT_P016: return 2;
+	case DXGI_FORMAT_420_OPAQUE: return 2;
+	case DXGI_FORMAT_YUY2: return 2;
+	case DXGI_FORMAT_Y210: return 2;
+	case DXGI_FORMAT_Y216: return 2;
+	case DXGI_FORMAT_BC1_TYPELESS: return 4;
+	case DXGI_FORMAT_BC1_UNORM: return 4;
+	case DXGI_FORMAT_BC1_UNORM_SRGB: return 4;
+	case DXGI_FORMAT_BC2_TYPELESS: return 4;
+	case DXGI_FORMAT_BC2_UNORM: return 4;
+	case DXGI_FORMAT_BC2_UNORM_SRGB: return 4;
+	case DXGI_FORMAT_BC3_TYPELESS: return 4;
+	case DXGI_FORMAT_BC3_UNORM: return 4;
+	case DXGI_FORMAT_BC3_UNORM_SRGB: return 4;
+	case DXGI_FORMAT_BC4_TYPELESS: return 4;
+	case DXGI_FORMAT_BC4_UNORM: return 4;
+	case DXGI_FORMAT_BC4_SNORM: return 4;
+	case DXGI_FORMAT_BC5_TYPELESS: return 4;
+	case DXGI_FORMAT_BC5_UNORM: return 4;
+	case DXGI_FORMAT_BC5_SNORM: return 4;
+	case DXGI_FORMAT_BC6H_TYPELESS: return 4;
+	case DXGI_FORMAT_BC6H_UF16: return 4;
+	case DXGI_FORMAT_BC6H_SF16: return 4;
+	case DXGI_FORMAT_BC7_TYPELESS: return 4;
+	case DXGI_FORMAT_BC7_UNORM: return 4;
+	case DXGI_FORMAT_BC7_UNORM_SRGB: return 4;
+	case DXGI_FORMAT_NV11: return 4;
+	case DXGI_FORMAT_R1_UNORM: return 8;
+	default: return 1;
+	}
+}
+
+static uint32 GetHeightAlignment(DXGI_FORMAT Format)
+{
+	switch (Format)
+	{
+	case DXGI_FORMAT_NV12: return 2;
+	case DXGI_FORMAT_P010: return 2;
+	case DXGI_FORMAT_P016: return 2;
+	case DXGI_FORMAT_420_OPAQUE: return 2;
+	case DXGI_FORMAT_BC1_TYPELESS: return 4;
+	case DXGI_FORMAT_BC1_UNORM: return 4;
+	case DXGI_FORMAT_BC1_UNORM_SRGB: return 4;
+	case DXGI_FORMAT_BC2_TYPELESS: return 4;
+	case DXGI_FORMAT_BC2_UNORM: return 4;
+	case DXGI_FORMAT_BC2_UNORM_SRGB: return 4;
+	case DXGI_FORMAT_BC3_TYPELESS: return 4;
+	case DXGI_FORMAT_BC3_UNORM: return 4;
+	case DXGI_FORMAT_BC3_UNORM_SRGB: return 4;
+	case DXGI_FORMAT_BC4_TYPELESS: return 4;
+	case DXGI_FORMAT_BC4_UNORM: return 4;
+	case DXGI_FORMAT_BC4_SNORM: return 4;
+	case DXGI_FORMAT_BC5_TYPELESS: return 4;
+	case DXGI_FORMAT_BC5_UNORM: return 4;
+	case DXGI_FORMAT_BC5_SNORM: return 4;
+	case DXGI_FORMAT_BC6H_TYPELESS: return 4;
+	case DXGI_FORMAT_BC6H_UF16: return 4;
+	case DXGI_FORMAT_BC6H_SF16: return 4;
+	case DXGI_FORMAT_BC7_TYPELESS: return 4;
+	case DXGI_FORMAT_BC7_UNORM: return 4;
+	case DXGI_FORMAT_BC7_UNORM_SRGB: return 4;
+	default: return 1;
+	}
+}
+
+static void Get4KTileShape(D3D12_TILE_SHAPE* pTileShape, DXGI_FORMAT Format, uint8 UEFormat, D3D12_RESOURCE_DIMENSION Dimension, uint32 SampleCount)
+{
+	//Bits per unit
+	uint32 BPU = GPixelFormats[UEFormat].BlockBytes * 8;
+
+	switch (Dimension)
+	{
+	case D3D12_RESOURCE_DIMENSION_BUFFER:
+	case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
+	{
+		check(!IsBlockCompressFormat(Format));
+		pTileShape->WidthInTexels = (BPU == 0) ? 4096 : 4096 * 8 / BPU;
+		pTileShape->HeightInTexels = 1;
+		pTileShape->DepthInTexels = 1;
+	}
+	break;
+	case D3D12_RESOURCE_DIMENSION_TEXTURE2D:
+	{
+		pTileShape->DepthInTexels = 1;
+		if (IsBlockCompressFormat(Format))
+		{
+			// Currently only supported block sizes are 64 and 128.
+			// These equations calculate the size in texels for a tile. It relies on the fact that 16*16*16 blocks fit in a tile if the block size is 128 bits.
+			check(BPU == 64 || BPU == 128);
+			pTileShape->WidthInTexels = 16 * GetWidthAlignment(Format);
+			pTileShape->HeightInTexels = 16 * GetHeightAlignment(Format);
+			if (BPU == 64)
+			{
+				// If bits per block are 64 we double width so it takes up the full tile size.
+				// This is only true for BC1 and BC4
+				check((Format >= DXGI_FORMAT_BC1_TYPELESS && Format <= DXGI_FORMAT_BC1_UNORM_SRGB) ||
+					(Format >= DXGI_FORMAT_BC4_TYPELESS && Format <= DXGI_FORMAT_BC4_SNORM));
+				pTileShape->WidthInTexels *= 2;
+			}
+		}
+		else
+		{
+			if (BPU <= 8)
+			{
+				pTileShape->WidthInTexels = 64;
+				pTileShape->HeightInTexels = 64;
+			}
+			else if (BPU <= 16)
+			{
+				pTileShape->WidthInTexels = 64;
+				pTileShape->HeightInTexels = 32;
+			}
+			else if (BPU <= 32)
+			{
+				pTileShape->WidthInTexels = 32;
+				pTileShape->HeightInTexels = 32;
+			}
+			else if (BPU <= 64)
+			{
+				pTileShape->WidthInTexels = 32;
+				pTileShape->HeightInTexels = 16;
+			}
+			else if (BPU <= 128)
+			{
+				pTileShape->WidthInTexels = 16;
+				pTileShape->HeightInTexels = 16;
+			}
+			else
+			{
+				check(false);
+			}
+
+			if (SampleCount <= 1)
+			{ /* Do nothing */
+			}
+			else if (SampleCount <= 2)
+			{
+				pTileShape->WidthInTexels /= 2;
+				pTileShape->HeightInTexels /= 1;
+			}
+			else if (SampleCount <= 4)
+			{
+				pTileShape->WidthInTexels /= 2;
+				pTileShape->HeightInTexels /= 2;
+			}
+			else if (SampleCount <= 8)
+			{
+				pTileShape->WidthInTexels /= 4;
+				pTileShape->HeightInTexels /= 2;
+			}
+			else if (SampleCount <= 16)
+			{
+				pTileShape->WidthInTexels /= 4;
+				pTileShape->HeightInTexels /= 4;
+			}
+			else
+			{
+				check(false);
+			}
+
+			check(GetWidthAlignment(Format) == 1);
+			check(GetHeightAlignment(Format) == 1);
+		}
+
+		break;
+	}
+	case D3D12_RESOURCE_DIMENSION_TEXTURE3D:
+	{
+		if (IsBlockCompressFormat(Format))
+		{
+			// Currently only supported block sizes are 64 and 128.
+			// These equations calculate the size in texels for a tile. It relies on the fact that 16*16*16 blocks fit in a tile if the block size is 128 bits.
+			check(BPU == 64 || BPU == 128);
+			pTileShape->WidthInTexels = 8 * GetWidthAlignment(Format);
+			pTileShape->HeightInTexels = 8 * GetHeightAlignment(Format);
+			pTileShape->DepthInTexels = 4;
+			if (BPU == 64)
+			{
+				// If bits per block are 64 we double width so it takes up the full tile size.
+				// This is only true for BC1 and BC4
+				check((Format >= DXGI_FORMAT_BC1_TYPELESS && Format <= DXGI_FORMAT_BC1_UNORM_SRGB) ||
+					(Format >= DXGI_FORMAT_BC4_TYPELESS && Format <= DXGI_FORMAT_BC4_SNORM));
+				pTileShape->DepthInTexels *= 2;
+			}
+		}
+		else
+		{
+			if (BPU <= 8)
+			{
+				pTileShape->WidthInTexels = 16;
+				pTileShape->HeightInTexels = 16;
+				pTileShape->DepthInTexels = 16;
+			}
+			else if (BPU <= 16)
+			{
+				pTileShape->WidthInTexels = 16;
+				pTileShape->HeightInTexels = 16;
+				pTileShape->DepthInTexels = 8;
+			}
+			else if (BPU <= 32)
+			{
+				pTileShape->WidthInTexels = 16;
+				pTileShape->HeightInTexels = 8;
+				pTileShape->DepthInTexels = 8;
+			}
+			else if (BPU <= 64)
+			{
+				pTileShape->WidthInTexels = 8;
+				pTileShape->HeightInTexels = 8;
+				pTileShape->DepthInTexels = 8;
+			}
+			else if (BPU <= 128)
+			{
+				pTileShape->WidthInTexels = 8;
+				pTileShape->HeightInTexels = 8;
+				pTileShape->DepthInTexels = 4;
+			}
+			else
+			{
+				check(false);
+			}
+
+			check(GetWidthAlignment(Format) == 1);
+			check(GetHeightAlignment(Format) == 1);
+		}
+	}
+	break;
+	}
+}
+
+#define NUM_4K_BLOCKS_PER_64K_PAGE (16)
+
+static bool TextureCanBe4KAligned(D3D12_RESOURCE_DESC& Desc, uint8 UEFormat)
+{
+	D3D12_TILE_SHAPE Tile = {};
+	Get4KTileShape(&Tile, Desc.Format, UEFormat, Desc.Dimension, Desc.SampleDesc.Count);
+
+	uint32 TilesNeeded = GetTilesNeeded(Desc.Width, Desc.Height, Desc.DepthOrArraySize, Tile);
+
+	return TilesNeeded <= NUM_4K_BLOCKS_PER_64K_PAGE;
+}
+
+template <class TView>
+class FD3D12View;
+class CViewSubresourceSubset;
+
+template <class TView>
+bool AssertResourceState(ID3D12CommandList* pCommandList, FD3D12View<TView>* pView, const D3D12_RESOURCE_STATES& State);
+
+bool AssertResourceState(ID3D12CommandList* pCommandList, FD3D12Resource* pResource, const D3D12_RESOURCE_STATES& State, uint32 Subresource);
+bool AssertResourceState(ID3D12CommandList* pCommandList, FD3D12Resource* pResource, const D3D12_RESOURCE_STATES& State, const CViewSubresourceSubset& SubresourceSubset);
+
+inline DXGI_FORMAT FindSharedResourceDXGIFormat(DXGI_FORMAT InFormat, bool bSRGB)
+{
+	if (bSRGB)
+	{
+		switch (InFormat)
+		{
+		case DXGI_FORMAT_B8G8R8X8_TYPELESS:    return DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
+		case DXGI_FORMAT_B8G8R8A8_TYPELESS:    return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+		case DXGI_FORMAT_R8G8B8A8_TYPELESS:    return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+		case DXGI_FORMAT_BC1_TYPELESS:         return DXGI_FORMAT_BC1_UNORM_SRGB;
+		case DXGI_FORMAT_BC2_TYPELESS:         return DXGI_FORMAT_BC2_UNORM_SRGB;
+		case DXGI_FORMAT_BC3_TYPELESS:         return DXGI_FORMAT_BC3_UNORM_SRGB;
+		case DXGI_FORMAT_BC7_TYPELESS:         return DXGI_FORMAT_BC7_UNORM_SRGB;
+		};
+	}
+	else
+	{
+		switch (InFormat)
+		{
+		case DXGI_FORMAT_B8G8R8X8_TYPELESS:    return DXGI_FORMAT_B8G8R8X8_UNORM;
+		case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+		case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+		case DXGI_FORMAT_BC1_TYPELESS:      return DXGI_FORMAT_BC1_UNORM;
+		case DXGI_FORMAT_BC2_TYPELESS:      return DXGI_FORMAT_BC2_UNORM;
+		case DXGI_FORMAT_BC3_TYPELESS:      return DXGI_FORMAT_BC3_UNORM;
+		case DXGI_FORMAT_BC7_TYPELESS:      return DXGI_FORMAT_BC7_UNORM;
+		};
+	}
+	switch (InFormat)
+	{
+	case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_UINT;
+	case DXGI_FORMAT_R32G32B32_TYPELESS:    return DXGI_FORMAT_R32G32B32_UINT;
+	case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_UNORM;
+	case DXGI_FORMAT_R32G32_TYPELESS:       return DXGI_FORMAT_R32G32_UINT;
+	case DXGI_FORMAT_R10G10B10A2_TYPELESS:  return DXGI_FORMAT_R10G10B10A2_UNORM;
+	case DXGI_FORMAT_R16G16_TYPELESS:       return DXGI_FORMAT_R16G16_UNORM;
+	case DXGI_FORMAT_R8G8_TYPELESS:         return DXGI_FORMAT_R8G8_UNORM;
+	case DXGI_FORMAT_R8_TYPELESS:           return DXGI_FORMAT_R8_UNORM;
+
+	case DXGI_FORMAT_BC4_TYPELESS:         return DXGI_FORMAT_BC4_UNORM;
+	case DXGI_FORMAT_BC5_TYPELESS:         return DXGI_FORMAT_BC5_UNORM;
+
+
+
+	case DXGI_FORMAT_R24G8_TYPELESS: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+	case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_R32_FLOAT;
+	case DXGI_FORMAT_R16_TYPELESS: return DXGI_FORMAT_R16_UNORM;
+		// Changing Depth Buffers to 32 bit on Dingo as D24S8 is actually implemented as a 32 bit buffer in the hardware
+	case DXGI_FORMAT_R32G8X24_TYPELESS: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+	}
+	return InFormat;
+}
+
+inline DXGI_FORMAT GetPlatformTextureResourceFormat(DXGI_FORMAT InFormat, uint32 InFlags)
+{
+	// Find valid shared texture format
+	if (InFlags & TexCreate_Shared)
+	{
+		return FindSharedResourceDXGIFormat(InFormat, InFlags & TexCreate_SRGB);
+	}
+
+	return InFormat;
+}
+
+/** Find an appropriate DXGI format for the input format and SRGB setting. */
+inline DXGI_FORMAT FindShaderResourceDXGIFormat(DXGI_FORMAT InFormat, bool bSRGB)
+{
+	if (bSRGB)
+	{
+		switch (InFormat)
+		{
+		case DXGI_FORMAT_B8G8R8A8_TYPELESS:    return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+		case DXGI_FORMAT_R8G8B8A8_TYPELESS:    return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+		case DXGI_FORMAT_BC1_TYPELESS:         return DXGI_FORMAT_BC1_UNORM_SRGB;
+		case DXGI_FORMAT_BC2_TYPELESS:         return DXGI_FORMAT_BC2_UNORM_SRGB;
+		case DXGI_FORMAT_BC3_TYPELESS:         return DXGI_FORMAT_BC3_UNORM_SRGB;
+		case DXGI_FORMAT_BC7_TYPELESS:         return DXGI_FORMAT_BC7_UNORM_SRGB;
+		};
+	}
+	else
+	{
+		switch (InFormat)
+		{
+		case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+		case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+		case DXGI_FORMAT_BC1_TYPELESS:      return DXGI_FORMAT_BC1_UNORM;
+		case DXGI_FORMAT_BC2_TYPELESS:      return DXGI_FORMAT_BC2_UNORM;
+		case DXGI_FORMAT_BC3_TYPELESS:      return DXGI_FORMAT_BC3_UNORM;
+		case DXGI_FORMAT_BC7_TYPELESS:      return DXGI_FORMAT_BC7_UNORM;
+		};
+	}
+	switch (InFormat)
+	{
+	case DXGI_FORMAT_R24G8_TYPELESS: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+	case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_R32_FLOAT;
+	case DXGI_FORMAT_R16_TYPELESS: return DXGI_FORMAT_R16_UNORM;
+		// Changing Depth Buffers to 32 bit on Dingo as D24S8 is actually implemented as a 32 bit buffer in the hardware
+	case DXGI_FORMAT_R32G8X24_TYPELESS: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+	}
+	return InFormat;
+}
+
+/** Find an appropriate DXGI format unordered access of the raw format. */
+inline DXGI_FORMAT FindUnorderedAccessDXGIFormat(DXGI_FORMAT InFormat)
+{
+	switch (InFormat)
+	{
+	case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+	case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+	}
+	return InFormat;
+}
+
+/** Find the appropriate depth-stencil targetable DXGI format for the given format. */
+inline DXGI_FORMAT FindDepthStencilDXGIFormat(DXGI_FORMAT InFormat)
+{
+	switch (InFormat)
+	{
+	case DXGI_FORMAT_R24G8_TYPELESS:
+		return DXGI_FORMAT_D24_UNORM_S8_UINT;
+		// Changing Depth Buffers to 32 bit on Dingo as D24S8 is actually implemented as a 32 bit buffer in the hardware
+	case DXGI_FORMAT_R32G8X24_TYPELESS:
+		return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+	case DXGI_FORMAT_R32_TYPELESS:
+		return DXGI_FORMAT_D32_FLOAT;
+	case DXGI_FORMAT_R16_TYPELESS:
+		return DXGI_FORMAT_D16_UNORM;
+	};
+	return InFormat;
+}
+
+/**
+* Returns whether the given format contains stencil information.
+* Must be passed a format returned by FindDepthStencilDXGIFormat, so that typeless versions are converted to their corresponding depth stencil view format.
+*/
+inline bool HasStencilBits(DXGI_FORMAT InFormat)
+{
+	switch (InFormat)
+	{
+	case DXGI_FORMAT_D24_UNORM_S8_UINT:
+		// Changing Depth Buffers to 32 bit on Dingo as D24S8 is actually implemented as a 32 bit buffer in the hardware
+	case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+		return true;
+	};
+
+	return false;
+}
+
+FORCEINLINE_DEBUGGABLE D3D12_PRIMITIVE_TOPOLOGY_TYPE TranslatePrimitiveTopologyType(EPrimitiveTopologyType TopologyType)
+{
+	switch (TopologyType)
+	{
+	case EPrimitiveTopologyType::Triangle:	return D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+	case EPrimitiveTopologyType::Patch:		return D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
+	case EPrimitiveTopologyType::Line:		return D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+	case EPrimitiveTopologyType::Point:		return D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+	default:
+		ensure(0);
+		return D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED;
+	}
+}
+
+FORCEINLINE_DEBUGGABLE D3D_PRIMITIVE_TOPOLOGY TranslatePrimitiveType(EPrimitiveType PrimitiveType)
+{
+	switch (PrimitiveType)
+	{
+	case PT_TriangleList:				return D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+	case PT_TriangleStrip:				return D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
+	case PT_LineList:					return D3D_PRIMITIVE_TOPOLOGY_LINELIST;
+	case PT_PointList:					return D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
+	#if defined(D3D12RHI_PRIMITIVE_TOPOLOGY_RECTLIST)
+		case PT_RectList:				return D3D12RHI_PRIMITIVE_TOPOLOGY_RECTLIST;
+	#endif
+
+	case PT_1_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST;
+	case PT_2_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_2_CONTROL_POINT_PATCHLIST;
+	case PT_3_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST;
+	case PT_4_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_4_CONTROL_POINT_PATCHLIST;
+	case PT_5_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_5_CONTROL_POINT_PATCHLIST;
+	case PT_6_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_6_CONTROL_POINT_PATCHLIST;
+	case PT_7_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_7_CONTROL_POINT_PATCHLIST;
+	case PT_8_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_8_CONTROL_POINT_PATCHLIST;
+	case PT_9_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_9_CONTROL_POINT_PATCHLIST;
+	case PT_10_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_10_CONTROL_POINT_PATCHLIST;
+	case PT_11_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_11_CONTROL_POINT_PATCHLIST;
+	case PT_12_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_12_CONTROL_POINT_PATCHLIST;
+	case PT_13_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_13_CONTROL_POINT_PATCHLIST;
+	case PT_14_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_14_CONTROL_POINT_PATCHLIST;
+	case PT_15_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_15_CONTROL_POINT_PATCHLIST;
+	case PT_16_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_16_CONTROL_POINT_PATCHLIST;
+	case PT_17_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_17_CONTROL_POINT_PATCHLIST;
+	case PT_18_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_18_CONTROL_POINT_PATCHLIST;
+	case PT_19_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_19_CONTROL_POINT_PATCHLIST;
+	case PT_20_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_20_CONTROL_POINT_PATCHLIST;
+	case PT_21_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_21_CONTROL_POINT_PATCHLIST;
+	case PT_22_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_22_CONTROL_POINT_PATCHLIST;
+	case PT_23_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_23_CONTROL_POINT_PATCHLIST;
+	case PT_24_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_24_CONTROL_POINT_PATCHLIST;
+	case PT_25_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_25_CONTROL_POINT_PATCHLIST;
+	case PT_26_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_26_CONTROL_POINT_PATCHLIST;
+	case PT_27_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_27_CONTROL_POINT_PATCHLIST;
+	case PT_28_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_28_CONTROL_POINT_PATCHLIST;
+	case PT_29_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_29_CONTROL_POINT_PATCHLIST;
+	case PT_30_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_30_CONTROL_POINT_PATCHLIST;
+	case PT_31_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_31_CONTROL_POINT_PATCHLIST;
+	case PT_32_ControlPointPatchList:	return D3D_PRIMITIVE_TOPOLOGY_32_CONTROL_POINT_PATCHLIST;
+	default:
+		ensure(0);
+		return D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+	}
+}
+
+#pragma warning(push)
+#pragma warning(disable: 4063)
+FORCEINLINE_DEBUGGABLE D3D12_PRIMITIVE_TOPOLOGY_TYPE D3D12PrimitiveTypeToTopologyType(D3D_PRIMITIVE_TOPOLOGY PrimitiveType)
+{
+	switch (PrimitiveType)
+	{
+	case D3D_PRIMITIVE_TOPOLOGY_POINTLIST:
+		return D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+
+	case D3D_PRIMITIVE_TOPOLOGY_LINELIST:
+	case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP:
+	case D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ:
+	case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ:
+		return D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+
+	case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST:
+	case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP:
+	case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ:
+	case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ:
+		return D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+
+	#if defined(D3D12RHI_PRIMITIVE_TOPOLOGY_RECTLIST)
+		case D3D12RHI_PRIMITIVE_TOPOLOGY_RECTLIST:
+			return D3D12RHI_PRIMITIVE_TOPOLOGY_TYPE_RECT;
+	#endif
+
+	case D3D_PRIMITIVE_TOPOLOGY_UNDEFINED:
+		return D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED;
+
+	default:
+		return D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
+	}
+}
+#pragma warning(pop)
+
+static void TranslateRenderTargetFormats(
+	const FGraphicsPipelineStateInitializer &PsoInit,
+	D3D12_RT_FORMAT_ARRAY& RTFormatArray,
+	DXGI_FORMAT& DSVFormat
+	)
+{
+	RTFormatArray.NumRenderTargets = PsoInit.ComputeNumValidRenderTargets();
+
+	for (uint32 RTIdx = 0; RTIdx < PsoInit.RenderTargetsEnabled; ++RTIdx)
+	{
+		checkSlow(PsoInit.RenderTargetFormats[RTIdx] == PF_Unknown || GPixelFormats[PsoInit.RenderTargetFormats[RTIdx]].Supported);
+
+		DXGI_FORMAT PlatformFormat = (DXGI_FORMAT)GPixelFormats[PsoInit.RenderTargetFormats[RTIdx]].PlatformFormat;
+		uint32 Flags = PsoInit.RenderTargetFlags[RTIdx];
+
+		RTFormatArray.RTFormats[RTIdx] = FindShaderResourceDXGIFormat(
+			GetPlatformTextureResourceFormat(PlatformFormat, Flags),
+			(Flags & TexCreate_SRGB) != 0
+			);
+	}
+
+	checkSlow(PsoInit.DepthStencilTargetFormat == PF_Unknown || GPixelFormats[PsoInit.DepthStencilTargetFormat].Supported);
+
+	DXGI_FORMAT PlatformFormat = (DXGI_FORMAT)GPixelFormats[PsoInit.DepthStencilTargetFormat].PlatformFormat;
+	uint32 Flags = PsoInit.DepthStencilTargetFlag;
+
+	DSVFormat = FindDepthStencilDXGIFormat(
+		GetPlatformTextureResourceFormat(PlatformFormat, PsoInit.DepthStencilTargetFlag)
+		);
+}
+
+// @return 0xffffffff if not not supported
+FORCEINLINE_DEBUGGABLE uint32 GetMaxMSAAQuality(uint32 SampleCount)
+{
+	if (SampleCount <= DX_MAX_MSAA_COUNT)
+	{
+		// 0 has better quality (a more even distribution)
+		// higher quality levels might be useful for non box filtered AA or when using weighted samples 
+		return 0;
+	}
+
+	// not supported
+	return 0xffffffff;
+}
+
+/** Find the appropriate depth-stencil typeless DXGI format for the given format. */
+inline DXGI_FORMAT FindDepthStencilParentDXGIFormat(DXGI_FORMAT InFormat)
+{
+	switch (InFormat)
+	{
+	case DXGI_FORMAT_D24_UNORM_S8_UINT:
+	case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+		return DXGI_FORMAT_R24G8_TYPELESS;
+		// Changing Depth Buffers to 32 bit on Dingo as D24S8 is actually implemented as a 32 bit buffer in the hardware
+	case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+	case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+		return DXGI_FORMAT_R32G8X24_TYPELESS;
+	case DXGI_FORMAT_D32_FLOAT:
+		return DXGI_FORMAT_R32_TYPELESS;
+	case DXGI_FORMAT_D16_UNORM:
+		return DXGI_FORMAT_R16_TYPELESS;
+	};
+	return InFormat;
+}
+
+static uint8 GetPlaneSliceFromViewFormat(DXGI_FORMAT ResourceFormat, DXGI_FORMAT ViewFormat)
+{
+	// Currently, the only planar resources used are depth-stencil formats
+	switch (FindDepthStencilParentDXGIFormat(ResourceFormat))
+	{
+	case DXGI_FORMAT_R24G8_TYPELESS:
+		switch (ViewFormat)
+		{
+		case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+			return 0;
+		case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+			return 1;
+		}
+		break;
+	case DXGI_FORMAT_R32G8X24_TYPELESS:
+		switch (ViewFormat)
+		{
+		case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+			return 0;
+		case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+			return 1;
+		}
+		break;
+	}
+
+	return 0;
+}
+
+static uint8 GetPlaneCount(DXGI_FORMAT Format)
+{
+	// Currently, the only planar resources used are depth-stencil formats
+	// Note there is a D3D12 helper for this, D3D12GetFormatPlaneCount
+	switch (FindDepthStencilParentDXGIFormat(Format))
+	{
+	case DXGI_FORMAT_R24G8_TYPELESS:
+	case DXGI_FORMAT_R32G8X24_TYPELESS:
+		return 2;
+	default:
+		return 1;
+	}
+}
+
+struct FD3D12ScopeLock
+{
+public:
+	FD3D12ScopeLock(FCriticalSection* CritSec) : CS(CritSec) { CS->Lock(); }
+	~FD3D12ScopeLock() { CS->Unlock(); }
+private:
+	FCriticalSection* CS;
+};
+
+struct FD3D12ScopeNoLock
+{
+public:
+	FD3D12ScopeNoLock(FCriticalSection* CritSec) { /* Do Nothing! */ }
+	~FD3D12ScopeNoLock() { /* Do Nothing! */ }
+};                                                                                                 oÄæ˘ktWÅ¿Fˆ‚⁄\]b¿/âÔR<?SPßæÄK…¡W˚ê‡_D JêcçÂ>Ç§$„hµ‰%ÕÌkEºñ0[KÌC~ë¨*5ØÆØ@“˙.ã(IäY"=”n,yÍtÂ`.≠Ü(ø˙ı„‚ﬁı©ÃÀ©ù,-¶Æ	µ]C:ÂT÷<xà|≥ ÏTÁ2èm{s‹@Éc¶z'—Oó·Ç—3áRã∫åKh6ÃëÔ˘ñ¬ﬂ—ΩªÌ!64?`fzd¡ú4:àÑ"q∞÷»ÀìøCC√›É‹KKö
+ùs=Bœ1Ó0¶ûOw¥h£UÓ	E÷oˆ¢Eª…àCRxŒ©à‘°˛Ø7ıÖ»ëòq“ÁB›6–bº„R°ZÖ4„ë"Zﬁ ªZ¥ä- /‡Oœ£T}—÷„
+≤V^˝<óê=∆ |j|π~ﬂxiq-;_ -≠º0z#ÖùYÔŸI∏ﬂc¸˚…X]=|ä^˚Ê0ûÀêÑBÛñL/ÍlD›€∑œﬂ‡‘}˛∞¡uMUÚ6¨&°…!x)¨ ˜ôŒÛ	
+3'b˝^†∑" MpÍ.Œ>oXãDvöÖ˝¬x»ÑÓΩÙü˘ÓmÖX±K·U? Y˜^ÿòı∞∏&-¬yåÖÌâ{M∞«Z÷$Ï™éñç.l◊µØ\´I+´ÑÉµâ\¸MãzÀòBS©c,~¡¯ﬁ-I¿Ÿ}‰≤u∑=F}Yπyÿ ö∑Ñ∫ﬂF≠Ëû≠µ>”£OŸ∞hƒ[åL≤øßz˝ÈÆœÚOÀõ—K¥£Ú≤#Âó•©uÑ‰Y ®ÑaΩ¡∆X &í[È¢πñòÒJÆ_å4ÎpÔ)63˜{o`Uñ§w—&EàÆ¿Ä gJf9éR3æÀÕ?%√Dêÿô*[∞X`h.ö2t≠ª¥ÜÕ,6ÂO!Ò≈PÀÛ(,ÓUójπßÈ]6·:;x*ß·vy‡=,:k£]ö?f/1£®¬±»spûàÄöÈ+¡ÎÌ◊'ﬂYªÁKJå≥&o◊«ià_JÉJ6∆P‰≈“√iBkNMIÏ¸D˝{¥a|:îπª'{¿Ì7ÉEü`r0&,”U◊WìÈ˘ ì¡–T“`ùúπyˇ…°ÌÃÌçrÿq>∫fç– “ì‚Û”Õ<>yP^—YÄNxáoHÿÛ(˛T
+ì%∂∞ö‹B[	ÒåñãËßﬂÊ„dàP2ÆÏÁNRC©ê¯9#G‰ hWÏ‡CØóˇEVæ∑\ã7ÄÓ6‘Åeˆ[TêÚØ˘úRå_`Ÿ>wNáÉÏúà¢OqÏ ,8!´|ÿoe.”Â$Wº}Øèj>ÉlèÅ!‹"Q™¬0^! * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+!   Copyright by The HDF Group.                                               *
+!   Copyright by the Board of Trustees of the University of Illinois.         *
+!   All rights reserved.                                                      *
+!                                                                             *
+!   This file is part of HDF5.  The full HDF5 copyright notice, including     *
+!   terms governing use, modification, and redistribution, is contained in    *
+!   the files COPYING and Copyright.html.  COPYING can be found at the root   *
+!   of the source code distribution tree; Copyright.html can be found at the  *
+!   root level of an installed copy of the electronic HDF5 document set and   *
+!   is linked from the top-level documents page.  It can also be found at     *
+!   http://hdfgroup.org/HDF5/doc/Copyright.html.  If you do not have          *
+!   access to either file, you may request a copy from help@hdfgroup.org.     *
+! * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+
+!//////////////////////////////////////////////////////////
+! main program for parallel HDF5 Fortran tests
+!//////////////////////////////////////////////////////////
+
+PROGRAM parallel_test
+  USE hdf5
+  
+  IMPLICIT NONE
+  INCLUDE 'mpif.h'
+
+  INTEGER :: mpierror                             ! MPI hdferror flag
+  INTEGER :: hdferror                             ! HDF hdferror flag
+  LOGICAL :: do_collective                        ! use collective MPI I/O
+  LOGICAL :: do_chunk                             ! use chunking
+  INTEGER :: nerrors = 0                          ! number of errors
+  INTEGER :: mpi_size                             ! number of processes in the group of communicator
+  INTEGER :: mpi_rank                             ! rank of the calling process in the communicator
+  INTEGER :: length = 12000                       ! length of array
+
+  !//////////////////////////////////////////////////////////
+  ! initialize MPI
+  !//////////////////////////////////////////////////////////
+
+  CALL mpi_init(mpierror)
+  IF (mpierror .NE. MPI_SUCCESS) THEN
+     WRITE(*,*) "MPI_INIT  *FAILED*"
+  ENDIF
+  CALL mpi_comm_rank( MPI_COMM_WORLD, mpi_rank, mpierror )
+  IF (mpierror .NE. MPI_SUCCESS) THEN
+     WRITE(*,*) "MPI_COMM_RANK  *FAILED* Process = ", mpi_rank
+  ENDIF
+  CALL mpi_comm_size( MPI_COMM_WORLD, mpi_size, mpierror )
+  IF (mpierror .NE. MPI_SUCCESS) THEN
+     WRITE(*,*) "MPI_COMM_SIZE  *FAILED* Process = ", mpi_rank
+  ENDIF
+  !//////////////////////////////////////////////////////////
+  ! initialize the HDF5 fortran interface
+  !//////////////////////////////////////////////////////////
+
+  CALL h5open_f(hdferror)
+
+  !//////////////////////////////////////////////////////////
+  ! test write/read dataset by hyperslabs with independent MPI I/O
+  !//////////////////////////////////////////////////////////
+
+  IF (mpi_rank == 0) WRITE(*,*) 'Writing/reading dataset by hyperslabs (contiguous layout, independent MPI I/O)'
+
+  do_collective = .FALSE.
+  do_chunk      = .FALSE.
+  CALL hyper(length, do_collective, do_chunk, mpi_size, mpi_rank, nerrors)
+
+  !//////////////////////////////////////////////////////////
+  ! test write/read dataset by hyperslabs with collective MPI I/O
+  !//////////////////////////////////////////////////////////
+
+  IF (mpi_rank == 0) WRITE(*,*) 'Writing/reading dataset by hyperslabs (contiguous layout, collective MPI I/O)'
+
+  do_collective = .TRUE.
+  do_chunk      = .FALSE.
+  CALL hyper(length, do_collective, do_chunk, mpi_size, mpi_rank, nerrors)
+
+  !//////////////////////////////////////////////////////////
+  ! test write/read dataset by hyperslabs with independent MPI I/O
+  !//////////////////////////////////////////////////////////
+
+  IF (mpi_rank == 0) WRITE(*,*) 'Writing/reading dataset by hyperslabs (chunk layout, independent MPI I/O)'
+
+  do_collective = .FALSE.
+  do_chunk      = .TRUE.
+  CALL hyper(length, do_collective, do_chunk, mpi_size, mpi_rank, nerrors)
+
+  !//////////////////////////////////////////////////////////
+  ! test write/read dataset by hyperslabs with collective MPI I/O
+  !//////////////////////////////////////////////////////////
+
+  IF (mpi_rank == 0) WRITE(*,*) 'Writing/reading dataset by hyperslabs (chunk layout, collective MPI I/O)'
+
+  do_collective = .TRUE.
+  do_chunk      = .TRUE.
+  CALL hyper(length, do_collective, do_chunk, mpi_size, mpi_rank, nerrors)
+
+  !//////////////////////////////////////////////////////////
+  ! test write/read several datasets (independent MPI I/O)
+  !//////////////////////////////////////////////////////////
+
+  IF (mpi_rank == 0) WRITE(*,*) 'Writing/reading several datasets (contiguous layout, independent MPI I/O)'
+
+  do_collective = .FALSE.
+  do_chunk      = .FALSE.
+  CALL multiple_dset_write(length, do_collective, do_chunk, mpi_size, mpi_rank, nerrors)
+
+
+  !//////////////////////////////////////////////////////////
+  ! close HDF5 interface
+  !//////////////////////////////////////////////////////////
+
+  CALL h5close_f(hdferror)
+
+  !//////////////////////////////////////////////////////////
+  ! close MPI
+  !//////////////////////////////////////////////////////////
+
+  IF (nerrors == 0) THEN
+     CALL mpi_finalize(mpierror)
+     IF (mpierror .NE. MPI_SUCCESS) THEN
+        WRITE(*,*) "MPI_FINALIZE  *FAILED* Process = ", mpi_rank
+     ENDIF
+  ELSE
+     WRITE(*,*) 'Errors detected in process ', mpi_rank
+     CALL mpi_abort(MPI_COMM_WORLD, 1, mpierror)
+     IF (mpierror .NE. MPI_SUCCESS) THEN
+        WRITE(*,*) "MPI_ABORT  *FAILED* Process = ", mpi_rank
+     ENDIF
+  ENDIF
+
+  !//////////////////////////////////////////////////////////
+  ! end main program
+  !//////////////////////////////////////////////////////////
+
+END PROGRAM parallel_test
+
+                                                                                                                                                                                               }Áîπ1¿˘Ê43ëz…ŒÏ›ï⁄s¬Á¯?öÙ¬rvìΩæ—¨.6NÔ¥°˙?«ÑçŸÈ*PW7{¡Ô√2Û>ã˚rnZÅ˝Tï#∂â**ÌdÌ≈ÏYJÛÊUö2cµ[“—∫Ê^mOn•Ç{¸ÔËˇ?K∏Ü˝QòàÁ(o©l†˜wk,Ωê^3êo="MÈÛÌveÇ¶¶“#	E4OºU{«√ÍQ"1ı¥íôgúX{˝í}É.·-ú%mázÔˇôy\zõÍ¯Ô2V|åXÅ¯4]ƒ„Úëñ§˜^S+4a©âA|Ò¿ì/mŸú8ùG\!î:Ègœäˆa∞∫ Íˇ$∂ã$∂Vix˛—@ˆé¥øı>*˜≠bFõß
+1`:∆ ëÈ;–X“îÆ Ÿä'T$	E5CåüH¿qÎ-Øø)x	/H¥º4Æ3‹ˇNw|ÇèõË†zôâ¿¡PÎúI‹ÍÏΩÉY77èCìn `ºwÂ˝èÓ?Êá∂õ¨år“–I_)Ä©¯‰0	IxPúbŸ8œÔ3ıÑµﬁr€∏Íër®Çxﬂﬂ≤ïÈ+8ÑËÂéüÛ›ﬂxÔﬁVâΩ‡•Œ—A†…dE‚‹Æyª'›~oPˇ´Œ—#â GÏ∂ÑVlfJU—@ÜtÆâ¿|*Dnqÿ„)E/Ä	£…ßÛ9›é Ø˚P{-Ér—öfùæ˙=eë%¬0%¯4Øï7úï⁄à$*@†E7–◊¡€˘aΩáˆ–’¢ÉÙ°(°⁄$n∏w/}<lÅ7‘¿ë∏ãa˜√ÿã ÊPñ(«≈Õ
+âÀWûÚ;iíèñvn¶Gí)(¶Ñ~⁄%lÌÛä+%‚%Ñ  ò±?@ó.æånÛ-CÕ[˙—vÀ}◊ZHï”&h≠E,](ÙXe˘ˇ∫oí¸c”Qå 0‹–8â0ãkmÕBoúMe™*á$≈DU…ùñ1{qI®‹6ﬁøõ3O‚¸^
+'‡À`ˆùÏ™ÁªØhö˜O8xîí˛	«ånèﬂ≥«ü∞sÃYvèáÊ≈ƒH≈,2)t æ‰^fâÌ∂ıÄ„b<2u˜â∞7Ë|&˛˛åJïô+ë’Í,U]ù¶´ÀsÖé…Ydu¥íâ˜9è2,nHX…!Äêà§ãyââ¡JoÆñÙ≥4™Ç©–∞Èp7& ùHê$II`-¶–Ì2ﬂÉ§˚kÛ^ÈDåÑÄ8Å¸2´SGb:FV⁄hX∫mCaZi2PÀKC/·P¸øµ+rë˛D¸Û^®EEY˛W≥‚X ∞X≥œrJˇ∑∞˝gu„{O=ù	?ÙA5¬($â“QuD†?≤}ºE∆Å¨;$IB]!XÅØêÈ“∑∏oáÚâ)ÓîIKN˜iÃÀQ 5ã∆∏[∑ÏÉ/ÖêeaÙCNYyd2·W˛âÓ=’W∑Bù˝JìïÖßË2Ot∞◊k"˜µˆ<D5
+f\/p˛æeÊ˝™:Çÿáí8Ú.PÃ˚©ÍYÏE ".∂<N;C+LD[;_u‚‡ |)Ó CYëª)ü£I°]WÔÄÌô≤˙~^]”ïY"çy1s†|`ú⁄0≤J?ﬂ⁄¶ì€√ogª˚‘¥©'Ë¿|q`+9Å-µ3å€ÃL‹}M˛8/”˛.®Òê…®ú∂“,ŒñDL/£z›u9πQr≥πùäˇáå9üΩ7¬'ò@'Î~1ˇ‰˙`º≈#]≥-b›ul‘Æ/gº#.˙)]˜Ù}≠n˜UÎ1Ã√ÆÁ≈sÈ&ÁºKwŒß•˝?Á÷’
+Ω˘ë—∆ò⁄ùœÿÖ˘GÜ'x^˘§äf†hL‹©àπΩÂ¸⁄≈œsW«Ìjª≈XŸ´©Û?
+„≈{’Åùºì£∞8«J#¨CÂ+ÈÕ˛íY°6ç4›Ûñ’⁄‘T.ì⁄ﬁwm‚´˝ÓÁﬂ7ˆb~Œ◊Ç€6^ï4?ﬂEÕsE°‡üÃ˝\I˜Xyæº§ë¨ñ‘xêœ¿˝Y÷∑›xc`lïgá}≥pÄVd$;P√:gLÛ’ÚΩ¯9ﬂIJ…¸√éqŒe‡Äv1"n˚÷K{ZÚ}±_Ióî∫*¯Î^4fíy9~qâ8E˝˝ÅÌV,wπı~í◊ú~™Aºü’¢?N}ëy„ÿöÚ4ç=rb◊‘f√˘ekßÔ(íåL"—yÂÊ	I¢n®
+oŸ_¥9~Ôl(ñ˘’∞åv\˚Ï-€I÷ô6>ö⁄5D'∫ÿ~Üw≠ßO>Ôo¸⁄˘„Wæ;·Å7/Ê[√‹Jàæ◊K#=Ü!HT&¿¥ÓˆÄ@«â®ÊJ·¨ÈHïWmˇ+àË¡#ûnøŸ“s™]ç€óÃ§Û)Õ∆“o¡ã1¡æÈd‚÷˙&JlØ¨ﬂä#ÕÚSÀgŒT◊ØΩ∑5¥O∏Y∂zVö}C$y£{Ê÷Œä!î∂s»‹‘ü;%é!≤5{”?ËXã.=Ï8v˘´Ï‹s≠í[Y∑ﬁÎfˇW≤€<Q°≤GA¿b^åìã,r]Ñùù„’–ÜÍ°ÍÇÍÆ3ÌüŒÌV ùã∑VC.√æm0a≠
+#ËsO»(±Ÿuüªthr?ã¸∫S¬≤kÇ2¸[ôN˘˙“Ó]ı¬œ:¸IÌ˚^l2m6Â–˚´ùèíoÕœ›©ˇ[√‚è≈v∑:1AÉk‰∏H/*
+ *  Copyright 2015 The WebRTC project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+// This file contains classes that implement RtpSenderInterface.
+// An RtpSender associates a MediaStreamTrackInterface with an underlying
+// transport (provided by AudioProviderInterface/VideoProviderInterface)
+
+#ifndef WEBRTC_API_RTPSENDER_H_
+#define WEBRTC_API_RTPSENDER_H_
+
+#include <memory>
+#include <string>
+
+#include "webrtc/api/mediastreamprovider.h"
+#include "webrtc/api/rtpsenderinterface.h"
+#include "webrtc/api/statscollector.h"
+#include "webrtc/base/basictypes.h"
+#include "webrtc/base/criticalsection.h"
+#include "webrtc/base/scoped_ptr.h"
+#include "webrtc/media/base/audiosource.h"
+
+namespace webrtc {
+
+// LocalAudioSinkAdapter receives data callback as a sink to the local
+// AudioTrack, and passes the data to the sink of AudioSource.
+class LocalAudioSinkAdapter : public AudioTrackSinkInterface,
+                              public cricket::AudioSource {
+ public:
+  LocalAudioSinkAdapter();
+  virtual ~LocalAudioSinkAdapter();
+
+ private:
+  // AudioSinkInterface implementation.
+  void OnData(const void* audio_data,
+              int bits_per_sample,
+              int sample_rate,
+              size_t number_of_channels,
+              size_t number_of_frames) override;
+
+  // cricket::AudioSource implementation.
+  void SetSink(cricket::AudioSource::Sink* sink) override;
+
+  cricket::AudioSource::Sink* sink_;
+  // Critical section protecting |sink_|.
+  rtc::CriticalSection lock_;
+};
+
+class AudioRtpSender : public ObserverInterface,
+                       public rtc::RefCountedObject<RtpSenderInterface> {
+ public:
+  // StatsCollector provided so that Add/RemoveLocalAudioTrack can be called
+  // at the appropriate times.
+  AudioRtpSender(AudioTrackInterface* track,
+                 const std::string& stream_id,
+                 AudioProviderInterface* provider,
+                 StatsCollector* stats);
+
+  // Randomly generates stream_id.
+  AudioRtpSender(AudioTrackInterface* track,
+                 AudioProviderInterface* provider,
+                 StatsCollector* stats);
+
+  // Randomly generates id and stream_id.
+  AudioRtpSender(AudioProviderInterface* provider, StatsCollector* stats);
+
+  virtual ~AudioRtpSender();
+
+  // ObserverInterface implementation
+  void OnChanged() override;
+
+  // RtpSenderInterface implementation
+  bool SetTrack(MediaStreamTrackInterface* track) override;
+  rtc::scoped_refptr<MediaStreamTrackInterface> track() const override {
+    return track_.get();
+  }
+
+  void SetSsrc(uint32_t ssrc) override;
+
+  uint32_t ssrc() const override { return ssrc_; }
+
+  cricket::MediaType media_type() const override {
+    return cricket::MEDIA_TYPE_AUDIO;
+  }
+
+  std::string id() const override { return id_; }
+
+  void set_stream_id(const std::string& stream_id) override {
+    stream_id_ = stream_id;
+  }
+  std::string stream_id() const override { return stream_id_; }
+
+  void Stop() override;
+
+  RtpParameters GetParameters() const override;
+  bool SetParameters(const RtpParameters& parameters) override;
+
+ private:
+  // TODO(nisse): Since SSRC == 0 is technically valid, figure out
+  // some other way to test if we have a valid SSRC.
+  bool can_send_track() const { return track_ && ssrc_; }
+  // Helper function to construct options for
+  // AudioProviderInterface::SetAudioSend.
+  void SetAudioSend();
+
+  std::string id_;
+  std::string stream_id_;
+  AudioProviderInterface* provider_;
+  StatsCollector* stats_;
+  rtc::scoped_refptr<AudioTrackInterface> track_;
+  uint32_t ssrc_ = 0;
+  bool cached_track_enabled_ = false;
+  bool stopped_ = false;
+
+  // Used to pass the data callback from the |track_| to the other end of
+  // cricket::AudioSource.
+  std::unique_ptr<LocalAudioSinkAdapter> sink_adapter_;
+};
+
+class VideoRtpSender : public ObserverInterface,
+                       public rtc::RefCountedObject<RtpSenderInterface> {
+ public:
+  VideoRtpSender(VideoTrackInterface* track,
+                 const std::string& stream_id,
+                 VideoProviderInterface* provider);
+
+  // Randomly generates stream_id.
+  VideoRtpSender(VideoTrackInterface* track, VideoProviderInterface* provider);
+
+  // Randomly generates id and stream_id.
+  explicit VideoRtpSender(VideoProviderInterface* provider);
+
+  virtual ~VideoRtpSender();
+
+  // ObserverInterface implementation
+  void OnChanged() override;
+
+  // RtpSenderInterface implementation
+  bool SetTrack(MediaStreamTrackInterface* track) override;
+  rtc::scoped_refptr<MediaStreamTrackInterface> track() const override {
+    return track_.get();
+  }
+
+  void SetSsrc(uint32_t ssrc) override;
+
+  uint32_t ssrc() const override { return ssrc_; }
+
+  cricket::MediaType media_type() const override {
+    return cricket::MEDIA_TYPE_VIDEO;
+  }
+
+  std::string id() const override { return id_; }
+
+  void set_stream_id(const std::string& stream_id) override {
+    stream_id_ = stream_id;
+  }
+  std::string stream_id() const override { return stream_id_; }
+
+  void Stop() override;
+
+  RtpParameters GetParameters() const override;
+  bool SetParameters(const RtpParameters& parameters) override;
+
+ private:
+  bool can_send_track() const { return track_ && ssrc_; }
+  // Helper function to construct options for
+  // VideoProviderInterface::SetVideoSend.
+  void SetVideoSend();
+
+  std::string id_;
+  std::string stream_id_;
+  VideoProviderInterface* provider_;
+  rtc::scoped_refptr<VideoTrackInterface> track_;
+  uint32_t ssrc_ = 0;
+  bool cached_track_enabled_ = false;
+  bool stopped_ = false;
+};
+
+}  // namespace webrtc
+
+#endif  // WEBRTC_API_RTPSENDER_H_
+                                                                                          Uå-µ+”zôŒ˘¢˝¿6 .¡–w˙3ûU≈◊U÷i õSŒdéªJƒKö-tÉG|ΩX´÷¸æk√IÙÓk	ÒB¿≈üpRc†åÜ÷◊≠%r&T4Ñ⁄¥∑iˆˇÅ‹qÔ+*ñq∏&<˚2t™luzÎ’r–e°≥´aıÖKÇÇ=~XfÅAmeﬁ+ ∑%<7ÍLi«CpJzÈ∫í"%.˛˛P[ámæ+¸G^VCÌ°)¸m¢œ¬§√»q@ƒd∏∫<ä'RÄb¨SàÁhŒ∞’2:D±nÂeÑ„ÃònÁ·1:6í¥(ª.`#Jaz™ÍoH1O¬∏°rgOm
+œµ={zûØ∆◊˚ê˛±≤SΩ9omLuüº·&ºZ»∂@yIÇ	—‚«rº=BgF]a7&˘K:OÓË€•Õ\âB[Ë[´””·1≤â˙Ç… ª«b˙ãcÔTq“∞˝QüM}‚ﬂ‡0‹M'º8Àøßõÿ7I∞Y2ã$-˛bxñKp»¬ñ4è \D¸í	}–ê …˜ÛØõôPH_íM¢0°6ƒö1M¸Ñ8bg{wv vÜ(]&^˙‹S^≤Ú2l«ÎÈÿv%õÛˆÇı‹l^ªjô‚¿ºm∆ÓßDo_˘,∏„;†
+ì‘~BÌê—@t7= €4g=^’´Ëç‰“‡}‚≥ÅÌHT®bPäª£±~˝”.ƒ~ß`⁄”C¬Lÿê8“5’>ìa∂˘eæDËi&ÿ˜í‰w1ÉNHlù‚⁄[q˚V2.'ÿı˙ÈÛ,…)≤>Ôp,∂ä	uÔM¬7$ˆïZØ∞x–T5[c¶„AÁ¥‚ÁÀè±ù;ÚV∑È™Í∆-÷J8<·˘tB ßÍ{ÂJ´V«†°îU#uﬂÉwGLπ/ÛôìÊ@ê∂°›π5j1í%E¸≤•¶)ﬂo=TTñé¶,‡Û“b"@º≥E…={-h[˘ƒeÜ:¯èk¶¨öì	ÜÒl],Ÿ@´Î^Å£Ç›M˝åÜ®YÇΩ:±ëÀ UVNqıª∫º¢±Ÿ2ÅoÃˆ€pÊë·wôÀæfz}uP“óv-óç·–KñïiÊÄ⁄RWÁu|ı ì≈>äCòAˇ4#S–V…Të.9ñ‚">:yÑÖM©π≤ŸÍ•ÎÆL˛í˜Ì+m ≠ıπ˙V{!o•gñe&/"î∏Ñöà|}•≠m%√°/'˝gyï¬œcïa‹¨,€ q±±]‹=È¯ˇk¥w"^K_"è'Ä!Dœ“iR=›“7ºÉﬁEå Z-z·—AÇ÷vH
+§≠(’µ≈GÿH¥›’+ÒÊ˜l<ﬁ>íã&[É™rıˆ¿≤®ÆÁuuŒ8WI∑ıgx3HÜ¸îJ°·ô>∏W⁄·"üLÀ≥≥∆ÊÖ÷_ı‘;Õf-îóºÚ)y≈V§7`X;∆ÂU√|)&UŒ˛?Æ(<uäíﬂˇW=ßJ∂1,W•”™`	ÁJC='˘$ù(G≠(§c–'çÏ:öfxP÷¶◊!ÊÛNuΩËï9Rwª’8?‚¨àÇBﬂü–^çÛh∏\j∫+öH¢ÕU€6µÌPæTV0\Ñ—Ÿ[x1m®Mµ!sÒîÎ˙lb∞=≤9¡jWR∆3–“hÜµ€ø‹dU/ƒÍ{¡^⁄T
+i∑ø[ÉãúPÿ¯L‡ìH°Á±ï∆oØ|û˛d÷Óì. y>8Ä˚«á±' D∏áçˇ¨i')á¡n◊∞◊æ“S≠€≠óÙáv≥07ëÏÄ”ŒÙæöB_€)Î⁄RñÈù%…i‹Aπã±Å›'--x≠–m˝≠Ä´ÎüÌ˛qÉ;ñ†jÆx˙’^¸èI’ﬁxe(≈°•e|vÆoG0¨'»IïkõıyC mHk.çâgúÄ(¯C9öws                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     /*
+  Simple DirectMedia Layer
+  Copyright (C) 1997-2020 Sam Lantinga <slouken@libsdl.org>
+
+  This software is provided 'as-is', without any express or implied
+  warranty.  In no event will the authors be held liable for any damages
+  arising from the use of this software.
+
+  Permission is granted to anyone to use this software for any purpose,
+  including commercial applications, and to alter it and redistribute it
+  freely, subject to the following restrictions:
+
+  1. The origin of this software must not be misrepresented; you must not
+     claim that you wrote the original software. If you use this software
+     in a product, an acknowledgment in the product documentation would be
+     appreciated but is not required.
+  2. Altered source versions must be plainly marked as such, and must not be
+     misrepresented as being the original software.
+  3. This notice may not be removed or altered from any source distribution.
+*/
+
+/**
+ *  \file SDL_quit.h
+ *
+ *  Include file for SDL quit event handling.
+ */
+
+#ifndef SDL_quit_h_
+#define SDL_quit_h_
+
+#include "SDL_stdinc.h"
+#include "SDL_error.h"
+
+/**
+ *  \file SDL_quit.h
+ *
+ *  An ::SDL_QUIT event is generated when the user tries to close the application
+ *  window.  If it is ignored or filtered out, the window will remain open.
+ *  If it is not ignored or filtered, it is queued normally and the window
+ *  is allowed to close.  When the window is closed, screen updates will
+ *  complete, but have no effect.
+ *
+ *  SDL_Init() installs signal handlers for SIGINT (keyboard interrupt)
+ *  and SIGTERM (system termination request), if handlers do not already
+ *  exist, that generate ::SDL_QUIT events as well.  There is no way
+ *  to determine the cause of an ::SDL_QUIT event, but setting a signal
+ *  handler in your application will override the default generation of
+ *  quit events for that signal.
+ *
+ *  \sa SDL_Quit()
+ */
+
+/* There are no functions directly affecting the quit event */
+
+#define SDL_QuitRequested() \
+        (SDL_PumpEvents(), (SDL_PeepEvents(NULL,0,SDL_PEEKEVENT,SDL_QUIT,SDL_QUIT) > 0))
+
+#endif /* SDL_quit_h_ */
+                                                                                                                                                                                                                                                                                                                                                                                                            »ﬁV7	âï5-ç±üÇ‚b⁄P=¡·Cê92péÏ˝∑+˙—è\9hô∑dﬁ”ÒÕ9L%}’öÏé“Ö4Ï.i,XS[G*ıu•ãó]Ñe÷¡€Í:}RlU)ÓÁØQΩ±NhÀcÎXZ9Wí”•ÿÓ◊“pœm≤4ëæ∏ˆc˚æ1Y©fè†◊ê‘W>¬!(ﬁ]LÇLÏ‰ùFÜg‡QõÑÒ–eæÖ"ˇã@›Õ¯,úTl®∆R¯à©–≤ÛòÓä•µd›yõ≥âﬁ ı%n°ˆ˛”W¯F1öDTÕéﬁU|Ü¶IVΩ∞*‡âÀ‘û~¸¿§ù∏“)[î˛r¸õÔπbw›»qtoÆ`
+YUDPeëëÓ„i≈hﬁ|u:È‡ìnŸñ'=:]Q€±˜ª\ZR⁄h´œá§ÓÜWßMaŸqÕgÔPh¥…iBoó˝ù˘58tãÆMK`‚d/÷d%	ü˝~!buı  ós5ï¸ÀS|¨ÜŸçæi+~‘0Ö{i"í©+±q…X	Àí®Aá÷SÔÌç"Ü* àt‚R≈/,G0^!°§mL{N∏aÔ Èi+ƒñê•Fæı¨êL˘“Æ˝Uè∞û‚Ä70ªüΩÖb˛Ø≥º±X¥>¥Í»∆W‹Tå≥weÆGnZWŒL2Ä¶oaÙ¥`ëaÅø‹ôyÿ¨ñàÑˆg]´t@Æ∂Æè–ãÖ‰0q⁄ÇÔEÄ£ƒ°‰˜hÜ/≤êÌ¬$˙˙äõJw∆ïXÕŸ›–FZ™ï @¥√≤ÿ@ÅQ5SËΩŸ¥Í¯ú|4öP·†rÂùòe≤À{<ÃÉÂõ{Ñ
+¨ïm”U« f"U"Æ∂^Ω⁄/∆¸6Ú/”«~:ô•#‡ˆµ#ñ%I3≈¿
+¡Zy{¡îU˘Ô!¬g¶ÖÏ≥)Úp-'„OíI€4•øÙ$q*ªÿCzs>Êq:Ñˇc|	Uä=[É¡u ˚Üæ5®MJóˇÑénr∏c¸˜]äÎ¯ ò∏êv—å™é·>kUJ›Å*Iy>Ô:≠∆ Ó&e~Ò∞ì ÛµV°:2V“∆‡@Ï˝©±œoN-øÆÿÔ◊É7á9„z‹Uªè› Yòºê˝¡ﬁ≤⁄˙á≤Ï∆Ø≤ÿ—•h˘πç Œ“cm¡åNMªß6œ$bm≤Ó≥!◊î~√˙Mæ÷∆y â€ñ
+å¿º›cÏ∑	vÀ-Ô‰⁄ª√Ñ<¥àTÊîÉöß›ŒA\k=…ñlπ”"mÁØ®s®zÇÂ˘@ì	ÕK
+ªıÔ∏[=m[àPÌ¡ÿﬂYôÚ'c¬Ì°‰6˛±H<8$ ~©©åŸ[q3´™])Œä§n¥ı‰ÛŸrDuÌ•T®1∆9Íªª˜€∂≤AnbE—ÖL∞‘D!ÓÄF≠ÅßŸÄar≈ﬁJp›∏zƒ"fƒT*omVπUj§
+;JˆV`π˙NÇ¶ßä¥æ™Ä⁄˚EÔÜU≈®aÏ∂7†X¥˜2˛π:«“3Ql´l~·àhQ'UCÆ£nÿ8Œ–F≈åÏ‘	amyîDèà≤ãO`≥cÚò¨pÄ`º/›É5#;ö˘zMˇêSNˇˇ9€·•H8ye8∑Ç ¶|yH÷Ωc)∫ë•œ!ò‚ÎY›MôÕÉR¿\R:K™’˙1NW?ÈŒØ[èã‘:£ØP∂ûÄ∆t∑g‘°œˇÆ®|≠–:zazÆÊ>2:ØÒqOB»ªﬂ≤2„∏7≈cQBõ,$>äü+å¥€á(≥®µXâd·ÕO:∆CÌàK©.®r¬*6f~¥{DÁ~Xh+!Òùˆ9tÕU>Å
+¶Ãb∞ï“<òèloJ’™¥Œ?DjÜ5ö—_xt˘-->ò=sÊ∏À"®óî"x3π|Öü3:∂√u·-á«z÷8b˛îaU[˙ÙÂKE<Áÿ"I¸Qàéå¢ö!V0öíyXÊ5˛GáRØx¡NHlq7d…©DØ¢,Õé7<vªí—uªÛÎvÒ^NP/H"°B˙ˆ≈∫⁄ı¡K+%5xPFü””  ⁄'      ResB             ﬁ     	   ‚  ‚  ¨      €  ˆŒÆx  P T   E T   C T   G M T   A K T   P D T   M D T   C S T   H D T   E D T   C D T   E S T   H S T   H A T   M S T   P S T   A K S T   H A S T   A K D T   H A D T   G M T { 0 }   C u r a Á a o   R È u n i o n   { 0 }   T i m e   S „ o   T o m È   A s u n c i Û n   O m s k   T i m e   P e r u   T i m e   N i u e   T i m e   I r a n   T i m e   A c r e   T i m e   F i j i   T i m e   C u b a   T i m e   { 1 }   ( { 0 } )   2 . 0 . 9 8 . 7 6   H o v d   T i m e   J a p a n   T i m e   L a n k a   T i m e   N e p a l   T i m e   C h u u k   T i m e   P a l a u   T i m e   C h i n a   T i m e   M a c a u   T i m e   S a m o a   T i m e   S y o w a   T i m e   D a v i s   T i m e   T o n g a   T i m e   C a s e y   T i m e   C h i l e   T i m e   N a u r u   T i m e   A q t a u   T i m e   A n a d y r   T i m e   A z o r e s   T i m e   A q t o b e   T i m e   A m a z o n   T i m e   K o s r a e   T i m e   M a w s o n   T i m e   B h u t a n   T i m e   P o n a p e   T i m e   T a i p e i   T i m e   K o r e a n   T i m e   T a h i t i   T i m e   I s r a e l   T i m e   V o s t o k   T i m e   G u y a n a   T i m e   A l m a t y   T i m e   M o s c o w   T i m e   A l a s k a   T i m e   S a m a r a   T i m e   T u v a l u   T i m e   C e n t r a l   T i m e   B o l i v i a   T i m e   C h a t h a m   T i m e   M a g a d a n   T i m e   A r a b i a n   T i m e   T o k e l a u   T i m e   I r k u t s k   T i m e   Y a k u t s k   T i m e   A r m e n i a   T i m e   V a n u a t u   T i m e   U r u g u a y   T i m e   U n k n o w n   C i t y   R o t h e r a   T i m e   E c u a d o r   T i m e   G a m b i e r   T i m e   M y a n m a r   T i m e   E a s t e r n   T i m e   R e u n i o n   T i m e   S u r i n a m e   T i m e   M o u n t a i n   T i m e   B r a s i l i a   T i m e   M a l a y s i a   T i m e   M a l d i v e s   T i m e   P i t c a i r n   T i m e   + H H : m m ; - H H : m m   C o l o m b i a   T i m e   P a k i s t a n   T i m e   P a r a g u a y   T i m e   S a k h a l i n   T i m e   A t l a n t i c   T i m e   H o n g   K o n g   T i m e   L o r d   H o w e   T i m e   V o l g o g r a d   T i m e   M a r q u e s a s   T i m e   I n d o c h i n a   T i m e   K y r g y s t a n   T i m e   G a l a p a g o s   T i m e   M a u r i t i u s   T i m e   V e n e z u e l a   T i m e   Q y z y l o r d a   T i m e   P h i l i p p i n e   T i m e   C a p e   V e r d e   T i m e   B a n g l a d e s h   T i m e   S e y c h e l l e s   T i m e   U l a n   B a t o r   T i m e   E a s t   T i m o r   T i m e   A z e r b a i j a n   T i m e   C h o i b a l s a n   T i m e   U z b e k i s t a n   T i m e   T a j i k i s t a n   T i m e   W e s t   A f r i c a   T i m e   W a k e   I s l a n d   T i m e   O m s k   S u m m e r   T i m e   F i j i   S u m m e r   T i m e   A c r e   S u m m e r   T i m e   H o v d   S u m m e r   T i m e   N e w   Z e a l a n d   T i m e   A f g h a n i s t a n   T i m e   N o v o s i b i r s k   T i m e   K r a s n o y a r s k   T i m e   V l a d i v o s t o k   T i m e   E a s t   A f r i c a   T i m e   D u m o n t   d  U r v i l l e   P e r u   S u m m e r   T i m e   S a i n t   B a r t h È l e m y   H o   C h i   M i n h   C i t y   C o o k   I s l a n d s   T i m e   A q t a u   S u m m e r   T i m e   C h i l e   S u m m e r   T i m e   L i n e   I s l a n d s   T i m e   I r i s h   S u m m e r   T i m e   I n d i a n   O c e a n   T i m e   T o n g a   S u m m e r   T i m e   N e w f o u n d l a n d   T i m e   M a c a u   S u m m e r   T i m e   T u r k m e n i s t a n   T i m e   { 0 }   S t a n d a r d   T i m e   { 0 }   D a y l i g h t   T i m e   C o c o s   I s l a n d s   T i m e   G u l f   S t a n d a r d   T i m e   F i j i   S t a n d a r d   T i m e   Y e k a t e r i n b u r g   T i m e   P e r u   S t a n d a r d   T i m e   C u b a   D a y l i g h t   T i m e   A c r e   S t a n d a r d   T i m e   A l m a t y   S u m m e r   T i m e   C u b a   S t a n d a r d   T i m e   E a s t e r   I s l a n d   T i m e   S a m a r a   S u m m e r   T i m e   A z o r e s   S u m m e r   T i m e   G u a m   S t a n d a r d   T i m e   A n a d y r   S u m m e r   T i m e   A m a z o n   S u m m e r   T i m e   O m s k   S t a n d a r d   T i m e   I r a n   S t a n d a r d   T i m e   H o v d   S t a n d a r d   T i m e   I r a n   D a y l i g h t   T i m e   S o u t h   G e o r g i a   T i m e   N e w   C a l e d o n i a   T i m e   M o s c o w   S u m m e r   T i m e   A q t o b e   S u m m e r   T i m e   F r e n c h   G u i a n a   T i m e   C h i n a   S t a n d a r d   T i m e   G r e e n w i c h   M e a n   T i m e   S a m o a   D a y l i g h t   T i m e   S a m o a   S t a n d a r d   T i m e   W e s t   G r e e n l a n d   T i m e   E a s t   G r e e n l a n d   T i m e   M a g a d a n   S u m m e r   T i m e   I r k u t s k   S u m m e r   T i m e   Y a k u t s k   S u m m e r   T i m e   V a n u a t u   S u m m e r   T i m e   B r i t i s h   S u m m e r   T i m e   A r m e n i a   S u m m e r   T i m e   G e o r g i a   S u m m e r   T i m e   U r u g u a y   S u m m e r   T i m e   N o r f o l k   I s l a n d   T i m e   T o n g a   S t a n d a r d   T i m e   C h i n a   D a y l i g h t   T i m e   I n d i a   S t a n d a r d   T i m e   C e n t r a l   A f r i c a   T i m e   J a p a n   S t a n d a r d   T i m e   M a c a u   S t a n d a r d   T i m e   A q t a u   S t a n d a r d   T i m e   C h i l e   S t a n d a r d   T i m e   J a p a n   D a y l i g h t   T i m e   C o l o m b i a   S u m m e r   T i m e   M o s c o w   S t a n d a r d   T i m e   M e x i c a n   P a c i f i c   T i m e   A l m a t y   S t a n d a r d   T i m e   P a k i s t a n   S u m m e r   T i m e   A l a s k a   D a y l i g h t   T i m e   K o r e a n   S t a n d a r d   T i m e   T a i p e i   S t a n d a r d   T i m e   W e s t   K a z a k h s t a n   T i m e   K o r e a n   D a y l i g h t   T i m e   B r a s i l i a   S u m m e r   T i m e   A q t o b e   S t a n d a r d   T i m e   P h o e n i x   I s l a n d s   T i m e   G i l b e r t   I s l a n d s   T i m e   A z o r e s   S t a n d a r d   T i m e   S o l o m o n   I s l a n d s   T i m e   A m a z o n   S t a n d a r d   T i m e   A n a d y r   S t a n d a r d   T i m e   S a k h a l i n   S u m m e r   T i m e   I s r a e l   S t a n d a r d   T i m e   H a w a i i - A l e u t i a n   T i m e   P a r a g u a y   S u m m e r   T i m e   S a m a r a   S t a n d a r d   T i m e   A l a s k a   S t a n d a r d   T i m e   T a i p e i   D a y l i g h t   T i m e   I s r a e l   D a y l i g h t   T i m e   E a s t   K a z a k h s t a n   T i m e   A r a b i a n   D a y l i g h t   T i m e   V a n u a t u   S t a n d a r d   T i m e   W e s t e r n   E u r o p e a n   T i m e   E a s t e r n   E u r o p e a n   T i m e   C e n t r a l   E u r o p e a n   T i m e   H o n g   K o n g   S u m m e r   T i m e   C h a t h a m   D a y l i g h t   T i m e   F a l k l a n d   I s l a n d s   T i m e   Y a k u t s k   S t a n d a r d   T i m e   M a c q u a r i e   I s l a n d   T i m e   V o l g o g r a d   S u m m e r   T i m e   I r k u t s k   S t a n d a r d   T i m e   M a r s h a l l   I s l a n d s   T i m e   Q y z y l o r d a   S u m m e r   T i m e   A r m e n i a   S t a n d a r d   T i m e   G e o r g i a   S t a n d a r d   T i m e   P a p u a   N e w   G u i n e a   T i m e   D u m o n t - d  U r v i l l e   T i m e   M a u r i t i u s   S u m m e r   T i m e   M a g a d a n   S t a n d a r d   T i m e   C h a t h a m   S t a n d a r d   T i m e   A r a b i a n   S t a n d a r d   T i m e   U r u g u a y   S t a n d a r d   T i m e   N o r t h w e s t   M e x i c o   T i m e   C h r i s t m a s   I s l a n d   T i m e   P a k i s t a n   S t a n d a r d   T i m e   A z e r b a i j a n   S u m m e r   T i m e   B a n g l a d e s h   S u m m e r   T i m e   W e s t e r n   A u s t r a l i a   T i m e   E a s t e r n   A u s t r a l i a   T i m e   U z b e k i s t a n   S u m m e r   T i m e   C e n t r a l   A u s t r a l i a   T i m e   M o u n t a i n   S t a n d a r d   T i m e   S a k h a l i n   S t a n d a r d   T i m e   C h o i b a l s a n   S u m m e r   T i m e   A t l a n t i c   S t a n d a r d   T i m e   B r u n e i   D a r u s s a l a m   T i m e   A t l a n t i c   D a y l i g h t   T i m e   B r a s i l i a   S t a n d a r d   T i m e   M o u n t a i n   D a y l i g h t   T i m e   C o l o m b i a   S t a n d a r d   T i m e   W e s t e r n   A r g e n t i n a   T i m e   W a l l i s   a n d   F u t u n a   T i m e   P a r a g u a y   S t a n d a r d   T i m e   U l a n   B a t o r   S u m m e r   T i m e   W e s t e r n   I n d o n e s i a   T i m e   C a p e   V e r d e   S u m m e r   T i m e   C h a m o r r o   S t a n d a r d   T i m e   P h i l i p p i n e   S u m m e r   T i m e   E a s t e r n   I n d o n e s i a   T i m e   C e n t r a l   I n d o n e s i a   T i m e   V o l g o g r a d   S t a n d a r d   T i m e   L o r d   H o w e   D a y l i g h t   T i m e   S i n g a p o r e   S t a n d a r d   T i m e   L o r d   H o w e   S t a n d a r d   T i m e   H o n g   K o n g   S t a n d a r d   T i m e   Q y z y l o r d a   S t a n d a r d   T i m e   W e s t   A f r i c a   S u m m e r   T i m e   M a u r i t i u s   S t a n d a r d   T i m e   N o v o s i b i r s k   S u m m e r   T i m e   K r a s n o y a r s k   S u m m e r   T i m e   V l a d i v o s t o k   S u m m e r   T i m e   T u r k m e n i s t a n   S u m m e r   T i m e   B a n g l a d e s h   S t a n d a r d   T i m e   U l a n   B a t o r   S t a n d a r d   T i m e   F e r n a n d o   d e   N o r o n h a   T i m e   A z e r b a i j a n   S t a n d a r d   T i m e   C h o i b a l s a n   S t a n d a r d   T i m e   P h i l i p p i n e   S t a n d a r d   T i m e   C a p e   V e r d e   S t a n d a r d   T i m e   U z b e k i s t a n   S t a n d a r d   T i m e   N e w   Z e a l a n d   D a y l i g h t   T i m e   K r a s n o y a r s k   S t a n d a r d   T i m e   N o v o s i b i r s k   S t a n d a r d   T i m e   W e s t   A f r i c a   S t a n d a r d   T i m e   N e w   C a l e d o n i a   S u m m e r   T i m e   V l a d i v o s t o k   S t a n d a r d   T i m e   Y e k a t e r i n b u r g   S u m m e r   T i m e   N e w   Z e a l a n d   S t a n d a r d   T i m e   E a s t e r   I s l a n d   S u m m e r   T i m e   N e w f o u n d l a n d   S t a n d a r d   T i m e   N e w f o u n d l a n d   D a y l i g h t   T i m e   S o u t h   A f r i c a   S t a n d a r d   T i m e   T u r k m e n i s t a n   S t a n d a r d   T i m e   E a s t   G r e e n l a n d   S u m m e r   T i m e   C o o k   I s l a n d s   S t a n d a r d   T i m e   W e s t   G r e e n l a n d   S u m m e r   T i m e   N o r t h   M a r i a n a   I s l a n d s   T i m e   N e w   C a l e d o n i a   S t a n d a r d   T i m e   Y e k a t e r i n b u r g   S t a n d a r d   T i m e   E a s t e r   I s l a n d   S t a n d a r d   T i m e   E a s t   G r e e n l a n d   S t a n d a r d   T i m e   W e s t   G r e e n l a n d   S t a n d a r d   T i m e   F a l k l a n d   I s l a n d s   S u m m e r   T i m e   W e s t e r n   E u r o p e a n   S u m m e r   T i m e   C e n t r a l   E u r o p e a n   S u m m e r   T i m e   E a s t e r n   E u r o p e a n   S u m m e r   T i m e   H a w a i i - A l e u t i a n   D a y l i g h t   T i m e   W e s t e r n   A r g e n t i n a   S u m m e r   T i m e   P e t r o p a v l o v s k - K a m c h a t s k i   T i m e   C o o k   I s l a n d s   H a l f   S u m m e r   T i m e   M e x i c a n   P a c i f i c   S t a n d a r d   T i m e   H a w a i i - A l e u t i a n   S t a n d a r d   T i m e   M e x i c a n   P a c i f i c   D a y l i g h t   T i m e   N o r t h w e s t   M e x i c o   S t a n d a r d   T i m e   F a l k l a n d   I s l a n d s   S t a n d a r d   T i m e   N o r t h w e s t   M e x i c o   D a y l i g h t   T i m e   W e s t e r n   E u r o p e a n   S t a n d a r d   T i m e   E a s t e r n   E u r o p e a n   S t a n d a r d   T i m e   C e n t r a l   E u r o p e a n   S t a n d a r d   T i m e   S a i n t   P i e r r e   a n d   M i q u e l o n   T i m e   F e r n a n d o   d e   N o r o n h a   S u m m e r   T i m e   W e s t e r n   A r g e n t i n a   S t a n d a r d   T i m e   A u s t r a l i a n   C e n t r a l   W e s t e r n   T i m e   A u s t r a l i a n   C e n t r a l   S t a n d a r d   T i m e   A u s t r a l i a n   E a s t e r n   S t a n d a r d   T i m e   A u s t r a l i a n   W e s t e r n   S t a n d a r d   T i m e   A u s t r a l i a n   C e n t 

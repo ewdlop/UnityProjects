@@ -1,0 +1,242 @@
+//===- Endian.h - Utilities for IO with endian specific data ----*- C++ -*-===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+//
+// This file declares generic functions to read and write endian specific data.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef LLVM_SUPPORT_ENDIAN_H
+#define LLVM_SUPPORT_ENDIAN_H
+
+#include "llvm/Support/AlignOf.h"
+#include "llvm/Support/Host.h"
+#include "llvm/Support/SwapByteOrder.h"
+
+#pragma warning( push )           // HLSL Change - constant comparisons are done for portability
+#pragma warning( disable : 6326 ) // 'Potential comparison of a constant with another constant.'
+
+namespace llvm {
+namespace support {
+enum endianness {big, little, native};
+
+// These are named values for common alignments.
+enum {aligned = 0, unaligned = 1};
+
+namespace detail {
+  /// \brief ::value is either alignment, or alignof(T) if alignment is 0.
+  template<class T, int alignment>
+  struct PickAlignment {
+    enum {value = alignment == 0 ? AlignOf<T>::Alignment : alignment};
+  };
+} // end namespace detail
+
+namespace endian {
+/// Swap the bytes of value to match the given endianness.
+template<typename value_type, endianness endian>
+inline value_type byte_swap(value_type value) {
+  if (endian != native && sys::IsBigEndianHost != (endian == big))
+    sys::swapByteOrder(value);
+  return value;
+}
+
+/// Read a value of a particular endianness from memory.
+template<typename value_type,
+         endianness endian,
+         std::size_t alignment>
+inline value_type read(const void *memory) {
+  value_type ret;
+
+  memcpy(&ret,
+         LLVM_ASSUME_ALIGNED(memory,
+           (detail::PickAlignment<value_type, alignment>::value)),
+         sizeof(value_type));
+  return byte_swap<value_type, endian>(ret);
+}
+
+/// Read a value of a particular endianness from a buffer, and increment the
+/// buffer past that value.
+template<typename value_type, endianness endian, std::size_t alignment,
+         typename CharT>
+inline value_type readNext(const CharT *&memory) {
+  value_type ret = read<value_type, endian, alignment>(memory);
+  memory += sizeof(value_type);
+  return ret;
+}
+
+/// Write a value to memory with a particular endianness.
+template<typename value_type,
+         endianness endian,
+         std::size_t alignment>
+inline void write(void *memory, value_type value) {
+  value = byte_swap<value_type, endian>(value);
+  memcpy(LLVM_ASSUME_ALIGNED(memory,
+           (detail::PickAlignment<value_type, alignment>::value)),
+         &value,
+         sizeof(value_type));
+}
+} // end namespace endian
+
+namespace detail {
+template<typename value_type,
+         endianness endian,
+         std::size_t alignment>
+struct packed_endian_specific_integral {
+  operator value_type() const {
+    return endian::read<value_type, endian, alignment>(
+      (const void*)Value.buffer);
+  }
+
+  void operator=(value_type newValue) {
+    endian::write<value_type, endian, alignment>(
+      (void*)Value.buffer, newValue);
+  }
+
+  packed_endian_specific_integral &operator+=(value_type newValue) {
+    *this = *this + newValue;
+    return *this;
+  }
+
+  packed_endian_specific_integral &operator-=(value_type newValue) {
+    *this = *this - newValue;
+    return *this;
+  }
+
+  packed_endian_specific_integral &operator|=(value_type newValue) {
+    *this = *this | newValue;
+    return *this;
+  }
+
+  packed_endian_specific_integral &operator&=(value_type newValue) {
+    *this = *this & newValue;
+    return *this;
+  }
+
+private:
+  AlignedCharArray<PickAlignment<value_type, alignment>::value,
+                   sizeof(value_type)> Value;
+
+public:
+  struct ref {
+    explicit ref(void *Ptr) : Ptr(Ptr) {}
+
+    operator value_type() const {
+      return endian::read<value_type, endian, alignment>(Ptr);
+    }
+
+    void operator=(value_type NewValue) {
+      endian::write<value_type, endian, alignment>(Ptr, NewValue);
+    }
+
+  private:
+    void *Ptr;
+  };
+};
+
+} // end namespace detail
+
+typedef detail::packed_endian_specific_integral
+                  <uint16_t, little, unaligned> ulittle16_t;
+typedef detail::packed_endian_specific_integral
+                  <uint32_t, little, unaligned> ulittle32_t;
+typedef detail::packed_endian_specific_integral
+                  <uint64_t, little, unaligned> ulittle64_t;
+
+typedef detail::packed_endian_specific_integral
+                   <int16_t, little, unaligned> little16_t;
+typedef detail::packed_endian_specific_integral
+                   <int32_t, little, unaligned> little32_t;
+typedef detail::packed_endian_specific_integral
+                   <int64_t, little, unaligned> little64_t;
+
+typedef detail::packed_endian_specific_integral
+                    <uint16_t, little, aligned> aligned_ulittle16_t;
+typedef detail::packed_endian_specific_integral
+                    <uint32_t, little, aligned> aligned_ulittle32_t;
+typedef detail::packed_endian_specific_integral
+                    <uint64_t, little, aligned> aligned_ulittle64_t;
+
+typedef detail::packed_endian_specific_integral
+                     <int16_t, little, aligned> aligned_little16_t;
+typedef detail::packed_endian_specific_integral
+                     <int32_t, little, aligned> aligned_little32_t;
+typedef detail::packed_endian_specific_integral
+                     <int64_t, little, aligned> aligned_little64_t;
+
+typedef detail::packed_endian_specific_integral
+                  <uint16_t, big, unaligned>    ubig16_t;
+typedef detail::packed_endian_specific_integral
+                  <uint32_t, big, unaligned>    ubig32_t;
+typedef detail::packed_endian_specific_integral
+                  <uint64_t, big, unaligned>    ubig64_t;
+
+typedef detail::packed_endian_specific_integral
+                   <int16_t, big, unaligned>    big16_t;
+typedef detail::packed_endian_specific_integral
+                   <int32_t, big, unaligned>    big32_t;
+typedef detail::packed_endian_specific_integral
+                   <int64_t, big, unaligned>    big64_t;
+
+typedef detail::packed_endian_specific_integral
+                    <uint16_t, big, aligned>    aligned_ubig16_t;
+typedef detail::packed_endian_specific_integral
+                    <uint32_t, big, aligned>    aligned_ubig32_t;
+typedef detail::packed_endian_specific_integral
+                    <uint64_t, big, aligned>    aligned_ubig64_t;
+
+typedef detail::packed_endian_specific_integral
+                     <int16_t, big, aligned>    aligned_big16_t;
+typedef detail::packed_endian_specific_integral
+                     <int32_t, big, aligned>    aligned_big32_t;
+typedef detail::packed_endian_specific_integral
+                     <int64_t, big, aligned>    aligned_big64_t;
+
+typedef detail::packed_endian_specific_integral
+                  <uint16_t, native, unaligned> unaligned_uint16_t;
+typedef detail::packed_endian_specific_integral
+                  <uint32_t, native, unaligned> unaligned_uint32_t;
+typedef detail::packed_endian_specific_integral
+                  <uint64_t, native, unaligned> unaligned_uint64_t;
+
+typedef detail::packed_endian_specific_integral
+                   <int16_t, native, unaligned> unaligned_int16_t;
+typedef detail::packed_endian_specific_integral
+                   <int32_t, native, unaligned> unaligned_int32_t;
+typedef detail::packed_endian_specific_integral
+                   <int64_t, native, unaligned> unaligned_int64_t;
+
+namespace endian {
+inline uint16_t read16le(const void *p) { return *(const ulittle16_t *)p; }
+inline uint32_t read32le(const void *p) { return *(const ulittle32_t *)p; }
+inline uint64_t read64le(const void *p) { return *(const ulittle64_t *)p; }
+inline uint16_t read16be(const void *p) { return *(const ubig16_t *)p; }
+inline uint32_t read32be(const void *p) { return *(const ubig32_t *)p; }
+inline uint64_t read64be(const void *p) { return *(const ubig64_t *)p; }
+
+inline void write16le(void *p, uint16_t v) { *(ulittle16_t *)p = v; }
+inline void write32le(void *p, uint32_t v) { *(ulittle32_t *)p = v; }
+inline void write64le(void *p, uint64_t v) { *(ulittle64_t *)p = v; }
+inline void write16be(void *p, uint16_t v) { *(ubig16_t *)p = v; }
+inline void write32be(void *p, uint32_t v) { *(ubig32_t *)p = v; }
+inline void write64be(void *p, uint64_t v) { *(ubig64_t *)p = v; }
+} // end namespace endian
+} // end namespace support
+} // end namespace llvm
+
+#pragma warning( pop ) // HLSL Change - pop warning level
+
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                            <çıI‘f8·÷„ÒpÃ!¬âæÍnéU_GÌ~j•×tæÎ­LkÌ¿ãœ¥Ìç®Ï(Ï«à 1YÊô_ÿBY…ÀßÀ¹£p~Ùİs±Y3{Ÿß˜íÊ²G"µ!nobLË´Êu&#â¨yş› Ú›©É+.úó¢2—J^å õB°U«Ô5SàëşÌÜ†ë¶Ã.9®U 4P÷ºR8Ñn½BÿxI‹{¶8È-Œ¡@Ö'oU1÷6 7l½Êª
+ì‰İØÖé¦2¥ÕˆÖPÓ‡›Lüßş§ ¸f±7a©›WºÏĞmÁåÂÌĞú!Q1‹VÎ±eàä2óÁ¡¡jÃ¡>	°"°½n¹ôÒâcc"ı¤Ræ[}ÒpTéì «K¹)-adÆ$ŠySu'ÎSR7µ(Sm¯¨Yÿì+qZÊp,.È2³\<Kšˆ–º:¾–‚ê`ƒ|·’®,b~Tà ¹úï
+
+Wî·Âúåå¹üÑrË¶3—[ÁöD4†ªózò5JSğ%†Í¥­YGöà•–îƒîŸšşFù€Ã;şğÄ”I9¢½”ù~¨fÎ¯Ï^¾U‰C”6À$¨mÉ¨±’OÑÌåpC!;&NûS€GÔf)\÷_Ö#¶¿êºœâÿŸ1÷Ö£ö[ƒVœ0ÀÀ["‚GttŠÎşsŠP×c–7|°‹\*/qÊüfÃÊûO4æ†Tµ^HÌ?z$Õ¯7YÓ´ò¥òIÑMÖ!b¸>,.X«nüø´.Ôù şÃŸİ†â´zQ`¸£Ì;E^1qêPmZ ²l~ÃÀ<¶€`ò_t^¸©%¸oıÏHÌì¢N8İÓ¶z—…—¸¨`© :õÿ®ƒBŠÅ Âª³Yûè–éXYº¹ŒtR~Š(XkR:Â°–°}#ÛFÆöÿ›ÑT¹7«*Ch†ÍBhØ¾•”œoz<sw¹sdÛyŞk60jnÏÿI‰w«$µ&2/¸™µ!«=™ºÿ´WÛÚ¯U•'À´aI
+G‚¥?šZöµ{+Ê9Š­×¨Àøæ…˜dÅíÛİG8,³ûdJ#pxóõD"òûJîû9Ìi'+şû	rÍƒÍ„]ÕáŸJ·µ‡ïíjÀ`’ Ë4Ò¦9JSo÷İ~í5U>jª$üÉÙ'º„ó‚ìa6¯«1eı¿Ùç¤÷¯|Ñ§2àäS§§}1Rù›7å &Â)¹ËïPjbpºÓ_äuyl/ş,y­º‰ÿÆš ¾cn«=%”1øMxí0³wùĞù€ÕQ·;7k>Y… ßšèúVbÔjfãÙ>»Ë&„i½;ÖKøŒ€Í®*dçjRÑÁë R0üS¶Â„èí ‰Òuúª¾~ ú½¸¤ÃsËH0®¨:“¯ÒÎäõ´V]@Úá<htK|p"ôjâİ@†”DH#û‚{ Åa'ÇÔN”ÿŸŸò1‹óö×Oi‰óÇ$$[*	‰1|ØX£_Ç_Îæúí’ïY.€w}}œKsN¾•X?gã²Uw%Ô9¦Ëm{áB~@¸uõ³—²v”z·`[8&f¦t+´å/\ñˆ~B%Úd¤ªúÀ0ŠDZ}€˜û)eo)«x–ãVj b®¹ï·ÏÌ~kíF\ =™\û£ÉÍg€Te>/ñ¬Bï¿–-ÇlÆçëE?0<¨e±×LèÄÆÿ~€h5/‡ˆö\'EÇìyåÙ^Q¹ª…ZÎºŠğ¬ERè~/“ZÂÈ
+/áÛYxæ¸/«8Ğˆ3HÔrÓŸú¿aì¯³.(ôT¬£ê`¸yce]ÌÎÓ²kD½ÄÜ¶†Ğh}«­şkhlÏp!$(J ÖBÿØ•jhJ»ÎÂ©„ãôĞaR=AKşés”|X±êKšâôšğŠn³/2õ4Ëİmu2z {›5àB»‘`„’|!c"Y¿Mbõ06É‡Ÿ½ˆ°v¦õŒ0?Ò¼üç8›¡{Qˆº=håÌ,îğWÃ×e%¥3Eš.ï!»¬—ŠèvEİ¯Ã•ñm
+S%w1Ò G:…3 $…±”Oßÿ?ï•í±šÿMÜÌGéã3­|(¡Zò½eÓ&¨|4Ê2Ùæú7±HvS'ø+,"«É-¢àÑÑg†5c¼ï<P}é¸t¾/3îÒ“V(,Ìs‡îDül³>2p>¢ıÃûà€“8µÆ«Ï3ªâ'>úÔv|ÃùRìŞx¿Î¸Š]œ¼uAê¨N·UæÉ&û‡´*‚[¬B}×Iœ¯‡´ÔSÕZ–UgVÚls'Ø˜ƒL(8°mÃõß?°7]M®¿ ­ú™˜ñL,”í8ğC“EÙQ£}„›ËhönÆ)±Iöàú{ß¾ö+¥™Æ£œ-}’ä>¡¦€kâ„h~W «äw¢ÓÓ4iw±ÿ=­µç',¸ÁÎHg¸"¢N+ß~(? µÿÄr#ˆ/Iç„Z ÊpæGÃc"hóµWC‘HífúˆõÈãïˆÍ“áÔjL‹Ö´ÿ(_x¥)òpŒËl}á8{ğcûk<öƒ`ë'ş`Ü‚CØ¾Úr†‡¿ƒ%Bîâ‚2·gB®æ
+[ÙĞZ)#V<\D@áƒòÄXwˆ­:Šùf/èÛ<yGct4»}JeÓe`CK1µa¢Ü£Öyv¼pNXÏ¯²“´3¥¾6ÄYhI‚È›‹ş»Ÿô±y¾‹úúÆÍ•ƒì.QÜ~ò\ÿâÍõ|1s+mF…ãO/ù°=o½9ƒÂØ; ••¿ªÚ°ãkÊ_”B.m÷EGP~˜üâäPô`£ Í0Ml¯:Ğmc¸eÙ(½1dZb3=YgSn¾êò³Ò:	&FÉHH”™9õÄqÌ<\Áƒ1
+QÜ«#6šUã°yKxĞeÌ¹µJÖó÷PS÷tAÒ¦Ù:ßÆúØxm¥Ûc*:Œ.c{l‡ î#äüpŸôYÜ}ËM˜ö+jXF¿	€fÃ$uê&Z–ÿ\âP~x‘{-	udı‰øŠídRØŞ¹,º”)o•]O×{1†Ø:¨rà}ñÀÂLîê3i`¡ĞÁ|7ªpeŸe†Ëø.¶îœ¤¦9Äí«…4M„Î•O»|¯¡¶0¦Š~eóÿûçì‰M _êY+M±Şê-p<‰9ôw•ù’şMó^Üh\êñêˆ”5IÇ<ã¡C öúöåOgF[­?*¢1‘ô€š7F’GKNZlóbùy°eyHtßÔŞÌ2aÛ_*/ÔÓÖX­i IZE‹ß$:OÈx*¶ÛNßH¢ì‡I(¥Q4Ùüş×CÎ5ƒ\%»p¢Aú|“rğŠF”P7†êD˜›µÍæ€_ê€saëéÃøÜıFw¢Î°¸Ÿ-ôŞîQAº¶wšÆ

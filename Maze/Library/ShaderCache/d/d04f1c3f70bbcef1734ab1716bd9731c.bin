@@ -1,0 +1,136 @@
+>
+						<Item1 Include='A;B;C' />
+						<Item2 Include=""@(Item1,'-')"" />
+						<Item3 Include=""@(Item1,'xx')"" />
+					</ItemGroup>
+				</Project>
+			";
+
+			proj.LoadXml (documentString);
+
+			CheckItems (proj, "Item2", "A1", "A-B-C");
+			CheckItems (proj, "Item3", "A2", "AxxBxxC");
+		}
+
+		[Test]
+		// item with 1. item ref with a separator and 2. another item ref
+		public void TestItems2a () {
+			Engine engine = new Engine (Consts.BinPath);
+			Project proj = engine.CreateNewProject ();
+
+			string documentString = @"
+				<Project xmlns='http://schemas.microsoft.com/developer/msbuild/2003'>
+					<ItemGroup>
+						<Item0 Include='D'/>
+						<Item1 Include='A;B;C' />
+						<Item2 Include=""@(Item1,'-');@(Item0)"" />
+						<Item3 Include=""@(Item1,'xx')"" />
+					</ItemGroup>
+				</Project>
+			";
+
+			proj.LoadXml (documentString);
+
+			CheckItems (proj, "Item2", "A1", "A-B-C", "D");
+			CheckItems (proj, "Item3", "A2", "AxxBxxC");
+		}
+
+		[Test]
+		public void TestInheritedMetadataFromItemRefs () {
+			Engine engine = new Engine (Consts.BinPath);
+			Project proj = engine.CreateNewProject ();
+			MonoTests.Microsoft.Build.Tasks.TestMessageLogger logger =
+				new MonoTests.Microsoft.Build.Tasks.TestMessageLogger ();
+			engine.RegisterLogger (logger);
+
+			string documentString = @"
+				<Project xmlns='http://schemas.microsoft.com/developer/msbuild/2003'>
+					<ItemGroup>
+						<Item0 Include='D'>
+							<MD0>Val0</MD0>
+						</Item0>
+						<Item1 Include='A;@(Item0)' >
+							<MD1>Val1</MD1>
+						</Item1>
+						<Item2 Include=""@(Item1,'-')"" />
+						<Item3 Include=""@(Item1);Z"" />
+					</ItemGroup>
+
+						<Target Name=""Main"">
+		<Message Text=""Item2: %(Item2.Identity) MD0: %(Item2.MD0) MD1: %(Item2.MD1)""/>
+		<Message Text=""Item3: %(Item3.Identity) MD0: %(Item3.MD0) MD1: %(Item3.MD1)""/>
+	</Target>
+				</Project>
+			";
+
+			proj.LoadXml (documentString);
+
+			CheckItems (proj, "Item2", "A1", "A-D");
+			CheckItems (proj, "Item3", "A2", "A", "D", "Z");
+
+			if (!proj.Build ("Main")) {
+				logger.DumpMessages ();
+				Assert.Fail ("Build failed");
+			}
+
+			logger.CheckLoggedMessageHead ("Item2: A-D MD0:  MD1: ", "A4");
+
+			logger.CheckLoggedMessageHead ("Item3: A MD0:  MD1: Val1", "A5");
+			logger.CheckLoggedMessageHead ("Item3: D MD0: Val0 MD1: Val1", "A6");
+			logger.CheckLoggedMessageHead ("Item3: Z MD0:  MD1: ", "A7");
+
+			Assert.AreEqual (0, logger.NormalMessageCount, "Unexpected extra messages found");
+		}
+
+		[Test]
+		public void TestInheritedMetadataFromItemRefs2 () {
+			Engine engine = new Engine (Consts.BinPath);
+			Project proj = engine.CreateNewProject ();
+			MonoTests.Microsoft.Build.Tasks.TestMessageLogger logger =
+				new MonoTests.Microsoft.Build.Tasks.TestMessageLogger ();
+			engine.RegisterLogger (logger);
+
+			string documentString = @"
+				<Project xmlns='http://schemas.microsoft.com/developer/msbuild/2003'>
+					<ItemGroup>
+						<Item5 Include='ZZ'>
+							<MD5>Val5</MD5>
+						</Item5>
+
+						<Item0 Include='D'>
+							<MD0>Val0</MD0>
+						</Item0>
+						<Item1 Include='A;@(Item0)' >
+							<MD1>Val1</MD1>
+						</Item1>
+						<Item2 Include=""@(Item1,'-');@(Item5)"" />
+					</ItemGroup>
+
+						<Target Name=""Main"">
+		<Message Text=""Item2: %(Item2.Identity) MD0: %(Item2.MD0) MD1: %(Item2.MD1) MD5: %(Item2.MD5)""/>
+	</Target>
+				</Project>
+			";
+
+			proj.LoadXml (documentString);
+
+			CheckItems (proj, "Item2", "A1", "A-D", "ZZ");
+
+			if (!proj.Build ("Main")) {
+				logger.DumpMessages ();
+				Assert.Fail ("Build failed");
+			}
+
+			logger.CheckLoggedMessageHead ("Item2: A-D MD0:  MD1:  MD5: ", "A4");
+			logger.CheckLoggedMessageHead ("Item2: ZZ MD0:  MD1:  MD5: Val5", "A5");
+			Assert.AreEqual (0, logger.NormalMessageCount, "Unexpected extra messages found");
+		}
+
+		[Test]
+		public void TestItems3 ()
+		{
+			Engine engine = new Engine (Consts.BinPath);
+			Project proj = engine.CreateNewProject ();
+
+			string documentString = @"
+				<Project xmlns='http://schemas.microsoft.com/developer/msbuild/2003'>

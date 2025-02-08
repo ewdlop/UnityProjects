@@ -1,0 +1,38 @@
+roxySettings.bReuseMeshLightmapUVs = true;
+	StaticMeshes.Empty( ComponentsToMerge.Num() );
+	for(UPrimitiveComponent* PrimitiveComponent : ComponentsToMerge)
+	{
+		if(UStaticMeshComponent* StaticMeshComponent = Cast<UStaticMeshComponent>(PrimitiveComponent))
+		{
+			if(StaticMeshComponent->GetStaticMesh())
+			{
+				StaticMeshes.Add( StaticMeshComponent->GetStaticMesh() );
+			}
+		}
+	}
+
+	for(UStaticMesh* StaticMesh : StaticMeshes)
+	{
+		const FMeshBuildSettings& BuildSettings = StaticMesh->GetSourceModel(0).BuildSettings;
+		if(!BuildSettings.bGenerateLightmapUVs)
+		{
+			ProxySettings.bReuseMeshLightmapUVs = false;
+			break;
+		}
+		else if(FMeshDescription* MeshDescription = StaticMesh->GetMeshDescription( 0 ))
+		{
+			FStaticMeshAttributes Attributes(*MeshDescription);
+			bool bHasValidLightmapUVs = Attributes.GetVertexInstanceUVs().IsValid() &&
+				Attributes.GetVertexInstanceUVs().GetNumIndices() > BuildSettings.SrcLightmapIndex &&
+				Attributes.GetVertexInstanceUVs().GetNumIndices() > BuildSettings.DstLightmapIndex;
+			if(!bHasValidLightmapUVs)
+			{
+				ProxySettings.bReuseMeshLightmapUVs = false;
+				break;
+			}
+		}
+	}
+
+	// Update the settings for materials
+	ProxySettings.MaterialSettings.bMetallicMap = true;
+	ProxySettings.MaterialSettings.bRoughnessMap

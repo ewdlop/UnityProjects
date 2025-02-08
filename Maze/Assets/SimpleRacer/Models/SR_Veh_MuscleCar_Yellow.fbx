@@ -1,0 +1,1659 @@
+"""Unit tests for the with statement specified in PEP 343."""
+
+
+__author__ = "Mike Bland"
+__email__ = "mbland at acm dot org"
+
+import sys
+import unittest
+from collections import deque
+from contextlib import GeneratorContextManager, contextmanager
+from test.test_support import run_unittest
+
+
+class MockContextManager(GeneratorContextManager):
+    def __init__(self, gen):
+        GeneratorContextManager.__init__(self, gen)
+        self.enter_called = False
+        self.exit_called = False
+        self.exit_args = None
+
+    def __enter__(self):
+        self.enter_called = True
+        return GeneratorContextManager.__enter__(self)
+
+    def __exit__(self, type, value, traceback):
+        self.exit_called = True
+        self.exit_args = (type, value, traceback)
+        return GeneratorContextManager.__exit__(self, type,
+                                                value, traceback)
+
+
+def mock_contextmanager(func):
+    def helper(*args, **kwds):
+        return MockContextManager(func(*args, **kwds))
+    return helper
+
+
+class MockResource(object):
+    def __init__(self):
+        self.yielded = False
+        self.stopped = False
+
+
+@mock_contextmanager
+def mock_contextmanager_generator():
+    mock = MockResource()
+    try:
+        mock.yielded = True
+        yield mock
+    finally:
+        mock.stopped = True
+
+
+class Nested(object):
+
+    def __init__(self, *managers):
+        self.managers = managers
+        self.entered = None
+
+    def __enter__(self):
+        if self.entered is not None:
+            raise RuntimeError("Context is not reentrant")
+        self.entered = deque()
+        vars = []
+        try:
+            for mgr in self.managers:
+                vars.append(mgr.__enter__())
+                self.entered.appendleft(mgr)
+        except:
+            if not self.__exit__(*sys.exc_info()):
+                raise
+        return vars
+
+    def __exit__(self, *exc_info):
+        # Behave like nested with statements
+        # first in, last out
+        # New exceptions override old ones
+        ex = exc_info
+        for mgr in self.entered:
+            try:
+                if mgr.__exit__(*ex):
+                    ex = (None, None, None)
+            except:
+                ex = sys.exc_info()
+        self.entered = None
+        if ex is not exc_info:
+            raise ex[0], ex[1], ex[2]
+
+
+class MockNested(Nested):
+    def __init__(self, *managers):
+        Nested.__init__(self, *managers)
+        self.enter_called = False
+        self.exit_called = False
+        self.exit_args = None
+
+    def __enter__(self):
+        self.enter_called = True
+        return Nested.__enter__(self)
+
+    def __exit__(self, *exc_info):
+        self.exit_called = True
+        self.exit_args = exc_info
+        return Nested.__exit__(self, *exc_info)
+
+
+class FailureTestCase(unittest.TestCase):
+    def testNameError(self):
+        def fooNotDeclared():
+            with foo: pass
+        self.assertRaises(NameError, fooNotDeclared)
+
+    def testEnterAttributeError(self):
+        class LacksEnter(object):
+            def __exit__(self, type, value, traceback):
+                pass
+
+        def fooLacksEnter():
+            foo = LacksEnter()
+            with foo: pass
+        self.assertRaises(AttributeError, fooLacksEnter)
+
+    def testExitAttributeError(self):
+        class LacksExit(object):
+            def __enter__(self):
+                pass
+
+        def fooLacksExit():
+            foo = LacksExit()
+            with foo: pass
+        self.assertRaises(AttributeError, fooLacksExit)
+
+    def assertRaisesSyntaxError(self, codestr):
+        def shouldRaiseSyntaxError(s):
+            compile(s, '', 'single')
+        self.assertRaises(SyntaxError, shouldRaiseSyntaxError, codestr)
+
+    def testAssignmentToNoneError(self):
+        self.assertRaisesSyntaxError('with mock as None:\n  pass')
+        self.assertRaisesSyntaxError(
+            'with mock as (None):\n'
+            '  pass')
+
+    def testAssignmentToEmptyTupleError(self):
+        self.assertRaisesSyntaxError(
+            'with mock as ():\n'
+            '  pass')
+
+    def testAssignmentToTupleOnlyContainingNoneError(self):
+        self.assertRaisesSyntaxError('with mock as None,:\n  pass')
+        self.assertRaisesSyntaxError(
+            'with mock as (None,):\n'
+            '  pass')
+
+    def testAssignmentToTupleContainingNoneError(self):
+        self.assertRaisesSyntaxError(
+            'with mock as (foo, None, bar):\n'
+            '  pass')
+
+    def testEnterThrows(self):
+        class EnterThrows(object):
+            def __enter__(self):
+                raise RuntimeError("Enter threw")
+            def __exit__(self, *args):
+                pass
+
+        def shouldThrow():
+            ct = EnterThrows()
+            self.foo = None
+            with ct as self.foo:
+                pass
+        self.assertRaises(RuntimeError, shouldThrow)
+        self.assertEqual(self.foo, None)
+
+    def testExitThrows(self):
+        class ExitThrows(object):
+            def __enter__(self):
+                return
+            def __exit__(self, *args):
+                raise RuntimeError(42)
+        def shouldThrow():
+            with ExitThrows():
+                pass
+        self.assertRaises(RuntimeError, shouldThrow)
+
+class ContextmanagerAssertionMixin(object):
+    TEST_EXCEPTION = RuntimeError("test exception")
+
+    def assertInWithManagerInvariants(self, mock_manager):
+        self.assertTrue(mock_manager.enter_called)
+        self.assertFalse(mock_manager.exit_called)
+        self.assertEqual(mock_manager.exit_args, None)
+
+    def assertAfterWithManagerInvariants(self, mock_manager, exit_args):
+        self.assertTrue(mock_manager.enter_called)
+        self.assertTrue(mock_manager.exit_called)
+        self.assertEqual(mock_manager.exit_args, exit_args)
+
+    def assertAfterWithManagerInvariantsNoError(self, mock_manager):
+        self.assertAfterWithManagerInvariants(mock_manager,
+            (None, None, None))
+
+    def assertInWithGeneratorInvariants(self, mock_generator):
+        self.assertTrue(mock_generator.yielded)
+        self.assertFalse(mock_generator.stopped)
+
+    def assertAfterWithGeneratorInvariantsNoError(self, mock_generator):
+        self.assertTrue(mock_generator.yielded)
+        self.assertTrue(mock_generator.stopped)
+
+    def raiseTestException(self):
+        raise self.TEST_EXCEPTION
+
+    def assertAfterWithManagerInvariantsWithError(self, mock_manager,
+                                                  exc_type=None):
+        self.assertTrue(mock_manager.enter_called)
+        self.assertTrue(mock_manager.exit_called)
+        if exc_type is None:
+            self.assertEqual(mock_manager.exit_args[1], self.TEST_EXCEPTION)
+            exc_type = type(self.TEST_EXCEPTION)
+        self.assertEqual(mock_manager.exit_args[0], exc_type)
+        # Test the __exit__ arguments. Issue #7853
+        self.assertIsInstance(mock_manager.exit_args[1], exc_type)
+        self.assertIsNot(mock_manager.exit_args[2], None)
+
+    def assertAfterWithGeneratorInvariantsWithError(self, mock_generator):
+        self.assertTrue(mock_generator.yielded)
+        self.assertTrue(mock_generator.stopped)
+
+
+class NonexceptionalTestCase(unittest.TestCase, ContextmanagerAssertionMixin):
+    def testInlineGeneratorSyntax(self):
+        with mock_contextmanager_generator():
+            pass
+
+    def testUnboundGenerator(self):
+        mock = mock_contextmanager_generator()
+        with mock:
+            pass
+        self.assertAfterWithManagerInvariantsNoError(mock)
+
+    def testInlineGeneratorBoundSyntax(self):
+        with mock_contextmanager_generator() as foo:
+            self.assertInWithGeneratorInvariants(foo)
+        # FIXME: In the future, we'll try to keep the bound names from leaking
+        self.assertAfterWithGeneratorInvariantsNoError(foo)
+
+    def testInlineGeneratorBoundToExistingVariable(self):
+        foo = None
+        with mock_contextmanager_generator() as foo:
+            self.assertInWithGeneratorInvariants(foo)
+        self.assertAfterWithGeneratorInvariantsNoError(foo)
+
+    def testInlineGeneratorBoundToDottedVariable(self):
+        with mock_contextmanager_generator() as self.foo:
+            self.assertInWithGeneratorInvariants(self.foo)
+        self.assertAfterWithGeneratorInvariantsNoError(self.foo)
+
+    def testBoundGenerator(self):
+        mock = mock_contextmanager_generator()
+        with mock as foo:
+            self.assertInWithGeneratorInvariants(foo)
+            self.assertInWithManagerInvariants(mock)
+        self.assertAfterWithGeneratorInvariantsNoError(foo)
+        self.assertAfterWithManagerInvariantsNoError(mock)
+
+    def testNestedSingleStatements(self):
+        mock_a = mock_contextmanager_generator()
+        with mock_a as foo:
+            mock_b = mock_contextmanager_generator()
+            with mock_b as bar:
+                self.assertInWithManagerInvariants(mock_a)
+                self.assertInWithManagerInvariants(mock_b)
+                self.assertInWithGeneratorInvariants(foo)
+                self.assertInWithGeneratorInvariants(bar)
+            self.assertAfterWithManagerInvariantsNoError(mock_b)
+            self.assertAfterWithGeneratorInvariantsNoError(bar)
+            self.assertInWithManagerInvariants(mock_a)
+            self.assertInWithGeneratorInvariants(foo)
+        self.assertAfterWithManagerInvariantsNoError(mock_a)
+        self.assertAfterWithGeneratorInvariantsNoError(foo)
+
+
+class NestedNonexceptionalTestCase(unittest.TestCase,
+    ContextmanagerAssertionMixin):
+    def testSingleArgInlineGeneratorSyntax(self):
+        with Nested(mock_contextmanager_generator()):
+            pass
+
+    def testSingleArgBoundToNonTuple(self):
+        m = mock_contextmanager_generator()
+        # This will bind all the arguments to nested() into a single list
+        # assigned to foo.
+        with Nested(m) as foo:
+            self.assertInWithManagerInvariants(m)
+        self.assertAfterWithManagerInvariantsNoError(m)
+
+    def testSingleArgBoundToSingleElementParenthesizedList(self):
+        m = mock_contextmanager_generator()
+        # This will bind all the arguments to nested() into a single list
+        # assigned to foo.
+        with Nested(m) as (foo):
+            self.assertInWithManagerInvariants(m)
+        self.assertAfterWithManagerInvariantsNoError(m)
+
+    def testSingleArgBoundToMultipleElementTupleError(self):
+        def shouldThrowValueError():
+            with Nested(mock_contextmanager_generator()) as (foo, bar):
+                pass
+        self.assertRaises(ValueError, shouldThrowValueError)
+
+    def testSingleArgUnbound(self):
+        mock_contextmanager = mock_contextmanager_generator()
+        mock_nested = MockNested(mock_contextmanager)
+        with mock_nested:
+            self.assertInWithManagerInvariants(mock_contextmanager)
+            self.assertInWithManagerInvariants(mock_nested)
+        self.assertAfterWithManagerInvariantsNoError(mock_contextmanager)
+        self.assertAfterWithManagerInvariantsNoError(mock_nested)
+
+    def testMultipleArgUnbound(self):
+        m = mock_contextmanager_generator()
+        n = mock_contextmanager_generator()
+        o = mock_contextmanager_generator()
+        mock_nested = MockNested(m, n, o)
+        with mock_nested:
+            self.assertInWithManagerInvariants(m)
+            self.assertInWithManagerInvariants(n)
+            self.assertInWithManagerInvariants(o)
+            self.assertInWithManagerInvariants(mock_nested)
+        self.assertAfterWithManagerInvariantsNoError(m)
+        self.assertAfterWithManagerInvariantsNoError(n)
+        self.assertAfterWithManagerInvariantsNoError(o)
+        self.assertAfterWithManagerInvariantsNoError(mock_nested)
+
+    def testMultipleArgBound(self):
+        mock_nested = MockNested(mock_contextmanager_generator(),
+            mock_contextmanager_generator(), mock_contextmanager_generator())
+        with mock_nested as (m, n, o):
+            self.assertInWithGeneratorInvariants(m)
+            self.assertInWithGeneratorInvariants(n)
+            self.assertInWithGeneratorInvariants(o)
+            self.assertInWithManagerInvariants(mock_nested)
+        self.assertAfterWithGeneratorInvariantsNoError(m)
+        self.assertAfterWithGeneratorInvariantsNoError(n)
+        self.assertAfterWithGeneratorInvariantsNoError(o)
+        self.assertAfterWithManagerInvariantsNoError(mock_nested)
+
+
+class ExceptionalTestCase(unittest.TestCase, ContextmanagerAssertionMixin):
+    def testSingleResource(self):
+        cm = mock_contextmanager_generator()
+        def shouldThrow():
+            with cm as self.resource:
+                self.assertInWithManagerInvariants(cm)
+                self.assertInWithGeneratorInvariants(self.resource)
+                self.raiseTestException()
+        self.assertRaises(RuntimeError, shouldThrow)
+        self.assertAfterWithManagerInvariantsWithError(cm)
+        self.assertAfterWithGeneratorInvariantsWithError(self.resource)
+
+    def testExceptionNormalized(self):
+        cm = mock_contextmanager_generator()
+        def shouldThrow():
+            with cm as self.resource:
+                # Note this relies on the fact that 1 // 0 produces an exception
+                # that is not normalized immediately.
+                1 // 0
+        self.assertRaises(ZeroDivisionError, shouldThrow)
+        self.assertAfterWithManagerInvariantsWithError(cm, ZeroDivisionError)
+
+    def testNestedSingleStatements(self):
+        mock_a = mock_contextmanager_generator()
+        mock_b = mock_contextmanager_generator()
+        def shouldThrow():
+            with mock_a as self.foo:
+                with mock_b as self.bar:
+                    self.assertInWithManagerInvariants(mock_a)
+                    self.assertInWithManagerInvariants(mock_b)
+                    self.assertInWithGeneratorInvariants(self.foo)
+                    self.assertInWithGeneratorInvariants(self.bar)
+                    self.raiseTestException()
+        self.assertRaises(RuntimeError, shouldThrow)
+        self.assertAfterWithManagerInvariantsWithError(mock_a)
+        self.assertAfterWithManagerInvariantsWithError(mock_b)
+        self.assertAfterWithGeneratorInvariantsWithError(self.foo)
+        self.assertAfterWithGeneratorInvariantsWithError(self.bar)
+
+    def testMultipleResourcesInSingleStatement(self):
+        cm_a = mock_contextmanager_generator()
+        cm_b = mock_contextmanager_generator()
+        mock_nested = MockNested(cm_a, cm_b)
+        def shouldThrow():
+            with mock_nested as (self.resource_a, self.resource_b):
+                self.assertInWithManagerInvariants(cm_a)
+                self.assertInWithManagerInvariants(cm_b)
+                self.assertInWithManagerInvariants(mock_nested)
+                self.assertInWithGeneratorInvariants(self.resource_a)
+                self.assertInWithGeneratorInvariants(self.resource_b)
+                self.raiseTestException()
+        self.assertRaises(RuntimeError, shouldThrow)
+        self.assertAfterWithManagerInvariantsWithError(cm_a)
+        self.assertAfterWithManagerInvariantsWithError(cm_b)
+        self.assertAfterWithManagerInvariantsWithError(mock_nested)
+        self.assertAfterWithGeneratorInvariantsWithError(self.resource_a)
+        self.assertAfterWithGeneratorInvariantsWithError(self.resource_b)
+
+    def testNestedExceptionBeforeInnerStatement(self):
+        mock_a = mock_contextmanager_generator()
+        mock_b = mock_contextmanager_generator()
+        self.bar = None
+        def shouldThrow():
+            with mock_a as self.foo:
+                self.assertInWithManagerInvariants(mock_a)
+                self.assertInWithGeneratorInvariants(self.foo)
+                self.raiseTestException()
+                with mock_b as self.bar:
+                    pass
+        self.assertRaises(RuntimeError, shouldThrow)
+        self.assertAfterWithManagerInvariantsWithError(mock_a)
+        self.assertAfterWithGeneratorInvariantsWithError(self.foo)
+
+        # The inner statement stuff should never have been touched
+        self.assertEqual(self.bar, None)
+        self.assertFalse(mock_b.enter_called)
+        self.assertFalse(mock_b.exit_called)
+        self.assertEqual(mock_b.exit_args, None)
+
+    def testNestedExceptionAfterInnerStatement(self):
+        mock_a = mock_contextmanager_generator()
+        mock_b = mock_contextmanager_generator()
+        def shouldThrow():
+            with mock_a as self.foo:
+                with mock_b as self.bar:
+                    self.assertInWithManagerInvariants(mock_a)
+                    self.assertInWithManagerInvariants(mock_b)
+                    self.assertInWithGeneratorInvariants(self.foo)
+                    self.assertInWithGeneratorInvariants(self.bar)
+                self.raiseTestException()
+        self.assertRaises(RuntimeError, shouldThrow)
+        self.assertAfterWithManagerInvariantsWithError(mock_a)
+        self.assertAfterWithManagerInvariantsNoError(mock_b)
+        self.assertAfterWithGeneratorInvariantsWithError(self.foo)
+        self.assertAfterWithGeneratorInvariantsNoError(self.bar)
+
+    def testRaisedStopIteration1(self):
+        # From bug 1462485
+        @contextmanager
+        def cm():
+            yield
+
+        def shouldThrow():
+            with cm():
+                raise StopIteration("from with")
+
+        self.assertRaises(StopIteration, shouldThrow)
+
+    def testRaisedStopIteration2(self):
+        # From bug 1462485
+        class cm(object):
+            def __enter__(self):
+                pass
+            def __exit__(self, type, value, traceback):
+                pass
+
+        def shouldThrow():
+            with cm():
+                raise StopIteration("from with")
+
+        self.assertRaises(StopIteration, shouldThrow)
+
+    def testRaisedStopIteration3(self):
+        # Another variant where the exception hasn't been instantiated
+        # From bug 1705170
+        @contextmanager
+        def cm():
+            yield
+
+        def shouldThrow():
+            with cm():
+                raise iter([]).next()
+
+        self.assertRaises(StopIteration, shouldThrow)
+
+    def testRaisedGeneratorExit1(self):
+        # From bug 1462485
+        @contextmanager
+        def cm():
+            yield
+
+        def shouldThrow():
+            with cm():
+                raise GeneratorExit("from with")
+
+        self.assertRaises(GeneratorExit, shouldThrow)
+
+    def testRaisedGeneratorExit2(self):
+        # From bug 1462485
+        class cm (object):
+            def __enter__(self):
+                pass
+            def __exit__(self, type, value, traceback):
+                pass
+
+        def shouldThrow():
+            with cm():
+                raise GeneratorExit("from with")
+
+        self.assertRaises(GeneratorExit, shouldThrow)
+
+    def testErrorsInBool(self):
+        # issue4589: __exit__ return code may raise an exception
+        # when looking at its truth value.
+
+        class cm(object):
+            def __init__(self, bool_conversion):
+                class Bool:
+                    def __nonzero__(self):
+                        return bool_conversion()
+                self.exit_result = Bool()
+            def __enter__(self):
+                return 3
+            def __exit__(self, a, b, c):
+                return self.exit_result
+
+        def trueAsBool():
+            with cm(lambda: True):
+                self.fail("Should NOT see this")
+        trueAsBool()
+
+        def falseAsBool():
+            with cm(lambda: False):
+                self.fail("Should raise")
+        self.assertRaises(AssertionError, falseAsBool)
+
+        def failAsBool():
+            with cm(lambda: 1 // 0):
+                self.fail("Should NOT see this")
+        self.assertRaises(ZeroDivisionError, failAsBool)
+
+
+class NonLocalFlowControlTestCase(unittest.TestCase):
+
+    def testWithBreak(self):
+        counter = 0
+        while True:
+            counter += 1
+            with mock_contextmanager_generator():
+                counter += 10
+                break
+            counter += 100 # Not reached
+        self.assertEqual(counter, 11)
+
+    def testWithContinue(self):
+        counter = 0
+        while True:
+            counter += 1
+            if counter > 2:
+                break
+            with mock_contextmanager_generator():
+                counter += 10
+                continue
+            counter += 100 # Not reached
+        self.assertEqual(counter, 12)
+
+    def testWithReturn(self):
+        def foo():
+            counter = 0
+            while True:
+                counter += 1
+                with mock_contextmanager_generator():
+                    counter += 10
+                    return counter
+                counter += 100 # Not reached
+        self.assertEqual(foo(), 11)
+
+    def testWithYield(self):
+        def gen():
+            with mock_contextmanager_generator():
+                yield 12
+                yield 13
+        x = list(gen())
+        self.assertEqual(x, [12, 13])
+
+    def testWithRaise(self):
+        counter = 0
+        try:
+            counter += 1
+            with mock_contextmanager_generator():
+                counter += 10
+                raise RuntimeError
+            counter += 100 # Not reached
+        except RuntimeError:
+            self.assertEqual(counter, 11)
+        else:
+            self.fail("Didn't raise RuntimeError")
+
+
+class AssignmentTargetTestCase(unittest.TestCase):
+
+    def testSingleComplexTarget(self):
+        targets = {1: [0, 1, 2]}
+        with mock_contextmanager_generator() as targets[1][0]:
+            self.assertEqual(targets.keys(), [1])
+            self.assertEqual(targets[1][0].__class__, MockResource)
+        with mock_contextmanager_generator() as targets.values()[0][1]:
+            self.assertEqual(targets.keys(), [1])
+            self.assertEqual(targets[1][1].__class__, MockResource)
+        with mock_contextmanager_generator() as targets[2]:
+            keys = targets.keys()
+            keys.sort()
+            self.assertEqual(keys, [1, 2])
+        class C: pass
+        blah = C()
+        with mock_contextmanager_generator() as blah.foo:
+            self.assertEqual(hasattr(blah, "foo"), True)
+
+    def testMultipleComplexTargets(self):
+        class C:
+            def __enter__(self): return 1, 2, 3
+            def __exit__(self, t, v, tb): pass
+        targets = {1: [0, 1, 2]}
+        with C() as (targets[1][0], targets[1][1], targets[1][2]):
+            self.assertEqual(targets, {1: [1, 2, 3]})
+        with C() as (targets.values()[0][2], targets.values()[0][1], targets.values()[0][0]):
+            self.assertEqual(targets, {1: [3, 2, 1]})
+        with C() as (targets[1], targets[2], targets[3]):
+            self.assertEqual(targets, {1: 1, 2: 2, 3: 3})
+        class B: pass
+        blah = B()
+        with C() as (blah.one, blah.two, blah.three):
+            self.assertEqual(blah.one, 1)
+            self.assertEqual(blah.two, 2)
+            self.assertEqual(blah.three, 3)
+
+
+class ExitSwallowsExceptionTestCase(unittest.TestCase):
+
+    def testExitTrueSwallowsException(self):
+        class AfricanSwallow:
+            def __enter__(self): pass
+            def __exit__(self, t, v, tb): return True
+        try:
+            with AfricanSwallow():
+                1 // 0
+        except ZeroDivisionError:
+            self.fail("ZeroDivisionError should have been swallowed")
+
+    def testExitFalseDoesntSwallowException(self):
+        class EuropeanSwallow:
+            def __enter__(self): pass
+            def __exit__(self, t, v, tb): return False
+        try:
+            with EuropeanSwallow():
+                1 // 0
+        except ZeroDivisionError:
+            pass
+        else:
+            self.fail("ZeroDivisionError should have been raised")
+
+
+class NestedWith(unittest.TestCase):
+
+    class Dummy(object):
+        def __init__(self, value=None, gobble=False):
+            if value is None:
+                value = self
+            self.value = value
+            self.gobble = gobble
+            self.enter_called = False
+            self.exit_called = False
+
+        def __enter__(self):
+            self.enter_called = True
+            return self.value
+
+        def __exit__(self, *exc_info):
+            self.exit_called = True
+            self.exc_info = exc_info
+            if self.gobble:
+                return True
+
+    class InitRaises(object):
+        def __init__(self): raise RuntimeError()
+
+    class EnterRaises(object):
+        def __enter__(self): raise RuntimeError()
+        def __exit__(self, *exc_info): pass
+
+    class ExitRaises(object):
+        def __enter__(self): pass
+        def __exit__(self, *exc_info): raise RuntimeError()
+
+    def testNoExceptions(self):
+        with self.Dummy() as a, self.Dummy() as b:
+            self.assertTrue(a.enter_called)
+            self.assertTrue(b.enter_called)
+        self.assertTrue(a.exit_called)
+        self.assertTrue(b.exit_called)
+
+    def testExceptionInExprList(self):
+        try:
+            with self.Dummy() as a, self.InitRaises():
+                pass
+        except:
+            pass
+        self.assertTrue(a.enter_called)
+        self.assertTrue(a.exit_called)
+
+    def testExceptionInEnter(self):
+        try:
+            with self.Dummy() as a, self.EnterRaises():
+                self.fail('body of bad with executed')
+        except RuntimeError:
+            pass
+        else:
+            self.fail('RuntimeError not reraised')
+        self.assertTrue(a.enter_called)
+        self.assertTrue(a.exit_called)
+
+    def testExceptionInExit(self):
+        body_executed = False
+        with self.Dummy(gobble=True) as a, self.ExitRaises():
+            body_executed = True
+        self.assertTrue(a.enter_called)
+        self.assertTrue(a.exit_called)
+        self.assertTrue(body_executed)
+        self.assertNotEqual(a.exc_info[0], None)
+
+    def testEnterReturnsTuple(self):
+        with self.Dummy(value=(1,2)) as (a1, a2), \
+             self.Dummy(value=(10, 20)) as (b1, b2):
+            self.assertEqual(1, a1)
+            self.assertEqual(2, a2)
+            self.assertEqual(10, b1)
+            self.assertEqual(20, b2)
+
+def test_main():
+    run_unittest(FailureTestCase, NonexceptionalTestCase,
+                 NestedNonexceptionalTestCase, ExceptionalTestCase,
+                 NonLocalFlowControlTestCase,
+                 AssignmentTargetTestCase,
+                 ExitSwallowsExceptionTestCase,
+                 NestedWith)
+
+
+if __name__ == '__main__':
+    test_main()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   bSÊÃ,c*=PD4ea…ÇPQ©`Ğ³çqbÎÏu÷‰EB¿aÆù(PXÀÅB›Š€ÛÆ[ö£Î³šlKÜ¡Ï÷.?Kä®[Ñ º'ÍZ0yz©Q»òd›—äZ”ŞXëSqv¤³fÖ£Øh½·Îk¤4\–	iÃøuyPä¯
+İ³Då<lúÙ1»â"|´å¹HAXŠoŒñ$úç•ÇaPH‚âd´¼¢Ìãv
+ı7Uo*"%ù-»Ï¹Ë•7VF/*›ÊMJw*“;p	Ãd*i²Ë‰6â¶Öô4_ã­î¿¼!5DêÑA^11&#‘XDhË•µ!ó|%è8Şc¹mşC‡U»Æ]¼	Lèÿµ¾4äµ
+ì3Ò¶áÚßp]Û ¿X7Ô„¦/w| ÖJ—s+‚N…gOãW*¤ÆTeâh÷“à«Ø9¢ºUô™ ‘~r@?Y]j€x7ÒÏ)Ê¿eû~!¬÷&JôÖ›é¯0’r8QEôö.s0Ä:ˆMpÙÖFK€9ßæ¢&_0uÒ» “V<Õäm©j¥H²è¥K|±³d€ŞRğrYrY!çQ6C…2>É=åúÊ'‡´Ñ¯*³ãt Ê—Ø}®«Ùu Xİšˆnè­m·*Å,õ×1xƒ²v;ó;PKİ#¬ÓêÖ:ì·‰ÕäGó	@,)£êòâ«Ã“Á³ã%j8@3w-ĞËyû^ı´Rï¥˜Æı›:˜¦Ÿ
+¹ŒÇªáÔü‹¼ş0Û´éá™n}œ"× ’Ëaê¤‰jNR2š—Ñ7µ™Qì¥ş‚¥XâÓ¸ OzRËıM­ÄCu+|­IßÕhŞ¹uYì~˜àMöpo§&&_nM¹ÍÍ––Üœ½Uí·¤ÿDgš^#b{Êd;¾®™Pë@òE‚	…+u%õ¼	:-¬ÜòºşÃFnQLàô×ˆéCVÚ¶RÉš¯sã~×ØË9¼e® ÁA§øiQ…´Ø¦9·û‚ÅFC/’PÛ¸,/ô-§dÓŞ=vÜÑÛÈÉ‹dÕu¯5Ø`è7ãsªÿHc Ë7kÊWöÖ;6ƒÚæPB`’$jB¦Œd§½Ğ“)à‡Î¸J¥ÆQöŸp€|sbxZnku)zeûëœHÀm?‹«.7Şÿ›'vGNŸ5ğAÑñÉ§	òRV Z·ñ§¨ïÔVÌ­<KûSß’"nªÂ†\ÍË¶¯;6éB"²r4é‘w°[—¼C4–c}u/úÑ,Ò„“q]
+^òô±¶„cÖW»€ÆğzçÓµƒ°£ôœi4·'dã‰PNG
+
+   IHDR   €   €   Ã>aË   gAMA  ±üa   	pHYs  Â  Â(J€   tEXtSoftware paint.net 4.0.10­
+
+À  #¨IDATx^í	¸UãÇo™R*'¥tšN)tºÍ§®æ’¦+9%”$Wª›yJ¡‰$"eÊ!2¥\…¡‰Ë5O™2…P¤Agİÿï³Şı¬–uFu¦Öû<ï³÷Ù{­µ×úşÿï¾w­ó·Xb‰%–X²“îİ»WHOO?·cÇıbÙ“äŞ{ï½céÒ¥^Û¶m35j4A•üã›XŠ½>¼ÍÜ¹swÌ›7Ï;é¤“¼&MšxM›6Ù·oß½üMb)®ÈW]uÕª™3gzè…^èĞ¬Y3ô¦˜Å\4`êÔ©Şõ×_ïôÊ+¯ôZ¶lé5oŞÜ©,Á¬±cÇÆî 8J—.]J9ríu×]ç]sÍ5N'Nœè) t --Í)î \¹r1	Š›0àÜÉ“';Ğå*«à5nÜ8A€-ZàfÄ$(FÒ³gÏòçŸşz0aÂ„TŸï¾©,Áô˜ÅDú÷ï?aÒ¤InÆã÷Ñ+®¸Âée—]æuîÜÙƒÄA•e˜¦İceéÚµkÕ³Î:k¾ß@GÇïtÌ˜1Ş‰'è5jÔ(ü?şñ§>	¦ê01	Šªôë×o¦ßo 7.¡Šú½!C†8@&`à£Gy¤{•u¸A‡ŠIPÔD¾¿Ş°aÃ¶âû™õ€¥\pwÔQGy6L V‘`ŠYâ#ÇR$D¦ıA ¾úê«Ğ˜û°=Ú»ä’K¼ôôtG À ğ­ZµrÊ{¹ƒëuØ˜EAzõê•vÆgì ßgötfzé¥—ztà“†ÁGÛ´ic$¸N‡IPØE³ÿ€eöÛL7½üòËwR2ÿûß^§N¼ÔÔTç‚à£­[·N@îàZıDL‚Â*Ç{lWÍ~—öÙì‚VˆrŞyçyÚÏ¹‚Á0ø¦mÛ¶5Kp~*&Aat4û_½øâ‹]äÏì7³Ò‹.ºÈ­2û4h°“ + 	ø\$˜¤ŸŒIP˜ä¸ãëúé§'òıÌÀ5jTâ…0ÿú×¿¼;zõë×wñ@øF€víÚ	®ÖÏÆ$(rÌ1Çì§ÙÿiæŸÙyäÈ‘™êˆ#\ğÏşÓ‚†‚0ğƒhß¾½ÛFÛ^¥ŸIPĞ¢ÈÿìÓN;Ío³?2é^f
+Î9ç¯OŸ>ÎüqÄÎ„Á7	:tèà¶?üğÃù§KAˆ€('şÍ¹ç›ü˜õnvŠ 0`@Â°L5ûƒÀ
+ğZ¯^½Éş©ÄR’>¥]f=å^LÜœ(®ƒø¦M›º”E @7ÅeÔ©S§­*±ä·ÈoW‘ïßxÖYg¹Š³Ÿ™rfJ †æ)tÀË¬»5‚Ìf?Êv)))ktqPPÒ»wï§zª0ûÔì”¾@Spæ™gºÕA|;éàßÿş÷„ÀHÀ6ÉÉÉ½üS‰%¿¥[·nuåû·Á[¥³7'
+Î>ûlWîÚµ«‹°ƒQ€à¯fÍš+uñJaA‰fÿı àø1ûĞÜ(İAdÔ¨
+š Y+$ J X­Zµîş©Ä’ß"ßß\³ÿ÷¡C‡:à	 ™ı€˜yQ@ÀñÇïÜ .  ™íAğ±
+Õ«W_®Óˆ}A‰rö§˜ı¤o–óc	 ’Ïò¢ wÒ¯_?ïè£vëJñÜkĞvØaÌşNş©Ä’ßÒ£G£‰ÙÊ¬·ÀSÔò¢`øğá. *ˆ (D°Ç{À§ULß³ş©ÄRrÌ1Ç,$ ³*¦?>ßåEÉˆh¡ĞCY+Àú ±€ŞgT­Zµ*±ä·tìØñ EÿÛÌü[Îo>ü¯(Y <x°wÂ	'¸aj "hö?éŸJ,%2Ã G®Ànúöíëüö)§œâ± €u0çˆ 63å{Sş† ¸–şıû»ª ¦Ÿª ~¿V­Z;äû[ú§KA‰"ğªT©2¡F(Ï`†)›™jruº|Èéå2œIgVSï§lIÈ ú …¼ò9d"ÄrÈ!ŞA´À?…X
+‹zè¡•Ê–-{d™2eúK/*W®ÜŒòåË¯Ò+€9àD¯nİº;‘„™m$éÒ¥‹#	Ö„|¬ë2û^éÒ¥7|ğÁ‡ú?Kaà¤½÷ŞÛCK–,¹“îµ×^Ş¾ûî ^˜$"“‹ú!
+E ””÷=Û‹dôÆRD3µ= ï·ß~¼}öÙ'¡F21J”(±“òÛ³ÿşûïïxàÓıÃÇRØE3¹.³û€p3-Uª”’WÔÈajä€:„{oû°RRÒ=–B/7>P¦{‡f­3óÁTq‚S#F àÍğ·@ÇzÄ?|,E@J*Kø	ÿ	8…¦òé	5r 4ÖÀ )øÂè8ËücÇRDùúGŠ\W¡BL¸#CXƒä€€n`ö›ÅĞşÿóKQêÕ«¿Ht_©R%G‚ Bˆ 9 3Ş²# VBÛ|â:–ÜJA<«V­Zód¼Ê•+{XˆP±bE§aB) VÀ2ÈÀß@ßı ÃÆË¿¹‘)S¦¤,\¸pîµ×^ûUÏ=Ûûç‹Ô®]{º¬€WµjÕ	L!C¦ W@F€€ 'È:léÖ­Û~şácÉJÆŸ4şüÉÏ>ûìæ¸…š®]»Ò>•oR·nİË(îPÅÃ((üÂŠ%À†	 bd¤¦¦VğK”<¸Ôı÷ßş’%K¾á…¼eË–¹;t©«·oß~;ıûş¦»Up9cÇ}à° …a5`p¤Àü¿O JÈídÊú?‹‰»äİwß}Ò“O>ùÑóÏ?ïşK/½äİqÇnUš»_oæï²[eõêÕ§Êú¸R®¹ 	Ì"˜UZÜ ™@˜ (kéééÛ;î¸¯õºF:¿OŸ>7ôîİûl½ï­ÏSõó{V“èí·ßŞ^~~%³ğÑåË—{O<ñ„[«×Œ±'qÒ[×ßßm·ÉÄ‰ËlØ°áówß}×Sàjü K€;02Dàˆş£ÀÂ«Š<¡ÜN†²$ÍÆıúõ{MW÷O§øÊÌ™3Såß<÷Üs<úâ‹/: ÀÏ-TôÓA ½íï¾Ûä½÷Ş‘‘á­_¿Ş­ bjÔ¨á"˜!L¸KÃ %,
+|–™¹Ÿ€îQ8í´Ófû§SüdÒ¤IU{ì±ÙK—.İ5Ó/wàL?Àcşi°„ iiiwû‡Ù-rÏ=÷$oÚ´i£'Ùºu«{àC:u	°¦Fˆ0) V€Ô/¢¸1³ Á™ğ4œ|òÉ®™¤GÅ¯j8jÔ¨~øá±O?ıôÆ0ğAğ¸6mºihŸf'vğ¾Y³f¯ø‡Û-²víÚÛvìØá¡¿ÿş»kæÀ
+à
+ i­Zµv"„‘`È  ®ÀÀÇ@¨^½z%`3Ÿ&ZÔLeé^õO©è‹›}xà!O=õÔ—QÀ£€éGy7³ÙÂÌç†KÒ­ìÀ»óÎ;Iïä‘G®™7oŞÅİÆŒSOZÆÿ¹<Ë¢E‹oŞ¼y»­\XH&BPX*ƒƒŒ XŞÓiDÓàÓ4ÂÌp®ÑºŒEôwıÓ*ÒRâ®»îê©ıVè(À›2ûï½÷^×‡‡éG,n×Æ*@¶	*Á"Ÿ+bßöŸÿüçËå^î–¥¹B„tÛm·u1bD­`J¬[·î)|Ğp.4vĞè	‚j„+@ hËÁ€+À5`Í 3sOÿ!íc(Ä¤»4‘Êİ}æŸWÑ”[o½5M3êÙ(ĞMÃàËB¸4hÔdö133d=Û¼üòËYj(a_¹ßDµ:§¥"Èí=ôĞe"ÛÉ3fÌ8Rƒ_Uh/ ‡ Fşæ|  n L€ I€+ ¤0ı¼,şŸĞ¸5Fg2}…6ûénÒ¤Éz(‹–Ìš5«¶Rºû4#`aæ™¤|ÜJEÀgäãlxPÃàg§FÿÍ7ßì ğC‚$¸ñÆ]‹W”ˆRH€ @5‚³Ÿ²1Ä|f:Í£Ü„b  Ä´'4nÜxÅ(X¿Œ?¾ü£>:Y‘ıæ(ĞÑ0ğ(æ{ÅŠf¥3ƒ4ZÒtÉ+7jÈ¬'LV &Ê¶áãÕ¶nÿÖ[o9Àƒb$ î€ ÙY Ô, ÀÜ¾Y€Åô3ë¹.9ÇSÈx-¤áÚ™ıtC YíÚ§´?¼…[æÌ™ÓwñâÅ_9™V@|ûí·©ÅäÓLIºÇLQJæ“øAĞíw9SûÌ4üûìûË/¿ø°ï,@®c' rxûÜPx@eßOZËÈ<y\–’€Ö“«t×Kàºí™"A†b $ˆ¯hæw“?Í`¦.Y²ÄØ3Ï<ãñoÕ0­¨ük¦úæ›o:`è½Ç×q“î1HY™ş0øxÔo5HôÃ?ôá–ß~ûÍ»ùæ›yæ¼¸ v”B RA¢~AŠ?\27>ü.×ÌQï`¡‹ÙùQ#â d˜¯uÔQİ‰ÔIÛ(`à×0o<f‹>}º7{ölOÑ¸c<³³J`'â80y*³ŒÊ©³ğW®\é­^½Ú[µj•{«@_yå• ŸÁdP£ ÏJÙŸbOvbî€˜`ãÆŞûï¿ïÎëáQò˜oü»ÿ¬ŸğıŒÍ|àmÙ²Å•Û·o÷¶mÛæˆõí·ßº1 øÃíY;¹@±P‘¸‡ ¤rõ¹˜¸={º›!ˆtí¢xn¶äş;ÌÏÙgà(õ*
+wû`2	œğ€:üO?ıä|Ã†Ş×_í}úé§n0±¯¾úª#Â
+˜‰Îî(ĞƒúÅ_øç^Œ¨ıÀ?üğƒsiœD±ï£ò)nr±Öğ,#b€†şnQÄ¾_çÎ	LÖŠ–÷Rç†ñøCî£ÃüaZ)œX[idÁ?âZ˜ñêçŸî}ÿı÷¿şú«·iÓ¦9>ùäGš×_İYö1&à€¤°Ö@–ÃõãúŒæ
+dZùC\ø¥uëÖeÄ=&A˜°
+åOÜÁ¦“µr”ª)~K€y%Oæn,Vã¦›nòæÎëÑ(˜¯½öš÷ÑG‘Ê9«1ìxÏ C|½YÜÈÚµk}
+Fp'¸1,$à[ğ´
+»ùÃ[4D']¾C‡/C‚("@”Z8d°Ef¼­šñJåŒÙ 	­v!X„4TĞÌŠğTK«˜Q·ß~»7ş|WXb¦cÖ­[çÌ³‘‹òã?z›7ov>@²2×»Z~şùgGdJÃÔÈ2‚V (8ŞÚ¢#iiiIíÚµ[•	‚D0%G¶ÆI«šQM£ÈJ 2=(Å!.¾aÇ‚HfU‚n†»tq1Zxø#A))åæ[n¹ÅEà>ø ë;ÀE¬Y³Æ‘…Xk$º«Âq°Z˜™OàÌ
+@ pŠ?¬EKÄÜŠÊa_7¢È$ ³€Õ3H ( ’óÿK•fFs;Ä f=¨ÄA
+Õ åŒ‡{™2eŠ7mÚ4—úİu×]Î’‡m Ö„XkB g%äœ
+ V
+r[ê´æ
+õ‡´è‰HPYà½™Yğl]O ¥„J@H*DI˜§ma¢€ÏB#Àíÿ f¥ö_Ãø÷1„Ì…´ö¾ûîsqù<®·bÖƒøƒ@•´÷bYTI™™ñT!@”K=ßÎ¢)ºˆªŠpßgĞ³"àZŞŒR=Ã0¸bî³57Êï‘X†eÖã¨Cd¦ÁÇ¶¦öÿŒ XÊºÄ øv‚«!Í£øCàIÉ™,„rS/ îa$0+ 	|Œñ‡²èŠ.¢ZË–-?6D¹¾c‚ à3†pX	z‚`F½·¿³S\Å*@¦6aÿ&3µ§ˆ¢ÔîM£ˆÂßlÇqq5(‹>‡5À§<Ì²q a+ 7À?˜*ú¢ª¥™ü)ş9Š ˜d|^ ¸+HY¢3+ xAs
+xX!3 ìÿd¦¢i
+Àaòp<^ù}ƒä!RÄ#€K½ƒÊgĞ
+@€ Ğ˜Ìò‡°è‹.¦Hğ~8l	x%àÃìS?‡ ÔĞYS'¦)7@0ˆƒ™µıxµ÷&™T2¨|f³›mèNL>ç•¿ÑÌˆ>KÀF ‚^N¶c$07`$Ğ˜¯ç	èÂ—IÿŠY$Ê,§„é|k¨d°ÔÊíq«¸V±hØ(À£ÔÖãíáA%è#U$0Å·ããÉğùXÈØF#¯v\Ÿ’8À¿C ºˆƒ[åèŠÈ´5	¾…–! DúdF mên®ôC›å3_WjøƒÆL¸ºl íc¸	#Ö"Š AÀcÂ÷f…%êÀ”²4J
+gïùœïÙæC 7ğí±qü‘?àÜ!;ëÄF‚`, 	D€‡úşÑR¼n(	7kÖìû 	 „LÀÖĞQü$¤¨\¹òXöc043’5xí¥gèûôı¢J•*} m~Å§2xarD’sC² 9¨&bÆÖ,@BÉÂÀÏ™3Çİ¥Dm e%¿Q¾ƒlu Ö¡Ş`àSğ|Ê¾A°ğÅ9GYT˜,÷WWZK²ªÆ¬¢Üh9½Tıúõ÷ÕpZô¢‹k!¿ÿ#f0  ÓO<@¤¬8àS™ÿêºø¸T]x™Ğ. µıÍ Kd®Ö`ÎÔök¿5Úÿ#é7eË–ıQ$ùE–c›‘ƒ
+›‘00×€Îš a0÷<Àğ¬?°œòŞ”Š"„`{\>µE/º€ ÂQµä¨zRìâ¼¢¬€t›ôó`]o?io]†vjĞ Á‘»¦ºúz©£T;Y°äĞ8•†"ÉŞæBIŒ
+¬JêD÷Ñlî"paö3kğÌ|$³_X¢ºMïïOJJz\€>­ïŸ—¾$°WJWº¯¯UÛ,—u˜+¢ŒĞ`öÓû¾úl˜tŠÈò˜î3Ì=À QìÉ|òz”½7å{öaæc¹ôØ€nàÓş$ A.1@ƒV@Ÿ®ó}@×~·\Åm"ùúìZe¬=çˆC4†u¼ã,£ô²³ÒFÚrÈÕÖ–<Xc]RhìîC©ª.ëÏ”¹¿B7Cƒğ‚Nx&Y¯‰>zQú“ìŸÀÍ®ÑşÏA ÚåÌ K"à+0SĞğ“7ğ1íAğ>
+|«@•¥]ë¤†A½R >ëüMfÃ5Bp¶@à]ä†ä+E¨¹é,Æm¾®í‘ã‘cªsö½B:Jä8WÄ8CãDY‹"C+M´#ÚÌdmi‘Ï_2ÀB]xW?CÃìM€¥‹ı P 1 Ïvè»·‚ÛåQWó{¸'5àkàîĞ9\§ÁÑ¨Q£1l¬°€D%/>æİ@6Dm‰# ğÉb˜ÉÄ€îßôéV6 ”»	jÙÇH ôÙ&wV¤ç;G]Û
+éré2Ÿ‹ VÓ'ÅH‘áT,„ˆ Ï—VO1EeußMä›”Ğ€(SÔM¬½Q'üBà‚ Á‡€2 fh]àû¼X€¬Ô  X-a³ğƒÁ3Ÿ™>¨F ÒC²\×ÀC¢0ñ"¾:ŞK·`[¶:¯µ¡óÍºkÓø¾(2,ÙgŠˆ—Šƒô»GƒÆŠªµjÕªl~À	æG3½©.xŒû´Âîä	Ş4s¶Š _Ùg¹Ğ<‘Dæy;åÙn¸!1ãÑ°ÏÏLùm	1İX/ÒW@
+KÄ[€d;ÄF ä2Ÿ 	ô~›Îëµğy†4»k]ÃÕñg‰Tcˆ4îİå
+
+üª²¸ÜJW`AbI@Šl(Á˜Nsu!EsDˆ>}úl¦hèáçxS¶›9s¦K+EhÃ@ ]£³d˜t^4è.%à5 ßwµ H PY¬ÈŸ“kü×Å"£~³Î£5Y–¸@fXH[”.õÔ‰Ş¡_ºÜhf?*‹ô#¾0°t.‡?«Í~Dá†Oc P æ¬€U2©Gğ7ÀZ°Râÿ…Ï1—ºJD\ªß½_Ç»‘T²^½z§!Èÿ§Jò3‚Â!ò‘ûè„k&‹¹Ë#.h·ª‚³ï ÀsªAPd=ƒˆ@ƒ  hàf=$`]ƒ…>ÇZP2´¢Î1ÊìÇ÷?¦ãİä›ş3È¨È%kæ—Ò¹ºú b²‚ óı¸ êâv¹j ş;mÚ´m€:oŞ¼H°Ãâ°ú¸øs €¿1í€n$  ¥ßOt>A TÇx/p~¹µj€ÿ²®é	ëÅ“ô;gé7{“RâáT…÷ùC²h¶ôÖlzˆ
+]`P‰r—)Z^ˆBıMjiE¡¨}ş¤½{÷^9ß”}x¥f@«³XÇs Ô pd¤„Tu.Xd{–¼! ûk›_ƒç–]é›şûdú§j/é(Öê$ğ`ú±¶Œt!êı¨æº›uQ«B	Ë—iÀn»ÏÔ`¶ÑEÕĞE¬‹=\W]üi=zôX6~üøŸ•Ïÿ.İÁ,;vì/C‡ı^9ù—2ÃËg¿;}úôí€ŸøÌ~~dY]>¯ss.À@ ˜ ÂÇ`	HõØï $xŸ®3·êL¿&Î#2ı³uüÑúÓ5>İ~¢~7š5™JaYu4f„İ2m7øx=¬…6ûÓ)Ÿo#¿¼ƒ^=zô¸iäË/¿t÷Ğ‹ÇÍ"´‹s72 RÃ'÷§`E ÒA:3e*|˜wòyãN@ æë°#Û;ˆÛµÿ}0 †şÎLÿÏbÏí*ÑÙ˜~¹ÕLe¤|…×ôg&T«tAí4`}4c›5èã,Y<dÈÜøøã;ğÃB÷.-Ş4lÒÙËM#´‚sÿ!7™ĞL'0Ñ}p¥åo+Ñ@@'Ÿëü¿€H€Ù$¦í ğA ¶ãs÷uÔ¬Ôˆa•@‚¾Ç}ğ'‰`ç)Ë8AQ;ª~”~EÊ—_¢¨~$Ïâ¦KÀÍĞ±KË6½‡»Şxãw
+w…`É˜2/&<3$n + «æ^ rÚ÷MÔ(²¤zOËM>(2ÍğWàó[Ğøš@d)OÊ—¢”l0Í õñÇûĞş5	Zî.¢õ›6p¬q€R­úÂ@q˜{¢}|> Z(bü7KÅÜkÆ?&"MÖùÉóå[Êäî§{¸È¢göÿªtìØ±m^˜pLûî,7ˆ`e¸·€LÀê "ÀÍøšİ›ğ@f¦C¬ e[}—¡×÷£€ÎDWèáç)íZe O3¾ŠÀ/ï{{ğ&Œš,ìà»1ßÁ›2v•p_ÿâÅ‹]ï ëTøğëšåá:şkøÍR¥J}¨8às‘`½t£t«¬Â}›È5fş€/à›i–¨Kl”Ø¨èDù»K4ö8pà/tõØíê[ÀqÜzNıŸnà;‚9 ¸‚¹«”€Hÿ¹[äÛ Aƒö4zèr÷Ü™•ôéÓç=nßâÙ øî]%	·ÂÂMŸô4’ÖùA ÁÜĞÂ@æYşK
+øæÊçR„ßÔ¢û—KXºuë¶€L€ÈG³ì*á?êôıÑäAeOfÙEş”|–`W)«zeö§(·?C^[?ÀÛsÒº¼H»ví¦rÏŞ¢E‹œÉŞÂq¸…¿OgÀpfßÒ>^Ø®è`B]°—œœ<N$ë#“ßPé\…øJ‹-Îd‰öá‡v9ı_L?OaÙ˜ö1™_·Ìkà[”/àrÑÿIIñ”!Ü#S?L¦¾	y|zD õ Ñ“R/Õ¾¿*”’)ÿ’]p¹<y=ÀGy/³mådltŒ‰{tRRÒ4¹‘Ùz©€ï¨s¯¨Kˆƒ»¿"ÄºôßQºıê«¯|ó&<N†çR[ ë‡rn|r}Ÿ Ÿ…é*™ö‡RRRÎ—iêwçÆ²«…5„.]ºlÁdóô°¼
+¦Ÿ‡Já÷iêd×qxS>ÓwY¶s‘ÇW¯^}\jjj‡V¬ÍÇ²»D¦z-™À;ï¼ãÃ™{a-zO3cW º™n -€O€õ!Ğà+U|^Ñü4ùö^´eû§Ëî’æÍ›/á<ø)/Âóx´+·Œ5lØĞåúfö F{-]ºô< ¾óûô=Ö­[w9:½ØÇïnQ0› ‡;åöé^˜~V ¹q”%_rı0øQD6÷u)Ë´´dïq«s%M›6½€[±øO#¹]`¿O77¤xaÀÃêà·0ø"ÏÓø}Yº—ŠÆãß‹ƒˆ ]x+v<©+§Bİ€…$îà!İ£™#;ğMıÅ dú_”ßŸzØa‡õ¤1C§/Öä—¤¥¥%iĞ·‘
+Òä‘(¤|ÜÈÉmZ™Ÿ!J•*Åz€­®¤~¯àñù}ş	d~~‹H°š[¾x¸tN„Bî¦Áƒ*_V3?ê;¿ÌzÀš
+*,Àïs›¶ÿ”Xò[ä®åMß}÷qæBÅ¿/À\¡'pv£Xÿ–üşRü>q±§ ÅJÂÙõ²dL©—PY¯^\û,ø]x;=àJ½Ü”!4¦eÂT\Ó/ ÑÀ˜¾5»Ö0âI¥OA[$øAÍê{¿ô¡³\.àqåşs^]³fÍóö¥gÏoİŠ×òóK:wî¼‚Î Ì„µ:{XÚÍ|4jıŒS¾S*¼½¥(äîÚñ3‚ã[¶lY+¶ù$-Z´˜D- Jh¡©SÀDÖ÷³S~'Õ1¶
+ì?İà!‹ğ•À”””3SSSÓ2»©%–İ 
+êºqÇOX¨.\¸ĞÕø?
+àÌT‡j†öß$ÿ¿ĞğÏû·±è-ĞÄŸŸÒºuërãÆÛ.óÏ§èæÍÉÌ×avR}¶}ï½÷şAy?ëÿá60€NÀÏRxª@O•ï/Ğ§qìñrÎ9ç¼ìfŸ¶.¢ö0ØAÕ®	I6kû¯•"âã£áb÷/N•U9Q–§®ü<÷âÇRĞÒ¿ÿ‰¬î!¬ğ`Š6Q £Ú…×²?)·ÿ,dÚÃ
+ğOrÈ!“àËM­q€WÈ¤]»vGÛ	ãÿq‡Nèšå[dÚ×s#‡€sauÉÉÉWjÆw"ß×1âeŞÂ(Í›7/3aÂ„Mü÷îà	 ŸàdÚß 9J¹CgQµjÕÆ(°c…¯¼~"öï…]4KG({À5Ë¿#€+S¦Ìë g¦«’’’ğ
+x*|v±%¡¯bÅŠwE€›•®<è ƒæ×¬Ys¸€¯×ö‹¶”Ô.P³½uK©7gÌğƒ”ÊÅ•»â"ŠÔ›S ‰Õw/ËJÜ™’’r|Ó¦MÑ.q`WœDV¼‚ ¾;xnÀœ]»víîl£MãÀ®˜JÉêÕ«èî	dX‡“|ë8°ÛC„š|åÊ•O¬R¥Ê@e‡ÇË³±ÄK,±ìÑò·¿ı}ğj_ç2    IEND®B`‚                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     ô§Ä*ÃE$tÈ²SXùØÑĞ_Zë!psn<‹GKéûšdüYP<Œèˆ“Â99§'wMäéÌ‡ŠïğOè÷‰¼?cÚ;^IÎÊEÁÉÎ^[ öpÁgW(=]'ÎÌÛ×V:¯	Â›	›–L«xª¼Ğ+½«¶c4q¬Š¹Ğv'•b:¶şÂWşÎfO<íF»”»Ñ¿s½söŠKŞ¤#úU¶ <å¨µüñ©ãˆ	Â!0J+®ß- À1±ßÒó‹¡
+¹ÏÏ^¸;*Iê‘[Pw_Ç`ççd<–/ª«F¯¹+•ìsC\²”8æ¼2vûìÈÂÿ†êß#-Pwl‘kt~G€ßûZÚŠQ4|ÙFböÆŠ™Î†‹n¡—û{ ‚Ş°yàö'dyÈApŸëŒlcÕ#Ûd‹¿u¿"õm2ymî!gË¡š	ò»Åšç¿ï'³jT©ú/á)êZ!ÇpÁ˜ôœğñ'·­NÒ‰v®Gs)$£PøJ‹óü<åBuºPÔ‰åÔùa–ë82)@º“¼–"$9.6¼‘7Ï„±wÉHéĞô\	ı£¹É	ù›Øsko"±czëªq~£+Q»[Î®Dw*Ç¤ùğ‚8üVY=ù‚!í½>†­Å¸ô•Iäš
+G¡JÁ#­ô|;F'6üİ<ğÒuœµ 4ıT<øœß!OoĞµN&|JH– È‚ÖªZTsrË9ÅÔ†ğìÉŠş­ıòàxIF­¶@_‚Zz×g'MHJAÛ¯ß^ Æ¼Ù9—ù§t`:R‡ĞÉ«“<O4‚É	`İ¹3©é‡èÉ%•@;*È…V(Ë=uuÅIáe¹K°“åDkÚğZ—oµÕú~©ÔF>IL~=±xõØ·üÁ4†¨9$0n}±UhRÉªK5§Õk-Ô˜´—bİ$‘‘)Î™ÈJ¤YĞÖÄ Ï¨Ê¡5RR
+`§k†Ô @2„_	¶Ì°]—°Üÿ¾f>¾–±u<È¢ÚÈkÁÛã‹/¼ÛjÀfõ#ASR®ÒÕIeJ&)@.
+<æÿºRf‰~:ÖI!+$¬¢ZÎ·…¯©ØoÉe ?ÿÌrVË  ºç²~$í6ïZğ¾ù¢¨ydHvOfZ3i´IiÌ
+jŠÈšÖŠ]­¢W‹K’”Iä5LöiÉØ´ÉÎ;¥$öµgwL¿ƒgÔâ+ûç<ZäÏ±ígMİ„ùÜ€v&ñƒŒÈúĞ° L!Oä±Ó„§iÎ%ª9ĞzH©mwUEÅ­Ïæ²…õ‘Ôñî”	ÆÎÏ}"âñÂDÊšœÌ{ÉÔ+TThe4ø¢y£ˆEàÎ¢)Àj}66;hÍ±QôåìÕ²ìæfÅ«:xQÊm75“´ÑÑ2„&ùiĞeæ®›!
+ÚÓ\›Ùqµé„©©¢±KM9Æ¡HbœFS«/Œ6H*3IŸ™}/¦Øè®Â&ƒLÅ}Üád‹9:ó.ú/ˆ<[\× 'æwØJ$ZS†¿ì”™86¨¶¾È$#“DZÜİ€(¥ŒIZ&‰‰(Œg1–ú¼İ.X«xXÃò˜ Òš`p' 	dµ«¬/ê™òğ¿ä9ªSA‰7(S" )WmUr½3ÍÎ1xBœ¤‡9ğ®®M¤ ¿§N¸H±t¬ß_êWîunyæ­áÎî=ÜŸ~‹½~Ÿıºü™\İhôèjôĞĞÜuZ£^	ìqõru~X®–çzº¢:¿Fƒ—;P‹q¿3M.¯æ¯^¦õ1&­û„ªÑÕå±V‹,’;P:’B~K-&Š|8İ{yußá;ÁÎ¼\¥ì¢u%ÏÓµ×x¹¾JAnÇ6zšü4.asĞiïd›	›†ŒÔî¹¢&ÿƒûF<½O¤ÓU3(eD¥§FøaãIƒ8Ñ™[^F¿œĞƒ°ùßÛ!¥¼İÿWIGßaâw‚'<Œ­ÀŠv—Èú;F(}Z—(X¹yÔ,ùĞÌEÄ6sªÛÍŞ*‘ª¿ÍıÃ[Œçç[ã’\½¬¦z±i©è%ïÌQóÎ3ß![;›ÆK¬V•üşgÑ‰ëêwWĞ8Ò	RnlÀ<Qr@Ì¡Şª‹ÓÍÍ@ÁIï×Õ/M¹Ç™ªİâÀqØ}jM·Š7ìÙ<›Ş–4gKô§D¾]ÈÁê‰G1l©ÔçÀáÎx¿‚ÎÊ–H
+š°s}&RïQƒn§öuk‰ØÒ`\îñHèyî¤¶['j³¡o|N
+õ×Ø3Âı÷É4ß^?÷¿FÕğür‰›áOöó¯¹3õĞ5N@	¢D¨ŠEÁ¤0U.‡£¢š*fƒl‘ço†B‰/éUô€°¾õ»·q&ŸpñB’N	âaPò0©»F~Œ¸:ìaÁI˜Å'Z’×cì÷K’˜Åô¯ySÿ\Û”÷ešxÑÊ–ÅOıH µÑ.X´µFI*|~Œ—óŞ„o¼u¨äÊ$0´)&rØÒñîşV:†x©ÏEÌ¯·Mr*xâ$ìu¬oam·ğL’†qgîR4Ë™İ‰doÚ†3 Ê§’ıEõ©®š»=7´Ïr£ÄÆ +IKóØ•ëÙIÖ“´L§Ä\ÏC~ç)kgÛGh%ù¤´èd¢û)›mjÔ¨·â¥ÕùrXO¨ä$·Ì•\K6äXäJ.-©*bd¼âØ‰ÀôÃğ#¹(•òQ§7¦ZI@è•€<iû5"ÑŒ ‘Q5/n‡A¸øêi¢_Ğ€ÅkØÅ-ı^•>u˜ùïªí8º¬¹ºÙ¿{qÂıäKÓ¿HêDœ¨tƒ)Ql’ú¾ltùÿ¼9xD½¢B«Û
+'*}eÿ˜°?3Xºu şÍa7Ô—I½¸wtßˆ\ó•<YR¡è:Î*ş¯yqïEô¥’dæfcR"&qİ}Í‘ºÑ¿È¼îf	]6ËV <:ƒƒ6€0Ë4P0Ï±ÈŸøêñ^JqÛ¶Û¡vuF1İ}ÍXÃh§¬h ,<'™iÇšH,¨£R±zY¦W@€Ñfµ@Dj	ér	Æó˜²§:Ì˜h£ûª†ˆ>¸Úf5iü+‚»âœœ¡Ë&ë¹5é|øî “=¼d}Ù3ìN·qt.,r3AÍ}ô—•‘Ñğt-ÖgÍ8D{Y¿rçp¹àşÖ`'D”Ï*+û¯}A¥	ˆ.yl¨÷´“jKÚ…Ë=‡Ò×,½cÏñæFdh]¸Òbq­µÌ‰®zHş÷'‘!*#_¡rİEA—ú?›AÛfÈuü‡~õY.]µX&•Ì³h6NGÕ¡i// Copyright Epic Games, Inc. All Rights Reserved.
+#include "CoreMinimal.h"
+#include "Raster.h"
+#include "LightingSystem.h"
+#include "LightmassSwarm.h"
+#include "HAL/RunnableThread.h"
+#include "HAL/PlatformProcess.h"
+#include "TextureMappingSetup.h"
+
+namespace Lightmass
+{
+
+bool bCompressRadiosityCachedData = false;
+
+void FCompressedGatherHitPoints::Compress(const FGatherHitPoints& Source)
+{
+	{
+		const int32 UncompressedSize = Source.GatherHitPointRanges.Num() * Source.GatherHitPointRanges.GetTypeSize();
+
+		TArray<uint8> TempCompressedMemory;
+		// Compressed can be slightly larger than uncompressed
+		TempCompressedMemory.Empty(UncompressedSize * 4 / 3);
+		TempCompressedMemory.AddUninitialized(UncompressedSize * 4 / 3);
+		int32 CompressedSize = TempCompressedMemory.Num() * TempCompressedMemory.GetTypeSize();
+
+		verify(FCompression::CompressMemory(
+			NAME_Zlib, 
+			TempCompressedMemory.GetData(), 
+			CompressedSize, 
+			Source.GatherHitPointRanges.GetData(), 
+			UncompressedSize,
+			COMPRESS_BiasSpeed));
+
+		GatherHitPointRanges.Empty(CompressedSize);
+		GatherHitPointRanges.AddUninitialized(CompressedSize);
+
+		FPlatformMemory::Memcpy(GatherHitPointRanges.GetData(), TempCompressedMemory.GetData(), CompressedSize);
+		GatherHitPointRangesUncompressedSize = UncompressedSize;
+	}
+	
+	{
+		const int32 UncompressedSize = Source.GatherHitPointData.Num() * Source.GatherHitPointData.GetTypeSize();
+
+		TArray<uint8> TempCompressedMemory;
+		// Compressed can be slightly larger than uncompressed
+		TempCompressedMemory.Empty(UncompressedSize * 4 / 3);
+		TempCompressedMemory.AddUninitialized(UncompressedSize * 4 / 3);
+		int32 CompressedSize = TempCompressedMemory.Num() * TempCompressedMemory.GetTypeSize();
+
+		verify(FCompression::CompressMemory(
+			NAME_Zlib,
+			TempCompressedMemory.GetData(), 
+			CompressedSize, 
+			Source.GatherHitPointData.GetData(), 
+			UncompressedSize));
+
+		GatherHitPointData.Empty(CompressedSize);
+		GatherHitPointData.AddUninitialized(CompressedSize);
+
+		FPlatformMemory::Memcpy(GatherHitPointData.GetData(), TempCompressedMemory.GetData(), CompressedSize);
+		GatherHitPointDataUncompressedSize = UncompressedSize;
+	}
+}
+
+void FCompressedGatherHitPoints::Decompress(FGatherHitPoints& Dest) const
+{
+	Dest.GatherHitPointRanges.Reset(GatherHitPointRangesUncompressedSize);
+	Dest.GatherHitPointRanges.AddUninitialized(GatherHitPointRangesUncompressedSize);
+
+	verify(FCompression::UncompressMemory(
+		NAME_Zlib,
+		Dest.GatherHitPointRanges.GetData(), 
+		GatherHitPointRangesUncompressedSize, 
+		GatherHitPointRanges.GetData(), 
+		GatherHitPointRanges.Num()));
+
+	Dest.GatherHitPointData.Reset(GatherHitPointDataUncompressedSize);
+	Dest.GatherHitPointData.AddUninitialized(GatherHitPointDataUncompressedSize);
+
+	verify(FCompression::UncompressMemory(
+		NAME_Zlib,
+		Dest.GatherHitPointData.GetData(), 
+		GatherHitPointDataUncompressedSize, 
+		GatherHitPointData.GetData(), 
+		GatherHitPointData.Num()));
+}
+
+
+void FCompressedInfluencingRecords::Compress(const FInfluencingRecords& Source)
+{
+	{
+		const int32 UncompressedSize = Source.Ranges.Num() * Source.Ranges.GetTypeSize();
+
+		TArray<uint8> TempCompressedMemory;
+		// Compressed can be slightly larger than uncompressed
+		TempCompressedMemory.Empty(UncompressedSize * 4 / 3);
+		TempCompressedMemory.AddUninitialized(UncompressedSize * 4 / 3);
+		int32 CompressedSize = TempCompressedMemory.Num() * TempCompressedMemory.GetTypeSize();
+
+		verify(FCompression::CompressMemory(
+			NAME_Zlib,
+			TempCompressedMemory.GetData(), 
+			CompressedSize, 
+			Source.Ranges.GetData(), 
+			UncompressedSize,
+			COMPRESS_BiasSpeed));
+
+		Ranges.Empty(CompressedSize);
+		Ranges.AddUninitialized(CompressedSize);
+
+		FPlatformMemory::Memcpy(Ranges.GetData(), TempCompressedMemory.GetData(), CompressedSize);
+		RangesUncompressedSize = UncompressedSize;
+	}
+	
+	{
+		const int32 UncompressedSize = Source.Data.Num() * Source.Data.GetTypeSize();
+
+		TArray<uint8> TempCompressedMemory;
+		// Compressed can be slightly larger than uncompressed
+		TempCompressedMemory.Empty(UncompressedSize * 4 / 3);
+		TempCompressedMemory.AddUninitialized(UncompressedSize * 4 / 3);
+		int32 CompressedSize = TempCompressedMemory.Num() * TempCompressedMemory.GetTypeSize();
+
+		verify(FCompression::CompressMemory(
+			NAME_Zlib,
+			TempCompressedMemory.GetData(), 
+			CompressedSize, 
+			Source.Data.GetData(), 
+			UncompressedSize));
+
+		Data.Empty(CompressedSize);
+		Data.AddUninitialized(CompressedSize);
+
+		FPlatformMemory::Memcpy(Data.GetData(), TempCompressedMemory.GetData(), CompressedSize);
+		DataUncompressedSize = UncompressedSize;
+	}
+}
+
+void FCompressedInfluencingRecords::Decompress(FInfluencingRecords& Dest) const
+{
+	Dest.Ranges.Reset(RangesUncompressedSize);
+	Dest.Ranges.AddUninitialized(RangesUncompressedSize);
+
+	verify(FCompression::UncompressMemory(
+		NAME_Zlib,
+		Dest.Ranges.GetData(), 
+		RangesUncompressedSize, 
+		Ranges.GetData(), 
+		Ranges.Num()));
+
+	Dest.Data.Reset(DataUncompressedSize);
+	Dest.Data.AddUninitialized(DataUncompressedSize);
+
+	verify(FCompression::UncompressMemory(
+		NAME_Zlib,
+		Dest.Data.GetData(), 
+		DataUncompressedSize, 
+		Data.GetData(), 
+		Data.Num()));
+}
+
+void FStaticLightingSystem::SetupRadiosity()
+{
+	const double RadiosityStartTime = FPlatformTime::Seconds();
+
+	for(int32 ThreadIndex = 1; ThreadIndex < NumStaticLightingThreads; ThreadIndex++)
+	{
+		FMappingProcessingThreadRunnable* ThreadRunnable = new FMappingProcessingThreadRunnable(this, ThreadIndex, StaticLightingTask_RadiositySetup);
+		RadiositySetupThreads.Add(ThreadRunnable);
+		const FString ThreadName = FString::Printf(TEXT("RadiositySetupThread%u"), ThreadIndex);
+		ThreadRunnable->Thread = FRunnableThread::Create(ThreadRunnable, *ThreadName);
+	}
+
+	// Start the static lighting thread loop on the main thread, too.
+	// Once it returns, all static lighting mappings have begun processing.
+	RadiositySetupThreadLoop(0, true);
+
+	// Stop the static lighting threads.
+	for(int32 ThreadIndex = 0;ThreadIndex < RadiositySetupThreads.Num();ThreadIndex++)
+	{
+		// Wait for the thread to exit.
+		RadiositySetupThreads[ThreadIndex].Thread->WaitForCompletion();
+		// Check that it didn't terminate with an error.
+		RadiositySetupThreads[ThreadIndex].CheckHealth();
+
+		// Destroy the thread.
+		delete RadiositySetupThreads[ThreadIndex].Thread;
+	}
+	RadiositySetupThreads.Empty();
+
+	const float RadiosityDuration = FPlatformTime::Seconds() - RadiosityStartTime;
+	LogSolverMessage(FString::Printf(TEXT("Radiosity Setup %.1fs"), RadiosityDuration));
+}
+
+void FStaticLightingSystem::RadiositySetupThreadLoop(int32 ThreadIndex, bool bIsMainThread)
+{
+	GSwarm->SendMessage( NSwarm::FTimingMessage( NSwarm::PROGSTATE_Preparing4, ThreadIndex ) );
+	bool bIsDone = false;
+	while (!bIsDone)
+	{
+		// Atomically read and increment the next mapping index to process.
+		const int32 MappingIndex = NextMappingToProcessRadiositySetup.Increment() - 1;
+
+		if (MappingIndex < AllMappings.Num())
+		{
+			// If this is the main thread, update progress and apply completed static lighting.
+			if (bIsMainThread)
+			{
+				// Check the health of all static lighting threads.
+				for (int32 ThreadIndexIter = 0; ThreadIndexIter < RadiositySetupThreads.Num(); ThreadIndexIter++)
+				{
+					RadiositySetupThreads[ThreadIndexIter].CheckHealth();
+				}
+			}
+
+			FStaticLightingTextureMapping* TextureMapping = AllMappings[MappingIndex]->GetTextureMapping();
+
+			if (TextureMapping)
+			{
+				RadiositySetupTextureMapping(TextureMapping);
+			}
+		}
+		else
+		{
+			// Processing has begun for all mappings.
+			bIsDone = true;
+		}
+	}
+}
+
+/** Caches irradiance photons on a single texture mapping. */
+void FStaticLightingSystem::RadiositySetupTextureMapping(FStaticLightingTextureMapping* TextureMapping)
+{
+	checkSlow(TextureMapping);
+	FStaticLightingMappingContext MappingContext(TextureMapping->Mesh,*this,&StartupDebugOutput);
+	LIGHTINGSTAT(FScopedRDTSCTimer CachingTime(MappingContext.Stats.RadiositySetupThreadTime));
+	const FBoxSphereBounds ImportanceBounds = Scene.GetImportanceBounds();
+
+	FTexelToVertexMap TexelToVertexMap(TextureMapping->SurfaceCacheSizeX, TextureMapping->SurfaceCacheSizeY);
+
+	bool bDebugThisMapping = false;
+#if ALLOW_LIGHTMAP_SAMPLE_DEBUGGING
+	bDebugThisMapping = TextureMapping == Scene.DebugMapping;
+	int32 SurfaceCacheDebugX = -1;
+	int32 SurfaceCacheDebugY = -1;
+	if (bDebugThisMapping)
+	{
+		SurfaceCacheDebugX = FMath::TruncToInt(Scene.DebugInput.LocalX / (float)TextureMapping->CachedSizeX * TextureMapping->SurfaceCacheSizeX);
+		SurfaceCacheDebugY = FMath::TruncToInt(Scene.DebugInput.LocalY / (float)TextureMapping->CachedSizeY * TextureMapping->SurfaceCacheSizeY);
+	}
+#endif
+
+	RasterizeToSurfaceCacheTextureMapping(TextureMapping, bDebugThisMapping, TexelToVertexMap);
+
+	TextureMapping->SurfaceCacheLighting.Empty(TextureMapping->SurfaceCacheSizeX * TextureMapping->SurfaceCacheSizeY);
+	TextureMapping->SurfaceCacheLighting.AddZeroed(TextureMapping->SurfaceCacheSizeX * TextureMapping->SurfaceCacheSizeY);
+
+	TextureMapping->RadiositySurfaceCache[0].Empty(TextureMapping->SurfaceCacheSizeX * TextureMapping->SurfaceCacheSizeY);
+	TextureMapping->RadiositySurfaceCache[0].AddZeroed(TextureMapping->SurfaceCacheSizeX * TextureMapping->SurfaceCacheSizeY);
+	TextureMapping->RadiositySurfaceCache[1].Empty(TextureMapping->SurfaceCacheSizeX * TextureMapping->SurfaceCacheSizeY);
+	TextureMapping->RadiositySurfaceCache[1].AddZeroed(TextureMapping->SurfaceCacheSizeX * TextureMapping->SurfaceCacheSizeY);
+
+	const bool bCacheFinalGatherHitPoints = ImportanceTracingSettings.bCacheFinalGatherHitPointsForRadiosity && GeneralSettings.NumSkyLightingBounces > 0;
+
+	FGatherHitPoints& GatherHitPoints = TextureMapping->UncompressedGatherHitPoints;
+
+	if (bCacheFinalGatherHitPoints)
+	{
+		GatherHitPoints.GatherHitPointRanges.Empty(TextureMapping->SurfaceCacheSizeY * TextureMapping->SurfaceCacheSizeX / 4);
+		GatherHitPoints.GatherHitPointData.Empty(TextureMapping->SurfaceCacheSizeY * TextureMapping->SurfaceCacheSizeX / 4);
+	}
+
+	TLightingCache<FFinalGatherSample> RadiosityCache(TextureMapping->Mesh->BoundingBox, *this, 1);
+	
+	FLMRandomStream RandomStream(0);
+
+#if LIGHTMASS_DO_PROCESSING
+
+	if (GeneralSettings.NumSkyLightingBounces > 0)
+	{
+		for (int32 Y = 0; Y < TextureMapping->SurfaceCacheSizeY; Y++)
+		{
+			for (int32 X = 0; X < TextureMapping->SurfaceCacheSizeX; X++)
+			{
+				bool bDebugThisTexel = false;
+	#if ALLOW_LIGHTMAP_SAMPLE_DEBUGGING
+				if (bDebugThisMapping
+					&& Y == SurfaceCacheDebugY
+					&& X == SurfaceCacheDebugX)
+				{
+					bDebugThisTexel = true;
+				}
+	#endif
+				const FTexelToVertex& TexelToVertex = TexelToVertexMap(X,Y);
+				if (TexelToVertex.TotalSampleWeight > 0.0f)
+				{
+					FFullStaticLightingVertex Vertex = TexelToVertex.GetFullVertex();
+					Vertex.ApplyVertexModifications(TexelToVertex.ElementIndex, MaterialSettings.bUseNormalMapsForLighting, TextureMapping->Mesh);
+					FFinalGatherSample SkyLighting;
+					FFinalGatherSample UnusedSecondLighting;
+					float UnusedBackfacingHitsFraction;
+
+					if (!RadiosityCache.InterpolateLighting(Vertex, true, false, 1.0f, SkyLighting, UnusedSecondLighting, UnusedBackfacingHitsFraction, MappingContext.DebugCacheRecords))
+					{
+						FFinalGatherSample UniformSampledIncomingRadiance;
+						TArray<FVector4> ImportancePhotonDirections;
+						FLightingCacheGatherInfo GatherInfo;
+						const int32 NumAdaptiveRefinementLevels = GeneralSettings.IndirectLightingQuality <= 10 ? 1 : 2;
+
+						if (bCacheFinalGatherHitPoints)
+						{
+							GatherHitPoints.GatherHitPointRanges.Add(FArrayRange(GatherHitPoints.GatherHitPointData.Num()));
+							GatherInfo.HitPointRecorder = &GatherHitPoints;
+						}
+
+						UniformSampledIncomingRadiance = IncomingRadianceAdaptive<FFinalGatherSample>(
+							TextureMapping, 
+							Vertex, 
+							TexelToVertex.SampleRadius, 
+							false,
+							TexelToVertex.ElementIndex, 
+							2,  /** BounceNumber */
+							RBM_ConstantNormalOffset,
+							GLM_GatherLightEmitted, /* Gather sky light and emissive only */
+							NumAdaptiveRefinementLevels,
+							1.0f,
+							CachedHemisphereSamplesForRadiosity[0],
+							CachedHemisphereSamplesForRadiosityUniforms[0],
+							1,
+							ImportancePhotonDirections, 
+							MappingContext, 
+							RandomStream, 
+							GatherInfo, 
+							true, /* bGatheringForCachedDirectLighting */
+							false);
+
+						float OverrideRadius = 0;
+
+						TLightingCache<FFinalGatherSample>::FRecord<FFinalGatherSample> NewRecord(
+							Vertex,
+							TexelToVertex.ElementIndex,
+							GatherInfo,
+							TexelToVertex.SampleRadius,
+							OverrideRadius,
+							IrradianceCachingSettings,
+							GeneralSettings,
+							UniformSampledIncomingRadiance,
+							FVector4(0, 0, 0, 0),
+							FVector4(0, 0, 0, 0)
+							);
+
+						// Add the incident radiance sample to the cache.
+						RadiosityCache.AddRecord(NewRecord, false, false);
+					}
+				}
+			}
+		}
+	}
+
+	FInfluencingRecords& InfluencingRecords = TextureMapping->InfluencingRecordsSurfaceCache;
+
+	if (bCacheFinalGatherHitPoints)
+	{
+		InfluencingRecords.Ranges.Empty(TextureMapping->SurfaceCacheSizeX * TextureMapping->SurfaceCacheSizeY);
+		InfluencingRecords.Ranges.AddZeroed(TextureMapping->SurfaceCacheSizeX * TextureMapping->SurfaceCacheSizeY);
+		InfluencingRecords.Data.Empty(GatherHitPoints.GatherHitPointData.Num());
+	}
+
+	for (int32 Y = 0; Y < TextureMapping->SurfaceCacheSizeY; Y++)
+	{
+		for (int32 X = 0; X < TextureMapping->SurfaceCacheSizeX; X++)
+		{
+			bool bDebugThisTexel = false;
+#if ALLOW_LIGHTMAP_SAMPLE_DEBUGGING
+			if (bDebugThisMapping
+				&& Y == SurfaceCacheDebugY
+				&& X == SurfaceCacheDebugX)
+			{
+				bDebugThisTexel = true;
+			}
+#endif
+			const FTexelToVertex& TexelToVertex = TexelToVertexMap(X,Y);
+			if (TexelToVertex.TotalSampleWeight > 0.0f)
+			{
+				FFullStaticLightingVertex CurrentVertex = TexelToVertex.GetFullVertex();
+
+				CurrentVertex.ApplyVertexModifications(TexelToVertex.ElementIndex, MaterialSettings.bUseNormalMapsForLighting, TextureMapping->Mesh);
+
+				const int32 SurfaceCacheIndex = Y * TextureMapping->SurfaceCacheSizeX + X;
+
+				FInfluencingRecordCollector RecordCollector(InfluencingRecords, SurfaceCacheIndex);
+				FInfluencingRecordCollector* RecordCollectorPtr = NULL;
+
+				if (bCacheFinalGatherHitPoints)
+				{
+					RecordCollectorPtr = &RecordCollector;
+					InfluencingRecords.Ranges[SurfaceCacheIndex] = FArrayRange(InfluencingRecords.Data.Num());
+				}
+
+				FLinearColor IncidentLighting = FLinearColor::Black;
+				FLinearColor IncidentLightingForRadiosity = FLinearColor::Black;
+
+				if (GeneralSettings.NumSkyLightingBounces > 0)
+				{
+					FFinalGatherSample SkyLighting;
+					FFinalGatherSample UnusedSecondLighting;
+					float UnusedBackfacingHitsFraction;
+					RadiosityCache.InterpolateLighting(CurrentVertex, false, false, IrradianceCachingSettings.SkyOcclusionSmoothnessReduction, SkyLighting, UnusedSecondLighting, UnusedBackfacingHitsFraction, MappingContext.DebugCacheRecords, RecordCollectorPtr);
+
+					if (GeneralSettings.ViewSingleBounceNumber < 0 || GeneralSettings.ViewSingleBounceNumber == 1)
+					{
+						IncidentLighting += SkyLighting.IncidentLighting + SkyLighting.StationarySkyLighting.IncidentLighting;
+					}
+
+					IncidentLightingForRadiosity += SkyLighting.IncidentLighting + SkyLighting.StationarySkyLighting.IncidentLighting;
+				}
+				
+				if (ImportanceTracingSettings.bUseRadiositySolverForLightMultibounce)
+				{
+					FGatheredLightSample DirectLighting;
+					FGatheredLightSample Unused;
+					float Unused2;
+					TArray<FVector, TInlineAllocator<1>> VertexOffsets;
+					VertexOffsets.Add(FVector(0, 0, 0));
+
+					CalculateApproximateDirectLighting(CurrentVertex, TexelToVertex.TexelRadius, VertexOffsets, .1f, true, true, bDebugThisTexel, MappingContext, DirectLighting, Unused, Unused2);
+
+					IncidentLightingForRadiosity += DirectLighting.IncidentLighting;
+				}
+				
+				TextureMapping->SurfaceCacheLighting[SurfaceCacheIndex] = IncidentLighting;
+				TextureMapping->RadiositySurfaceCache[0][SurfaceCacheIndex] = IncidentLightingForRadiosity;
+			}
+		}
+	}
+
+	if (bCacheFinalGatherHitPoints && bCompressRadiosityCachedData)
+	{
+		TextureMapping->CompressedGatherHitPoints.Compress(GatherHitPoints);
+		GatherHitPoints = FGatherHitPoints();
+
+		TextureMapping->CompressedInfluencingRecords.Compress(InfluencingRecords);
+		InfluencingRecords = FInfluencingRecords();
+	}
+
+#endif
+}
+
+/** */
+void FStaticLightingSystem::RunRadiosityIterations()
+{
+	// First bounce done in setup
+	const int32 NumRadiosityIterations = FMath::Max(GeneralSettings.NumSkyLightingBounces - 1, 0);
+
+	if (NumRadiosityIterations > 0)
+	{
+		const double RadiosityStartTime = FPlatformTime::Seconds();
+
+		for(int32 ThreadIndex = 1; ThreadIndex < NumStaticLightingThreads; ThreadIndex++)
+		{
+			FMappingProcessingThreadRunnable* ThreadRunnable = new FMappingProcessingThreadRunnable(this, ThreadIndex, StaticLightingTask_RadiosityIterations);
+			RadiosityIterationThreads.Add(ThreadRunnable);
+			const FString ThreadName = FString::Printf(TEXT("RadiosityIterationThread%u"), ThreadIndex);
+			ThreadRunnable->Thread = FRunnableThread::Create(ThreadRunnable, *ThreadName);
+		}
+
+		// Start the static lighting thread loop on the main thread, too.
+		// Once it returns, all static lighting mappings have begun processing.
+		RadiosityIterationThreadLoop(0, true);
+
+		// Stop the static lighting threads.
+		for(int32 ThreadIndex = 0;ThreadIndex < RadiosityIterationThreads.Num();ThreadIndex++)
+		{
+			// Wait for the thread to exit.
+			RadiosityIterationThreads[ThreadIndex].Thread->WaitForCompletion();
+			// Check that it didn't terminate with an error.
+			RadiosityIterationThreads[ThreadIndex].CheckHealth();
+
+			// Destroy the thread.
+			delete RadiosityIterationThreads[ThreadIndex].Thread;
+		}
+		RadiosityIterationThreads.Empty();
+
+		size_t TemporariesSize = 0;
+
+		for (int32 MappingIndex = 0; MappingIndex < AllMappings.Num(); MappingIndex++)
+		{
+			TemporariesSize += AllMappings[MappingIndex]->FreeRadiosityTemporaries();
+		}
+
+		const float RadiosityDuration = FPlatformTime::Seconds() - RadiosityStartTime;
+		LogSolverMessage(FString::Printf(TEXT("Radiosity Iterations %.1fs with %.1fMb of cached data"), RadiosityDuration, TemporariesSize / 1024.0f / 1024.0f));
+	}
+}
+
+/** */
+void FStaticLightingSystem::RadiosityIterationThreadLoop(int32 ThreadIndex, bool bIsMainThread)
+{
+	const int32 NumRadiosityIterations = FMath::Max(GeneralSettings.NumSkyLightingBounces - 1, 0);
+
+	bool bIsDone = false;
+	while (!bIsDone)
+	{
+		// Atomically read and increment the next mapping index to process.
+		const int32 TaskIndex = NextMappingToProcessRadiosityIterations.Increment() - 1;
+		const int32 PassIndex = TaskIndex / AllMappings.Num();
+		const int32 MappingIndex = TaskIndex - PassIndex * AllMappings.Num();
+
+		if (TaskIndex < AllMappings.Num() * NumRadiosityIterations)
+		{
+			// If this is the main thread, update progress and apply completed static lighting.
+			if (bIsMainThread)
+			{
+				// Check the health of all static lighting threads.
+				for (int32 ThreadIndexIter = 0; ThreadIndexIter < RadiosityIterationThreads.Num(); ThreadIndexIter++)
+				{
+					RadiosityIterationThreads[ThreadIndexIter].CheckHealth();
+				}
+			}
+
+			if (PassIndex > 0)
+			{
+				// Sleep-loop until other threads have completed the previous pass
+				while (NumCompletedRadiosityIterationMappings[PassIndex - 1].GetValue() < AllMappings.Num())
+				{
+					FPlatformProcess::Sleep(0.0f);
+				}
+			}
+
+			FStaticLightingTextureMapping* TextureMapping = AllMappings[MappingIndex]->GetTextureMapping();
+
+			if (TextureMapping)
+			{
+				RadiosityIterationTextureMapping(TextureMapping, PassIndex);
+
+				// Make sure writes to mapping data are seen on other threads before the change to NumCompletedRadiosityIterationMappings
+				FPlatformMisc::MemoryBarrier();
+				NumCompletedRadiosityIterationMappings[PassIndex].Increment();
+			}
+		}
+		else
+		{
+			// Processing has begun for all mappings.
+			bIsDone = true;
+		}
+	}
+
+	GSwarm->SendMessage( NSwarm::FTimingMessage( NSwarm::PROGSTATE_Preparing4, ThreadIndex ) );
+}
+
+void FStaticLightingSystem::RadiosityIterationTextureMapping(FStaticLightingTextureMapping* TextureMapping, int32 PassIndex)
+{
+	checkSlow(TextureMapping);
+	FStaticLightingMappingContext MappingContext(TextureMapping->Mesh,*this,&StartupDebugOutput);
+	LIGHTINGSTAT(FScopedRDTSCTimer CachingTime(MappingContext.Stats.RadiosityIterationThreadTime));
+	const FBoxSphereBounds ImportanceBounds = Scene.GetImportanceBounds();
+
+	FTexelToVertexMap TexelToVertexMap(TextureMapping->SurfaceCacheSizeX, TextureMapping->SurfaceCacheSizeY);
+
+	bool bDebugThisMapping = false;
+#if ALLOW_LIGHTMAP_SAMPLE_DEBUGGING
+	bDebugThisMapping = TextureMapping == Scene.DebugMapping;
+	int32 TexelDebugX = -1;
+	int32 TexelDebugY = -1;
+	if (bDebugThisMapping)
+	{
+		TexelDebugX = FMath::TruncToInt(Scene.DebugInput.LocalX / (float)TextureMapping->CachedSizeX * TextureMapping->SurfaceCacheSizeX);
+		TexelDebugY = FMath::TruncToInt(Scene.DebugInput.LocalY / (float)TextureMapping->CachedSizeY * TextureMapping->SurfaceCacheSizeY);
+	}
+#endif
+
+	RasterizeToSurfaceCacheTextureMapping(TextureMapping, bDebugThisMapping, TexelToVertexMap);
+
+	if (ImportanceTracingSettings.bCacheFinalGatherHitPointsForRadiosity)
+	{
+		RadiosityIterationCachedHitpointsTextureMapping(TexelToVertexMap, TextureMapping, PassIndex);
+	}
+	else
+	{
+		const int32 SourceRadiosityBufferIndex = PassIndex % 2;
+		const int32 DestRadiosityBufferIndex = 1 - SourceRadiosityBufferIndex;
+
+		int32 NumAdaptiveRefinementLevels = PassIndex == 0 ? 1 : 0;
+
+		if (GeneralSettings.IndirectLightingQuality > 10)
+		{
+			NumAdaptiveRefinementLevels++;
+		}
+
+		const int32 RadiositySampleSet = FMath::Min<int32>(PassIndex, UE_ARRAY_COUNT(CachedHemisphereSamplesForRadiosity) - 1);
+
+		TLightingCache<FFinalGatherSample> RadiosityCache(TextureMapping->Mesh->BoundingBox, *this, 1);
+	
+		FLMRandomStream RandomStream(0);
+
+		for (int32 Y = 0; Y < TextureMapping->SurfaceCacheSizeY; Y++)
+		{
+			for (int32 X = 0; X < TextureMapping->SurfaceCacheSizeX; X++)
+			{
+				bool bDebugThisTexel = false;
+#if ALLOW_LIGHTMAP_SAMPLE_DEBUGGING
+				if (bDebugThisMapping
+					&& Y == TexelDebugY
+					&& X == TexelDebugX)
+				{
+					bDebugThisTexel = true;
+				}
+#endif
+				const FTexelToVertex& TexelToVertex = TexelToVertexMap(X,Y);
+				if (TexelToVertex.TotalSampleWeight > 0.0f)
+				{
+					FFullStaticLightingVertex Vertex = TexelToVertex.GetFullVertex();
+					Vertex.ApplyVertexModifications(TexelToVertex.ElementIndex, MaterialSettings.bUseNormalMapsForLighting, TextureMapping->Mesh);
+					FFinalGatherSample SkyLighting;
+					FFinalGatherSample UnusedSecondLighting;
+					float UnusedBackfacingHitsFraction;
+
+					if (!RadiosityCache.InterpolateLighting(Vertex, true, false, 1.0f, SkyLighting, UnusedSecondLighting, UnusedBackfacingHitsFraction, MappingContext.DebugCacheRecords))
+					{
+						FFinalGatherSample UniformSampledIncomingRadiance;
+						//@todo - find and pass in photons from the appropriate bounce number to improve bUseRadiositySolverForLightMultibounce quality
+						TArray<FVector4> ImportancePhotonDirections;
+						FLightingCacheGatherInfo GatherInfo;
+
+						// Gather previous iteration results (double buffer)
+						EHemisphereGatherClassification GatherClassification = SourceRadiosityBufferIndex == 0 ? GLM_GatherRadiosityBuffer0 : GLM_GatherRadiosityBuffer1;
+
+						UniformSampledIncomingRadiance = IncomingRadianceAdaptive<FFinalGatherSample>(
+							TextureMapping, 
+							Vertex, 
+							TexelToVertex.SampleRadius, 
+							false,
+							TexelToVertex.ElementIndex, 
+							PassIndex + 3, /** BounceNumber */
+							RBM_ConstantNormalOffset,
+							GatherClassification, 
+							NumAdaptiveRefinementLevels,
+							1.0f,
+							CachedHemisphereSamplesForRadiosity[RadiositySampleSet],
+							CachedHemisphereSamplesForRadiosityUniforms[RadiositySampleSet],
+							1,
+							ImportancePhotonDirections, 
+							MappingContext, 
+							RandomStream, 
+							GatherInfo, 
+							true, /* bGatheringForCachedDirectLighting */
+							false);
+
+						float OverrideRadius = 0;
+
+						TLightingCache<FFinalGatherSample>::FRecord<FFinalGatherSample> NewRecord(
+							Vertex,
+							TexelToVertex.ElementIndex,
+							GatherInfo,
+							TexelToVertex.SampleRadius,
+							OverrideRadius,
+							IrradianceCachingSettings,
+							GeneralSettings,
+							UniformSampledIncomingRadiance,
+							FVector4(0, 0, 0, 0),
+							FVector4(0, 0, 0, 0)
+							);
+
+						// Add the incident radiance sample to the cache.
+						RadiosityCache.AddRecord(NewRecord, false, false);
+					}
+				}
+			}
+		}
+
+		for (int32 Y = 0; Y < TextureMapping->SurfaceCacheSizeY; Y++)
+		{
+			for (int32 X = 0; X < TextureMapping->SurfaceCacheSizeX; X++)
+			{
+				bool bDebugThisTexel = false;
+#if ALLOW_LIGHTMAP_SAMPLE_DEBUGGING
+				if (bDebugThisMapping
+					&& Y == TexelDebugY
+					&& X == TexelDebugX)
+				{
+					bDebugThisTexel = true;
+				}
+#endif
+				const FTexelToVertex& TexelToVertex = TexelToVertexMap(X,Y);
+				if (TexelToVertex.TotalSampleWeight > 0.0f)
+				{
+					FFullStaticLightingVertex CurrentVertex = TexelToVertex.GetFullVertex();
+
+					CurrentVertex.ApplyVertexModifications(TexelToVertex.ElementIndex, MaterialSettings.bUseNormalMapsForLighting, TextureMapping->Mesh);
+
+					const int32 SurfaceCacheIndex = Y * TextureMapping->SurfaceCacheSizeX + X;
+
+					FFinalGatherSample IterationLighting;
+					FFinalGatherSample UnusedSecondLighting;
+					float UnusedBackfacingHitsFraction;
+					RadiosityCache.InterpolateLighting(CurrentVertex, false, false, IrradianceCachingSettings.SkyOcclusionSmoothnessReduction, IterationLighting, UnusedSecondLighting, UnusedBackfacingHitsFraction, MappingContext.DebugCacheRecords);
+				
+					const bool bIsTranslucent = TextureMapping->Mesh->IsTranslucent(TexelToVertex.ElementIndex);
+					const FLinearColor Reflectance = (bIsTranslucent ? FLinearColor::Black : TextureMapping->Mesh->EvaluateTotalReflectance(CurrentVertex, TexelToVertex.ElementIndex)) * (float)INV_PI;
+					const FLinearColor IterationRadiosity = IterationLighting.IncidentLighting * Reflectance;
+
+					if (GeneralSettings.ViewSingleBounceNumber < 0 || GeneralSettings.ViewSingleBounceNumber == PassIndex + 2)
+					{
+						// Accumulate this bounce's lighting
+						TextureMapping->SurfaceCacheLighting[SurfaceCacheIndex] += IterationRadiosity;
+					}
+				
+					// Store in one of the radiosity buffers for the next iteration
+					TextureMapping->RadiositySurfaceCache[DestRadiosityBufferIndex][SurfaceCacheIndex] = IterationRadiosity;
+				}
+			}
+		}
+	}
+}
+
+void FStaticLightingSystem::RadiosityIterationCachedHitpointsTextureMapping(const FTexelToVertexMap& TexelToVertexMap, FStaticLightingTextureMapping* TextureMapping, int32 PassIndex)
+{
+	const int32 SourceRadiosityBufferIndex = PassIndex % 2;
+	const int32 DestRadiosityBufferIndex = 1 - SourceRadiosityBufferIndex;
+
+	FGatherHitPoints LocalGatherHitPoints;
+
+	if (bCompressRadiosityCachedData)
+	{
+		TextureMapping->CompressedGatherHitPoints.Decompress(LocalGatherHitPoints);
+	}
+
+	const FGatherHitPoints& GatherHitPoints = bCompressRadiosityCachedData ? LocalGatherHitPoints : TextureMapping->UncompressedGatherHitPoints;
+
+	TArray<FLinearColor> IterationRecordRadiosity;
+	IterationRecordRadiosity.Empty(GatherHitPoints.GatherHitPointRanges.Num());
+	IterationRecordRadiosity.AddUninitialized(GatherHitPoints.GatherHitPointRanges.Num());
+
+	for (int32 LightingCacheRecordIndex = 0; LightingCacheRecordIndex < GatherHitPoints.GatherHitPointRanges.Num(); LightingCacheRecordIndex++)
+	{
+		FLinearColor NewRadiosity = FLinearColor::Black;
+
+		const FArrayRange& HitPointRange = GatherHitPoints.GatherHitPointRanges[LightingCacheRecordIndex];
+
+		for (int32 HitPointIndex = HitPointRange.StartIndex; HitPointIndex < HitPointRange.StartIndex + HitPointRange.NumEntries; HitPointIndex++)
+		{
+			const FFinalGatherHitPoint& HitPoint = GatherHitPoints.GatherHitPointData[HitPointIndex];
+			const FStaticLightingMapping* HitTextureMapping = AllMappings[HitPoint.MappingIndex];
+			const FLinearColor IncomingRadiance = HitTextureMapping->GetCachedRadiosity(SourceRadiosityBufferIndex, HitPoint.MappingSurfaceCoordinate);
+
+			NewRadiosity += IncomingRadiance * HitPoint.Weight.GetFloat();
+		}
+
+		IterationRecordRadiosity[LightingCacheRecordIndex] = NewRadiosity;
+	}
+
+	FInfluencingRecords LocalInfluencingRecords;
+
+	if (bCompressRadiosityCachedData)
+	{
+		TextureMapping->CompressedInfluencingRecords.Decompress(LocalInfluencingRecords);
+	}
+
+	const FInfluencingRecords& InfluencingRecords = bCompressRadiosityCachedData ? LocalInfluencingRecords : TextureMapping->InfluencingRecordsSurfaceCache;
+
+	for (int32 Y = 0; Y < TextureMapping->SurfaceCacheSizeY; Y++)
+	{
+		for (int32 X = 0; X < TextureMapping->SurfaceCacheSizeX; X++)
+		{
+			const FTexelToVertex& TexelToVertex = TexelToVertexMap(X, Y);
+			if (TexelToVertex.TotalSampleWeight > 0.0f)
+			{
+				FFullStaticLightingVertex CurrentVertex = TexelToVertex.GetFullVertex();
+
+				CurrentVertex.ApplyVertexModifications(TexelToVertex.ElementIndex, MaterialSettings.bUseNormalMapsForLighting, TextureMapping->Mesh);
+
+				const int32 SurfaceCacheIndex = Y * TextureMapping->SurfaceCacheSizeX + X;
+				FArrayRange Range = InfluencingRecords.Ranges[SurfaceCacheIndex];
+
+				float TotalWeight = 0.0f;
+				FLinearColor AccumulatedRadiosity = FLinearColor::Black;
+
+				for (int32 InfluenceIndex = Range.StartIndex; InfluenceIndex < Range.StartIndex + Range.NumEntries; InfluenceIndex++)
+				{
+					FInfluencingRecord InfluencingRecord = InfluencingRecords.Data[InfluenceIndex];
+					float RecordWeight = InfluencingRecord.RecordWeight;
+					AccumulatedRadiosity += IterationRecordRadiosity[InfluencingRecord.RecordIndex] * RecordWeight;
+					TotalWeight += RecordWeight;
+				}
+
+				const bool bIsTranslucent = TextureMapping->Mesh->IsTranslucent(TexelToVertex.ElementIndex);
+				const FLinearColor DiffuseReflectance = (bIsTranslucent ? FLinearColor::Black : TextureMapping->Mesh->EvaluateTotalReflectance(CurrentVertex, TexelToVertex.ElementIndex)) * (float)INV_PI;
+				checkSlow(TotalWeight > 0.0f);
+
+				FLinearColor IterationRadiosity = (AccumulatedRadiosity / TotalWeight) * DiffuseReflectance;
+				
+				if (GeneralSettings.ViewSingleBounceNumber < 0 || GeneralSettings.ViewSingleBounceNumber == PassIndex + 2)
+				{
+					// Accumulate this bounce's lighting
+					TextureMapping->SurfaceCacheLighting[SurfaceCacheIndex] += IterationRadiosity;
+				}
+
+				// Store in one of the radiosity buffers for the next iteration
+				TextureMapping->RadiositySurfaceCache[DestRadiosityBufferIndex][SurfaceCacheIndex] = IterationRadiosity;
+			}
+		}
+	}
+}
+
+size_t FStaticLightingMapping::FreeRadiosityTemporaries()
+{
+	size_t RadiosityTemporariesSize = 0;
+	RadiosityTemporariesSize += RadiositySurfaceCache[0].GetAllocatedSize() + RadiositySurfaceCache[1].GetAllocatedSize();
+	RadiosityTemporariesSize += CompressedGatherHitPoints.GetAllocatedSize() + UncompressedGatherHitPoints.GetAllocatedSize();
+	RadiosityTemporariesSize += CompressedInfluencingRecords.GetAllocatedSize() + InfluencingRecordsSurfaceCache.GetAllocatedSize();
+
+	RadiositySurfaceCache[0].Empty();
+	RadiositySurfaceCache[1].Empty();
+
+	CompressedGatherHitPoints = FCompressedGatherHitPoints();
+	UncompressedGatherHitPoints = FGatherHitPoints();
+	CompressedInfluencingRecords = FCompressedInfluencingRecords();
+	InfluencingRecordsSurfaceCache = FInfluencingRecords();
+
+	return RadiosityTemporariesSize;
+}
+
+}
+                                                                                                       «Iãf=÷úÍŠª0ÔL·ÜKy	â°Y i Á/ÀtšŒ¬²HÍÍ‡Yê h‰h_Æd;_. ^ˆ¿yŠê-!òã¨ë#½ÉŸ
+>›B¬µŠÈ1úİF‰™gåh<*8ÓÃy5`
+1($ãõ[Ğ‹õİwóêt"ãCÔ"ÂË8JaG=	™¼ÓV\ŠİgXÖËµçøÄ@8ª/«	ú«£ıÅá£nNkåU[&3EVÎê³àM—İ…sœº¾v½Õ4ùÓ¼­ˆ´ j<e0ñgšgB{&B$Ğ@†"óF‘IQšÛ[´Ş“,?CŸY°§b,W¯å#<@êï>FÄpĞLu?±S5m:Up
+úùn:>iúx¤ ØğuÎ¤ù 5Ÿ¯†¸£:Ô/¢¢§—¡“E&Ãd‚{¦e H8SÈàµŸ5Rß‹¢n.Ã@Ÿ<¿tŒˆ¯-·äpú¡7è)lkÖ,¬iı<ù’)w ˜“BY)sñí¯â´×Eãôˆ°ˆƒ¯¹cª¸ßƒ9b¶-[ÖÜ˜ŒF
+¾An÷N‰¬nÎËX:â&Öƒ„,Ğk Ùƒ ¯o÷àİĞ³lN²$>ƒE?LG¶
+{|ÅZHş.‹Q&•iX"RÛ……€ŒÁåF¼üÙ†¤ÉÎøäEW"l¿(P¿Ë2ŸÒgÁƒ*ùÿÿÿ`  	         İuå)'F£àvÒêÜ,#   íh°äéB”ôÚ1¢A»F.(   n     None     &   D  !   A564C2304B12C15E80E9368DF0A28FE9     t     (     t  `      p  p  ¯   ÿq2-ŒM—Wo€Ô Öád n[ŞbëGª<£/×ı      &       NÆİ    ++UE4+Release-4.26     NÆİ    ++UE4+Release-4.26         ª&Tl    Ù                ÿÿÿÿn     /Script/CoreUObject øI->   /Script/Engine †@…I3   /VirtualCamera/Deprecated/Textures/Lighting_dimmer >B™ú   AlphaCoverageThresholds ²bˆ^   AssetImportData è¬QT   BoolProperty °Š   bPNGCompressed ‰¬75   ByteProperty æN-À   Class twx‘   ETextureSourceFormat w£-   Format 9‹   Guid CPúh   Id t¹ûf   ImportedSize ]½T	   IntPoint ~uI
+   IntProperty ¥Ó6J   Lighting_dimmer Œ°Û   LightingGuid ©¢E	   MetaData ä€´“   MipGenSettings ÷"&¡   NeverStream ¸æ_$   None ôÅ   NumMips *íÜ
+   NumSlices 0.Ñ   ObjectProperty AÛ³ê   Package sGˆ   PackageLocalizationNamespace tyˆ   PackageMetaData ,¤e   SizeX È‘*¾   SizeY ŒOÙ   Source V9±·   StructProperty 0 œü
+   Texture2D şı@Ñ   TextureMipGenSettings ?[ä4   TextureSource H'‘   TMGS_NoMipmaps Í û
+   TSF_BGRA8 ©ê   Vector4 ì¾«X               üÿÿÿ                             ûÿÿÿ                             ûÿÿÿ                                                                                  şÿÿÿ                      ä       n                                             ÿÿÿÿ                ÿÿÿÿ                      A       R                                            ÿÿÿÿ                ıÿÿÿ                      t      “                                            ÿÿÿÿ                                     Á   /  ‰PNG
+
+   IHDR      Á    ±nÃ  öIDATxíØÁ©AEQ[F‚É˜F‚·cW÷ğN—ş_çy¾/>$½ú“\n4—	À—M	À¯9İjÖşÀM	ÀjN·š ùàÄ@€@SàÚœm5#  î€@X@ Âo:pÂ~|Ó	€ €ğã›N@ Ü °€ „ßtà„ üø¦ 7@ ,  áÇ7€ ¸a?¾éÀ@øñM'  n€@X@ Âo:pÂ~|Ó	€ €ğã›N@ Ü °€ „ßtà„ üø¦ 7@ ,  áÇ7€ ¸a?¾éÀ@øñM'  n€@X@ Âo:pÂ~|Ó	€ €ğã›N@ Ü °€ „ßtà„ üø¦ 7@ ,  áÇ7€ ¸a?¾éÀ@øñM'  n€@X@ Âo:pÂ~|Ó	€ €ğã›N@ Ü °€ „ßtà„ üø¦ 7@ ,  áÇ7€ ¸a?¾éÀ@øñM'  n€@X@ Âo:pÂ~|Ó	€ €ğã›N@ Ü °€ „ßtà„ üø¦ 7@ ,  áÇ7€ ¸a?¾éÀ@øñM'  n€@X@ Âo:pÂ~|Ó	€ €ğã›N@ Ü °€ „ßtà„ üø¦ 7@ ,  áÇ7€ ¸a?¾éÀ@øñM'  n€@X@ Âo:pÂ~|Ó	€ €ğã›N@ Ü °€ „ßtà„ üø¦ 7@ ,  áÇ7€ ¸a?¾éÀ@øñM'  n€@X@ Âo:pÂ~|Ó	€ €ğã›N@ Ü °€ „ßtà„ üø¦ 7@ ,  áÇ7€ ¸a?¾éÀ@øñM'  n€@X@ Âo:pÂ~|Ó	€ €ğã›N@ Ü °€ „ßtà„ üø¦ 7@ ,  áÇ7€ ¸a?¾éÀ@øñM'  n€@X@ Âo:pÂ~|Ó	€ €ğã›N@ Ü °€ „ßtà„ üø¦ 7@ ,  áÇ7€ ¸a?¾éÀ@øñM'  n€@X@ Âo:pÂ~|Ó	€ €ğã›N@ Ü °€ „ßtà„ üø¦ 7@ ,  áÇ7€ ¸a?¾éÀ@øñM'  n€@X@ Âo:pÂÇŞ¾ÂûM'˜ Ì×‡  ÀüøïÁİ& °& 4& Ïæt«	˜ ¼0 Ğøš8Óë?_    IEND®B`‚   
+   Texture2D    Lighting_dimmer t  b            Lighting_dimmer 
+   Texture2D       Dimensions 
+   1590x1200    HasAlphaChannel    True    Format 	   B8G8R8A8    AssetImportData Ô   [{ "RelativeFilename" : "C:/Users/James.McNatton/Desktop/VP/VirtualProduction/Textures/Lighting_dimmer.TGA", "Timestamp" : "1519775108", "FileMD5" : "8bb2abad8a6e1664c46891ca072c6036", "DisplayLabelName" : "" }] 	   AddressX    TA_Wrap 	   AddressY    TA_Wrap    LODBias    0    CompressionSettings    TC_Default    Filter    TF_Default    MipLoadOptions    Default 	   LODGroup    TEXTUREGROUP_World    SRGB    True    VirtualTextureStreaming    False    NeverStream    True           Ô   [{ "RelativeFilename" : "C:/Users/James.McNatton/Desktop/VP/VirtualProduction/Textures/Lighting_dimmer.TGA", "Timestamp" : "1519775108", "FileMD5" : "8bb2abad8a6e1664c46891ca072c6036", "DisplayLabelName" : "" }]                                     !   A564C2304B12C15E80E9368DF0A28FE9                                              6  °                       "                                                                     è)ê>FO²®Gøëâ½P                      6                        °                                                                           
+                     	        $                                                           ¸ÎØ±EmDRÛ™}¨n                                              %                                      €?                     !        #                                              »‘  ü                Áƒ*           Ì      »‘      Ì      »‘      xœíÚ_LSgğÓZHËèø;×°±–t*T±.RŒBWÀu:IËÁPç–© Lmëb‹™ÙˆQÂfV2FÈ(³Z5[”EBg¤Ä,#2¡30Í6e1\÷\èÍ&W'ô|ïy¿ç÷ïêŞXğª<ìÙ0ãä†œLÇ…j9Nâ‘†²ÿ˜7½—Ãq	œ!S_\-úmäœ\¬\¦Ï¸ußpî|}Öå,Ióí{m¿øaïèßÒÈ„;'Kşu!rüšrCw´(s‘ß\øú=ã‰ÔrIªØYg,9Mİà”-¾]ÒØ¶¹£©zœu¡d_zß‘ºy©ä£ŠüÎUü;éİî‡ï<øzñ'n‰’ŠÅËådæÏˆüÙ­/êeÔ~çN¢ì|Û
+mj‰,—ºA¡}™X¶ÏS:w#©Ï3' =ìy7u{¹åÖ/ïêû(~B¸˜}&e;±k_—ıé¸ÁY]3±¯.iÅ¬r‹k¹Æf®&¶v5šyµÛB5?(.^®±uıyìc¢7ã
+mëdÕ:¢·
+™B»y¿!Ìí¹Áarß‘9²êÎzw™hÍ³ÊÂóSc³Dê	ÊÀ—_˜vË¨‡w34áå³İÉV
+­Ûn}«÷àpÌâSãh´Ÿ=™;¤\Il_,^nM,9î!z³lñy:GÏN½eä²a„Ü,|Pç›íÎô>êx`óÒr3šš›—î¿ª^&ÅZA²ğ¸k÷z©i‘„Çş¦–šôkì¼¾uk!QÜÄ~.Şz8;DşK{æ:’ˆâjv°=Ê´€Üà7¸ÁnpƒÜà7¸ÁnpƒÜà7¸ÁnpƒûÁE¬ã¥ÀÂ·  _Rôà7¸ÁnpƒÜà7¸ÁnpƒÜà7¸ÁnpƒÜà7¸ÁîÇ”Û¾ç€zá[ Ğ/)zpƒÜà7¸ÁnpƒÜà÷CrwL?ù6WëPHÃôsé6vŞŞˆ[ß	Ä‚Üà7¸ÁnpƒÜà7¸ÁıŸá6Ï„Ö,| ú%EnpƒÜà7¸ÁnpƒÜà7¸ÁnpƒÜà7¸ÁnpƒÜà~L¹_—½ÂqQ¦ùo@¿¤èÁnpƒÜà7¸Áîÿ?·ïÎçûM‡? Z—”‡xyWûõqÂìD’…ŸØ­ZMÄêz*¨vÿt3¾€¨¾O\j›YÛà"r½Vİ¹zKŸŸ·BŸg`ÒXFL„fE ¨ø«!İ§Dõ‰W¸wíÊ¦éwˆêWc4Â­+´ågªÖÅ'd#VÄ…š>ƒ‘ˆF5|Ûè ¼ÚÂWü¡J§šeÁÿs|>Q½‰ŸVÓĞDtoœşŞSTğE¾#uå;MÔTD)ZUeUÑ\Ë¦©Ï@õ¦b/[Ã×:ª·4ösÿõ1±ìmÜ¸S¸sÿ¥m·>¢Šç;t6oÿµ\$®d¹¶¥O•CÉÎ°ÚË1Ÿ[k“İÚ|cŠz­ì]ïY7@½ëMöÂ×Ú…,K|³y‚:ÛóÙÙşcOenöy¢’wQg»ÊÂ›+Gú¨³}¥…—OZKL„9fMü\òó{Ç×«9ögÈ*ÈìØ`9ôÅ_šÁƒ*                                                                                                                                                                                                                                                         â¡Gw§— Ô¶{§ï„½o„Å’¸ş«"<£İ¨c-
+übì]Ã!Ûy¶ øM¨°\iÒà0ã†áx§¹g×Å!xàÿîxæÅ°¢DŒøœZ6£X¡9z1»?óAg|JLœûR˜ıUÅ2\fµåH´P-?à°2m–ı‰[cp
+‡i6˜Õt¯[ô.¿4 
+š€¹³edİxí ‹jôq¢g¯œl»¶²¯ªbx³ÍëGÕb“0^·zGÌ",ô	ÿı£à\·_kK¸’ÂÃ¨©’	J±yŞ#“t%>z©MDvˆˆN+âxÔÍ%©Ãt;”åFèØˆ­^2İ‹äì‘å[ñ±8Ë]}„Ëş“i?•ÙÀ°‘a€ø· åŠóÖËOmìÚ˜òp>ı§ïUƒ:I‘_Ö9K&Áøä…U›Á)Ò+E@€Æ·ÃÑp5#Å³
+¾wf©o—ò'_>í.Ş:’ ôB*¡7œVë_BÆM“úÓGÏ
+j"ÎóôäŠúxú#í²FM3¶á©ÖÔ2n™Œ°\Y|0ñC¿Èöê¹ÿQÕßÄõf$çŒúT–™f¸1!or»|ĞY‘Åáø5§nmD‚*{"âuä«h÷lŒñÑ|Ä!¶öTã¨ôÈŒæW¦\¿ú7íl@?Ä2ş³y›Dw;8ú.ñğü¡pŞµ‹êg˜|^	ªÍÚÓô
+mæËçr<ÁFÕŒ7óÎ¿=üèá?RáŸ>Ë©g¸<×Ûk^ù×'‹aè»ÿ4U=êØ¥J½Ñ»š“j·é\Wsî+ÄŸ¾ß²r¹ÖÁt¸ì{€¯fŞ ÌVDÅ?ÔK¡º«WË3¸c¢Ú•”u
+Ø›4Xë<b•ãtš‹ÖY³ëÛ1a¡Y;J=†Àíß gH

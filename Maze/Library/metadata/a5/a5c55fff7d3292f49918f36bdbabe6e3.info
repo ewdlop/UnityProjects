@@ -1,0 +1,149 @@
+aptureComponents[CaptureIndex]);
+
+	// FINAL COLOR
+	if (RenderPasses[CurrentRenderPassIndex] == ERenderPass::FinalColor)
+	{
+		LeftEyeCaptureComponents[CaptureIndex]->bCaptureEveryFrame = false;			// true will create bandings, false wont pick up blendables
+		LeftEyeCaptureComponents[CaptureIndex]->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
+		RightEyeCaptureComponents[CaptureIndex]->bCaptureEveryFrame = false;		// true will create bandings, false wont pick up blendables
+		RightEyeCaptureComponents[CaptureIndex]->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
+
+		// Enable bCaptureEveryFrame ONLY when capture is in a PPVolume with blendables, to avoid bandings
+		FVector CameraPosition = CapturePlayerController->PlayerCameraManager->GetCameraLocation();
+		for (FPostProcessVolumeData &PPVolume : PPVolumeArray)
+		{
+			FBoxSphereBounds bounds = PPVolume.Object->GetBounds();
+			FBox BB = bounds.GetBox();
+			if (BB.IsInsideOrOn(CameraPosition))
+			{
+				//LeftEyeCaptureComponents[CaptureIndex]->PostProcessSettings.WeightedBlendables = ppvolume->Settings.WeightedBlendables;
+				if (PPVolume.Object->bEnabled && PPVolume.Object->Settings.WeightedBlendables.Array.Num() > 0)
+				{
+					LeftEyeCaptureComponents[CaptureIndex]->bCaptureEveryFrame = true;
+					RightEyeCaptureComponents[CaptureIndex]->bCaptureEveryFrame = true;
+				}
+			}
+
+		}
+	}
+
+	// SCENE DEPTH
+	if (RenderPasses[CurrentRenderPassIndex] == ERenderPass::SceneDepth)
+	{
+		LeftEyeCaptureComponents[CaptureIndex]->bCaptureEveryFrame = false;
+		LeftEyeCaptureComponents[CaptureIndex]->CaptureSource = ESceneCaptureSource::SCS_DeviceDepth;
+		RightEyeCaptureComponents[CaptureIndex]->bCaptureEveryFrame = false;
+		RightEyeCaptureComponents[CaptureIndex]->CaptureSource = ESceneCaptureSource::SCS_DeviceDepth;
+	}
+
+	// All other passes
+	if (RenderPasses[CurrentRenderPassIndex] < ERenderPass::FinalColor)
+	{
+		LeftEyeCaptureComponents[CaptureIndex]->bCaptureEveryFrame = true;										// "true" for blendable to work
+		LeftEyeCaptureComponents[CaptureIndex]->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;			// "SCS_FinalColorLDR" for blendable to work
+		LeftEyeCaptureComponents[CaptureIndex]->PostProcessSettings.AddBlendable(GetCurrentBlendableMaterial(), 1.0f);		// add postprocess material
+		RightEyeCaptureComponents[CaptureIndex]->bCaptureEveryFrame = true;										// "true" for blendable to work
+		RightEyeCaptureComponents[CaptureIndex]->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;		// "SCS_FinalColorLDR" for blendable to work
+		RightEyeCaptureComponents[CaptureIndex]->PostProcessSettings.AddBlendable(GetCurrentBlendableMaterial(), 1.0f);	// add postprocess material
+	}
+	
+	DisableUnsupportedPostProcesses(LeftEyeCaptureComponents[CaptureIndex]);
+	DisableUnsupportedPostProcesses(RightEyeCaptureComponents[CaptureIndex]);
+}
+
+
+void USceneCapturer::SetPositionAndRotation( int32 CurrentHorizontalStep, int32 CurrentVerticalStep, int32 CaptureIndex )
+{
+	// Using FRotator Rotation to hold local rotation.
+	FRotator Rotation = FRotator(90.0f - 1.0f * CurrentVerticalStep * vAngIncrement, 180.0f + CurrentHorizontalStep * hAngIncrement, 0);
+
+    Rotation = Rotation.Clamp();
+
+	FVector Offset( 0.0f, eyeSeparation / 2.0f, 0.0f );
+    if (dbgDisableOffsetRotation)
+    {
+        //For rendering near field objects, we don't rotate the capture components around the stereo pivot, but instead
+        //around each capture component
+        const auto rotAngleOffset = FRotator::ClampAxis(Rotation.Yaw - StartRotation.Yaw);
+        float eyeSeparationDampeningFactor = 1.0f;
+        if (rotAngleOffset <= 90.0f)
+        {
+            eyeSeparationDampeningFactor = FMath::Lerp(1.0f, 0.0f, rotAngleOffset / 90.0f);
+        }
+        else if (rotAngleOffset <= 270.0f)
+        {
+            eyeSeparationDampeningFactor = 0.0f;
+        }
+        else
+        {
+            eyeSeparationDampeningFactor = FMath::Lerp(0.0f, 1.0f, (rotAngleOffset - 270.0f) / 90.0f);
+        }
+
+        Offset = StartRotation.RotateVector(Offset * eyeSeparationDampeningFactor);
+    }
+    else
+    {
+        Offset = Rotation.RotateVector(Offset);
+    }
+
+	// Applying local offsets.
+	// Rotation will be used as local rotation to make it regardless of World Rotation.
+	// Local location will be used to set eye offset.
+	LeftEyeCaptureComponents[CaptureIndex]->SetRelativeLocationAndRotation( -1.0f * Offset, Rotation );
+    LeftEyeCaptureComponents[CaptureIndex]->CaptureSceneDeferred();
+
+	// Do not process right eye in mono
+	if (!bMonoscopicMode)
+	{
+		RightEyeCaptureComponents[CaptureIndex]->SetRelativeLocationAndRotation(1.0f * Offset, Rotation);
+		RightEyeCaptureComponents[CaptureIndex]->CaptureSceneDeferred();
+	}
+}
+
+void USceneCapturer::ValidateParameters()
+{
+	ErrorFound = false;
+
+	FFormatNamedArguments Args;
+	Args.Add(TEXT("CaptureWidth"), CaptureWidth);
+	Args.Add(TEXT("CaptureHeight"), CaptureHeight);
+	Args.Add(TEXT("SphericalAtlasWidth"), SphericalAtlasWidth);
+	Args.Add(TEXT("SphericalAtlasHeight"), SphericalAtlasHeight);
+	Args.Add(TEXT("UnprojectedAtlasWidth"), UnprojectedAtlasWidth);
+	Args.Add(TEXT("UnprojectedAtlasHeight"), UnprojectedAtlasHeight);
+	Args.Add(TEXT("StripWidth"), StripWidth);
+	Args.Add(TEXT("StripHeight"), StripHeight);
+	Args.Add(TEXT("NumberOfHorizontalSteps"), NumberOfHorizontalSteps);
+	Args.Add(TEXT("NumberOfVerticalSteps"), NumberOfVerticalSteps);
+	Args.Add(TEXT("vAngIncrement"), vAngIncrement);
+	Args.Add(TEXT("hAngIncrement"), hAngIncrement);
+
+
+	// check if we output renders in an existing drive
+	int32 Index = OutputDir.Find(TEXT(":"), ESearchCase::CaseSensitive);
+	FString Drive = OutputDir.Left(Index + 1);
+	if (!Drive.IsEmpty() && FPaths::IsDrive(Drive))
+	{
+		if (!FPaths::DirectoryExists(Drive))
+		{
+			ErrorFound = true;
+			FMessageLog(StereoPanoramaLogName).Message(EMessageSeverity::Error, LOCTEXT("ValidationError_MissingOutputDirectory", "The output directory's drive doesn't exists. Plese set SP.OutputDir with a valid path. Skipping renders..."));
+		}
+	}
+
+	// check if we have found all blendables
+	if (MaterialBlendableAO == NULL || MaterialBlendableBaseColor == NULL || MaterialBlendableMetallic == NULL || MaterialBlendableRoughness == NULL || MaterialBlendableWorldNormal == NULL)
+	{
+		ErrorFound = true;
+		FMessageLog(StereoPanoramaLogName).Message(EMessageSeverity::Error, LOCTEXT("ValidationError_MissingBlendableMaterials", "Missing blendable materials. Skipping renders..."));
+	}
+
+	// Angular increment needs to be a factor of 360 to avoid seams i.e. 360 / angular increment needs to be a whole number
+	if ((int32)(NumberOfHorizontalSteps * hAngIncrement) != 360)
+	{
+		FMessageLog(StereoPanoramaLogName).Message(EMessageSeverity::Warning, FText::Format(LOCTEXT("ValidationWarning_InvalidHorizonalAngularStep", "Horizontal angular step {hAngIncrement} is not a factor of 360! This will lead to a seam between the start and end points"), Args));
+	}
+
+	if ((int32)((NumberOfVerticalSteps - 1) * vAngIncrement) != 180)
+	{
+		FMessageLog(StereoPanoramaLogName).Message(EMessageSeverity::Warning, FText::Format(LOCTEXT("ValidationWarning_InvalidVerticalAngularStep", "Vertical angular step {vAngIncrement} is not a factor of 180! This will lead to a seam between the start and end points"), A

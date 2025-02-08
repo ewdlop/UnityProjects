@@ -1,0 +1,47 @@
+B2cA.q.dot(data.drivePosition.q)>0 ? data.drivePosition.q : -data.drivePosition.q; 
+
+			const PxVec3& v = data.driveAngularVelocity;
+			PxQuat delta = d2cA_q.getConjugate() * cB2cA.q;
+
+			if(driving & (1<<PxD6Drive::eSLERP))
+			{
+				PxVec3 velTarget = -cA2w.rotate(data.driveAngularVelocity);
+
+				PxVec3 axis[3] = { PxVec3(1.f,0,0), PxVec3(0,1.f,0), PxVec3(0,0,1.f) };
+				
+				if(drives[PxD6Drive::eSLERP].stiffness!=0)
+					computeJacobianAxes(axis, cA2w.q * d2cA_q, cB2w.q);	// converges faster if there is only velocity drive
+
+				for(PxU32 i = 0; i < 3; i++)
+					g.angular(axis[i], axis[i].dot(velTarget), -delta.getImaginaryPart()[i], drives[PxD6Drive::eSLERP], PxConstraintSolveHint::eSLERP_SPRING);
+			}
+			else 
+			{
+				if(driving & (1<<PxD6Drive::eTWIST))
+					g.angular(bX, v.x, -2.0f * delta.x, drives[PxD6Drive::eTWIST]); 
+
+				if(driving & (1<<PxD6Drive::eSWING))
+				{
+					PxVec3 err = delta.rotate(PxVec3(1.f,0,0));
+
+					if(!(locked & SWING1_FLAG))
+						g.angular(cB2w_m[1], v.y, err.z, drives[PxD6Drive::eSWING]);
+
+					if(!(locked & SWING2_FLAG))
+						g.angular(cB2w_m[2], v.z, -err.y, drives[PxD6Drive::eSWING]);
+				}
+			}
+		}
+
+		if (limited & ANGULAR_MASK)
+		{
+			PxQuat swing, twist;
+			Ps::separateSwingTwist(cB2cA.q,swing,twist);
+
+			// swing limits: if just one is limited: if the other is free, we support 
+			// (-pi/2, +pi/2) limit, using tan of the half-angle as the error measure parameter. 
+			// If the other is locked, we support (-pi, +pi) limits using the tan of the quarter-angle
+			// Notation: th == Ps::tanHalf, tq = tanQuarter
+
+			if(limited & SWING1_FLAG && limited & SWING2_FLAG)
+		

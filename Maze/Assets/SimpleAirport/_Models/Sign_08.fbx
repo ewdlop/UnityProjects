@@ -1,0 +1,665 @@
+nBrkIter(NULL)
+{
+  init(description, info, perror, status);
+}
+
+RuleBasedNumberFormat::RuleBasedNumberFormat(const UnicodeString& description, 
+                         UParseError& perror, 
+                         UErrorCode& status) 
+  : ruleSets(NULL)
+  , ruleSetDescriptions(NULL)
+  , numRuleSets(0)
+  , defaultRuleSet(NULL)
+  , locale(Locale::getDefault())
+  , collator(NULL)
+  , decimalFormatSymbols(NULL)
+  , lenient(FALSE)
+  , lenientParseRules(NULL)
+  , localizations(NULL)
+  , capitalizationInfoSet(FALSE)
+  , capitalizationForUIListMenu(FALSE)
+  , capitalizationForStandAlone(FALSE)
+  , capitalizationBrkIter(NULL)
+{
+    init(description, NULL, perror, status);
+}
+
+RuleBasedNumberFormat::RuleBasedNumberFormat(const UnicodeString& description, 
+                         const Locale& aLocale,
+                         UParseError& perror, 
+                         UErrorCode& status) 
+  : ruleSets(NULL)
+  , ruleSetDescriptions(NULL)
+  , numRuleSets(0)
+  , defaultRuleSet(NULL)
+  , locale(aLocale)
+  , collator(NULL)
+  , decimalFormatSymbols(NULL)
+  , lenient(FALSE)
+  , lenientParseRules(NULL)
+  , localizations(NULL)
+  , capitalizationInfoSet(FALSE)
+  , capitalizationForUIListMenu(FALSE)
+  , capitalizationForStandAlone(FALSE)
+  , capitalizationBrkIter(NULL)
+{
+    init(description, NULL, perror, status);
+}
+
+RuleBasedNumberFormat::RuleBasedNumberFormat(URBNFRuleSetTag tag, const Locale& alocale, UErrorCode& status)
+  : ruleSets(NULL)
+  , ruleSetDescriptions(NULL)
+  , numRuleSets(0)
+  , defaultRuleSet(NULL)
+  , locale(alocale)
+  , collator(NULL)
+  , decimalFormatSymbols(NULL)
+  , lenient(FALSE)
+  , lenientParseRules(NULL)
+  , localizations(NULL)
+  , capitalizationInfoSet(FALSE)
+  , capitalizationForUIListMenu(FALSE)
+  , capitalizationForStandAlone(FALSE)
+  , capitalizationBrkIter(NULL)
+{
+    if (U_FAILURE(status)) {
+        return;
+    }
+
+    const char* rules_tag = "RBNFRules";
+    const char* fmt_tag = "";
+    switch (tag) {
+    case URBNF_SPELLOUT: fmt_tag = "SpelloutRules"; break;
+    case URBNF_ORDINAL: fmt_tag = "OrdinalRules"; break;
+    case URBNF_DURATION: fmt_tag = "DurationRules"; break;
+    case URBNF_NUMBERING_SYSTEM: fmt_tag = "NumberingSystemRules"; break;
+    default: status = U_ILLEGAL_ARGUMENT_ERROR; return;
+    }
+
+    // TODO: read localization info from resource
+    LocalizationInfo* locinfo = NULL;
+
+    UResourceBundle* nfrb = ures_open(U_ICUDATA_RBNF, locale.getName(), &status);
+    if (U_SUCCESS(status)) {
+        setLocaleIDs(ures_getLocaleByType(nfrb, ULOC_VALID_LOCALE, &status),
+                     ures_getLocaleByType(nfrb, ULOC_ACTUAL_LOCALE, &status));
+
+        UResourceBundle* rbnfRules = ures_getByKeyWithFallback(nfrb, rules_tag, NULL, &status);
+        if (U_FAILURE(status)) {
+            ures_close(nfrb);
+        }
+        UResourceBundle* ruleSets = ures_getByKeyWithFallback(rbnfRules, fmt_tag, NULL, &status);
+        if (U_FAILURE(status)) {
+            ures_close(rbnfRules);
+            ures_close(nfrb);
+            return;
+        }
+
+        UnicodeString desc;
+        while (ures_hasNext(ruleSets)) {
+           desc.append(ures_getNextUnicodeString(ruleSets,NULL,&status));
+        }
+        UParseError perror;
+
+        init (desc, locinfo, perror, status);
+
+        ures_close(ruleSets);
+        ures_close(rbnfRules);
+    }
+    ures_close(nfrb);
+}
+
+RuleBasedNumberFormat::RuleBasedNumberFormat(const RuleBasedNumberFormat& rhs)
+  : NumberFormat(rhs)
+  , ruleSets(NULL)
+  , ruleSetDescriptions(NULL)
+  , numRuleSets(0)
+  , defaultRuleSet(NULL)
+  , locale(rhs.locale)
+  , collator(NULL)
+  , decimalFormatSymbols(NULL)
+  , lenient(FALSE)
+  , lenientParseRules(NULL)
+  , localizations(NULL)
+  , capitalizationInfoSet(FALSE)
+  , capitalizationForUIListMenu(FALSE)
+  , capitalizationForStandAlone(FALSE)
+  , capitalizationBrkIter(NULL)
+{
+    this->operator=(rhs);
+}
+
+// --------
+
+RuleBasedNumberFormat&
+RuleBasedNumberFormat::operator=(const RuleBasedNumberFormat& rhs)
+{
+    if (this == &rhs) {
+        return *this;
+    }
+    NumberFormat::operator=(rhs);
+    UErrorCode status = U_ZERO_ERROR;
+    dispose();
+    locale = rhs.locale;
+    lenient = rhs.lenient;
+
+    UParseError perror;
+    init(rhs.originalDescription, rhs.localizations ? rhs.localizations->ref() : NULL, perror, status);
+    setDecimalFormatSymbols(*rhs.getDecimalFormatSymbols());
+    setDefaultRuleSet(rhs.getDefaultRuleSetName(), status);
+
+    capitalizationInfoSet = rhs.capitalizationInfoSet;
+    capitalizationForUIListMenu = rhs.capitalizationForUIListMenu;
+    capitalizationForStandAlone = rhs.capitalizationForStandAlone;
+#if !UCONFIG_NO_BREAK_ITERATION
+    capitalizationBrkIter = (rhs.capitalizationBrkIter!=NULL)? rhs.capitalizationBrkIter->clone(): NULL;
+#endif
+
+    return *this;
+}
+
+RuleBasedNumberFormat::~RuleBasedNumberFormat()
+{
+    dispose();
+}
+
+Format*
+RuleBasedNumberFormat::clone(void) const
+{
+    return new RuleBasedNumberFormat(*this);
+}
+
+UBool
+RuleBasedNumberFormat::operator==(const Format& other) const
+{
+    if (this == &other) {
+        return TRUE;
+    }
+
+    if (typeid(*this) == typeid(other)) {
+        const RuleBasedNumberFormat& rhs = (const RuleBasedNumberFormat&)other;
+        // test for capitalization info equality is adequately handled
+        // by the NumberFormat test for fCapitalizationContext equality;
+        // the info here is just derived from that.
+        if (locale == rhs.locale &&
+            lenient == rhs.lenient &&
+            (localizations == NULL 
+                ? rhs.localizations == NULL 
+                : (rhs.localizations == NULL 
+                    ? FALSE
+                    : *localizations == rhs.localizations))) {
+
+            NFRuleSet** p = ruleSets;
+            NFRuleSet** q = rhs.ruleSets;
+            if (p == NULL) {
+                return q == NULL;
+            } else if (q == NULL) {
+                return FALSE;
+            }
+            while (*p && *q && (**p == **q)) {
+                ++p;
+                ++q;
+            }
+            return *q == NULL && *p == NULL;
+        }
+    }
+
+    return FALSE;
+}
+
+UnicodeString
+RuleBasedNumberFormat::getRules() const
+{
+    UnicodeString result;
+    if (ruleSets != NULL) {
+        for (NFRuleSet** p = ruleSets; *p; ++p) {
+            (*p)->appendRules(result);
+        }
+    }
+    return result;
+}
+
+UnicodeString
+RuleBasedNumberFormat::getRuleSetName(int32_t index) const
+{
+    if (localizations) {
+      UnicodeString string(TRUE, localizations->getRuleSetName(index), (int32_t)-1);
+      return string;
+    } else if (ruleSets) {
+        UnicodeString result;
+        for (NFRuleSet** p = ruleSets; *p; ++p) {
+            NFRuleSet* rs = *p;
+            if (rs->isPublic()) {
+                if (--index == -1) {
+                    rs->getName(result);
+                    return result;
+                }
+            }
+        }
+    }
+    UnicodeString empty;
+    return empty;
+}
+
+int32_t
+RuleBasedNumberFormat::getNumberOfRuleSetNames() const
+{
+    int32_t result = 0;
+    if (localizations) {
+      result = localizations->getNumberOfRuleSets();
+    } else if (ruleSets) {
+        for (NFRuleSet** p = ruleSets; *p; ++p) {
+            if ((**p).isPublic()) {
+                ++result;
+            }
+        }
+    }
+    return result;
+}
+
+int32_t 
+RuleBasedNumberFormat::getNumberOfRuleSetDisplayNameLocales(void) const {
+    if (localizations) {
+        return localizations->getNumberOfDisplayLocales();
+    }
+    return 0;
+}
+
+Locale 
+RuleBasedNumberFormat::getRuleSetDisplayNameLocale(int32_t index, UErrorCode& status) const {
+    if (U_FAILURE(status)) {
+        return Locale("");
+    }
+    if (localizations && index >= 0 && index < localizations->getNumberOfDisplayLocales()) {
+        UnicodeString name(TRUE, localizations->getLocaleName(index), -1);
+        char buffer[64];
+        int32_t cap = name.length() + 1;
+        char* bp = buffer;
+        if (cap > 64) {
+            bp = (char *)uprv_malloc(cap);
+            if (bp == NULL) {
+                status = U_MEMORY_ALLOCATION_ERROR;
+                return Locale("");
+            }
+        }
+        name.extract(0, name.length(), bp, cap, UnicodeString::kInvariant);
+        Locale retLocale(bp);
+        if (bp != buffer) {
+            uprv_free(bp);
+        }
+        return retLocale;
+    }
+    status = U_ILLEGAL_ARGUMENT_ERROR;
+    Locale retLocale;
+    return retLocale;
+}
+
+UnicodeString 
+RuleBasedNumberFormat::getRuleSetDisplayName(int32_t index, const Locale& localeParam) {
+    if (localizations && index >= 0 && index < localizations->getNumberOfRuleSets()) {
+        UnicodeString localeName(localeParam.getBaseName(), -1, UnicodeString::kInvariant); 
+        int32_t len = localeName.length();
+        UChar* localeStr = localeName.getBuffer(len + 1);
+        while (len >= 0) {
+            localeStr[len] = 0;
+            int32_t ix = localizations->indexForLocale(localeStr);
+            if (ix >= 0) {
+                UnicodeString name(TRUE, localizations->getDisplayName(ix, index), -1);
+                return name;
+            }
+            
+            // trim trailing portion, skipping over ommitted sections
+            do { --len;} while (len > 0 && localeStr[len] != 0x005f); // underscore
+            while (len > 0 && localeStr[len-1] == 0x005F) --len;
+        }
+        UnicodeString name(TRUE, localizations->getRuleSetName(index), -1);
+        return name;
+    }
+    UnicodeString bogus;
+    bogus.setToBogus();
+    return bogus;
+}
+
+UnicodeString 
+RuleBasedNumberFormat::getRuleSetDisplayName(const UnicodeString& ruleSetName, const Locale& localeParam) {
+    if (localizations) {
+        UnicodeString rsn(ruleSetName);
+        int32_t ix = localizations->indexForRuleSet(rsn.getTerminatedBuffer());
+        return getRuleSetDisplayName(ix, localeParam);
+    }
+    UnicodeString bogus;
+    bogus.setToBogus();
+    return bogus;
+}
+
+NFRuleSet*
+RuleBasedNumberFormat::findRuleSet(const UnicodeString& name, UErrorCode& status) const
+{
+    if (U_SUCCESS(status) && ruleSets) {
+        for (NFRuleSet** p = ruleSets; *p; ++p) {
+            NFRuleSet* rs = *p;
+            if (rs->isNamed(name)) {
+                return rs;
+            }
+        }
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+    }
+    return NULL;
+}
+
+UnicodeString&
+RuleBasedNumberFormat::format(int32_t number,
+                              UnicodeString& toAppendTo,
+                              FieldPosition& /* pos */) const
+{
+    if (defaultRuleSet) {
+        int32_t startPos = toAppendTo.length();
+        defaultRuleSet->format((int64_t)number, toAppendTo, toAppendTo.length());
+        adjustForCapitalizationContext(startPos, toAppendTo);
+    }
+    return toAppendTo;
+}
+
+
+UnicodeString&
+RuleBasedNumberFormat::format(int64_t number,
+                              UnicodeString& toAppendTo,
+                              FieldPosition& /* pos */) const
+{
+    if (defaultRuleSet) {
+        int32_t startPos = toAppendTo.length();
+        defaultRuleSet->format(number, toAppendTo, toAppendTo.length());
+        adjustForCapitalizationContext(startPos, toAppendTo);
+    }
+    return toAppendTo;
+}
+
+
+UnicodeString&
+RuleBasedNumberFormat::format(double number,
+                              UnicodeString& toAppendTo,
+                              FieldPosition& /* pos */) const
+{
+    int32_t startPos = toAppendTo.length();
+    // Special case for NaN; adapted from what DecimalFormat::_format( double number,...) does.
+    if (uprv_isNaN(number)) {
+        DecimalFormatSymbols* decFmtSyms = getDecimalFormatSymbols(); // RuleBasedNumberFormat internal
+        if (decFmtSyms) {
+            toAppendTo += decFmtSyms->getConstSymbol(DecimalFormatSymbols::kNaNSymbol);
+        }
+    } else if (defaultRuleSet) {
+        defaultRuleSet->format(number, toAppendTo, toAppendTo.length());
+    }
+    return adjustForCapitalizationContext(startPos, toAppendTo);
+}
+
+
+UnicodeString&
+RuleBasedNumberFormat::format(int32_t number,
+                              const UnicodeString& ruleSetName,
+                              UnicodeString& toAppendTo,
+                              FieldPosition& /* pos */,
+                              UErrorCode& status) const
+{
+    // return format((int64_t)number, ruleSetName, toAppendTo, pos, status);
+    if (U_SUCCESS(status)) {
+        if (ruleSetName.indexOf(gPercentPercent, 2, 0) == 0) {
+            // throw new IllegalArgumentException("Can't use internal rule set");
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+        } else {
+            NFRuleSet *rs = findRuleSet(ruleSetName, status);
+            if (rs) {
+                int32_t startPos = toAppendTo.length();
+                rs->format((int64_t)number, toAppendTo, toAppendTo.length());
+                adjustForCapitalizationContext(startPos, toAppendTo);
+            }
+        }
+    }
+    return toAppendTo;
+}
+
+
+UnicodeString&
+RuleBasedNumberFormat::format(int64_t number,
+                              const UnicodeString& ruleSetName,
+                              UnicodeString& toAppendTo,
+                              FieldPosition& /* pos */,
+                              UErrorCode& status) const
+{
+    if (U_SUCCESS(status)) {
+        if (ruleSetName.indexOf(gPercentPercent, 2, 0) == 0) {
+            // throw new IllegalArgumentException("Can't use internal rule set");
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+        } else {
+            NFRuleSet *rs = findRuleSet(ruleSetName, status);
+            if (rs) {
+                int32_t startPos = toAppendTo.length();
+                rs->format(number, toAppendTo, toAppendTo.length());
+                adjustForCapitalizationContext(startPos, toAppendTo);
+            }
+        }
+    }
+    return toAppendTo;
+}
+
+
+UnicodeString&
+RuleBasedNumberFormat::format(double number,
+                              const UnicodeString& ruleSetName,
+                              UnicodeString& toAppendTo,
+                              FieldPosition& /* pos */,
+                              UErrorCode& status) const
+{
+    if (U_SUCCESS(status)) {
+        if (ruleSetName.indexOf(gPercentPercent, 2, 0) == 0) {
+            // throw new IllegalArgumentException("Can't use internal rule set");
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+        } else {
+            NFRuleSet *rs = findRuleSet(ruleSetName, status);
+            if (rs) {
+                int32_t startPos = toAppendTo.length();
+                rs->format(number, toAppendTo, toAppendTo.length());
+                adjustForCapitalizationContext(startPos, toAppendTo);
+            }
+        }
+    }
+    return toAppendTo;
+}
+
+UnicodeString&
+RuleBasedNumberFormat::adjustForCapitalizationContext(int32_t startPos,
+                                                      UnicodeString& currentResult) const
+{
+#if !UCONFIG_NO_BREAK_ITERATION
+    if (startPos==0 && currentResult.length() > 0) {
+        // capitalize currentResult according to context
+        UChar32 ch = currentResult.char32At(0);
+        UErrorCode status = U_ZERO_ERROR;
+        UDisplayContext capitalizationContext = getContext(UDISPCTX_TYPE_CAPITALIZATION, status);
+        if ( u_islower(ch) && U_SUCCESS(status) && capitalizationBrkIter!= NULL &&
+              ( capitalizationContext==UDISPCTX_CAPITALIZATION_FOR_BEGINNING_OF_SENTENCE ||
+                (capitalizationContext==UDISPCTX_CAPITALIZATION_FOR_UI_LIST_OR_MENU && capitalizationForUIListMenu) ||
+                (capitalizationContext==UDISPCTX_CAPITALIZATION_FOR_STANDALONE && capitalizationForStandAlone)) ) {
+            // titlecase first word of currentResult, here use sentence iterator unlike current implementations
+            // in LocaleDisplayNamesImpl::adjustForUsageAndContext and RelativeDateFormat::format
+            currentResult.toTitle(capitalizationBrkIter, locale, U_TITLECASE_NO_LOWERCASE | U_TITLECASE_NO_BREAK_ADJUSTMENT);
+        }
+    }
+#endif
+    return currentResult;
+}
+
+
+void
+RuleBasedNumberFormat::parse(const UnicodeString& text,
+                             Formattable& result,
+                             ParsePosition& parsePosition) const
+{
+    if (!ruleSets) {
+        parsePosition.setErrorIndex(0);
+        return;
+    }
+
+    UnicodeString workingText(text, parsePosition.getIndex());
+    ParsePosition workingPos(0);
+
+    ParsePosition high_pp(0);
+    Formattable high_result;
+
+    for (NFRuleSet** p = ruleSets; *p; ++p) {
+        NFRuleSet *rp = *p;
+        if (rp->isPublic() && rp->isParseable()) {
+            ParsePosition working_pp(0);
+            Formattable working_result;
+
+            rp->parse(workingText, working_pp, kMaxDouble, working_result);
+            if (working_pp.getIndex() > high_pp.getIndex()) {
+                high_pp = working_pp;
+                high_result = working_result;
+
+                if (high_pp.getIndex() == workingText.length()) {
+                    break;
+                }
+            }
+        }
+    }
+
+    int32_t startIndex = parsePosition.getIndex();
+    parsePosition.setIndex(startIndex + high_pp.getIndex());
+    if (high_pp.getIndex() > 0) {
+        parsePosition.setErrorIndex(-1);
+    } else {
+        int32_t errorIndex = (high_pp.getErrorIndex()>0)? high_pp.getErrorIndex(): 0;
+        parsePosition.setErrorIndex(startIndex + errorIndex);
+    }
+    result = high_result;
+    if (result.getType() == Formattable::kDouble) {
+        int32_t r = (int32_t)result.getDouble();
+        if ((double)r == result.getDouble()) {
+            result.setLong(r);
+        }
+    }
+}
+
+#if !UCONFIG_NO_COLLATION
+
+void
+RuleBasedNumberFormat::setLenient(UBool enabled)
+{
+    lenient = enabled;
+    if (!enabled && collator) {
+        delete collator;
+        collator = NULL;
+    }
+}
+
+#endif
+
+void 
+RuleBasedNumberFormat::setDefaultRuleSet(const UnicodeString& ruleSetName, UErrorCode& status) {
+    if (U_SUCCESS(status)) {
+        if (ruleSetName.isEmpty()) {
+          if (localizations) {
+              UnicodeString name(TRUE, localizations->getRuleSetName(0), -1);
+              defaultRuleSet = findRuleSet(name, status);
+          } else {
+            initDefaultRuleSet();
+          }
+        } else if (ruleSetName.startsWith(UNICODE_STRING_SIMPLE("%%"))) {
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+        } else {
+            NFRuleSet* result = findRuleSet(ruleSetName, status);
+            if (result != NULL) {
+                defaultRuleSet = result;
+            }
+        }
+    }
+}
+
+UnicodeString
+RuleBasedNumberFormat::getDefaultRuleSetName() const {
+  UnicodeString result;
+  if (defaultRuleSet && defaultRuleSet->isPublic()) {
+    defaultRuleSet->getName(result);
+  } else {
+    result.setToBogus();
+  }
+  return result;
+}
+
+void 
+RuleBasedNumberFormat::initDefaultRuleSet()
+{
+    defaultRuleSet = NULL;
+    if (!ruleSets) {
+      return;
+    }
+
+    const UnicodeString spellout = UNICODE_STRING_SIMPLE("%spellout-numbering");
+    const UnicodeString ordinal = UNICODE_STRING_SIMPLE("%digits-ordinal");
+    const UnicodeString duration = UNICODE_STRING_SIMPLE("%duration");
+
+    NFRuleSet**p = &ruleSets[0];
+    while (*p) {
+        if ((*p)->isNamed(spellout) || (*p)->isNamed(ordinal) || (*p)->isNamed(duration)) {
+            defaultRuleSet = *p;
+            return;
+        } else {
+            ++p;
+        }
+    }
+
+    defaultRuleSet = *--p;
+    if (!defaultRuleSet->isPublic()) {
+        while (p != ruleSets) {
+            if ((*--p)->isPublic()) {
+                defaultRuleSet = *p;
+                break;
+            }
+        }
+    }
+}
+
+
+void
+RuleBasedNumberFormat::init(const UnicodeString& rules, LocalizationInfo* localizationInfos,
+                            UParseError& pErr, UErrorCode& status)
+{
+    // TODO: implement UParseError
+    uprv_memset(&pErr, 0, sizeof(UParseError));
+    // Note: this can leave ruleSets == NULL, so remaining code should check
+    if (U_FAILURE(status)) {
+        return;
+    }
+
+    this->localizations = localizationInfos == NULL ? NULL : localizationInfos->ref();
+
+    UnicodeString description(rules);
+    if (!description.length()) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return;
+    }
+
+    // start by stripping the trailing whitespace from all the rules
+    // (this is all the whitespace follwing each semicolon in the
+    // description).  This allows us to look for rule-set boundaries
+    // by searching for ";%" without having to worry about whitespace
+    // between the ; and the %
+    stripWhitespace(description);
+
+    // check to see if there's a set of lenient-parse rules.  If there
+    // is, pull them out into our temporary holding place for them,
+    // and delete them from the description before the real desciption-
+    // parsing code sees them
+    int32_t lp = description.indexOf(gLenientParse, -1, 0);
+    if (lp != -1) {
+        // we've got to make sure we're not in the middle of a rule
+        // (where "%%lenient-parse" would actually get treated as
+        // rule text)
+        if (lp == 0 || description.charAt(lp - 1) == gSemiColon) {
+            // locate the beginning and end of the actual collation
+            // rules (there may be whitespace between the name and
+            // the first token in the description)
+            int lpEnd = description.indexOf(gSemiPercent, 2, lp);
+
+            if (lpEnd

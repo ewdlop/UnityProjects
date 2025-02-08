@@ -1,0 +1,481 @@
+ocessingCount; i++)
+	{
+		if (SignalTextures.Textures[i])
+			UAVs.UAVs[i] = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(SignalTextures.Textures[i], MipLevel));
+	}
+	return UAVs;
+}
+
+class FSSDCompressMetadataCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FSSDCompressMetadataCS);
+	SHADER_USE_PARAMETER_STRUCT(FSSDCompressMetadataCS, FGlobalShader);
+
+	class FMetadataLayoutDim : SHADER_PERMUTATION_ENUM_CLASS("DIM_METADATA_LAYOUT", ECompressedMetadataLayout);
+	using FPermutationDomain = TShaderPermutationDomain<FMetadataLayoutDim>;
+
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		FPermutationDomain PermutationVector(Parameters.PermutationId);
+		if (PermutationVector.Get<FMetadataLayoutDim>() == ECompressedMetadataLayout::Disabled)
+		{
+			return false;
+		}
+
+		return ShouldCompileSignalPipeline(ESignalProcessing::ScreenSpaceDiffuseIndirect, Parameters.Platform);
+	}
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_STRUCT_INCLUDE(FSSDCommonParameters, CommonParameters)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV_ARRAY(RWTexture2D<uint>, CompressedMetadataOutput, [kCompressedMetadataTextures])
+	END_SHADER_PARAMETER_STRUCT()
+};
+
+class FSSDInjestCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FSSDInjestCS);
+	SHADER_USE_PARAMETER_STRUCT(FSSDInjestCS, FGlobalShader);
+
+	using FPermutationDomain = TShaderPermutationDomain<FSignalProcessingDim, FSignalBatchSizeDim, FMultiSPPDim>;
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		FPermutationDomain PermutationVector(Parameters.PermutationId);
+		ESignalProcessing SignalProcessing = PermutationVector.Get<FSignalProcessingDim>();
+
+		// Only compile this shader for signal processing that uses it.
+		if (!SignalUsesInjestion(SignalProcessing))
+		{
+			return false;
+		}
+
+		// Not all signal processing allow to batch multiple signals at the same time.
+		if (PermutationVector.Get<FSignalBatchSizeDim>() > SignalMaxBatchSize(SignalProcessing))
+		{
+			return false;
+		}
+
+		// Only compiler multi SPP permutation for signal that supports it.
+		if (PermutationVector.Get<FMultiSPPDim>() && !SignalSupportMultiSPP(SignalProcessing))
+		{
+			return false;
+		}
+
+		// Compile out the shader if this permutation gets remapped.
+		if (RemapPermutationVector(PermutationVector) != PermutationVector)
+		{
+			return false;
+		}
+
+		return ShouldCompileSignalPipeline(SignalProcessing, Parameters.Platform);
+	}
+
+	static FPermutationDomain RemapPermutationVector(FPermutationDomain PermutationVector)
+	{
+		ESignalProcessing SignalProcessing = PermutationVector.Get<FSignalProcessingDim>();
+
+		// force use the multi sample per pixel code path.
+		if (!SignalSupport1SPP(SignalProcessing))
+		{
+			PermutationVector.Set<FMultiSPPDim>(true);
+		}
+
+		return PermutationVector;
+	}
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_STRUCT_INCLUDE(FSSDCommonParameters, CommonParameters)
+		SHADER_PARAMETER_STRUCT_INCLUDE(FSSDConvolutionMetaData, ConvolutionMetaData)
+
+		SHADER_PARAMETER_STRUCT(FSSDSignalTextures, SignalInput)
+		SHADER_PARAMETER_STRUCT(FSSDSignalUAVs, SignalOutput)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D, DebugOutput)
+	END_SHADER_PARAMETER_STRUCT()
+};
+
+class FSSDSpatialAccumulationCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FSSDSpatialAccumulationCS);
+	SHADER_USE_PARAMETER_STRUCT(FSSDSpatialAccumulationCS, FGlobalShader);
+
+	static const uint32 kGroupSize = 8;
+	
+	enum class EStage
+	{
+		// Spatial kernel used to process raw input for the temporal accumulation.
+		ReConstruction,
+
+		// Spatial kernel to pre filter.
+		PreConvolution,
+
+		// Spatial kernel used to pre convolve history rejection.
+		RejectionPreConvolution,
+
+		// Spatial kernel used to post filter the temporal accumulation.
+		PostFiltering,
+
+		// Final spatial kernel, that may output specific buffer encoding to integrate with the rest of the renderer
+		FinalOutput,
+
+		MAX
+	};
+
+	class FStageDim : SHADER_PERMUTATION_ENUM_CLASS("DIM_STAGE", EStage);
+	class FUpscaleDim : SHADER_PERMUTATION_BOOL("DIM_UPSCALE");
+
+	using FPermutationDomain = TShaderPermutationDomain<FSignalProcessingDim, FStageDim, FUpscaleDim, FSignalBatchSizeDim, FMultiSPPDim>;
+	
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		FPermutationDomain PermutationVector(Parameters.PermutationId);
+		ESignalProcessing SignalProcessing = PermutationVector.Get<FSignalProcessingDim>();
+
+		// Only constant pixel density pass layout uses this shader.
+		if (!UsesConstantPixelDensityPassLayout(PermutationVector.Get<FSignalProcessingDim>()))
+		{
+			return false;
+		}
+
+		// Not all signal processing allow to batch multiple signals at the same time.
+		if (PermutationVector.Get<FSignalBatchSizeDim>() > SignalMaxBatchSize(SignalProcessing))
+		{
+			return false;
+		}
+
+		// Only reconstruction have upscale capability for now.
+		if (PermutationVector.Get<FUpscaleDim>() && 
+			PermutationVector.Get<FStageDim>() != EStage::ReConstruction)
+		{
+			return false;
+		}
+
+		// Only upscale is only for signal that needs it.
+		if (PermutationVector.Get<FUpscaleDim>() &&
+			!SignalSupportsUpscaling(SignalProcessing))
+		{
+			return false;
+		}
+
+		// Only compile pre convolution for signal that uses it.
+		if (!SignalUsesPreConvolution(SignalProcessing) &&
+			PermutationVector.Get<FStageDim>() == EStage::PreConvolution)
+		{
+			return false;
+		}
+
+		// Only compile rejection pre convolution for signal that uses it.
+		if (!SignalUsesRejectionPreConvolution(SignalProcessing) &&
+			PermutationVector.Get<FStageDim>() == EStage::RejectionPreConvolution)
+		{
+			return false;
+		}
+
+		// Only compile post convolution for signal that uses it.
+		if (!SignalUsesPostConvolution(SignalProcessing) &&
+			PermutationVector.Get<FStageDim>() == EStage::PostFiltering)
+		{
+			return false;
+		}
+
+		// Only compile final convolution for signal that uses it.
+		if (!SignalUsesFinalConvolution(SignalProcessing) &&
+			PermutationVector.Get<FStageDim>() == EStage::FinalOutput)
+		{
+			return false;
+		}
+
+		// Only compile multi SPP permutation for signal that supports it.
+		if (PermutationVector.Get<FStageDim>() == EStage::ReConstruction &&
+			PermutationVector.Get<FMultiSPPDim>() && !SignalSupportMultiSPP(SignalProcessing))
+		{
+			return false;
+		}
+
+		// Compile out the shader if this permutation gets remapped.
+		if (RemapPermutationVector(PermutationVector) != PermutationVector)
+		{
+			return false;
+		}
+
+		return ShouldCompileSignalPipeline(SignalProcessing, Parameters.Platform);
+	}
+
+	static FPermutationDomain RemapPermutationVector(FPermutationDomain PermutationVector)
+	{
+		ESignalProcessing SignalProcessing = PermutationVector.Get<FSignalProcessingDim>();
+
+		if (PermutationVector.Get<FStageDim>() == EStage::ReConstruction)
+		{
+			// force use the multi sample per pixel code path.
+			if (!SignalSupport1SPP(SignalProcessing))
+			{
+				PermutationVector.Set<FMultiSPPDim>(true);
+			}
+		}
+		else
+		{
+			PermutationVector.Set<FMultiSPPDim>(true);
+		}
+
+		return PermutationVector;
+	}
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_ARRAY(FVector4, InputBufferUVMinMax, [IScreenSpaceDenoiser::kMaxBatchSize])
+
+		SHADER_PARAMETER(uint32, MaxSampleCount)
+		SHADER_PARAMETER(uint32, PreviousCumulativeMaxSampleCount)
+		SHADER_PARAMETER(int32, UpscaleFactor)
+		SHADER_PARAMETER(float, KernelSpreadFactor)
+		SHADER_PARAMETER(float, HarmonicPeriode)
+		
+		SHADER_PARAMETER_STRUCT_INCLUDE(FSSDCommonParameters, CommonParameters)
+		SHADER_PARAMETER_STRUCT_INCLUDE(FSSDConvolutionMetaData, ConvolutionMetaData)
+
+		SHADER_PARAMETER_STRUCT(FSSDSignalTextures, SignalInput)
+		SHADER_PARAMETER_STRUCT(FSSDSignalSRVs, SignalInputUint)
+		SHADER_PARAMETER_STRUCT(FSSDSignalUAVs, SignalOutput)
+
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D, DebugOutput) // TODO(Denoiser): remove
+	END_SHADER_PARAMETER_STRUCT()
+};
+
+class FSSDTemporalAccumulationCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FSSDTemporalAccumulationCS);
+	SHADER_USE_PARAMETER_STRUCT(FSSDTemporalAccumulationCS, FGlobalShader);
+
+	using FPermutationDomain = TShaderPermutationDomain<FSignalProcessingDim, FSignalBatchSizeDim>;
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		FPermutationDomain PermutationVector(Parameters.PermutationId);
+		ESignalProcessing SignalProcessing = PermutationVector.Get<FSignalProcessingDim>();
+
+		// Only constant pixel density pass layout uses this shader.
+		if (!UsesConstantPixelDensityPassLayout(SignalProcessing))
+		{
+			return false;
+		}
+
+		// Not all signal processing allow to batch multiple signals at the same time.
+		if (PermutationVector.Get<FSignalBatchSizeDim>() > SignalMaxBatchSize(SignalProcessing))
+		{
+			return false;
+		}
+
+		return ShouldCompileSignalPipeline(SignalProcessing, Parameters.Platform);
+	}
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_ARRAY(int32, bCameraCut, [IScreenSpaceDenoiser::kMaxBatchSize])
+		SHADER_PARAMETER(float, HistoryPreExposureCorrection)
+		SHADER_PARAMETER(FVector4, ScreenPosToHistoryBufferUV)
+		SHADER_PARAMETER(FVector4, HistoryBufferSizeAndInvSize)
+		SHADER_PARAMETER(FVector4, HistoryBufferUVMinMax)
+		SHADER_PARAMETER_ARRAY(FVector4, HistoryBufferScissorUVMinMax, [IScreenSpaceDenoiser::kMaxBatchSize])
+		SHADER_PARAMETER(FVector4, PrevSceneBufferUVToScreenPosition)
+
+		SHADER_PARAMETER_STRUCT_INCLUDE(FSSDCommonParameters, CommonParameters)
+		SHADER_PARAMETER_STRUCT_INCLUDE(FSSDConvolutionMetaData, ConvolutionMetaData)
+
+		SHADER_PARAMETER_STRUCT(FSSDSignalTextures, SignalInput)
+		SHADER_PARAMETER_STRUCT(FSSDSignalTextures, HistoryRejectionSignal)
+		SHADER_PARAMETER_STRUCT(FSSDSignalUAVs, SignalHistoryOutput)
+
+		SHADER_PARAMETER_STRUCT(FSSDSignalTextures, PrevHistory)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, PrevDepthBuffer)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, PrevGBufferA)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, PrevGBufferB)
+		SHADER_PARAMETER_RDG_TEXTURE_ARRAY(Texture2D<uint>, PrevCompressedMetadata, [kCompressedMetadataTextures])
+
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D, DebugOutput) // TODO(Denoiser): remove
+	END_SHADER_PARAMETER_STRUCT()
+};
+
+class FSSDComposeHarmonicsCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FSSDComposeHarmonicsCS);
+	SHADER_USE_PARAMETER_STRUCT(FSSDComposeHarmonicsCS, FGlobalShader);
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return ShouldCompileSignalPipeline(ESignalProcessing::PolychromaticPenumbraHarmonic, Parameters.Platform);
+	}
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_STRUCT_ARRAY(FSSDSignalTextures, SignalHarmonics, [IScreenSpaceDenoiser::kMultiPolychromaticPenumbraHarmonics])
+		SHADER_PARAMETER_STRUCT(FSSDSignalTextures, SignalIntegrand)
+		SHADER_PARAMETER_STRUCT_INCLUDE(FSSDCommonParameters, CommonParameters)
+		SHADER_PARAMETER_STRUCT(FSSDSignalUAVs, SignalOutput)
+
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D, DebugOutput)
+	END_SHADER_PARAMETER_STRUCT()
+};
+
+IMPLEMENT_GLOBAL_SHADER(FSSDCompressMetadataCS, "/Engine/Private/ScreenSpaceDenoise/SSDCompressMetadata.usf", "MainCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FSSDInjestCS, "/Engine/Private/ScreenSpaceDenoise/SSDInjest.usf", "MainCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FSSDSpatialAccumulationCS, "/Engine/Private/ScreenSpaceDenoise/SSDSpatialAccumulation.usf", "MainCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FSSDTemporalAccumulationCS, "/Engine/Private/ScreenSpaceDenoise/SSDTemporalAccumulation.usf", "MainCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FSSDComposeHarmonicsCS, "/Engine/Private/ScreenSpaceDenoise/SSDComposeHarmonics.usf", "MainCS", SF_Compute);
+
+} // namespace
+
+
+/** PrevViewInfo and PrevFrameViewInfo pooled render targets to use for temporal storage of scene textures. */
+struct FViewInfoPooledRenderTargets
+{
+	TRefCountPtr<IPooledRenderTarget> PrevDepthBuffer;
+	TRefCountPtr<IPooledRenderTarget> PrevGBufferA;
+	TRefCountPtr<IPooledRenderTarget> PrevGBufferB;
+	TRefCountPtr<IPooledRenderTarget> PrevCompressedDepthViewNormal;
+
+	TRefCountPtr<IPooledRenderTarget>* NextDepthBuffer;
+	TRefCountPtr<IPooledRenderTarget>* NextGBufferA;
+	TRefCountPtr<IPooledRenderTarget>* NextGBufferB;
+	TRefCountPtr<IPooledRenderTarget>* NextCompressedDepthViewNormal;
+};
+
+void SetupSceneViewInfoPooledRenderTargets(
+	const FViewInfo& View,
+	FViewInfoPooledRenderTargets* OutViewInfoPooledRenderTargets)
+{
+	auto&& PrevViewInfo = View.PrevViewInfo;
+	auto&& PrevFrameViewInfo = View.ViewState->PrevFrameViewInfo;
+
+	OutViewInfoPooledRenderTargets->PrevDepthBuffer = PrevViewInfo.DepthBuffer;
+	OutViewInfoPooledRenderTargets->PrevGBufferA = PrevViewInfo.GBufferA;
+	OutViewInfoPooledRenderTargets->PrevGBufferB = PrevViewInfo.GBufferB;
+	OutViewInfoPooledRenderTargets->PrevCompressedDepthViewNormal = PrevViewInfo.CompressedDepthViewNormal;
+
+	OutViewInfoPooledRenderTargets->NextDepthBuffer = &PrevFrameViewInfo.DepthBuffer;
+	OutViewInfoPooledRenderTargets->NextGBufferA = &PrevFrameViewInfo.GBufferA;
+	OutViewInfoPooledRenderTargets->NextGBufferB = &PrevFrameViewInfo.GBufferB;
+	OutViewInfoPooledRenderTargets->NextCompressedDepthViewNormal = &PrevFrameViewInfo.CompressedDepthViewNormal;
+}
+
+void SetupImaginaryReflectionViewInfoPooledRenderTargets(
+	const FViewInfo& View,
+	FViewInfoPooledRenderTargets* OutViewInfoPooledRenderTargets)
+{
+	auto&& PrevViewInfo = View.PrevViewInfo;
+	auto&& PrevFrameViewInfo = View.ViewState->PrevFrameViewInfo;
+
+	OutViewInfoPooledRenderTargets->PrevDepthBuffer = PrevViewInfo.ImaginaryReflectionDepthBuffer;
+	OutViewInfoPooledRenderTargets->PrevGBufferA = PrevViewInfo.ImaginaryReflectionGBufferA;
+	OutViewInfoPooledRenderTargets->PrevGBufferB = nullptr; // GBufferB not used
+	OutViewInfoPooledRenderTargets->PrevCompressedDepthViewNormal = PrevViewInfo.ImaginaryReflectionCompressedDepthViewNormal;
+
+	OutViewInfoPooledRenderTargets->NextDepthBuffer = &PrevFrameViewInfo.ImaginaryReflectionDepthBuffer;
+	OutViewInfoPooledRenderTargets->NextGBufferA = &PrevFrameViewInfo.ImaginaryReflectionGBufferA;
+	OutViewInfoPooledRenderTargets->NextGBufferB = nullptr; // GBufferB not used
+	OutViewInfoPooledRenderTargets->NextCompressedDepthViewNormal = &PrevFrameViewInfo.ImaginaryReflectionCompressedDepthViewNormal;
+}
+
+/** Generic settings to denoise signal at constant pixel density across the viewport. */
+struct FSSDConstantPixelDensitySettings
+{
+	FIntRect FullResViewport;
+	ESignalProcessing SignalProcessing;
+	int32 SignalBatchSize = 1;
+	float HarmonicPeriode = 1.0f;
+	int32 MaxInputSPP = 1;
+	float InputResolutionFraction = 1.0f;
+	float DenoisingResolutionFraction = 1.0f;
+	bool bEnableReconstruction = true;
+	int32 ReconstructionSamples = 1;
+	int32 PreConvolutionCount = 0;
+	float KernelSpreadFactor = 8;
+	bool bUseTemporalAccumulation = false;
+	int32 HistoryConvolutionSampleCount = 1;
+	float HistoryConvolutionKernelSpreadFactor = 1.0f;
+	TStaticArray<FIntRect, IScreenSpaceDenoiser::kMaxBatchSize> SignalScissor;
+	TStaticArray<const FLightSceneInfo*, IScreenSpaceDenoiser::kMaxBatchSize> LightSceneInfo;
+};
+
+/** Denoises a signal at constant pixel density across the viewport. */
+static void DenoiseSignalAtConstantPixelDensity(
+	FRDGBuilder& GraphBuilder,
+	const FViewInfo& View,
+	const FSceneTextureParameters& SceneTextures,
+	const FViewInfoPooledRenderTargets& ViewInfoPooledRenderTargets,
+	const FSSDSignalTextures& InputSignal,
+	FSSDConstantPixelDensitySettings Settings,
+	TStaticArray<FScreenSpaceDenoiserHistory*, IScreenSpaceDenoiser::kMaxBatchSize> PrevFilteringHistory,
+	TStaticArray<FScreenSpaceDenoiserHistory*, IScreenSpaceDenoiser::kMaxBatchSize> NewFilteringHistory,
+	FSSDSignalTextures* OutputSignal)
+{
+	check(UsesConstantPixelDensityPassLayout(Settings.SignalProcessing));
+	
+	// Make sure the viewport of the denoiser is within the viewport of the view.
+	{
+		FIntRect Union = View.ViewRect;
+		Union.Union(Settings.FullResViewport);
+		check(Union == View.ViewRect);
+	}
+
+	ensure(Settings.InputResolutionFraction == 1.0f || Settings.InputResolutionFraction == 0.5f || Settings.InputResolutionFraction == 0.25f);
+	
+	auto GetResourceNames = [&](const TCHAR* const ResourceNames[])
+	{
+		return ResourceNames + (int32(Settings.SignalProcessing) * kMaxBufferProcessingCount);
+	};
+
+	const bool bUseMultiInputSPPShaderPath = Settings.MaxInputSPP > 1;
+
+	FIntPoint FullResBufferExtent = SceneTextures.SceneDepthTexture->Desc.Extent;
+	FIntPoint BufferExtent = FullResBufferExtent;
+	FIntRect Viewport = Settings.FullResViewport;
+	if (Settings.DenoisingResolutionFraction == 0.5f)
+	{
+		BufferExtent /= 2;
+		Viewport = FIntRect::DivideAndRoundUp(Viewport, 2);
+	}
+
+	// Number of signal to batch.
+	int32 MaxSignalBatchSize = SignalMaxBatchSize(Settings.SignalProcessing);
+	check(Settings.SignalBatchSize >= 1 && Settings.SignalBatchSize <= MaxSignalBatchSize);
+
+	// Number of texture per batched signal.
+	int32 InjestTextureCount = 0;
+	int32 ReconstructionTextureCount = 0;
+	int32 HistoryTextureCountPerSignal = 0;
+
+	// Descriptor to allocate internal denoising buffer.
+	bool bHasReconstructionLayoutDifferentFromHistory = false;
+	TStaticArray<FRDGTextureDesc, kMaxBufferProcessingCount> InjestDescs;
+	TStaticArray<FRDGTextureDesc, kMaxBufferProcessingCount> ReconstructionDescs;
+	TStaticArray<FRDGTextureDesc, kMaxBufferProcessingCount> HistoryDescs;
+	FRDGTextureDesc DebugDesc;
+	{
+		// Manually format texel in the shader to reduce VGPR pressure with overlapped texture fetched.
+		const bool bManualTexelFormatting = true;
+
+		static const EPixelFormat PixelFormatPerChannel[] = {
+			PF_Unknown,
+			PF_R16F,
+			PF_G16R16F,
+			PF_FloatRGBA, // there is no 16bits float RGB
+			PF_FloatRGBA,
+		};
+
+		FRDGTextureDesc RefDesc = FRDGTextureDesc::Create2D(
+			BufferExtent,
+			PF_Unknown,
+			FClearValueBinding::Black,
+			TexCreate_ShaderResource | TexCreate_RenderTargetable | TexCreate_UAV);
+
+		DebugDesc = RefDesc;
+		DebugDesc.Format = PF_FloatRGBA;
+
+		for (int32 i = 0; i < kMaxBufferProcessingCount; i++)
+		{
+			InjestDescs[i] = RefDesc;
+			ReconstructionDescs[i] = RefDesc;
+			HistoryDescs[i] = RefDesc;
+		}
+
+		if (Settings.SignalProcessing == ESignalProcessing::ShadowVisibilityMask)
+		{
+			check(Settings.SignalBatchSize >= 1 && Settings.SignalBatch

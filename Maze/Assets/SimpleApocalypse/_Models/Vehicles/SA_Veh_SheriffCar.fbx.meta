@@ -1,0 +1,108 @@
+#include "Hull2MeshEdges.h"
+#include "PsUserAllocated.h"
+#include "PxVec4.h"
+#include "PxVec3.h"
+#include "PxPlane.h"
+#include "PxMath.h"
+#include "PxTransform.h"
+#include "PsArray.h"
+
+
+#define FLT_EPS 0.000000001f
+
+PX_INLINE bool intersectPlanes(physx::PxVec3& pos, physx::PxVec3& dir, const physx::PxPlane& plane0, const physx::PxPlane& plane1)
+{
+	const physx::PxVec3 n0 = plane0.n;
+	const physx::PxVec3 n1 = plane1.n;
+
+	dir = n0.cross(n1);
+
+	if(dir.normalize() < FLT_EPS)
+	{
+		return false;
+	}
+
+	pos = physx::PxVec3(0.0f);
+
+	for (int iter = 3; iter--;)
+	{
+		// Project onto plane0:
+		pos = plane0.project(pos);
+
+		// Raycast to plane1:
+		const physx::PxVec3 b = dir.cross(n0);
+		//pos = pos - (pos.dot(plane1.n)/b.dot(plane1.n))*b;
+
+		pos = pos - (plane1.distance(pos) / b.dot(plane1.n))*b;
+
+	}
+
+	return true;
+}
+
+void calculatePolygonEdges(physx::shdfnd::Array<HullEdge>& edges,uint32_t planeCount,const physx::PxPlane *planes)
+{
+	for (uint32_t i = 0; i <planeCount; ++i)
+	{
+		const physx::PxPlane& plane_i = planes[i];
+		for (uint32_t j = i+1; j <planeCount; ++j)
+		{
+			const physx::PxPlane& plane_j = planes[j];
+			// Find potential edge from intersection if plane_i and plane_j
+			physx::PxVec3 orig;
+			physx::PxVec3 edgeDir;
+			if (intersectPlanes(orig, edgeDir, plane_i, plane_j))
+			{
+				float minS = -FLT_MAX;
+				float maxS = FLT_MAX;
+				bool intersectionFound = true;
+				for (uint32_t k = 0; k < planeCount; ++k)
+				{
+					if (k == i || k == j)
+					{
+						continue;
+					}
+					const physx::PxPlane& plane_k = planes[k];
+					const float num = -plane_k.distance(orig);
+					const float den = plane_k.n.dot(edgeDir);
+					if (physx::PxAbs(den) > FLT_EPS)
+					{
+						const float s = num/den;
+						if (den > 0.0f)
+						{
+							maxS = physx::PxMin(maxS, s);
+						}
+						else
+						{
+							minS = physx::PxMax(minS, s);
+						}
+						if (maxS <= minS)
+						{
+							intersectionFound = false;
+							break;
+						}
+					}
+					else
+						if (num < -10*FLT_EPS)
+						{
+							intersectionFound = false;
+							break;
+						}
+				}
+				if (intersectionFound && minS != -FLT_MAX && maxS != FLT_MIN)
+				{
+					HullEdge& s = edges.insert();
+					s.e0 = orig + minS * edgeDir;
+					s.e1 = orig + maxS * edgeDir;
+				}
+			}
+		}
+	}
+}
+
+struct ConvexMeshBuilder 
+{
+	ConvexMeshBuilder(void) : mVertices("ConvexMeshBuilder::mVertice"), mIndices("ConvexMeshBuilder::mIndices") {}
+	void buildMesh(uint16_t numPlanes,const physx::PxVec4 *planes);
+	physx::shdfnd::Array<physx::PxVec3> mVertices;
+	physx::shdfnd::Array<uint16_t> mIndice

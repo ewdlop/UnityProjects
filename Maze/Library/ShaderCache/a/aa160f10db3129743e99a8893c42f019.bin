@@ -1,0 +1,167 @@
+[3])>eps)
+            assert(false );
+        assert((abs(z.length()-1.f)<eps));
+        assert(abs(x^z)<eps);
+        assert(abs(y^z)<eps);
+        assert(((x%y)^z)>0);
+    }
+}
+
+void
+getRandTRS(Rand48& random, V3f& trans, V3f& rot, V3f& scale)
+{
+    // Translate 
+    trans = V3f (random.nextf (-10, 10), 
+                 random.nextf (-10, 10), 
+                 random.nextf (-10, 10));
+    // Rotate 
+    rot = V3f (rad (random.nextf (-180, 180)),
+               rad (random.nextf (-180, 180)),
+               rad (random.nextf (-180, 180)));
+
+    // Scale 
+    V3f s(random.nextf (0.000001, 2.0),
+          random.nextf (0.000001, 2.0),
+          random.nextf (0.000001, 2.0));
+    for (int j=0; j < 3; j++)
+        if (random.nextf (0.0, 1.0) >= 0.5)
+            s[j] *= -1;
+    scale = s;
+}
+
+M44f
+createRandomMat(Rand48& random, V3f& trans, V3f& rot, V3f& scale)
+{
+    
+    M44f M;
+    V3f t, r, s;
+    getRandTRS(random, t, r, s);
+    
+    M.translate (t);
+    M.rotate (r);
+
+    // Shear M.
+    V3f h (random.nextf (0.000001, 2.0), 
+           random.nextf (0.000001, 2.0), 
+           random.nextf (0.000001, 2.0));
+
+    for (int j=0; j < 3; j++)
+        if (random.nextf (0.0, 1.0) >= 0.5)
+            h[j] *= -1;
+    M.shear (h);
+
+    M.scale (s);
+
+    //
+    // Add a small random error to the elements of M
+    //
+    for (int j = 0; j < 4; ++j)
+        for (int k = 0; k < 3; ++k)
+            M[j][k] += random.nextf (-1e-7, 1e-7);
+
+    V3f sh;
+    extractSHRT (M, scale, sh, rot, trans);
+
+    debug (("Scale   : %f %f %f\n", s[0], s[1], s[2]));
+    debug (("Shear   : %f %f %f\n", h[0], h[1], h[2]));
+    debug (("Rot     : %f %f %f\n", r[0], r[1], r[2]));
+    debug (("Trans   : %f %f %f\n", t[0], t[1], t[2]));
+    
+    return M;
+}
+
+void
+compareMat(M44f& M, M44f& N)
+{
+    float eps = 0.0001;
+    
+    /// Verify that the entries in M and N do not
+    // differ too much.
+
+    M44f D (M - N);
+
+    for (int j = 0; j < 4; ++j)
+    {
+        for (int k = 0; k < 4; ++k)
+        {
+            //cout << "diff="<<D[j][k] << endl;
+            if (abs (D[j][k]) > eps)
+            {
+                cout << "unexpectedly diff "<<
+                D[j][k] << endl;
+
+                cout << j << " " << k << endl;
+
+                cout << "M\n" << M << endl;
+                cout << "N\n" << N << endl;
+                cout << "D\n" << D << endl;
+
+                assert (false);
+            }
+        }
+    }
+}
+
+void
+testAddOffset()
+{
+    Rand48 random(0);
+
+    for (int i = 0; i < 100000; ++i)
+    {
+        debug (("iteration: %d\n", i));
+
+        V3f transA, transB, rotA, rotB, scaleA, scaleB;
+        V3f tOffset, rOffset, sOffset;
+        M44f inMat  = createRandomMat(random, transA, rotA, scaleA);
+        M44f refMat = createRandomMat(random, transB, rotB, scaleB);
+        getRandTRS(random, tOffset, rOffset, sOffset);
+        
+        // addOffset : function to test
+        M44f outMat = addOffset( inMat, tOffset, rOffset, sOffset, refMat);
+        
+        // add the inverse offset
+        M44f invO;
+        invO.rotate (V3f(rad(rOffset[0]), rad(rOffset[1]), rad(rOffset[2])));
+        invO[3][0] = tOffset[0];
+        invO[3][1] = tOffset[1];
+        invO[3][2] = tOffset[2];
+        invO.invert();
+
+        M44f invS;
+        invS.scale (sOffset);
+        invS.invert(); // zero scale is avoided in getRandTRS
+        
+        // in ref mat from the function result
+        M44f outInRefMat = invO*invS*outMat;
+        
+        // in ref mat from the inputs
+        M44f inRefMat    = inMat*refMat;
+        
+        // compare the mat
+        compareMat(outInRefMat, inRefMat);
+    }
+}
+
+void
+testRSMatrix(M44f& M, V3f& t, V3f& r, V3f& s)
+{
+    M44f N;
+    N.makeIdentity();
+    N.translate (t); // ... matrix compositions
+    N.rotate (r);
+    N.scale (s);
+
+    compareMat(M, N);
+}
+
+void
+testComputeRSMatrix ()
+{
+    Rand48 random(0);
+    
+    for (int i = 0; i < 100000; ++i)
+    {
+        debug (("iteration: %d\n", i));
+
+        V3f transA, transB, rotA, rotB, scaleA, scaleB;

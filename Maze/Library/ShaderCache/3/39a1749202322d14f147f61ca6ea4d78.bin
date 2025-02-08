@@ -1,0 +1,66 @@
+//==- AArch64AsmParser.cpp - Parse AArch64 assembly to MCInst instructions -==//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+
+#include "MCTargetDesc/AArch64AddressingModes.h"
+#include "MCTargetDesc/AArch64MCExpr.h"
+#include "MCTargetDesc/AArch64MCTargetDesc.h"
+#include "MCTargetDesc/AArch64TargetStreamer.h"
+#include "Utils/AArch64BaseInfo.h"
+#include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/APInt.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSwitch.h"
+#include "llvm/ADT/Twine.h"
+#include "llvm/MC/MCContext.h"
+#include "llvm/MC/MCExpr.h"
+#include "llvm/MC/MCInst.h"
+#include "llvm/MC/MCLinkerOptimizationHint.h"
+#include "llvm/MC/MCObjectFileInfo.h"
+#include "llvm/MC/MCParser/MCAsmLexer.h"
+#include "llvm/MC/MCParser/MCAsmParser.h"
+#include "llvm/MC/MCParser/MCAsmParserExtension.h"
+#include "llvm/MC/MCParser/MCParsedAsmOperand.h"
+#include "llvm/MC/MCParser/MCTargetAsmParser.h"
+#include "llvm/MC/MCRegisterInfo.h"
+#include "llvm/MC/MCStreamer.h"
+#include "llvm/MC/MCSubtargetInfo.h"
+#include "llvm/MC/MCSymbol.h"
+#include "llvm/MC/MCTargetOptions.h"
+#include "llvm/MC/SubtargetFeature.h"
+#include "llvm/Support/Casting.h"
+#include "llvm/Support/Compiler.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/MathExtras.h"
+#include "llvm/Support/SMLoc.h"
+#include "llvm/Support/TargetParser.h"
+#include "llvm/Support/TargetRegistry.h"
+#include "llvm/Support/raw_ostream.h"
+#include <cassert>
+#include <cctype>
+#include <cstdint>
+#include <cstdio>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+using namespace llvm;
+
+namespace {
+
+enum class RegKind {
+  Scalar,
+  NeonVector,
+  SVEDataVector,
+  SVEPred

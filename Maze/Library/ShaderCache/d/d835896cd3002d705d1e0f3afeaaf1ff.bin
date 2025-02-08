@@ -1,0 +1,56 @@
+            /* output BMP code point below 0xd800 */
+                } else if(c<=0xdbff) {
+                    /* output roundtrip or fallback supplementary code point */
+                    c=((c&0x3ff)<<10)+unicodeCodeUnits[finalOffset]+(0x10000-0xdc00);
+                } else if(c==0xe000) {
+                    /* output roundtrip BMP code point above 0xd800 or fallback BMP code point */
+                    c=unicodeCodeUnits[finalOffset];
+                } else {
+                    c=U_SENTINEL;
+                }
+            } else if(action==MBCS_STATE_VALID_DIRECT_20) {
+                /* output supplementary code point */
+                c=(UChar32)(MBCS_ENTRY_FINAL_VALUE(entry)+0x10000);
+            } else {
+                c=U_SENTINEL;
+            }
+
+            codePoints[b&0x1f]=c;
+            anyCodePoints&=c;
+        }
+        if(((++b)&0x1f)==0) {
+            if(anyCodePoints>=0) {
+                if(!callback(context, value|(uint32_t)(b-0x20), codePoints)) {
+                    return FALSE;
+                }
+                anyCodePoints=-1;
+            }
+        }
+    }
+    return TRUE;
+}
+
+/*
+ * Only called if stateProps[state]==-1.
+ * A recursive call may do stateProps[state]|=0x40 if this state is the target of an
+ * MBCS_STATE_CHANGE_ONLY.
+ */
+static int8_t
+getStateProp(const int32_t (*stateTable)[256], int8_t stateProps[], int state) {
+    const int32_t *row;
+    int32_t min, max, entry, nextState;
+
+    row=stateTable[state];
+    stateProps[state]=0;
+
+    /* find first non-ignorable state */
+    for(min=0;; ++min) {
+        entry=row[min];
+        nextState=MBCS_ENTRY_STATE(entry);
+        if(stateProps[nextState]==-1) {
+            getStateProp(stateTable, stateProps, nextState);
+        }
+        if(MBCS_ENTRY_IS_TRANSITION(entry)) {
+            if(stateProps[nextState]>=0) {
+                break;
+            }

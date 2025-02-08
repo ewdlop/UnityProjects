@@ -1,0 +1,67 @@
+using System;
+using System.Threading.Tasks;
+
+using System.Net.WebSockets;
+using System.Threading;
+using System.IO;
+using System.Text;
+using System.Collections.Generic;
+
+namespace WebAssembly.Net.Debugging {
+	public class DevToolsClient: IDisposable {
+		ClientWebSocket socket;
+		List<Task> pending_ops = new List<Task> ();
+		TaskCompletionSource<bool> side_exit = new TaskCompletionSource<bool> ();
+		List<byte []> pending_writes = new List<byte []> ();
+		Task current_write;
+
+		public DevToolsClient () {
+		}
+
+		~DevToolsClient() {
+			Dispose(false);
+		}
+
+		public void Dispose() {
+			Dispose(true);
+		}
+
+		public async Task Close (CancellationToken cancellationToken)
+		{
+			if (socket.State == WebSocketState.Open)
+				await socket.CloseOutputAsync (WebSocketCloseStatus.NormalClosure, "Closing", cancellationToken);
+		}
+
+		protected virtual void Dispose (bool disposing) {
+			if (disposing)
+				socket.Dispose ();
+		}
+
+		Task Pump (Task task, CancellationToken token)
+		{
+			if (task != current_write)
+				return null;
+			current_write = null;
+
+			pending_writes.RemoveAt (0);
+
+			if (pending_writes.Count > 0) {
+				current_write = socket.SendAsync (new ArraySegment<byte> (pending_writes [0]), WebSocketMessageType.Text, true, token);
+				return current_write;
+			}
+			return null;
+		}
+
+		async Task<string> ReadOne (CancellationToken token)
+		{
+			byte [] buff = new byte [4000];
+			var mem = new MemoryStream ();
+			while (true) {
+				var result = await this.socket.ReceiveAsync (new ArraySegment<byte> (buff), token);
+				if (result.MessageType == WebSocketMessageType.Close) {
+					return null;
+				}
+
+				if (result.EndOfMessage) {
+					mem.Write (buff, 0, result.Count);
+					return Encod

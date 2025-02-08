@@ -1,0 +1,102 @@
+= 1;
+			}
+			else
+			{
+				UE_LOG(LogD3D12RHI, Log, TEXT("[Aftermath] Aftermath enabled but failed to initialize (%x)"), Result);
+				GDX12NVAfterMathEnabled = 0;
+			}
+		}
+		else
+		{
+			GDX12NVAfterMathEnabled = 0;
+			UE_LOG(LogD3D12RHI, Warning, TEXT("[Aftermath] Skipping aftermath initialization on non-Nvidia device"));
+		}
+	}
+	else
+	{
+		GDX12NVAfterMathEnabled = 0;
+	}
+#endif
+
+#if PLATFORM_WINDOWS
+	if (bWithDebug)
+	{
+		// add vectored exception handler to write the debug device warning & error messages to the log
+		ExceptionHandlerHandle = AddVectoredExceptionHandler(1, D3DVectoredExceptionHandler);
+	}
+#endif // PLATFORM_WINDOWS
+
+#if (PLATFORM_WINDOWS || PLATFORM_HOLOLENS)
+	if (bWithDebug)
+	{
+		// Manually load dxgi debug if available
+		HMODULE DxgiDebugDLL = (HMODULE)FPlatformProcess::GetDllHandle(TEXT("dxgidebug.dll"));
+		if (DxgiDebugDLL)
+		{
+			typedef HRESULT(WINAPI* FDXGIGetDebugInterface)(REFIID, void**);
+#pragma warning(push)
+#pragma warning(disable: 4191) // disable the "unsafe conversion from 'FARPROC' to 'blah'" warning
+			FDXGIGetDebugInterface DXGIGetDebugInterfaceFnPtr = (FDXGIGetDebugInterface)(GetProcAddress(DxgiDebugDLL, "DXGIGetDebugInterface"));
+#pragma warning(pop)
+			if (DXGIGetDebugInterfaceFnPtr != nullptr)
+			{
+				DXGIGetDebugInterfaceFnPtr(__uuidof(IDXGIDebug), (void**)DXGIDebug.GetInitReference());
+			}
+
+			FPlatformProcess::FreeDllHandle(DxgiDebugDLL);
+		}
+	}
+#endif //  (PLATFORM_WINDOWS || PLATFORM_HOLOLENS)
+
+#if UE_BUILD_DEBUG	&& (PLATFORM_WINDOWS || PLATFORM_HOLOLENS)
+	//break on debug
+	TRefCountPtr<ID3D12Debug> d3dDebug;
+	if (SUCCEEDED(RootDevice->QueryInterface(__uuidof(ID3D12Debug), (void**)d3dDebug.GetInitReference())))
+	{
+		TRefCountPtr<ID3D12InfoQueue> d3dInfoQueue;
+		if (SUCCEEDED(d3dDebug->QueryInterface(__uuidof(ID3D12InfoQueue), (void**)d3dInfoQueue.GetInitReference())))
+		{
+			d3dInfoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, true);
+			d3dInfoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, true);
+			//d3dInfoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, true);
+		}
+	}
+#endif
+
+#if !(UE_BUILD_SHIPPING && WITH_EDITOR) && (PLATFORM_WINDOWS || PLATFORM_HOLOLENS)
+	// Add some filter outs for known debug spew messages (that we don't care about)
+	if (bWithDebug)
+	{
+		ID3D12InfoQueue *pd3dInfoQueue = nullptr;
+		VERIFYD3D12RESULT(RootDevice->QueryInterface(__uuidof(ID3D12InfoQueue), (void**)&pd3dInfoQueue));
+		if (pd3dInfoQueue)
+		{
+			D3D12_INFO_QUEUE_FILTER NewFilter;
+			FMemory::Memzero(&NewFilter, sizeof(NewFilter));
+
+			// Turn off info msgs as these get really spewy
+			D3D12_MESSAGE_SEVERITY DenySeverity = D3D12_MESSAGE_SEVERITY_INFO;
+			NewFilter.DenyList.NumSeverities = 1;
+			NewFilter.DenyList.pSeverityList = &DenySeverity;
+
+			// Be sure to carefully comment the reason for any additions here!  Someone should be able to look at it later and get an idea of whether it is still necessary.
+			TArray<D3D12_MESSAGE_ID, TInlineAllocator<16>> DenyIds = {
+
+				// The Pixel Shader expects a Render Target View bound to slot 0, but the PSO indicates that none will be bound.
+				// This typically happens when a non-depth-only pixel shader is used for depth-only rendering.
+				D3D12_MESSAGE_ID_CREATEGRAPHICSPIPELINESTATE_RENDERTARGETVIEW_NOT_SET,
+
+#if PLATFORM_DESKTOP || PLATFORM_HOLOLENS
+				// OMSETRENDERTARGETS_INVALIDVIEW - d3d will complain if depth and color targets don't have the exact same dimensions, but actually
+				//	if the color target is smaller then things are ok.  So turn off this error.  There is a manual check in FD3D12DynamicRHI::SetRenderTarget
+				//	that tests for depth smaller than color and MSAA settings to match.
+				D3D12_MESSAGE_ID_OMSETRENDERTARGETS_INVALIDVIEW,
+#endif
+
+				// QUERY_BEGIN_ABANDONING_PREVIOUS_RESULTS - The RHI exposes the interface to make and issue queries and a separate interface to use that data.
+				//		Currently there is a situation where queries are issued and the results may be ignored on purpose.  Filtering out this message so it doesn't
+				//		swarm the debug spew and mask other important warnings
+				//D3D12_MESSAGE_ID_QUERY_BEGIN_ABANDONING_PREVIOUS_RESULTS,
+				//D3D12_MESSAGE_ID_QUERY_END_ABANDONING_PREVIOUS_RESULTS,
+
+				// D3D12_M

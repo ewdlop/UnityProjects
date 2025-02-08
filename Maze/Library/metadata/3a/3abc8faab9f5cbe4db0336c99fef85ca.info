@@ -1,0 +1,180 @@
+// Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+// See the LICENSE file in the project root for more information.
+
+using System;
+using System.Globalization;
+using System.Threading;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
+using System.Security;
+using System.Diagnostics;
+
+namespace System
+{
+    [Flags]
+    public enum Base64FormattingOptions
+    {
+        None = 0,
+        InsertLineBreaks = 1
+    }
+
+    // Returns the type code of this object. An implementation of this method
+    // must not return TypeCode.Empty (which represents a null reference) or
+    // TypeCode.Object (which represents an object that doesn't implement the
+    // IConvertible interface). An implementation of this method should return
+    // TypeCode.DBNull if the value of this object is a database null. For
+    // example, a nullable integer type should return TypeCode.DBNull if the
+    // value of the object is the database null. Otherwise, an implementation
+    // of this method should return the TypeCode that best describes the
+    // internal representation of the object.
+    // The Value class provides conversion and querying methods for values. The
+    // Value class contains static members only, and it is not possible to create
+    // instances of the class.
+    //
+    // The statically typed conversion methods provided by the Value class are all
+    // of the form:
+    //
+    //    public static XXX ToXXX(YYY value)
+    //
+    // where XXX is the target type and YYY is the source type. The matrix below
+    // shows the set of supported conversions. The set of conversions is symmetric
+    // such that for every ToXXX(YYY) there is also a ToYYY(XXX).
+    //
+    // From:  To: Bol Chr SBy Byt I16 U16 I32 U32 I64 U64 Sgl Dbl Dec Dat Str
+    // ----------------------------------------------------------------------
+    // Boolean     x       x   x   x   x   x   x   x   x   x   x   x       x
+    // Char            x   x   x   x   x   x   x   x   x                   x
+    // SByte       x   x   x   x   x   x   x   x   x   x   x   x   x       x
+    // Byte        x   x   x   x   x   x   x   x   x   x   x   x   x       x
+    // Int16       x   x   x   x   x   x   x   x   x   x   x   x   x       x
+    // UInt16      x   x   x   x   x   x   x   x   x   x   x   x   x       x
+    // Int32       x   x   x   x   x   x   x   x   x   x   x   x   x       x
+    // UInt32      x   x   x   x   x   x   x   x   x   x   x   x   x       x
+    // Int64       x   x   x   x   x   x   x   x   x   x   x   x   x       x
+    // UInt64      x   x   x   x   x   x   x   x   x   x   x   x   x       x
+    // Single      x       x   x   x   x   x   x   x   x   x   x   x       x
+    // Double      x       x   x   x   x   x   x   x   x   x   x   x       x
+    // Decimal     x       x   x   x   x   x   x   x   x   x   x   x       x
+    // DateTime                                                        x   x
+    // String      x   x   x   x   x   x   x   x   x   x   x   x   x   x   x
+    // ----------------------------------------------------------------------
+    //
+    // For dynamic conversions, the Value class provides a set of methods of the
+    // form:
+    //
+    //    public static XXX ToXXX(object value)
+    //
+    // where XXX is the target type (Boolean, Char, SByte, Byte, Int16, UInt16,
+    // Int32, UInt32, Int64, UInt64, Single, Double, Decimal, DateTime,
+    // or String). The implementations of these methods all take the form:
+    //
+    //    public static XXX toXXX(object value) {
+    //        return value == null? XXX.Default: ((IConvertible)value).ToXXX();
+    //    }
+    //
+    // The code first checks if the given value is a null reference (which is the
+    // same as Value.Empty), in which case it returns the default value for type
+    // XXX. Otherwise, a cast to IConvertible is performed, and the appropriate ToXXX()
+    // method is invoked on the object. An InvalidCastException is thrown if the
+    // cast to IConvertible fails, and that exception is simply allowed to propagate out
+    // of the conversion method.
+
+    // Constant representing the database null value. This value is used in
+    // database applications to indicate the absence of a known value. Note
+    // that Value.DBNull is NOT the same as a null object reference, which is
+    // represented by Value.Empty.
+    //
+    // The Equals() method of DBNull always returns false, even when the
+    // argument is itself DBNull.
+    //
+    // When passed Value.DBNull, the Value.GetTypeCode() method returns
+    // TypeCode.DBNull.
+    //
+    // When passed Value.DBNull, the Value.ToXXX() methods all throw an
+    // InvalidCastException.
+
+    public static partial class Convert
+    {
+        //A typeof operation is fairly expensive (does a system call), so we'll cache these here
+        //statically.  These are exactly lined up with the TypeCode, eg. ConvertType[TypeCode.Int16]
+        //will give you the type of an short.
+        internal static readonly Type[] ConvertTypes = {
+            typeof(System.Empty),
+            typeof(object),
+            typeof(System.DBNull),
+            typeof(bool),
+            typeof(char),
+            typeof(sbyte),
+            typeof(byte),
+            typeof(short),
+            typeof(ushort),
+            typeof(int),
+            typeof(uint),
+            typeof(long),
+            typeof(ulong),
+            typeof(float),
+            typeof(double),
+            typeof(decimal),
+            typeof(DateTime),
+            typeof(object), //TypeCode is discontinuous so we need a placeholder.
+            typeof(string)
+        };
+
+        // Need to special case Enum because typecode will be underlying type, e.g. Int32
+        private static readonly Type EnumType = typeof(Enum);
+
+        internal static readonly char[] base64Table = {'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O',
+                                                       'P','Q','R','S','T','U','V','W','X','Y','Z','a','b','c','d',
+                                                       'e','f','g','h','i','j','k','l','m','n','o','p','q','r','s',
+                                                       't','u','v','w','x','y','z','0','1','2','3','4','5','6','7',
+                                                       '8','9','+','/','=' };
+
+        private const int base64LineBreakPosition = 76;
+
+#if DEBUG
+        private static bool TriggerAsserts = DoAsserts();
+        private static bool DoAsserts()
+        {
+            Debug.Assert(ConvertTypes != null, "[Convert.cctor]ConvertTypes!=null");
+            Debug.Assert(ConvertTypes.Length == ((int)TypeCode.String + 1), "[Convert.cctor]ConvertTypes.Length == ((int)TypeCode.String + 1)");
+            Debug.Assert(ConvertTypes[(int)TypeCode.Empty] == typeof(System.Empty),
+                            "[Convert.cctor]ConvertTypes[(int)TypeCode.Empty]==typeof(System.Empty)");
+            Debug.Assert(ConvertTypes[(int)TypeCode.String] == typeof(string),
+                            "[Convert.cctor]ConvertTypes[(int)TypeCode.String]==typeof(System.String)");
+            Debug.Assert(ConvertTypes[(int)TypeCode.Int32] == typeof(int),
+                            "[Convert.cctor]ConvertTypes[(int)TypeCode.Int32]==typeof(int)");
+            return true;
+        }
+#endif
+
+        public static readonly object DBNull = System.DBNull.Value;
+
+        // Returns the type code for the given object. If the argument is null,
+        // the result is TypeCode.Empty. If the argument is not a value (i.e. if
+        // the object does not implement IConvertible), the result is TypeCode.Object.
+        // Otherwise, the result is the type code of the object, as determined by
+        // the object's implementation of IConvertible.
+        public static TypeCode GetTypeCode(object value)
+        {
+            if (value == null) return TypeCode.Empty;
+            IConvertible temp = value as IConvertible;
+            if (temp != null)
+            {
+                return temp.GetTypeCode();
+            }
+            return TypeCode.Object;
+        }
+
+        // Returns true if the given object is a database null. This operation
+        // corresponds to "value.GetTypeCode() == TypeCode.DBNull".
+        public static bool IsDBNull(object value)
+        {
+            if (value == System.DBNull.Value) return true;
+            IConvertible convertible = value as IConvertible;
+            return convertible != null ? convertible.GetTypeCode() == TypeCode.DBNull : false;
+        }
+
+        // Converts the given object to the given type. In general, this

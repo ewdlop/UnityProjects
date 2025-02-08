@@ -1,0 +1,45 @@
+red_iterator PI = pred_begin(H);
+  assert(PI != pred_end(H) && "Loop must have at least one backedge!");
+  Backedge = *PI++;
+  if (PI == pred_end(H))
+    return nullptr; // dead loop
+  Incoming = *PI++;
+  if (PI != pred_end(H))
+    return nullptr; // multiple backedges?
+
+  if (contains(Incoming)) {
+    if (contains(Backedge))
+      return nullptr;
+    std::swap(Incoming, Backedge);
+  } else if (!contains(Backedge))
+    return nullptr;
+
+  // Loop over all of the PHI nodes, looking for a canonical indvar.
+  for (BasicBlock::iterator I = H->begin(); isa<PHINode>(I); ++I) {
+    PHINode *PN = cast<PHINode>(I);
+    if (ConstantInt *CI =
+            dyn_cast<ConstantInt>(PN->getIncomingValueForBlock(Incoming)))
+      if (CI->isZero())
+        if (Instruction *Inc =
+                dyn_cast<Instruction>(PN->getIncomingValueForBlock(Backedge)))
+          if (Inc->getOpcode() == Instruction::Add && Inc->getOperand(0) == PN)
+            if (ConstantInt *CI = dyn_cast<ConstantInt>(Inc->getOperand(1)))
+              if (CI->isOne())
+                return PN;
+  }
+  return nullptr;
+}
+
+// Check that 'BB' doesn't have any uses outside of the 'L'
+static bool isBlockInLCSSAForm(const Loop &L, const BasicBlock &BB,
+                               DominatorTree &DT) {
+  for (const Instruction &I : BB) {
+    // Tokens can't be used in PHI nodes and live-out tokens prevent loop
+    // optimizations, so for the purposes of considered LCSSA form, we
+    // can ignore them.
+    if (I.getType()->isTokenTy())
+      continue;
+
+    for (const Use &U : I.uses()) {
+      const Instruction *UI = cast<Instruction>(U.getUser());
+      const

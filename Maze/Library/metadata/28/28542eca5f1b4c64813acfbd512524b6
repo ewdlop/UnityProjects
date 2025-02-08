@@ -1,0 +1,141 @@
+um run-time overhead
+    std::string checkFinite(bool updateMask = false)
+    {
+        CheckFinite<GridType,typename GridType::ValueAllCIter> c;
+        return mDiagnose.check(c, updateMask, /*voxel*/true, /*tiles*/true, /*background*/true);
+    }
+
+    /// @brief Return a nonempty message if any of the inactive values are not zero.
+    ///
+    /// @note Medium run-time overhead
+    std::string checkInactiveValues(bool updateMask = false)
+    {
+        CheckMagnitude<GridType, typename GridType::ValueOffCIter> c(0);
+        return mDiagnose.check(c, updateMask, /*voxel*/true, /*tiles*/true, /*background*/true);
+    }
+
+    /// @brief Return a nonempty message if the active voxel values
+    /// are out-of-range, i.e. not in the range [0,1].
+    ///
+    /// @note Medium run-time overhead
+    std::string checkRange(bool updateMask = false)
+    {
+        CheckRange<GridType> c(0, 1);
+        return mDiagnose.check(c, updateMask, /*voxel*/true, /*tiles*/true, /*background*/false);
+    }
+
+    /// @brief Return a nonempty message if an error or issue is detected. Only
+    /// runs tests with a number lower than or equal to n, where:
+    ///
+    /// Fast checks
+    /// 1: value type is floating point
+    /// 2: has FOG volume class type
+    /// 3: background value is zero
+    ///
+    /// Slower checks
+    /// 4: all the values are finite, i.e not NaN or infinite
+    /// 5: inactive values are zero
+    /// 6: active values are in the range [0,1]
+    std::string check(size_t n=6, bool updateMask = false)
+    {
+        std::string str = this->checkValueType();
+        if (str.empty() && n>1) str = this->checkClassType();
+        if (str.empty() && n>2) str = this->checkBackground();
+        if (str.empty() && n>3) str = this->checkFinite(updateMask);
+        if (str.empty() && n>4) str = this->checkInactiveValues(updateMask);
+        if (str.empty() && n>5) str = this->checkRange(updateMask);
+        return str;
+    }
+
+private:
+    // disallow copy construction and copy by assignment!
+    CheckFogVolume(const CheckFogVolume&);// not implemented
+    CheckFogVolume& operator=(const CheckFogVolume&);// not implemented
+
+    // Member data
+    Diagnose<GridType> mDiagnose;
+};// CheckFogVolume
+
+template<class GridType>
+std::string
+checkFogVolume(const GridType& grid, size_t n)
+{
+    CheckFogVolume<GridType> c(grid);
+    return c.check(n, false);
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+
+// Internal utility objects and implementation details
+
+
+namespace diagnostics_internal {
+
+
+template<typename TreeType>
+class InactiveVoxelValues
+{
+public:
+    typedef tree::LeafManager<TreeType> LeafArray;
+    typedef typename TreeType::ValueType ValueType;
+    typedef std::set<ValueType> SetType;
+
+    InactiveVoxelValues(LeafArray&, size_t numValues);
+
+    void runParallel();
+    void runSerial();
+
+    void getInactiveValues(SetType&) const;
+
+    inline InactiveVoxelValues(const InactiveVoxelValues<TreeType>&, tbb::split);
+    inline void operator()(const tbb::blocked_range<size_t>&);
+    inline void join(const InactiveVoxelValues<TreeType>&);
+
+private:
+    LeafArray& mLeafArray;
+    SetType mInactiveValues;
+    size_t mNumValues;
+};// InactiveVoxelValues
+
+template<typename TreeType>
+InactiveVoxelValues<TreeType>::InactiveVoxelValues(LeafArray& leafs, size_t numValues)
+    : mLeafArray(leafs)
+    , mInactiveValues()
+    , mNumValues(numValues)
+{
+}
+
+template <typename TreeType>
+inline
+InactiveVoxelValues<TreeType>::InactiveVoxelValues(
+    const InactiveVoxelValues<TreeType>& rhs, tbb::split)
+    : mLeafArray(rhs.mLeafArray)
+    , mInactiveValues()
+    , mNumValues(rhs.mNumValues)
+{
+}
+
+template<typename TreeType>
+void
+InactiveVoxelValues<TreeType>::runParallel()
+{
+    tbb::parallel_reduce(mLeafArray.getRange(), *this);
+}
+
+
+template<typename TreeType>
+void
+InactiveVoxelValues<TreeType>::runSerial()
+{
+    (*this)(mLeafArray.getRange());
+}
+
+
+template<typename TreeType>
+inline void
+InactiveVoxelValues<TreeType>::operator()(const tbb::blocked_range<size_t>& range)
+{
+    typename TreeType::LeafNodeType::ValueOffCIter iter;
+
+    for (size_t n = range.begin(); n < range.end() && !tbb::ta

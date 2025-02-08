@@ -1,0 +1,776 @@
+   }
+                    break;
+                case EntityState.Detached:
+                    Debug.Fail("detached entry");
+                    break;
+            }
+        }
+
+        internal void UpdateOriginalValues(object entity)
+        {
+            Debug.Assert(EntityState.Added != this.State, "Cannot change original values of an entity in the Added state");
+
+            EntityState oldState = this.State;
+
+            this.UpdateRecordWithSetModified(entity, this.EditableOriginalValues);
+
+            if (oldState == EntityState.Unchanged && this.State == EntityState.Modified)
+            {
+                // The UpdateRecord changes state but doesn't update ObjectStateManager's dictionaries.
+                this.ObjectStateManager.ChangeState(this, oldState, EntityState.Modified);
+            }
+        }
+        
+        internal void UpdateRecordWithoutSetModified(object value, DbUpdatableDataRecord current)
+        {
+            UpdateRecord(value, current, UpdateRecordBehavior.WithoutSetModified, s_EntityRoot);
+        }
+
+        internal void UpdateRecordWithSetModified(object value, DbUpdatableDataRecord current)
+        {
+            UpdateRecord(value, current, UpdateRecordBehavior.WithSetModified, s_EntityRoot);
+        }
+
+        private enum UpdateRecordBehavior
+        {
+            WithoutSetModified,
+            WithSetModified
+        }
+
+        internal const int s_EntityRoot = -1;
+
+        private void UpdateRecord(object value, DbUpdatableDataRecord current, UpdateRecordBehavior behavior, int propertyIndex)
+        {
+            Debug.Assert(null != value, "null value");
+            Debug.Assert(null != current, "null CurrentValueRecord");
+            Debug.Assert(!(value is IEntityWrapper));
+            Debug.Assert(propertyIndex == s_EntityRoot ||
+                         propertyIndex >= 0, "Unexpected index. Use -1 if the passed value is an entity, not a complex type object");
+
+            // get Metadata for type
+            StateManagerTypeMetadata typeMetadata = current._metadata;
+            DataRecordInfo recordInfo = typeMetadata.DataRecordInfo;
+            
+            foreach (FieldMetadata field in recordInfo.FieldMetadata)
+            {
+                int index = field.Ordinal;
+
+                var member = typeMetadata.Member(index);
+                object fieldValue = member.GetValue(value) ?? DBNull.Value;
+
+                if (Helper.IsComplexType(field.FieldType.TypeUsage.EdmType))
+                {
+                    object existing = current.GetValue(index);
+                    // Ensure that the existing ComplexType value is not null. This is not supported.
+                    if (existing == DBNull.Value)
+                    {
+                        throw EntityUtil.NullableComplexTypesNotSupported(field.FieldType.Name);
+                    }
+                    else if (fieldValue != DBNull.Value)
+                    {
+                        // There is both an IExtendedDataRecord and an existing CurrentValueRecord
+
+                        // This part is different than Shaper.UpdateRecord - we have to remember the name of property on the entity (for complex types)
+                        // For property of a complex type the rootCLayerName is CLayerName of the complex property on the entity.
+                        this.UpdateRecord(fieldValue, (DbUpdatableDataRecord)existing, 
+                            behavior,
+                            propertyIndex == s_EntityRoot ? index : propertyIndex);
+                    }
+                }
+                else
+                {
+                    Debug.Assert(Helper.IsScalarType(field.FieldType.TypeUsage.EdmType), "Expected primitive or enum type.");
+
+                    // Set the new value if it doesn't match the existing value or if the field is modified, not a primary key, and
+                    // this entity has a conceptual null, since setting the field may then clear the conceptual null--see 640443.
+                    if (HasRecordValueChanged(current, index, fieldValue) && !member.IsPartOfKey)
+                    {
+                        current.SetValue(index, fieldValue);
+
+                        if (behavior == UpdateRecordBehavior.WithSetModified)
+                        {
+                            // This part is different than Shaper.UpdateRecord - we have to mark the field as modified.
+                            // For property of a complex type the rootCLayerName is CLayerName of the complex property on the entity.
+                            SetModifiedPropertyInternal(propertyIndex == s_EntityRoot ? index : propertyIndex);
+                        }
+                    }
+                }
+            }
+        }
+
+        internal bool HasRecordValueChanged(DbDataRecord record, int propertyIndex, object newFieldValue)
+        {
+            object existing = record.GetValue(propertyIndex);
+            return (existing != newFieldValue) &&
+                (((object)DBNull.Value == newFieldValue) ||
+                 ((object)DBNull.Value == existing) ||
+                 (!ByValueEqualityComparer.Default.Equals(existing, newFieldValue))) ||
+                (_cache.EntryHasConceptualNull(this) && _modifiedFields != null && _modifiedFields[propertyIndex]);
+        }
+
+        internal void ApplyCurrentValuesInternal(IEntityWrapper wrappedCurrentEntity)
+        {
+            Debug.Assert(!IsKeyEntry, "Cannot apply values to a key KeyEntry.");
+            Debug.Assert(wrappedCurrentEntity != null, "null entity wrapper");
+
+            if (this.State != EntityState.Modified &&
+                this.State != EntityState.Unchanged)
+            {
+                throw EntityUtil.EntityMustBeUnchangedOrModified(this.State);
+            }
+
+            if (this.WrappedEntity.IdentityType != wrappedCurrentEntity.IdentityType)
+            {
+                throw EntityUtil.EntitiesHaveDifferentType(this.Entity.GetType().FullName, wrappedCurrentEntity.Entity.GetType().FullName);
+            }
+
+            this.CompareKeyProperties(wrappedCurrentEntity.Entity);
+
+            UpdateCurrentValueRecord(wrappedCurrentEntity.Entity);
+        }
+
+        internal void UpdateCurrentValueRecord(object value)
+        {
+            Debug.Assert(!(value is IEntityWrapper));
+            _wrappedEntity.UpdateCurrentValueRecord(value, this);
+        }
+
+        internal void ApplyOriginalValuesInternal(IEntityWrapper wrappedOriginalEntity)
+        {
+            Debug.Assert(!IsKeyEntry, "Cannot apply values to a key KeyEntry.");
+            Debug.Assert(wrappedOriginalEntity != null, "null entity wrapper");
+
+            if (this.State != EntityState.Modified &&
+                this.State != EntityState.Unchanged &&
+                this.State != EntityState.Deleted)
+            {
+                throw EntityUtil.EntityMustBeUnchangedOrModifiedOrDeleted(this.State);
+            }
+
+            if (this.WrappedEntity.IdentityType != wrappedOriginalEntity.IdentityType)
+            {
+                throw EntityUtil.EntitiesHaveDifferentType(this.Entity.GetType().FullName, wrappedOriginalEntity.Entity.GetType().FullName);
+            }
+
+            this.CompareKeyProperties(wrappedOriginalEntity.Entity);
+
+            // The ObjectStateEntry.UpdateModifiedFields uses a variation of Shaper.UpdateRecord method 
+            // which additionaly marks properties as modified as necessary.
+            this.UpdateOriginalValues(wrappedOriginalEntity.Entity);
+        }
+
+        /// <summary>
+        /// For each FK contained in this entry, the entry is removed from the index maintained by
+        /// the ObjectStateManager for that key.
+        /// </summary>
+        internal void RemoveFromForeignKeyIndex()
+        {
+            if (!this.IsKeyEntry)
+            {
+                foreach (EntityReference relatedEnd in FindFKRelatedEnds())
+                {
+                    foreach(EntityKey foreignKey in relatedEnd.GetAllKeyValues())
+                    {
+                        _cache.RemoveEntryFromForeignKeyIndex(foreignKey, this);
+                    }
+                }
+                _cache.AssertEntryDoesNotExistInForeignKeyIndex(this);
+            }
+        }
+
+        /// <summary>
+        /// Looks at the foreign keys contained in this entry and performs fixup to the entities that
+        /// they reference, or adds the key and this entry to the index of foreign keys that reference
+        /// entities that we don't yet know about.
+        /// </summary>
+        internal void FixupReferencesByForeignKeys(bool replaceAddedRefs)
+        {
+            Debug.Assert(_cache != null, "Attempt to fixup detached entity entry");
+            _cache.TransactionManager.BeginGraphUpdate();
+            bool setIsLoaded = !(_cache.TransactionManager.IsAttachTracking || _cache.TransactionManager.IsAddTracking);
+            try
+            {
+                foreach (var dependent in ForeignKeyDependents)
+                {
+                    EntityReference relatedEnd = WrappedEntity.RelationshipManager.GetRelatedEndInternal(
+                        dependent.Item1.ElementType.FullName, dependent.Item2.FromRole.Name) as EntityReference;
+                    Debug.Assert(relatedEnd != null, "Expected non-null EntityReference to principal.");
+                    // Prevent fixup using values that are effectivly null but aren't nullable.
+                    if (!ForeignKeyFactory.IsConceptualNullKey(relatedEnd.CachedForeignKey))
+                    {
+                        FixupEntityReferenceToPrincipal(relatedEnd, null, setIsLoaded, replaceAddedRefs);
+                    }
+                }
+            }
+            finally
+            {
+                _cache.TransactionManager.EndGraphUpdate();
+            }
+        }
+
+        internal void FixupEntityReferenceByForeignKey(EntityReference reference)
+        {
+            // The FK is changing, so the reference is no longer loaded from the store, even if we do fixup
+            reference.SetIsLoaded(false);
+
+            // Remove the existing CachedForeignKey
+            bool hasConceptualNullFk = ForeignKeyFactory.IsConceptualNullKey(reference.CachedForeignKey);
+            if (hasConceptualNullFk)
+            {
+                ObjectStateManager.ForgetEntryWithConceptualNull(this, resetAllKeys: false);
+            }
+            
+            IEntityWrapper existingPrincipal = reference.ReferenceValue;
+            EntityKey foreignKey = ForeignKeyFactory.CreateKeyFromForeignKeyValues(this, reference);
+            
+            // Check if the new FK matches the key of the entity already at the principal end.
+            // If it does, then don't change the ref.
+            bool needToSetRef;
+            if ((object)foreignKey == null || existingPrincipal.Entity == null)
+            {
+                needToSetRef = true;
+            }
+            else
+            {
+                EntityKey existingPrincipalKey = existingPrincipal.EntityKey;
+                EntityEntry existingPrincipalEntry = existingPrincipal.ObjectStateEntry;
+                // existingPrincipalKey may be null if this fixup code is being called in the middle of
+                // adding an object.  This can happen when using change tracking proxies with fixup.
+                if ((existingPrincipalKey == null || existingPrincipalKey.IsTemporary) && existingPrincipalEntry != null)
+                {
+                    // Build a temporary non-temp key for the added entity so we can see if it matches the new FK
+                    existingPrincipalKey = new EntityKey((EntitySet)existingPrincipalEntry.EntitySet, (IExtendedDataRecord)existingPrincipalEntry.CurrentValues);
+                }
+                
+                // If existingPrincipalKey is still a temp key here, then the equality check will fail
+                needToSetRef = !foreignKey.Equals(existingPrincipalKey);
+            }
+
+            if (_cache.TransactionManager.RelationshipBeingUpdated != reference)
+            {
+                if (needToSetRef)
+                {
+                    ObjectStateManager stateManager = _cache;
+                    _cache.TransactionManager.BeginGraphUpdate();
+                    // Keep track of this entity so that we don't try to delete/detach the entity while we're
+                    // working with it.  This allows the FK to be set to some value without that entity being detached.
+                    // However, if the FK is being set to null, then for an identifying relationship we will detach.
+                    if ((object)foreignKey != null)
+                    {
+                        _cache.TransactionManager.EntityBeingReparented = Entity;
+                    }
+                    try
+                    {
+                        FixupEntityReferenceToPrincipal(reference, foreignKey, setIsLoaded: false, replaceExistingRef: true);
+                    }
+                    finally
+                    {
+                        Debug.Assert(_cache != null, "Unexpected null state manager.");
+                        _cache.TransactionManager.EntityBeingReparented = null;
+                        _cache.TransactionManager.EndGraphUpdate();
+                    }
+                }
+            }
+            else
+            {
+                // We only want to update the CachedForeignKey and not touch the EntityReference.Value/EntityKey
+                FixupEntityReferenceToPrincipal(reference, foreignKey, setIsLoaded: false, replaceExistingRef: false);
+            }
+        }
+
+        /// <summary>
+        /// Given a RelatedEnd that represents a FK from this dependent entity to the principal entity of the
+        /// relationship, this method fixes up references between the two entities.
+        /// </summary>
+        /// <param name="relatedEnd">Represents a FK relationship to a principal</param>
+        /// <param name="foreignKey">The foreign key, if it has already been computed</param>
+        /// <param name="setIsLoaded">If true, then the IsLoaded flag for the relationship is set</param>
+        /// <param name="replaceExistingRef">If true, then any existing references will be replaced</param>
+        internal void FixupEntityReferenceToPrincipal(EntityReference relatedEnd, EntityKey foreignKey, bool setIsLoaded, bool replaceExistingRef)
+        {
+            Debug.Assert(relatedEnd != null, "Found null RelatedEnd or EntityCollection to principal");
+            if (foreignKey == null)
+            {
+                foreignKey = ForeignKeyFactory.CreateKeyFromForeignKeyValues(this, relatedEnd);
+            }
+            // Note that if we're not changing FKs directly, but rather as a result of fixup after a ref has changed,
+            // and if the entity currently being pointed to is Added, then we shouldn't clobber it, because a ref to
+            // an Added entity wins in this case.
+            bool canModifyReference = _cache.TransactionManager.RelationshipBeingUpdated != relatedEnd &&
+                                      (!_cache.TransactionManager.IsForeignKeyUpdate ||
+                                       relatedEnd.ReferenceValue.ObjectStateEntry == null ||
+                                       relatedEnd.ReferenceValue.ObjectStateEntry.State != EntityState.Added);
+
+            // 
+
+            relatedEnd.SetCachedForeignKey(foreignKey, this);
+            ObjectStateManager.ForgetEntryWithConceptualNull(this, resetAllKeys: false);
+            if (foreignKey != null) // Implies no value is null or CreateKeyFromForeignKeyValues would have returned null
+            {
+                // Lookup key in OSM.  If found, then we can do fixup.  If not, then need to add to index
+                // Should not overwrite a reference at this point since this might cause the graph to
+                // be shredded.  This allows us to correctly detect key violations or RIC violations later.
+                EntityEntry principalEntry;
+                if (_cache.TryGetEntityEntry(foreignKey, out principalEntry) &&
+                    !principalEntry.IsKeyEntry &&
+                    principalEntry.State != EntityState.Deleted &&
+                    (replaceExistingRef || WillNotRefSteal(relatedEnd, principalEntry.WrappedEntity)) &&
+                    relatedEnd.CanSetEntityType(principalEntry.WrappedEntity))
+                {
+                    if (canModifyReference)
+                    {
+                        // We add both sides to the promoted EntityKeyRefs collection because it could be the dependent or
+                        // the principal or both that are being added.  Having extra members in this index doesn't hurt.
+                        if (_cache.TransactionManager.PopulatedEntityReferences != null)
+                        {
+                            Debug.Assert(_cache.TransactionManager.IsAddTracking || _cache.TransactionManager.IsAttachTracking,
+                                "PromotedEntityKeyRefs is non-null while not tracking add or attach");
+                            _cache.TransactionManager.PopulatedEntityReferences.Add(relatedEnd);
+                        }
+
+                        // Set the EntityKey on the RelatedEnd--this will cause the reference to be set and fixup to happen.
+                        relatedEnd.SetEntityKey(foreignKey, forceFixup: true);
+
+                        if (_cache.TransactionManager.PopulatedEntityReferences != null)
+                        {
+                            EntityReference otherEnd = relatedEnd.GetOtherEndOfRelationship(principalEntry.WrappedEntity) as EntityReference;
+                            if (otherEnd != null)
+                            {
+                                _cache.TransactionManager.PopulatedEntityReferences.Add(otherEnd);
+                            }
+                        }
+                    }
+                    if (setIsLoaded && principalEntry.State != EntityState.Added)
+                    {
+                        relatedEnd.SetIsLoaded(true);
+                    }
+                }
+                else
+                {
+                    // Add an entry to the index for later fixup
+                    _cache.AddEntryContainingForeignKeyToIndex(foreignKey, this);
+                    if (canModifyReference && replaceExistingRef && relatedEnd.ReferenceValue.Entity != null)
+                    {
+                        relatedEnd.ReferenceValue = EntityWrapperFactory.NullWrapper;
+                    }
+                }
+            }
+            else if(canModifyReference)
+            {
+                if (replaceExistingRef && (relatedEnd.ReferenceValue.Entity != null || relatedEnd.EntityKey != null))
+                {
+                    relatedEnd.ReferenceValue = EntityWrapperFactory.NullWrapper;
+                }
+                if (setIsLoaded)
+                {
+                    // This is the case where a query comes from the database with a null FK value.
+                    // We know that there is no related entity in the database and therefore the entity on the
+                    // other end of the relationship is as loaded as it is possible to be.  Therefore, we
+                    // set the IsLoaded flag so that if a user asks we will tell them that (based on last known
+                    // state of the database) there is no need to do a load.
+                    relatedEnd.SetIsLoaded(true);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Determins whether or not setting a reference will cause implicit ref stealing as part of FK fixup.
+        /// If it would, then an exception is thrown.  If it would not and we can safely overwrite the existing
+        /// value, then true is returned.  If it would not but we should not overwrite the existing value,
+        /// then false is returned.
+        private bool WillNotRefSteal(EntityReference refToPrincipal, IEntityWrapper wrappedPrincipal)
+        {
+            RelatedEnd dependentEnd = refToPrincipal.GetOtherEndOfRelationship(wrappedPrincipal);
+            EntityReference refToDependent = dependentEnd as EntityReference;
+            if ((refToPrincipal.ReferenceValue.Entity == null && refToPrincipal.NavigationPropertyIsNullOrMissing()) &&
+                (refToDependent == null || (refToDependent.ReferenceValue.Entity == null && refToDependent.NavigationPropertyIsNullOrMissing())))
+            {
+                // Return true if the ref to principal is null and it's not 1:1 or it is 1:1 and the ref to dependent is also null.
+                return true;
+            }
+            else if (refToDependent != null &&
+                     (Object.ReferenceEquals(refToDependent.ReferenceValue.Entity, refToPrincipal.WrappedOwner.Entity) ||
+                      refToDependent.CheckIfNavigationPropertyContainsEntity(refToPrincipal.WrappedOwner)))
+            {
+                return true;
+            }
+            else if (refToDependent == null ||
+                     Object.ReferenceEquals(refToPrincipal.ReferenceValue.Entity, wrappedPrincipal.Entity) ||
+                     refToPrincipal.CheckIfNavigationPropertyContainsEntity(wrappedPrincipal))
+            {
+                // Return false if the ref to principal is non-null and it's not 1:1
+                return false;
+            }
+            else
+            {
+                // Else it is 1:1 and one side or the other is non-null => reference steal!
+                throw EntityUtil.CannotAddMoreThanOneEntityToEntityReference(
+                    refToDependent.RelationshipNavigation.To,
+                    refToDependent.RelationshipNavigation.RelationshipName);
+            }
+        }
+
+        /// <summary>
+        /// Given that this entry represents an entity on the dependent side of a FK, this method attempts to return the key of the
+        /// entity on the principal side of the FK.  If the two entities both exist in the context, then the primary key of
+        /// the principal entity is found and returned.  If the principal entity does not exist in the context, then a key
+        /// for it is built up from the foreign key values contained in the dependent entity.
+        /// </summary>
+        /// <param name="principalRole">The role indicating the FK to navigate</param>
+        /// <param name="principalKey">Set to the principal key or null on return</param>
+        /// <returns>True if the principal key was found or built; false if it could not be found or built</returns>
+        internal bool TryGetReferenceKey(AssociationEndMember principalRole, out EntityKey principalKey)
+        {
+            EntityReference relatedEnd = (RelatedEnd)RelationshipManager.GetRelatedEnd(principalRole.DeclaringType.FullName, principalRole.Name) as EntityReference;
+            Debug.Assert(relatedEnd != null, "Expected there to be a non null EntityReference to the principal");
+            if (relatedEnd.CachedValue.Entity == null || relatedEnd.CachedValue.ObjectStateEntry == null)
+            {
+                principalKey = null;
+                return false;
+            }
+            // 
+            principalKey = relatedEnd.EntityKey ?? relatedEnd.CachedValue.ObjectStateEntry.EntityKey;
+            return principalKey != null;
+        }
+
+        /// <summary>
+        /// Performs fixuyup of foreign keys based on referencesd between objects.  This should only be called
+        /// for Added objects since this is the only time that references take precedence over FKs in fixup.
+        /// </summary>
+        internal void FixupForeignKeysByReference()
+        {
+            Debug.Assert(_cache != null, "Attempt to fixup detached entity entry");
+            _cache.TransactionManager.BeginFixupKeysByReference();
+            try
+            {
+                FixupForeignKeysByReference(null);
+            }
+            finally
+            {
+                _cache.TransactionManager.EndFixupKeysByReference();
+            }
+        }
+
+        /// <summary>
+        /// Fixup the FKs by the current reference values
+        /// Do this in the order of fixing up values from the principal ends first, and then propogate those values to the dependents
+        /// </summary>
+        /// <param name="visited"></param>
+        private void FixupForeignKeysByReference(List<EntityEntry> visited)
+        {
+            EntitySet entitySet = EntitySet as EntitySet;
+
+            // Perf optimization to avoid all this work if the entity doesn't participate in any FK relationships
+            if (!entitySet.HasForeignKeyRelationships)
+            {
+                return;
+            }
+            
+            foreach (var dependent in ForeignKeyDependents)
+            {
+                // Added dependent.  Make sure we traverse all the way to the top-most principal before beginging fixup.
+                EntityReference reference = RelationshipManager.GetRelatedEndInternal(dependent.Item1.ElementType.FullName, dependent.Item2.FromRole.Name) as EntityReference;
+                Debug.Assert(reference != null, "Expected reference to exist and be an entity reference (not collection)");
+                IEntityWrapper existingPrincipal = reference.ReferenceValue;
+                if (existingPrincipal.Entity != null)
+                {
+                    EntityEntry principalEntry = existingPrincipal.ObjectStateEntry;
+                    bool? isOneToMany = null;
+                    if (principalEntry != null && principalEntry.State == EntityState.Added &&
+                        (principalEntry != this || (isOneToMany = reference.GetOtherEndOfRelationship(existingPrincipal) is EntityReference).Value))
+                    {
+                        visited = visited ?? new List<EntityEntry>();
+                        if (visited.Contains(this))
+                        {
+                            if (!isOneToMany.HasValue)
+                            {
+                                isOneToMany = reference.GetOtherEndOfRelationship(existingPrincipal) is EntityReference;
+                            }
+                            if (isOneToMany.Value)
+                            {
+                                // Cycles in constraints are dissallowed except for 1:* self references
+                                throw EntityUtil.CircularRelationshipsWithReferentialConstraints();
+                            }
+                        }
+                        else
+                        {
+                            visited.Add(this);
+                            principalEntry.FixupForeignKeysByReference(visited);
+                            visited.Remove(this);
+                        }
+                    }
+                    // "forceChange" is false because we don't want to actually set the property values
+                    // here if they are aready set to the same thing--we don't want the events and setting
+                    // the modified flag is irrelavent during AcceptChanges.
+                    reference.UpdateForeignKeyValues(this.WrappedEntity, existingPrincipal, changedFKs: null, forceChange: false);
+                }
+                else
+                {
+                    EntityKey principalKey = reference.EntityKey;
+                    if (principalKey != null && !principalKey.IsTemporary)
+                    {
+                        reference.UpdateForeignKeyValues(this.WrappedEntity, principalKey);
+                    }
+                }
+            }
+
+            foreach (var principal in ForeignKeyPrincipals)
+            {
+                // Added prinipal end.  Fixup FKs on all dependents.
+                // This is necessary because of the case where a PK in an added entity is changed after it and its dependnents
+                // are added to the context--see bug 628752.
+                bool fkOverlapsPk = false; // Set to true if we find out that the FK overlaps the dependent PK
+                bool dependentPropsChecked = false; // Set to true once we have checked whether or not the FK overlaps the PK
+                EntityKey principalKey = WrappedEntity.EntityKey;
+                RelatedEnd principalEnd = RelationshipManager.GetRelatedEndInternal(principal.Item1.ElementType.FullName, principal.Item2.ToRole.Name);
+                foreach (IEntityWrapper dependent in principalEnd.GetWrappedEntities())
+                {
+                    EntityEntry dependentEntry = dependent.ObjectStateEntry;
+                    Debug.Assert(dependentEntry != null, "Should have fully tracked graph at this point.");
+                    if (dependentEntry.State != EntityState.Added && !dependentPropsChecked)
+                    {
+                        dependentPropsChecked = true;
+                        foreach (EdmProperty dependentProp in principal.Item2.ToProperties)
+                        {
+                            int dependentOrdinal = dependentEntry._cacheTypeMetadata.GetOrdinalforOLayerMemberName(dependentProp.Name);
+                            StateManagerMemberMetadata member = dependentEntry._cacheTypeMetadata.Member(dependentOrdinal);
+                            if (member.IsPartOfKey)
+                            {
+                                // If the FK overlpas the PK then we can't set it for non-Added entities.
+                                // In this situation we just continue with the next one and if the conflict
+                                // may then be flagged later as a RIC check.
+                                fkOverlapsPk = true;
+                                break;
+                            }
+                        }
+                    }
+                    // This code relies on the fact that a dependent referenced to an Added principal must be either Added or
+                    // Modified since we cannpt trust thestate of the principal PK and therefore the dependent FK must also
+                    // be considered not completely trusted--it may need to be updated.
+                    if (dependentEntry.State == EntityState.Added || (dependentEntry.State == EntityState.Modified && !fkOverlapsPk))
+                    {
+                        EntityReference principalRef = principalEnd.GetOtherEndOfRelationship(dependent) as EntityReference;
+                        Debug.Assert(principalRef != null, "Expected reference to exist and be an entity reference (not collection)");
+                        // "forceChange" is false because we don't want to actually set the property values
+                        // here if they are aready set to the same thing--we don't want the events and setting
+                        // the modified flag is irrelavent during AcceptChanges.
+                        principalRef.UpdateForeignKeyValues(dependent, WrappedEntity, changedFKs: null, forceChange: false);
+                    }
+                }
+            }
+        }
+
+        private bool IsPropertyAForeignKey(string propertyName)
+        {
+            foreach (var dependent in ForeignKeyDependents)
+            {
+                foreach (EdmProperty property in dependent.Item2.ToProperties)
+                {
+                    if (property.Name == propertyName)
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        private bool IsPropertyAForeignKey(string propertyName, out List<Pair<string, string>> relationships)
+        {
+            relationships = null;
+
+            foreach (var dependent in ForeignKeyDependents)
+            {
+                foreach (EdmProperty property in dependent.Item2.ToProperties)
+                {
+                    if (property.Name == propertyName)
+                    {
+                        if (relationships == null)
+                        {
+                            relationships = new List<Pair<string, string>>();
+                        }
+                        relationships.Add(new Pair<string, string>(dependent.Item1.ElementType.FullName, dependent.Item2.FromRole.Name));
+                        break;
+                    }
+                }
+            }
+            
+            return relationships != null;
+        }
+
+        internal void FindRelatedEntityKeysByForeignKeys(
+            out Dictionary<RelatedEnd, HashSet<EntityKey>> relatedEntities, 
+            bool useOriginalValues)
+        {
+            relatedEntities = null;
+
+            foreach (var dependent in ForeignKeyDependents)
+            {
+                AssociationSet associationSet = dependent.Item1;
+                ReferentialConstraint constraint = dependent.Item2;
+                // Get association end members for the dependent and the principal ends
+                string dependentId = constraint.ToRole.Identity;
+                var setEnds = associationSet.AssociationSetEnds;
+                Debug.Assert(associationSet.AssociationSetEnds.Count == 2, "Expected an association set with only two ends.");
+                AssociationEndMember dependentEnd;
+                AssociationEndMember principalEnd;
+                if (setEnds[0].CorrespondingAssociationEndMember.Identity == dependentId)
+                {
+                    dependentEnd = setEnds[0].CorrespondingAssociationEndMember;
+                    principalEnd = setEnds[1].CorrespondingAssociationEndMember;
+                }
+                else
+                {
+                    dependentEnd = setEnds[1].CorrespondingAssociationEndMember;
+                    principalEnd = setEnds[0].CorrespondingAssociationEndMember;
+                }
+
+                EntitySet principalEntitySet = MetadataHelper.GetEntitySetAtEnd(associationSet, principalEnd);
+                EntityKey foreignKey = ForeignKeyFactory.CreateKeyFromForeignKeyValues(this, constraint, principalEntitySet, useOriginalValues);
+                if (foreignKey != null) // Implies no value is null or CreateKeyFromForeignKeyValues would have returned null
+                {
+                    EntityReference reference = RelationshipManager.GetRelatedEndInternal(
+                        associationSet.ElementType.FullName, constraint.FromRole.Name) as EntityReference;
+
+                    // only for deleted relationships the hashset can have > 1 elements
+                    HashSet<EntityKey> entityKeys;
+                    relatedEntities = relatedEntities != null ? relatedEntities : new Dictionary<RelatedEnd, HashSet<EntityKey>>();
+                    if (!relatedEntities.TryGetValue(reference, out entityKeys))
+                    {
+                        entityKeys = new HashSet<EntityKey>();
+                        relatedEntities.Add(reference, entityKeys);
+                    }
+                    entityKeys.Add(foreignKey);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Returns a list of all RelatedEnds for this entity
+        /// that are the dependent end of an FK Association
+        /// </summary>
+        internal IEnumerable<EntityReference> FindFKRelatedEnds()
+        {
+            HashSet<EntityReference> relatedEnds = new HashSet<EntityReference>();
+
+            foreach (var dependent in ForeignKeyDependents)
+            {
+                EntityReference reference = RelationshipManager.GetRelatedEndInternal(
+                    dependent.Item1.ElementType.FullName, dependent.Item2.FromRole.Name) as EntityReference;
+                relatedEnds.Add(reference);
+            }
+            return relatedEnds;
+        }
+
+        /// <summary>
+        /// Identifies any changes in FK's and creates entries in;
+        /// - TransactionManager.AddedRelationshipsByForeignKey
+        /// - TransactionManager.DeletedRelationshipsByForeignKey
+        /// 
+        /// If the FK change will result in fix-up then two entries
+        /// are added to TransactionManager.AddedRelationshipsByForeignKey 
+        /// (one for each direction of the new realtionship)
+        /// </summary>
+        internal void DetectChangesInForeignKeys()
+        {
+            //DetectChangesInProperties should already have marked this entity as dirty
+            Debug.Assert(this.State == EntityState.Added || this.State == EntityState.Modified, "unexpected state");
+
+            //We are going to be adding data to the TransactionManager
+            TransactionManager tm = this.ObjectStateManager.TransactionManager;
+
+            foreach (EntityReference entityReference in this.FindFKRelatedEnds())
+            {
+                EntityKey currentKey = ForeignKeyFactory.CreateKeyFromForeignKeyValues(this, entityReference);
+                EntityKey originalKey = entityReference.CachedForeignKey;
+                bool originalKeyIsConceptualNull = ForeignKeyFactory.IsConceptualNullKey(originalKey);
+
+                //If both keys are null there is nothing to check
+                if (originalKey != null || currentKey != null)
+                {
+                    if (originalKey == null)
+                    {
+                        //If original is null then we are just adding a relationship
+                        EntityEntry entry;
+                        this.ObjectStateManager.TryGetEntityEntry(currentKey, out entry);
+                        this.AddRelationshipDetectedByForeignKey(tm.AddedRelationshipsByForeignKey, tm.AddedRelationshipsByPrincipalKey, currentKey, entry, entityReference);
+                    }
+                    else if (currentKey == null)
+                    {
+                        //If current is null we are just deleting a relationship
+                        Debug.Assert(!originalKeyIsConceptualNull, "If FK is nullable there shouldn't be a conceptual null set");
+                        this.AddDetectedRelationship(tm.DeletedRelationshipsByForeignKey, originalKey, entityReference);
+                    }
+                    //If there is a Conceptual Null set we need to check if the current values
+                    //are different from the values when the Conceptual Null was created
+                    else if (!currentKey.Equals(originalKey)
+                        && (!originalKeyIsConceptualNull || ForeignKeyFactory.IsConceptualNullKeyChanged(originalKey, currentKey)))
+                    {
+                        //If keys don't match then we are always adding
+                        EntityEntry entry;
+                        this.ObjectStateManager.TryGetEntityEntry(currentKey, out entry);
+                        this.AddRelationshipDetectedByForeignKey(tm.AddedRelationshipsByForeignKey, tm.AddedRelationshipsByPrincipalKey, currentKey, entry, entityReference);
+
+                        //And if the original key wasn't a conceptual null we are also deleting
+                        if (!originalKeyIsConceptualNull)
+                        {
+                            this.AddDetectedRelationship(tm.DeletedRelationshipsByForeignKey, originalKey, entityReference);
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// True if the underlying entity is not capable of tracking changes to complex types such that
+        /// DetectChanges is required to do this.
+        /// </summary>
+        internal bool RequiresComplexChangeTracking
+        {
+            get { return _requiresComplexChangeTracking; }
+        }
+
+        /// <summary>
+        /// True if the underlying entity is not capable of tracking changes to scalars such that
+        /// DetectChanges is required to do this.
+        /// </summary>
+        internal bool RequiresScalarChangeTracking
+        {
+            get { return _requiresScalarChangeTracking; }
+        }
+
+        /// <summary>
+        /// True if the underlying entity is not capable of performing full change tracking such that
+        /// it must be considered by at least some parts of DetectChanges.
+        /// </summary>
+        internal bool RequiresAnyChangeTracking
+        {
+            get { return _requiresAnyChangeTracking; }
+        }
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        rl"
+	{te = p+1;{output[0]=0x2115; {p++; goto _out; }}}
+	break;
+	case 289:
+#line 315 "src/char_ref.rl"
+	{te = p+1;{output[0]=0x2aec; {p++; goto _out; }}}
+	break;
+	case 290:
+#line 316 "src/char_ref.rl"
+	{te = p+1;{output[0]=0x2262; {p++; goto _out; }}}
+	break;
+	case 291:
+#line 317 "src/char_ref.rl"
+	{te = p+1;{output[0]=0x226d; {p++; goto _out; }}}
+	break;
+	case 292:
+#line 318 "src/char_ref.rl"
+	{te = p+1;{output[0]=0x2226; {p++; goto _out; }}}
+	break;
+	case 293:
+#line 319 "src/char_ref.rl"
+	{te = p+1;{outputINDX( 	 ù3¶           (   ð
+  è        c     t             –¢$    ` L     •¢$    ‹#”LlàÖ‹#”LlàÖ‹#”LlàÖÈ¨1FoàÖ       â               a p p . h     —¢$    ` L     •¢$    ‹#”LlàÖ‹#”LlàÖ‹#”LlàÖ »2FoàÖ       <               b y e . h     ˜¢$    p `     •¢$    ˜J”LlàÖ˜J”LlàÖ˜J”LlàÖ¬¢3FoàÖ       Ø               c o m m o n _ h e a d e r . h ™¢$    x d     •¢$    ˜J”LlàÖ˜J”LlàÖ˜J”LlàÖ?4FoàÖ       ã               c o m p o u n d _ p a c k e t . h     š¢$    ` N     •¢$    ¨q”LlàÖ¨q”LlàÖ¨q”LlàÖ•ë4FoàÖ       u               d l r r . h   ›¢$    ˆ r     •¢$    ¨q”LlàÖ¨q”LlàÖ¨q”LlàÖ:Õ5FoàÖ                      e x t e n d e d _ j i t t e r _ r e p o r t . h       œ¢$    x f     •¢$    ¼˜”LlàÖ¼˜”LlàÖ¼˜”LlàÖU˜6FoàÖ       º               e x t e n d e d _ r e p o r t s . h   ¢$    ` L     •¢$    ¼˜”LlàÖ¼˜”LlàÖ¼˜”LlàÖµ[7FoàÖ       T               f i r . h     ž¢$    ` N     •¢$    ß¿”LlàÖß¿”LlàÖß¿”LlàÖÂù7FoàÖ       Ó               n a  k . h   Ÿ¢$    ` L     •¢$    åæ”LlàÖåæ”LlàÖåæ”LlàÖúã8FoàÖ       €               p l i . h      ¢$    ` N     •¢$    åæ”LlàÖåæ”LlàÖåæ”LlàÖÔá9FoàÖ       Î               p s f b . h   ¡¢$    € n     •¢$    ù•LlàÖù•LlàÖù•LlàÖÌ:FoàÖ       ­               r a p i d _ r e s y n c _ r e q u e s t . h   ¢¢$    x d     •¢$    ù•LlàÖ"5•LlàÖ"5•LlàÖe;FoàÖ       )               r e c e i v e r _ r e p o r t . h     £¢$    ` N     •¢$    "5•LlàÖ"5•LlàÖ"5•LlàÖš<FoàÖ      	               r e m b . h   ¤¢$    p ^     •¢$    \•LlàÖ\•LlàÖ\•LlàÖ²Ü<FoàÖ       µ               r e p o r t _ b l o c k . h   ¥¢$    ` N     •¢$    \•LlàÖ\•LlàÖ\•LlàÖÑy=FoàÖ       Î               r p s i . h   ¦¢$    ` N     •¢$    /ƒ•LlàÖ/ƒ•LlàÖ/ƒ•LlàÖ¶J>FoàÖ       H               r r t r . h   §¢$    ` P     •¢$    /ƒ•LlàÖ/ƒ•LlàÖ/ƒ•LlàÖ5?FoàÖ       Ò               r t p f b . h ¨¢$    ` N     •¢$    9ª•LlàÖ9ª•LlàÖ9ª•LlàÖ“ø?FoàÖ       ï              s d e s . h   ©¢$    p `     •¢$    9ª•LlàÖÒ•LlàÖÒ•LlàÖ›¼@FoàÖ       ÿ
+               s e n d e r _ r e p o r t . h ª¢$    ` L     •¢$    Ò•LlàÖÒ•LlàÖÒ•LlàÖ·JAFoàÖ       
+               s l i . h     «¢$    ` P     •¢$    uø•LlàÖuø•LlàÖuø•LlàÖëçAFoàÖ       «               t m m b n . h ¬¢$    ` P     •¢$    uø•LlàÖ[–LlàÖ[–LlàÖiÒBFoàÖ                      t m m b r . h ­¢$    h X     •¢$    Ò•LlàÖuø•LlàÖuø•LlàÖznCFoàÖ       U               t m m b _ i  e m . h ®¢$    € j     •¢$    [–LlàÖ[–LlàÖ[–LlàÖÏ1DFoàÖ       ž               t r a n s p o r t _ f e e d b a c k . h       ¯¢$    p \     •¢$    [–LlàÖkF–LlàÖkF–LlàÖŒEFoàÖ       W               v o i p _ m e t r i c . h                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        

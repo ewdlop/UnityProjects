@@ -1,0 +1,694 @@
+d)
+    :   UObject(), fID(id)
+{
+}
+
+// -------------------------------------
+
+TimeZone::~TimeZone()
+{
+}
+
+// -------------------------------------
+
+TimeZone::TimeZone(const TimeZone &source)
+    :   UObject(source), fID(source.fID)
+{
+}
+
+// -------------------------------------
+
+TimeZone &
+TimeZone::operator=(const TimeZone &right)
+{
+    if (this != &right) fID = right.fID;
+    return *this;
+}
+
+// -------------------------------------
+
+UBool
+TimeZone::operator==(const TimeZone& that) const
+{
+    return typeid(*this) == typeid(that) &&
+        fID == that.fID;
+}
+
+// -------------------------------------
+
+namespace {
+TimeZone*
+createSystemTimeZone(const UnicodeString& id, UErrorCode& ec) {
+    if (U_FAILURE(ec)) {
+        return NULL;
+    }
+    TimeZone* z = 0;
+    UResourceBundle res;
+    ures_initStackObject(&res);
+    U_DEBUG_TZ_MSG(("pre-err=%s\n", u_errorName(ec)));
+    UResourceBundle *top = openOlsonResource(id, res, ec);
+    U_DEBUG_TZ_MSG(("post-err=%s\n", u_errorName(ec)));
+    if (U_SUCCESS(ec)) {
+        z = new OlsonTimeZone(top, &res, id, ec);
+        if (z == NULL) {
+          U_DEBUG_TZ_MSG(("cstz: olson time zone failed to initialize - err %s\n", u_errorName(ec)));
+        }
+    }
+    ures_close(&res);
+    ures_close(top);
+    if (U_FAILURE(ec)) {
+        U_DEBUG_TZ_MSG(("cstz: failed to create, err %s\n", u_errorName(ec)));
+        delete z;
+        z = 0;
+    }
+    return z;
+}
+
+/**
+ * Lookup the given name in our system zone table.  If found,
+ * instantiate a new zone of that name and return it.  If not
+ * found, return 0.
+ */
+TimeZone*
+createSystemTimeZone(const UnicodeString& id) {
+    UErrorCode ec = U_ZERO_ERROR;
+    return createSystemTimeZone(id, ec);
+}
+
+}
+
+TimeZone* U_EXPORT2
+TimeZone::createTimeZone(const UnicodeString& ID)
+{
+    /* We first try to lookup the zone ID in our system list.  If this
+     * fails, we try to parse it as a custom string GMT[+-]hh:mm.  If
+     * all else fails, we return GMT, which is probably not what the
+     * user wants, but at least is a functioning TimeZone object.
+     *
+     * We cannot return NULL, because that would break compatibility
+     * with the JDK.
+     */
+    TimeZone* result = createSystemTimeZone(ID);
+
+    if (result == 0) {
+        U_DEBUG_TZ_MSG(("failed to load system time zone with id - falling to custom"));
+        result = createCustomTimeZone(ID);
+    }
+    if (result == 0) {
+        U_DEBUG_TZ_MSG(("failed to load time zone with id - falling to Etc/Unknown(GMT)"));
+        result = getUnknown().clone();
+    }
+    return result;
+}
+
+// -------------------------------------
+
+/**
+ * Initialize DEFAULT_ZONE from the system default time zone.  
+ * Upon return, DEFAULT_ZONE will not be NULL, unless operator new()
+ * returns NULL.
+ */
+static void U_CALLCONV initDefault()
+{
+    ucln_i18n_registerCleanup(UCLN_I18N_TIMEZONE, timeZone_cleanup);
+
+    // If setDefault() has already been called we can skip getting the
+    // default zone information from the system.
+    if (DEFAULT_ZONE != NULL) {
+        return;
+    }
+    
+    // We access system timezone data through TPlatformUtilities,
+    // including tzset(), timezone, and tzname[].
+    int32_t rawOffset = 0;
+    const char *hostID;
+
+    // First, try to create a system timezone, based
+    // on the string ID in tzname[0].
+
+    // NOTE:  this code is safely single threaded, being only
+    // run via umtx_initOnce().
+    //
+    // Some of the locale/timezone OS functions may not be thread safe,
+    //
+    // The operating system might actually use ICU to implement timezones.
+    // So we may have ICU calling ICU here, like on AIX.
+    // There shouldn't be a problem with this; initOnce does not hold a mutex
+    // while the init function is being run.
+
+    uprv_tzset(); // Initialize tz... system data
+
+#if U_PLATFORM == U_PF_DURANGO
+	{
+		// create a simple time zone from info returned from GetTimeZoneInformation
+		// the Windows logic for detecting timezone name in uprv_tzname(0) doesn't work on Xbox
+		TIME_ZONE_INFORMATION apiTZI;
+		uprv_memset(&apiTZI, 0, sizeof(apiTZI));
+		GetTimeZoneInformation(&apiTZI);
+
+		rawOffset = -apiTZI.Bias * U_MILLIS_PER_MINUTE;
+		UnicodeString hostStrID(apiTZI.StandardName);
+		if (apiTZI.DaylightBias == 0)
+		{
+			DEFAULT_ZONE = new SimpleTimeZone(rawOffset, hostStrID);
+		}
+		else
+		{
+			int32_t savingsStartTime = apiTZI.DaylightDate.wHour * U_MILLIS_PER_HOUR
+				+ apiTZI.DaylightDate.wMinute * U_MILLIS_PER_MINUTE
+				+ apiTZI.DaylightDate.wSecond * U_MILLIS_PER_SECOND
+				+ apiTZI.DaylightDate.wMilliseconds;
+			int32_t savingsEndTime = apiTZI.StandardDate.wHour * U_MILLIS_PER_HOUR
+				+ apiTZI.StandardDate.wMinute * U_MILLIS_PER_MINUTE
+				+ apiTZI.StandardDate.wSecond * U_MILLIS_PER_SECOND
+				+ apiTZI.StandardDate.wMilliseconds;
+
+			UErrorCode result = U_ZERO_ERROR;
+			DEFAULT_ZONE = new SimpleTimeZone(rawOffset, hostStrID,
+				apiTZI.DaylightDate.wMonth, apiTZI.DaylightDate.wDay,
+				apiTZI.DaylightDate.wDayOfWeek, savingsStartTime,
+				apiTZI.StandardDate.wMonth, apiTZI.StandardDate.wDay,
+				apiTZI.StandardDate.wDayOfWeek, savingsEndTime,
+				-apiTZI.DaylightBias * U_MILLIS_PER_MINUTE, result);
+
+			if (U_FAILURE(result))
+			{
+				// just use it without DST info
+				delete DEFAULT_ZONE;
+				DEFAULT_ZONE = new SimpleTimeZone(rawOffset, hostStrID);
+			}
+		}
+		return;
+	}
+#endif
+
+    // Get the timezone ID from the host.  This function should do
+    // any required host-specific remapping; e.g., on Windows this
+    // function maps the Date and Time control panel setting to an
+    // ICU timezone ID.
+    hostID = uprv_tzname(0);
+
+    // Invert sign because UNIX semantics are backwards
+    rawOffset = uprv_timezone() * -U_MILLIS_PER_SECOND;
+
+    TimeZone* default_zone = NULL;
+
+    /* Make sure that the string is NULL terminated to prevent BoundsChecker/Purify warnings. */
+    UnicodeString hostStrID(hostID, -1, US_INV);
+    hostStrID.append((UChar)0);
+    hostStrID.truncate(hostStrID.length()-1);
+    default_zone = createSystemTimeZone(hostStrID);
+
+#if U_PLATFORM_USES_ONLY_WIN32_API
+    // hostID points to a heap-allocated location on Windows.
+    uprv_free(const_cast<char *>(hostID));
+#endif
+
+    int32_t hostIDLen = hostStrID.length();
+    if (default_zone != NULL && rawOffset != default_zone->getRawOffset()
+        && (3 <= hostIDLen && hostIDLen <= 4))
+    {
+        // Uh oh. This probably wasn't a good id.
+        // It was probably an ambiguous abbreviation
+        delete default_zone;
+        default_zone = NULL;
+    }
+
+    // Construct a fixed standard zone with the host's ID
+    // and raw offset.
+    if (default_zone == NULL) {
+        default_zone = new SimpleTimeZone(rawOffset, hostStrID);
+    }
+
+    // If we _still_ don't have a time zone, use GMT.
+    if (default_zone == NULL) {
+        const TimeZone* temptz = TimeZone::getGMT();
+        // If we can't use GMT, get out.
+        if (temptz == NULL) {
+            return;
+        }
+        default_zone = temptz->clone();
+    }
+
+    // The only way for DEFAULT_ZONE to be non-null at this point is if the user
+    // made a thread-unsafe call to setDefault() or adoptDefault() in another
+    // thread while this thread was doing something that required getting the default.
+    U_ASSERT(DEFAULT_ZONE == NULL);
+
+    DEFAULT_ZONE = default_zone;
+}
+
+// -------------------------------------
+
+TimeZone* U_EXPORT2
+TimeZone::createDefault()
+{
+    umtx_initOnce(gDefaultZoneInitOnce, initDefault);
+    return (DEFAULT_ZONE != NULL) ? DEFAULT_ZONE->clone() : NULL;
+}
+
+// -------------------------------------
+
+void U_EXPORT2
+TimeZone::adoptDefault(TimeZone* zone)
+{
+    if (zone != NULL)
+    {
+        TimeZone *old = DEFAULT_ZONE;
+        DEFAULT_ZONE = zone;
+        delete old;
+        ucln_i18n_registerCleanup(UCLN_I18N_TIMEZONE, timeZone_cleanup);
+    }
+}
+// -------------------------------------
+
+void U_EXPORT2
+TimeZone::setDefault(const TimeZone& zone)
+{
+    adoptDefault(zone.clone());
+}
+
+//----------------------------------------------------------------------
+
+
+static void U_CALLCONV initMap(USystemTimeZoneType type, UErrorCode& ec) {
+    ucln_i18n_registerCleanup(UCLN_I18N_TIMEZONE, timeZone_cleanup);
+
+    UResourceBundle *res = ures_openDirect(0, kZONEINFO, &ec);
+    res = ures_getByKey(res, kNAMES, res, &ec); // dereference Zones section
+    if (U_SUCCESS(ec)) {
+        int32_t size = ures_getSize(res);
+        int32_t *m = (int32_t *)uprv_malloc(size * sizeof(int32_t));
+        if (m == NULL) {
+            ec = U_MEMORY_ALLOCATION_ERROR;
+        } else {
+            int32_t numEntries = 0;
+            for (int32_t i = 0; i < size; i++) {
+                UnicodeString id = ures_getUnicodeStringByIndex(res, i, &ec);
+                if (U_FAILURE(ec)) {
+                    break;
+                }
+                if (0 == id.compare(UNKNOWN_ZONE_ID, UNKNOWN_ZONE_ID_LENGTH)) {
+                    // exclude Etc/Unknown
+                    continue;
+                }
+                if (type == UCAL_ZONE_TYPE_CANONICAL || type == UCAL_ZONE_TYPE_CANONICAL_LOCATION) {
+                    UnicodeString canonicalID;
+                    ZoneMeta::getCanonicalCLDRID(id, canonicalID, ec);
+                    if (U_FAILURE(ec)) {
+                        break;
+                    }
+                    if (canonicalID != id) {
+                        // exclude aliases
+                        continue;
+                    }
+                }
+                if (type == UCAL_ZONE_TYPE_CANONICAL_LOCATION) {
+                    const UChar *region = TimeZone::getRegion(id, ec);
+                    if (U_FAILURE(ec)) {
+                        break;
+                    }
+                    if (u_strcmp(region, WORLD) == 0) {
+                       // exclude non-location ("001")
+                        continue;
+                    }
+                }
+                m[numEntries++] = i;
+            }
+            if (U_SUCCESS(ec)) {
+                int32_t *tmp = m;
+                m = (int32_t *)uprv_realloc(tmp, numEntries * sizeof(int32_t));
+                if (m == NULL) {
+                    // realloc failed.. use the original one even it has unused
+                    // area at the end
+                    m = tmp;
+                }
+
+                switch(type) {
+                case UCAL_ZONE_TYPE_ANY:
+                    U_ASSERT(MAP_SYSTEM_ZONES == NULL);
+                    MAP_SYSTEM_ZONES = m;
+                    LEN_SYSTEM_ZONES = numEntries;
+                    break;
+                case UCAL_ZONE_TYPE_CANONICAL:
+                    U_ASSERT(MAP_CANONICAL_SYSTEM_ZONES == NULL);
+                    MAP_CANONICAL_SYSTEM_ZONES = m;
+                    LEN_CANONICAL_SYSTEM_ZONES = numEntries;
+                    break;
+                case UCAL_ZONE_TYPE_CANONICAL_LOCATION:
+                    U_ASSERT(MAP_CANONICAL_SYSTEM_LOCATION_ZONES == NULL);
+                    MAP_CANONICAL_SYSTEM_LOCATION_ZONES = m;
+                    LEN_CANONICAL_SYSTEM_LOCATION_ZONES = numEntries;
+                    break;
+                }
+            }
+        }
+    }
+    ures_close(res);
+}
+
+
+/**
+ * This is the default implementation for subclasses that do not
+ * override this method.  This implementation calls through to the
+ * 8-argument getOffset() method after suitable computations, and
+ * correctly adjusts GMT millis to local millis when necessary.
+ */
+void TimeZone::getOffset(UDate date, UBool local, int32_t& rawOffset,
+                         int32_t& dstOffset, UErrorCode& ec) const {
+    if (U_FAILURE(ec)) {
+        return;
+    }
+
+    rawOffset = getRawOffset();
+    if (!local) {
+        date += rawOffset; // now in local standard millis
+    }
+
+    // When local == TRUE, date might not be in local standard
+    // millis.  getOffset taking 7 parameters used here assume
+    // the given time in day is local standard time.
+    // At STD->DST transition, there is a range of time which
+    // does not exist.  When 'date' is in this time range
+    // (and local == TRUE), this method interprets the specified
+    // local time as DST.  At DST->STD transition, there is a
+    // range of time which occurs twice.  In this case, this
+    // method interprets the specified local time as STD.
+    // To support the behavior above, we need to call getOffset
+    // (with 7 args) twice when local == true and DST is
+    // detected in the initial call.
+    for (int32_t pass=0; ; ++pass) {
+        int32_t year, month, dom, dow;
+        double day = uprv_floor(date / U_MILLIS_PER_DAY);
+        int32_t millis = (int32_t) (date - day * U_MILLIS_PER_DAY);
+
+        Grego::dayToFields(day, year, month, dom, dow);
+
+        dstOffset = getOffset(GregorianCalendar::AD, year, month, dom,
+                              (uint8_t) dow, millis,
+                              Grego::monthLength(year, month),
+                              ec) - rawOffset;
+
+        // Recompute if local==TRUE, dstOffset!=0.
+        if (pass!=0 || !local || dstOffset == 0) {
+            break;
+        }
+        // adjust to local standard millis
+        date -= dstOffset;
+    }
+}
+
+// -------------------------------------
+
+// New available IDs API as of ICU 2.4.  Uses StringEnumeration API.
+
+class TZEnumeration : public StringEnumeration {
+private:
+
+    // Map into to zones.  Our results are zone[map[i]] for
+    // i=0..len-1, where zone[i] is the i-th Olson zone.  If map==NULL
+    // then our results are zone[i] for i=0..len-1.  Len will be zero
+    // if the zone data could not be loaded.
+    int32_t* map;
+    int32_t* localMap;
+    int32_t  len;
+    int32_t  pos;
+
+    TZEnumeration(int32_t* mapData, int32_t mapLen, UBool adoptMapData) : pos(0) {
+        map = mapData;
+        localMap = adoptMapData ? mapData : NULL;
+        len = mapLen;
+    }
+
+    UBool getID(int32_t i) {
+        UErrorCode ec = U_ZERO_ERROR;
+        int32_t idLen = 0;
+        const UChar* id = NULL;
+        UResourceBundle *top = ures_openDirect(0, kZONEINFO, &ec);
+        top = ures_getByKey(top, kNAMES, top, &ec); // dereference Zones section
+        id = ures_getStringByIndex(top, i, &idLen, &ec);
+        if(U_FAILURE(ec)) {
+            unistr.truncate(0);
+        }
+        else {
+            unistr.fastCopyFrom(UnicodeString(TRUE, id, idLen));
+        }
+        ures_close(top);
+        return U_SUCCESS(ec);
+    }
+
+    static int32_t* getMap(USystemTimeZoneType type, int32_t& len, UErrorCode& ec) {
+        len = 0;
+        if (U_FAILURE(ec)) {
+            return NULL;
+        }
+        int32_t* m = NULL;
+        switch (type) {
+        case UCAL_ZONE_TYPE_ANY:
+            umtx_initOnce(gSystemZonesInitOnce, &initMap, type, ec);
+            m = MAP_SYSTEM_ZONES;
+            len = LEN_SYSTEM_ZONES;
+            break;
+        case UCAL_ZONE_TYPE_CANONICAL:
+            umtx_initOnce(gCanonicalZonesInitOnce, &initMap, type, ec);
+            m = MAP_CANONICAL_SYSTEM_ZONES;
+            len = LEN_CANONICAL_SYSTEM_ZONES;
+            break;
+        case UCAL_ZONE_TYPE_CANONICAL_LOCATION:
+            umtx_initOnce(gCanonicalLocationZonesInitOnce, &initMap, type, ec);
+            m = MAP_CANONICAL_SYSTEM_LOCATION_ZONES;
+            len = LEN_CANONICAL_SYSTEM_LOCATION_ZONES;
+            break;
+        default:
+            ec = U_ILLEGAL_ARGUMENT_ERROR;
+            m = NULL;
+            len = 0;
+            break;
+        }
+        return m;
+    }
+
+public:
+
+#define DEFAULT_FILTERED_MAP_SIZE 8
+#define MAP_INCREMENT_SIZE 8
+
+    static TZEnumeration* create(USystemTimeZoneType type, const char* region, const int32_t* rawOffset, UErrorCode& ec) {
+        if (U_FAILURE(ec)) {
+            return NULL;
+        }
+
+        int32_t baseLen;
+        int32_t *baseMap = getMap(type, baseLen, ec);
+
+        if (U_FAILURE(ec)) {
+            return NULL;
+        }
+
+        // If any additional conditions are available,
+        // create instance local map filtered by the conditions.
+
+        int32_t *filteredMap = NULL;
+        int32_t numEntries = 0;
+
+        if (region != NULL || rawOffset != NULL) {
+            int32_t filteredMapSize = DEFAULT_FILTERED_MAP_SIZE;
+            filteredMap = (int32_t *)uprv_malloc(filteredMapSize * sizeof(int32_t));
+            if (filteredMap == NULL) {
+                ec = U_MEMORY_ALLOCATION_ERROR;
+                return NULL;
+            }
+
+            // Walk through the base map
+            UResourceBundle *res = ures_openDirect(0, kZONEINFO, &ec);
+            res = ures_getByKey(res, kNAMES, res, &ec); // dereference Zones section
+            for (int32_t i = 0; i < baseLen; i++) {
+                int32_t zidx = baseMap[i];
+                UnicodeString id = ures_getUnicodeStringByIndex(res, zidx, &ec);
+                if (U_FAILURE(ec)) {
+                    break;
+                }
+                if (region != NULL) {
+                    // Filter by region
+                    char tzregion[4]; // max 3 letters + null term
+                    TimeZone::getRegion(id, tzregion, sizeof(tzregion), ec);
+                    if (U_FAILURE(ec)) {
+                        break;
+                    }
+                    if (uprv_stricmp(tzregion, region) != 0) {
+                        // region does not match
+                        continue;
+                    }
+                }
+                if (rawOffset != NULL) {
+                    // Filter by raw offset
+                    // Note: This is VERY inefficient
+                    TimeZone *z = createSystemTimeZone(id, ec);
+                    if (U_FAILURE(ec)) {
+                        break;
+                    }
+                    int32_t tzoffset = z->getRawOffset();
+                    delete z;
+
+                    if (tzoffset != *rawOffset) {
+                        continue;
+                    }
+                }
+
+                if (filteredMapSize <= numEntries) {
+                    filteredMapSize += MAP_INCREMENT_SIZE;
+                    int32_t *tmp = (int32_t *)uprv_realloc(filteredMap, filteredMapSize * sizeof(int32_t));
+                    if (tmp == NULL) {
+                        ec = U_MEMORY_ALLOCATION_ERROR;
+                        break;
+                    } else {
+                        filteredMap = tmp;
+                    }
+                }
+
+                filteredMap[numEntries++] = zidx;
+            }
+
+            if (U_FAILURE(ec)) {
+                uprv_free(filteredMap);
+                filteredMap = NULL;
+            }
+
+            ures_close(res);
+        }
+
+        TZEnumeration *result = NULL;
+        if (U_SUCCESS(ec)) {
+            // Finally, create a new enumeration instance
+            if (filteredMap == NULL) {
+                result = new TZEnumeration(baseMap, baseLen, FALSE);
+            } else {
+                result = new TZEnumeration(filteredMap, numEntries, TRUE);
+                filteredMap = NULL;
+            }
+            if (result == NULL) {
+                ec = U_MEMORY_ALLOCATION_ERROR;
+            }
+        }
+
+        if (filteredMap != NULL) {
+            uprv_free(filteredMap);
+        }
+
+        return result;
+    }
+
+    TZEnumeration(const TZEnumeration &other) : StringEnumeration(), map(NULL), localMap(NULL), len(0), pos(0) {
+        if (other.localMap != NULL) {
+            localMap = (int32_t *)uprv_malloc(other.len * sizeof(int32_t));
+            if (localMap != NULL) {
+                len = other.len;
+                uprv_memcpy(localMap, other.localMap, len * sizeof(int32_t));
+                pos = other.pos;
+                map = localMap;
+            } else {
+                len = 0;
+                pos = 0;
+                map = NULL;
+            }
+        } else {
+            map = other.map;
+            localMap = NULL;
+            len = other.len;
+            pos = other.pos;
+        }
+    }
+
+    virtual ~TZEnumeration();
+
+    virtual StringEnumeration *clone() const {
+        return new TZEnumeration(*this);
+    }
+
+    virtual int32_t count(UErrorCode& status) const {
+        return U_FAILURE(status) ? 0 : len;
+    }
+
+    virtual const UnicodeString* snext(UErrorCode& status) {
+        if (U_SUCCESS(status) && map != NULL && pos < len) {
+            getID(map[pos]);
+            ++pos;
+            return &unistr;
+        }
+        return 0;
+    }
+
+    virtual void reset(UErrorCode& /*status*/) {
+        pos = 0;
+    }
+
+public:
+    static UClassID U_EXPORT2 getStaticClassID(void);
+    virtual UClassID getDynamicClassID(void) const;
+};
+
+TZEnumeration::~TZEnumeration() {
+    if (localMap != NULL) {
+        uprv_free(localMap);
+    }
+}
+
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(TZEnumeration)
+
+StringEnumeration* U_EXPORT2
+TimeZone::createTimeZoneIDEnumeration(
+            USystemTimeZoneType zoneType,
+            const char* region,
+            const int32_t* rawOffset,
+            UErrorCode& ec) {
+    return TZEnumeration::create(zoneType, region, rawOffset, ec);
+}
+
+StringEnumeration* U_EXPORT2
+TimeZone::createEnumeration() {
+    UErrorCode ec = U_ZERO_ERROR;
+    return TZEnumeration::create(UCAL_ZONE_TYPE_ANY, NULL, NULL, ec);
+}
+
+StringEnumeration* U_EXPORT2
+TimeZone::createEnumeration(int32_t rawOffset) {
+    UErrorCode ec = U_ZERO_ERROR;
+    return TZEnumeration::create(UCAL_ZONE_TYPE_ANY, NULL, &rawOffset, ec);
+}
+
+StringEnumeration* U_EXPORT2
+TimeZone::createEnumeration(const char* country) {
+    UErrorCode ec = U_ZERO_ERROR;
+    return TZEnumeration::create(UCAL_ZONE_TYPE_ANY, country, NULL, ec);
+}
+
+// ---------------------------------------
+
+int32_t U_EXPORT2
+TimeZone::countEquivalentIDs(const UnicodeString& id) {
+    int32_t result = 0;
+    UErrorCode ec = U_ZERO_ERROR;
+    UResourceBundle res;
+    ures_initStackObject(&res);
+    U_DEBUG_TZ_MSG(("countEquivalentIDs..\n"));
+    UResourceBundle *top = openOlsonResource(id, res, ec);
+    if (U_SUCCESS(ec)) {
+        UResourceBundle r;
+        ures_initStackObject(&r);
+        ures_getByKey(&res, kLINKS, &r, &ec);
+        ures_getIntVector(&r, &result, &ec);
+        ures_close(&r);
+    }
+    ures_close(&res);
+    ures_close(top);
+    return result;
+}
+
+// ---------------------------------------
+
+const UnicodeString U_EXPORT2
+TimeZone::getEquivalentID(const UnicodeString& id, int32_t index) {
+    U_DEBUG_TZ_MSG(("gEI(%d)\n", index));
+    UnicodeString result;
+    UErrorCode ec = U_ZERO_ERROR;
+    UResourceBundle res;

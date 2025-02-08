@@ -1,0 +1,656 @@
+           {
+                if (optionName == SocketOptionName.MulticastInterface)
+                {
+                    // if the value of the IP_MULTICAST_IF is an address in the 0.x.x.x block
+                    // the value is interpreted as an interface index
+                    int interfaceIndex = IPAddress.NetworkToHostOrder(optionValue);
+                    if ((interfaceIndex & 0xff000000) == 0)
+                    {
+                        var opt = new Interop.Sys.IPv4MulticastOption
+                        {
+                            MulticastAddress = 0,
+                            LocalAddress = 0,
+                            InterfaceIndex = interfaceIndex
+                        };
+
+                        err = Interop.Sys.SetIPv4MulticastOption(handle, Interop.Sys.MulticastOption.MULTICAST_IF, &opt);
+                        return GetErrorAndTrackSetting(handle, optionLevel, optionName, err);
+                    }
+                }
+            }
+
+            err = Interop.Sys.SetSockOpt(handle, optionLevel, optionName, (byte*)&optionValue, sizeof(int));
+
+            if (err == Interop.Error.SUCCESS)
+            {
+                if (optionLevel == SocketOptionLevel.IPv6 && optionName == SocketOptionName.IPv6Only)
+                {
+                    // Unix stacks may set IPv6Only to true once bound to an address.  This causes problems
+                    // for Socket.DualMode, and anything that depends on it, like CanTryAddressFamily.
+                    // To aid in connecting to multiple addresses (e.g. a DNS endpoint), we need to remember
+                    // whether DualMode / !IPv6Only was set, so that we can restore that value to a subsequent
+                    // handle after a failed connect.
+                    handle.DualMode = optionValue == 0;
+                }
+            }
+
+            return GetErrorAndTrackSetting(handle, optionLevel, optionName, err);
+        }
+
+        public static unsafe SocketError SetSockOpt(SafeCloseSocket handle, SocketOptionLevel optionLevel, SocketOptionName optionName, byte[] optionValue)
+        {
+            fixed (byte* pinnedValue = optionValue)
+            {
+                Interop.Error err = Interop.Sys.SetSockOpt(handle, optionLevel, optionName, pinnedValue, optionValue.Length);
+                return GetErrorAndTrackSetting(handle, optionLevel, optionName, err);
+            }
+        }
+
+        public static unsafe SocketError SetMulticastOption(SafeCloseSocket handle, SocketOptionName optionName, MulticastOption optionValue)
+        {
+            Debug.Assert(optionName == SocketOptionName.AddMembership || optionName == SocketOptionName.DropMembership, $"Unexpected optionName: {optionName}");
+
+            Interop.Sys.MulticastOption optName = optionName == SocketOptionName.AddMembership ?
+                Interop.Sys.MulticastOption.MULTICAST_ADD :
+                Interop.Sys.MulticastOption.MULTICAST_DROP;
+
+            IPAddress localAddress = optionValue.LocalAddress ?? IPAddress.Any;
+
+#pragma warning disable CS0618 // Address is marked obsolete
+            var opt = new Interop.Sys.IPv4MulticastOption
+            {
+                MulticastAddress = unchecked((uint)optionValue.Group.Address),
+                LocalAddress = unchecked((uint)localAddress.Address),
+                InterfaceIndex = optionValue.InterfaceIndex
+            };
+#pragma warning restore CS0618
+
+            Interop.Error err = Interop.Sys.SetIPv4MulticastOption(handle, optName, &opt);
+            return GetErrorAndTrackSetting(handle, SocketOptionLevel.IP, optionName, err);
+        }
+
+        public static unsafe SocketError SetIPv6MulticastOption(SafeCloseSocket handle, SocketOptionName optionName, IPv6MulticastOption optionValue)
+        {
+            Debug.Assert(optionName == SocketOptionName.AddMembership || optionName == SocketOptionName.DropMembership, $"Unexpected optionName={optionName}");
+
+            Interop.Sys.MulticastOption optName = optionName == SocketOptionName.AddMembership ?
+                Interop.Sys.MulticastOption.MULTICAST_ADD :
+                Interop.Sys.MulticastOption.MULTICAST_DROP;
+
+            var opt = new Interop.Sys.IPv6MulticastOption {
+                Address = optionValue.Group.GetNativeIPAddress(),
+                InterfaceIndex = (int)optionValue.InterfaceIndex
+            };
+
+            Interop.Error err = Interop.Sys.SetIPv6MulticastOption(handle, optName, &opt);
+            return GetErrorAndTrackSetting(handle, SocketOptionLevel.IPv6, optionName, err);
+        }
+
+        public static unsafe SocketError SetLingerOption(SafeCloseSocket handle, LingerOption optionValue)
+        {
+            var opt = new Interop.Sys.LingerOption {
+                OnOff = optionValue.Enabled ? 1 : 0,
+                Seconds = optionValue.LingerTime
+            };
+
+            Interop.Error err = Interop.Sys.SetLingerOption(handle, &opt);
+            return GetErrorAndTrackSetting(handle, SocketOptionLevel.Socket, SocketOptionName.Linger, err);
+        }
+
+        public static void SetReceivingDualModeIPv4PacketInformation(Socket socket)
+        {
+            // NOTE: some platforms (e.g. OS X) do not support receiving IPv4 packet information for packets received
+            //       on dual-mode sockets. On these platforms, this call is a no-op.
+            if (SupportsDualModeIPv4PacketInfo)
+            {
+                socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.PacketInformation, true);
+            }
+        }
+
+        public static void SetIPProtectionLevel(Socket socket, SocketOptionLevel optionLevel, int protectionLevel)
+        {
+            throw new PlatformNotSupportedException(SR.PlatformNotSupported_IPProtectionLevel);
+        }
+
+        public static unsafe SocketError GetSockOpt(SafeCloseSocket handle, SocketOptionLevel optionLevel, SocketOptionName optionName, out int optionValue)
+        {
+            if (optionLevel == SocketOptionLevel.Socket)
+            {
+                if (optionName == SocketOptionName.ReceiveTimeout)
+                {
+                    optionValue = handle.ReceiveTimeout == -1 ? 0 : handle.ReceiveTimeout;
+                    return SocketError.Success;
+                }
+                else if (optionName == SocketOptionName.SendTimeout)
+                {
+                    optionValue = handle.SendTimeout == -1 ? 0 : handle.SendTimeout;
+                    return SocketError.Success;
+                }
+            }
+
+            if (optionName == SocketOptionName.Error)
+            {
+                Interop.Error socketError = default(Interop.Error);
+                Interop.Error getErrorError = Interop.Sys.GetSocketErrorOption(handle, &socketError);
+                optionValue = (int)GetSocketErrorForErrorCode(socketError);
+                return getErrorError == Interop.Error.SUCCESS ? SocketError.Success : GetSocketErrorForErrorCode(getErrorError);
+            }
+
+            int value = 0;
+            int optLen = sizeof(int);
+            Interop.Error err = Interop.Sys.GetSockOpt(handle, optionLevel, optionName, (byte*)&value, &optLen);
+
+            optionValue = value;
+            return err == Interop.Error.SUCCESS ? SocketError.Success : GetSocketErrorForErrorCode(err);
+        }
+
+        public static unsafe SocketError GetSockOpt(SafeCloseSocket handle, SocketOptionLevel optionLevel, SocketOptionName optionName, byte[] optionValue, ref int optionLength)
+        {
+            int optLen = optionLength;
+
+            Interop.Error err;
+            if (optionValue == null || optionValue.Length == 0)
+            {
+                optLen = 0;
+                err = Interop.Sys.GetSockOpt(handle, optionLevel, optionName, null, &optLen);
+            }
+            else if (optionName == SocketOptionName.Error && optionValue.Length >= sizeof(int))
+            {
+                int outError;
+                SocketError returnError = GetSockOpt(handle, optionLevel, optionName, out outError);
+                if (returnError == SocketError.Success)
+                {
+                    fixed (byte* pinnedValue = &optionValue[0])
+                    {
+                        Debug.Assert(BitConverter.IsLittleEndian, "Expected little endian");
+                        *((int*)pinnedValue) = outError;
+                    }
+                    optionLength = sizeof(int);
+                }
+                return returnError;
+            }
+            else
+            {
+                fixed (byte* pinnedValue = &optionValue[0])
+                {
+                    err = Interop.Sys.GetSockOpt(handle, optionLevel, optionName, pinnedValue, &optLen);
+                }
+            }
+
+            if (err == Interop.Error.SUCCESS)
+            {
+                optionLength = optLen;
+                return SocketError.Success;
+            }
+
+            return GetSocketErrorForErrorCode(err);
+        }
+
+        public static unsafe SocketError GetMulticastOption(SafeCloseSocket handle, SocketOptionName optionName, out MulticastOption optionValue)
+        {
+            Debug.Assert(optionName == SocketOptionName.AddMembership || optionName == SocketOptionName.DropMembership, $"Unexpected optionName={optionName}");
+
+            Interop.Sys.MulticastOption optName = optionName == SocketOptionName.AddMembership ?
+                Interop.Sys.MulticastOption.MULTICAST_ADD :
+                Interop.Sys.MulticastOption.MULTICAST_DROP;
+
+            Interop.Sys.IPv4MulticastOption opt = default;
+            Interop.Error err = Interop.Sys.GetIPv4MulticastOption(handle, optName, &opt);
+            if (err != Interop.Error.SUCCESS)
+            {
+                optionValue = default(MulticastOption);
+                return GetSocketErrorForErrorCode(err);
+            }
+
+            var multicastAddress = new IPAddress((long)opt.MulticastAddress);
+            var localAddress = new IPAddress((long)opt.LocalAddress);
+            optionValue = new MulticastOption(multicastAddress, localAddress) {
+                InterfaceIndex = opt.InterfaceIndex
+            };
+
+            return SocketError.Success;
+        }
+
+        public static unsafe SocketError GetIPv6MulticastOption(SafeCloseSocket handle, SocketOptionName optionName, out IPv6MulticastOption optionValue)
+        {
+            Debug.Assert(optionName == SocketOptionName.AddMembership || optionName == SocketOptionName.DropMembership, $"Unexpected optionName={optionName}");
+
+            Interop.Sys.MulticastOption optName = optionName == SocketOptionName.AddMembership ?
+                Interop.Sys.MulticastOption.MULTICAST_ADD :
+                Interop.Sys.MulticastOption.MULTICAST_DROP;
+
+            Interop.Sys.IPv6MulticastOption opt = default;
+            Interop.Error err = Interop.Sys.GetIPv6MulticastOption(handle, optName, &opt);
+            if (err != Interop.Error.SUCCESS)
+            {
+                optionValue = default(IPv6MulticastOption);
+                return GetSocketErrorForErrorCode(err);
+            }
+
+            optionValue = new IPv6MulticastOption(opt.Address.GetIPAddress(), opt.InterfaceIndex);
+            return SocketError.Success;
+        }
+
+        public static unsafe SocketError GetLingerOption(SafeCloseSocket handle, out LingerOption optionValue)
+        {
+            var opt = new Interop.Sys.LingerOption();
+            Interop.Error err = Interop.Sys.GetLingerOption(handle, &opt);
+            if (err != Interop.Error.SUCCESS)
+            {
+                optionValue = default(LingerOption);
+                return GetSocketErrorForErrorCode(err);
+            }
+
+            optionValue = new LingerOption(opt.OnOff != 0, opt.Seconds);
+            return SocketError.Success;
+        }
+
+        public static unsafe SocketError Poll(SafeCloseSocket handle, int microseconds, SelectMode mode, out bool status)
+        {
+            Interop.Sys.PollEvents inEvent = Interop.Sys.PollEvents.POLLNONE;
+            switch (mode)
+            {
+                case SelectMode.SelectRead: inEvent = Interop.Sys.PollEvents.POLLIN; break;
+                case SelectMode.SelectWrite: inEvent = Interop.Sys.PollEvents.POLLOUT; break;
+                case SelectMode.SelectError: inEvent = Interop.Sys.PollEvents.POLLPRI; break;
+            }
+
+            int milliseconds = microseconds == -1 ? -1 : microseconds / 1000;
+
+            Interop.Sys.PollEvents outEvents;
+            Interop.Error err = Interop.Sys.Poll(handle, inEvent, milliseconds, out outEvents);
+            if (err != Interop.Error.SUCCESS)
+            {
+                status = false;
+                return GetSocketErrorForErrorCode(err);
+            }
+
+            switch (mode)
+            {
+                case SelectMode.SelectRead: status = (outEvents & (Interop.Sys.PollEvents.POLLIN | Interop.Sys.PollEvents.POLLHUP)) != 0; break;
+                case SelectMode.SelectWrite: status = (outEvents & Interop.Sys.PollEvents.POLLOUT) != 0; break;
+                case SelectMode.SelectError: status = (outEvents & (Interop.Sys.PollEvents.POLLERR | Interop.Sys.PollEvents.POLLPRI)) != 0; break;
+                default: status = false; break;
+            }
+            return SocketError.Success;
+        }
+
+        public static unsafe SocketError Select(IList checkRead, IList checkWrite, IList checkError, int microseconds)
+        {
+            int checkReadInitialCount = checkRead != null ? checkRead.Count : 0;
+            int checkWriteInitialCount = checkWrite != null ? checkWrite.Count : 0;
+            int checkErrorInitialCount = checkError != null ? checkError.Count : 0;
+            int count = checked(checkReadInitialCount + checkWriteInitialCount + checkErrorInitialCount);
+            Debug.Assert(count > 0, $"Expected at least one entry.");
+
+            // Rather than using the select syscall, we use poll.  While this has a mismatch in API from Select and
+            // requires some translation, it avoids the significant limitation of select only working with file descriptors
+            // less than FD_SETSIZE, and thus failing arbitrarily depending on the file descriptor value assigned
+            // by the system.  Since poll then expects an array of entries, we try to allocate the array on the stack,
+            // only falling back to allocating it on the heap if it's deemed too big.
+
+            const int StackThreshold = 80; // arbitrary limit to avoid too much space on stack
+            if (count < StackThreshold)
+            {
+                Interop.Sys.PollEvent* eventsOnStack = stackalloc Interop.Sys.PollEvent[count];
+                return SelectViaPoll(
+                    checkRead, checkReadInitialCount,
+                    checkWrite, checkWriteInitialCount,
+                    checkError, checkErrorInitialCount,
+                    eventsOnStack, count, microseconds);
+            }
+            else
+            {
+                var eventsOnHeap = new Interop.Sys.PollEvent[count];
+                fixed (Interop.Sys.PollEvent* eventsOnHeapPtr = &eventsOnHeap[0])
+                {
+                    return SelectViaPoll(
+                        checkRead, checkReadInitialCount,
+                        checkWrite, checkWriteInitialCount,
+                        checkError, checkErrorInitialCount,
+                        eventsOnHeapPtr, count, microseconds);
+                }
+            }
+        }
+
+        private static unsafe SocketError SelectViaPoll(
+            IList checkRead, int checkReadInitialCount,
+            IList checkWrite, int checkWriteInitialCount,
+            IList checkError, int checkErrorInitialCount,
+            Interop.Sys.PollEvent* events, int eventsLength,
+            int microseconds)
+        {
+            // Add each of the list's contents to the events array 
+            Debug.Assert(eventsLength == checkReadInitialCount + checkWriteInitialCount + checkErrorInitialCount, "Invalid eventsLength");
+            int offset = 0;
+            AddToPollArray(events, eventsLength, checkRead, ref offset, Interop.Sys.PollEvents.POLLIN | Interop.Sys.PollEvents.POLLHUP);
+            AddToPollArray(events, eventsLength, checkWrite, ref offset, Interop.Sys.PollEvents.POLLOUT);
+            AddToPollArray(events, eventsLength, checkError, ref offset, Interop.Sys.PollEvents.POLLPRI);
+            Debug.Assert(offset == eventsLength, $"Invalid adds. offset={offset}, eventsLength={eventsLength}.");
+
+            // Do the poll
+            uint triggered = 0;
+            int milliseconds = microseconds == -1 ? -1 : microseconds / 1000;
+            Interop.Error err = Interop.Sys.Poll(events, (uint)eventsLength, milliseconds, &triggered);
+            if (err != Interop.Error.SUCCESS)
+            {
+                return GetSocketErrorForErrorCode(err);
+            }
+
+            // Remove from the lists any entries which weren't set
+            if (triggered == 0)
+            {
+                checkRead?.Clear();
+                checkWrite?.Clear();
+                checkError?.Clear();
+            }
+            else
+            {
+                FilterPollList(checkRead, events, checkReadInitialCount - 1, Interop.Sys.PollEvents.POLLIN | Interop.Sys.PollEvents.POLLHUP);
+                FilterPollList(checkWrite, events, checkWriteInitialCount + checkReadInitialCount - 1, Interop.Sys.PollEvents.POLLOUT);
+                FilterPollList(checkError, events, checkErrorInitialCount + checkWriteInitialCount + checkReadInitialCount - 1, Interop.Sys.PollEvents.POLLERR | Interop.Sys.PollEvents.POLLPRI);
+            }
+            return SocketError.Success;
+        }
+
+        private static unsafe void AddToPollArray(Interop.Sys.PollEvent* arr, int arrLength, IList socketList, ref int arrOffset, Interop.Sys.PollEvents events)
+        {
+            if (socketList == null)
+                return;
+
+            int listCount = socketList.Count;
+            for (int i = 0; i < listCount; i++)
+            {
+                if (arrOffset >= arrLength)
+                {
+                    Debug.Fail("IList.Count must have been faulty, returning a negative value and/or returning a different value across calls.");
+                    throw new ArgumentOutOfRangeException(nameof(socketList));
+                }
+
+                Socket socket = socketList[i] as Socket;
+                if (socket == null)
+                {
+                    throw new ArgumentException(SR.Format(SR.net_sockets_select, socket?.GetType().FullName ?? "null", typeof(Socket).FullName), nameof(socketList));
+                }
+
+                int fd = (int)socket.SafeHandle.DangerousGetHandle();
+                arr[arrOffset++] = new Interop.Sys.PollEvent { Events = events, FileDescriptor = fd };
+            }
+        }
+
+        private static unsafe void FilterPollList(IList socketList, Interop.Sys.PollEvent* arr, int arrEndOffset, Interop.Sys.PollEvents desiredEvents)
+        {
+            if (socketList == null)
+                return;
+
+            // The Select API requires leaving in the input lists only those sockets that were ready.  As such, we need to loop
+            // through each poll event, and for each that wasn't ready, remove the corresponding Socket from its list.  Technically
+            // this is O(n^2), due to removing from the list requiring shifting down all elements after it.  However, this doesn't
+            // happen with the most common cases.  If very few sockets were ready, then as we iterate from the end of the list, each
+            // removal will typically be O(1) rather than O(n).  If most sockets were ready, then we only need to remove a few, in
+            // which case we're only doing a small number of O(n) shifts.  It's only for the intermediate case, where a non-trivial
+            // number of sockets are ready and a non-trivial number of sockets are not ready that we end up paying the most.  We could
+            // avoid these costs by, for example, allocating a side list that we fill with the sockets that should remain, clearing
+            // the original list, and then populating the original list with the contents of the side list.  That of course has its
+            // own costs, and so for now we do the "simple" thing.  This can be changed in the future as needed.
+
+            for (int i = socketList.Count - 1; i >= 0; --i, --arrEndOffset)
+            {
+                if (arrEndOffset < 0)
+                {
+                    Debug.Fail("IList.Count must have been faulty, returning a negative value and/or returning a different value across calls.");
+                    throw new ArgumentOutOfRangeException(nameof(arrEndOffset));
+                }
+
+                if ((arr[arrEndOffset].TriggeredEvents & desiredEvents) == 0)
+                {
+                    socketList.RemoveAt(i);
+                }
+            }
+        }
+
+        public static SocketError Shutdown(SafeCloseSocket handle, bool isConnected, bool isDisconnected, SocketShutdown how)
+        {
+            Interop.Error err = Interop.Sys.Shutdown(handle, how);
+            if (err == Interop.Error.SUCCESS)
+            {
+                return SocketError.Success;
+            }
+
+            // If shutdown returns ENOTCONN and we think that this socket has ever been connected,
+            // ignore the error. This can happen for TCP connections if the underlying connection
+            // has reached the CLOSE state. Ignoring the error matches Winsock behavior.
+            if (err == Interop.Error.ENOTCONN && (isConnected || isDisconnected))
+            {
+                return SocketError.Success;
+            }
+
+            return GetSocketErrorForErrorCode(err);
+        }
+
+        public static SocketError ConnectAsync(Socket socket, SafeCloseSocket handle, byte[] socketAddress, int socketAddressLen, ConnectOverlappedAsyncResult asyncResult)
+        {
+            SocketError socketError = handle.AsyncContext.ConnectAsync(socketAddress, socketAddressLen, asyncResult.CompletionCallback);
+            if (socketError == SocketError.Success)
+            {
+                asyncResult.CompletionCallback(SocketError.Success);
+            }
+            return socketError;
+        }
+
+        public static SocketError SendAsync(SafeCloseSocket handle, byte[] buffer, int offset, int count, SocketFlags socketFlags, OverlappedAsyncResult asyncResult)
+        {
+            int bytesSent;
+            SocketError socketError = handle.AsyncContext.SendAsync(buffer, offset, count, socketFlags, out bytesSent, asyncResult.CompletionCallback);
+            if (socketError == SocketError.Success)
+            {
+                asyncResult.CompletionCallback(bytesSent, null, 0, SocketFlags.None, SocketError.Success);
+            }
+            return socketError;
+        }
+
+        public static SocketError SendAsync(SafeCloseSocket handle, IList<ArraySegment<byte>> buffers, SocketFlags socketFlags, OverlappedAsyncResult asyncResult)
+        {
+            int bytesSent;
+            SocketError socketError = handle.AsyncContext.SendAsync(buffers, socketFlags, out bytesSent, asyncResult.CompletionCallback);
+            if (socketError == SocketError.Success)
+            {
+                asyncResult.CompletionCallback(bytesSent, null, 0, SocketFlags.None, SocketError.Success);
+            }
+            return socketError;
+        }
+
+        public static SocketError SendFileAsync(SafeCloseSocket handle, FileStream fileStream, Action<long, SocketError> callback) =>
+            SendFileAsync(handle, fileStream, 0, (int)fileStream.Length, callback);
+
+        private static SocketError SendFileAsync(SafeCloseSocket handle, FileStream fileStream, int offset, int count, Action<long, SocketError> callback)
+        {
+            long bytesSent;
+            SocketError socketError = handle.AsyncContext.SendFileAsync(fileStream.SafeFileHandle, offset, count, out bytesSent, callback);
+            if (socketError == SocketError.Success)
+            {
+                callback(bytesSent, SocketError.Success);
+            }
+            return socketError;
+        }
+
+        public static async void SendPacketsAsync(
+            Socket socket, TransmitFileOptions options, SendPacketsElement[] elements, FileStream[] files, Action<long, SocketError> callback)
+        {
+            SocketError error = SocketError.Success;
+            long bytesTransferred = 0;
+            try
+            {
+                Debug.Assert(elements.Length == files.Length);
+                for (int i = 0; i < elements.Length; i++)
+                {
+                    SendPacketsElement e = elements[i];
+                    if (e != null)
+                    {
+                        if (e.FilePath == null)
+                        {
+                            bytesTransferred += await socket.SendAsync(new ArraySegment<byte>(e.Buffer, e.Offset, e.Count), SocketFlags.None).ConfigureAwait(false);
+                        }
+                        else
+                        {
+                            FileStream fs = files[i];
+                            if (e.Offset > fs.Length - e.Count)
+                            {
+                                throw new ArgumentOutOfRangeException();
+                            }
+
+                            var tcs = new TaskCompletionSource<SocketError>();
+                            error = SendFileAsync(socket.SafeHandle, fs, e.Offset, e.Count > 0 ? e.Count : checked((int)(fs.Length - e.Offset)), (transferred, se) =>
+                            {
+                                bytesTransferred += transferred;
+                                tcs.TrySetResult(se);
+                            });
+                            if (error == SocketError.IOPending)
+                            {
+                                error = await tcs.Task.ConfigureAwait(false);
+                            }
+                            if (error != SocketError.Success)
+                            {
+                                throw new SocketException((int)error);
+                            }
+                        }
+                    }
+                }
+
+                if ((options & (TransmitFileOptions.Disconnect | TransmitFileOptions.ReuseSocket)) != 0)
+                {
+                    await Task.Factory.FromAsync(
+                        (reuse, c, s) => ((Socket)s).BeginDisconnect(reuse, c, s),
+                        iar => ((Socket)iar.AsyncState).EndDisconnect(iar),
+                        (options & TransmitFileOptions.ReuseSocket) != 0,
+                        socket).ConfigureAwait(false);
+                }
+            }
+            catch (Exception exc)
+            {
+                foreach (FileStream fs in files)
+                {
+                    fs?.Dispose();
+                }
+
+                error =
+                    exc is SocketException se ? se.SocketErrorCode :
+                    exc is ArgumentException ? SocketError.InvalidArgument :
+                    exc is OperationCanceledException ? SocketError.OperationAborted :
+                    SocketError.SocketError;
+            }
+            finally
+            {
+                callback(bytesTransferred, error);
+            }
+        }
+
+        public static SocketError SendToAsync(SafeCloseSocket handle, byte[] buffer, int offset, int count, SocketFlags socketFlags, Internals.SocketAddress socketAddress, OverlappedAsyncResult asyncResult)
+        {
+            asyncResult.SocketAddress = socketAddress;
+
+            int bytesSent;
+            int socketAddressLen = socketAddress.Size;
+            SocketError socketError = handle.AsyncContext.SendToAsync(buffer, offset, count, socketFlags, socketAddress.Buffer, ref socketAddressLen, out bytesSent, asyncResult.CompletionCallback);
+            if (socketError == SocketError.Success)
+            {
+                asyncResult.CompletionCallback(bytesSent, socketAddress.Buffer, socketAddressLen, SocketFlags.None, SocketError.Success);
+            }
+            return socketError;
+        }
+
+        public static SocketError ReceiveAsync(SafeCloseSocket handle, byte[] buffer, int offset, int count, SocketFlags socketFlags, OverlappedAsyncResult asyncResult)
+        {
+            int bytesReceived;
+            SocketFlags receivedFlags;
+            SocketError socketError = handle.AsyncContext.ReceiveAsync(new Memory<byte>(buffer, offset, count), socketFlags, out bytesReceived, out receivedFlags, asyncResult.CompletionCallback);
+            if (socketError == SocketError.Success)
+            {
+                asyncResult.CompletionCallback(bytesReceived, null, 0, receivedFlags, SocketError.Success);
+            }
+            return socketError;
+        }
+
+        public static SocketError ReceiveAsync(SafeCloseSocket handle, IList<ArraySegment<byte>> buffers, SocketFlags socketFlags, OverlappedAsyncResult asyncResult)
+        {
+            int bytesReceived;
+            SocketFlags receivedFlags;
+            SocketError socketError = handle.AsyncContext.ReceiveAsync(buffers, socketFlags, out bytesReceived, out receivedFlags, asyncResult.CompletionCallback);
+            if (socketError == SocketError.Success)
+            {
+                asyncResult.CompletionCallback(bytesReceived, null, 0, receivedFlags, SocketError.Success);
+            }
+            return socketError;
+        }
+
+        public static SocketError ReceiveFromAsync(SafeCloseSocket handle, byte[] buffer, int offset, int count, SocketFlags socketFlags, Internals.SocketAddress socketAddress, OverlappedAsyncResult asyncResult)
+        {
+            asyncResult.SocketAddress = socketAddress;
+
+            int socketAddressSize = socketAddress.InternalSize;
+            int bytesReceived;
+            SocketFlags receivedFlags;
+            SocketError socketError = handle.AsyncContext.ReceiveFromAsync(new Memory<byte>(buffer, offset, count), socketFlags, socketAddress.Buffer, ref socketAddressSize, out bytesReceived, out receivedFlags, asyncResult.CompletionCallback);
+            if (socketError == SocketError.Success)
+            {
+                asyncResult.CompletionCallback(bytesReceived, socketAddress.Buffer, socketAddressSize, receivedFlags, SocketError.Success);
+            }
+            return socketError;
+        }
+
+        public static SocketError ReceiveMessageFromAsync(Socket socket, SafeCloseSocket handle, byte[] buffer, int offset, int count, SocketFlags socketFlags, Internals.SocketAddress socketAddress, ReceiveMessageOverlappedAsyncResult asyncResult)
+        {
+            asyncResult.SocketAddress = socketAddress;
+
+            bool isIPv4, isIPv6;
+            Socket.GetIPProtocolInformation(((Socket)asyncResult.AsyncObject).AddressFamily, socketAddress, out isIPv4, out isIPv6);
+
+            int socketAddressSize = socketAddress.InternalSize;
+            int bytesReceived;
+            SocketFlags receivedFlags;
+            IPPacketInformation ipPacketInformation;
+            SocketError socketError = handle.AsyncContext.ReceiveMessageFromAsync(new Memory<byte>(buffer, offset, count), null, socketFlags, socketAddress.Buffer, ref socketAddressSize, isIPv4, isIPv6, out bytesReceived, out receivedFlags, out ipPacketInformation, asyncResult.CompletionCallback);
+            if (socketError == SocketError.Success)
+            {
+                asyncResult.CompletionCallback(bytesReceived, socketAddress.Buffer, socketAddressSize, receivedFlags, ipPacketInformation, SocketError.Success);
+            }
+            return socketError;
+        }
+
+        public static SocketError AcceptAsync(Socket socket, SafeCloseSocket handle, SafeCloseSocket acceptHandle, int receiveSize, int socketAddressSize, AcceptOverlappedAsyncResult asyncResult)
+        {
+            Debug.Assert(acceptHandle == null, $"Unexpected acceptHandle: {acceptHandle}");
+            Debug.Assert(receiveSize == 0, $"Unexpected receiveSize: {receiveSize}");
+
+            byte[] socketAddressBuffer = new byte[socketAddressSize];
+
+            IntPtr acceptedFd;
+            SocketError socketError = handle.AsyncContext.AcceptAsync(socketAddressBuffer, ref socketAddressSize, out acceptedFd, asyncResult.CompletionCallback);
+            if (socketError == SocketError.Success)
+            {
+                asyncResult.CompletionCallback(acceptedFd, socketAddressBuffer, socketAddressSize, SocketError.Success);
+            }
+
+            return socketError;
+        }
+
+        internal static SocketError DisconnectAsync(Socket socket, SafeCloseSocket handle, bool reuseSocket, DisconnectOverlappedAsyncResult asyncResult)
+        {
+            SocketError socketError = Disconnect(socket, handle, reuseSocket);
+            asyncResult.PostCompletion(socketError);
+            return socketError;
+        }
+
+        internal static SocketError Disconnect(Socket socket, SafeCloseSocket handle, bool reuseSocket)
+        {
+            handle.SetToDisconnected();
+
+            socket.Shutdown(SocketShutdown.Both);
+            return reuseSocket ?
+                socket.ReplaceHandle() :
+                SocketError.Success;
+        }
+    }
+}
+                                                                                                                         leted successfully      A required output parameter could not be written        A token had an invalid Message Integrity Check (MIC)    No credentials were supplied, or the credentials were unavailable or inaccessible       Invalid credential was supplied The referenced credential has expired   The referenced context has expired      Unspecified GSS failure.  Minor code may provide more information       The quality-of-protection (QOP) requested could not be provided The operation is forbidden by local security policy     The operation or option is not available or unsupported The requested credential element already exists The provided name was not mechanism specific (MN)       An expected per-message token was not received Invalid token was supplied   VCýÿ6CýÿCýÿVCýÿüBýÿVCýÿVCýÿVCýÿßBýÿVCýÿVCýÿVCýÿVCýÿVCýÿVCýÿVCýÿ¥Býÿ../../../../src/lib/gssapi/mechglue/g_encapsulate_token.c tokenSize > 2         gss_encapsulate_token *†H†÷ + +‚7
+       /usr/lib/x86_64-linux-gnu/gss/  gss_inquire_sec_context_by_oid  gss_acquire_cred_impersonate_name       gssspi_acquire_cred_with_password       gssspi_import_sec_context_by_mech       ../../../../src/lib/gssapi/mechglue/g_initialize.c      gssi_inquire_sec_context_by_oid gssi_acquire_cred_impersonate_name      gssi_add_cred_impersonate_name  gssi_inquire_saslname_for_mech  gssi_inquire_mech_for_saslname  gssi_acquire_cred_with_password gssi_import_sec_context_by_mech %s%s gss_acquire_cred gss_release_cred gss_init_sec_context gss_accept_sec_context gss_process_context_token gss_delete_sec_context gss_context_time gss_get_mic gss_verify_mic 

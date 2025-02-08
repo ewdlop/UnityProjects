@@ -1,0 +1,56 @@
+ isl::union_map PHIMap =
+          PerPHI.apply_domain(PHIValInst).apply_range(IncomingValInsts);
+      assert(!PHIMap.is_single_valued().is_false());
+
+      // Resolve transitiveness: The incoming value of the newly discovered PHI
+      // may reference a previously normalized PHI. At the same time, already
+      // normalized PHIs might be normalized to the new PHI. At the end, none of
+      // the PHIs may appear on the right-hand-side of the normalization map.
+      PHIMap = normalizeValInst(PHIMap, AllPHIs, AllPHIMaps);
+      AllPHIs.insert(PHI);
+      AllPHIMaps = normalizeValInst(AllPHIMaps, AllPHIs, PHIMap);
+
+      AllPHIMaps = AllPHIMaps.unite(PHIMap);
+      NumNormalizablePHIs++;
+    }
+  }
+  simplify(AllPHIMaps);
+
+  // Apply the normalization.
+  ComputedPHIs = AllPHIs;
+  NormalizeMap = AllPHIMaps;
+
+  assert(!NormalizeMap || isNormalized(NormalizeMap));
+}
+
+void ZoneAlgorithm::printAccesses(llvm::raw_ostream &OS, int Indent) const {
+  OS.indent(Indent) << "After accesses {\n";
+  for (auto &Stmt : *S) {
+    OS.indent(Indent + 4) << Stmt.getBaseName() << "\n";
+    for (auto *MA : Stmt)
+      MA->print(OS);
+  }
+  OS.indent(Indent) << "}\n";
+}
+
+isl::union_map ZoneAlgorithm::computeKnownFromMustWrites() const {
+  // { [Element[] -> Zone[]] -> [Element[] -> DomainWrite[]] }
+  isl::union_map EltReachdDef = distributeDomain(WriteReachDefZone.curry());
+
+  // { [Element[] -> DomainWrite[]] -> ValInst[] }
+  isl::union_map AllKnownWriteValInst = filterKnownValInst(AllWriteValInst);
+
+  // { [Element[] -> Zone[]] -> ValInst[] }
+  return EltReachdDef.apply_range(AllKnownWriteValInst);
+}
+
+isl::union_map ZoneAlgorithm::computeKnownFromLoad() const {
+  // { Element[] }
+  isl::union_set AllAccessedElts = AllReads.range().unite(AllWrites.range());
+
+  // { Element[] -> Scatter[] }
+  isl::union_map EltZoneUniverse = isl::union_map::from_domain_and_range(
+      AllAccessedElts, isl::set::universe(ScatterSpace));
+
+  // This assumes there are no "holes" in
+  // isl_union_map_domain(WriteReachDefZone); alternatively, compute the z

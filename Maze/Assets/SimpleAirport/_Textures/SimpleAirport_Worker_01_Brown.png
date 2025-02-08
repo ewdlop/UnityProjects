@@ -1,0 +1,232 @@
+to be predicated/speculated: "
+               << TotalIn << ", spare room: " << Spare << "\n");
+  if (TotalIn >= SizeLimit+Spare)
+    return false;
+
+  // Count the number of PHI nodes that will need to be updated (converted
+  // to MUX). Those can be later converted to predicated instructions, so
+  // they aren't always adding extra cost.
+  // KLUDGE: Also, count the number of predicate register definitions in
+  // each block. The scheduler may increase the pressure of these and cause
+  // expensive spills (e.g. bitmnp01).
+  unsigned TotalPh = 0;
+  unsigned PredDefs = countPredicateDefs(FP.SplitB);
+  if (FP.JoinB) {
+    TotalPh = computePhiCost(FP.JoinB, FP);
+    PredDefs += countPredicateDefs(FP.JoinB);
+  } else {
+    if (FP.TrueB && FP.TrueB->succ_size() > 0) {
+      MachineBasicBlock *SB = *FP.TrueB->succ_begin();
+      TotalPh += computePhiCost(SB, FP);
+      PredDefs += countPredicateDefs(SB);
+    }
+    if (FP.FalseB && FP.FalseB->succ_size() > 0) {
+      MachineBasicBlock *SB = *FP.FalseB->succ_begin();
+      TotalPh += computePhiCost(SB, FP);
+      PredDefs += countPredicateDefs(SB);
+    }
+  }
+  DEBUG(dbgs() << "Total number of extra muxes from converted phis: "
+               << TotalPh << "\n");
+  if (TotalIn+TotalPh >= SizeLimit+Spare)
+    return false;
+
+  DEBUG(dbgs() << "Total number of predicate registers: " << PredDefs << "\n");
+  if (PredDefs > 4)
+    return false;
+
+  return true;
+}
+
+bool HexagonEarlyIfConversion::visitBlock(MachineBasicBlock *B,
+      MachineLoop *L) {
+  bool Changed = false;
+
+  // Visit all dominated blocks from the same loop first, then process B.
+  MachineDomTreeNode *N = MDT->getNode(B);
+
+  using GTN = GraphTraits<MachineDomTreeNode *>;
+
+  // We will change CFG/DT during this traversal, so take precautions to
+  // avoid problems related to invalidated iterators. In fact, processing
+  // a child C of B cannot cause another child to be removed, but it can
+  // cause a new child to be added (which was a child of C before C itself
+  // was removed. This new child C, however, would have been processed
+  // prior to processing B, so there is no need to process it again.
+  // Simply keep a list of children of B, and traverse that list.
+  using DTNodeVectType = SmallVector<MachineDomTreeNode *, 4>;
+  DTNodeVectType Cn(GTN::child_begin(N), GTN::child_end(N));
+  for (DTNodeVectType::iterator I = Cn.begin(), E = Cn.end(); I != E; ++I) {
+    MachineBasicBlock *SB = (*I)->getBlock();
+    if (!Deleted.count(SB))
+      Changed |= visitBlock(SB, L);
+  }
+  // When walking down the dominator tree, we want to traverse through
+  // blocks from nested (other) loops, because they can dominate blocks
+  // that are in L. Skip the non-L blocks only after the tree traversal.
+  if (MLI->getLoopFor(B) != L)
+    return Changed;
+
+  FlowPattern FP;
+  if (!matchFlowPattern(B, L, FP))
+    return Changed;
+
+  if (!isValid(FP)) {
+    DEBUG(dbgs() << "Conversion is not valid\n");
+    return Changed;
+  }
+  if (!isProfitable(FP)) {
+    DEBUG(dbgs() << "Conversion is not profitable\n");
+    return Changed;
+  }
+
+  convert(FP);
+  simplifyFlowGraph(FP);
+  return true;
+}
+
+bool HexagonEarlyIfConversion::visitLoop(MachineLoop *L) {
+  MachineBasicBlock *HB = L ? L->getHeader() : nullptr;
+  DEBUG((L ? dbgs() << "Visiting loop H:" << PrintMB(HB)
+           : dbgs() << "Visiting function") << "\n");
+  bool Changed = false;
+  if (L) {
+    for (MachineLoop::iterator I = L->begin(), E = L->end(); I != E; ++I)
+      Changed |= visitLoop(*I);
+  }
+
+  MachineBasicBlock *EntryB = GraphTraits<MachineFunction*>::getEntryNode(MFN);
+  Changed |= visitBlock(L ? HB : EntryB, L);
+  return Changed;
+}
+
+bool HexagonEarlyIfConversion::isPredicableStore(const MachineInstr *MI)
+      const {
+  // HexagonInstrInfo::isPredicable will consider these stores are non-
+  // -predicable if the offset would become constant-extended after
+  // predication.
+  unsigned Opc = MI->getOpcode();
+  switch (Opc) {
+    case Hexagon::S2_storerb_io:
+    case Hexagon::S2_storerbnew_io:
+    case Hexagon::S2_storerh_io:
+    case Hexagon::S2_storerhnew_io:
+    case Hexagon::S2_storeri_io:
+    case Hexagon::S2_storerinew_io:
+    case Hexagon::S2_storerd_io:
+    case Hexagon::S4_storeirb_io:
+    case Hexagon::S4_storeirh_io:
+    case Hexagon::S4_storeiri_io:
+      return true;
+  }
+
+  // TargetInstrInfo::isPredicable takes a non-const pointer.
+  return MI->mayStore() && HII->isPredicable(const_cast<MachineInstr&>(*MI));
+}
+
+bool HexagonEarlyIfConversion::isSafeToSpeculate(const MachineInstr *MI)
+      const {
+  if (MI->mayLoad() || MI->mayStore())
+    return false;
+  if (MI->isCall() || MI->isBarrier() || MI->isBranch())
+    return false;
+  if (MI->hasUnmodeledSideEffects())
+    return false;
+
+  return true;
+}
+
+unsigned HexagonEarlyIfConversion::getCondStoreOpcode(unsigned Opc,
+      bool IfTrue) const {
+  return HII->getCondOpcode(Opc, !IfTrue);
+}
+
+void HexagonEarlyIfConversion::predicateInstr(MachineBasicBlock *ToB,
+      MachineBasicBlock::iterator At, MachineInstr *MI,
+      unsigned PredR, bool IfTrue) {
+  DebugLoc DL;
+  if (At != ToB->end())
+    DL = At->getDebugLoc();
+  else if (!ToB->empty())
+    DL = ToB->back().getDebugLoc();
+
+  unsigned Opc = MI->getOpcode();
+
+  if (isPredicableStore(MI)) {
+    unsigned COpc = getCondStoreOpcode(Opc, IfTrue);
+    assert(COpc);
+    MachineInstrBuilder MIB = BuildMI(*ToB, At, DL, HII->get(COpc));
+    MachineInstr::mop_iterator MOI = MI->operands_begin();
+    if (HII->isPostIncrement(*MI)) {
+      MIB.add(*MOI);
+      ++MOI;
+    }
+    MIB.addReg(PredR);
+    for (const MachineOperand &MO : make_range(MOI, MI->operands_end()))
+      MIB.add(MO);
+
+    // Set memory references.
+    MachineInstr::mmo_iterator MMOBegin = MI->memoperands_begin();
+    MachineInstr::mmo_iterator MMOEnd = MI->memoperands_end();
+    MIB.setMemRefs(MMOBegin, MMOEnd);
+
+    MI->eraseFromParent();
+    return;
+  }
+
+  if (Opc == Hexagon::J2_jump) {
+    MachineBasicBlock *TB = MI->getOperand(0).getMBB();
+    const MCInstrDesc &D = HII->get(IfTrue ? Hexagon::J2_jumpt
+                                           : Hexagon::J2_jumpf);
+    BuildMI(*ToB, At, DL, D)
+      .addReg(PredR)
+      .addMBB(TB);
+    MI->eraseFromParent();
+    return;
+  }
+
+  // Print the offending instruction unconditionally as we are about to
+  // abort.
+  dbgs() << *MI;
+  llvm_unreachable("Unexpected instruction");
+}
+
+// Predicate/speculate non-branch instructions from FromB into block ToB.
+// Leave the branches alone, they will be handled later. Btw, at this point
+// FromB should have at most one branch, and it should be unconditional.
+void HexagonEarlyIfConversion::predicateBlockNB(MachineBasicBlock *ToB,
+      MachineBasicBlock::iterator At, MachineBasicBlock *FromB,
+      unsigned PredR, bool IfTrue) {
+  DEBUG(dbgs() << "Predicating block " << PrintMB(FromB) << "\n");
+  MachineBasicBlock::iterator End = FromB->getFirstTerminator();
+  MachineBasicBlock::iterator I, NextI;
+
+  for (I = FromB->begin(); I != End; I = NextI) {
+    assert(!I->isPHI());
+    NextI = std::next(I);
+    if (isSafeToSpeculate(&*I))
+      ToB->splice(At, FromB, I);
+    else
+      predicateInstr(ToB, At, &*I, PredR, IfTrue);
+  }
+}
+
+unsigned HexagonEarlyIfConversion::buildMux(MachineBasicBlock *B,
+      MachineBasicBlock::iterator At, const TargetRegisterClass *DRC,
+      unsigned PredR, unsigned TR, unsigned TSR, unsigned FR, unsigned FSR) {
+  unsigned Opc = 0;
+  switch (DRC->getID()) {
+    case Hexagon::IntRegsRegClassID:
+      Opc = Hexagon::C2_mux;
+      break;
+    case Hexagon::DoubleRegsRegClassID:
+      Opc = Hexagon::PS_pselect;
+      break;
+    case Hexagon::HvxVRRegClassID:
+      Opc = Hexagon::PS_vselect;
+      break;
+    case Hexagon::HvxWRRegClassID:
+      Opc = Hexagon::PS_wselect;
+      break;
+    default:
+      ll

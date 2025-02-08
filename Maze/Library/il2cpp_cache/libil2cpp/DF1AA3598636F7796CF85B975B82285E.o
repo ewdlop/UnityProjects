@@ -1,0 +1,278 @@
+_copy(upma));
+	upma = isl_union_pw_multi_aff_gist(upma, domain);
+	contraction = isl_union_pw_multi_aff_union_add(contraction, upma);
+	tree = isl_schedule_tree_expansion_set_contraction_and_expansion(tree,
+							contraction, expansion);
+
+	return tree;
+}
+
+/* Update the tree root "tree" to refer to the group instances
+ * in data->group rather than the original domain elements in data->domain.
+ * "pos" is the position in the original schedule tree where the modified
+ * "tree" will be attached.
+ *
+ * If we have come across a domain or expansion node before (data->finished
+ * is set), then we no longer need perform any modifications.
+ *
+ * If "tree" is a filter, then we add data->group_universe to the filter.
+ * We also remove data->domain_universe from the filter if all the domain
+ * elements in this universe that reach the filter node are part of
+ * the elements that are being grouped by data->expansion.
+ * If "tree" is a band, domain or expansion, then it is handled
+ * in a separate function.
+ */
+static __isl_give isl_schedule_tree *group_ancestor(
+	__isl_take isl_schedule_tree *tree, __isl_keep isl_schedule_node *pos,
+	void *user)
+{
+	struct isl_schedule_group_data *data = user;
+	isl_union_set *domain;
+	int is_covered;
+
+	if (!tree || !pos)
+		return isl_schedule_tree_free(tree);
+
+	if (data->finished)
+		return tree;
+
+	switch (isl_schedule_tree_get_type(tree)) {
+	case isl_schedule_node_error:
+		return isl_schedule_tree_free(tree);
+	case isl_schedule_node_extension:
+		isl_die(isl_schedule_tree_get_ctx(tree), isl_error_unsupported,
+			"grouping not allowed in extended tree",
+			return isl_schedule_tree_free(tree));
+	case isl_schedule_node_band:
+		tree = group_band(tree, pos, data);
+		break;
+	case isl_schedule_node_context:
+		tree = group_context(tree, pos, data);
+		break;
+	case isl_schedule_node_domain:
+		tree = group_domain(tree, pos, data);
+		data->finished = 1;
+		break;
+	case isl_schedule_node_filter:
+		domain = isl_schedule_node_get_domain(pos);
+		is_covered = locally_covered_by_domain(domain, data);
+		isl_union_set_free(domain);
+		if (is_covered < 0)
+			return isl_schedule_tree_free(tree);
+		domain = isl_schedule_tree_filter_get_filter(tree);
+		if (is_covered)
+			domain = isl_union_set_subtract(domain,
+				    isl_union_set_copy(data->domain_universe));
+		domain = isl_union_set_union(domain,
+				    isl_union_set_copy(data->group_universe));
+		tree = isl_schedule_tree_filter_set_filter(tree, domain);
+		break;
+	case isl_schedule_node_expansion:
+		tree = group_expansion(tree, pos, data);
+		data->finished = 1;
+		break;
+	case isl_schedule_node_leaf:
+	case isl_schedule_node_guard:
+	case isl_schedule_node_mark:
+	case isl_schedule_node_sequence:
+	case isl_schedule_node_set:
+		break;
+	}
+
+	return tree;
+}
+
+/* Group the domain elements that reach "node" into instances
+ * of a single statement with identifier "group_id".
+ * In particular, group the domain elements according to their
+ * prefix schedule.
+ *
+ * That is, introduce an expansion node with as contraction
+ * the prefix schedule (with the target space replaced by "group_id")
+ * and as expansion the inverse of this contraction (with its range
+ * intersected with the domain elements that reach "node").
+ * The outer nodes are then modified to refer to the group instances
+ * instead of the original domain elements.
+ *
+ * No instance of "group_id" is allowed to reach "node" prior
+ * to the grouping.
+ * No ancestor of "node" is allowed to be an extension node.
+ *
+ * Return a pointer to original node in tree, i.e., the child
+ * of the newly introduced expansion node.
+ */
+__isl_give isl_schedule_node *isl_schedule_node_group(
+	__isl_take isl_schedule_node *node, __isl_take isl_id *group_id)
+{
+	struct isl_schedule_group_data data = { 0 };
+	isl_space *space;
+	isl_union_set *domain;
+	isl_union_pw_multi_aff *contraction;
+	isl_union_map *expansion;
+	int disjoint;
+
+	if (!node || !group_id)
+		goto error;
+	if (check_insert(node) < 0)
+		goto error;
+
+	domain = isl_schedule_node_get_domain(node);
+	data.domain = isl_union_set_copy(domain);
+	data.domain_universe = isl_union_set_copy(domain);
+	data.domain_universe = isl_union_set_universe(data.domain_universe);
+
+	data.dim = isl_schedule_node_get_schedule_depth(node);
+	if (data.dim == 0) {
+		isl_ctx *ctx;
+		isl_set *set;
+		isl_union_set *group;
+		isl_union_map *univ;
+
+		ctx = isl_schedule_node_get_ctx(node);
+		space = isl_space_set_alloc(ctx, 0, 0);
+		space = isl_space_set_tuple_id(space, isl_dim_set, group_id);
+		set = isl_set_universe(isl_space_copy(space));
+		group = isl_union_set_from_set(set);
+		expansion = isl_union_map_from_domain_and_range(domain, group);
+		univ = isl_union_map_universe(isl_union_map_copy(expansion));
+		contraction = isl_union_pw_multi_aff_from_union_map(univ);
+		expansion = isl_union_map_reverse(expansion);
+	} else {
+		isl_multi_union_pw_aff *prefix;
+		isl_union_set *univ;
+
+		prefix =
+		isl_schedule_node_get_prefix_schedule_multi_union_pw_aff(node);
+		prefix = isl_multi_union_pw_aff_set_tuple_id(prefix,
+							isl_dim_set, group_id);
+		space = isl_multi_union_pw_aff_get_space(prefix);
+		contraction = isl_union_pw_multi_aff_from_multi_union_pw_aff(
+							prefix);
+		univ = isl_union_set_universe(isl_union_set_copy(domain));
+		contraction =
+		    isl_union_pw_multi_aff_intersect_domain(contraction, univ);
+		expansion = isl_union_map_from_union_pw_multi_aff(
+				    isl_union_pw_multi_aff_copy(contraction));
+		expansion = isl_union_map_reverse(expansion);
+		expansion = isl_union_map_intersect_range(expansion, domain);
+	}
+	space = isl_space_map_from_set(space);
+	data.sched = isl_multi_aff_identity(space);
+	data.group = isl_union_map_domain(isl_union_map_copy(expansion));
+	data.group = isl_union_set_coalesce(data.group);
+	data.group_universe = isl_union_set_copy(data.group);
+	data.group_universe = isl_union_set_universe(data.group_universe);
+	data.expansion = isl_union_map_copy(expansion);
+	data.contraction = isl_union_pw_multi_aff_copy(contraction);
+	node = isl_schedule_node_insert_expansion(node, contraction, expansion);
+
+	disjoint = isl_union_set_is_disjoint(data.domain_universe,
+					    data.group_universe);
+
+	node = update_ancestors(node, &group_ancestor, &data);
+
+	isl_union_set_free(data.domain);
+	isl_union_set_free(data.domain_universe);
+	isl_union_set_free(data.group);
+	isl_union_set_free(data.group_universe);
+	isl_multi_aff_free(data.sched);
+	isl_union_map_free(data.expansion);
+	isl_union_pw_multi_aff_free(data.contraction);
+
+	node = isl_schedule_node_child(node, 0);
+
+	if (!node || disjoint < 0)
+		return isl_schedule_node_free(node);
+	if (!disjoint)
+		isl_die(isl_schedule_node_get_ctx(node), isl_error_invalid,
+			"group instances already reach node",
+			return isl_schedule_node_free(node));
+
+	return node;
+error:
+	isl_schedule_node_free(node);
+	isl_id_free(group_id);
+	return NULL;
+}
+
+/* Compute the gist of the given band node with respect to "context".
+ */
+__isl_give isl_schedule_node *isl_schedule_node_band_gist(
+	__isl_take isl_schedule_node *node, __isl_take isl_union_set *context)
+{
+	isl_schedule_tree *tree;
+
+	tree = isl_schedule_node_get_tree(node);
+	tree = isl_schedule_tree_band_gist(tree, context);
+	return isl_schedule_node_graft_tree(node, tree);
+}
+
+/* Internal data structure for isl_schedule_node_gist.
+ * "n_expansion" is the number of outer expansion nodes
+ * with respect to the current position
+ * "filters" contains an element for each outer filter, expansion or
+ * extension node with respect to the current position, each representing
+ * the intersection of the previous element and the filter on the filter node
+ * or the expansion/extension of the previous element.
+ * The first element in the original context passed to isl_schedule_node_gist.
+ */
+struct isl_node_gist_data {
+	int n_expansion;
+	isl_union_set_list *filters;
+};
+
+/* Enter the expansion node "node" during a isl_schedule_node_gist traversal.
+ *
+ * In particular, add an extra element to data->filters containing
+ * the expansion of the previous element and replace the expansion
+ * and contraction on "node" by the gist with respect to these filters.
+ * Also keep track of the fact that we have entered another expansion.
+ */
+static __isl_give isl_schedule_node *gist_enter_expansion(
+	__isl_take isl_schedule_node *node, struct isl_node_gist_data *data)
+{
+	int n;
+	isl_union_set *inner;
+	isl_union_map *expansion;
+	isl_union_pw_multi_aff *contraction;
+
+	data->n_expansion++;
+
+	n = isl_union_set_list_n_union_set(data->filters);
+	inner = isl_union_set_list_get_union_set(data->filters, n - 1);
+	expansion = isl_schedule_node_expansion_get_expansion(node);
+	inner = isl_union_set_apply(inner, expansion);
+
+	contraction = isl_schedule_node_expansion_get_contraction(node);
+	contraction = isl_union_pw_multi_aff_gist(contraction,
+						isl_union_set_copy(inner));
+
+	data->filters = isl_union_set_list_add(data->filters, inner);
+
+	inner = isl_union_set_list_get_union_set(data->filters, n - 1);
+	expansion = isl_schedule_node_expansion_get_expansion(node);
+	expansion = isl_union_map_gist_domain(expansion, inner);
+	node = isl_schedule_node_expansion_set_contraction_and_expansion(node,
+						contraction, expansion);
+
+	return node;
+}
+
+/* Leave the expansion node "node" during a isl_schedule_node_gist traversal.
+ *
+ * In particular, remove the element in data->filters that was added by
+ * gist_enter_expansion and decrement the number of outer expansions.
+ *
+ * The expansion has already been simplified in gist_enter_expansion.
+ * If this simplification results in an identity expansion, then
+ * it is removed here.
+ */
+static __isl_give isl_schedule_node *gist_leave_expansion(
+	__isl_take isl_schedule_node *node, struct isl_node_gist_data *data)
+{
+	int n;
+	isl_bool identity;
+	isl_union_map *expansion;
+
+	expansion = isl_schedule_node_expansion_get_expansion(node);
+	identity = is

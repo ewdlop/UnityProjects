@@ -1,0 +1,597 @@
+gmatchInfo;
+    }
+
+    if (results != NULL) {
+        delete results;
+    }
+
+    // All names are not yet loaded into the local trie.
+    // Load all available names into the trie. This could be very heavy.
+    umtx_lock(&gLock);
+    {
+        if (!fGNamesTrieFullyLoaded) {
+            StringEnumeration *tzIDs = TimeZone::createTimeZoneIDEnumeration(UCAL_ZONE_TYPE_CANONICAL, NULL, NULL, status);
+            if (U_SUCCESS(status)) {
+                const UnicodeString *tzID;
+                while ((tzID = tzIDs->snext(status))) {
+                    if (U_FAILURE(status)) {
+                        break;
+                    }
+                    nonConstThis->loadStrings(*tzID);
+                }
+            }
+            if (tzIDs != NULL) {
+                delete tzIDs;
+            }
+
+            if (U_SUCCESS(status)) {
+                nonConstThis->fGNamesTrieFullyLoaded = TRUE;
+            }
+        }
+    }
+    umtx_unlock(&gLock);
+
+    if (U_FAILURE(status)) {
+        return NULL;
+    }
+
+    umtx_lock(&gLock);
+    {
+        // now try it again
+        fGNamesTrie.search(text, start, (TextTrieMapSearchResultHandler *)&handler, status);
+    }
+    umtx_unlock(&gLock);
+
+    results = handler.getMatches(maxLen);
+    if (results != NULL && maxLen > 0) {
+        gmatchInfo = new TimeZoneGenericNameMatchInfo(results);
+        if (gmatchInfo == NULL) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+            delete results;
+            return NULL;
+        }
+    }
+
+    return gmatchInfo;
+}
+
+TimeZoneNames::MatchInfoCollection*
+TZGNCore::findTimeZoneNames(const UnicodeString& text, int32_t start, uint32_t types, UErrorCode& status) const {
+    // Check if the target name typs is really in the TimeZoneNames
+    uint32_t nameTypes = 0;
+    if (types & UTZGNM_LONG) {
+        nameTypes |= (UTZNM_LONG_GENERIC | UTZNM_LONG_STANDARD);
+    }
+    if (types & UTZGNM_SHORT) {
+        nameTypes |= (UTZNM_SHORT_GENERIC | UTZNM_SHORT_STANDARD);
+    }
+
+    if (types) {
+        // Find matches in the TimeZoneNames
+        return fTimeZoneNames->find(text, start, nameTypes, status);
+    }
+
+    return NULL;
+}
+
+typedef struct TZGNCoreRef {
+    TZGNCore*       obj;
+    int32_t         refCount;
+    double          lastAccess;
+} TZGNCoreRef;
+
+// TZGNCore object cache handling
+static UMutex gTZGNLock = U_MUTEX_INITIALIZER;
+static UHashtable *gTZGNCoreCache = NULL;
+static UBool gTZGNCoreCacheInitialized = FALSE;
+
+// Access count - incremented every time up to SWEEP_INTERVAL,
+// then reset to 0
+static int32_t gAccessCount = 0;
+
+// Interval for calling the cache sweep function - every 100 times
+#define SWEEP_INTERVAL 100
+
+// Cache expiration in millisecond. When a cached entry is no
+// longer referenced and exceeding this threshold since last
+// access time, then the cache entry will be deleted by the sweep
+// function. For now, 3 minutes.
+#define CACHE_EXPIRATION 180000.0
+
+U_CDECL_BEGIN
+/**
+ * Cleanup callback func
+ */
+static UBool U_CALLCONV tzgnCore_cleanup(void)
+{
+    if (gTZGNCoreCache != NULL) {
+        uhash_close(gTZGNCoreCache);
+        gTZGNCoreCache = NULL;
+    }
+    gTZGNCoreCacheInitialized = FALSE;
+    return TRUE;
+}
+
+/**
+ * Deleter for TZGNCoreRef
+ */
+static void U_CALLCONV
+deleteTZGNCoreRef(void *obj) {
+    icu::TZGNCoreRef *entry = (icu::TZGNCoreRef*)obj;
+    delete (icu::TZGNCore*) entry->obj;
+    uprv_free(entry);
+}
+U_CDECL_END
+
+/**
+ * Function used for removing unreferrenced cache entries exceeding
+ * the expiration time. This function must be called with in the mutex
+ * block.
+ */
+static void sweepCache() {
+    int32_t pos = -1;
+    const UHashElement* elem;
+    double now = (double)uprv_getUTCtime();
+
+    while ((elem = uhash_nextElement(gTZGNCoreCache, &pos))) {
+        TZGNCoreRef *entry = (TZGNCoreRef *)elem->value.pointer;
+        if (entry->refCount <= 0 && (now - entry->lastAccess) > CACHE_EXPIRATION) {
+            // delete this entry
+            uhash_removeElement(gTZGNCoreCache, elem);
+        }
+    }
+}
+
+TimeZoneGenericNames::TimeZoneGenericNames()
+: fRef(0) {
+}
+
+TimeZoneGenericNames::~TimeZoneGenericNames() {
+    umtx_lock(&gTZGNLock);
+    {
+        U_ASSERT(fRef->refCount > 0);
+        // Just decrement the reference count
+        fRef->refCount--;
+    }
+    umtx_unlock(&gTZGNLock);
+}
+
+TimeZoneGenericNames*
+TimeZoneGenericNames::createInstance(const Locale& locale, UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return NULL;
+    }
+    TimeZoneGenericNames* instance = new TimeZoneGenericNames();
+    if (instance == NULL) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return NULL;
+    }
+
+    TZGNCoreRef *cacheEntry = NULL;
+    {
+        Mutex lock(&gTZGNLock);
+
+        if (!gTZGNCoreCacheInitialized) {
+            // Create empty hashtable
+            gTZGNCoreCache = uhash_open(uhash_hashChars, uhash_compareChars, NULL, &status);
+            if (U_SUCCESS(status)) {
+                uhash_setKeyDeleter(gTZGNCoreCache, uprv_free);
+                uhash_setValueDeleter(gTZGNCoreCache, deleteTZGNCoreRef);
+                gTZGNCoreCacheInitialized = TRUE;
+                ucln_i18n_registerCleanup(UCLN_I18N_TIMEZONEGENERICNAMES, tzgnCore_cleanup);
+            }
+        }
+        if (U_FAILURE(status)) {
+            return NULL;
+        }
+
+        // Check the cache, if not available, create new one and cache
+        const char *key = locale.getName();
+        cacheEntry = (TZGNCoreRef *)uhash_get(gTZGNCoreCache, key);
+        if (cacheEntry == NULL) {
+            TZGNCore *tzgnCore = NULL;
+            char *newKey = NULL;
+
+            tzgnCore = new TZGNCore(locale, status);
+            if (tzgnCore == NULL) {
+                status = U_MEMORY_ALLOCATION_ERROR;
+            }
+            if (U_SUCCESS(status)) {
+                newKey = (char *)uprv_malloc(uprv_strlen(key) + 1);
+                if (newKey == NULL) {
+                    status = U_MEMORY_ALLOCATION_ERROR;
+                } else {
+                    uprv_strcpy(newKey, key);
+                }
+            }
+            if (U_SUCCESS(status)) {
+                cacheEntry = (TZGNCoreRef *)uprv_malloc(sizeof(TZGNCoreRef));
+                if (cacheEntry == NULL) {
+                    status = U_MEMORY_ALLOCATION_ERROR;
+                } else {
+                    cacheEntry->obj = tzgnCore;
+                    cacheEntry->refCount = 1;
+                    cacheEntry->lastAccess = (double)uprv_getUTCtime();
+
+                    uhash_put(gTZGNCoreCache, newKey, cacheEntry, &status);
+                }
+            }
+            if (U_FAILURE(status)) {
+                if (tzgnCore != NULL) {
+                    delete tzgnCore;
+                }
+                if (newKey != NULL) {
+                    uprv_free(newKey);
+                }
+                if (cacheEntry != NULL) {
+                    uprv_free(cacheEntry);
+                }
+                cacheEntry = NULL;
+            }
+        } else {
+            // Update the reference count
+            cacheEntry->refCount++;
+            cacheEntry->lastAccess = (double)uprv_getUTCtime();
+        }
+        gAccessCount++;
+        if (gAccessCount >= SWEEP_INTERVAL) {
+            // sweep
+            sweepCache();
+            gAccessCount = 0;
+        }
+    }  // End of mutex locked block
+
+    if (cacheEntry == NULL) {
+        delete instance;
+        return NULL;
+    }
+
+    instance->fRef = cacheEntry;
+    return instance;
+}
+
+UBool
+TimeZoneGenericNames::operator==(const TimeZoneGenericNames& other) const {
+    // Just compare if the other object also use the same
+    // ref entry
+    return fRef == other.fRef;
+}
+
+TimeZoneGenericNames*
+TimeZoneGenericNames::clone() const {
+    TimeZoneGenericNames* other = new TimeZoneGenericNames();
+    if (other) {
+        umtx_lock(&gTZGNLock);
+        {
+            // Just increments the reference count
+            fRef->refCount++;
+            other->fRef = fRef;
+        }
+        umtx_unlock(&gTZGNLock);
+    }
+    return other;
+}
+
+UnicodeString&
+TimeZoneGenericNames::getDisplayName(const TimeZone& tz, UTimeZoneGenericNameType type,
+                        UDate date, UnicodeString& name) const {
+    return fRef->obj->getDisplayName(tz, type, date, name);
+}
+
+UnicodeString&
+TimeZoneGenericNames::getGenericLocationName(const UnicodeString& tzCanonicalID, UnicodeString& name) const {
+    return fRef->obj->getGenericLocationName(tzCanonicalID, name);
+}
+
+int32_t
+TimeZoneGenericNames::findBestMatch(const UnicodeString& text, int32_t start, uint32_t types,
+        UnicodeString& tzID, UTimeZoneFormatTimeType& timeType, UErrorCode& status) const {
+    return fRef->obj->findBestMatch(text, start, types, tzID, timeType, status);
+}
+
+U_NAMESPACE_END
+#endif
+                                                                                                                                                                                                                                                      èİ¶0ê…™N‡¨°’CbÆ}ÿE›†|0ª|ìÚ)û4),²kæˆØØEÊ³ófÙ‡9³V(4¿í™ód0ÉÜˆïıµùƒŞ#Q†Äï»D¬—ç'ADAÁIø%cÓ“ğVi‚l øŞRšß­FpeÆöé›îŸ/ğ&×{ÇöÕ0zƒ“9}4rô…÷|¤‘‘•¯$'Äáéb’6°‘J…gíƒÖ¾\´[¿ãGpßZ.¾Gö .°S˜úêxIsO,fZ„²‰Êçb÷…Â’Òq!ŸHÙv¶ğã–Õª×ãè:2£!wıb”Şc÷`Æîckş±$•ˆŒh\z	/xì9®rïëÍ¶s—Ô¸÷-»xG¾à(³Ú3OÓŸFì£©¤Pq·Ë÷½xH~×ü³.£ÂĞ@´¿;À½Ço-RÀ:˜é¬}<R±Œh^qÚ ù†IÁ±´*¿?¥ÉfLT­‰ó™À›Õ;?p^–Ÿ$7‘„ù’Êl3àæŒƒ
+½³şV ÿO˜…šÕ‘ÁY	ogt¥äİêf08mÔU&ŠÄIã]ŒÁ›…(kUšãŸ0ÇÛ³¯eíg}ÈI÷O¦ÖKUÒZ-Ôu#Šèß|ÀƒÂœWKÈÜ¯†ŒLlSÃé!`¬Î>ÊT±>ÀŠŒÏÃÈÈ‚U@2ÑğD‡,Ş:29•‹–$lÒ›¢Ä@Øò”vá(¢Óò'Z}y“]–èƒd-„Äz'{=@#ÿÀQô%ª±m¿Ûg°b+U9ŸØ´%ÍÜúT‡Õ™.ó©AU«*_#'{ñÎÁŒiÑä>4§wßÅşÛzi ‹]W¡iñyäŸ¼Š÷ÍRQ—¥oŞAüzo F é%0#D_ïIÇ\é«ÖE6,)Ì©†.afÅçK““JÇ_¢(-=Ÿ	“Ï4Î¶g‚çå-ÑğŞGÜ Ä¢—QyÙD=¸í†òùœ%\”Ê$wƒ+/¶=á¸gt@‹q 4}aÄÉ±{)„Ru• İ]QG÷§ñ®[Õ²6ìÖ4·ı†ıoMªLYŒò6k|ª•dŞê øÔX? ,æ»Çø}I›Â¨Ó›à¨‰¿Ó±JúàqÂ`%H  ßşmæVÇQ¹ƒ µôZ‰Í¾u‹=Ş,Ü=rù)š$œ¼o€–Pd‘Û"2`#R0Cvÿ<ôe”"f¤ƒ~mèU`ˆ½RfØ*á¹@‰=È*bÃiÜQ™‡$¦‘r¿a±	§¶càmeï	pê‘°ËV‹XÀÇq?_¸~ÒÆ ŞÏ¹VÉ½ÃEväŒÇuPuÃ÷³WÀ4ÂDø–û'	‘!²{'¡6Ìc»jò–¡BsNbTßb¬İkŸ£$?A5Ÿ{–UÂÏ»“->Û!âÍ wdzkÙó.µ{q3 «]ŒË=+Ï¤™åø@z;¹ÿ#UşÆU¶Kx~5D‘ƒ®˜¤“‰1/Ü7¹½ùÄ\íIO½9©Vñö˜Åô¤—°šOğ}c¯sÓ+ >2šMQ©Îşáß¹+b&eåom§É4ƒÓ8ò¬±e`ë: €™\øÙ¹éŞ:Ó8ö0D5÷¤ÅªM¨İ÷„u2|ày™íãvûwjé—M²ëNˆ.NÛ¦UÕRH¨³õ®=¶RŒí³ğ€K¢æ&´ˆXÂËİğiÀ´€û•€í%Òm# 0‘µ˜U¬#9fÂ]^)D»kƒÛÂ£[CYP°zC‹·„UıLD#-˜zpôıÇÓZÒsb>¢Ä÷]±ã3– qÿ;<ÕMÉ$Ö”
+ñJpï¿²š÷Áëg‘çLà£02hÓÎpW“#‰rñ·]±$ëdŞ—©ÎWÙÀ=‰1İ’y@Ço¤5+%ùLŒÿ“ï§g·ñ–ö¤’Y$~¥³¸?é^FCéT-wo¾£ ©ê#ß§là87¡4õ5ùÄf•O‚-à¨fz2àô||&V×™ù	ñ‰
+Y«o7\xÃ´×ú1ÙFJ."ğU­@ÁFÎdÓÉÿ<Á|¥õŠ j´Òº ®ï1ìËİÚ÷XûôºùúÆ)0Ğ2h_(Åy¸ªëG=¤è­×¶{”*UKCóq80tnƒïœNSËi©xaá9ØŠ³ÒÙş¡û²%gÅEÑÑ
+vY¹À¡{©èø¸n©›Ïß7’RŞ*gğÓt%yïr.UúüiÏÕ1&/F·%næ°ßÔ.ƒ'e®’çybLl$[UXèÂápõ¢IE¦·‚¯™dÓš«VYÑ®+BëU4ºÖ‚çÒ³YÈŠÂ ÒÃJ¡kßĞòÊDlÔ×?Å¨õ`%Î2Ìà)ş±8MÍY¾­»ÂLx³ÏT¬uE¿¸Q´odšªwIúŒıF¸‰E{gğ“w.£ô~İ ‰eë¾Ë€Ê·KŠ‘"	At"—”Çó9øä=†r¸8İHÃvü]8˜,÷ôÍˆ+â˜€‰{…Ö¡i§IUùRŸ"yCå¦e†ûp c¨UÌ=‡¯ËØpk0q—¸Æùs‘¬}œ|¢™5ûİ¿æwf/vÜğÔ#cáèJˆ—}×äÅUÁ{ŠÚ_†8ÅY9_û|p9PçÅñ…(tÔz\	5³÷ØhZu—Oüj^­vkkN¯œPù
+Hşø1æ ç$ ¤O$˜?¥„bö¥ñ–¬i‡Û*’æû´áçtˆ¶œ/L† É%ì’‘©½z†rÛ|ù€mÀw0‚‡ååÄ²£5:ëæî ÃUDê¶† D0C£'ù£5îkk¸^4õ¾à»jŸ~2µq©×Ef
+¶Ì¶¨=ØĞRk2¬`¾œsSÇw;SÆ©}kĞÊÓÈàÿË‘"çÓ|'¾èÆ?jµŸ~8HóÆ8èöÎpÙ(]èÁ»Û,‡:s%‹#"CÎú°$—9ÓP÷ğ­×9?@†ğ,IÂ'£êƒ5=ÆŒ=·Óƒ‘ã°;’ £§wG¤ÙRADe£|ÚRX´¯c=^ş94w <J<å‚ÆßrÆ»!ÓjI…u_6ÔöLÔ/Q]ƒÜ°ƒ£ä¬âÕÇŸh²¸·À8õª?‰•ßyÖ-*í‡–`±ZVŒ2F(SbgùÜÿJ›Å5òüàøÊI´}æâW–nb+/a[Õp®×¸ìÊò€ÚA{¾f_t6D×íU°Ä`¡Fër‚F*XF—˜|çhæ‰!Ç^:^J¿©ù}CJöáÑ˜A"qu]Mjòˆx²±½9IëvŞ¾Fuf	@EÅÉé\ƒtW‰i”=ËÈy“#‡é@ÎÌïN•Í7B'£i9öí/ãİmÜè{ßæIzU‡2ØÕBCV²±ìBíÉşGVU‚Nn„Y¤FZ¾DJKeÚ+C¬ŠÙæ½ğ•±£Ãù¿”šxC„R³&ätĞî"ReSò?èï‚‚‡È#¥…ßeqºßº2^‡lo
+ç"Şšñ¤ ’Pv¼ó‚u´øˆ=Ğ)¿avl\í„^qg²ÎP}'şĞ¾ù-³ÃÖ7ÇR'.»wèñV¡í¶mínwP9˜[(.èz°xøƒHt3S°éÃûzn“9NÔ(Õq=D!÷ÉkrÖ‘Òš<Îå˜4_ }‰Ş ²³j·P) ·uug\v(-29Â¶,j[¿Î¨“—–æå7şá›P­š>ÏÔÊK—F¿Î’F7:;şî— Ñz®âc”B”d|~“ACbÛRÑÜÜËÿ:zî±P}cÜò÷|ı„€pÑ‚^P6ÓÕí=ÿ‰¹½nıjö«ePZÇ†F‘y‰iö(7‡¬€K)—VèéVôJv[@xôSºú²:{÷n µ¹n¡xzqì6Ù··Ï}Öõ&áŞ ÌÈ'U Ê}ItêY,ıòOò3_s“ªs­î‹ˆëÊup/¢Ñ‚k¤ÂœÁÔØCMï»¿//
+// 
+//
+// Authors:
+//      Alexander Olk (alex.olk@googlemail.com)
+//      Gert Driesen (drieseng@users.sourceforge.net)
+//
+
+using System;
+using System.Collections;
+using System.Drawing;
+using System.Globalization;
+using System.Windows.Forms;
+
+using NUnit.Framework;
+
+namespace MonoTests.System.Windows.Forms
+{
+	[TestFixture]
+	public class UpDownTest : TestHelper
+	{
+		[SetUp]
+		protected override void SetUp () {
+			Reset ();
+			base.SetUp ();
+		}
+
+		private void Reset ()
+		{
+			selected_item_changed = 0;
+			text_changed = 0;
+			value_changed = 0;
+		}
+
+		[Test]
+		public void UpDownActiveControlTest ()
+		{
+			NumericUpDown n1 = new NumericUpDown ();
+			Assert.IsNull (n1.ActiveControl, "1");
+		}
+
+		[Test]
+		public void UpDownBasePropTest ()
+		{
+			NumericUpDown n1 = new NumericUpDown ();
+			
+			Assert.AreEqual (BorderStyle.Fixed3D, n1.BorderStyle, "#1");
+			Assert.AreEqual (true, n1.InterceptArrowKeys, "#2");
+			Assert.AreEqual (LeftRightAlignment.Right, n1.UpDownAlign, "#3");
+		}
+
+		[Test]
+		public void ToStringTest ()
+		{
+			NumericUpDown n1 = new NumericUpDown ();
+
+			Assert.AreEqual ("System.Windows.Forms.NumericUpDown, Minimum = 0, Maximum = 100", n1.ToString (), "1");
+
+			n1.Minimum = 0.33m;
+			n1.Maximum = 100.33m;
+			Assert.AreEqual (string.Format (CultureInfo.CurrentCulture,
+				"System.Windows.Forms.NumericUpDown, Minimum = {0}, Maximum = {1}",
+				0.33, 100.33), n1.ToString (), "2");
+		}
+
+		[Test] // bug #80620
+		public void NumericUpDownClientRectangle_Borders ()
+		{
+			NumericUpDown nud = new NumericUpDown ();
+			nud.CreateControl ();
+			Assert.AreEqual (nud.ClientRectangle, new NumericUpDown ().ClientRectangle);
+		}
+
+		[Test]
+		public void NumericUpDownStandardPropTest ()
+		{
+			NumericUpDown n1 = new NumericUpDown ();
+			
+			Assert.AreEqual (100, n1.Maximum, "#4");
+			Assert.AreEqual (0, n1.Minimum, "#5");
+			Assert.AreEqual (0, n1.Value, "#6");
+			Assert.AreEqual (0, n1.DecimalPlaces, "#7");
+			Assert.IsFalse (n1.Hexadecimal, "#8");
+			Assert.IsFalse (n1.ThousandsSeparator, "#9");
+			Assert.AreEqual (1, n1.Increment, "#10");
+		}
+
+		[Test]
+		public void NumericUpDownEnhancedPropTest ()
+		{
+			NumericUpDown n1 = new NumericUpDown ();
+			
+			n1.Minimum = 200;
+			Assert.AreEqual (200, n1.Maximum, "#11");
+			Assert.AreEqual (200, n1.Value, "#12");
+			
+			n1.Minimum = 100;
+			n1.Maximum = 50;
+			Assert.AreEqual (50, n1.Minimum, "#13");
+			
+			n1.Minimum = 0;
+			n1.Maximum = 100;
+			n1.Value = 90;
+			n1.Maximum = 50;
+			Assert.AreEqual (50, n1.Value, "#14");
+			
+			n1.Minimum = 0;
+			n1.Maximum = 100;
+			n1.Value = 90;
+			n1.DownButton ();
+			Assert.AreEqual (89, n1.Value, "#15");
+			
+			n1.UpButton ();
+			Assert.AreEqual (90, n1.Value, "#16");
+		}
+
+		[Test]
+		[Category ("NotWorking")]
+		public void NumericUpDownEditValidateTest ()
+		{
+			NumericNew nn = new NumericNew ();
+			Assert.IsTrue (nn.update_edit_text_called, "#17");
+			
+			Assert.IsFalse (nn.user_edit, "#18");
+			
+			nn.Reset ();
+			nn.user_edit = true;
+			nn.Text = "10";
+			Assert.IsTrue (nn.validate_edit_text_called, "#19");
+			Assert.IsTrue (nn.update_edit_text_called, "#20");
+			
+			nn.Reset ();
+			nn.user_edit = false;
+			nn.Text = "11";
+			Assert.IsTrue (nn.validate_edit_text_called, "#21");
+			Assert.IsTrue (nn.update_edit_text_called, "#22");
+			
+			nn.DownButton ();
+			Assert.AreEqual (10, nn.Value, "#23");
+		}
+
+		[Test]
+		[Category ("NotWorking")]
+		public void NumericUpDown_BeginInit ()
+		{
+			NumericNew nud = new NumericNew ();
+			nud.TextChanged += new EventHandler (NumericUpDown_TextChanged);
+			nud.ValueChanged += new EventHandler (NumericUpDown_ValueChanged);
+			Assert.AreEqual (2, nud.CallStack.Count, "#A1");
+			Assert.AreEqual ("ValidateEditText", nud.CallStack [0], "#A2");
+			Assert.AreEqual ("UpdateEditText", nud.CallStack [1], "#A3");
+			Assert.AreEqual (0, nud.Value, "#A4");
+			Assert.AreEqual (2, nud.CallStack.Count, "#A5");
+			Assert.AreEqual (0, value_changed, "#A6");
+			Assert.AreEqual (0, text_changed, "#A7");
+
+			nud.BeginInit ();
+			Assert.AreEqual (2, nud.CallStack.Count, "#B1");
+			nud.Value = 10;
+			Assert.AreEqual (3, nud.CallStack.Count, "#B2");
+			Assert.AreEqual ("UpdateEditText", nud.CallStack [2], "#B3");
+			Assert.AreEqual ("0", nud.Text, "#B4");
+			Assert.AreEqual (10, nud.Value, "#B5");
+			Assert.AreEqual (3, nud.CallStack.Count, "#B6");
+			Assert.AreEqual (1, value_changed, "#B7");
+			Assert.AreEqual (0, text_changed, "#B8");
+			nud.EndInit ();
+			Assert.AreEqual (4, nud.CallStack.Count, "#B9");
+			Assert.AreEqual ("UpdateEditText", nud.CallStack [3], "#B10");
+			Assert.AreEqual (1, text_changed, "#B11");
+			Assert.AreEqual ("10", nud.Text, "#B12");
+			Assert.AreEqual (10, nud.Value, "#B13");
+			Assert.AreEqual (4, nud.CallStack.Count, "#B14");
+			Assert.AreEqual (1, value_changed, "#B15");
+			Assert.AreEqual (1, text_changed, "#B16");
+
+			// multiple calls to BeginInit are undone by a single EndInit call
+			nud.BeginInit ();
+			nud.BeginInit ();
+			Assert.AreEqual (4, nud.CallStack.Count, "#C1");
+			nud.Value = 20;
+			Assert.AreEqual (5, nud.CallStack.Count, "#C2");
+			Assert.AreEqual ("UpdateEditText", nud.CallStack [4], "#C3");
+			Assert.AreEqual ("10", nud.Text, "#C4");
+			Assert.AreEqual (20, nud.Value, "#C5");
+			Assert.AreEqual (5, nud.CallStack.Count, "#C6");
+			Assert.AreEqual (2, value_changed, "#C7");
+			Assert.AreEqual (1, text_changed, "#C8");
+			nud.EndInit ();
+			Assert.AreEqual (6, nud.CallStack.Count, "#C9");
+			Assert.AreEqual ("UpdateEditText", nud.CallStack [5], "#C10");
+			Assert.AreEqual (2, text_changed, "#C11");
+			Assert.AreEqual ("20", nud.Text, "#C12");
+			Assert.AreEqual (20, nud.Value, "#C13");
+			Assert.AreEqual (6, nud.CallStack.Count, "#C14");
+			Assert.AreEqual (2, value_changed, "#C15");
+			Assert.AreEqual (2, text_changed, "#C16");
+		}
+
+		[Test]
+		[Category ("NotWorking")]
+		public void NumericUpDown_ChangingText ()
+		{
+			NumericNew nud = new NumericNew ();
+			nud.TextChanged += new EventHandler (NumericUpDown_TextChanged);
+			nud.ValueChanged += new EventHandler (NumericUpDown_ValueChanged);
+			Assert.IsFalse (nud.changing_text, "#A1");
+			Assert.IsFalse (nud.user_edit, "#A2");
+			Assert.AreEqual (0, text_changed, "#A3");
+
+			nud.Text = "1";
+			Assert.IsFalse (nud.changing_text, "#B1");
+			Assert.IsFalse (nud.user_edit, "#B2");
+			Assert.AreEqual (5, nud.CallStack.Count, "#B3");
+			Assert.AreEqual (1, text_changed, "#B4");
+
+			nud.changing_text = true;
+			nud.Text = "2";
+			Assert.IsFalse (nud.changing_text, "#C1");
+			Assert.IsFalse (nud.user_edit, "#C2");
+			Assert.AreEqual (5, nud.CallStack.Count, "#C3");
+			Assert.AreEqual (2, text_changed, "#C4");
+		}
+
+		[Test]
+		[Category ("NotWorking")]
+		public void NumericUpDown_EndInit ()
+		{
+			NumericNew nud = new NumericNew ();
+			nud.TextChanged += new EventHandler (NumericUpDown_TextChanged);
+			nud.ValueChanged += new EventHandler (NumericUpDown_ValueChanged);
+			Assert.AreEqual (2, nud.CallStack.Count, "#A1");
+			Assert.AreEqual ("ValidateEditText", nud.CallStack [0], "#A2");
+			Assert.AreEqual ("UpdateEditText", nud.CallStack [1], "#A3");
+			Assert.AreEqual (0, nud.Value, "#A4");
+			Assert.AreEqual (2, nud.CallStack.Count, "#A5");
+			Assert.AreEqual (0, value_changed, "#A6");
+			Assert.AreEqual (0, text_changed, "#A7");
+
+			// EndInit without corresponding BeginInit
+			nud.EndInit ();
+			Assert.AreEqual (3, nud.CallStack.Count, "#B1");
+			Assert.AreEqual ("UpdateEditText", nud.CallStack [1], "#B2");
+			Assert.AreEqual (0, nud.Value, "#B3");
+			Assert.AreEqual (3, nud.CallStack.Count, "#B4");
+			Assert.AreEqual (0, value_changed, "#B5");
+			Assert.AreEqual (0, text_changed, "#B6");
+		}
+
+		[Test]
+		[Category ("NotWorking")]
+		public void NumericUpDown_UpButton ()
+		{
+			NumericNew nud = new NumericNew ();
+			nud.TextChanged += new EventHandler (NumericUpDown_TextChanged);
+			nud.ValueChanged += new EventHandler (NumericUpDown_ValueChanged);
+			nud.UpButton ();
+			Assert.AreEqual (3, nud.CallStack.Count, "#A1");
+			Assert.AreEqual ("ValidateEditText", nud.CallStack [0], "#A2");
+			Assert.AreEqual ("UpdateEditText", nud.CallStack [1], "#A3");
+			Assert.AreEqual ("UpdateEditText", nud.CallStack [2], "#A4");
+			Assert.AreEqual (1, value_changed, "#A5");
+			Assert.AreEqual (1, nud.Value, "#A6");
+			Assert.AreEqual (3, nud.CallStack.Count, "#A7");
+			Assert.AreEqual (1, value_changed, "#A8");
+			Assert.AreEqual (1, text_changed, "#A9");
+
+			nud.Text = "5";
+			nud.UpButton ();
+			Assert.AreEqual (7, nud.CallStack.Count, "#B1");
+			Assert.AreEqual ("ValidateEditText", nud.CallStack [3], "#B2");
+			Assert.AreEqual ("UpdateEditText", nud.CallStack [4], "#B3");
+			Assert.AreEqual ("UpdateEditText", nud.CallStack [5], "#B4");
+			Assert.AreEqual ("UpdateEditText", nud.CallStack [6], "#B5");
+			Assert.AreEqual (3, value_changed, "#B6");
+			Assert.AreEqual (6, nud.Value, "#B7");
+			Assert.AreEqual ("6", nud.Text, "#B8");
+			Assert.AreEqual (7, nud.CallStack.Count, "#B9");
+			Assert.AreEqual (3, value_changed, "#B10");
+			Assert.AreEqual (3, text_changed, "#B11");
+
+			nud.Text = "7";
+			nud.user_edit = true;
+			nud.UpButton ();
+			Assert.AreEqual (11, nud.CallStack.Count, "#C1");
+			Assert.AreEqual ("ValidateEditText", nud.CallStack [7], "#C2");
+			Assert.AreEqual ("UpdateEditText", nud.CallStack [8], "#C3");
+			Assert.AreEqual ("UpdateEditText", nud.CallStack [9], "#C4");
+			Assert.AreEqual ("UpdateEditText", nud.CallStack [10], "#C5");
+			Assert.AreEqual (5, value_changed, "#C6");
+			Assert.AreEqual (8, nud.Value, "#C7");
+			Assert.AreEqual (11, nud.CallStack.Count, "#C8");
+			Assert.AreEqual (5, value_changed, "#C9");
+			Assert.AreEqual (5, text_changed, "#C10");
+			nud.user_edit = false;
+			Assert.AreEqual ("8", nud.Text, "#C11");
+			Assert.AreEqual (11, nud.CallStack.Count, "#C12"

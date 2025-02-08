@@ -1,0 +1,623 @@
+               install_action = "install_script." + ver
+                exe_prop = "PYTHON" + ver
+                add_data(self.db, "CustomAction",
+                        [(install_action, 50, exe_prop, self.install_script_key)])
+                add_data(self.db, "InstallExecuteSequence",
+                        [(install_action, "&Python%s=3" % ver, start)])
+                start += 1
+        # XXX pre-install scripts are currently refused in finalize_options()
+        #     but if this feature is completed, it will also need to add
+        #     entries for each version as the above code does
+        if self.pre_install_script:
+            scriptfn = os.path.join(self.bdist_dir, "preinstall.bat")
+            f = open(scriptfn, "w")
+            # The batch file will be executed with [PYTHON], so that %1
+            # is the path to the Python interpreter; %0 will be the path
+            # of the batch file.
+            # rem ="""
+            # %1 %0
+            # exit
+            # """
+            # <actual script>
+            f.write('rem ="""\n%1 %0\nexit\n"""\n')
+            f.write(open(self.pre_install_script).read())
+            f.close()
+            add_data(self.db, "Binary",
+                [("PreInstall", msilib.Binary(scriptfn))
+                ])
+            add_data(self.db, "CustomAction",
+                [("PreInstall", 2, "PreInstall", None)
+                ])
+            add_data(self.db, "InstallExecuteSequence",
+                    [("PreInstall", "NOT Installed", 450)])
+
+
+    def add_ui(self):
+        db = self.db
+        x = y = 50
+        w = 370
+        h = 300
+        title = "[ProductName] Setup"
+
+        # see "Dialog Style Bits"
+        modal = 3      # visible | modal
+        modeless = 1   # visible
+
+        # UI customization properties
+        add_data(db, "Property",
+                 # See "DefaultUIFont Property"
+                 [("DefaultUIFont", "DlgFont8"),
+                  # See "ErrorDialog Style Bit"
+                  ("ErrorDialog", "ErrorDlg"),
+                  ("Progress1", "Install"),   # modified in maintenance type dlg
+                  ("Progress2", "installs"),
+                  ("MaintenanceForm_Action", "Repair"),
+                  # possible values: ALL, JUSTME
+                  ("WhichUsers", "ALL")
+                 ])
+
+        # Fonts, see "TextStyle Table"
+        add_data(db, "TextStyle",
+                 [("DlgFont8", "Tahoma", 9, None, 0),
+                  ("DlgFontBold8", "Tahoma", 8, None, 1), #bold
+                  ("VerdanaBold10", "Verdana", 10, None, 1),
+                  ("VerdanaRed9", "Verdana", 9, 255, 0),
+                 ])
+
+        # UI Sequences, see "InstallUISequence Table", "Using a Sequence Table"
+        # Numbers indicate sequence; see sequence.py for how these action integrate
+        add_data(db, "InstallUISequence",
+                 [("PrepareDlg", "Not Privileged or Windows9x or Installed", 140),
+                  ("WhichUsersDlg", "Privileged and not Windows9x and not Installed", 141),
+                  # In the user interface, assume all-users installation if privileged.
+                  ("SelectFeaturesDlg", "Not Installed", 1230),
+                  # XXX no support for resume installations yet
+                  #("ResumeDlg", "Installed AND (RESUME OR Preselected)", 1240),
+                  ("MaintenanceTypeDlg", "Installed AND NOT RESUME AND NOT Preselected", 1250),
+                  ("ProgressDlg", None, 1280)])
+
+        add_data(db, 'ActionText', text.ActionText)
+        add_data(db, 'UIText', text.UIText)
+        #####################################################################
+        # Standard dialogs: FatalError, UserExit, ExitDialog
+        fatal=PyDialog(db, "FatalError", x, y, w, h, modal, title,
+                     "Finish", "Finish", "Finish")
+        fatal.title("[ProductName] Installer ended prematurely")
+        fatal.back("< Back", "Finish", active = 0)
+        fatal.cancel("Cancel", "Back", active = 0)
+        fatal.text("Description1", 15, 70, 320, 80, 0x30003,
+                   "[ProductName] setup ended prematurely because of an error.  Your system has not been modified.  To install this program at a later time, please run the installation again.")
+        fatal.text("Description2", 15, 155, 320, 20, 0x30003,
+                   "Click the Finish button to exit the Installer.")
+        c=fatal.next("Finish", "Cancel", name="Finish")
+        c.event("EndDialog", "Exit")
+
+        user_exit=PyDialog(db, "UserExit", x, y, w, h, modal, title,
+                     "Finish", "Finish", "Finish")
+        user_exit.title("[ProductName] Installer was interrupted")
+        user_exit.back("< Back", "Finish", active = 0)
+        user_exit.cancel("Cancel", "Back", active = 0)
+        user_exit.text("Description1", 15, 70, 320, 80, 0x30003,
+                   "[ProductName] setup was interrupted.  Your system has not been modified.  "
+                   "To install this program at a later time, please run the installation again.")
+        user_exit.text("Description2", 15, 155, 320, 20, 0x30003,
+                   "Click the Finish button to exit the Installer.")
+        c = user_exit.next("Finish", "Cancel", name="Finish")
+        c.event("EndDialog", "Exit")
+
+        exit_dialog = PyDialog(db, "ExitDialog", x, y, w, h, modal, title,
+                             "Finish", "Finish", "Finish")
+        exit_dialog.title("Completing the [ProductName] Installer")
+        exit_dialog.back("< Back", "Finish", active = 0)
+        exit_dialog.cancel("Cancel", "Back", active = 0)
+        exit_dialog.text("Description", 15, 235, 320, 20, 0x30003,
+                   "Click the Finish button to exit the Installer.")
+        c = exit_dialog.next("Finish", "Cancel", name="Finish")
+        c.event("EndDialog", "Return")
+
+        #####################################################################
+        # Required dialog: FilesInUse, ErrorDlg
+        inuse = PyDialog(db, "FilesInUse",
+                         x, y, w, h,
+                         19,                # KeepModeless|Modal|Visible
+                         title,
+                         "Retry", "Retry", "Retry", bitmap=False)
+        inuse.text("Title", 15, 6, 200, 15, 0x30003,
+                   r"{\DlgFontBold8}Files in Use")
+        inuse.text("Description", 20, 23, 280, 20, 0x30003,
+               "Some files that need to be updated are currently in use.")
+        inuse.text("Text", 20, 55, 330, 50, 3,
+                   "The following applications are using files that need to be updated by this setup. Close these applications and then click Retry to continue the installation or Cancel to exit it.")
+        inuse.control("List", "ListBox", 20, 107, 330, 130, 7, "FileInUseProcess",
+                      None, None, None)
+        c=inuse.back("Exit", "Ignore", name="Exit")
+        c.event("EndDialog", "Exit")
+        c=inuse.next("Ignore", "Retry", name="Ignore")
+        c.event("EndDialog", "Ignore")
+        c=inuse.cancel("Retry", "Exit", name="Retry")
+        c.event("EndDialog","Retry")
+
+        # See "Error Dialog". See "ICE20" for the required names of the controls.
+        error = Dialog(db, "ErrorDlg",
+                       50, 10, 330, 101,
+                       65543,       # Error|Minimize|Modal|Visible
+                       title,
+                       "ErrorText", None, None)
+        error.text("ErrorText", 50,9,280,48,3, "")
+        #error.control("ErrorIcon", "Icon", 15, 9, 24, 24, 5242881, None, "py.ico", None, None)
+        error.pushbutton("N",120,72,81,21,3,"No",None).event("EndDialog","ErrorNo")
+        error.pushbutton("Y",240,72,81,21,3,"Yes",None).event("EndDialog","ErrorYes")
+        error.pushbutton("A",0,72,81,21,3,"Abort",None).event("EndDialog","ErrorAbort")
+        error.pushbutton("C",42,72,81,21,3,"Cancel",None).event("EndDialog","ErrorCancel")
+        error.pushbutton("I",81,72,81,21,3,"Ignore",None).event("EndDialog","ErrorIgnore")
+        error.pushbutton("O",159,72,81,21,3,"Ok",None).event("EndDialog","ErrorOk")
+        error.pushbutton("R",198,72,81,21,3,"Retry",None).event("EndDialog","ErrorRetry")
+
+        #####################################################################
+        # Global "Query Cancel" dialog
+        cancel = Dialog(db, "CancelDlg", 50, 10, 260, 85, 3, title,
+                        "No", "No", "No")
+        cancel.text("Text", 48, 15, 194, 30, 3,
+                    "Are you sure you want to cancel [ProductName] installation?")
+        #cancel.control("Icon", "Icon", 15, 15, 24, 24, 5242881, None,
+        #               "py.ico", None, None)
+        c=cancel.pushbutton("Yes", 72, 57, 56, 17, 3, "Yes", "No")
+        c.event("EndDialog", "Exit")
+
+        c=cancel.pushbutton("No", 132, 57, 56, 17, 3, "No", "Yes")
+        c.event("EndDialog", "Return")
+
+        #####################################################################
+        # Global "Wait for costing" dialog
+        costing = Dialog(db, "WaitForCostingDlg", 50, 10, 260, 85, modal, title,
+                         "Return", "Return", "Return")
+        costing.text("Text", 48, 15, 194, 30, 3,
+                     "Please wait while the installer finishes determining your disk space requirements.")
+        c = costing.pushbutton("Return", 102, 57, 56, 17, 3, "Return", None)
+        c.event("EndDialog", "Exit")
+
+        #####################################################################
+        # Preparation dialog: no user input except cancellation
+        prep = PyDialog(db, "PrepareDlg", x, y, w, h, modeless, title,
+                        "Cancel", "Cancel", "Cancel")
+        prep.text("Description", 15, 70, 320, 40, 0x30003,
+                  "Please wait while the Installer prepares to guide you through the installation.")
+        prep.title("Welcome to the [ProductName] Installer")
+        c=prep.text("ActionText", 15, 110, 320, 20, 0x30003, "Pondering...")
+        c.mapping("ActionText", "Text")
+        c=prep.text("ActionData", 15, 135, 320, 30, 0x30003, None)
+        c.mapping("ActionData", "Text")
+        prep.back("Back", None, active=0)
+        prep.next("Next", None, active=0)
+        c=prep.cancel("Cancel", None)
+        c.event("SpawnDialog", "CancelDlg")
+
+        #####################################################################
+        # Feature (Python directory) selection
+        seldlg = PyDialog(db, "SelectFeaturesDlg", x, y, w, h, modal, title,
+                        "Next", "Next", "Cancel")
+        seldlg.title("Select Python Installations")
+
+        seldlg.text("Hint", 15, 30, 300, 20, 3,
+                    "Select the Python locations where %s should be installed."
+                    % self.distribution.get_fullname())
+
+        seldlg.back("< Back", None, active=0)
+        c = seldlg.next("Next >", "Cancel")
+        order = 1
+        c.event("[TARGETDIR]", "[SourceDir]", ordering=order)
+        for version in self.versions + [self.other_version]:
+            order += 1
+            c.event("[TARGETDIR]", "[TARGETDIR%s]" % version,
+                    "FEATURE_SELECTED AND &Python%s=3" % version,
+                    ordering=order)
+        c.event("SpawnWaitDialog", "WaitForCostingDlg", ordering=order + 1)
+        c.event("EndDialog", "Return", ordering=order + 2)
+        c = seldlg.cancel("Cancel", "Features")
+        c.event("SpawnDialog", "CancelDlg")
+
+        c = seldlg.control("Features", "SelectionTree", 15, 60, 300, 120, 3,
+                           "FEATURE", None, "PathEdit", None)
+        c.event("[FEATURE_SELECTED]", "1")
+        ver = self.other_version
+        install_other_cond = "FEATURE_SELECTED AND &Python%s=3" % ver
+        dont_install_other_cond = "FEATURE_SELECTED AND &Python%s<>3" % ver
+
+        c = seldlg.text("Other", 15, 200, 300, 15, 3,
+                        "Provide an alternate Python location")
+        c.condition("Enable", install_other_cond)
+        c.condition("Show", install_other_cond)
+        c.condition("Disable", dont_install_other_cond)
+        c.condition("Hide", dont_install_other_cond)
+
+        c = seldlg.control("PathEdit", "PathEdit", 15, 215, 300, 16, 1,
+                           "TARGETDIR" + ver, None, "Next", None)
+        c.condition("Enable", install_other_cond)
+        c.condition("Show", install_other_cond)
+        c.condition("Disable", dont_install_other_cond)
+        c.condition("Hide", dont_install_other_cond)
+
+        #####################################################################
+        # Disk cost
+        cost = PyDialog(db, "DiskCostDlg", x, y, w, h, modal, title,
+                        "OK", "OK", "OK", bitmap=False)
+        cost.text("Title", 15, 6, 200, 15, 0x30003,
+                  "{\DlgFontBold8}Disk Space Requirements")
+        cost.text("Description", 20, 20, 280, 20, 0x30003,
+                  "The disk space required for the installation of the selected features.")
+        cost.text("Text", 20, 53, 330, 60, 3,
+                  "The highlighted volumes (if any) do not have enough disk space "
+              "available for the currently selected features.  You can either "
+              "remove some files from the highlighted volumes, or choose to "
+              "install less features onto local drive(s), or select different "
+              "destination drive(s).")
+        cost.control("VolumeList", "VolumeCostList", 20, 100, 330, 150, 393223,
+                     None, "{120}{70}{70}{70}{70}", None, None)
+        cost.xbutton("OK", "Ok", None, 0.5).event("EndDialog", "Return")
+
+        #####################################################################
+        # WhichUsers Dialog. Only available on NT, and for privileged users.
+        # This must be run before FindRelatedProducts, because that will
+        # take into account whether the previous installation was per-user
+        # or per-machine. We currently don't support going back to this
+        # dialog after "Next" was selected; to support this, we would need to
+        # find how to reset the ALLUSERS property, and how to re-run
+        # FindRelatedProducts.
+        # On Windows9x, the ALLUSERS property is ignored on the command line
+        # and in the Property table, but installer fails according to the documentation
+        # if a dialog attempts to set ALLUSERS.
+        whichusers = PyDialog(db, "WhichUsersDlg", x, y, w, h, modal, title,
+                            "AdminInstall", "Next", "Cancel")
+        whichusers.title("Select whether to install [ProductName] for all users of this computer.")
+        # A radio group with two options: allusers, justme
+        g = whichusers.radiogroup("AdminInstall", 15, 60, 260, 50, 3,
+                                  "WhichUsers", "", "Next")
+        g.add("ALL", 0, 5, 150, 20, "Install for all users")
+        g.add("JUSTME", 0, 25, 150, 20, "Install just for me")
+
+        whichusers.back("Back", None, active=0)
+
+        c = whichusers.next("Next >", "Cancel")
+        c.event("[ALLUSERS]", "1", 'WhichUsers="ALL"', 1)
+        c.event("EndDialog", "Return", ordering = 2)
+
+        c = whichusers.cancel("Cancel", "AdminInstall")
+        c.event("SpawnDialog", "CancelDlg")
+
+        #####################################################################
+        # Installation Progress dialog (modeless)
+        progress = PyDialog(db, "ProgressDlg", x, y, w, h, modeless, title,
+                            "Cancel", "Cancel", "Cancel", bitmap=False)
+        progress.text("Title", 20, 15, 200, 15, 0x30003,
+                      "{\DlgFontBold8}[Progress1] [ProductName]")
+        progress.text("Text", 35, 65, 300, 30, 3,
+                      "Please wait while the Installer [Progress2] [ProductName]. "
+                      "This may take several minutes.")
+        progress.text("StatusLabel", 35, 100, 35, 20, 3, "Status:")
+
+        c=progress.text("ActionText", 70, 100, w-70, 20, 3, "Pondering...")
+        c.mapping("ActionText", "Text")
+
+        #c=progress.text("ActionData", 35, 140, 300, 20, 3, None)
+        #c.mapping("ActionData", "Text")
+
+        c=progress.control("ProgressBar", "ProgressBar", 35, 120, 300, 10, 65537,
+                           None, "Progress done", None, None)
+        c.mapping("SetProgress", "Progress")
+
+        progress.back("< Back", "Next", active=False)
+        progress.next("Next >", "Cancel", active=False)
+        progress.cancel("Cancel", "Back").event("SpawnDialog", "CancelDlg")
+
+        ###################################################################
+        # Maintenance type: repair/uninstall
+        maint = PyDialog(db, "MaintenanceTypeDlg", x, y, w, h, modal, title,
+                         "Next", "Next", "Cancel")
+        maint.title("Welcome to the [ProductName] Setup Wizard")
+        maint.text("BodyText", 15, 63, 330, 42, 3,
+                   "Select whether you want to repair or remove [ProductName].")
+        g=maint.radiogroup("RepairRadioGroup", 15, 108, 330, 60, 3,
+                            "MaintenanceForm_Action", "", "Next")
+        #g.add("Change", 0, 0, 200, 17, "&Change [ProductName]")
+        g.add("Repair", 0, 18, 200, 17, "&Repair [ProductName]")
+        g.add("Remove", 0, 36, 200, 17, "Re&move [ProductName]")
+
+        maint.back("< Back", None, active=False)
+        c=maint.next("Finish", "Cancel")
+        # Change installation: Change progress dialog to "Change", then ask
+        # for feature selection
+        #c.event("[Progress1]", "Change", 'MaintenanceForm_Action="Change"', 1)
+        #c.event("[Progress2]", "changes", 'MaintenanceForm_Action="Change"', 2)
+
+        # Reinstall: Change progress dialog to "Repair", then invoke reinstall
+        # Also set list of reinstalled features to "ALL"
+        c.event("[REINSTALL]", "ALL", 'MaintenanceForm_Action="Repair"', 5)
+        c.event("[Progress1]", "Repairing", 'MaintenanceForm_Action="Repair"', 6)
+        c.event("[Progress2]", "repairs", 'MaintenanceForm_Action="Repair"', 7)
+        c.event("Reinstall", "ALL", 'MaintenanceForm_Action="Repair"', 8)
+
+        # Uninstall: Change progress to "Remove", then invoke uninstall
+        # Also set list of removed features to "ALL"
+        c.event("[REMOVE]", "ALL", 'MaintenanceForm_Action="Remove"', 11)
+        c.event("[Progress1]", "Removing", 'MaintenanceForm_Action="Remove"', 12)
+        c.event("[Progress2]", "removes", 'MaintenanceForm_Action="Remove"', 13)
+        c.event("Remove", "ALL", 'MaintenanceForm_Action="Remove"', 14)
+
+        # Close dialog when maintenance action scheduled
+        c.event("EndDialog", "Return", 'MaintenanceForm_Action<>"Change"', 20)
+        #c.event("NewDialog", "SelectFeaturesDlg", 'MaintenanceForm_Action="Change"', 21)
+
+        maint.cancel("Cancel", "RepairRadioGroup").event("SpawnDialog", "CancelDlg")
+
+    def get_installer_filename(self, fullname):
+        # Factored out to allow overriding in subclasses
+        if self.target_version:
+            base_name = "%s.%s-py%s.msi" % (fullname, self.plat_name,
+                                            self.target_version)
+        else:
+            base_name = "%s.%s.msi" % (fullname, self.plat_name)
+        installer_name = os.path.join(self.dist_dir, base_name)
+        return installer_name
+                                                                                                                                                                                                                                                                                                                                                                                                                                   áW´„ÊÙè‚®ÓÚ‹<≈èª˜Ä"t(Bb›Y5v]‰è†õ-eCc‡@>EGv'¬#ê¯πóP<mR€≈§9»¯Z‰ej=$÷õ»pFÀô	ÙK˚5?¥è≈ %Ø4Ü…‰tÌÚ§@üÌ“∏Æ)ÊFïûÌÓ†D;epCr{6åÉ∂PèπŒ J_(√! UR»”Ë[Å¯lT€0Oo~É=5ƒÑ\^„À’l‘sH91˜œ">j—ä•îï*ØPzwMaÙŸ˚∂C¬\]qáë‘±KÁN ÀoÖ∆Ω?FŸÊ„°5—áv:≈?$.0Îö/†‚DfÎÀÄ:W	~µ<Ãgä∞Ô3Õ_∞“¸n√çÉÔS®t
+D;dŸ≈Ëè)xapÇÂçgc¶PòΩWÀóﬂÏæïœiTä^ê7àN§ıHR˙(U…`ãéœ∆ÒMÎÕ.Bü™∂Ä◊!∫ÀeKZRe™No	›Ú'{tÚ≈rSw f‹vˇlLQzË†©≥5ø“≤÷7‚ÿöÑﬂï≥Ë@?#s≤èA¢ïÛBÖî©‹}k¿v-áîﬂ#<]÷Ôã¬äs+ﬁc√∞≤2e”∞Rtj?_‰Ôd'ò‹7≥ˇ‡Õœ≈©î˝÷Ö?d—ºhl•z∂Ô◊&√[“Lv|Ü›T//
+// Copyright 2017 The Abseil Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+// This file declares INTERNAL parts of the Join API that are inlined/templated
+// or otherwise need to be available at compile time. The main abstractions
+// defined in this file are:
+//
+//   - A handful of default Formatters
+//   - JoinAlgorithm() overloads
+//   - JoinRange() overloads
+//   - JoinTuple()
+//
+// DO NOT INCLUDE THIS FILE DIRECTLY. Use this file by including
+// absl/strings/str_join.h
+//
+// IWYU pragma: private, include "absl/strings/str_join.h"
+
+#ifndef ABSL_STRINGS_INTERNAL_STR_JOIN_INTERNAL_H_
+#define ABSL_STRINGS_INTERNAL_STR_JOIN_INTERNAL_H_
+
+#include <cstring>
+#include <iterator>
+#include <memory>
+#include <string>
+#include <type_traits>
+#include <utility>
+
+#include "absl/strings/internal/ostringstream.h"
+#include "absl/strings/internal/resize_uninitialized.h"
+#include "absl/strings/str_cat.h"
+
+namespace absl {
+namespace strings_internal {
+
+//
+// Formatter objects
+//
+// The following are implementation classes for standard Formatter objects. The
+// factory functions that users will call to create and use these formatters are
+// defined and documented in strings/join.h.
+//
+
+// The default formatter. Converts alpha-numeric types to strings.
+struct AlphaNumFormatterImpl {
+  // This template is needed in order to support passing in a dereferenced
+  // vector<bool>::iterator
+  template <typename T>
+  void operator()(std::string* out, const T& t) const {
+    StrAppend(out, AlphaNum(t));
+  }
+
+  void operator()(std::string* out, const AlphaNum& t) const {
+    StrAppend(out, t);
+  }
+};
+
+// A type that's used to overload the JoinAlgorithm() function (defined below)
+// for ranges that do not require additional formatting (e.g., a range of
+// strings).
+
+struct NoFormatter : public AlphaNumFormatterImpl {};
+
+// Formats types to strings using the << operator.
+class StreamFormatterImpl {
+ public:
+  // The method isn't const because it mutates state. Making it const will
+  // render StreamFormatterImpl thread-hostile.
+  template <typename T>
+  void operator()(std::string* out, const T& t) {
+    // The stream is created lazily to avoid paying the relatively high cost
+    // of its construction when joining an empty range.
+    if (strm_) {
+      strm_->clear();  // clear the bad, fail and eof bits in case they were set
+      strm_->str(out);
+    } else {
+      strm_.reset(new strings_internal::OStringStream(out));
+    }
+    *strm_ << t;
+  }
+
+ private:
+  std::unique_ptr<strings_internal::OStringStream> strm_;
+};
+
+// Formats a std::pair<>. The 'first' member is formatted using f1_ and the
+// 'second' member is formatted using f2_. sep_ is the separator.
+template <typename F1, typename F2>
+class PairFormatterImpl {
+ public:
+  PairFormatterImpl(F1 f1, absl::string_view sep, F2 f2)
+      : f1_(std::move(f1)), sep_(sep), f2_(std::move(f2)) {}
+
+  template <typename T>
+  void operator()(std::string* out, const T& p) {
+    f1_(out, p.first);
+    out->append(sep_);
+    f2_(out, p.second);
+  }
+
+  template <typename T>
+  void operator()(std::string* out, const T& p) const {
+    f1_(out, p.first);
+    out->append(sep_);
+    f2_(out, p.second);
+  }
+
+ private:
+  F1 f1_;
+  std::string sep_;
+  F2 f2_;
+};
+
+// Wraps another formatter and dereferences the argument to operator() then
+// passes the dereferenced argument to the wrapped formatter. This can be
+// useful, for example, to join a std::vector<int*>.
+template <typename Formatter>
+class DereferenceFormatterImpl {
+ public:
+  DereferenceFormatterImpl() : f_() {}
+  explicit DereferenceFormatterImpl(Formatter&& f)
+      : f_(std::forward<Formatter>(f)) {}
+
+  template <typename T>
+  void operator()(std::string* out, const T& t) {
+    f_(out, *t);
+  }
+
+  template <typename T>
+  void operator()(std::string* out, const T& t) const {
+    f_(out, *t);
+  }
+
+ private:
+  Formatter f_;
+};
+
+// DefaultFormatter<T> is a traits class that selects a default Formatter to use
+// for the given type T. The ::Type member names the Formatter to use. This is
+// used by the strings::Join() functions that do NOT take a Formatter argument,
+// in which case a default Formatter must be chosen.
+//
+// AlphaNumFormatterImpl is the default in the base template, followed by
+// specializations for other types.
+template <typename ValueType>
+struct DefaultFormatter {
+  typedef AlphaNumFormatterImpl Type;
+};
+template <>
+struct DefaultFormatter<const char*> {
+  typedef AlphaNumFormatterImpl Type;
+};
+template <>
+struct DefaultFormatter<char*> {
+  typedef AlphaNumFormatterImpl Type;
+};
+template <>
+struct DefaultFormatter<std::string> {
+  typedef NoFormatter Type;
+};
+template <>
+struct DefaultFormatter<absl::string_view> {
+  typedef NoFormatter Type;
+};
+template <typename ValueType>
+struct DefaultFormatter<ValueType*> {
+  typedef DereferenceFormatterImpl<typename DefaultFormatter<ValueType>::Type>
+      Type;
+};
+
+template <typename ValueType>
+struct DefaultFormatter<std::unique_ptr<ValueType>>
+    : public DefaultFormatter<ValueType*> {};
+
+//
+// JoinAlgorithm() functions
+//
+
+// The main joining algorithm. This simply joins the elements in the given
+// iterator range, each separated by the given separator, into an output std::string,
+// and formats each element using the provided Formatter object.
+template <typename Iterator, typename Formatter>
+std::string JoinAlgorithm(Iterator start, Iterator end, absl::string_view s,
+                     Formatter&& f) {
+  std::string result;
+  absl::string_view sep("");
+  for (Iterator it = start; it != end; ++it) {
+    result.append(sep.data(), sep.size());
+    f(&result, *it);
+    sep = s;
+  }
+  return result;
+}
+
+// A joining algorithm that's optimized for a forward iterator range of
+// std::string-like objects that do not need any additional formatting. This is to
+// optimize the common case of joining, say, a std::vector<std::string> or a
+// std::vector<absl::string_view>.
+//
+// This is an overload of the previous JoinAlgorithm() function. Here the
+// Formatter argument is of type NoFormatter. Since NoFormatter is an internal
+// type, this overload is only invoked when strings::Join() is called with a
+// range of std::string-like objects (e.g., std::string, absl::string_view), and an
+// explicit Formatter argument was NOT specified.
+//
+// The optimization is that the needed space will be reserved in the output
+// std::string to avoid the need to resize while appending. To do this, the iterator
+// range will be traversed twice: once to calculate the total needed size, and
+// then again to copy the elements and delimiters to the output std::string.
+template <typename Iterator,
+          typename = typename std::enable_if<std::is_convertible<
+              typename std::iterator_traits<Iterator>::iterator_category,
+              std::forward_iterator_tag>::value>::type>
+std::string JoinAlgorithm(Iterator start, Iterator end, absl::string_view s,
+                     NoFormatter) {
+  std::string result;
+  if (start != end) {
+    // Sums size
+    size_t result_size = start->size();
+    for (Iterator it = start; ++it != end;) {
+      result_size += s.size();
+      result_size += it->size();
+    }
+
+    if (result_size > 0) {
+      STLStringResizeUninitialized(&result, result_size);
+
+      // Joins strings
+      char* result_buf = &*result.begin();
+      memcpy(result_buf, start->data(), start->size());
+      result_buf += start->size();
+      for (Iterator it = start; ++it != end;) {
+        memcpy(result_buf, s.data(), s.size());
+        result_buf += s.size();
+        memcpy(result_buf, it->data(), it->size());
+        result_buf += it->size();
+      }
+    }
+  }
+
+  return result;
+}
+
+// JoinTupleLoop implements a loop over the elements of a std::tuple, which
+// are heterogeneous. The primary template matches the tuple interior case. It
+// continues the iteration after appending a separator (for nonzero indices)
+// and formatting an element of the tuple. The specialization for the I=N case
+// matches the end-of-tuple, and terminates the iteration.
+template <size_t I, size_t N>
+struct JoinTupleLoop {

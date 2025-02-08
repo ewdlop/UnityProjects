@@ -1,0 +1,55 @@
+& !bAgreeToCrashUpload;
+
+	if (!bSkipCRC)
+	{
+		FString CrashInfoFolder = FPaths::Combine(*FPaths::ProjectSavedDir(), TEXT("Crashes"), *FString::Printf(TEXT("%sinfo-%s-pid-%d-%s"), bReportingNonCrash ? TEXT("ensure") : TEXT("crash"), FApp::GetProjectName(), getpid(), *CrashGuid));
+		FString CrashInfoAbsolute = FPaths::ConvertRelativePathToFull(CrashInfoFolder);
+		if (IFileManager::Get().MakeDirectory(*CrashInfoAbsolute, true))
+		{
+			// generate "minidump"
+			GenerateReport(FPaths::Combine(*CrashInfoAbsolute, TEXT("Diagnostics.txt")));
+
+			// Introduces a new runtime crash context. Will replace all Windows related crash reporting.
+			FString FilePath(CrashInfoFolder);
+			FilePath += TEXT("/");
+			FilePath += FGenericCrashContext::CrashContextRuntimeXMLNameW;
+			SerializeAsXML(*FilePath);
+
+			// copy log
+			FString LogSrcAbsolute = FPlatformOutputDevices::GetAbsoluteLogFilename();
+			FString LogFolder = FPaths::GetPath(LogSrcAbsolute);
+			FString LogFilename = FPaths::GetCleanFilename(LogSrcAbsolute);
+			FString LogBaseFilename = FPaths::GetBaseFilename(LogSrcAbsolute);
+			FString LogExtension = FPaths::GetExtension(LogSrcAbsolute, true);
+			FString LogDstAbsolute = FPaths::Combine(*CrashInfoAbsolute, *LogFilename);
+			FPaths::NormalizeDirectoryName(LogDstAbsolute);
+
+			// Flush out the log
+			GLog->Flush();
+
+#if !NO_LOGGING
+			bool bMemoryOnly = FPlatformOutputDevices::GetLog()->IsMemoryOnly();
+			bool bBacklogEnabled = FOutputDeviceRedirector::Get()->IsBacklogEnabled();
+
+			// The minimum free space on drive for saving a crash log
+			const uint64 MinDriveSpaceForCrashLog = 250 * 1024 * 1024;
+			// Max log file size to copy to report folder as will be filtered before submission to crash reporting backend
+			const uint64 MaxFileSizeForCrashLog = 100 * 1024 * 1024;
+
+			// Check whether server has low disk space available
+			uint64 TotalDiskSpace = 0;
+			uint64 TotalDiskFreeSpace = 0;
+			bool bLowDriveSpace = false;
+			if (FPlatformMisc::GetDiskTotalAndFreeSpace(*CrashInfoAbsolute, TotalDiskSpace, TotalDiskFreeSpace))
+			{
+				if (TotalDiskFreeSpace < MinDriveSpaceForCrashLog)
+				{
+					bLowDriveSpace = true;
+				}
+			}
+
+			if (!bLowDriveSpace)
+			{
+				if (bMemoryOnly || bBacklogEnabled)
+				{
+					FArch

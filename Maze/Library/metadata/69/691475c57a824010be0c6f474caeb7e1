@@ -1,0 +1,460 @@
+//
+// System.Web.UI.WebControls.Calendar.cs
+//
+// Authors:
+//    Jordi Mas i Hernandez (jordi@ximian.com)
+//
+// (C) 2005-2010 Novell, Inc (http://www.novell.com)
+//
+//
+//
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+//
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+//
+//
+
+using System.Globalization;
+using System.Collections;
+using System.ComponentModel;
+using System.Drawing;
+using System.Security.Permissions;
+using System.Threading;
+using System.Text;
+using System.Web.Util;
+
+namespace System.Web.UI.WebControls
+{
+	// CAS
+	[AspNetHostingPermissionAttribute (SecurityAction.LinkDemand, Level = AspNetHostingPermissionLevel.Minimal)]
+	[AspNetHostingPermissionAttribute (SecurityAction.InheritanceDemand, Level = AspNetHostingPermissionLevel.Minimal)]
+	// attributes
+	[DataBindingHandler("System.Web.UI.Design.WebControls.CalendarDataBindingHandler, " + Consts.AssemblySystem_Design)]
+	[DefaultEvent("SelectionChanged")]
+	[DefaultProperty("SelectedDate")]
+	[Designer("System.Web.UI.Design.WebControls.CalendarDesigner, " + Consts.AssemblySystem_Design, "System.ComponentModel.Design.IDesigner")]
+	[ControlValueProperty ("SelectedDate", "1/1/0001 12:00:00 AM")]
+	[SupportsEventValidation]
+	public class Calendar : WebControl, IPostBackEventHandler
+	{
+		TableItemStyle dayHeaderStyle;
+		TableItemStyle dayStyle;
+		TableItemStyle nextPrevStyle;
+		TableItemStyle otherMonthDayStyle;
+		TableItemStyle selectedDayStyle;
+		TableItemStyle titleStyle;
+		TableItemStyle todayDayStyle;
+		TableItemStyle selectorStyle;
+		TableItemStyle weekendDayStyle;
+		DateTimeFormatInfo dateInfo;
+		SelectedDatesCollection selectedDatesCollection;
+		ArrayList dateList;
+		DateTime today = DateTime.Today;
+		static DateTime dateZenith  = new DateTime (2000, 1,1);
+		const int daysInAWeek = 7;
+		static readonly object DayRenderEvent = new object ();
+		static readonly object SelectionChangedEvent = new object ();
+		static readonly object VisibleMonthChangedEvent = new object ();
+
+		public Calendar ()
+		{
+		}
+
+		[Localizable (true)]
+		[DefaultValue ("")]
+		[WebSysDescription ("")]
+		[WebCategoryAttribute ("Appearance")]
+		public virtual string Caption {
+			get { return ViewState.GetString ("Caption", String.Empty); }
+			set { ViewState["Caption"] = value; }
+		}
+
+		[DefaultValue (TableCaptionAlign.NotSet)]
+		[WebSysDescription ("")]
+		[WebCategoryAttribute ("Accessibility")]
+		public virtual TableCaptionAlign CaptionAlign {
+			get { return (TableCaptionAlign)ViewState.GetInt ("CaptionAlign", (int)TableCaptionAlign.NotSet); }
+			set { ViewState ["CaptionAlign"] = value; }
+		}
+
+		[DefaultValue(2)]
+		[WebSysDescription ("")]
+		[WebCategory ("Layout")]
+		public int CellPadding {
+			get { return ViewState.GetInt ("CellPadding", 2); }
+
+			set {
+				if (value < -1)
+					throw new ArgumentOutOfRangeException ("The specified cell padding is less than -1.");
+
+				ViewState ["CellPadding"] = value;
+			}
+		}
+
+		[DefaultValue(0)]
+		[WebSysDescription ("")]
+		[WebCategory ("Layout")]
+		public int CellSpacing {
+			get { return ViewState.GetInt ("CellSpacing", 0); }
+
+			set {
+				if (value < -1)
+					throw new ArgumentOutOfRangeException ("The specified cell spacing is less than -1");
+
+				ViewState ["CellSpacing"] = value;
+			}
+		}
+
+		[PersistenceMode(PersistenceMode.InnerProperty)]
+		[NotifyParentProperty(true)]
+		[DesignerSerializationVisibility(DesignerSerializationVisibility.Content)]
+		[WebSysDescription ("")]
+		[WebCategory ("Style")]
+		public TableItemStyle DayHeaderStyle {
+			get {
+				if (dayHeaderStyle == null) {
+					dayHeaderStyle = new TableItemStyle ();
+					if (IsTrackingViewState)
+						dayHeaderStyle.TrackViewState ();
+				}
+
+				return dayHeaderStyle;
+			}
+		}
+
+		[DefaultValue(DayNameFormat.Short)]
+		[WebSysDescription ("")]
+		[WebCategory ("Appearance")]
+		public DayNameFormat DayNameFormat {
+			get { return (DayNameFormat) ViewState.GetInt ("DayNameFormat", (int) DayNameFormat.Short); }
+
+			set {
+				if (value != DayNameFormat.FirstLetter && value != DayNameFormat.FirstTwoLetters &&
+					value != DayNameFormat.Full && value != DayNameFormat.Short && value != DayNameFormat.Shortest) {
+					throw new ArgumentOutOfRangeException ("The specified day name format is not one of the DayNameFormat values.");
+				}
+
+				ViewState ["DayNameFormat"] = value;
+			}
+		}
+
+		[DefaultValue(null)]
+		[DesignerSerializationVisibility(DesignerSerializationVisibility.Content)]
+		[NotifyParentProperty(true)]
+		[PersistenceMode(PersistenceMode.InnerProperty)]
+		[WebSysDescription ("")]
+		[WebCategory ("Style")]
+		public TableItemStyle DayStyle {
+			get {
+				if (dayStyle == null) {
+					dayStyle = new TableItemStyle ();
+					if (IsTrackingViewState)
+						dayStyle.TrackViewState ();
+				}
+
+				return dayStyle;
+			}
+		}
+
+		[DefaultValue(FirstDayOfWeek.Default)]
+		[WebSysDescription ("")]
+		[WebCategory ("Appearance")]
+		public FirstDayOfWeek FirstDayOfWeek {
+			get { return (FirstDayOfWeek) ViewState.GetInt ("FirstDayOfWeek", (int) FirstDayOfWeek.Default); }
+
+			set {
+				if (value < FirstDayOfWeek.Sunday || value > FirstDayOfWeek.Default) {
+					throw new ArgumentOutOfRangeException ("The specified day name format is not one of the DayNameFormat values.");
+				}
+
+				ViewState ["FirstDayOfWeek"] = value;
+			}
+		}
+
+		[DefaultValue("&gt;")]
+		[Localizable (true)]
+		[WebSysDescription ("")]
+		[WebCategory ("Appearance")]
+		public string NextMonthText {
+			get { return ViewState.GetString ("NextMonthText", "&gt;"); }
+			set { ViewState ["NextMonthText"] = value; }
+		}
+
+		[DefaultValue(NextPrevFormat.CustomText)]
+		[WebSysDescription ("")]
+		[WebCategory ("Appearance")]
+		public NextPrevFormat NextPrevFormat {
+			get { return (NextPrevFormat) ViewState.GetInt ("NextPrevFormat", (int) NextPrevFormat.CustomText); }
+
+			set {
+				if (value != NextPrevFormat.CustomText && value != NextPrevFormat.ShortMonth && value != NextPrevFormat.FullMonth)
+					throw new ArgumentOutOfRangeException ("The specified day name format is not one of the DayNameFormat values.");
+
+				ViewState ["NextPrevFormat"] = value;
+			}
+		}
+
+		[DesignerSerializationVisibility(DesignerSerializationVisibility.Content)]
+		[NotifyParentProperty(true)]
+		[PersistenceMode(PersistenceMode.InnerProperty)]
+		[WebSysDescription ("")]
+		[WebCategory ("Style")]
+		public TableItemStyle NextPrevStyle {
+			get {
+				if (nextPrevStyle == null) {
+					nextPrevStyle = new TableItemStyle ();
+					if (IsTrackingViewState)
+						nextPrevStyle.TrackViewState ();
+				}
+
+				return nextPrevStyle;
+			}
+		}
+
+		[DefaultValue(null)]
+		[NotifyParentProperty(true)]
+		[DesignerSerializationVisibility(DesignerSerializationVisibility.Content)]
+		[PersistenceMode(PersistenceMode.InnerProperty)]
+		[WebSysDescription ("")]
+		[WebCategory ("Style")]
+		public TableItemStyle OtherMonthDayStyle {
+			get {
+				if (otherMonthDayStyle == null) {
+					otherMonthDayStyle = new TableItemStyle ();
+					if (IsTrackingViewState)
+						otherMonthDayStyle.TrackViewState ();
+				}
+
+				return otherMonthDayStyle;
+			}
+		}
+
+		[DefaultValue("&lt;")]
+		[Localizable (true)]
+		[WebSysDescription ("")]
+		[WebCategory ("Appearance")]
+		public string PrevMonthText {
+			get { return ViewState.GetString ("PrevMonthText", "&lt;"); }
+			set { ViewState ["PrevMonthText"] = value; }
+		}
+
+		[Bindable(true, BindingDirection.TwoWay)]
+		[DefaultValue("1/1/0001 12:00:00 AM")]
+		[WebSysDescription ("")]
+		[WebCategory ("Appearance")]
+		public DateTime SelectedDate {
+			get {
+				if (SelectedDates.Count > 0)
+					return SelectedDates [0];
+
+				return DateTime.MinValue;
+			}
+
+			set { SelectedDates.SelectRange (value, value); }
+		}
+
+		[Browsable(false)]
+		[DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+		[WebSysDescription ("")]
+		[WebCategory ("Appearance")]
+		public SelectedDatesCollection SelectedDates {
+			get {
+				if (dateList == null)
+					dateList = new ArrayList ();
+
+				if (selectedDatesCollection == null)
+					selectedDatesCollection = new SelectedDatesCollection (dateList);
+
+				return selectedDatesCollection;
+			}
+		}
+
+		[DefaultValue(null)]
+		[DesignerSerializationVisibility(DesignerSerializationVisibility.Content)]
+		[NotifyParentProperty(true)]
+		[PersistenceMode(PersistenceMode.InnerProperty)]
+		[WebSysDescription ("")]
+		[WebCategory ("Style")]
+		public TableItemStyle SelectedDayStyle {
+			get {
+				if (selectedDayStyle == null) {
+					selectedDayStyle = new TableItemStyle ();
+					if (IsTrackingViewState)
+						selectedDayStyle.TrackViewState ();
+				}
+
+				return selectedDayStyle;
+			}
+		}
+
+		[DefaultValue(CalendarSelectionMode.Day)]
+		[WebSysDescription ("")]
+		[WebCategory ("Behavior")]
+		public CalendarSelectionMode SelectionMode {
+			get { return (CalendarSelectionMode) ViewState.GetInt ("SelectionMode", (int) CalendarSelectionMode.Day); }
+
+			set {
+				if (value != CalendarSelectionMode.Day  && value != CalendarSelectionMode.DayWeek &&
+					value != CalendarSelectionMode.DayWeekMonth  && value != CalendarSelectionMode.None) {
+					throw new ArgumentOutOfRangeException ("The specified selection mode is not one of the CalendarSelectionMode values.");
+				}
+				ViewState ["SelectionMode"] = value;
+			}
+		}
+
+		[DefaultValue("&gt;&gt;")]
+		[Localizable (true)]
+		[WebSysDescription ("")]
+		[WebCategory ("Appearance")]
+		public string SelectMonthText {
+			get { return ViewState.GetString ("SelectMonthText", "&gt;&gt;"); }
+			set { ViewState ["SelectMonthText"] = value; }
+		}
+
+		[DesignerSerializationVisibility(DesignerSerializationVisibility.Content)]
+		[NotifyParentProperty(true)]
+		[PersistenceMode(PersistenceMode.InnerProperty)]
+		[WebSysDescription ("")]
+		[WebCategory ("Style")]
+		public TableItemStyle SelectorStyle {
+			get {
+				if (selectorStyle == null) {
+					 selectorStyle = new TableItemStyle ();
+					if (IsTrackingViewState)
+						selectorStyle.TrackViewState ();
+				}
+
+				return selectorStyle;
+			}
+		}
+
+		[DefaultValue("&gt;")]
+		[Localizable (true)]
+		[WebSysDescription ("")]
+		[WebCategory ("Appearance")]
+		public string SelectWeekText {
+			get { return ViewState.GetString ("SelectWeekText", "&gt;"); }
+			set { ViewState ["SelectWeekText"] = value; }
+		}
+
+		[DefaultValue(true)]
+		[WebSysDescription ("")]
+		[WebCategory ("Appearance")]
+		public bool ShowDayHeader {
+			get { return ViewState.GetBool ("ShowDayHeader", true); }
+			set { ViewState ["ShowDayHeader"] = value; }
+		}
+
+		[DefaultValue(false)]
+		[WebSysDescription ("")]
+		[WebCategory ("Appearance")]
+		public bool ShowGridLines {
+			get { return ViewState.GetBool ("ShowGridLines", false); }
+			set { ViewState ["ShowGridLines"] = value; }
+		}
+
+		[DefaultValue(true)]
+		[WebSysDescription ("")]
+		[WebCategory ("Appearance")]
+		public bool ShowNextPrevMonth {
+			get { return ViewState.GetBool ("ShowNextPrevMonth", true); }
+			set { ViewState ["ShowNextPrevMonth"] = value; }
+		}
+
+		[DefaultValue(true)]
+		[WebSysDescription ("")]
+		[WebCategory ("Appearance")]
+		public bool ShowTitle {
+			get { return ViewState.GetBool ("ShowTitle", true); }
+			set { ViewState ["ShowTitle"] = value; }
+		}
+
+		[DefaultValue(TitleFormat.MonthYear)]
+		[WebSysDescription ("")]
+		[WebCategory ("Appearance")]
+		public TitleFormat TitleFormat {
+			get { return (TitleFormat) ViewState.GetInt ("TitleFormat", (int) TitleFormat.MonthYear); }
+
+			set {
+				if (value != TitleFormat.Month && value != TitleFormat.MonthYear) {
+					throw new ArgumentOutOfRangeException ("The specified title format is not one of the TitleFormat values.");
+				}
+
+				ViewState ["TitleFormat"] = value;
+			}
+		}
+
+		[DesignerSerializationVisibility(DesignerSerializationVisibility.Content)]
+		[NotifyParentProperty(true)]
+		[PersistenceMode(PersistenceMode.InnerProperty)]
+		[WebSysDescription ("")]
+		[WebCategory ("Style")]
+		public TableItemStyle TitleStyle {
+			get {
+				if (titleStyle == null) {
+					titleStyle = new TableItemStyle ();
+					if (IsTrackingViewState)
+						titleStyle.TrackViewState ();
+				}
+
+				return titleStyle;
+			}
+		}
+
+		[DefaultValue(null)]
+		[DesignerSerializationVisibility(DesignerSerializationVisibility.Content)]
+		[NotifyParentProperty(true)]
+		[PersistenceMode(PersistenceMode.InnerProperty)]
+		[WebSysDescription ("")]
+		[WebCategory ("Style")]
+		public TableItemStyle TodayDayStyle {
+			get {
+				if (todayDayStyle == null) {
+					todayDayStyle = new TableItemStyle ();
+					if (IsTrackingViewState)
+						todayDayStyle.TrackViewState ();
+				}
+
+				return todayDayStyle;
+			}
+		}
+
+		[Browsable(false)]
+		[DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+		[WebSysDescription ("")]
+		[WebCategory ("Style")]
+		public DateTime TodaysDate {
+			get {
+				object obj = ViewState ["TodaysDate"];
+
+				if (obj != null)
+					return (DateTime) obj;
+
+				return today;
+			}
+
+			set { ViewState ["TodaysDate"] = value.Date; }
+		}
+
+		[DefaultValue (true)]
+		[WebSysDescription ("")]
+		[WebCategoryAttribute ("Accessibility")]
+		public virtual bool UseAccessibleHeader  {
+			get { return ViewState.GetBool ("UseAccessibleHeader", true); }
+			set { ViewState ["UseAccessibleHeader"] = value; }
+		

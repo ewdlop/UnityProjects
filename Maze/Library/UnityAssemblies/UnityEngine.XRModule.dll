@@ -1,0 +1,544 @@
+evice profile name, to look for CVars in, along the tree
+			FString NextBaseDeviceProfileName;
+			if( GConfig->GetString( *CurrentSectionName, TEXT("BaseProfileName"), NextBaseDeviceProfileName, GDeviceProfilesIni ) )
+			{
+				BaseDeviceProfileName = NextBaseDeviceProfileName;
+				UE_LOG(LogInit, Log, TEXT("Going up to parent DeviceProfile [%s]"), *BaseDeviceProfileName);
+			}
+			else
+			{
+				BaseDeviceProfileName.Empty();
+			}
+		}
+		
+		// Check if we have inevitably reached the end of the device profile tree.
+		bReachedEndOfTree = !bProfileExists || BaseDeviceProfileName.IsEmpty();
+	}
+}
+
+bool UDeviceProfileManager::DoActiveProfilesReference(const TSet<FString>& DeviceProfilesToQuery)
+{
+	TArray< FString > AvailableProfiles;
+	GConfig->GetSectionNames(GDeviceProfilesIni, AvailableProfiles);
+
+	auto DoesProfileReference = [&AvailableProfiles, GDeviceProfilesIni = GDeviceProfilesIni](const FString& SearchProfile, const TSet<FString>& InDeviceProfilesToQuery)
+	{
+		// For each device profile, starting with the selected and working our way up the BaseProfileName tree,
+		FString BaseDeviceProfileName = SearchProfile;
+		bool bReachedEndOfTree = BaseDeviceProfileName.IsEmpty();
+		while (bReachedEndOfTree == false)
+		{
+			FString CurrentSectionName = FString::Printf(TEXT("%s %s"), *BaseDeviceProfileName, *UDeviceProfile::StaticClass()->GetName());
+			bool bProfileExists = AvailableProfiles.Contains(CurrentSectionName);
+			if (bProfileExists)
+			{
+				if (InDeviceProfilesToQuery.Contains(BaseDeviceProfileName))
+				{
+					return true;
+				}
+
+				// Get the next device profile name
+				FString NextBaseDeviceProfileName;
+				if (GConfig->GetString(*CurrentSectionName, TEXT("BaseProfileName"), NextBaseDeviceProfileName, GDeviceProfilesIni))
+				{
+					BaseDeviceProfileName = NextBaseDeviceProfileName;
+				}
+				else
+				{
+					BaseDeviceProfileName.Empty();
+				}
+			}
+			bReachedEndOfTree = !bProfileExists || BaseDeviceProfileName.IsEmpty();
+		}
+		return false;
+	};
+
+	bool bDoActiveProfilesReferenceQuerySet = DoesProfileReference(DeviceProfileManagerSingleton->GetActiveProfile()->GetName(), DeviceProfilesToQuery);
+	if (!bDoActiveProfilesReferenceQuerySet && DeviceProfileManagerSingleton->BaseDeviceProfile != nullptr)
+	{
+		bDoActiveProfilesReferenceQuerySet = DoesProfileReference(DeviceProfileManagerSingleton->BaseDeviceProfile->GetName(), DeviceProfilesToQuery);
+	}
+	return bDoActiveProfilesReferenceQuerySet;
+}
+
+void UDeviceProfileManager::ReapplyDeviceProfile()
+{	
+	UDeviceProfile* OverrideProfile = DeviceProfileManagerSingleton->BaseDeviceProfile ? DeviceProfileManagerSingleton->GetActiveProfile() : nullptr;
+	UDeviceProfile* BaseProfile = DeviceProfileManagerSingleton->BaseDeviceProfile ? DeviceProfileManagerSingleton->BaseDeviceProfile : DeviceProfileManagerSingleton->GetActiveProfile();
+
+	UE_LOG(LogInit, Log, TEXT("ReapplyDeviceProfile applying profile: [%s]"), *BaseProfile->GetName(), OverrideProfile ? *OverrideProfile->GetName() : TEXT("not set.") );
+
+	// pop any pushed settings
+	RestoreDefaultDeviceProfile();
+
+	// Set base profile and re-apply cvars.
+	SetActiveDeviceProfile(BaseProfile);
+	InitializeCVarsForActiveDeviceProfile();
+
+	if (OverrideProfile)
+	{
+		UE_LOG(LogInit, Log, TEXT("ReapplyDeviceProfile applying override profile: [%s]"), *OverrideProfile->GetName());
+		// reapply the override.
+		SetOverrideDeviceProfile(OverrideProfile);
+	}
+	else
+	{
+		// broadcast cvar sinks now that we are done
+		IConsoleManager::Get().CallAllConsoleVariableSinks();
+	}
+}
+
+static void TestProfileForCircularReferences(const FString& ProfileName, const FString& ParentName, const FConfigFile &PlatformConfigFile)
+{
+	TArray<FString> ProfileDependancies;
+	ProfileDependancies.Add(ProfileName);
+	FString CurrentParent = ParentName;
+	while (!CurrentParent.IsEmpty())
+	{
+		if (ProfileDependancies.FindByPredicate([CurrentParent](const FString& InName) { return InName.Equals(CurrentParent); }))
+		{
+			UE_LOG(LogInit, Fatal, TEXT("Device Profile %s has a circular dependency on %s"), *ProfileName, *CurrentParent);
+		}
+		else
+		{
+			ProfileDependancies.Add(CurrentParent);
+			const FString SectionName = FString::Printf(TEXT("%s %s"), *CurrentParent, *UDeviceProfile::StaticClass()->GetName());
+			CurrentParent.Reset();
+			PlatformConfigFile.GetString(*SectionName, TEXT("BaseProfileName"), CurrentParent);
+		}
+	}
+}
+
+UDeviceProfile* UDeviceProfileManager::CreateProfile(const FString& ProfileName, const FString& ProfileType, const FString& InSpecifyParentName, const TCHAR* ConfigPlatform)
+{
+	UDeviceProfile* DeviceProfile = FindObject<UDeviceProfile>( GetTransientPackage(), *ProfileName );
+	if (DeviceProfile == NULL)
+	{
+		// use ConfigPlatform ini hierarchy to look in for the parent profile
+		// @todo config: we could likely cache local ini files to speed this up,
+		// along with the ones we load in LoadConfig
+		// NOTE: This happens at runtime, so maybe only do this if !RequiresCookedData()?
+		FConfigFile* PlatformConfigFile;
+		FConfigFile LocalConfigFile;
+		if (FPlatformProperties::RequiresCookedData())
+		{
+			PlatformConfigFile = GConfig->Find(GDeviceProfilesIni, false);
+		}
+		else
+		{
+			FConfigCacheIni::LoadLocalIniFile(LocalConfigFile, TEXT("DeviceProfiles"), true, ConfigPlatform);
+			PlatformConfigFile = &LocalConfigFile;
+		}
+
+		// Build Parent objects first. Important for setup
+		FString ParentName = InSpecifyParentName;
+		if (ParentName.Len() == 0)
+		{
+			const FString SectionName = FString::Printf(TEXT("%s %s"), *ProfileName, *UDeviceProfile::StaticClass()->GetName());
+			PlatformConfigFile->GetString(*SectionName, TEXT("BaseProfileName"), ParentName);
+		}
+
+		UObject* ParentObject = nullptr;
+		// Recursively build the parent tree
+		if (ParentName.Len() > 0 && ParentName != ProfileName)
+		{
+			ParentObject = FindObject<UDeviceProfile>(GetTransientPackage(), *ParentName);
+			if (ParentObject == nullptr)
+			{
+				TestProfileForCircularReferences(ProfileName, ParentName, *PlatformConfigFile);
+				ParentObject = CreateProfile(ParentName, ProfileType, TEXT(""), ConfigPlatform);
+			}
+		}
+
+		// Create the profile after it's parents have been created.
+		DeviceProfile = NewObject<UDeviceProfile>(GetTransientPackage(), *ProfileName);
+		if (ConfigPlatform != nullptr)
+		{
+			// if the config needs to come from a platform, set it now, then reload the config
+			DeviceProfile->ConfigPlatform = ConfigPlatform;
+			DeviceProfile->LoadConfig();
+			DeviceProfile->ValidateProfile();
+		}
+
+		// if the config didn't specify a DeviceType, use the passed in one
+		if (DeviceProfile->DeviceType.IsEmpty())
+		{
+			DeviceProfile->DeviceType = ProfileType;
+		}
+
+		// final fixups
+		DeviceProfile->BaseProfileName = DeviceProfile->BaseProfileName.Len() > 0 ? DeviceProfile->BaseProfileName : ParentName;
+		DeviceProfile->Parent = ParentObject;
+		// the DP manager can be marked as Disregard for GC, so what it points to needs to be in the Root set
+		DeviceProfile->AddToRoot();
+
+		// Add the new profile to the accessible device profile list
+		Profiles.Add( DeviceProfile );
+
+		// Inform any listeners that the device list has changed
+		ManagerUpdatedDelegate.Broadcast(); 
+	}
+
+	return DeviceProfile;
+}
+
+
+void UDeviceProfileManager::DeleteProfile( UDeviceProfile* Profile )
+{
+	Profiles.Remove( Profile );
+}
+
+
+UDeviceProfile* UDeviceProfileManager::FindProfile( const FString& ProfileName, bool bCreateProfileOnFail )
+{
+	UDeviceProfile* FoundProfile = nullptr;
+
+	for( int32 Idx = 0; Idx < Profiles.Num(); Idx++ )
+	{
+		UDeviceProfile* CurrentDevice = CastChecked<UDeviceProfile>( Profiles[Idx] );
+		if( CurrentDevice->GetName() == ProfileName )
+		{
+			FoundProfile = CurrentDevice;
+			break;
+		}
+	}
+
+	if ( bCreateProfileOnFail && FoundProfile == nullptr )
+	{
+		FoundProfile = CreateProfile(ProfileName, FPlatformProperties::PlatformName());
+	}
+	return FoundProfile;
+}
+
+
+FOnDeviceProfileManagerUpdated& UDeviceProfileManager::OnManagerUpdated()
+{
+	return ManagerUpdatedDelegate;
+}
+
+
+void UDeviceProfileManager::LoadProfiles()
+{
+	if( !HasAnyFlags( RF_ClassDefaultObject ) )
+	{
+		TMap<FString, FString> DeviceProfileToPlatformConfigMap;
+		TArray<FString> ConfidentialPlatforms = FDataDrivenPlatformInfoRegistry::GetConfidentialPlatforms();
+		
+		checkf(ConfidentialPlatforms.Contains(FString(FPlatformProperties::IniPlatformName())) == false,
+			TEXT("UDeviceProfileManager::LoadProfiles is called from a confidential platform (%s). Confidential platforms are not expected to be editor/non-cooked builds."), 
+			ANSI_TO_TCHAR(FPlatformProperties::IniPlatformName()));
+
+		// go over all the platforms we find, starting with the current platform
+		for (int32 PlatformIndex = 0; PlatformIndex <= ConfidentialPlatforms.Num(); PlatformIndex++)
+		{
+			// which platform's set of ini files should we load from?
+			FString ConfigLoadPlatform = PlatformIndex == 0 ? FString(FPlatformProperties::IniPlatformName()) : ConfidentialPlatforms[PlatformIndex - 1];
+
+			// load the DP.ini files (from current platform and then by the extra confidential platforms)
+			FConfigFile PlatformConfigFile;
+			FConfigCacheIni::LoadLocalIniFile(PlatformConfigFile, TEXT("DeviceProfiles"), true, *ConfigLoadPlatform);
+
+			// load all of the DeviceProfiles
+			TArray<FString> ProfileDescriptions;
+			PlatformConfigFile.GetArray(TEXT("DeviceProfiles"), TEXT("DeviceProfileNameAndTypes"), ProfileDescriptions);
+
+
+			// add them to our collection of profiles by platform
+			for (const FString& Desc : ProfileDescriptions)
+			{
+				if (!DeviceProfileToPlatformConfigMap.Contains(Desc))
+				{
+					DeviceProfileToPlatformConfigMap.Add(Desc, ConfigLoadPlatform);
+				}
+			}
+		}
+
+		// now that we have gathered all the unique DPs, load them from the proper platform hierarchy
+		for (auto It = DeviceProfileToPlatformConfigMap.CreateIterator(); It; ++It)
+		{
+			// the value of the map is in the format Name,DeviceType (DeviceType is usually platform)
+			FString Name, DeviceType;
+			It.Key().Split(TEXT(","), &Name, &DeviceType);
+
+			if (FindObject<UDeviceProfile>(GetTransientPackage(), *Name) == NULL)
+			{
+				// set the config platform if it's not the current platform
+				if (It.Value() != FPlatformProperties::IniPlatformName())
+				{
+					CreateProfile(Name, DeviceType, TEXT(""), *It.Value());
+				}
+				else
+				{
+					CreateProfile(Name, DeviceType);
+				}
+			}
+		}
+
+#if WITH_EDITOR
+		if (!FPlatformProperties::RequiresCookedData())
+		{
+			// Register Texture LOD settings with each Target Platform
+			ITargetPlatformManagerModule& TargetPlatformManager = GetTargetPlatformManagerRef();
+			const TArray<ITargetPlatform*>& TargetPlatforms = TargetPlatformManager.GetTargetPlatforms();
+			for (int32 PlatformIndex = 0; PlatformIndex < TargetPlatforms.Num(); ++PlatformIndex)
+			{
+				ITargetPlatform* Platform = TargetPlatforms[PlatformIndex];
+
+				// Set TextureLODSettings
+				const UTextureLODSettings* TextureLODSettingsObj = FindProfile(*Platform->GetPlatformInfo().VanillaPlatformName.ToString(), false);
+				Platform->RegisterTextureLODSettings(TextureLODSettingsObj);
+			}
+		}
+#endif
+
+		ManagerUpdatedDelegate.Broadcast();
+	}
+}
+
+
+void UDeviceProfileManager::SaveProfiles(bool bSaveToDefaults)
+{
+	if( !HasAnyFlags( RF_ClassDefaultObject ) )
+	{
+		if(bSaveToDefaults)
+		{
+			for (int32 DeviceProfileIndex = 0; DeviceProfileIndex < Profiles.Num(); ++DeviceProfileIndex)
+			{
+				UDeviceProfile* CurrentProfile = CastChecked<UDeviceProfile>(Profiles[DeviceProfileIndex]);
+				CurrentProfile->UpdateDefaultConfigFile();
+			}
+		}
+		else
+		{
+			for (int32 DeviceProfileIndex = 0; DeviceProfileIndex < Profiles.Num(); ++DeviceProfileIndex)
+			{
+				UDeviceProfile* CurrentProfile = CastChecked<UDeviceProfile>(Profiles[DeviceProfileIndex]);
+				FString DeviceProfileTypeNameCombo = FString::Printf(TEXT("%s,%s"), *CurrentProfile->GetName(), *CurrentProfile->DeviceType);
+
+				CurrentProfile->SaveConfig(CPF_Config, *GDeviceProfilesIni);
+			}
+		}
+
+		ManagerUpdatedDelegate.Broadcast();
+	}
+}
+
+/**
+* Overrides the device profile. The original profile can be restored with RestoreDefaultDeviceProfile
+*/
+void UDeviceProfileManager::SetOverrideDeviceProfile(UDeviceProfile* DeviceProfile, bool bForceDeviceProfilePriority)
+{
+	// pop any pushed settings
+	HandleDeviceProfileOverridePop();
+
+	// record the currently active profile, needed when we restore the default.
+	BaseDeviceProfile = DeviceProfileManagerSingleton->GetActiveProfile();
+
+	// activate new one!
+	DeviceProfileManagerSingleton->SetActiveDeviceProfile(DeviceProfile);
+	InitializeCVarsForActiveDeviceProfile(true, bForceDeviceProfilePriority);
+
+	// broadcast cvar sinks now that we are done
+	IConsoleManager::Get().CallAllConsoleVariableSinks();
+}
+
+/**
+* Restore the device profile to the default for this device
+*/
+void UDeviceProfileManager::RestoreDefaultDeviceProfile()
+{
+	// restore pushed settings
+	for (TMap<FString, FString>::TIterator It(PushedSettings); It; ++It)
+	{
+		IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(*It.Key());
+		if (CVar)
+		{
+			// restore it!
+			CVar->Set(*It.Value(), ECVF_SetByDeviceProfile);
+			UE_LOG(LogInit, Log, TEXT("Popping Device Profile CVar: [[%s:%s]]"), *It.Key(), *It.Value());
+		}
+	}
+
+	if(BaseDeviceProfile)
+	{
+		// reset the base profile as we are no longer overriding
+		DeviceProfileManagerSingleton->SetActiveDeviceProfile(BaseDeviceProfile);
+		BaseDeviceProfile = nullptr;
+	}
+}
+
+
+
+void UDeviceProfileManager::HandleDeviceProfileOverrideChange()
+{
+	FString CVarValue = CVarDeviceProfileOverride.GetValueOnGameThread();
+	// only handle when the value is different
+	if (CVarValue.Len() > 0 && CVarValue != GetActiveProfile()->GetName())
+	{
+		// find the profile (note that if the name is bad, this will create one with that name)
+		UDeviceProfile* NewActiveProfile = FindProfile(CVarValue);
+		SetOverrideDeviceProfile(NewActiveProfile);
+	}
+}
+
+void UDeviceProfileManager::HandleDeviceProfileOverridePop()
+{
+	RestoreDefaultDeviceProfile();
+}
+
+const FString UDeviceProfileManager::GetPlatformDeviceProfileName()
+{
+	FString ActiveProfileName = FPlatformProperties::PlatformName();
+
+	// look for a commandline override (never even calls into the selector plugin)
+	FString OverrideProfileName;
+	if (FParse::Value(FCommandLine::Get(), TEXT("DeviceProfile="), OverrideProfileName) || FParse::Value(FCommandLine::Get(), TEXT("DP="), OverrideProfileName))
+	{
+		return OverrideProfileName;
+	}
+
+	// look for cvar override
+	OverrideProfileName = CVarDeviceProfileOverride.GetValueOnGameThread();
+	if (OverrideProfileName.Len() > 0)
+	{
+		return OverrideProfileName;
+	}
+
+
+	FString DeviceProfileSelectionModule;
+	if (GConfig->GetString(TEXT("DeviceProfileManager"), TEXT("DeviceProfileSelectionModule"), DeviceProfileSelectionModule, GEngineIni))
+	{
+		if (IDeviceProfileSelectorModule* DPSelectorModule = FModuleManager::LoadModulePtr<IDeviceProfileSelectorModule>(*DeviceProfileSelectionModule))
+		{
+			ActiveProfileName = DPSelectorModule->GetRuntimeDeviceProfileName();
+		}
+	}
+
+#if WITH_EDITOR
+	if (FPIEPreviewDeviceModule::IsRequestingPreviewDevice())
+	{
+		IDeviceProfileSelectorModule* PIEPreviewDeviceProfileSelectorModule = FModuleManager::LoadModulePtr<IDeviceProfileSelectorModule>("PIEPreviewDeviceProfileSelector");
+		if (PIEPreviewDeviceProfileSelectorModule)
+		{
+			FString PIEProfileName = PIEPreviewDeviceProfileSelectorModule->GetRuntimeDeviceProfileName();
+			if (!PIEProfileName.IsEmpty())
+			{
+				ActiveProfileName = PIEProfileName;
+			}
+		}
+	}
+#endif
+	return ActiveProfileName;
+}
+
+
+const FString UDeviceProfileManager::GetActiveDeviceProfileName()
+{
+	if(ActiveDeviceProfile != nullptr)
+	{
+		return ActiveDeviceProfile->GetName();
+	}
+	else
+	{
+		return GetPlatformDeviceProfileName();
+	}
+}
+
+const FString UDeviceProfileManager::GetActiveProfileName()
+{
+	return GetPlatformDeviceProfileName();
+}
+
+bool UDeviceProfileManager::GetScalabilityCVar(const FString& CVarName, int32& OutValue)
+{
+	if (const FString* CVarValue = DeviceProfileScalabilityCVars.Find(CVarName))
+	{
+		TTypeFromString<int32>::FromString(OutValue, **CVarValue);
+		return true;
+	}
+
+	return false;
+}
+
+bool UDeviceProfileManager::GetScalabilityCVar(const FString& CVarName, float& OutValue)
+{
+	if (const FString* CVarValue = DeviceProfileScalabilityCVars.Find(CVarName))
+	{
+		TTypeFromString<float>::FromString(OutValue, **CVarValue);
+		return true;
+	}
+
+	return false;
+}
+
+void UDeviceProfileManager::SetActiveDeviceProfile( UDeviceProfile* DeviceProfile )
+{
+	ActiveDeviceProfile = DeviceProfile;
+
+	FString ProfileNames;
+	for (int32 Idx = 0; Idx < Profiles.Num(); ++Idx)
+	{
+		UDeviceProfile* Profile = Cast<UDeviceProfile>(Profiles[Idx]);
+		const void* TextureLODGroupsAddr = Profile ? Profile->TextureLODGroups.GetData() : nullptr;
+		const int32 NumTextureLODGroups = Profile ? Profile->TextureLODGroups.Num() : 0;
+		ProfileNames += FString::Printf(TEXT("[%p][%p %d] %s, "), Profile, TextureLODGroupsAddr, NumTextureLODGroups, Profile ? *Profile->GetName() : TEXT("None"));
+	}
+
+	const void* TextureLODGroupsAddr = ActiveDeviceProfile ? ActiveDeviceProfile->TextureLODGroups.GetData() : nullptr;
+	const int32 NumTextureLODGroups = ActiveDeviceProfile ? ActiveDeviceProfile->TextureLODGroups.Num() : 0;
+	UE_LOG(LogInit, Log, TEXT("Active device profile: [%p][%p %d] %s"), ActiveDeviceProfile, TextureLODGroupsAddr, NumTextureLODGroups, ActiveDeviceProfile ? *ActiveDeviceProfile->GetName() : TEXT("None"));
+	UE_LOG(LogInit, Log, TEXT("Profiles: %s"), *ProfileNames);
+
+#if CSV_PROFILER
+	CSV_METADATA(TEXT("DeviceProfile"), *GetActiveDeviceProfileName());
+#endif
+}
+
+
+UDeviceProfile* UDeviceProfileManager::GetActiveProfile() const
+{
+	return ActiveDeviceProfile;
+}
+
+
+void UDeviceProfileManager::GetAllPossibleParentProfiles(const UDeviceProfile* ChildProfile, OUT TArray<UDeviceProfile*>& PossibleParentProfiles) const
+{
+	for(auto& NextProfile : Profiles)
+	{
+		UDeviceProfile* ParentProfile = CastChecked<UDeviceProfile>(NextProfile);
+		if (ParentProfile->DeviceType == ChildProfile->DeviceType && ParentProfile != ChildProfile)
+		{
+			bool bIsValidPossibleParent = true;
+
+			UDeviceProfile* CurrentAncestor = ParentProfile;
+			do
+			{
+				if(CurrentAncestor->BaseProfileName == ChildProfile->GetName())
+				{
+					bIsValidPossibleParent = false;
+					break;
+				}
+				else
+				{
+					CurrentAncestor = CurrentAncestor->Parent != nullptr ? CastChecked<UDeviceProfile>(CurrentAncestor->Parent) : NULL;
+				}
+			} while(CurrentAncestor && bIsValidPossibleParent);
+
+			if(bIsValidPossibleParent)
+			{
+				PossibleParentProfiles.Add(ParentProfile);
+			}
+		}
+	}
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                              G˜ìàDTˆ˜KY>á”ä+rrC ⁄¢˙=êÿ&∏¢ÆœmÚÎÔiû≤∞P%A^0å—Ô∂◊NHÀ~˛èù2ÚŒpy4ıS¬rZ 1zQË@ƒn√>ÖzlÂ«&<mLj¸á!ƒ«hÓ∑1D1òËullÔV+mÓ+¬∏ìŸ∏H∏;πÖßãxˆ„.§4†∑ƒ…-<É(ç`ıœÈ¨hÆ§¨Ój»Á‚˚ßüµàDn»»`Îèän	∫≤ÅÌJﬁm`ü5;=A`ã¡DM|ñg0Gπ4∆ÿKŒ4(õÕ	û_§PC˛Œ£ÛnÍ˙<∏≤ıp±:◊À©èïc[bÿœ{ÉD˜<“Åø›U$N}L;µÂ¥'a
+–3òÑ´é€+mh
+è˜m÷÷ı!ÚZô2˚ùµ+ÃàVbüªµ„…eª"CÃ◊û}qÃÎùé
+Ê∞slÒ¶Âf@‹y…p˝€¡x|Ò∆Æ’ç≥Ω·Õ\Ω,œMqkt0%Úw∫´≈ËÂ˙TƒÑ“4ôÓ˝æ:]oJL =Ø•/Çˇ‰ßı ò«%gùS§ÏØ7Y”Yu◊'∂—W: ˝N¢Á+ªiKópœuk‚oË‡TÁ8òö8öeHæ
+t/zπ¸7÷‚f.À¡S#' %í∑k¸’Û4^E¢;@√B{6£œÑêª¨¸„©ëùﬂgô"Qc©œ~√ü_BZPaÓ=bâU‹$_5ﬂ∂¡≠d:?˘Dà±{gA@„R_!qˆc≤§V}</<¢´´0±§≠V√≈¨HDáÏ/∞¶aG‘≥É«‘…2¨‡:ë9%™Ë5^N{@{v.“k*t?‘Êîz∏´1yø—ÛI…ÀR˛/1‹*Ô‡…0îúbd/?Ÿ# ë7Ù˝ïÌ[fSÀπc≥èbòßji;~À˛‰‹µMÔ∏3nÄzHÌQyéªÖß}º◊‡Ãp©ö "ò|˙.{Ó˚ÿº8œÑ*·ﬁòa€?≥8•›˝åe”≥»gBü5ëNπ\ü‡*Mt÷ÂY$gôµbK»ú¸Ê¶6
+Ï‡˝ ™Wè••™##õl¯ø>¶∆ãîÚ A®ªPT¶Ù“∑8•Pÿ6,"·ßtÂ!Æ&˘ﬂû⁄ŒeA˘œ’µS ‹gùù™ΩZﬂhJè
+äyCFÃ/`_O…Øq”•Y≤)æ20ó¥nLlÍÈ]ê©∆È]8A9ö∑H!hÜí¶/Î‰=Ñﬂ!O ›Œ°
+ˇ∫$^‡™AN•ö”7YE9„˝UIçÀrŒ	ãœìOîlKé™Ÿ∞‡…ÿ-ã›Éïÿ»Œ¸©ë¡÷Í¨õŒôG§∏$Á∫[{F  ⁄'      ResB             ¢  ƒ› 	   ¨  ¨  ü    ƒ›ƒ  Òi~Ï  2@>H  5>=5  ;5>=5H  0=0=  A548  8@E0<  ¿&-  =48=  @C?8  C10=  ?5A>  0>A0=  :8?  5@C=  A>;L  '8;8=  ?5A>  (5<0=  DC=B   C<K=8=  ;59  &(=  4>;;0@  ;10=8=  ;5:  =3;8=  DC=B  08B8=  3C@4  0=8=  :@>=0  8B09=  N0=L  <0=0=  @80;   >AA89=  A><  '5E8=  :@>=0  -D8>?8=  1K@  /?>=8=  85=0  0=0=  A548H  =48=  @C?8H  C10=  ?5A>H  828=  48=0@  5@C=  A>;0H  '8;8=  ?5A>H  >;30@8=  ;52  0<18=  :20G0  5<5=0=  @80;  0B0@0=  @80;  8@3878=  A><  820=0=  DC=B  8A0@0=  DC=B  >;4028=  ;59  LO=<0=  :LOB  5?0;0=  @C?8  !5@18=  48=0@  (25F8=  :@>=0  /<09=  4>;;0@  &(=  4>;;0@H  0=8=  :@>=0H  8@E0<0H  ¿&-  8B09=  N0=0H  0>A0=  :8?0H  <0=0=  @80;H   C<K=8=  ;59H  '5E8=  :@>=0H  (5<0=  DC=B0H  /?>=8=  85=0H  >;C<18=  ?5A>  ;68@0=  48=0@  @C10=  D;>@8=  @078;8=  @50;  0=C0BC=  20BC  0<18=  40;0A8  28=59=  D@0=:  5=8=  H8;;8=3  02@8:8=  @C?8  0:0>=  ?0B0:0  0;028=  :20G0  5:A8:0=  ?5A>  835@8=  =09@0   C0=40=  D@0=:  !0<>0=0=  B0;0  !59H5;0=  @C?8  "08;0=40=  10B  "C=8A0=  48=0@  #@40=0=  48=0@  #@C3209=  ?5A>  $8468=  4>;;0@  %>@20B8=  :C=0  ;10=8=  ;5:0H  =3;8=  DC=B0H  >;30@8=  ;52H  08B8=  3C@40H  0<18=  :20G0H  5<5=0=  @80;H  0B0@0=  @80;H  >;4028=  ;59H  5?0;0=  @C?8H  (25F8=  :@>=0H  -D8>?8=  1K@0H  /<09=  4>;;0@H  =3>;0=  :20=70  030<0=  4>;;0@  5;878=  4>;;0@  5;>@CAA8=  A><  >BA20=0=  ?C;0  @C=59=  4>;;0@  C@C=48=  D@0=:  5=3@8=  D>@8=B  L5B=0<0=  4>=3  090=0=  4>;;0@  681CB8=  D@0=:  ><8=8:0=  ?5A>  =4>=578=  @C?8  A;0=48=  :@>=0  0=040=  4>;;0@  C259B0=  48=0@  815@8=  4>;;0@  02@8B0=8=  C38  0<818=  4>;;0@  >@2538=  :@>=0  >;LH0=  7;>BK9  -@8B@59=  =0:D0  ¿8@0:J0=  48=0@  @078;8=  @50;H  0=C0BC=  20BCH  0<18=  40;0A8H  820=0=  DC=B0H  02@8:8=  @C?8H  0:0>=  ?0B0:0H  0;028=  :20G0H  5:A8:0=  ?5A>H  8A0@0=  DC=B0H  LO=<0=  :LOB0H  835@8=  =09@0H   >AA89=  A>L<0H  !0<>0=0=  B0;0H  !59H5;0=  @C?8H  !5@18=  48=0@0H  #@40=0=  48=0@H  #@C3209=  ?5A>H  $8468=  4>;;0@H  %>@20B8=  :C=0H  @35=B8=0=  ?5A>  0E@59=0=  48=0@  5@<C40=  4>;;0@  0<1>460=  @85;L  0:54>=8=  48=0@  0;L48289=  @CD8  0@>::>=  48@E0<  >=3>;8=  BC3@8:  0:8AB0=0=  @C?8  0=0<0=  10;L1>0  !><0;8=  H8;;8=3  ">=30=0=  ?00=30  #30=40=  H8;;8=3  #:@08=0=  3@82=0  (259F0@8=  D@0=:  (@8- 0=:0=  @C?8  ;68@0=  48=0@0H  =3>;0=  :20=70H  @C10=  D;>@8=0H  030<0=  4>;;0@H  5;878=  4>;;0@H  >BA20=0=  ?C;0H  @C=59=  4>;;0@H  090=0=  4>;;0@H  28=59=  D@0=:0H  ><8=8:0=  ?5A>H  =4>=578=  @C?8H  A;0=48=  :@>=0H  0<1>460=  @85;H  0=040=  4>;;0@H  5=8=  H8;;8=30H  8@3878=  A>L<0H  C259B0=  48=0@H  815@8=  4>;;0@H  8289A:89  48=0@  02@8B0=8=  C38H  0<818=  4>;;0@H  >@2538=  :@>=0H  >;LH0=  7;>BK9H   C0=40=  D@0=:0H  "08;0=40=  10B0H  "C=8A0=  48=0@0H  -@8B@59=  =0:D0H  ¿8@0:J0=  48=0@H  2AB@0;8=  4>;;0@  0=3;045H0=  B0:0  CB0=0=  =3C;B@C<  81@0;B0@0=  DC=B  >=:>=30=  4>;;0@  >=3>;578=  D@0=:  >AB0@8:0=  :>;>=  0;0978=  @8=338B  !C@8=0<0=  4>;;0@  "0=70=8=  H8;;8=3  #715:8AB0=0=  A><  $8;8??8=89=  ?5A>  @35=B8=0=  ?5A>H  5@<C40=  4>;;0@H  C@C=48=  D@0=:0H  5=3@8=  D>@8=B0H  L5B=0<0=  4>=30H  681CB8=  D@0=:0H  0;L48289=  @CD8H  0:8AB0=0=  @C?8H  0=0<0=  10;L1>0H  ">=30=0=  ?00=30H  #:@08=0=  3@82=0H  (@8- 0=:0=  @C?8H  0@104>A0=  4>;;0@  >;828=  1>;8280=>  0;030A89=  0@80@8  0@03209=  3C0@0=8  !8=30?C@0=  4>;;0@  2AB@0;8=  4>;;0@H  0=3;045H0=  B0:0H  0E@59=0=  48=0@0H  5;>@CAA8=  A>L<0H  >=:>=30=  4>;;0@H  >AB0@8:0=  :>;>=H  8289A:89  48=0@0H  0:54>=8=  48=0@0H  0@>::>=  48@E0<0H  >=3>;8=  BC3@8:0H  !><0;8=  H8;;8=30H  !C@8=0<0=  4>;;0@H  "C@:>9G>L=0=  ;8@0  #30=40=  H8;;8=30H  $8;8??8=89=  ?5A>H  (259F0@8=  D@0=:0H  5=5ACM;0=  1>;820@  20B5<0;0=  :5BA0;L  >=4C@0A0=  ;5<?8@0  CL@689G>L=0=  ;0@8  01>- 5@45=  MA:C4>  J8;10  >@59=  2>=0  >70<18:0=  <5B8:0;  8:0@03C0=  :>@4>10  -@<0;>9G>L=0=  4@0<  0@104>A0=  4>;;0@H  >;828=  1>;8280=>H  CB0=0=  =3C;B@C<0H  20B5<0;0=  :5BA0;H  81@0;B0@0=  DC=B0H  >=3>;578=  D@0=:0H  0;030A89=  0@80@8H  0;0978=  @8=338B0H  0@03209=  3C0@0=8H  !8=30?C@0=  4>;;0@H  "0=70=8=  H8;;8=30H  "C@:>9G>L=0=  ;8@0H  #715:8AB0=0=  A><0H  J8;10  !C40=0=  DC=B  75@109460=0=  <0=0B  ¿060@89G>L=0=  @80;  C10=  E89F0;C=  ?5A>  E070:EAB0=0=  B5=35  J8;10- D@8:8=  @M=4  5=5ACM;0=  1>;820@H  >=4C@0A0=  ;5<?8@0H  CL@689G>L=0=  ;0@8H  01>- 5@45=  MA:C4>H  J8;10  >@59=  2>=0H  >70<18:0=  <5B8:0;H  8:0@03C0=  :>@4>10H  "0468:8AB0=0=  A><>=8  ¿060@89G>L=0=  @80;H  C10=  E89F0;C=  ?5A>H  E070:EAB0=0=  B5=35H  -@<0;>9G>L=0=  4@0<0H  7@08;0=  :5@;0  H5:5;L  5@;0  5;0=48=  4>;;0@  !2078;5=40=  ;8;0=35=8  "0920=0=  :5@;0  4>;;0@  "C@:<5=8=  :5@;0  <0=0B  J8;10  !C40=0=  DC=B0H  75@109460=0=  <0=0B0H  7@08;0=  :5@;0  H5:5;H  J8;10- D@8:8=  @M=40H  "0468:8AB0=0=  A><>=8H  J8;10A540  >@59=  2>=0  5@;0  5;0=48=  4>;;0@H  !2078;5=40=  ;8;0=35=8H  "0920=0=  :5@;0  4>;;0@H  J8;10A540  >@59=  2>=0H  "C@:<5=8=  :5@;0  <0=0B0H  "C@:>9G>L=0=  :5@;0  ;8@0  ><>@89=  3¿09@5=89=  D@0=:  0;E10;5=  0@8189=  4>;;0@  2E¿0=- ?0GEL0;:E0=  0D30=8  5;>@CAA8=  A><  ( 2 0 0 0  2 0 1 6 )   02@8B0=8=  C38  ( 1 9 7 3  2 0 1 7 )   0?C0     5@;0  28=59=  :8=0  $>;:;5=40=  3¿09@5=89=  DC=B  .::J5@GC  D@8:0=  $  D@0=:  0;E10;5=  0@8189=  4>;;0@H  2E¿0=- ?0GEL0;:E0=  0D30=8H  0;E1C75=  D@8:0=  $  D@0=:  09<0=89=  3¿09@5=89=  4>;;0@  845@;0=48=  =B8;8=  3C;L45=  !0¿C489=  ¿0L@189G>L=0=  @80;  !>;><>=0=  3¿09@5=89=  4>;;0@  ><>@89=  3¿09@5=89=  D@0=:0H  02@8B0=8=  C38H  ( 1 9 7 3  2 0 1 7 )   0?C0     5@;0  28=59=  :8=0H  09<0=89=  3¿09@5=89=  4>;;0@H  845@;0=48=  =B8;8=  3C;L45=H  !0¿C489=  ¿0L@189G>L=0=  @80;H  !>;><>=0=  3¿09@5=89=  4>;;0@H  $>;:;5=40=  3¿09@5=89=  DC=B0H  .::J5@GC  D@8:0=  $  D@0=:0H  45270H  4>FC  O  ;5;0H  4>FC  0EG0  !89;0ELGC  ;5=8=  3¿09@5=  DC=B  5;>@CAA8=  A>L<0H  ( 2 0 0 0  2 0 1 6 )   $@0=FC789=  "89=0  >:50=0=  D@0=:  5=5ACM;0=  1>;820@  ( 2 0 0 8  2 0 1 8 )   !0=- "><5=  0,   @8=A8?8=  0  4>1@0  "@8=84040=  0,   ">103>=  0  4>;;0@  5=5ACM;0=  1>;820@H  ( 2 0 0 8  2 0 1 8 )   !0=- "><5=  0,   @8=A8?8=  0  4>1@0H  !89;0ELGC  ;5=8=  3¿09@5=  DC=B0H  "@8=84040=  0,   ">103>=  0  4>;;0@H  >A=8=  0,   5@F53>28=0=  0  E89F0;C=  <0@:0  >A=8=  0,   5@F53>28=0=  0  E89F0;C=  <0@:0H  *‹!0=- "><5=  0,   @8=A8?8=  0  4>1@0  ( 1 9 7 7  2 0 1 7 )   +‹!0=- "><5=  0,   @8=A8?8=  0  4>1@0H  ( 1 9 7 7  2 0 1 7 )    Æ „› Ô VHﬁ ÔÍ 
+) é ‚ nÖ‰ EÁ rO‡ ÆÏ ä’Ú v›Ë RVÁ Zﬂ ≤ ï‰ z i‚ R•‰ Z‚ VÔË √]‡ ‚ gÁ ~ K‚ ≤<‚ ^4Ô z-‚ 
+·‚ Œ öÁ f eÂ ∂ﬁ ˙ xﬁ ∫3‡ Z´Á é5Ï 2˘› j £Í júﬁ í •‚ ^lﬁ æ¥‚ n A‡ Ç Vﬂ b J„ Ü ®ﬁ  ô ¶K· ¬ÖÔ \Tﬁ ~êÍ Fÿ› bxÁ r y‡ Çá‡ JjÍ fñ‚ ∆âÁ Ü}Í ∆Y·  `ﬁ íx‚ √‚  fÌ  Ó› ŒY„ !Ï ““‚ ÷§ﬂ j/· ¥ﬁ ï‡ n<ﬂ "µ‰ ñ ÊÓ äBÓ t∂Í r‚ é vIÏ ⁄ﬁ zIﬂ &uÂ ö ˇ‚ û ‰ﬁ ∂ Â‰ *cﬂ ∫ È ~≈‰ .pﬂ Çı‰ 2±‡ v OÔ æ „ “ £‡ b’‰ ÷ ø‡  Õ‡ NºÁ í…Í Ó „ Ú €‡ f‹Í ﬁ,„ 6}ﬂ “|Ì ‚Ñﬁ ñÂ 6ﬁ ÊjÔ Ü Ë öÂ ö;„ ˛È û/ﬂ :0ﬁ >äﬂ  êﬁ ¢ È‡ ¶ E ûa ¬ · ⁄  Ï :óﬂ B%È ™ ùÒ ∆ À› ﬁ %Â ¢ÕÁ ™˘Î ˆ &Û   Ú F%ﬁ ‚ íÌ Z· ¶˝Ï ÆæÌ Ê !· Í5Â JÍ Ó6Ú ñ®Ì ﬁÁ ¢UÂ ˛ EÂ <ﬁ ™=· ÚÔÁ >¯Ò BWÍ  á‚ ˆk‡ ˙˜‡ v†Ô ∫ Ô wÒÔ {ŸÒ è
+Ò N"ﬂ Í ]Ï ä ﬂ\  # ' 3 7 ; K O S W [ c g o s  á ã è ì ó ü ß ´ ≥ ø √ « À € „ Î Ô Û ˜ ˚ #+7;?CKOSW[_{Éáó£ß≥∑ªø√«€ﬂ„ÁÔ˚'+37?OW[_gos{ÉìßØ; àà8 à àà, √àxM àààà ààD áàã à\\\A Làà‰ J 5 >   áà øttà ! G ) à/ l ) àà †á) à ) 2  8ﬁœàáà\à\P \Ñ? àà àà,  àPk œ W	 „ Ï„›Àﬂ ÏÔ÷Ô ÏHﬁg· ÏÔÍQÌ Ï)Ó Ï‚ïÂ ÏÖ‰Ë ÏEÁ7È ÏO‡•Â ÏÏÍÌ Ï’Ú˝Ú Ï›ËÎ ÏVÁIÈ ÏﬂÉ· Ïï‰[È Ïi‚3Ë Ï•‰"Ë ÏZ‚ÂÂ ÏÔËÎ Ï]‡h„ Ï‚µÂ ÏgÁ(Î ÏK‚’Â Ï<‚mÈ Ï4ÔªÒ Ï-‚≈Â Ï·‚UÊ ÏöÁaÎ ÏeÂEÍ Ïﬁ¸ﬁ Ïxﬁÿﬂ Ï3‡3‡ Ï´ÁëÈ Ï5Ï'Ì Ï˘›ÿﬁ Ï£Í≠Ï Ïúﬁ‡ Ï•‚fË Ïlﬁæﬂ Ï¥‚Ê ÏA‡ÖÂ ÏVﬂ‡„ ÏJ„%Á Ï®ﬁÛ· Ï≈› ÏK·g‰ ÏÖÔEÒ ÏTﬁu· ÏêÍôÏ Ïÿ›¿ﬁ ÏxÁNÎ Ïy‡Ü„ Ïá‡Ê ÏjÍ;Î Ïñ‚ıÂ ÏâÁÈ Ï}ÍÖÏ ÏY·v‰ Ï`ﬁë· Ïx‚DË Ï√‚%Ê ÏfÌ Ó ÏÓ›Ãﬁ ÏY„5Á Ï!ÏÌ Ï“‚5Ê Ï§ﬂ‚ Ï/·I‰ Ï¥ﬁ&‡ Ïï‡eÊ Ï<ﬂuÊ Ïµ‰EÊ ÏÊÓ} ÏBÓûÓ Ï∂Í¡Ï Ï‚ÖÊ Ï— ÏIÏ<Ì Ï

@@ -1,0 +1,80 @@
+ems = new BuildItemGroup (null, this, null, true);
+			evaluatedItemsIgnoringCondition = new BuildItemGroup (null, this, null, true);
+			evaluatedItemsByName = new Dictionary <string, BuildItemGroup> (StringComparer.OrdinalIgnoreCase);
+			evaluatedItemsByNameIgnoringCondition = new Dictionary <string, BuildItemGroup> (StringComparer.OrdinalIgnoreCase);
+			if (building && current_settings == BuildSettings.None)
+				RemoveBuiltTargets ();
+
+			InitializeProperties (effective_tools_version);
+		}
+
+		void Evaluate ()
+		{
+			groupingCollection.Evaluate ();
+
+			//FIXME: UsingTasks aren't really evaluated. (shouldn't use expressions or anything)
+			foreach (UsingTask usingTask in UsingTasks)
+				usingTask.Evaluate ();
+		}
+
+		// Removes entries of all earlier built targets for this project
+		void RemoveBuiltTargets ()
+		{
+			ParentEngine.ClearBuiltTargetsForProject (this);
+		}
+
+		void InitializeProperties (string effective_tools_version)
+		{
+			BuildProperty bp;
+
+			evaluatedProperties = new BuildPropertyGroup (null, null, null, true);
+			conditionedProperties = new Dictionary<string, List<string>> ();
+
+			foreach (BuildProperty gp in GlobalProperties) {
+				bp = new BuildProperty (gp.Name, gp.Value, PropertyType.Global);
+				evaluatedProperties.AddProperty (bp);
+			}
+			
+			foreach (BuildProperty gp in GlobalProperties)
+				ParentEngine.GlobalProperties.AddProperty (gp);
+
+			// add properties that we dont have from parent engine's
+			// global properties
+			foreach (BuildProperty gp in ParentEngine.GlobalProperties) {
+				if (evaluatedProperties [gp.Name] == null) {
+					bp = new BuildProperty (gp.Name, gp.Value, PropertyType.Global);
+					evaluatedProperties.AddProperty (bp);
+				}
+			}
+
+			foreach (DictionaryEntry de in Environment.GetEnvironmentVariables ()) {
+				bp = new BuildProperty ((string) de.Key, (string) de.Value, PropertyType.Environment);
+				evaluatedProperties.AddProperty (bp);
+			}
+
+			evaluatedProperties.AddProperty (new BuildProperty ("MSBuildProjectFile", Path.GetFileName (fullFileName),
+						PropertyType.Reserved));
+			evaluatedProperties.AddProperty (new BuildProperty ("MSBuildProjectFullPath", fullFileName, PropertyType.Reserved));
+			evaluatedProperties.AddProperty (new BuildProperty ("MSBuildProjectName",
+						Path.GetFileNameWithoutExtension (fullFileName),
+						PropertyType.Reserved));
+			evaluatedProperties.AddProperty (new BuildProperty ("MSBuildProjectExtension",
+						Path.GetExtension (fullFileName),
+						PropertyType.Reserved));
+
+			string toolsPath = parentEngine.Toolsets [effective_tools_version].ToolsPath;
+			if (toolsPath == null)
+				throw new Exception (String.Format ("Invalid tools version '{0}', no tools path set for this.", effective_tools_version));
+			evaluatedProperties.AddProperty (new BuildProperty ("MSBuildBinPath", toolsPath, PropertyType.Reserved));
+			evaluatedProperties.AddProperty (new BuildProperty ("MSBuildToolsPath", toolsPath, PropertyType.Reserved));
+			evaluatedProperties.AddProperty (new BuildProperty ("MSBuildToolsRoot", Path.GetDirectoryName (toolsPath), PropertyType.Reserved));
+			evaluatedProperties.AddProperty (new BuildProperty ("MSBuildToolsVersion", effective_tools_version, PropertyType.Reserved));
+			SetExtensionsPathProperties (DefaultExtensionsPath);
+			evaluatedProperties.AddProperty (new BuildProperty ("MSBuildProjectDefaultTargets", DefaultTargets, PropertyType.Reserved));
+			evaluatedProperties.AddProperty (new BuildProperty ("OS", OS, PropertyType.Environment));
+#if XBUILD_12
+			// see http://msdn.microsoft.com/en-us/library/vstudio/hh162058(v=vs.120).aspx
+			if (effective_tools_version == "12.0" || effective_tools_version == "14.0") {
+				evaluatedProperties.AddProperty (new BuildProperty ("MSBuildToolsPath32", toolsPath, PropertyType.Reserved));
+
+				var frameworkToolsPath = ToolLocationHelper.GetPathToDotNetFr

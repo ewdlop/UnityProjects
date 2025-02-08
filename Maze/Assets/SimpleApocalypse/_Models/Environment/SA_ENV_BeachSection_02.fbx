@@ -1,0 +1,574 @@
+urce());
+    if (!NativeAnchor)
+    {
+        Callback(EAzureSpatialAnchorsResult::FailNoLocalAnchor, L"Provided ARPin did not have a valid associated ARAnchor, Azure Spatial Anchors was unable to create a cloud anchor");
+        return;
+    }
+    
+    ASACloudSpatialAnchor *CloudAnchor = nullptr;
+    {
+        FScopeLock Lock(&CloudAnchorMapMutex);
+        if (!CloudAnchorMap.Contains(InCloudAnchorID))
+        {
+            Callback(EAzureSpatialAnchorsResult::FailAnchorDoesNotExist, L"Provided AzureCloudSpatialAnchor was not known to plugin");
+            return;
+        }
+        
+        CloudAnchor = CloudAnchorMap[InCloudAnchorID];
+    }
+    
+    {
+        // TODO: decide the best practice for avoiding exceptions due to setting properties after the anchor has been saved
+        FScopeLock Lock(&SavedAnchorsMutex);
+        SavedAnchors.Add(InCloudAnchorID);
+    }
+    
+    [Session createAnchor:CloudAnchor withCompletionHandler:^(NSError *error) {
+        if (error != nullptr)
+        {
+            std::wstringstream string;
+            string << L"Failed to create azure spatial anchor: " << *NSStringToFString(error.localizedDescription) << L", " << *NSStringToFString(error.localizedFailureReason);
+            Callback(EAzureSpatialAnchorsResult::FailSeeErrorString, string.str().c_str());
+            return;
+        }
+        
+        Callback(EAzureSpatialAnchorsResult::Success, L"");
+    }];
+}
+
+void FAzureSpatialAnchorsARKitInterop::DeleteAnchorAsync(IAzureSpatialAnchors::CloudAnchorID InCloudAnchorID, IAzureSpatialAnchors::Callback_Result Callback)
+{
+    if (!Session)
+    {
+        Callback(EAzureSpatialAnchorsResult::FailNoSession, L"");
+        return;
+    }
+    
+    ASACloudSpatialAnchor* CloudAnchor;
+    {
+        FScopeLock Lock(&CloudAnchorMapMutex);
+        if (!CloudAnchorMap.Contains(InCloudAnchorID))
+        {
+            Callback(EAzureSpatialAnchorsResult::FailAnchorDoesNotExist, L"Provided AzureCloudSpatialAnchor was not known to plugin");
+            return;
+        }
+        
+        CloudAnchor = CloudAnchorMap[InCloudAnchorID];
+    }
+    
+    if ([CloudAnchor.identifier length] == 0)
+    {
+        ClearAnchorData(InCloudAnchorID);
+        Callback(EAzureSpatialAnchorsResult::Success, L"");
+        return;
+    }
+    
+    [Session deleteAnchor:CloudAnchor withCompletionHandler:^(NSError* error) {
+        if (error != nullptr)
+        {
+           std::wstringstream string;
+           string << L"Failed to delete azure spatial anchor: " << *NSStringToFString(error.localizedDescription);
+           Callback(EAzureSpatialAnchorsResult::FailSeeErrorString, string.str().c_str());
+           return;
+        }
+        
+        this->ClearAnchorData(InCloudAnchorID);
+        Callback(EAzureSpatialAnchorsResult::Success, L"");
+    }];
+}
+
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsARKitInterop::CreateWatcher(const FAzureSpatialAnchorsLocateCriteria& InLocateCriteria, float InWorldToMetersScale, IAzureSpatialAnchors::WatcherID& OutWatcherIdentifier, FString& OutErrorString)
+{
+    if (!Session ||
+        !bSessionRunning)
+    {
+        OutErrorString = TEXT("Attempted to create a watcher when no Azure Spatial Anchors session was running");
+        return EAzureSpatialAnchorsResult::FailNoSession;
+    }
+    
+    if (CurrentWatcher != nullptr)
+    {
+        OutErrorString = TEXT("Attempted to start a watcher when a watcher already exists. Only one watcher is supported at a time");
+        return EAzureSpatialAnchorsResult::FailSeeErrorString;
+    }
+    
+    ASACloudSpatialAnchor *NearAnchor = nullptr;
+    if (InLocateCriteria.NearAnchor != nullptr)
+    {
+        FScopeLock Lock(&CloudAnchorMapMutex);
+        if (!CloudAnchorMap.Contains(InLocateCriteria.NearAnchor->CloudAnchorID))
+        {
+            OutErrorString = TEXT("Provided near anchor has not been saved/associated with the Azure Spatial Anchor service");
+            return EAzureSpatialAnchorsResult::FailBadCloudAnchorIdentifier;
+        }
+        
+        NearAnchor = CloudAnchorMap[InLocateCriteria.NearAnchor->CloudAnchorID];
+    }
+    
+    ASAAnchorLocateCriteria *Criteria = [ASAAnchorLocateCriteria new];
+    
+    Criteria.bypassCache = InLocateCriteria.bBypassCache;
+    Criteria.requestedCategories = static_cast<ASAAnchorDataCategory>(InLocateCriteria.RequestedCategories);
+    Criteria.strategy = static_cast<ASALocateStrategy>(InLocateCriteria.Strategy);
+    
+    NSMutableArray *Identifiers = [[NSMutableArray alloc] init];
+    for (FString Identifier : InLocateCriteria.Identifiers)
+    {
+        [Identifiers addObject:FStringToNSString(Identifier)];
+    }
+    Criteria.identifiers = Identifiers;
+    
+    if (NearAnchor != nullptr)
+    {
+        ASANearAnchorCriteria *NearCriteria = [ASANearAnchorCriteria new];
+        NearCriteria.distanceInMeters = InLocateCriteria.NearAnchorDistance / 100.0f; // Convert from cm to m
+        NearCriteria.sourceAnchor = NearAnchor;
+        NearCriteria.maxResultCount = InLocateCriteria.NearAnchorMaxResultCount;
+        Criteria.nearAnchor = NearCriteria;
+    }
+
+    if (InLocateCriteria.bSearchNearDevice)
+    {
+        ASANearDeviceCriteria *DeviceCriteria = [ASANearDeviceCriteria new];
+        DeviceCriteria.distanceInMeters = InLocateCriteria.NearDeviceDistance / 100.0f; // Convert from cm to m
+        DeviceCriteria.maxResultCount = InLocateCriteria.NearDeviceMaxResultCount;
+        Criteria.nearDevice = DeviceCriteria;
+    }
+    
+    CurrentWatcher = [Session createWatcher:Criteria];
+    [CurrentWatcher retain];
+    OutWatcherIdentifier = CurrentWatcher.identifier;
+    return EAzureSpatialAnchorsResult::Success;
+}
+
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsARKitInterop::GetActiveWatchers(TArray<IAzureSpatialAnchors::WatcherID>& OutWatcherIDs)
+{
+    OutWatcherIDs.Empty();
+    if (CurrentWatcher)
+    {
+        OutWatcherIDs.Add(CurrentWatcher.identifier);
+    }
+    
+    return EAzureSpatialAnchorsResult::Success;
+}
+
+void FAzureSpatialAnchorsARKitInterop::GetAnchorPropertiesAsync(const FString& InCloudAnchorIdentifier, IAzureSpatialAnchors::Callback_Result_CloudAnchorID Callback)
+{
+    if (!Session ||
+        !bSessionRunning)
+    {
+        Callback(EAzureSpatialAnchorsResult::FailNoSession, L"Attempted to get AzureCloudSpatialAnchor properties when no session was running", IAzureSpatialAnchors::CloudAnchorID_Invalid);
+        return;
+    }
+    
+    if (InCloudAnchorIdentifier.IsEmpty())
+    {
+        Callback(EAzureSpatialAnchorsResult::FailNoSession, L"Provided CloudIdentifier was invalid", IAzureSpatialAnchors::CloudAnchorID_Invalid);
+        return;
+    }
+    
+    NSString *Identifier = FStringToNSString(InCloudAnchorIdentifier);
+    IAzureSpatialAnchors::CloudAnchorID CloudAnchorID = IAzureSpatialAnchors::CloudAnchorID_Invalid;
+    {
+        FScopeLock Lock(&CloudAnchorMapMutex);
+        for (auto pair : CloudAnchorMap)
+        {
+            if (pair.Value.identifier == Identifier)
+            {
+                CloudAnchorID = pair.Key;
+                break;
+            }
+        }
+    }
+    
+    if (CloudAnchorID == IAzureSpatialAnchors::CloudAnchorID_Invalid)
+    {
+        Callback(EAzureSpatialAnchorsResult::FailBadCloudAnchorIdentifier, L"Provided CloudIdentifier was not known to the plugin", IAzureSpatialAnchors::CloudAnchorID_Invalid);
+        return;
+    }
+    
+    [Session getAnchorProperties:Identifier withCompletionHandler: ^(ASACloudSpatialAnchor *value, NSError *error) {
+        if (error != nullptr)
+        {
+            std::wstringstream string;
+            string << L"Failed to get azure spatial anchor properties: " << *NSStringToFString(error.localizedDescription);
+            Callback(EAzureSpatialAnchorsResult::FailSeeErrorString, string.str().c_str(), IAzureSpatialAnchors::CloudAnchorID_Invalid);
+            return;
+        }
+        
+        Callback(EAzureSpatialAnchorsResult::Success, L"", CloudAnchorID);
+    }];
+}
+
+void FAzureSpatialAnchorsARKitInterop::RefreshAnchorPropertiesAsync(IAzureSpatialAnchors::CloudAnchorID InCloudAnchorID, IAzureSpatialAnchors::Callback_Result Callback)
+{
+	if (!Session ||
+        !bSessionRunning)
+    {
+        Callback(EAzureSpatialAnchorsResult::FailNoSession, L"Attempted to refresh AzureCloudSpatialAnchor properties when no session was running");
+        return;
+    }
+    
+    ASACloudSpatialAnchor *CloudAnchor = nullptr;
+    {
+        FScopeLock Lock(&CloudAnchorMapMutex);
+        if (!CloudAnchorMap.Contains(InCloudAnchorID))
+        {
+            Callback(EAzureSpatialAnchorsResult::FailAnchorDoesNotExist, L"Provided AzureCloudSpatialAnchor does not have an associated cloud anchor. This anchor was not saved/declared to the Azure Spatial Anchors service");
+            return;
+        }
+        
+        CloudAnchor = CloudAnchorMap[InCloudAnchorID];
+    }
+    
+    if ([CloudAnchor.identifier length] == 0)
+    {
+        Callback(EAzureSpatialAnchorsResult::FailNoCloudAnchor, L"Provided AzureCloudSpatialAnchor has not been saved to the service");
+        return;
+    }
+    
+    [Session refreshAnchorProperties:CloudAnchor withCompletionHandler:^(NSError *error) {
+        if (error != nullptr)
+        {
+           std::wstringstream string;
+           string << L"Failed to refresh azure spatial anchor properties: " <<  *NSStringToFString(error.localizedDescription);
+           Callback(EAzureSpatialAnchorsResult::FailSeeErrorString, string.str().c_str());
+           return;
+        }
+        
+        Callback(EAzureSpatialAnchorsResult::Success, L"");
+    }];
+}
+
+void FAzureSpatialAnchorsARKitInterop::UpdateAnchorPropertiesAsync(IAzureSpatialAnchors::CloudAnchorID InCloudAnchorID, IAzureSpatialAnchors::Callback_Result Callback)
+{
+    if (!Session ||
+        !bSessionRunning)
+    {
+        Callback(EAzureSpatialAnchorsResult::FailNoSession, L"Attempted to update AzureCloudSpatialAnchor properties when no session was running");
+        return;
+    }
+    
+    ASACloudSpatialAnchor *CloudAnchor = nullptr;
+    {
+        FScopeLock Lock(&CloudAnchorMapMutex);
+        if (!CloudAnchorMap.Contains(InCloudAnchorID))
+        {
+            Callback(EAzureSpatialAnchorsResult::FailAnchorDoesNotExist, L"Provided AzureCloudSpatialAnchor does not have an associated cloud anchor. This anchor was not saved/declared to the Azure Spatial Anchors service");
+            return;
+        }
+        
+        CloudAnchor = CloudAnchorMap[InCloudAnchorID];
+    }
+    
+    [Session updateAnchorProperties:CloudAnchor withCompletionHandler:^(NSError *error) {
+        if (error != nullptr)
+        {
+           std::wstringstream string;
+           string << L"Failed to update azure spatial anchor properties: " <<  *NSStringToFString(error.localizedDescription);
+           Callback(EAzureSpatialAnchorsResult::FailSeeErrorString, string.str().c_str());
+           return;
+        }
+        
+        Callback(EAzureSpatialAnchorsResult::Success, L"");
+    }];
+}
+
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsARKitInterop::GetConfiguration(FAzureSpatialAnchorsSessionConfiguration& OutConfig)
+{
+    if (!Session)
+    {
+        UE_LOG(LogAzureSpatialAnchorsARKitInterop, Error, TEXT("Failed to configure Azure Spatial Anchors session, session was null"));
+        return EAzureSpatialAnchorsResult::FailNoSession;
+    }
+    
+    OutConfig.AccessToken = NSStringToFString(Session.configuration.accessToken);
+    OutConfig.AccountId = NSStringToFString(Session.configuration.accountId);
+    OutConfig.AccountKey = NSStringToFString(Session.configuration.accountKey);
+    OutConfig.AccountDomain = NSStringToFString(Session.configuration.accountDomain);
+    OutConfig.AuthenticationToken = NSStringToFString(Session.configuration.authenticationToken);
+    
+    return EAzureSpatialAnchorsResult::Success;
+}
+
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsARKitInterop::SetConfiguration(const FAzureSpatialAnchorsSessionConfiguration& InConfig)
+{
+    if (!Session)
+    {
+        UE_LOG(LogAzureSpatialAnchorsARKitInterop, Error, TEXT("Failed to configure Azure Spatial Anchors session, session was null"));
+        return EAzureSpatialAnchorsResult::FailNoSession;
+    }
+   
+    if (!InConfig.AccessToken.IsEmpty())
+    {
+        Session.configuration.accessToken = FStringToNSString(InConfig.AccessToken);
+    }
+    
+    if (!InConfig.AccountId.IsEmpty())
+    {
+        Session.configuration.accountId = FStringToNSString(InConfig.AccountId);
+    }
+    
+    if (!InConfig.AccountKey.IsEmpty())
+    {
+        Session.configuration.accountKey = FStringToNSString(InConfig.AccountKey);
+    }
+    
+    if (!InConfig.AccountDomain.IsEmpty())
+    {
+        Session.configuration.accountDomain = FStringToNSString(InConfig.AccountDomain);
+    }
+    
+    if (!InConfig.AuthenticationToken.IsEmpty())
+    {
+        Session.configuration.accessToken = FStringToNSString(InConfig.AuthenticationToken);
+    }
+    
+	return EAzureSpatialAnchorsResult::Success;
+}
+
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsARKitInterop::SetLocationProvider(const FCoarseLocalizationSettings& InConfig)
+{
+    if (!Session)
+    {
+        UE_LOG(LogAzureSpatialAnchorsARKitInterop, Error, TEXT("Azure Spatial Anchors failed to set location provider for session, session was null"));
+        return EAzureSpatialAnchorsResult::FailNoSession;
+    }
+    
+    if (InConfig.bEnable)
+    {
+        auto LocationProvider = [[ASAPlatformLocationProvider alloc] init];
+        LocationProvider.sensors.geoLocationEnabled = InConfig.bEnableGPS;
+        LocationProvider.sensors.wifiEnabled = InConfig.bEnableWifi;
+        
+        bool bBluetoothEnabled = InConfig.BLEBeaconUUIDs.Num() > 0;
+        LocationProvider.sensors.bluetoothEnabled = bBluetoothEnabled;
+        if (bBluetoothEnabled)
+        {
+            NSMutableArray *beacons = [NSMutableArray array];
+            for (int i = 0; i < InConfig.BLEBeaconUUIDs.Num(); i++)
+            {
+                [beacons addObject:FStringToNSString(InConfig.BLEBeaconUUIDs[i])];
+            }
+            
+            LocationProvider.sensors.knownBeaconProximityUuids = beacons;
+        }
+        
+        Session.locationProvider = LocationProvider;
+    }
+    else
+    {
+        // TODO: jeff.fisher - uncomment out this bottom line when the service crash is fixed
+        // Session.locationProvider = nullptr;
+    }
+    
+    return EAzureSpatialAnchorsResult::Success;
+}
+
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsARKitInterop::GetLogLevel(EAzureSpatialAnchorsLogVerbosity& OutLogVerbosity)
+{
+    if (!Session)
+    {
+        return EAzureSpatialAnchorsResult::FailNoSession;
+    }
+    
+    OutLogVerbosity = static_cast<EAzureSpatialAnchorsLogVerbosity>(Session.logLevel);
+    return EAzureSpatialAnchorsResult::Success;
+}
+	
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsARKitInterop::SetLogLevel(EAzureSpatialAnchorsLogVerbosity InLogVerbosity)
+{
+    if (!Session)
+    {
+        return EAzureSpatialAnchorsResult::FailNoSession;
+    }
+    
+    Session.logLevel = static_cast<ASASessionLogLevel>(InLogVerbosity);
+    return EAzureSpatialAnchorsResult::Success;
+}
+
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsARKitInterop::GetSessionId(FString& OutSessionID)
+{
+    if (!Session)
+    {
+        return EAzureSpatialAnchorsResult::FailNoSession;
+    }
+    
+    OutSessionID = NSStringToFString(Session.sessionId);
+    return EAzureSpatialAnchorsResult::Success;
+}
+
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsARKitInterop::StopWatcher(IAzureSpatialAnchors::WatcherID InWatcherIdentifier)
+{
+    if (!Session ||
+        !bSessionRunning)
+    {
+        UE_LOG(LogAzureSpatialAnchorsARKitInterop, Error, TEXT("Attempted to stop a watcher when no Azure Spatial Anchor session was running"));
+        return EAzureSpatialAnchorsResult::NotStarted;
+    }
+    
+    if (CurrentWatcher == nullptr ||
+        CurrentWatcher.identifier != InWatcherIdentifier)
+    {
+        UE_LOG(LogAzureSpatialAnchorsARKitInterop, Error, TEXT("Attempted to stop a watcher that was not known to the current Azure Spatial Anchor"));
+        return EAzureSpatialAnchorsResult::FailNoWatcher;
+    }
+    
+    [CurrentWatcher stop];
+    [CurrentWatcher release];
+    CurrentWatcher = nullptr;
+	return EAzureSpatialAnchorsResult::Success;
+}
+
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsARKitInterop::GetCloudSpatialAnchorIdentifier(IAzureSpatialAnchors::CloudAnchorID CloudAnchorID, FString& OutCloudAnchorIdentifier)
+{
+    OutCloudAnchorIdentifier = FString{};
+    
+    if (!Session)
+    {
+        UE_LOG(LogAzureSpatialAnchorsARKitInterop, Error, TEXT("Attempted to get a cloud anchor identifier when no Azure Spatial Anchor session is running"));
+        return EAzureSpatialAnchorsResult::FailNoSession;
+    }
+    
+    ASACloudSpatialAnchor *CloudAnchor = nullptr;
+    {
+        FScopeLock Lock(&CloudAnchorMapMutex);
+        if (!CloudAnchorMap.Contains(CloudAnchorID))
+        {
+            UE_LOG(LogAzureSpatialAnchorsARKitInterop, Error, TEXT("Attempted to get cloud anchor identifier for an anchor not known to the plugin"));
+            return EAzureSpatialAnchorsResult::FailNoCloudAnchor;
+        }
+        
+        CloudAnchor = CloudAnchorMap[CloudAnchorID];
+        if (CloudAnchor == nil)
+        {
+            UE_LOG(LogAzureSpatialAnchorsARKitInterop, Error, TEXT("Attempted to get cloud anchor identifier for an anchor released by the plugin"));
+            CloudAnchorMap.Remove(CloudAnchorID);
+            return EAzureSpatialAnchorsResult::FailNoCloudAnchor;
+        }
+    }
+    
+    OutCloudAnchorIdentifier = NSStringToFString(CloudAnchor.identifier);
+    return EAzureSpatialAnchorsResult::Success;
+}
+
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsARKitInterop::SetCloudAnchorExpiration(IAzureSpatialAnchors::CloudAnchorID InCloudAnchorID, float InLifetimeInSeconds)
+{
+    if (!Session ||
+        !bSessionRunning)
+    {
+        UE_LOG(LogAzureSpatialAnchorsARKitInterop, Error, TEXT("Attempted to set cloud anchor expiration when no Azure Spatial Anchors session is running"));
+        return EAzureSpatialAnchorsResult::NotStarted;
+    }
+    
+    ASACloudSpatialAnchor *CloudAnchor = nullptr;
+    {
+        FScopeLock Lock(&CloudAnchorMapMutex);
+        if (!CloudAnchorMap.Contains(InCloudAnchorID))
+        {
+            UE_LOG(LogAzureSpatialAnchorsARKitInterop, Error, TEXT("Attempted to set cloud anchor expiration for an anchor not known to the plugin"));
+            return EAzureSpatialAnchorsResult::FailNoCloudAnchor;
+        }
+        
+        CloudAnchor = CloudAnchorMap[InCloudAnchorID];
+    }
+    
+    bool bAnchorSaved = false;
+    {
+        FScopeLock Lock(&SavedAnchorsMutex);
+        bAnchorSaved = SavedAnchors.Contains(InCloudAnchorID);
+    }
+    
+    if (bAnchorSaved)
+    {
+        UE_LOG(LogAzureSpatialAnchorsARKitInterop, Error, TEXT("Attempted to set cloud anchor expiration for an anchor already saved to the Azure Spatial Anchors session. This is not supported."));
+        return EAzureSpatialAnchorsResult::FailAnchorAlreadyTracked;
+    }
+    
+    NSDate *Expiration = [[NSDate alloc] initWithTimeIntervalSinceNow: static_cast<NSTimeInterval>(InLifetimeInSeconds)];
+    CloudAnchor.expiration = Expiration;
+    return EAzureSpatialAnchorsResult::Success;
+}
+
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsARKitInterop::GetCloudAnchorExpiration(IAzureSpatialAnchors::CloudAnchorID InCloudAnchorID, float& OutLifetimeInSeconds)
+{
+    if (!Session ||
+        !bSessionRunning)
+    {
+        UE_LOG(LogAzureSpatialAnchorsARKitInterop, Error, TEXT("Attempted to get cloud anchor expiration when no Azure Spatial Anchors session is running"));
+        return EAzureSpatialAnchorsResult::NotStarted;
+    }
+    
+    ASACloudSpatialAnchor *CloudAnchor = nullptr;
+    {
+        FScopeLock Lock(&CloudAnchorMapMutex);
+        if (!CloudAnchorMap.Contains(InCloudAnchorID))
+        {
+            UE_LOG(LogAzureSpatialAnchorsARKitInterop, Error, TEXT("Attempted to get cloud anchor expiration for an anchor not known to the plugin"));
+            return EAzureSpatialAnchorsResult::FailNoCloudAnchor;
+        }
+        
+        CloudAnchor = CloudAnchorMap[InCloudAnchorID];
+    }
+    
+    OutLifetimeInSeconds = CloudAnchor.expiration.timeIntervalSinceNow;
+    return EAzureSpatialAnchorsResult::Success;
+}
+
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsARKitInterop::SetCloudAnchorAppProperties(IAzureSpatialAnchors::CloudAnchorID InCloudAnchorID, const TMap<FString, FString>& InAppProperties)
+{
+    if (!Session ||
+        !bSessionRunning)
+    {
+        UE_LOG(LogAzureSpatialAnchorsARKitInterop, Error, TEXT("Attempted to set cloud anchor app properties when no Azure Spatial anchors session is running"));
+        return EAzureSpatialAnchorsResult::NotStarted;
+    }
+    
+    ASACloudSpatialAnchor *CloudAnchor = nullptr;
+    {
+        FScopeLock Lock(&CloudAnchorMapMutex);
+        if (!CloudAnchorMap.Contains(InCloudAnchorID))
+        {
+            UE_LOG(LogAzureSpatialAnchorsARKitInterop, Error, TEXT("Attempted to set cloud anchor app properties for an AzureCloudSpatialAnchor not known to the plugin"));
+            return EAzureSpatialAnchorsResult::FailNoCloudAnchor;
+        }
+        
+        CloudAnchor = CloudAnchorMap[InCloudAnchorID];
+    }
+    
+    if ([CloudAnchor.identifier length] == 0)
+    {
+        UE_LOG(LogAzureSpatialAnchorsARKitInterop, Error, TEXT("Attempted to set cloud anchor app properties for an AzureCloudSpatialAnchor not known to the service"));
+        return EAzureSpatialAnchorsResult::FailNoCloudAnchor;
+    }
+    
+    NSMutableDictionary *AppProperties = [[NSMutableDictionary alloc] init];
+    for (auto Property : InAppProperties)
+    {
+        AppProperties[FStringToNSString(Property.Key)] = FStringToNSString(Property.Value);
+    }
+    
+    CloudAnchor.appProperties = AppProperties;
+	return EAzureSpatialAnchorsResult::Success;
+}
+
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsARKitInterop::GetCloudAnchorAppProperties(IAzureSpatialAnchors::CloudAnchorID InCloudAnchorID, TMap<FString, FString>& OutAppProperties)
+{
+    OutAppProperties.Empty();
+    if (!Session ||
+        !bSessionRunning)
+    {
+        UE_LOG(LogAzureSpatialAnchorsARKitInterop, Error, TEXT("Attempted to get cloud anchor app properties when no Azure Spatial Anchors session is running"));
+        return EAzureSpatialAnchorsResult::NotStarted;
+    }
+    
+    NSDictionary *Properties;
+    {
+        FScopeLock Lock(&CloudAnchorMapMutex);
+        if (!CloudAnchorMap.Contains(InCloudAnchorID))
+        {
+            UE_LOG(LogAzureSpatialAnchorsARKitInterop, Error, TEXT("Attempted to get cloud anchor properties for an AzureCloudSpatialAnchor not known to the plugin"));
+            return EAzureSpatialAnchorsResult::FailNoCloudAnchor;
+        }
+        
+        Properties = Clou

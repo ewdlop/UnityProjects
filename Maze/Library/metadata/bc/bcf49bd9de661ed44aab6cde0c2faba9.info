@@ -1,0 +1,270 @@
+  // This is the CultureInfo hierarchy traversal code for resource 
+                // lookups, similar but necessarily orthogonal to the ResourceSet 
+                // lookup logic.
+                ResourceFallbackManager mgr = new ResourceFallbackManager(culture, _neutralResourcesCulture, true);
+                foreach (CultureInfo currentCultureInfo in mgr) {
+
+                    ResourceSet rs = InternalGetResourceSet(currentCultureInfo, true, true);
+                    if (rs == null)
+                        break;
+
+                    if (rs != last) {
+                        String value = rs.GetString(name, _ignoreCase);
+                        if (value != null)
+                        {
+                            // update last used ResourceSet
+                            if (_lastUsedResourceCache != null) {
+                                lock (_lastUsedResourceCache) {
+                                    _lastUsedResourceCache.lastCultureName = currentCultureInfo.Name;
+                                    _lastUsedResourceCache.lastResourceSet = rs;
+                                }
+                            }
+                            return value;
+                        }
+
+                        last = rs;
+                    }
+                }
+
+#if !FEATURE_CORECLR && !MONO
+                if (FrameworkEventSource.IsInitialized)
+                {
+                    FrameworkEventSource.Log.ResourceManagerLookupFailed(BaseNameField, MainAssembly, culture.Name);
+                }
+#endif
+            }
+
+            return null;
+        }
+        
+        
+        // Looks up a resource value for a particular name.  Looks in the 
+        // current thread's CultureInfo, and if not found, all parent CultureInfos.
+        // Returns null if the resource wasn't found.
+        // 
+        public virtual Object GetObject(String name) {
+            return GetObject(name, (CultureInfo)null, true);
+        }
+        
+        // Looks up a resource value for a particular name.  Looks in the 
+        // specified CultureInfo, and if not found, all parent CultureInfos.
+        // Returns null if the resource wasn't found.
+        public virtual Object GetObject(String name, CultureInfo culture) {
+            return GetObject(name, culture, true);
+        }
+
+        private Object GetObject(String name, CultureInfo culture, bool wrapUnmanagedMemStream)
+        {
+            if (null==name)
+                throw new ArgumentNullException("name");
+            Contract.EndContractBlock();
+
+#if FEATURE_APPX
+            if(s_IsAppXModel)
+            {
+                 // If the caller explictily passed in a culture that was obtained by calling CultureInfo.CurrentUICulture,
+                 // null it out, so that we re-compute it based on the Win32 value and not the AppX language list value.
+                 // (See the call a little later to GetCurrentUICultureNoAppX()).
+                 if(Object.ReferenceEquals(culture, CultureInfo.CurrentUICulture))
+                 {
+                     culture = null;
+                 }              
+            }
+#endif
+
+            if (null==culture) {
+                // When running inside AppX we want to ignore the languages list when trying to come up with our CurrentUICulture.
+                // This line behaves the same way as CultureInfo.CurrentUICulture would have in .NET 4
+                culture = Thread.CurrentThread.GetCurrentUICultureNoAppX();
+            }
+
+#if !FEATURE_CORECLR && !MONO
+            if (FrameworkEventSource.IsInitialized)
+            {
+                FrameworkEventSource.Log.ResourceManagerLookupStarted(BaseNameField, MainAssembly, culture.Name);
+            }
+#endif
+            ResourceSet last = GetFirstResourceSet(culture);
+            if (last != null)
+            {
+                Object value = last.GetObject(name, _ignoreCase);
+
+                if (value != null) 
+                {
+                    UnmanagedMemoryStream stream = value as UnmanagedMemoryStream;
+                    if (stream != null && wrapUnmanagedMemStream)
+                        return new UnmanagedMemoryStreamWrapper(stream);
+                    else
+                        return value;
+                }
+            }
+            
+            // This is the CultureInfo hierarchy traversal code for resource 
+            // lookups, similar but necessarily orthogonal to the ResourceSet 
+            // lookup logic.
+            ResourceFallbackManager mgr = new ResourceFallbackManager(culture, _neutralResourcesCulture, true);
+            
+            foreach (CultureInfo currentCultureInfo in mgr) {
+                // Note: Technically this method should be passed in a stack crawl mark that we then pass
+                // to InternalGetResourceSet for ensuring we demand permissions to read your private resources
+                // if you're reading resources from an assembly other than yourself.  But, we must call our
+                // three argument overload (without the stack crawl mark) for compatibility.  After 
+                // consideration, we aren't worried about the security impact.
+                ResourceSet rs = InternalGetResourceSet(currentCultureInfo, true, true);
+                if (rs == null)
+                    break;
+
+                if (rs != last) {
+                    Object value = rs.GetObject(name, _ignoreCase);
+                    if (value != null) {
+                        // update the last used ResourceSet
+                        if (_lastUsedResourceCache != null) {
+                            lock (_lastUsedResourceCache) {
+                                _lastUsedResourceCache.lastCultureName = currentCultureInfo.Name;
+                                _lastUsedResourceCache.lastResourceSet = rs;
+                            }
+                        }
+
+                        UnmanagedMemoryStream stream = value as UnmanagedMemoryStream;
+                        if (stream != null && wrapUnmanagedMemStream)
+                            return new UnmanagedMemoryStreamWrapper(stream);
+                        else
+                            return value;
+                    }
+
+                    last = rs;
+                }
+            }
+
+#if !FEATURE_CORECLR && !MONO
+            if (FrameworkEventSource.IsInitialized)
+            {
+                FrameworkEventSource.Log.ResourceManagerLookupFailed(BaseNameField, MainAssembly, culture.Name);
+            }
+#endif
+            return null;
+        }
+
+        [ComVisible(false)]
+        public UnmanagedMemoryStream GetStream(String name) {
+            return GetStream(name, (CultureInfo)null);
+        }
+        
+        [ComVisible(false)]
+        public UnmanagedMemoryStream GetStream(String name, CultureInfo culture) {
+            Object obj = GetObject(name, culture, false);
+            UnmanagedMemoryStream ums = obj as UnmanagedMemoryStream;
+            if (ums == null && obj != null)
+                throw new InvalidOperationException(Environment.GetResourceString("InvalidOperation_ResourceNotStream_Name", name));
+            return ums;
+        }
+
+#if RESOURCE_SATELLITE_CONFIG
+        // Internal helper method - gives an end user the ability to prevent
+        // satellite assembly probes for certain cultures via a config file.
+        [System.Security.SecurityCritical]  // auto-generated
+        private bool TryLookingForSatellite(CultureInfo lookForCulture)
+        {
+            if (!_checkedConfigFile) {
+                lock (this) {
+                    if (!_checkedConfigFile) {
+                        _checkedConfigFile = true;
+                        _installedSatelliteInfo = GetSatelliteAssembliesFromConfig();
+                    }
+                }
+            }
+
+            if (_installedSatelliteInfo == null)
+                return true;
+
+            String[] installedSatellites = (String[]) _installedSatelliteInfo[MainAssembly.FullName];
+
+            if (installedSatellites == null)
+                return true;
+
+            // The config file told us what satellites might be installed.
+            int pos = Array.IndexOf(installedSatellites, lookForCulture.Name);
+
+#if !FEATURE_CORECLR && !MONO
+            if (FrameworkEventSource.IsInitialized && FrameworkEventSource.Log.IsEnabled()) {
+                if (pos < 0) {
+                    FrameworkEventSource.Log.ResourceManagerCultureNotFoundInConfigFile(BaseNameField, MainAssembly, lookForCulture.Name);
+                }
+                else {
+                    FrameworkEventSource.Log.ResourceManagerCultureFoundInConfigFile(BaseNameField, MainAssembly, lookForCulture.Name);
+                }
+            }
+#endif
+            return pos >= 0;
+        }
+
+        // Note: There is one config file per appdomain.  This is not 
+        // per-process nor per-assembly.
+        [System.Security.SecurityCritical]  // auto-generated
+        [ResourceExposure(ResourceScope.None)]
+        [ResourceConsumption(ResourceScope.Machine, ResourceScope.Machine)]
+        private Hashtable GetSatelliteAssembliesFromConfig()
+        {
+#if FEATURE_FUSION
+
+            String fileName = AppDomain.CurrentDomain.FusionStore.ConfigurationFileInternal;
+            if (fileName == null) {
+                return null;
+            }
+
+            // Don't do a security assert.  We need to support semi-trusted 
+            // scenarios, but asserting here causes infinite resource lookups
+            // while initializing security & looking up mscorlib's config file.
+            // Use internal methods to bypass security checks.
+
+            // If we're dealing with a local file name or a UNC path instead 
+            // of a URL, check to see if the file exists here for perf (avoids
+            // throwing a FileNotFoundException).
+            if (fileName.Length >= 2 && 
+                ((fileName[1] == Path.VolumeSeparatorChar) || (fileName[0] == Path.DirectorySeparatorChar && fileName[1] == Path.DirectorySeparatorChar)) &&
+                !File.InternalExists(fileName))
+                return null;
+
+            ConfigTreeParser parser = new ConfigTreeParser();
+            String queryPath = "/configuration/satelliteassemblies";
+            ConfigNode node = null;
+            // Catch exceptions in case a web app doesn't have a config file.
+            try {
+                node = parser.Parse(fileName, queryPath, true);
+            }
+            catch(Exception) {}
+
+            if (node == null) {
+                return null;
+            }
+
+            // The application config file will contain sections like this:
+            // <?xml version="1.0"?>
+            // <configuration>
+            //     <satelliteassemblies>
+            //         <assembly name="mscorlib, Version=..., PublicKeyToken=...">
+            //             <culture>fr</culture>
+            //         </assembly>
+            //         <assembly name="UserAssembly, ...">
+            //             <culture>fr-FR</culture>
+            //             <culture>de-CH</culture>
+            //         </assembly>
+            //         <assembly name="UserAssembly2, ...">
+            //         </assembly>
+            //    </satelliteassemblies>
+            // </configuration>
+            Hashtable satelliteInfo = new Hashtable(StringComparer.OrdinalIgnoreCase);
+            foreach(ConfigNode assemblyNode in node.Children) {
+                if (!String.Equals(assemblyNode.Name, "assembly"))
+                    throw new ApplicationException(Environment.GetResourceString("XMLSyntax_InvalidSyntaxSatAssemTag", Path.GetFileName(fileName), assemblyNode.Name));
+
+                if (assemblyNode.Attributes.Count == 0)
+                    throw new ApplicationException(Environment.GetResourceString("XMLSyntax_InvalidSyntaxSatAssemTagNoAttr", Path.GetFileName(fileName)));
+
+                DictionaryEntry de = (DictionaryEntry) assemblyNode.Attributes[0];
+                String assemblyName = (String) de.Value;
+                if (!String.Equals(de.Key, "name") || String.IsNullOrEmpty(assemblyName) || assemblyNode.Attributes.Count > 1) 
+                    throw new ApplicationException(Environment.GetResourceString("XMLSyntax_InvalidSyntaxSatAssemTagBadAttr", Path.GetFileName(fileName), de.Key, de.Value));
+
+                ArrayList list = new ArrayList(5);
+                foreac

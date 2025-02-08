@@ -1,0 +1,187 @@
+ecord->len, ctx->sizeof_size);
+    UINT32ENCODE(raw, nrecord->filter_mask);
+    H5F_ENCODE_LENGTH_LEN(raw, nrecord->obj_size, ctx->sizeof_size);
+    H5F_ENCODE_LENGTH_LEN(raw, nrecord->id, ctx->sizeof_size);
+
+    FUNC_LEAVE_NOAPI(SUCCEED)
+} /* H5HF_huge_bt2_filt_indir_encode() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:	H5HF_huge_bt2_filt_indir_decode
+ *
+ * Purpose:	Decode raw disk form of record into native form
+ *
+ * Return:	Success:	non-negative
+ *		Failure:	negative
+ *
+ * Programmer:	Quincey Koziol
+ *              Monday, August  7, 2006
+ *
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5HF_huge_bt2_filt_indir_decode(const uint8_t *raw, void *_nrecord, void *_ctx)
+{
+    H5HF_huge_bt2_ctx_t *ctx = (H5HF_huge_bt2_ctx_t *)_ctx;       /* Callback context structure */
+    H5HF_huge_bt2_filt_indir_rec_t *nrecord = (H5HF_huge_bt2_filt_indir_rec_t *)_nrecord;
+
+    FUNC_ENTER_NOAPI_NOINIT_NOERR
+
+    /* Sanity check */
+    HDassert(ctx);
+
+    /* Decode the record's fields */
+    H5F_addr_decode_len(ctx->sizeof_addr, &raw, &nrecord->addr);
+    H5F_DECODE_LENGTH_LEN(raw, nrecord->len, ctx->sizeof_size);
+    UINT32DECODE(raw, nrecord->filter_mask);
+    H5F_DECODE_LENGTH_LEN(raw, nrecord->obj_size, ctx->sizeof_size);
+    H5F_DECODE_LENGTH_LEN(raw, nrecord->id, ctx->sizeof_size);
+
+    FUNC_LEAVE_NOAPI(SUCCEED)
+} /* H5HF_huge_bt2_filt_indir_decode() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:	H5HF_huge_bt2_filt_indir_debug
+ *
+ * Purpose:	Debug native form of record
+ *
+ * Return:	Success:	non-negative
+ *		Failure:	negative
+ *
+ * Programmer:	Quincey Koziol
+ *              Monday, August  7, 2006
+ *
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5HF_huge_bt2_filt_indir_debug(FILE *stream, const H5F_t H5_ATTR_UNUSED *f, hid_t H5_ATTR_UNUSED dxpl_id,
+    int indent, int fwidth, const void *_nrecord,
+    const void H5_ATTR_UNUSED *_udata)
+{
+    const H5HF_huge_bt2_filt_indir_rec_t *nrecord = (const H5HF_huge_bt2_filt_indir_rec_t *)_nrecord;
+
+    FUNC_ENTER_NOAPI_NOINIT_NOERR
+
+    HDfprintf(stream, "%*s%-*s {%a, %Hu, %x, %Hu, %Hu}\n", indent, "", fwidth, "Record:",
+        nrecord->addr, nrecord->len, nrecord->filter_mask, nrecord->obj_size, nrecord->id);
+
+    FUNC_LEAVE_NOAPI(SUCCEED)
+} /* H5HF_huge_bt2_filt_indir_debug() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:	H5HF_huge_bt2_dir_remove
+ *
+ * Purpose:	Free space for directly accessed 'huge' object, as v2 B-tree
+ *              is being deleted or v2 B-tree node is being removed
+ *
+ * Return:	Success:	non-negative
+ *		Failure:	negative
+ *
+ * Programmer:	Quincey Koziol
+ *              Tuesday, August  8, 2006
+ *
+ *-------------------------------------------------------------------------
+ */
+herr_t
+H5HF_huge_bt2_dir_remove(const void *nrecord, void *_udata)
+{
+    H5HF_huge_remove_ud_t *udata = (H5HF_huge_remove_ud_t *)_udata;   /* User callback data */
+    herr_t ret_value = SUCCEED;         /* Return value */
+
+    FUNC_ENTER_NOAPI_NOINIT
+
+    /* Free the space in the file for the object being removed */
+    if(H5MF_xfree(udata->hdr->f, H5FD_MEM_FHEAP_HUGE_OBJ, udata->dxpl_id, ((const H5HF_huge_bt2_indir_rec_t *)nrecord)->addr, ((const H5HF_huge_bt2_indir_rec_t *)nrecord)->len) < 0)
+        HGOTO_ERROR(H5E_HEAP, H5E_CANTFREE, FAIL, "unable to free space for huge object on disk")
+
+    /* Set the length of the object removed */
+    udata->obj_len = ((const H5HF_huge_bt2_indir_rec_t *)nrecord)->len;
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* H5HF_huge_bt2_dir_remove() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:	H5HF_huge_bt2_dir_store
+ *
+ * Purpose:	Store native information into record for v2 B-tree
+ *
+ * Return:	Success:	non-negative
+ *		Failure:	negative
+ *
+ * Programmer:	Quincey Koziol
+ *              Monday, August  7, 2006
+ *
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5HF_huge_bt2_dir_store(void *nrecord, const void *udata)
+{
+    FUNC_ENTER_NOAPI_NOINIT_NOERR
+
+    *(H5HF_huge_bt2_dir_rec_t *)nrecord = *(const H5HF_huge_bt2_dir_rec_t *)udata;
+
+    FUNC_LEAVE_NOAPI(SUCCEED)
+} /* H5HF_huge_bt2_dir_store() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:	H5HF_huge_bt2_dir_compare
+ *
+ * Purpose:	Compare two native information records, according to some key
+ *
+ * Return:	<0 if rec1 < rec2
+ *              =0 if rec1 == rec2
+ *              >0 if rec1 > rec2
+ *
+ * Programmer:	Quincey Koziol
+ *              Monday, August  7, 2006
+ *
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5HF_huge_bt2_dir_compare(const void *_rec1, const void *_rec2, int *result)
+{
+    const H5HF_huge_bt2_dir_rec_t *rec1 = (const H5HF_huge_bt2_dir_rec_t *)_rec1;
+    const H5HF_huge_bt2_dir_rec_t *rec2 = (const H5HF_huge_bt2_dir_rec_t *)_rec2;
+
+    FUNC_ENTER_NOAPI_NOINIT_NOERR
+
+#ifdef QAK
+HDfprintf(stderr, "%s: rec1 = {%a, %Hu}\n", "H5HF_huge_bt2_dir_compare", rec1->addr, rec1->len);
+HDfprintf(stderr, "%s: rec2 = {%a, %Hu}\n", "H5HF_huge_bt2_dir_compare", rec2->addr, rec2->len);
+#endif /* QAK */
+    if(rec1->addr < rec2->addr)
+        *result = -1;
+    else if(rec1->addr > rec2->addr)
+        *result = 1;
+    else if(rec1->len < rec2->len)
+        *result = -1;
+    else if(rec1->len > rec2->len)
+        *result = 1;
+    else
+        *result = 0;
+
+    FUNC_LEAVE_NOAPI(SUCCEED)
+} /* H5HF_huge_bt2_dir_compare() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:	H5HF_huge_bt2_dir_encode
+ *
+ * Purpose:	Encode native information into raw form for storing on disk
+ *
+ * Return:	Success:	non-negative
+ *		Failure:	negative
+ *
+ * Programmer:	Quincey Koziol
+ *              Monday, August  7, 2006
+ *
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5HF_huge_bt2_dir_encode(uint8_t *r

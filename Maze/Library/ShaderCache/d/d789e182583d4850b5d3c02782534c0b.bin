@@ -1,0 +1,33 @@
+  newStateTable[0][EBCDIC_NL]=MBCS_ENTRY_FINAL(0, MBCS_STATE_VALID_DIRECT_16, U_LF);
+
+    /* copy and modify the from-Unicode result table */
+    newResults=(uint16_t *)newStateTable[mbcsTable->countStates];
+    uprv_memcpy(newResults, bytes, sizeofFromUBytes);
+
+    /* conveniently, the table access macros work on the left side of expressions */
+    if(mbcsTable->outputType==MBCS_OUTPUT_1) {
+        MBCS_SINGLE_RESULT_FROM_U(table, newResults, U_LF)=EBCDIC_RT_NL;
+        MBCS_SINGLE_RESULT_FROM_U(table, newResults, U_NL)=EBCDIC_RT_LF;
+    } else /* MBCS_OUTPUT_2_SISO */ {
+        stage2Entry=MBCS_STAGE_2_FROM_U(table, U_LF);
+        MBCS_VALUE_2_FROM_STAGE_2(newResults, stage2Entry, U_LF)=EBCDIC_NL;
+
+        stage2Entry=MBCS_STAGE_2_FROM_U(table, U_NL);
+        MBCS_VALUE_2_FROM_STAGE_2(newResults, stage2Entry, U_NL)=EBCDIC_LF;
+    }
+
+    /* set the canonical converter name */
+    name=(char *)newResults+sizeofFromUBytes;
+    uprv_strcpy(name, sharedData->staticData->name);
+    uprv_strcat(name, UCNV_SWAP_LFNL_OPTION_STRING);
+
+    /* set the pointers */
+    umtx_lock(NULL);
+    if(mbcsTable->swapLFNLStateTable==NULL) {
+        mbcsTable->swapLFNLStateTable=newStateTable;
+        mbcsTable->swapLFNLFromUnicodeBytes=(uint8_t *)newResults;
+        mbcsTable->swapLFNLName=name;
+
+        newStateTable=NULL;
+    }
+    umtx_unlock(NULL);

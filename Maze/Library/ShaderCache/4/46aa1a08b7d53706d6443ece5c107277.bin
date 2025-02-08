@@ -1,0 +1,135 @@
+//------------------------------------------------------------------------------
+// <copyright file="PerformanceCounterCategory.cs" company="Microsoft">
+//     Copyright (c) Microsoft Corporation.  All rights reserved.
+// </copyright>
+//------------------------------------------------------------------------------
+
+namespace System.Diagnostics {
+    using System.Runtime.Serialization.Formatters;
+    using System.ComponentModel;
+    using System.Diagnostics;
+    using System;
+    using System.Threading;
+    using System.Security;
+    using System.Security.Permissions;
+    using System.Collections;
+    using Microsoft.Win32;
+    using System.Globalization;
+    using System.Runtime.CompilerServices;
+    using System.Runtime.Versioning;
+
+    /// <devdoc>
+    ///     A Performance counter category object.
+    /// </devdoc>
+    [
+    HostProtection(Synchronization=true, SharedState=true)
+    ]
+    public sealed class PerformanceCounterCategory {
+        private string categoryName;
+        private string categoryHelp;
+        private string machineName;
+        internal const int MaxCategoryNameLength = 80; 
+        internal const int MaxCounterNameLength = 32767;
+        internal const int MaxHelpLength = 32767;
+        private const string perfMutexName = "netfxperf.1.0";
+
+        /// <devdoc>
+        ///    <para>[To be supplied.]</para>
+        /// </devdoc>
+        public PerformanceCounterCategory() {
+            machineName = ".";
+        }
+
+        /// <devdoc>
+        ///     Creates a PerformanceCounterCategory object for given category.
+        ///     Uses the local machine.
+        /// </devdoc>
+        public PerformanceCounterCategory(string categoryName)
+            : this(categoryName, ".") {
+        }
+
+        /// <devdoc>
+        ///     Creates a PerformanceCounterCategory object for given category.
+        ///     Uses the given machine name.
+        /// </devdoc>
+        public PerformanceCounterCategory(string categoryName, string machineName) {
+            if (categoryName == null)
+                throw new ArgumentNullException("categoryName");
+
+            if (categoryName.Length == 0)
+                throw new ArgumentException(SR.GetString(SR.InvalidParameter, "categoryName", categoryName));
+
+            if (!SyntaxCheck.CheckMachineName(machineName))
+                throw new ArgumentException(SR.GetString(SR.InvalidParameter, "machineName", machineName));
+
+            PerformanceCounterPermission permission = new PerformanceCounterPermission(PerformanceCounterPermissionAccess.Read, machineName, categoryName);
+            permission.Demand();
+
+            this.categoryName = categoryName;
+            this.machineName = machineName;
+         }
+
+        /// <devdoc>
+        ///     Gets/sets the Category name
+        /// </devdoc>
+        public string CategoryName {
+            get {
+                return categoryName;
+            }
+
+            set {
+                if (value == null)
+                    throw new ArgumentNullException("value");
+
+                if (value.Length == 0)
+                    throw new ArgumentException(SR.GetString(SR.InvalidProperty, "CategoryName", value));
+
+                // there lock prevents a ---- between setting CategoryName and MachineName, since this permission 
+                // checks depend on both pieces of info. 
+                lock (this) {
+                    PerformanceCounterPermission permission = new PerformanceCounterPermission(PerformanceCounterPermissionAccess.Read, machineName, value);
+                    permission.Demand();
+
+                    this.categoryName = value;
+                }
+            }
+        }
+
+        /// <devdoc>
+        ///     Gets/sets the Category help
+        /// </devdoc>
+        public string CategoryHelp {
+            get {
+                if (this.categoryName == null)
+                    throw new InvalidOperationException(SR.GetString(SR.CategoryNameNotSet));
+
+                if (categoryHelp == null)
+                    categoryHelp = PerformanceCounterLib.GetCategoryHelp(this.machineName, this.categoryName);
+
+                return categoryHelp;
+            }
+        }
+
+        public PerformanceCounterCategoryType CategoryType{
+            get {
+                CategorySample categorySample = PerformanceCounterLib.GetCategorySample(machineName, categoryName);
+
+                // If we get MultiInstance, we can be confident it is correct.  If it is single instance, though
+                // we need to check if is a custom category and if the IsMultiInstance value is set in the registry.
+                // If not we return Unknown
+                if (categorySample.IsMultiInstance)
+                    return PerformanceCounterCategoryType.MultiInstance;
+                else {
+                    if (PerformanceCounterLib.IsCustomCategory(".", categoryName))
+                        return PerformanceCounterLib.GetCategoryType(".", categoryName);
+                    else
+                        return PerformanceCounterCategoryType.SingleInstance;
+                }
+            }
+        }
+        
+
+        /// <devdoc>
+        ///     Gets/sets the Machine name
+        /// </devdoc>
+        public 

@@ -1,0 +1,138 @@
+﻿using UnityEngine;
+using UnityEngine.Profiling;
+using UnityEngine.UI;
+using System.Collections.Generic;
+
+
+namespace TMPro
+{
+
+    public class TMP_UpdateManager
+    {
+        private static TMP_UpdateManager s_Instance;
+
+        private readonly HashSet<int> m_LayoutQueueLookup = new HashSet<int>();
+        private readonly List<TMP_Text> m_LayoutRebuildQueue = new List<TMP_Text>();
+
+        private readonly HashSet<int> m_GraphicQueueLookup = new HashSet<int>();
+        private readonly List<TMP_Text> m_GraphicRebuildQueue = new List<TMP_Text>();
+
+        private readonly HashSet<int> m_InternalUpdateLookup = new HashSet<int>();
+        private readonly List<TMP_Text> m_InternalUpdateQueue = new List<TMP_Text>();
+
+        private readonly HashSet<int> m_CullingUpdateLookup = new HashSet<int>();
+        private readonly List<TMP_Text> m_CullingUpdateQueue = new List<TMP_Text>();
+
+
+        /// <summary>
+        /// Get a singleton instance of the registry
+        /// </summary>
+        static TMP_UpdateManager instance
+        {
+            get
+            {
+                if (s_Instance == null)
+                    s_Instance = new TMP_UpdateManager();
+
+                return s_Instance;
+            }
+        }
+
+        /// <summary>
+        /// Register to receive rendering callbacks.
+        /// </summary>
+        TMP_UpdateManager()
+        {
+            Canvas.willRenderCanvases += DoRebuilds;
+        }
+
+        /// <summary>
+        /// Function used as a replacement for LateUpdate() to handle SDF Scale updates and Legacy Animation updates.
+        /// </summary>
+        /// <param name="textObject"></param>
+        internal static void RegisterTextObjectForUpdate(TMP_Text textObject)
+        {
+            Profiler.BeginSample("TMP.RegisterTextObjectForUpdate");
+
+            instance.InternalRegisterTextObjectForUpdate(textObject);
+
+            Profiler.EndSample();
+        }
+
+        private void InternalRegisterTextObjectForUpdate(TMP_Text textObject)
+        {
+            int id = textObject.GetInstanceID();
+
+            if (m_InternalUpdateLookup.Contains(id))
+                return;
+
+            m_InternalUpdateLookup.Add(id);
+            m_InternalUpdateQueue.Add(textObject);
+        }
+
+        /// <summary>
+        /// Function to register elements which require a layout rebuild.
+        /// </summary>
+        /// <param name="element"></param>
+        public static void RegisterTextElementForLayoutRebuild(TMP_Text element)
+        {
+            instance.InternalRegisterTextElementForLayoutRebuild(element);
+        }
+
+        private void InternalRegisterTextElementForLayoutRebuild(TMP_Text element)
+        {
+            int id = element.GetInstanceID();
+
+            if (m_LayoutQueueLookup.Contains(id))
+                return;
+
+            m_LayoutQueueLookup.Add(id);
+            m_LayoutRebuildQueue.Add(element);
+        }
+
+        /// <summary>
+        /// Function to register elements which require a layout rebuild.
+        /// </summary>
+        /// <param name="element"></param>
+        public static void RegisterTextElementForGraphicRebuild(TMP_Text element)
+        {
+            Profiler.BeginSample("TMP.RegisterTextElementForGraphicRebuild");
+
+            instance.InternalRegisterTextElementForGraphicRebuild(element);
+
+            Profiler.EndSample();
+        }
+
+        private void InternalRegisterTextElementForGraphicRebuild(TMP_Text element)
+        {
+            int id = element.GetInstanceID();
+
+            if (m_GraphicQueueLookup.Contains(id))
+                return;
+
+            m_GraphicQueueLookup.Add(id);
+            m_GraphicRebuildQueue.Add(element);
+        }
+
+        public static void RegisterTextElementForCullingUpdate(TMP_Text element)
+        {
+            Profiler.BeginSample("TMP.RegisterTextElementForCullingUpdate");
+
+            instance.InternalRegisterTextElementForCullingUpdate(element);
+
+            Profiler.EndSample();
+        }
+
+        private void InternalRegisterTextElementForCullingUpdate(TMP_Text element)
+        {
+            int id = element.GetInstanceID();
+
+            if (m_CullingUpdateLookup.Contains(id))
+                return;
+
+            m_CullingUpdateLookup.Add(id);
+            m_CullingUpdateQueue.Add(element);
+        }
+
+        /// <summary>
+        /// Callback which occurs just before the cam is ren

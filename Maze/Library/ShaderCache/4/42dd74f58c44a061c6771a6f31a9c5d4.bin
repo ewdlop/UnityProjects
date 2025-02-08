@@ -1,0 +1,155 @@
+//===-- WebAssemblyExplicitLocals.cpp - Make Locals Explicit --------------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+///
+/// \file
+/// \brief This file converts any remaining registers into WebAssembly locals.
+///
+/// After register stackification and register coloring, convert non-stackified
+/// registers into locals, inserting explicit get_local and set_local
+/// instructions.
+///
+//===----------------------------------------------------------------------===//
+
+#include "MCTargetDesc/WebAssemblyMCTargetDesc.h"
+#include "WebAssembly.h"
+#include "WebAssemblyMachineFunctionInfo.h"
+#include "WebAssemblySubtarget.h"
+#include "WebAssemblyUtilities.h"
+#include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
+#include "llvm/CodeGen/MachineInstrBuilder.h"
+#include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/CodeGen/Passes.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
+using namespace llvm;
+
+#define DEBUG_TYPE "wasm-explicit-locals"
+
+// A command-line option to disable this pass. Note that this produces output
+// which is not valid WebAssembly, though it may be more convenient for writing
+// LLVM unit tests with.
+static cl::opt<bool> DisableWebAssemblyExplicitLocals(
+    "disable-wasm-explicit-locals", cl::ReallyHidden,
+    cl::desc("WebAssembly: Disable emission of get_local/set_local."),
+    cl::init(false));
+
+namespace {
+class WebAssemblyExplicitLocals final : public MachineFunctionPass {
+  StringRef getPassName() const override {
+    return "WebAssembly Explicit Locals";
+  }
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.setPreservesCFG();
+    AU.addPreserved<MachineBlockFrequencyInfo>();
+    MachineFunctionPass::getAnalysisUsage(AU);
+  }
+
+  bool runOnMachineFunction(MachineFunction &MF) override;
+
+public:
+  static char ID; // Pass identification, replacement for typeid
+  WebAssemblyExplicitLocals() : MachineFunctionPass(ID) {}
+};
+} // end anonymous namespace
+
+char WebAssemblyExplicitLocals::ID = 0;
+FunctionPass *llvm::createWebAssemblyExplicitLocals() {
+  return new WebAssemblyExplicitLocals();
+}
+
+/// Return a local id number for the given register, assigning it a new one
+/// if it doesn't yet have one.
+static unsigned getLocalId(DenseMap<unsigned, unsigned> &Reg2Local,
+                           unsigned &CurLocal, unsigned Reg) {
+  auto P = Reg2Local.insert(std::make_pair(Reg, CurLocal));
+  if (P.second)
+    ++CurLocal;
+  return P.first->second;
+}
+
+/// Get the appropriate drop opcode for the given register class.
+static unsigned getDropOpcode(const TargetRegisterClass *RC) {
+  if (RC == &WebAssembly::I32RegClass)
+    return WebAssembly::DROP_I32;
+  if (RC == &WebAssembly::I64RegClass)
+    return WebAssembly::DROP_I64;
+  if (RC == &WebAssembly::F32RegClass)
+    return WebAssembly::DROP_F32;
+  if (RC == &WebAssembly::F64RegClass)
+    return WebAssembly::DROP_F64;
+  if (RC == &WebAssembly::V128RegClass)
+    return WebAssembly::DROP_V128;
+  llvm_unreachable("Unexpected register class");
+}
+
+/// Get the appropriate get_local opcode for the given register class.
+static unsigned getGetLocalOpcode(const TargetRegisterClass *RC) {
+  if (RC == &WebAssembly::I32RegClass)
+    return WebAssembly::GET_LOCAL_I32;
+  if (RC == &WebAssembly::I64RegClass)
+    return WebAssembly::GET_LOCAL_I64;
+  if (RC == &WebAssembly::F32RegClass)
+    return WebAssembly::GET_LOCAL_F32;
+  if (RC == &WebAssembly::F64RegClass)
+    return WebAssembly::GET_LOCAL_F64;
+  if (RC == &WebAssembly::V128RegClass)
+    return WebAssembly::GET_LOCAL_V128;
+  llvm_unreachable("Unexpected register class");
+}
+
+/// Get the appropriate set_local opcode for the given register class.
+static unsigned getSetLocalOpcode(const TargetRegisterClass *RC) {
+  if (RC == &WebAssembly::I32RegClass)
+    return WebAssembly::SET_LOCAL_I32;
+  if (RC == &WebAssembly::I64RegClass)
+    return WebAssembly::SET_LOCAL_I64;
+  if (RC == &WebAssembly::F32RegClass)
+    return WebAssembly::SET_LOCAL_F32;
+  if (RC == &WebAssembly::F64RegClass)
+    return WebAssembly::SET_LOCAL_F64;
+  if (RC == &WebAssembly::V128RegClass)
+    return WebAssembly::SET_LOCAL_V128;
+  llvm_unreachable("Unexpected register class");
+}
+
+/// Get the appropriate tee_local opcode for the given register class.
+static unsigned getTeeLocalOpcode(const TargetRegisterClass *RC) {
+  if (RC == &WebAssembly::I32RegClass)
+    return WebAssembly::TEE_LOCAL_I32;
+  if (RC == &WebAssembly::I64RegClass)
+    return WebAssembly::TEE_LOCAL_I64;
+  if (RC == &WebAssembly::F32RegClass)
+    return WebAssembly::TEE_LOCAL_F32;
+  if (RC == &WebAssembly::F64RegClass)
+    return WebAssembly::TEE_LOCAL_F64;
+  if (RC == &WebAssembly::V128RegClass)
+    return WebAssembly::TEE_LOCAL_V128;
+  llvm_unreachable("Unexpected register class");
+}
+
+/// Get the type associated with the given register class.
+static MVT typeForRegClass(const TargetRegisterClass *RC) {
+  if (RC == &WebAssembly::I32RegClass)
+    return MVT::i32;
+  if (RC == &WebAssembly::I64RegClass)
+    return MVT::i64;
+  if (RC == &WebAssembly::F32RegClass)
+    return MVT::f32;
+  if (RC == &WebAssembly::F64RegClass)
+    return MVT::f64;
+  llvm_unreachable("unrecognized register class");
+}
+
+/// Given a MachineOperand of a stackified vreg, return the instruction at the
+/// start of the expression tree.
+static MachineInstr *FindStartOfTree(MachineOperand &MO,
+                                     MachineRegisterInfo &MRI,
+                                     WebAssemblyFunctionInfo &MFI) {
+  unsigned Reg = M

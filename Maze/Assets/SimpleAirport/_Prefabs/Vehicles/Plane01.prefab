@@ -1,0 +1,299 @@
+argetRegisterInfo::isVirtualRegister(RR.Reg));
+  // For virtual registers that belong to a class that is not tracked,
+  // generate an "unknown" value as well.
+  const TargetRegisterClass *C = MRI.getRegClass(RR.Reg);
+  if (!track(C))
+    return RegisterCell::self(0, BW);
+
+  CellMapType::const_iterator F = M.find(RR.Reg);
+  if (F != M.end()) {
+    if (!RR.Sub)
+      return F->second;
+    BitMask M = mask(RR.Reg, RR.Sub);
+    return F->second.extract(M);
+  }
+  // If not found, create a "top" entry, but do not insert it in the map.
+  return RegisterCell::top(BW);
+}
+
+void BT::MachineEvaluator::putCell(const RegisterRef &RR, RegisterCell RC,
+      CellMapType &M) const {
+  // While updating the cell map can be done in a meaningful way for
+  // a part of a register, it makes little sense to implement it as the
+  // SSA representation would never contain such "partial definitions".
+  if (!TargetRegisterInfo::isVirtualRegister(RR.Reg))
+    return;
+  assert(RR.Sub == 0 && "Unexpected sub-register in definition");
+  // Eliminate all ref-to-reg-0 bit values: replace them with "self".
+  M[RR.Reg] = RC.regify(RR.Reg);
+}
+
+// Check if the cell represents a compile-time integer value.
+bool BT::MachineEvaluator::isInt(const RegisterCell &A) const {
+  uint16_t W = A.width();
+  for (uint16_t i = 0; i < W; ++i)
+    if (!A[i].is(0) && !A[i].is(1))
+      return false;
+  return true;
+}
+
+// Convert a cell to the integer value. The result must fit in uint64_t.
+uint64_t BT::MachineEvaluator::toInt(const RegisterCell &A) const {
+  assert(isInt(A));
+  uint64_t Val = 0;
+  uint16_t W = A.width();
+  for (uint16_t i = 0; i < W; ++i) {
+    Val <<= 1;
+    Val |= A[i].is(1);
+  }
+  return Val;
+}
+
+// Evaluator helper functions. These implement some common operation on
+// register cells that can be used to implement target-specific instructions
+// in a target-specific evaluator.
+
+BT::RegisterCell BT::MachineEvaluator::eIMM(int64_t V, uint16_t W) const {
+  RegisterCell Res(W);
+  // For bits beyond the 63rd, this will generate the sign bit of V.
+  for (uint16_t i = 0; i < W; ++i) {
+    Res[i] = BitValue(V & 1);
+    V >>= 1;
+  }
+  return Res;
+}
+
+BT::RegisterCell BT::MachineEvaluator::eIMM(const ConstantInt *CI) const {
+  const APInt &A = CI->getValue();
+  uint16_t BW = A.getBitWidth();
+  assert((unsigned)BW == A.getBitWidth() && "BitWidth overflow");
+  RegisterCell Res(BW);
+  for (uint16_t i = 0; i < BW; ++i)
+    Res[i] = A[i];
+  return Res;
+}
+
+BT::RegisterCell BT::MachineEvaluator::eADD(const RegisterCell &A1,
+      const RegisterCell &A2) const {
+  uint16_t W = A1.width();
+  assert(W == A2.width());
+  RegisterCell Res(W);
+  bool Carry = false;
+  uint16_t I;
+  for (I = 0; I < W; ++I) {
+    const BitValue &V1 = A1[I];
+    const BitValue &V2 = A2[I];
+    if (!V1.num() || !V2.num())
+      break;
+    unsigned S = bool(V1) + bool(V2) + Carry;
+    Res[I] = BitValue(S & 1);
+    Carry = (S > 1);
+  }
+  for (; I < W; ++I) {
+    const BitValue &V1 = A1[I];
+    const BitValue &V2 = A2[I];
+    // If the next bit is same as Carry, the result will be 0 plus the
+    // other bit. The Carry bit will remain unchanged.
+    if (V1.is(Carry))
+      Res[I] = BitValue::ref(V2);
+    else if (V2.is(Carry))
+      Res[I] = BitValue::ref(V1);
+    else
+      break;
+  }
+  for (; I < W; ++I)
+    Res[I] = BitValue::self();
+  return Res;
+}
+
+BT::RegisterCell BT::MachineEvaluator::eSUB(const RegisterCell &A1,
+      const RegisterCell &A2) const {
+  uint16_t W = A1.width();
+  assert(W == A2.width());
+  RegisterCell Res(W);
+  bool Borrow = false;
+  uint16_t I;
+  for (I = 0; I < W; ++I) {
+    const BitValue &V1 = A1[I];
+    const BitValue &V2 = A2[I];
+    if (!V1.num() || !V2.num())
+      break;
+    unsigned S = bool(V1) - bool(V2) - Borrow;
+    Res[I] = BitValue(S & 1);
+    Borrow = (S > 1);
+  }
+  for (; I < W; ++I) {
+    const BitValue &V1 = A1[I];
+    const BitValue &V2 = A2[I];
+    if (V1.is(Borrow)) {
+      Res[I] = BitValue::ref(V2);
+      break;
+    }
+    if (V2.is(Borrow))
+      Res[I] = BitValue::ref(V1);
+    else
+      break;
+  }
+  for (; I < W; ++I)
+    Res[I] = BitValue::self();
+  return Res;
+}
+
+BT::RegisterCell BT::MachineEvaluator::eMLS(const RegisterCell &A1,
+      const RegisterCell &A2) const {
+  uint16_t W = A1.width() + A2.width();
+  uint16_t Z = A1.ct(false) + A2.ct(false);
+  RegisterCell Res(W);
+  Res.fill(0, Z, BitValue::Zero);
+  Res.fill(Z, W, BitValue::self());
+  return Res;
+}
+
+BT::RegisterCell BT::MachineEvaluator::eMLU(const RegisterCell &A1,
+      const RegisterCell &A2) const {
+  uint16_t W = A1.width() + A2.width();
+  uint16_t Z = A1.ct(false) + A2.ct(false);
+  RegisterCell Res(W);
+  Res.fill(0, Z, BitValue::Zero);
+  Res.fill(Z, W, BitValue::self());
+  return Res;
+}
+
+BT::RegisterCell BT::MachineEvaluator::eASL(const RegisterCell &A1,
+      uint16_t Sh) const {
+  assert(Sh <= A1.width());
+  RegisterCell Res = RegisterCell::ref(A1);
+  Res.rol(Sh);
+  Res.fill(0, Sh, BitValue::Zero);
+  return Res;
+}
+
+BT::RegisterCell BT::MachineEvaluator::eLSR(const RegisterCell &A1,
+      uint16_t Sh) const {
+  uint16_t W = A1.width();
+  assert(Sh <= W);
+  RegisterCell Res = RegisterCell::ref(A1);
+  Res.rol(W-Sh);
+  Res.fill(W-Sh, W, BitValue::Zero);
+  return Res;
+}
+
+BT::RegisterCell BT::MachineEvaluator::eASR(const RegisterCell &A1,
+      uint16_t Sh) const {
+  uint16_t W = A1.width();
+  assert(Sh <= W);
+  RegisterCell Res = RegisterCell::ref(A1);
+  BitValue Sign = Res[W-1];
+  Res.rol(W-Sh);
+  Res.fill(W-Sh, W, Sign);
+  return Res;
+}
+
+BT::RegisterCell BT::MachineEvaluator::eAND(const RegisterCell &A1,
+      const RegisterCell &A2) const {
+  uint16_t W = A1.width();
+  assert(W == A2.width());
+  RegisterCell Res(W);
+  for (uint16_t i = 0; i < W; ++i) {
+    const BitValue &V1 = A1[i];
+    const BitValue &V2 = A2[i];
+    if (V1.is(1))
+      Res[i] = BitValue::ref(V2);
+    else if (V2.is(1))
+      Res[i] = BitValue::ref(V1);
+    else if (V1.is(0) || V2.is(0))
+      Res[i] = BitValue::Zero;
+    else if (V1 == V2)
+      Res[i] = V1;
+    else
+      Res[i] = BitValue::self();
+  }
+  return Res;
+}
+
+BT::RegisterCell BT::MachineEvaluator::eORL(const RegisterCell &A1,
+      const RegisterCell &A2) const {
+  uint16_t W = A1.width();
+  assert(W == A2.width());
+  RegisterCell Res(W);
+  for (uint16_t i = 0; i < W; ++i) {
+    const BitValue &V1 = A1[i];
+    const BitValue &V2 = A2[i];
+    if (V1.is(1) || V2.is(1))
+      Res[i] = BitValue::One;
+    else if (V1.is(0))
+      Res[i] = BitValue::ref(V2);
+    else if (V2.is(0))
+      Res[i] = BitValue::ref(V1);
+    else if (V1 == V2)
+      Res[i] = V1;
+    else
+      Res[i] = BitValue::self();
+  }
+  return Res;
+}
+
+BT::RegisterCell BT::MachineEvaluator::eXOR(const RegisterCell &A1,
+      const RegisterCell &A2) const {
+  uint16_t W = A1.width();
+  assert(W == A2.width());
+  RegisterCell Res(W);
+  for (uint16_t i = 0; i < W; ++i) {
+    const BitValue &V1 = A1[i];
+    const BitValue &V2 = A2[i];
+    if (V1.is(0))
+      Res[i] = BitValue::ref(V2);
+    else if (V2.is(0))
+      Res[i] = BitValue::ref(V1);
+    else if (V1 == V2)
+      Res[i] = BitValue::Zero;
+    else
+      Res[i] = BitValue::self();
+  }
+  return Res;
+}
+
+BT::RegisterCell BT::MachineEvaluator::eNOT(const RegisterCell &A1) const {
+  uint16_t W = A1.width();
+  RegisterCell Res(W);
+  for (uint16_t i = 0; i < W; ++i) {
+    const BitValue &V = A1[i];
+    if (V.is(0))
+      Res[i] = BitValue::One;
+    else if (V.is(1))
+      Res[i] = BitValue::Zero;
+    else
+      Res[i] = BitValue::self();
+  }
+  return Res;
+}
+
+BT::RegisterCell BT::MachineEvaluator::eSET(const RegisterCell &A1,
+      uint16_t BitN) const {
+  assert(BitN < A1.width());
+  RegisterCell Res = RegisterCell::ref(A1);
+  Res[BitN] = BitValue::One;
+  return Res;
+}
+
+BT::RegisterCell BT::MachineEvaluator::eCLR(const RegisterCell &A1,
+      uint16_t BitN) const {
+  assert(BitN < A1.width());
+  RegisterCell Res = RegisterCell::ref(A1);
+  Res[BitN] = BitValue::Zero;
+  return Res;
+}
+
+BT::RegisterCell BT::MachineEvaluator::eCLB(const RegisterCell &A1, bool B,
+      uint16_t W) const {
+  uint16_t C = A1.cl(B), AW = A1.width();
+  // If the last leading non-B bit is not a constant, then we don't know
+  // the real count.
+  if ((C < AW && A1[AW-1-C].num()) || C == AW)
+    return eIMM(C, W);
+  return RegisterCell::self(0, W);
+}
+
+BT::RegisterCell BT::MachineEvaluator::eCTB(const RegisterCell &A1, bool B,
+      uint16_t W) const {
+  uint16_t C =

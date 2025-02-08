@@ -1,0 +1,550 @@
+Activity parent, Activity root)
+        {
+            Receive receive = null;
+            if (parent != null && root != null)
+            {
+                TransactedReceiveScope rootTRS = root as TransactedReceiveScope;
+                if (rootTRS != null)
+                {
+                    receive = rootTRS.Request;
+                }
+            }
+
+            return (parent == root && receive == request);
+        }
+        
+        Constraint GetContractFirstValidationReceiveConstraints()
+        {
+            DelegateInArgument<Receive> element = new DelegateInArgument<Receive> { Name = "ReceiveElement" };
+            DelegateInArgument<ValidationContext> validationContext = new DelegateInArgument<ValidationContext> { Name = "validationContext" };
+            Variable<IEnumerable<Activity>> parentChainVar = new Variable<IEnumerable<Activity>>("parentChainVar");
+            return new Constraint<Receive>
+            {
+                Body = new ActivityAction<Receive, ValidationContext>
+                {
+                    Argument1 = element,
+                    Argument2 = validationContext,
+                    Handler = new Sequence
+                    {
+                        Variables = { parentChainVar },
+                        Activities =
+                        {
+                            new GetParentChain { ValidationContext = validationContext, Result = parentChainVar },
+                            new ValidateReceiveContract()
+                            {
+                                DisplayName = "ValidateReceiveContract",
+                                ReceiveActivity = element,
+                                WorkflowService = new InArgument<WorkflowService>()
+                                {
+                                    Expression = new GetWorkflowSerivce(this)
+                                },
+                                ParentChain = parentChainVar,
+                            }
+                        }
+                    }
+                }
+            };
+        }
+
+        Constraint GetContractFirstValidationSendReplyConstraints()
+        {
+            DelegateInArgument<SendReply> element = new DelegateInArgument<SendReply> { Name = "ReceiveElement" };
+            DelegateInArgument<ValidationContext> validationContext = new DelegateInArgument<ValidationContext> { Name = "validationContext" };
+
+            return new Constraint<SendReply>
+            {
+                Body = new ActivityAction<SendReply, ValidationContext>
+                {
+                    Argument1 = element,
+                    Argument2 = validationContext,
+                    Handler = new Sequence
+                    {
+                        Activities =
+                        {
+                            new ValidateSendReplyContract()
+                            {
+                                DisplayName = "ValidateReceiveContract",
+                                ReceiveActivity = element,
+                                WorkflowSerivce = new InArgument<WorkflowService>()
+                                {
+                                    Expression = new GetWorkflowSerivce(this)
+                                },
+                                ValidationContext = validationContext
+                            }
+                        }
+                    }
+                }
+            };
+        }
+
+        struct ContractAndOperationNameTuple : IEquatable<ContractAndOperationNameTuple>
+        {
+            XName serviceContractXName;
+            string operationName;
+
+            public ContractAndOperationNameTuple(XName serviceContractXName, string operationName)
+            {
+                this.serviceContractXName = serviceContractXName;
+                this.operationName = operationName;
+            }
+
+            public bool Equals(ContractAndOperationNameTuple other)
+            {
+                return this.serviceContractXName == other.serviceContractXName && this.operationName == other.operationName; 
+            }
+
+            public override int GetHashCode()
+            {
+                int hashCode = 0;
+                if (this.serviceContractXName != null)
+                {
+                    hashCode ^= this.serviceContractXName.GetHashCode();
+                }
+
+                hashCode ^= this.operationName.GetHashCode();
+
+                return hashCode;
+            }
+        }
+
+        struct ReceiveAndReplyTuple : IEquatable<ReceiveAndReplyTuple>
+        {
+            Receive receive;
+            Activity reply;
+
+            public ReceiveAndReplyTuple(Receive receive, SendReply reply)
+            {
+                this.receive = receive;
+                this.reply = reply;
+            }
+
+            public bool Equals(ReceiveAndReplyTuple other)
+            {
+                return this.receive == other.receive && this.reply == other.reply;
+            }
+
+            public override int GetHashCode()
+            {
+                int hash = 0; 
+                if (this.receive != null)
+                {
+                    hash ^= this.receive.GetHashCode();
+                }
+
+                if (this.reply != null)
+                {
+                    hash ^= this.reply.GetHashCode();
+                }
+
+                return hash;
+            }
+        }
+
+        class OperationInfo
+        {
+            Receive receive;
+            OperationDescription operationDescription;
+
+            public OperationInfo(Receive receive, OperationDescription operationDescription)
+            {
+                this.receive = receive;
+                this.operationDescription = operationDescription;
+            }
+
+            public Receive Receive
+            {
+                get { return this.receive; }
+                set { this.receive = value; }
+            }
+
+            public OperationDescription OperationDescription
+            {
+                get { return this.operationDescription; }
+            }
+        }
+
+        class QueueItem
+        {
+            Activity activity;
+            Activity parent;
+            Activity rootTransactedReceiveScope;
+
+            public QueueItem(Activity element, Activity parent, Activity root)
+            {
+                this.activity = element;
+                this.parent = parent;
+                this.rootTransactedReceiveScope = root; 
+            }
+
+            public Activity Activity
+            {
+                get { return this.activity; }
+            }
+
+            public Activity ParentReceiveScope
+            {
+                get { return this.parent; }
+            }
+
+            public Activity RootTransactedReceiveScope
+            {
+                get { return this.rootTransactedReceiveScope; }
+            }
+        }
+
+        class GetWorkflowSerivce : CodeActivity<WorkflowService>
+        {
+            WorkflowService workflowService; 
+            public GetWorkflowSerivce(WorkflowService serviceReference)
+            {
+                workflowService = serviceReference;
+            }
+
+            protected override void CacheMetadata(CodeActivityMetadata metadata)
+            {
+                RuntimeArgument resultArgument = new RuntimeArgument("Result", typeof(WorkflowService), ArgumentDirection.Out);
+                metadata.Bind(this.Result, resultArgument);
+
+                metadata.SetArgumentsCollection(
+                    new Collection<RuntimeArgument>
+                {
+                    resultArgument
+                });
+            }
+
+            protected override WorkflowService Execute(CodeActivityContext context)
+            {
+                return workflowService;
+            }
+        }
+
+        class ValidateReceiveContract : NativeActivity
+        {
+            public InArgument<Receive> ReceiveActivity
+            {
+                get;
+                set;
+            }
+
+            public InArgument<IEnumerable<Activity>> ParentChain
+            {
+                get;
+                set;
+            }
+
+            public InArgument<WorkflowService> WorkflowService
+            {
+                get;
+                set; 
+            }
+
+            protected override void CacheMetadata(NativeActivityMetadata metadata)
+            {
+                RuntimeArgument receiveActivity = new RuntimeArgument("ReceiveActivity", typeof(Receive), ArgumentDirection.In);
+                RuntimeArgument parentChain = new RuntimeArgument("ParentChain", typeof(IEnumerable<Activity>), ArgumentDirection.In);
+                RuntimeArgument operationProperties = new RuntimeArgument("OperationProperties", typeof(WorkflowService), ArgumentDirection.In);
+
+                if (this.ReceiveActivity == null)
+                {
+                    this.ReceiveActivity = new InArgument<Receive>();
+                }
+                metadata.Bind(this.ReceiveActivity, receiveActivity);
+
+                if (this.ParentChain == null)
+                {
+                    this.ParentChain = new InArgument<IEnumerable<Activity>>();
+                }
+                metadata.Bind(this.ParentChain, parentChain);
+
+                if (this.WorkflowService == null)
+                {
+                    this.WorkflowService = new InArgument<WorkflowService>();
+                }
+                metadata.Bind(this.WorkflowService, operationProperties);
+
+                Collection<RuntimeArgument> arguments = new Collection<RuntimeArgument>
+                {
+                    receiveActivity,
+                    parentChain,
+                    operationProperties,
+                };
+
+                metadata.SetArgumentsCollection(arguments);
+            }
+
+            protected override void Execute(NativeActivityContext context)
+            {
+                Receive receiveActivity = this.ReceiveActivity.Get(context);
+                Dictionary<OperationIdentifier, OperationProperty> operationProperties;
+
+                Fx.Assert(receiveActivity != null, "ValidateReceiveContract needs the receive activity to be present");
+
+                if (string.IsNullOrEmpty(receiveActivity.OperationName))
+                {
+                    Constraint.AddValidationError(context, new ValidationError(SR.MissingOperationName(this.DisplayName)));
+                }
+                else
+                {
+                    WorkflowService workflowService = this.WorkflowService.Get(context);
+                    operationProperties = workflowService.OperationProperties;
+                    XName serviceName = workflowService.FixServiceContractName(receiveActivity.ServiceContractName);
+                    // We only do contract first validation if there are contract specified
+                    if (operationProperties != null)
+                    {
+                        string contractName = serviceName.LocalName;
+                        string contractNamespace = string.IsNullOrEmpty(serviceName.NamespaceName) ?
+                            NamingHelper.DefaultNamespace : serviceName.NamespaceName;
+                        string operationXmlName = NamingHelper.XmlName(receiveActivity.OperationName);
+
+                        OperationProperty property;
+                        OperationIdentifier operationId = new OperationIdentifier(contractName, contractNamespace, operationXmlName);
+                        if (operationProperties.TryGetValue(operationId, out property))
+                        {
+                            property.ImplementingReceives.Add(receiveActivity);
+                            Fx.Assert(property.Operation != null, "OperationProperty.Operation should not be null!");                            
+                            ValidateContract(context, receiveActivity, property.Operation);
+                        }
+                        else
+                        {
+                            // It is OK to add a new contract, but we do not allow adding a new operation to a specified contract.
+                            foreach (OperationIdentifier id in operationProperties.Keys)
+                            {
+                                if (contractName == id.ContractName && contractNamespace == id.ContractNamespace)
+                                {
+                                    Constraint.AddValidationError(context, new ValidationError(SR.OperationDoesNotExistInContract(receiveActivity.OperationName, contractName, contractNamespace)));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            void ValidateTransactionBehavior(NativeActivityContext context, Receive receiveActivity, OperationDescription targetOperation)
+            {
+                TransactionFlowAttribute transactionFlowAttribute = targetOperation.Behaviors.Find<TransactionFlowAttribute>();
+                Activity parent = null;
+
+                // we know it's IList<Activity>
+                IList<Activity> parentChain = (IList<Activity>)this.ParentChain.Get(context);
+                if (parentChain.Count > 0)
+                {
+                    parent = parentChain[0];
+                }
+
+                bool isInTransactedReceiveScope = false;
+
+                TransactedReceiveScope trs = parent as TransactedReceiveScope;
+                if (trs != null && trs.Request == receiveActivity)
+                {
+                    isInTransactedReceiveScope = true;
+                }
+
+                if (transactionFlowAttribute != null)
+                {
+                    if (transactionFlowAttribute.Transactions == TransactionFlowOption.Mandatory)
+                    {
+                        if (targetOperation.IsOneWay)
+                        {
+                            Constraint.AddValidationError(context, new ValidationError(SR.TargetContractCannotBeOneWayWithTransactionFlow(targetOperation.Name, targetOperation.DeclaringContract.Name)));
+                        }
+
+                        // Receive has to be in a transacted receive scope
+                        if (!isInTransactedReceiveScope)
+                        {
+                            Constraint.AddValidationError(context, new ValidationError(SR.ReceiveIsNotInTRS(targetOperation.Name, targetOperation.DeclaringContract.Name)));
+                        }
+                    }
+                    else if (transactionFlowAttribute.Transactions == TransactionFlowOption.NotAllowed)
+                    {
+                        if (isInTransactedReceiveScope)
+                        {
+                            Constraint.AddValidationError(context, new ValidationError(SR.ReceiveIsInTRSWhenTransactionFlowNotAllowed(targetOperation.Name, targetOperation.DeclaringContract.Name), true));
+                        }
+                    }
+                }
+            }
+
+            void ValidateContract(NativeActivityContext context, Receive receiveActivity, OperationDescription targetOperation)
+            {
+                SerializerOption targetSerializerOption = targetOperation.Behaviors.Contains(typeof(XmlSerializerOperationBehavior)) ?
+                    SerializerOption.XmlSerializer : SerializerOption.DataContractSerializer;
+                if (receiveActivity.SerializerOption != targetSerializerOption)
+                {
+                    Constraint.AddValidationError(context, new ValidationError(SR.PropertyMismatch(receiveActivity.SerializerOption.ToString(), "SerializerOption", targetSerializerOption.ToString(), targetOperation.DeclaringContract.Name, targetSerializerOption.ToString())));
+                }
+
+                if ((!targetOperation.HasProtectionLevel && receiveActivity.ProtectionLevel.HasValue && receiveActivity.ProtectionLevel != Net.Security.ProtectionLevel.None)
+                    || (receiveActivity.ProtectionLevel.HasValue && receiveActivity.ProtectionLevel.Value != targetOperation.ProtectionLevel)
+                    || (!receiveActivity.ProtectionLevel.HasValue && targetOperation.ProtectionLevel != Net.Security.ProtectionLevel.None))
+                {
+                    string targetProtectionLevelString = targetOperation.HasProtectionLevel ?
+                        targetOperation.ProtectionLevel.ToString() : SR.NotSpecified;
+                    string receiveProtectionLevelString = receiveActivity.ProtectionLevel.HasValue ? receiveActivity.ProtectionLevel.ToString() : SR.NotSpecified;
+                    Constraint.AddValidationError(context, new ValidationError(SR.PropertyMismatch(receiveProtectionLevelString, "ProtectionLevel", targetProtectionLevelString, targetOperation.Name, targetOperation.DeclaringContract.Name)));
+                }
+
+                // We validate that all known types on the contract be present on the activity.
+                // If activity contains more known types, we don't mind.
+                if (targetOperation.KnownTypes.Count > 0)
+                {
+                    // We require that each Receive contains all the known types specified on the contract.
+                    // Known type collections from multiple Receive activities with same contract name and operation name will NOT be merged.
+
+                    // We expect the number of known types to be small, therefore we choose to use simple iterative search.
+                    foreach (Type targetType in targetOperation.KnownTypes)
+                    {
+                        if (receiveActivity.KnownTypes == null || !receiveActivity.KnownTypes.Contains(targetType))
+                        {
+                            if (targetType != null && targetType != TypeHelper.VoidType)
+                            {
+                                Constraint.AddValidationError(context, new ValidationError(SR.MissingKnownTypes(targetType.FullName, targetOperation.Name, targetOperation.DeclaringContract.Name)));
+                            }
+                        }
+                    }
+                }
+
+                this.ValidateTransactionBehavior(context, receiveActivity, targetOperation);
+                receiveActivity.InternalContent.ValidateContract(context, targetOperation, receiveActivity, MessageDirection.Input);
+            }
+        }
+
+        class ValidateSendReplyContract : NativeActivity
+        {
+            public InArgument<SendReply> ReceiveActivity
+            {
+                get;
+                set;
+            }
+
+            public InArgument<ValidationContext> ValidationContext
+            {
+                get;
+                set;
+            }
+            
+            public InArgument<WorkflowService> WorkflowSerivce
+            {
+                get;
+                set;
+            }
+
+            protected override void CacheMetadata(NativeActivityMetadata metadata)
+            {
+                RuntimeArgument receiveActivity = new RuntimeArgument("ReceiveActivity", typeof(SendReply), ArgumentDirection.In);
+                RuntimeArgument validationContext = new RuntimeArgument("ValidationContext", typeof(ValidationContext), ArgumentDirection.In);
+                RuntimeArgument operationProperties = new RuntimeArgument("OperationProperties", typeof(WorkflowService), ArgumentDirection.In);
+
+                if (this.ReceiveActivity == null)
+                {
+                    this.ReceiveActivity = new InArgument<SendReply>();
+                }
+                metadata.Bind(this.ReceiveActivity, receiveActivity);
+
+                if (this.ValidationContext == null)
+                {
+                    this.ValidationContext = new InArgument<ValidationContext>();
+                }
+                metadata.Bind(this.ValidationContext, validationContext);
+
+                if (this.WorkflowSerivce == null)
+                {
+                    this.WorkflowSerivce = new InArgument<WorkflowService>();
+                }
+                metadata.Bind(this.WorkflowSerivce, operationProperties);
+
+                Collection<RuntimeArgument> arguments = new Collection<RuntimeArgument>
+                {
+                    receiveActivity,
+                    validationContext,
+                    operationProperties
+                };
+
+                metadata.SetArgumentsCollection(arguments);
+            }
+
+            protected override void Execute(NativeActivityContext context)
+            {
+                SendReply sendReplyActivity = this.ReceiveActivity.Get(context);
+                Dictionary<OperationIdentifier, OperationProperty> operationProperties;
+
+                if (sendReplyActivity.Request != null)
+                {
+                    if (sendReplyActivity.Request.ServiceContractName != null && sendReplyActivity.Request.OperationName != null)
+                    {
+                        WorkflowService workflowService = this.WorkflowSerivce.Get(context);
+                        operationProperties = workflowService.OperationProperties;
+                        if (operationProperties != null)
+                        {
+                            XName contractXName = sendReplyActivity.Request.ServiceContractName;
+                            string contractName = contractXName.LocalName;
+                            string contractNamespace = string.IsNullOrEmpty(contractXName.NamespaceName) ?
+                                NamingHelper.DefaultNamespace : contractXName.NamespaceName;
+                            string operationXmlName = NamingHelper.XmlName(sendReplyActivity.Request.OperationName);
+
+                            OperationProperty property;
+                            OperationIdentifier id = new OperationIdentifier(contractName, contractNamespace, operationXmlName);
+                            if (operationProperties.TryGetValue(id, out property))
+                            {
+                                if (!property.Operation.IsOneWay)
+                                {
+                                    property.ImplementingSendRepliesRequests.Add(sendReplyActivity.Request);
+                                    Fx.Assert(property.Operation != null, "OperationProperty.Operation should not be null!");
+                                    ValidateContract(context, sendReplyActivity, property.Operation);
+                                }
+                                else
+                                {
+                                    Constraint.AddValidationError(context, new ValidationError(SR.OnewayContractIsImplementedAsTwoWay(property.Operation.Name, contractName)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            void ValidateContract(NativeActivityContext context, SendReply sendReply, OperationDescription targetOperation)
+            {
+                sendReply.InternalContent.ValidateContract(context, targetOperation, sendReply, MessageDirection.Output);
+            }
+        }
+    }
+}
+                                                                                                           ng" /> in Visual Basic) to obtain the numeric format information from the current locale setting of the operating system.</param>
+      <returns>The value of the current instance in the specified format.</returns>
+    </member>
+    <member name="M:System.Windows.Media.Media3D.GeneralTransform3D.ToString">
+      <summary>Creates a string representation of this instance.</summary>
+      <returns>A string representation of this instance.</returns>
+    </member>
+    <member name="M:System.Windows.Media.Media3D.GeneralTransform3D.ToString(System.IFormatProvider)">
+      <summary>Creates a string representation of this instance, based on the passed <see cref="T:System.IFormatProvider" /> parameter.</summary>
+      <param name="provider">
+        <see cref="T:System.IFormatProvider" /> instance used to process this instance.</param>
+      <returns>The value of the current instance in the specified format.</returns>
+    </member>
+    <member name="M:System.Windows.Media.Media3D.GeneralTransform3D.Transfo/*
+******************************************************************************
+*   Copyright (C) 1997-2014, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+******************************************************************************
+*   file name:  nfrule.cpp
+*   encoding:   US-ASCII
+*   tab size:   8 (not used)
+*   indentation:4
+*
+* Modification history
+* Date        Name      Comments
+* 10/11/2001  Doug      Ported from ICU4J
+*/
+
+#include "nfrule.h"
+
+#if U_HAVE_RBNF
+
+#include "unicode/localpointer.h"
+#include "unicode/rbnf.h"
+#include "unicode/tblcoll.h"
+#include "unicode/coleitr.h"
+#include "unicode/uchar.h"
+#include "nfrs.h"
+#include "nfrlist.h

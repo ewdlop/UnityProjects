@@ -1,0 +1,163 @@
+ existing MSBuild
+    project references that do *not* build a .wixlib. These are the projects that will be skipped.
+     -->
+    <CreateItem
+      Include="@(_MSBuildProjectReferenceExistent->'%(FullPath)')"
+      Exclude="@(_ReferencedWixLibPaths->'%(MSBuildSourceProjectFile)')"
+      Condition=" '$(BuildProjectReferences)' == 'wixlib' and ('$(BuildingSolutionFile)' != 'true' and '$(BuildingInsideVisualStudio)' != 'true') ">
+
+      <Output TaskParameter="Include" ItemName="_ProjectReferencesToSkip" />
+    </CreateItem>
+
+    <!--
+    Finally, when building only 'wixlib' project references, the list of projects to build are naturally the
+    list of projects *not* being skipped.
+    -->
+    <CreateItem
+      Include="@(_MSBuildProjectReferenceExistent->'%(FullPath)')"
+      Exclude="@(_ProjectReferencesToSkip)"
+      Condition=" '$(BuildProjectReferences)' == 'wixlib' and ('$(BuildingSolutionFile)' != 'true' and '$(BuildingInsideVisualStudio)' != 'true') ">
+
+      <Output TaskParameter="Include" ItemName="_ProjectReferencesToBuild" />
+    </CreateItem>
+
+    <!-- Display a warning for all projects being skipped. -->
+    <Warning
+      Text="BuildProjectReferences set to '$(BuildProjectReferences)'. Skipping the non-Library project: %(_ProjectReferencesToSkip.Identity)"
+      Condition=" '@(_ProjectReferencesToSkip)' != '' " />
+
+    <Message
+      Importance="low"
+      Text="Project reference to build: %(_ProjectReferencesToBuild.Identity), properties: %(_ProjectReferencesToBuild.Properties)"
+      Condition=" '@(_ProjectReferencesToBuild)' != '' " />
+
+    <!--
+    Build referenced projects when building from the command line.
+
+    The $(ProjectReferenceBuildTargets) will normally be blank so that the project's default target
+    is used during a P2P reference. However if a custom build process requires that the referenced
+    project has a different target to build it can be specified.
+    -->
+    <MSBuild
+      Projects="@(_ProjectReferencesToBuild)"
+      Targets="$(ProjectReferenceBuildTargets)"
+      Properties="%(_ProjectReferencesToBuild.SetConfiguration);%(_ProjectReferencesToBuild.SetPlatform)"
+      Condition=" '@(_ProjectReferencesToBuild)' != '' ">
+
+      <Output TaskParameter="TargetOutputs" ItemName="_BuiltProjectReferencePaths" />
+    </MSBuild>
+
+    <!-- Assign the unique gathered and built project references to the resolved project
+         reference paths. -->
+    <RemoveDuplicates Inputs="@(_GatheredProjectReferencePaths);@(_BuiltProjectReferencePaths)">
+      <Output TaskParameter="Filtered" ItemName="_ResolvedProjectReferencePaths" />
+      <Output TaskParameter="Filtered" ItemName="_MSBuildResolvedProjectReferencePaths" />
+    </RemoveDuplicates>
+
+    <!-- Create list of all .wixlib project references. -->
+    <CreateItem
+      Include="@(_ResolvedProjectReferencePaths)"
+      Condition=" '%(Extension)' == '.wixlib' ">
+
+      <Output TaskParameter="Include" ItemName="WixLibProjects" />
+    </CreateItem>
+
+    <Message
+      Importance="low"
+      Text="Library from referenced projects: %(WixLibProjects.Identity)"
+      Condition=" '@(WixLibProjects)' != '' " />
+
+  </Target>
+
+  <!--
+  ================================================================================================
+  GetTargetPath
+
+    This stand-alone target returns the name of the build product (i.e. MSI, MSM) that would be
+    produced if we built this project.
+  ================================================================================================
+  -->
+  <PropertyGroup>
+    <GetTargetPathDependsOn>
+      PrepareForBuild;
+      AssignCultures
+    </GetTargetPathDependsOn>
+  </PropertyGroup>
+  <Target
+    Name="GetTargetPath"
+    DependsOnTargets="$(GetTargetPathDependsOn)"
+    Outputs="$(TargetPath)" />
+
+  <!--
+  ================================================================================================
+  ResolveVCProjectReferences
+
+    Find outputs of referenced VC projects (currently we never build VC projects ourselves).
+
+    [IN]
+    @(VCProjectReference) - the list of VC project references
+
+    [OUT]
+    @(_ResolvedProjectReferencePaths) - paths to projects' outputs
+  ================================================================================================
+  -->
+  <Target
+    Name="ResolveVCProjectReferences"
+    Condition=" '@(VCProjectReference)' != '' "
+    DependsOnTargets="SplitProjectReferencesByType">
+
+    <!--
+    Use the task for matching projects with pre-resolved project outputs set by the IDE
+    if building inside the IDE.
+    -->
+    <ResolveNonMSBuildProjectOutput
+      ProjectReferences="@(VCProjectReference)"
+      PreresolvedProjectOutputs="$(VSIDEResolvedNonMSBuildProjectOutputs)"
+      Condition=" '$(BuildingInsideVisualStudio)' == 'true' ">
+
+      <Output TaskParameter="ResolvedOutputPaths" ItemName="_ResolvedVCProjectReferencePaths" />
+    </ResolveNonMSBuildProjectOutput>
+
+    <!--
+    Use the task that uses VC project engine if building from the command line. Invoking this
+    task only makes sense for building solution files, otherwise we won't have the necessary
+    configuration information.
+    -->
+    <ResolveVCProjectOutput
+      ProjectReferences="@(VCProjectReference)"
+      Configuration="%(VCProjectReference.FullConfiguration)"
+      SolutionFile="$(SolutionPath)"
+      Override="$(VCBuildOverride)"
+      Condition=" '$(BuildingSolutionFile)' == 'true' ">
+
+      <Output TaskParameter="ResolvedOutputPaths" ItemName="_ResolvedVCProjectReferencePaths" />
+    </ResolveVCProjectOutput>
+
+    <Error
+      Code="WIXTARGETS104"
+      Text="MSBuild cannot resolve the reference to the Visual C++ project '%(VCProjectReference.Identity)' when building a stand-alone MSBuild project. To correctly resolve this reference, please build the solution file containing these projects."
+      Condition=" '$(BuildingSolutionFile)' != 'true' and '$(BuildingInsideVisualStudio)' != 'true' " />
+
+    <CreateItem Include="@(_ResolvedVCProjectReferencePaths)">
+      <Output TaskParameter="Include" ItemName="_ResolvedProjectReferencePaths" />
+    </CreateItem>
+
+  </Target>
+
+  <!--
+  ================================================================================================
+  ResolveWixLibraryReferences
+
+    Resolve the library references to full paths.
+
+    [IN]
+    @(WixLibrary) - The list of .wixlib files.
+    
+    [OUT]
+    @(_ResolvedWixLibraryPaths) - Item group with full paths to libraries
+  ================================================================================================
+  -->
+  <PropertyGroup>
+    <ResolveWixLibraryReferencesDependsOn>
+      PrepareForBuild;
+    </ResolveWixLibraryReference

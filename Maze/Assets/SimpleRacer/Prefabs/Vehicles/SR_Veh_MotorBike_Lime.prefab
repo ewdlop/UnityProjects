@@ -1,0 +1,181 @@
+//===- ShrinkWrap.cpp - Compute safe point for prolog/epilog insertion ----===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+//
+// This pass looks for safe point where the prologue and epilogue can be
+// inserted.
+// The safe point for the prologue (resp. epilogue) is called Save
+// (resp. Restore).
+// A point is safe for prologue (resp. epilogue) if and only if
+// it 1) dominates (resp. post-dominates) all the frame related operations and
+// between 2) two executions of the Save (resp. Restore) point there is an
+// execution of the Restore (resp. Save) point.
+//
+// For instance, the following points are safe:
+// for (int i = 0; i < 10; ++i) {
+//   Save
+//   ...
+//   Restore
+// }
+// Indeed, the execution looks like Save -> Restore -> Save -> Restore ...
+// And the following points are not:
+// for (int i = 0; i < 10; ++i) {
+//   Save
+//   ...
+// }
+// for (int i = 0; i < 10; ++i) {
+//   ...
+//   Restore
+// }
+// Indeed, the execution looks like Save -> Save -> ... -> Restore -> Restore.
+//
+// This pass also ensures that the safe points are 3) cheaper than the regular
+// entry and exits blocks.
+//
+// Property #1 is ensured via the use of MachineDominatorTree and
+// MachinePostDominatorTree.
+// Property #2 is ensured via property #1 and MachineLoopInfo, i.e., both
+// points must be in the same loop.
+// Property #3 is ensured via the MachineBlockFrequencyInfo.
+//
+// If this pass found points matching all these properties, then
+// MachineFrameInfo is updated with this information.
+//
+//===----------------------------------------------------------------------===//
+
+#include "llvm/ADT/BitVector.h"
+#include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/Statistic.h"
+#include "llvm/CodeGen/MachineBasicBlock.h"
+#include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
+#include "llvm/CodeGen/MachineDominators.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
+#include "llvm/CodeGen/MachineFunction.h"
+#include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/CodeGen/MachineInstr.h"
+#include "llvm/CodeGen/MachineLoopInfo.h"
+#include "llvm/CodeGen/MachineOperand.h"
+#include "llvm/CodeGen/MachinePostDominators.h"
+#include "llvm/CodeGen/RegisterClassInfo.h"
+#include "llvm/CodeGen/RegisterScavenging.h"
+#include "llvm/CodeGen/TargetFrameLowering.h"
+#include "llvm/CodeGen/TargetInstrInfo.h"
+#include "llvm/CodeGen/TargetRegisterInfo.h"
+#include "llvm/CodeGen/TargetSubtargetInfo.h"
+#include "llvm/IR/Attributes.h"
+#include "llvm/IR/Function.h"
+#include "llvm/MC/MCAsmInfo.h"
+#include "llvm/Pass.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Target/TargetMachine.h"
+#include <cassert>
+#include <cstdint>
+#include <memory>
+
+using namespace llvm;
+
+#define DEBUG_TYPE "shrink-wrap"
+
+STATISTIC(NumFunc, "Number of functions");
+STATISTIC(NumCandidates, "Number of shrink-wrapping candidates");
+STATISTIC(NumCandidatesDropped,
+          "Number of shrink-wrapping candidates dropped because of frequency");
+
+static cl::opt<cl::boolOrDefault>
+EnableShrinkWrapOpt("enable-shrink-wrap", cl::Hidden,
+                    cl::desc("enable the shrink-wrapping pass"));
+
+namespace {
+
+/// \brief Class to determine where the safe point to insert the
+/// prologue and epilogue are.
+/// Unlike the paper from Fred C. Chow, PLDI'88, that introduces the
+/// shrink-wrapping term for prologue/epilogue placement, this pass
+/// does not rely on expensive data-flow analysis. Instead we use the
+/// dominance properties and loop information to decide which point
+/// are safe for such insertion.
+class ShrinkWrap : public MachineFunctionPass {
+  /// Hold callee-saved information.
+  RegisterClassInfo RCI;
+  MachineDominatorTree *MDT;
+  MachinePostDominatorTree *MPDT;
+
+  /// Current safe point found for the prologue.
+  /// The prologue will be inserted before the first instruction
+  /// in this basic block.
+  MachineBasicBlock *Save;
+
+  /// Current safe point found for the epilogue.
+  /// The epilogue will be inserted before the first terminator instruction
+  /// in this basic block.
+  MachineBasicBlock *Restore;
+
+  /// Hold the information of the basic block frequency.
+  /// Use to check the profitability of the new points.
+  MachineBlockFrequencyInfo *MBFI;
+
+  /// Hold the loop information. Used to determine if Save and Restore
+  /// are in the same loop.
+  MachineLoopInfo *MLI;
+
+  /// Frequency of the Entry block.
+  uint64_t EntryFreq;
+
+  /// Current opcode for frame setup.
+  unsigned FrameSetupOpcode;
+
+  /// Current opcode for frame destroy.
+  unsigned FrameDestroyOpcode;
+
+  /// Entry block.
+  const MachineBasicBlock *Entry;
+
+  using SetOfRegs = SmallSetVector<unsigned, 16>;
+
+  /// Registers that need to be saved for the current function.
+  mutable SetOfRegs CurrentCSRs;
+
+  /// Current MachineFunction.
+  MachineFunction *MachineFunc;
+
+  /// \brief Check if \p MI uses or defines a callee-saved register or
+  /// a frame index. If this is the case, this means \p MI must happen
+  /// after Save and before Restore.
+  bool useOrDefCSROrFI(const MachineInstr &MI, RegScavenger *RS) const;
+
+  const SetOfRegs &getCurrentCSRs(RegScavenger *RS) const {
+    if (CurrentCSRs.empty()) {
+      BitVector SavedRegs;
+      const TargetFrameLowering *TFI =
+          MachineFunc->getSubtarget().getFrameLowering();
+
+      TFI->determineCalleeSaves(*MachineFunc, SavedRegs, RS);
+
+      for (int Reg = SavedRegs.find_first(); Reg != -1;
+           Reg = SavedRegs.find_next(Reg))
+        CurrentCSRs.insert((unsigned)Reg);
+    }
+    return CurrentCSRs;
+  }
+
+  /// \brief Update the Save and Restore points such that \p MBB is in
+  /// the region that is dominated by Save and post-dominated by Restore
+  /// and Save and Restore still match the safe point definition.
+  /// Such point may not exist and Save and/or Restore may be null after
+  /// this call.
+  void updateSaveRestorePoints(MachineBasicBlock &MBB, RegScavenger *RS);
+
+  /// \brief Initialize the pass for \p MF.
+  void init(MachineFunction &MF) {
+    RCI.runOnMachineFunction(MF);
+    MDT = &getAnalysis<MachineDom

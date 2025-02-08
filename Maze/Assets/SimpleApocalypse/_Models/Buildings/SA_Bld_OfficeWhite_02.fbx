@@ -1,0 +1,1698 @@
+/*
+ * kmp_atomic.cpp -- ATOMIC implementation routines
+ */
+
+//===----------------------------------------------------------------------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is dual licensed under the MIT and the University of Illinois Open
+// Source Licenses. See LICENSE.txt for details.
+//
+//===----------------------------------------------------------------------===//
+
+#include "kmp_atomic.h"
+#include "kmp.h" // TRUE, asm routines prototypes
+
+typedef unsigned char uchar;
+typedef unsigned short ushort;
+
+/*!
+@defgroup ATOMIC_OPS Atomic Operations
+These functions are used for implementing the many different varieties of atomic
+operations.
+
+The compiler is at liberty to inline atomic operations that are naturally
+supported by the target architecture. For instance on IA-32 architecture an
+atomic like this can be inlined
+@code
+static int s = 0;
+#pragma omp atomic
+    s++;
+@endcode
+using the single instruction: `lock; incl s`
+
+However the runtime does provide entrypoints for these operations to support
+compilers that choose not to inline them. (For instance,
+`__kmpc_atomic_fixed4_add` could be used to perform the increment above.)
+
+The names of the functions are encoded by using the data type name and the
+operation name, as in these tables.
+
+Data Type  | Data type encoding
+-----------|---------------
+int8_t     | `fixed1`
+uint8_t    | `fixed1u`
+int16_t    | `fixed2`
+uint16_t   | `fixed2u`
+int32_t    | `fixed4`
+uint32_t   | `fixed4u`
+int32_t    | `fixed8`
+uint32_t   | `fixed8u`
+float      | `float4`
+double     | `float8`
+float 10 (8087 eighty bit float)  | `float10`
+complex<float>   |  `cmplx4`
+complex<double>  | `cmplx8`
+complex<float10> | `cmplx10`
+<br>
+
+Operation | Operation encoding
+----------|-------------------
++ | add
+- | sub
+\* | mul
+/ | div
+& | andb
+<< | shl
+\>\> | shr
+\| | orb
+^  | xor
+&& | andl
+\|\| | orl
+maximum | max
+minimum | min
+.eqv.   | eqv
+.neqv.  | neqv
+
+<br>
+For non-commutative operations, `_rev` can also be added for the reversed
+operation. For the functions that capture the result, the suffix `_cpt` is
+added.
+
+Update Functions
+================
+The general form of an atomic function that just performs an update (without a
+`capture`)
+@code
+void __kmpc_atomic_<datatype>_<operation>( ident_t *id_ref, int gtid, TYPE *
+lhs, TYPE rhs );
+@endcode
+@param ident_t  a pointer to source location
+@param gtid  the global thread id
+@param lhs   a pointer to the left operand
+@param rhs   the right operand
+
+`capture` functions
+===================
+The capture functions perform an atomic update and return a result, which is
+either the value before the capture, or that after. They take an additional
+argument to determine which result is returned.
+Their general form is therefore
+@code
+TYPE __kmpc_atomic_<datatype>_<operation>_cpt( ident_t *id_ref, int gtid, TYPE *
+lhs, TYPE rhs, int flag );
+@endcode
+@param ident_t  a pointer to source location
+@param gtid  the global thread id
+@param lhs   a pointer to the left operand
+@param rhs   the right operand
+@param flag  one if the result is to be captured *after* the operation, zero if
+captured *before*.
+
+The one set of exceptions to this is the `complex<float>` type where the value
+is not returned, rather an extra argument pointer is passed.
+
+They look like
+@code
+void __kmpc_atomic_cmplx4_<op>_cpt(  ident_t *id_ref, int gtid, kmp_cmplx32 *
+lhs, kmp_cmplx32 rhs, kmp_cmplx32 * out, int flag );
+@endcode
+
+Read and Write Operations
+=========================
+The OpenMP<sup>*</sup> standard now supports atomic operations that simply
+ensure that the value is read or written atomically, with no modification
+performed. In many cases on IA-32 architecture these operations can be inlined
+since the architecture guarantees that no tearing occurs on aligned objects
+accessed with a single memory operation of up to 64 bits in size.
+
+The general form of the read operations is
+@code
+TYPE __kmpc_atomic_<type>_rd ( ident_t *id_ref, int gtid, TYPE * loc );
+@endcode
+
+For the write operations the form is
+@code
+void __kmpc_atomic_<type>_wr ( ident_t *id_ref, int gtid, TYPE * lhs, TYPE rhs
+);
+@endcode
+
+Full list of functions
+======================
+This leads to the generation of 376 atomic functions, as follows.
+
+Functons for integers
+---------------------
+There are versions here for integers of size 1,2,4 and 8 bytes both signed and
+unsigned (where that matters).
+@code
+    __kmpc_atomic_fixed1_add
+    __kmpc_atomic_fixed1_add_cpt
+    __kmpc_atomic_fixed1_add_fp
+    __kmpc_atomic_fixed1_andb
+    __kmpc_atomic_fixed1_andb_cpt
+    __kmpc_atomic_fixed1_andl
+    __kmpc_atomic_fixed1_andl_cpt
+    __kmpc_atomic_fixed1_div
+    __kmpc_atomic_fixed1_div_cpt
+    __kmpc_atomic_fixed1_div_cpt_rev
+    __kmpc_atomic_fixed1_div_float8
+    __kmpc_atomic_fixed1_div_fp
+    __kmpc_atomic_fixed1_div_rev
+    __kmpc_atomic_fixed1_eqv
+    __kmpc_atomic_fixed1_eqv_cpt
+    __kmpc_atomic_fixed1_max
+    __kmpc_atomic_fixed1_max_cpt
+    __kmpc_atomic_fixed1_min
+    __kmpc_atomic_fixed1_min_cpt
+    __kmpc_atomic_fixed1_mul
+    __kmpc_atomic_fixed1_mul_cpt
+    __kmpc_atomic_fixed1_mul_float8
+    __kmpc_atomic_fixed1_mul_fp
+    __kmpc_atomic_fixed1_neqv
+    __kmpc_atomic_fixed1_neqv_cpt
+    __kmpc_atomic_fixed1_orb
+    __kmpc_atomic_fixed1_orb_cpt
+    __kmpc_atomic_fixed1_orl
+    __kmpc_atomic_fixed1_orl_cpt
+    __kmpc_atomic_fixed1_rd
+    __kmpc_atomic_fixed1_shl
+    __kmpc_atomic_fixed1_shl_cpt
+    __kmpc_atomic_fixed1_shl_cpt_rev
+    __kmpc_atomic_fixed1_shl_rev
+    __kmpc_atomic_fixed1_shr
+    __kmpc_atomic_fixed1_shr_cpt
+    __kmpc_atomic_fixed1_shr_cpt_rev
+    __kmpc_atomic_fixed1_shr_rev
+    __kmpc_atomic_fixed1_sub
+    __kmpc_atomic_fixed1_sub_cpt
+    __kmpc_atomic_fixed1_sub_cpt_rev
+    __kmpc_atomic_fixed1_sub_fp
+    __kmpc_atomic_fixed1_sub_rev
+    __kmpc_atomic_fixed1_swp
+    __kmpc_atomic_fixed1_wr
+    __kmpc_atomic_fixed1_xor
+    __kmpc_atomic_fixed1_xor_cpt
+    __kmpc_atomic_fixed1u_add_fp
+    __kmpc_atomic_fixed1u_sub_fp
+    __kmpc_atomic_fixed1u_mul_fp
+    __kmpc_atomic_fixed1u_div
+    __kmpc_atomic_fixed1u_div_cpt
+    __kmpc_atomic_fixed1u_div_cpt_rev
+    __kmpc_atomic_fixed1u_div_fp
+    __kmpc_atomic_fixed1u_div_rev
+    __kmpc_atomic_fixed1u_shr
+    __kmpc_atomic_fixed1u_shr_cpt
+    __kmpc_atomic_fixed1u_shr_cpt_rev
+    __kmpc_atomic_fixed1u_shr_rev
+    __kmpc_atomic_fixed2_add
+    __kmpc_atomic_fixed2_add_cpt
+    __kmpc_atomic_fixed2_add_fp
+    __kmpc_atomic_fixed2_andb
+    __kmpc_atomic_fixed2_andb_cpt
+    __kmpc_atomic_fixed2_andl
+    __kmpc_atomic_fixed2_andl_cpt
+    __kmpc_atomic_fixed2_div
+    __kmpc_atomic_fixed2_div_cpt
+    __kmpc_atomic_fixed2_div_cpt_rev
+    __kmpc_atomic_fixed2_div_float8
+    __kmpc_atomic_fixed2_div_fp
+    __kmpc_atomic_fixed2_div_rev
+    __kmpc_atomic_fixed2_eqv
+    __kmpc_atomic_fixed2_eqv_cpt
+    __kmpc_atomic_fixed2_max
+    __kmpc_atomic_fixed2_max_cpt
+    __kmpc_atomic_fixed2_min
+    __kmpc_atomic_fixed2_min_cpt
+    __kmpc_atomic_fixed2_mul
+    __kmpc_atomic_fixed2_mul_cpt
+    __kmpc_atomic_fixed2_mul_float8
+    __kmpc_atomic_fixed2_mul_fp
+    __kmpc_atomic_fixed2_neqv
+    __kmpc_atomic_fixed2_neqv_cpt
+    __kmpc_atomic_fixed2_orb
+    __kmpc_atomic_fixed2_orb_cpt
+    __kmpc_atomic_fixed2_orl
+    __kmpc_atomic_fixed2_orl_cpt
+    __kmpc_atomic_fixed2_rd
+    __kmpc_atomic_fixed2_shl
+    __kmpc_atomic_fixed2_shl_cpt
+    __kmpc_atomic_fixed2_shl_cpt_rev
+    __kmpc_atomic_fixed2_shl_rev
+    __kmpc_atomic_fixed2_shr
+    __kmpc_atomic_fixed2_shr_cpt
+    __kmpc_atomic_fixed2_shr_cpt_rev
+    __kmpc_atomic_fixed2_shr_rev
+    __kmpc_atomic_fixed2_sub
+    __kmpc_atomic_fixed2_sub_cpt
+    __kmpc_atomic_fixed2_sub_cpt_rev
+    __kmpc_atomic_fixed2_sub_fp
+    __kmpc_atomic_fixed2_sub_rev
+    __kmpc_atomic_fixed2_swp
+    __kmpc_atomic_fixed2_wr
+    __kmpc_atomic_fixed2_xor
+    __kmpc_atomic_fixed2_xor_cpt
+    __kmpc_atomic_fixed2u_add_fp
+    __kmpc_atomic_fixed2u_sub_fp
+    __kmpc_atomic_fixed2u_mul_fp
+    __kmpc_atomic_fixed2u_div
+    __kmpc_atomic_fixed2u_div_cpt
+    __kmpc_atomic_fixed2u_div_cpt_rev
+    __kmpc_atomic_fixed2u_div_fp
+    __kmpc_atomic_fixed2u_div_rev
+    __kmpc_atomic_fixed2u_shr
+    __kmpc_atomic_fixed2u_shr_cpt
+    __kmpc_atomic_fixed2u_shr_cpt_rev
+    __kmpc_atomic_fixed2u_shr_rev
+    __kmpc_atomic_fixed4_add
+    __kmpc_atomic_fixed4_add_cpt
+    __kmpc_atomic_fixed4_add_fp
+    __kmpc_atomic_fixed4_andb
+    __kmpc_atomic_fixed4_andb_cpt
+    __kmpc_atomic_fixed4_andl
+    __kmpc_atomic_fixed4_andl_cpt
+    __kmpc_atomic_fixed4_div
+    __kmpc_atomic_fixed4_div_cpt
+    __kmpc_atomic_fixed4_div_cpt_rev
+    __kmpc_atomic_fixed4_div_float8
+    __kmpc_atomic_fixed4_div_fp
+    __kmpc_atomic_fixed4_div_rev
+    __kmpc_atomic_fixed4_eqv
+    __kmpc_atomic_fixed4_eqv_cpt
+    __kmpc_atomic_fixed4_max
+    __kmpc_atomic_fixed4_max_cpt
+    __kmpc_atomic_fixed4_min
+    __kmpc_atomic_fixed4_min_cpt
+    __kmpc_atomic_fixed4_mul
+    __kmpc_atomic_fixed4_mul_cpt
+    __kmpc_atomic_fixed4_mul_float8
+    __kmpc_atomic_fixed4_mul_fp
+    __kmpc_atomic_fixed4_neqv
+    __kmpc_atomic_fixed4_neqv_cpt
+    __kmpc_atomic_fixed4_orb
+    __kmpc_atomic_fixed4_orb_cpt
+    __kmpc_atomic_fixed4_orl
+    __kmpc_atomic_fixed4_orl_cpt
+    __kmpc_atomic_fixed4_rd
+    __kmpc_atomic_fixed4_shl
+    __kmpc_atomic_fixed4_shl_cpt
+    __kmpc_atomic_fixed4_shl_cpt_rev
+    __kmpc_atomic_fixed4_shl_rev
+    __kmpc_atomic_fixed4_shr
+    __kmpc_atomic_fixed4_shr_cpt
+    __kmpc_atomic_fixed4_shr_cpt_rev
+    __kmpc_atomic_fixed4_shr_rev
+    __kmpc_atomic_fixed4_sub
+    __kmpc_atomic_fixed4_sub_cpt
+    __kmpc_atomic_fixed4_sub_cpt_rev
+    __kmpc_atomic_fixed4_sub_fp
+    __kmpc_atomic_fixed4_sub_rev
+    __kmpc_atomic_fixed4_swp
+    __kmpc_atomic_fixed4_wr
+    __kmpc_atomic_fixed4_xor
+    __kmpc_atomic_fixed4_xor_cpt
+    __kmpc_atomic_fixed4u_add_fp
+    __kmpc_atomic_fixed4u_sub_fp
+    __kmpc_atomic_fixed4u_mul_fp
+    __kmpc_atomic_fixed4u_div
+    __kmpc_atomic_fixed4u_div_cpt
+    __kmpc_atomic_fixed4u_div_cpt_rev
+    __kmpc_atomic_fixed4u_div_fp
+    __kmpc_atomic_fixed4u_div_rev
+    __kmpc_atomic_fixed4u_shr
+    __kmpc_atomic_fixed4u_shr_cpt
+    __kmpc_atomic_fixed4u_shr_cpt_rev
+    __kmpc_atomic_fixed4u_shr_rev
+    __kmpc_atomic_fixed8_add
+    __kmpc_atomic_fixed8_add_cpt
+    __kmpc_atomic_fixed8_add_fp
+    __kmpc_atomic_fixed8_andb
+    __kmpc_atomic_fixed8_andb_cpt
+    __kmpc_atomic_fixed8_andl
+    __kmpc_atomic_fixed8_andl_cpt
+    __kmpc_atomic_fixed8_div
+    __kmpc_atomic_fixed8_div_cpt
+    __kmpc_atomic_fixed8_div_cpt_rev
+    __kmpc_atomic_fixed8_div_float8
+    __kmpc_atomic_fixed8_div_fp
+    __kmpc_atomic_fixed8_div_rev
+    __kmpc_atomic_fixed8_eqv
+    __kmpc_atomic_fixed8_eqv_cpt
+    __kmpc_atomic_fixed8_max
+    __kmpc_atomic_fixed8_max_cpt
+    __kmpc_atomic_fixed8_min
+    __kmpc_atomic_fixed8_min_cpt
+    __kmpc_atomic_fixed8_mul
+    __kmpc_atomic_fixed8_mul_cpt
+    __kmpc_atomic_fixed8_mul_float8
+    __kmpc_atomic_fixed8_mul_fp
+    __kmpc_atomic_fixed8_neqv
+    __kmpc_atomic_fixed8_neqv_cpt
+    __kmpc_atomic_fixed8_orb
+    __kmpc_atomic_fixed8_orb_cpt
+    __kmpc_atomic_fixed8_orl
+    __kmpc_atomic_fixed8_orl_cpt
+    __kmpc_atomic_fixed8_rd
+    __kmpc_atomic_fixed8_shl
+    __kmpc_atomic_fixed8_shl_cpt
+    __kmpc_atomic_fixed8_shl_cpt_rev
+    __kmpc_atomic_fixed8_shl_rev
+    __kmpc_atomic_fixed8_shr
+    __kmpc_atomic_fixed8_shr_cpt
+    __kmpc_atomic_fixed8_shr_cpt_rev
+    __kmpc_atomic_fixed8_shr_rev
+    __kmpc_atomic_fixed8_sub
+    __kmpc_atomic_fixed8_sub_cpt
+    __kmpc_atomic_fixed8_sub_cpt_rev
+    __kmpc_atomic_fixed8_sub_fp
+    __kmpc_atomic_fixed8_sub_rev
+    __kmpc_atomic_fixed8_swp
+    __kmpc_atomic_fixed8_wr
+    __kmpc_atomic_fixed8_xor
+    __kmpc_atomic_fixed8_xor_cpt
+    __kmpc_atomic_fixed8u_add_fp
+    __kmpc_atomic_fixed8u_sub_fp
+    __kmpc_atomic_fixed8u_mul_fp
+    __kmpc_atomic_fixed8u_div
+    __kmpc_atomic_fixed8u_div_cpt
+    __kmpc_atomic_fixed8u_div_cpt_rev
+    __kmpc_atomic_fixed8u_div_fp
+    __kmpc_atomic_fixed8u_div_rev
+    __kmpc_atomic_fixed8u_shr
+    __kmpc_atomic_fixed8u_shr_cpt
+    __kmpc_atomic_fixed8u_shr_cpt_rev
+    __kmpc_atomic_fixed8u_shr_rev
+@endcode
+
+Functions for floating point
+----------------------------
+There are versions here for floating point numbers of size 4, 8, 10 and 16
+bytes. (Ten byte floats are used by X87, but are now rare).
+@code
+    __kmpc_atomic_float4_add
+    __kmpc_atomic_float4_add_cpt
+    __kmpc_atomic_float4_add_float8
+    __kmpc_atomic_float4_add_fp
+    __kmpc_atomic_float4_div
+    __kmpc_atomic_float4_div_cpt
+    __kmpc_atomic_float4_div_cpt_rev
+    __kmpc_atomic_float4_div_float8
+    __kmpc_atomic_float4_div_fp
+    __kmpc_atomic_float4_div_rev
+    __kmpc_atomic_float4_max
+    __kmpc_atomic_float4_max_cpt
+    __kmpc_atomic_float4_min
+    __kmpc_atomic_float4_min_cpt
+    __kmpc_atomic_float4_mul
+    __kmpc_atomic_float4_mul_cpt
+    __kmpc_atomic_float4_mul_float8
+    __kmpc_atomic_float4_mul_fp
+    __kmpc_atomic_float4_rd
+    __kmpc_atomic_float4_sub
+    __kmpc_atomic_float4_sub_cpt
+    __kmpc_atomic_float4_sub_cpt_rev
+    __kmpc_atomic_float4_sub_float8
+    __kmpc_atomic_float4_sub_fp
+    __kmpc_atomic_float4_sub_rev
+    __kmpc_atomic_float4_swp
+    __kmpc_atomic_float4_wr
+    __kmpc_atomic_float8_add
+    __kmpc_atomic_float8_add_cpt
+    __kmpc_atomic_float8_add_fp
+    __kmpc_atomic_float8_div
+    __kmpc_atomic_float8_div_cpt
+    __kmpc_atomic_float8_div_cpt_rev
+    __kmpc_atomic_float8_div_fp
+    __kmpc_atomic_float8_div_rev
+    __kmpc_atomic_float8_max
+    __kmpc_atomic_float8_max_cpt
+    __kmpc_atomic_float8_min
+    __kmpc_atomic_float8_min_cpt
+    __kmpc_atomic_float8_mul
+    __kmpc_atomic_float8_mul_cpt
+    __kmpc_atomic_float8_mul_fp
+    __kmpc_atomic_float8_rd
+    __kmpc_atomic_float8_sub
+    __kmpc_atomic_float8_sub_cpt
+    __kmpc_atomic_float8_sub_cpt_rev
+    __kmpc_atomic_float8_sub_fp
+    __kmpc_atomic_float8_sub_rev
+    __kmpc_atomic_float8_swp
+    __kmpc_atomic_float8_wr
+    __kmpc_atomic_float10_add
+    __kmpc_atomic_float10_add_cpt
+    __kmpc_atomic_float10_add_fp
+    __kmpc_atomic_float10_div
+    __kmpc_atomic_float10_div_cpt
+    __kmpc_atomic_float10_div_cpt_rev
+    __kmpc_atomic_float10_div_fp
+    __kmpc_atomic_float10_div_rev
+    __kmpc_atomic_float10_mul
+    __kmpc_atomic_float10_mul_cpt
+    __kmpc_atomic_float10_mul_fp
+    __kmpc_atomic_float10_rd
+    __kmpc_atomic_float10_sub
+    __kmpc_atomic_float10_sub_cpt
+    __kmpc_atomic_float10_sub_cpt_rev
+    __kmpc_atomic_float10_sub_fp
+    __kmpc_atomic_float10_sub_rev
+    __kmpc_atomic_float10_swp
+    __kmpc_atomic_float10_wr
+    __kmpc_atomic_float16_add
+    __kmpc_atomic_float16_add_cpt
+    __kmpc_atomic_float16_div
+    __kmpc_atomic_float16_div_cpt
+    __kmpc_atomic_float16_div_cpt_rev
+    __kmpc_atomic_float16_div_rev
+    __kmpc_atomic_float16_max
+    __kmpc_atomic_float16_max_cpt
+    __kmpc_atomic_float16_min
+    __kmpc_atomic_float16_min_cpt
+    __kmpc_atomic_float16_mul
+    __kmpc_atomic_float16_mul_cpt
+    __kmpc_atomic_float16_rd
+    __kmpc_atomic_float16_sub
+    __kmpc_atomic_float16_sub_cpt
+    __kmpc_atomic_float16_sub_cpt_rev
+    __kmpc_atomic_float16_sub_rev
+    __kmpc_atomic_float16_swp
+    __kmpc_atomic_float16_wr
+@endcode
+
+Functions for Complex types
+---------------------------
+Functions for complex types whose component floating point variables are of size
+4,8,10 or 16 bytes. The names here are based on the size of the component float,
+*not* the size of the complex type. So `__kmpc_atomc_cmplx8_add` is an operation
+on a `complex<double>` or `complex(kind=8)`, *not* `complex<float>`.
+
+@code
+    __kmpc_atomic_cmplx4_add
+    __kmpc_atomic_cmplx4_add_cmplx8
+    __kmpc_atomic_cmplx4_add_cpt
+    __kmpc_atomic_cmplx4_div
+    __kmpc_atomic_cmplx4_div_cmplx8
+    __kmpc_atomic_cmplx4_div_cpt
+    __kmpc_atomic_cmplx4_div_cpt_rev
+    __kmpc_atomic_cmplx4_div_rev
+    __kmpc_atomic_cmplx4_mul
+    __kmpc_atomic_cmplx4_mul_cmplx8
+    __kmpc_atomic_cmplx4_mul_cpt
+    __kmpc_atomic_cmplx4_rd
+    __kmpc_atomic_cmplx4_sub
+    __kmpc_atomic_cmplx4_sub_cmplx8
+    __kmpc_atomic_cmplx4_sub_cpt
+    __kmpc_atomic_cmplx4_sub_cpt_rev
+    __kmpc_atomic_cmplx4_sub_rev
+    __kmpc_atomic_cmplx4_swp
+    __kmpc_atomic_cmplx4_wr
+    __kmpc_atomic_cmplx8_add
+    __kmpc_atomic_cmplx8_add_cpt
+    __kmpc_atomic_cmplx8_div
+    __kmpc_atomic_cmplx8_div_cpt
+    __kmpc_atomic_cmplx8_div_cpt_rev
+    __kmpc_atomic_cmplx8_div_rev
+    __kmpc_atomic_cmplx8_mul
+    __kmpc_atomic_cmplx8_mul_cpt
+    __kmpc_atomic_cmplx8_rd
+    __kmpc_atomic_cmplx8_sub
+    __kmpc_atomic_cmplx8_sub_cpt
+    __kmpc_atomic_cmplx8_sub_cpt_rev
+    __kmpc_atomic_cmplx8_sub_rev
+    __kmpc_atomic_cmplx8_swp
+    __kmpc_atomic_cmplx8_wr
+    __kmpc_atomic_cmplx10_add
+    __kmpc_atomic_cmplx10_add_cpt
+    __kmpc_atomic_cmplx10_div
+    __kmpc_atomic_cmplx10_div_cpt
+    __kmpc_atomic_cmplx10_div_cpt_rev
+    __kmpc_atomic_cmplx10_div_rev
+    __kmpc_atomic_cmplx10_mul
+    __kmpc_atomic_cmplx10_mul_cpt
+    __kmpc_atomic_cmplx10_rd
+    __kmpc_atomic_cmplx10_sub
+    __kmpc_atomic_cmplx10_sub_cpt
+    __kmpc_atomic_cmplx10_sub_cpt_rev
+    __kmpc_atomic_cmplx10_sub_rev
+    __kmpc_atomic_cmplx10_swp
+    __kmpc_atomic_cmplx10_wr
+    __kmpc_atomic_cmplx16_add
+    __kmpc_atomic_cmplx16_add_cpt
+    __kmpc_atomic_cmplx16_div
+    __kmpc_atomic_cmplx16_div_cpt
+    __kmpc_atomic_cmplx16_div_cpt_rev
+    __kmpc_atomic_cmplx16_div_rev
+    __kmpc_atomic_cmplx16_mul
+    __kmpc_atomic_cmplx16_mul_cpt
+    __kmpc_atomic_cmplx16_rd
+    __kmpc_atomic_cmplx16_sub
+    __kmpc_atomic_cmplx16_sub_cpt
+    __kmpc_atomic_cmplx16_sub_cpt_rev
+    __kmpc_atomic_cmplx16_swp
+    __kmpc_atomic_cmplx16_wr
+@endcode
+*/
+
+/*!
+@ingroup ATOMIC_OPS
+@{
+*/
+
+/*
+ * Global vars
+ */
+
+#ifndef KMP_GOMP_COMPAT
+int __kmp_atomic_mode = 1; // Intel perf
+#else
+int __kmp_atomic_mode = 2; // GOMP compatibility
+#endif /* KMP_GOMP_COMPAT */
+
+KMP_ALIGN(128)
+
+// Control access to all user coded atomics in Gnu compat mode
+kmp_atomic_lock_t __kmp_atomic_lock;
+// Control access to all user coded atomics for 1-byte fixed data types
+kmp_atomic_lock_t __kmp_atomic_lock_1i;
+// Control access to all user coded atomics for 2-byte fixed data types
+kmp_atomic_lock_t __kmp_atomic_lock_2i;
+// Control access to all user coded atomics for 4-byte fixed data types
+kmp_atomic_lock_t __kmp_atomic_lock_4i;
+// Control access to all user coded atomics for kmp_real32 data type
+kmp_atomic_lock_t __kmp_atomic_lock_4r;
+// Control access to all user coded atomics for 8-byte fixed data types
+kmp_atomic_lock_t __kmp_atomic_lock_8i;
+// Control access to all user coded atomics for kmp_real64 data type
+kmp_atomic_lock_t __kmp_atomic_lock_8r;
+// Control access to all user coded atomics for complex byte data type
+kmp_atomic_lock_t __kmp_atomic_lock_8c;
+// Control access to all user coded atomics for long double data type
+kmp_atomic_lock_t __kmp_atomic_lock_10r;
+// Control access to all user coded atomics for _Quad data type
+kmp_atomic_lock_t __kmp_atomic_lock_16r;
+// Control access to all user coded atomics for double complex data type
+kmp_atomic_lock_t __kmp_atomic_lock_16c;
+// Control access to all user coded atomics for long double complex type
+kmp_atomic_lock_t __kmp_atomic_lock_20c;
+// Control access to all user coded atomics for _Quad complex data type
+kmp_atomic_lock_t __kmp_atomic_lock_32c;
+
+/* 2007-03-02:
+   Without "volatile" specifier in OP_CMPXCHG and MIN_MAX_CMPXCHG we have a bug
+   on *_32 and *_32e. This is just a temporary workaround for the problem. It
+   seems the right solution is writing OP_CMPXCHG and MIN_MAX_CMPXCHG routines
+   in assembler language. */
+#define KMP_ATOMIC_VOLATILE volatile
+
+#if (KMP_ARCH_X86) && KMP_HAVE_QUAD
+
+static inline void operator+=(Quad_a4_t &lhs, Quad_a4_t &rhs) {
+  lhs.q += rhs.q;
+}
+static inline void operator-=(Quad_a4_t &lhs, Quad_a4_t &rhs) {
+  lhs.q -= rhs.q;
+}
+static inline void operator*=(Quad_a4_t &lhs, Quad_a4_t &rhs) {
+  lhs.q *= rhs.q;
+}
+static inline void operator/=(Quad_a4_t &lhs, Quad_a4_t &rhs) {
+  lhs.q /= rhs.q;
+}
+static inline bool operator<(Quad_a4_t &lhs, Quad_a4_t &rhs) {
+  return lhs.q < rhs.q;
+}
+static inline bool operator>(Quad_a4_t &lhs, Quad_a4_t &rhs) {
+  return lhs.q > rhs.q;
+}
+
+static inline void operator+=(Quad_a16_t &lhs, Quad_a16_t &rhs) {
+  lhs.q += rhs.q;
+}
+static inline void operator-=(Quad_a16_t &lhs, Quad_a16_t &rhs) {
+  lhs.q -= rhs.q;
+}
+static inline void operator*=(Quad_a16_t &lhs, Quad_a16_t &rhs) {
+  lhs.q *= rhs.q;
+}
+static inline void operator/=(Quad_a16_t &lhs, Quad_a16_t &rhs) {
+  lhs.q /= rhs.q;
+}
+static inline bool operator<(Quad_a16_t &lhs, Quad_a16_t &rhs) {
+  return lhs.q < rhs.q;
+}
+static inline bool operator>(Quad_a16_t &lhs, Quad_a16_t &rhs) {
+  return lhs.q > rhs.q;
+}
+
+static inline void operator+=(kmp_cmplx128_a4_t &lhs, kmp_cmplx128_a4_t &rhs) {
+  lhs.q += rhs.q;
+}
+static inline void operator-=(kmp_cmplx128_a4_t &lhs, kmp_cmplx128_a4_t &rhs) {
+  lhs.q -= rhs.q;
+}
+static inline void operator*=(kmp_cmplx128_a4_t &lhs, kmp_cmplx128_a4_t &rhs) {
+  lhs.q *= rhs.q;
+}
+static inline void operator/=(kmp_cmplx128_a4_t &lhs, kmp_cmplx128_a4_t &rhs) {
+  lhs.q /= rhs.q;
+}
+
+static inline void operator+=(kmp_cmplx128_a16_t &lhs,
+                              kmp_cmplx128_a16_t &rhs) {
+  lhs.q += rhs.q;
+}
+static inline void operator-=(kmp_cmplx128_a16_t &lhs,
+                              kmp_cmplx128_a16_t &rhs) {
+  lhs.q -= rhs.q;
+}
+static inline void operator*=(kmp_cmplx128_a16_t &lhs,
+                              kmp_cmplx128_a16_t &rhs) {
+  lhs.q *= rhs.q;
+}
+static inline void operator/=(kmp_cmplx128_a16_t &lhs,
+                              kmp_cmplx128_a16_t &rhs) {
+  lhs.q /= rhs.q;
+}
+
+#endif
+
+// ATOMIC implementation routines -----------------------------------------
+// One routine for each operation and operand type.
+// All routines declarations looks like
+// void __kmpc_atomic_RTYPE_OP( ident_t*, int, TYPE *lhs, TYPE rhs );
+
+#define KMP_CHECK_GTID                                                         \
+  if (gtid == KMP_GTID_UNKNOWN) {                                              \
+    gtid = __kmp_entry_gtid();                                                 \
+  } // check and get gtid when needed
+
+// Beginning of a definition (provides name, parameters, gebug trace)
+//     TYPE_ID - operands type and size (fixed*, fixed*u for signed, unsigned
+//     fixed)
+//     OP_ID   - operation identifier (add, sub, mul, ...)
+//     TYPE    - operands' type
+#define ATOMIC_BEGIN(TYPE_ID, OP_ID, TYPE, RET_TYPE)                           \
+  RET_TYPE __kmpc_atomic_##TYPE_ID##_##OP_ID(ident_t *id_ref, int gtid,        \
+                                             TYPE *lhs, TYPE rhs) {            \
+    KMP_DEBUG_ASSERT(__kmp_init_serial);                                       \
+    KA_TRACE(100, ("__kmpc_atomic_" #TYPE_ID "_" #OP_ID ": T#%d\n", gtid));
+
+// ------------------------------------------------------------------------
+// Lock variables used for critical sections for various size operands
+#define ATOMIC_LOCK0 __kmp_atomic_lock // all types, for Gnu compat
+#define ATOMIC_LOCK1i __kmp_atomic_lock_1i // char
+#define ATOMIC_LOCK2i __kmp_atomic_lock_2i // short
+#define ATOMIC_LOCK4i __kmp_atomic_lock_4i // long int
+#define ATOMIC_LOCK4r __kmp_atomic_lock_4r // float
+#define ATOMIC_LOCK8i __kmp_atomic_lock_8i // long long int
+#define ATOMIC_LOCK8r __kmp_atomic_lock_8r // double
+#define ATOMIC_LOCK8c __kmp_atomic_lock_8c // float complex
+#define ATOMIC_LOCK10r __kmp_atomic_lock_10r // long double
+#define ATOMIC_LOCK16r __kmp_atomic_lock_16r // _Quad
+#define ATOMIC_LOCK16c __kmp_atomic_lock_16c // double complex
+#define ATOMIC_LOCK20c __kmp_atomic_lock_20c // long double complex
+#define ATOMIC_LOCK32c __kmp_atomic_lock_32c // _Quad complex
+
+// ------------------------------------------------------------------------
+// Operation on *lhs, rhs bound by critical section
+//     OP     - operator (it's supposed to contain an assignment)
+//     LCK_ID - lock identifier
+// Note: don't check gtid as it should always be valid
+// 1, 2-byte - expect valid parameter, other - check before this macro
+#define OP_CRITICAL(OP, LCK_ID)                                                \
+  __kmp_acquire_atomic_lock(&ATOMIC_LOCK##LCK_ID, gtid);                       \
+                                                                               \
+  (*lhs) OP(rhs);                                                              \
+                                                                               \
+  __kmp_release_atomic_lock(&ATOMIC_LOCK##LCK_ID, gtid);
+
+// ------------------------------------------------------------------------
+// For GNU compatibility, we may need to use a critical section,
+// even though it is not required by the ISA.
+//
+// On IA-32 architecture, all atomic operations except for fixed 4 byte add,
+// sub, and bitwise logical ops, and 1 & 2 byte logical ops use a common
+// critical section.  On Intel(R) 64, all atomic operations are done with fetch
+// and add or compare and exchange.  Therefore, the FLAG parameter to this
+// macro is either KMP_ARCH_X86 or 0 (or 1, for Intel-specific extension which
+// require a critical section, where we predict that they will be implemented
+// in the Gnu codegen by calling GOMP_atomic_start() / GOMP_atomic_end()).
+//
+// When the OP_GOMP_CRITICAL macro is used in a *CRITICAL* macro construct,
+// the FLAG parameter should always be 1.  If we know that we will be using
+// a critical section, then we want to make certain that we use the generic
+// lock __kmp_atomic_lock to protect the atomic update, and not of of the
+// locks that are specialized based upon the size or type of the data.
+//
+// If FLAG is 0, then we are relying on dead code elimination by the build
+// compiler to get rid of the useless block of code, and save a needless
+// branch at runtime.
+
+#ifdef KMP_GOMP_COMPAT
+#define OP_GOMP_CRITICAL(OP, FLAG)                                             \
+  if ((FLAG) && (__kmp_atomic_mode == 2)) {                                    \
+    KMP_CHECK_GTID;                                                            \
+    OP_CRITICAL(OP, 0);                                                        \
+    return;                                                                    \
+  }
+#else
+#define OP_GOMP_CRITICAL(OP, FLAG)
+#endif /* KMP_GOMP_COMPAT */
+
+#if KMP_MIC
+#define KMP_DO_PAUSE _mm_delay_32(1)
+#else
+#define KMP_DO_PAUSE KMP_CPU_PAUSE()
+#endif /* KMP_MIC */
+
+// ------------------------------------------------------------------------
+// Operation on *lhs, rhs using "compare_and_store" routine
+//     TYPE    - operands' type
+//     BITS    - size in bits, used to distinguish low level calls
+//     OP      - operator
+#define OP_CMPXCHG(TYPE, BITS, OP)                                             \
+  {                                                                            \
+    TYPE old_value, new_value;                                                 \
+    old_value = *(TYPE volatile *)lhs;                                         \
+    new_value = old_value OP rhs;                                              \
+    while (!KMP_COMPARE_AND_STORE_ACQ##BITS(                                   \
+        (kmp_int##BITS *)lhs, *VOLATILE_CAST(kmp_int##BITS *) & old_value,     \
+        *VOLATILE_CAST(kmp_int##BITS *) & new_value)) {                        \
+      KMP_DO_PAUSE;                                                            \
+                                                                               \
+      old_value = *(TYPE volatile *)lhs;                                       \
+      new_value = old_value OP rhs;                                            \
+    }                                                                          \
+  }
+
+#if USE_CMPXCHG_FIX
+// 2007-06-25:
+// workaround for C78287 (complex(kind=4) data type). lin_32, lin_32e, win_32
+// and win_32e are affected (I verified the asm). Compiler ignores the volatile
+// qualifier of the temp_val in the OP_CMPXCHG macro. This is a problem of the
+// compiler. Related tracker is C76005, targeted to 11.0. I verified the asm of
+// the workaround.
+#define OP_CMPXCHG_WORKAROUND(TYPE, BITS, OP)                                  \
+  {                                                                            \
+    struct _sss {                                                              \
+      TYPE cmp;                                                                \
+      kmp_int##BITS *vvv;                                                      \
+    };                                                                         \
+    struct _sss old_value, new_value;                                          \
+    old_value.vvv = (kmp_int##BITS *)&old_value.cmp;                           \
+    new_value.vvv = (kmp_int##BITS *)&new_value.cmp;                           \
+    *old_value.vvv = *(volatile kmp_int##BITS *)lhs;                           \
+    new_value.cmp = old_value.cmp OP rhs;                                      \
+    while (!KMP_COMPARE_AND_STORE_ACQ##BITS(                                   \
+        (kmp_int##BITS *)lhs, *VOLATILE_CAST(kmp_int##BITS *) old_value.vvv,   \
+        *VOLATILE_CAST(kmp_int##BITS *) new_value.vvv)) {                      \
+      KMP_DO_PAUSE;                                                            \
+                                                                               \
+      *old_value.vvv = *(volatile kmp_int##BITS *)lhs;                         \
+      new_value.cmp = old_value.cmp OP rhs;                                    \
+    }                                                                          \
+  }
+// end of the first part of the workaround for C78287
+#endif // USE_CMPXCHG_FIX
+
+#if KMP_ARCH_X86 || KMP_ARCH_X86_64
+
+// ------------------------------------------------------------------------
+// X86 or X86_64: no alignment problems ====================================
+#define ATOMIC_FIXED_ADD(TYPE_ID, OP_ID, TYPE, BITS, OP, LCK_ID, MASK,         \
+                         GOMP_FLAG)                                            \
+  ATOMIC_BEGIN(TYPE_ID, OP_ID, TYPE, void)                                     \
+  OP_GOMP_CRITICAL(OP## =, GOMP_FLAG)                                          \
+  /* OP used as a sign for subtraction: (lhs-rhs) --> (lhs+-rhs) */            \
+  KMP_TEST_THEN_ADD##BITS(lhs, OP rhs);                                        \
+  }
+// -------------------------------------------------------------------------
+#define ATOMIC_CMPXCHG(TYPE_ID, OP_ID, TYPE, BITS, OP, LCK_ID, MASK,           \
+                       GOMP_FLAG)                                              \
+  ATOMIC_BEGIN(TYPE_ID, OP_ID, TYPE, void)                                     \
+  OP_GOMP_CRITICAL(OP## =, GOMP_FLAG)                                          \
+  OP_CMPXCHG(TYPE, BITS, OP)                                                   \
+  }
+#if USE_CMPXCHG_FIX
+// -------------------------------------------------------------------------
+// workaround for C78287 (complex(kind=4) data type)
+#define ATOMIC_CMPXCHG_WORKAROUND(TYPE_ID, OP_ID, TYPE, BITS, OP, LCK_ID,      \
+                                  MASK, GOMP_FLAG)                             \
+  ATOMIC_BEGIN(TYPE_ID, OP_ID, TYPE, void)                                     \
+  OP_GOMP_CRITICAL(OP## =, GOMP_FLAG)                                          \
+  OP_CMPXCHG_WORKAROUND(TYPE, BITS, OP)                                        \
+  }
+// end of the second part of the workaround for C78287
+#endif
+
+#else
+// -------------------------------------------------------------------------
+// Code for other architectures that don't handle unaligned accesses.
+#define ATOMIC_FIXED_ADD(TYPE_ID, OP_ID, TYPE, BITS, OP, LCK_ID, MASK,         \
+                         GOMP_FLAG)                                            \
+  ATOMIC_BEGIN(TYPE_ID, OP_ID, TYPE, void)                                     \
+  OP_GOMP_CRITICAL(OP## =, GOMP_FLAG)                                          \
+  if (!((kmp_uintptr_t)lhs & 0x##MASK)) {                                      \
+    /* OP used as a sign for subtraction: (lhs-rhs) --> (lhs+-rhs) */          \
+    KMP_TEST_THEN_ADD##BITS(lhs, OP rhs);                                      \
+  } else {                                                                     \
+    KMP_CHECK_GTID;                                                            \
+    OP_CRITICAL(OP## =, LCK_ID) /* unaligned address - use critical */         \
+  }                                                                            \
+  }
+// -------------------------------------------------------------------------
+#define ATOMIC_CMPXCHG(TYPE_ID, OP_ID, TYPE, BITS, OP, LCK_ID, MASK,           \
+                       GOMP_FLAG)                                              \
+  ATOMIC_BEGIN(TYPE_ID, OP_ID, TYPE, void)                                     \
+  OP_GOMP_CRITICAL(OP## =, GOMP_FLAG)                                          \
+  if (!((kmp_uintptr_t)lhs & 0x##MASK)) {                                      \
+    OP_CMPXCHG(TYPE, BITS, OP) /* aligned address */                           \
+  } else {                                                                     \
+    KMP_CHECK_GTID;                                                            \
+    OP_CRITICAL(OP## =, LCK_ID) /* unaligned address - use critical */         \
+  }                                                                            \
+  }
+#if USE_CMPXCHG_FIX
+// -------------------------------------------------------------------------
+// workaround for C78287 (complex(kind=4) data type)
+#define ATOMIC_CMPXCHG_WORKAROUND(TYPE_ID, OP_ID, TYPE, BITS, OP, LCK_ID,      \
+                                  MASK, GOMP_FLAG)                             \
+  ATOMIC_BEGIN(TYPE_ID, OP_ID, TYPE, void)                                     \
+  OP_GOMP_CRITICAL(OP## =, GOMP_FLAG)                                          \
+  if (!((kmp_uintptr_t)lhs & 0x##MASK)) {                                      \
+    OP_CMPXCHG(TYPE, BITS, OP) /* aligned address */                           \
+  } else {                                                                     \
+    KMP_CHECK_GTID;                                                            \
+    OP_CRITICAL(OP## =, LCK_ID) /* unaligned address - use critical */         \
+  }                                                                            \
+  }
+// end of the second part of the workaround for C78287
+#endif // USE_CMPXCHG_FIX
+#endif /* KMP_ARCH_X86 || KMP_ARCH_X86_64 */
+
+// Routines for ATOMIC 4-byte operands addition and subtraction
+ATOMIC_FIXED_ADD(fixed4, add, kmp_int32, 32, +, 4i, 3,
+                 0) // __kmpc_atomic_fixed4_add
+ATOMIC_FIXED_ADD(fixed4, sub, kmp_int32, 32, -, 4i, 3,
+                 0) // __kmpc_atomic_fixed4_sub
+
+ATOMIC_CMPXCHG(float4, add, kmp_real32, 32, +, 4r, 3,
+               KMP_ARCH_X86) // __kmpc_atomic_float4_add
+ATOMIC_CMPXCHG(float4, sub, kmp_real32, 32, -, 4r, 3,
+               KMP_ARCH_X86) // __kmpc_atomic_float4_sub
+
+// Routines for ATOMIC 8-byte operands addition and subtraction
+ATOMIC_FIXED_ADD(fixed8, add, kmp_int64, 64, +, 8i, 7,
+                 KMP_ARCH_X86) // __kmpc_atomic_fixed8_add
+ATOMIC_FIXED_ADD(fixed8, sub, kmp_int64, 64, -, 8i, 7,
+                 KMP_ARCH_X86) // __kmpc_atomic_fixed8_sub
+
+ATOMIC_CMPXCHG(float8, add, kmp_real64, 64, +, 8r, 7,
+               KMP_ARCH_X86) // __kmpc_atomic_float8_add
+ATOMIC_CMPXCHG(float8, sub, kmp_real64, 64, -, 8r, 7,
+               KMP_ARCH_X86) // __kmpc_atomic_float8_sub
+
+// ------------------------------------------------------------------------
+// Entries definition for integer operands
+//     TYPE_ID - operands type and size (fixed4, float4)
+//     OP_ID   - operation identifier (add, sub, mul, ...)
+//     TYPE    - operand type
+//     BITS    - size in bits, used to distinguish low level calls
+//     OP      - operator (used in critical section)
+//     LCK_ID  - lock identifier, used to possibly distinguish lock variable
+//     MASK    - used for alignment check
+
+//               TYPE_ID,OP_ID,  TYPE,   BITS,OP,LCK_ID,MASK,GOMP_FLAG
+// ------------------------------------------------------------------------
+// Routines for ATOMIC integer operands, other operators
+// ------------------------------------------------------------------------
+//              TYPE_ID,OP_ID, TYPE,          OP, LCK_ID, GOMP_FLAG
+ATOMIC_CMPXCHG(fixed1, add, kmp_int8, 8, +, 1i, 0,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed1_add
+ATOMIC_CMPXCHG(fixed1, andb, kmp_int8, 8, &, 1i, 0,
+               0) // __kmpc_atomic_fixed1_andb
+ATOMIC_CMPXCHG(fixed1, div, kmp_int8, 8, /, 1i, 0,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed1_div
+ATOMIC_CMPXCHG(fixed1u, div, kmp_uint8, 8, /, 1i, 0,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed1u_div
+ATOMIC_CMPXCHG(fixed1, mul, kmp_int8, 8, *, 1i, 0,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed1_mul
+ATOMIC_CMPXCHG(fixed1, orb, kmp_int8, 8, |, 1i, 0,
+               0) // __kmpc_atomic_fixed1_orb
+ATOMIC_CMPXCHG(fixed1, shl, kmp_int8, 8, <<, 1i, 0,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed1_shl
+ATOMIC_CMPXCHG(fixed1, shr, kmp_int8, 8, >>, 1i, 0,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed1_shr
+ATOMIC_CMPXCHG(fixed1u, shr, kmp_uint8, 8, >>, 1i, 0,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed1u_shr
+ATOMIC_CMPXCHG(fixed1, sub, kmp_int8, 8, -, 1i, 0,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed1_sub
+ATOMIC_CMPXCHG(fixed1, xor, kmp_int8, 8, ^, 1i, 0,
+               0) // __kmpc_atomic_fixed1_xor
+ATOMIC_CMPXCHG(fixed2, add, kmp_int16, 16, +, 2i, 1,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed2_add
+ATOMIC_CMPXCHG(fixed2, andb, kmp_int16, 16, &, 2i, 1,
+               0) // __kmpc_atomic_fixed2_andb
+ATOMIC_CMPXCHG(fixed2, div, kmp_int16, 16, /, 2i, 1,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed2_div
+ATOMIC_CMPXCHG(fixed2u, div, kmp_uint16, 16, /, 2i, 1,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed2u_div
+ATOMIC_CMPXCHG(fixed2, mul, kmp_int16, 16, *, 2i, 1,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed2_mul
+ATOMIC_CMPXCHG(fixed2, orb, kmp_int16, 16, |, 2i, 1,
+               0) // __kmpc_atomic_fixed2_orb
+ATOMIC_CMPXCHG(fixed2, shl, kmp_int16, 16, <<, 2i, 1,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed2_shl
+ATOMIC_CMPXCHG(fixed2, shr, kmp_int16, 16, >>, 2i, 1,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed2_shr
+ATOMIC_CMPXCHG(fixed2u, shr, kmp_uint16, 16, >>, 2i, 1,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed2u_shr
+ATOMIC_CMPXCHG(fixed2, sub, kmp_int16, 16, -, 2i, 1,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed2_sub
+ATOMIC_CMPXCHG(fixed2, xor, kmp_int16, 16, ^, 2i, 1,
+               0) // __kmpc_atomic_fixed2_xor
+ATOMIC_CMPXCHG(fixed4, andb, kmp_int32, 32, &, 4i, 3,
+               0) // __kmpc_atomic_fixed4_andb
+ATOMIC_CMPXCHG(fixed4, div, kmp_int32, 32, /, 4i, 3,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed4_div
+ATOMIC_CMPXCHG(fixed4u, div, kmp_uint32, 32, /, 4i, 3,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed4u_div
+ATOMIC_CMPXCHG(fixed4, mul, kmp_int32, 32, *, 4i, 3,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed4_mul
+ATOMIC_CMPXCHG(fixed4, orb, kmp_int32, 32, |, 4i, 3,
+               0) // __kmpc_atomic_fixed4_orb
+ATOMIC_CMPXCHG(fixed4, shl, kmp_int32, 32, <<, 4i, 3,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed4_shl
+ATOMIC_CMPXCHG(fixed4, shr, kmp_int32, 32, >>, 4i, 3,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed4_shr
+ATOMIC_CMPXCHG(fixed4u, shr, kmp_uint32, 32, >>, 4i, 3,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed4u_shr
+ATOMIC_CMPXCHG(fixed4, xor, kmp_int32, 32, ^, 4i, 3,
+               0) // __kmpc_atomic_fixed4_xor
+ATOMIC_CMPXCHG(fixed8, andb, kmp_int64, 64, &, 8i, 7,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed8_andb
+ATOMIC_CMPXCHG(fixed8, div, kmp_int64, 64, /, 8i, 7,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed8_div
+ATOMIC_CMPXCHG(fixed8u, div, kmp_uint64, 64, /, 8i, 7,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed8u_div
+ATOMIC_CMPXCHG(fixed8, mul, kmp_int64, 64, *, 8i, 7,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed8_mul
+ATOMIC_CMPXCHG(fixed8, orb, kmp_int64, 64, |, 8i, 7,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed8_orb
+ATOMIC_CMPXCHG(fixed8, shl, kmp_int64, 64, <<, 8i, 7,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed8_shl
+ATOMIC_CMPXCHG(fixed8, shr, kmp_int64, 64, >>, 8i, 7,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed8_shr
+ATOMIC_CMPXCHG(fixed8u, shr, kmp_uint64, 64, >>, 8i, 7,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed8u_shr
+ATOMIC_CMPXCHG(fixed8, xor, kmp_int64, 64, ^, 8i, 7,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed8_xor
+ATOMIC_CMPXCHG(float4, div, kmp_real32, 32, /, 4r, 3,
+               KMP_ARCH_X86) // __kmpc_atomic_float4_div
+ATOMIC_CMPXCHG(float4, mul, kmp_real32, 32, *, 4r, 3,
+               KMP_ARCH_X86) // __kmpc_atomic_float4_mul
+ATOMIC_CMPXCHG(float8, div, kmp_real64, 64, /, 8r, 7,
+               KMP_ARCH_X86) // __kmpc_atomic_float8_div
+ATOMIC_CMPXCHG(float8, mul, kmp_real64, 64, *, 8r, 7,
+               KMP_ARCH_X86) // __kmpc_atomic_float8_mul
+//              TYPE_ID,OP_ID, TYPE,          OP, LCK_ID, GOMP_FLAG
+
+/* ------------------------------------------------------------------------ */
+/* Routines for C/C++ Reduction operators && and ||                         */
+
+// ------------------------------------------------------------------------
+// Need separate macros for &&, || because there is no combined assignment
+//   TODO: eliminate ATOMIC_CRIT_{L,EQV} macros as not used
+#define ATOMIC_CRIT_L(TYPE_ID, OP_ID, TYPE, OP, LCK_ID, GOMP_FLAG)             \
+  ATOMIC_BEGIN(TYPE_ID, OP_ID, TYPE, void)                                     \
+  OP_GOMP_CRITICAL(= *lhs OP, GOMP_FLAG)                                       \
+  OP_CRITICAL(= *lhs OP, LCK_ID)                                               \
+  }
+
+#if KMP_ARCH_X86 || KMP_ARCH_X86_64
+
+// ------------------------------------------------------------------------
+// X86 or X86_64: no alignment problems ===================================
+#define ATOMIC_CMPX_L(TYPE_ID, OP_ID, TYPE, BITS, OP, LCK_ID, MASK, GOMP_FLAG) \
+  ATOMIC_BEGIN(TYPE_ID, OP_ID, TYPE, void)                                     \
+  OP_GOMP_CRITICAL(= *lhs OP, GOMP_FLAG)                                       \
+  OP_CMPXCHG(TYPE, BITS, OP)                                                   \
+  }
+
+#else
+// ------------------------------------------------------------------------
+// Code for other architectures that don't handle unaligned accesses.
+#define ATOMIC_CMPX_L(TYPE_ID, OP_ID, TYPE, BITS, OP, LCK_ID, MASK, GOMP_FLAG) \
+  ATOMIC_BEGIN(TYPE_ID, OP_ID, TYPE, void)                                     \
+  OP_GOMP_CRITICAL(= *lhs OP, GOMP_FLAG)                                       \
+  if (!((kmp_uintptr_t)lhs & 0x##MASK)) {                                      \
+    OP_CMPXCHG(TYPE, BITS, OP) /* aligned address */                           \
+  } else {                                                                     \
+    KMP_CHECK_GTID;                                                            \
+    OP_CRITICAL(= *lhs OP, LCK_ID) /* unaligned - use critical */              \
+  }                                                                            \
+  }
+#endif /* KMP_ARCH_X86 || KMP_ARCH_X86_64 */
+
+ATOMIC_CMPX_L(fixed1, andl, char, 8, &&, 1i, 0,
+              KMP_ARCH_X86) // __kmpc_atomic_fixed1_andl
+ATOMIC_CMPX_L(fixed1, orl, char, 8, ||, 1i, 0,
+              KMP_ARCH_X86) // __kmpc_atomic_fixed1_orl
+ATOMIC_CMPX_L(fixed2, andl, short, 16, &&, 2i, 1,
+              KMP_ARCH_X86) // __kmpc_atomic_fixed2_andl
+ATOMIC_CMPX_L(fixed2, orl, short, 16, ||, 2i, 1,
+              KMP_ARCH_X86) // __kmpc_atomic_fixed2_orl
+ATOMIC_CMPX_L(fixed4, andl, kmp_int32, 32, &&, 4i, 3,
+              0) // __kmpc_atomic_fixed4_andl
+ATOMIC_CMPX_L(fixed4, orl, kmp_int32, 32, ||, 4i, 3,
+              0) // __kmpc_atomic_fixed4_orl
+ATOMIC_CMPX_L(fixed8, andl, kmp_int64, 64, &&, 8i, 7,
+              KMP_ARCH_X86) // __kmpc_atomic_fixed8_andl
+ATOMIC_CMPX_L(fixed8, orl, kmp_int64, 64, ||, 8i, 7,
+              KMP_ARCH_X86) // __kmpc_atomic_fixed8_orl
+
+/* ------------------------------------------------------------------------- */
+/* Routines for Fortran operators that matched no one in C:                  */
+/* MAX, MIN, .EQV., .NEQV.                                                   */
+/* Operators .AND., .OR. are covered by __kmpc_atomic_*_{andl,orl}           */
+/* Intrinsics IAND, IOR, IEOR are covered by __kmpc_atomic_*_{andb,orb,xor}  */
+
+// -------------------------------------------------------------------------
+// MIN and MAX need separate macros
+// OP - operator to check if we need any actions?
+#define MIN_MAX_CRITSECT(OP, LCK_ID)                                           \
+  __kmp_acquire_atomic_lock(&ATOMIC_LOCK##LCK_ID, gtid);                       \
+                                                                               \
+  if (*lhs OP rhs) { /* still need actions? */                                 \
+    *lhs = rhs;                                                                \
+  }                                                                            \
+  __kmp_release_atomic_lock(&ATOMIC_LOCK##LCK_ID, gtid);
+
+// -------------------------------------------------------------------------
+#ifdef KMP_GOMP_COMPAT
+#define GOMP_MIN_MAX_CRITSECT(OP, FLAG)                                        \
+  if ((FLAG) && (__kmp_atomic_mode == 2)) {                                    \
+    KMP_CHECK_GTID;                                                            \
+    MIN_MAX_CRITSECT(OP, 0);                                                   \
+    return;                                                                    \
+  }
+#else
+#define GOMP_MIN_MAX_CRITSECT(OP, FLAG)
+#endif /* KMP_GOMP_COMPAT */
+
+// -------------------------------------------------------------------------
+#define MIN_MAX_CMPXCHG(TYPE, BITS, OP)                                        \
+  {                                                                            \
+    TYPE KMP_ATOMIC_VOLATILE temp_val;                                         \
+    TYPE old_value;                                                            \
+    temp_val = *lhs;                                                           \
+    old_value = temp_val;                                                      \
+    while (old_value OP rhs && /* still need actions? */                       \
+           !KMP_COMPARE_AND_STORE_ACQ##BITS(                                   \
+               (kmp_int##BITS *)lhs,                                           \
+               *VOLATILE_CAST(kmp_int##BITS *) & old_value,                    \
+               *VOLATILE_CAST(kmp_int##BITS *) & rhs)) {                       \
+      KMP_CPU_PAUSE();                                                         \
+      temp_val = *lhs;                                                         \
+      old_value = temp_val;                                                    \
+    }                                                                          \
+  }
+
+// -------------------------------------------------------------------------
+// 1-byte, 2-byte operands - use critical section
+#define MIN_MAX_CRITICAL(TYPE_ID, OP_ID, TYPE, OP, LCK_ID, GOMP_FLAG)          \
+  ATOMIC_BEGIN(TYPE_ID, OP_ID, TYPE, void)                                     \
+  if (*lhs OP rhs) { /* need actions? */                                       \
+    GOMP_MIN_MAX_CRITSECT(OP, GOMP_FLAG)                                       \
+    MIN_MAX_CRITSECT(OP, LCK_ID)                                               \
+  }                                                                            \
+  }
+
+#if KMP_ARCH_X86 || KMP_ARCH_X86_64
+
+// -------------------------------------------------------------------------
+// X86 or X86_64: no alignment problems ====================================
+#define MIN_MAX_COMPXCHG(TYPE_ID, OP_ID, TYPE, BITS, OP, LCK_ID, MASK,         \
+                         GOMP_FLAG)                                            \
+  ATOMIC_BEGIN(TYPE_ID, OP_ID, TYPE, void)                                     \
+  if (*lhs OP rhs) {                                                           \
+    GOMP_MIN_MAX_CRITSECT(OP, GOMP_FLAG)                                       \
+    MIN_MAX_CMPXCHG(TYPE, BITS, OP)                                            \
+  }                                                                            \
+  }
+
+#else
+// -------------------------------------------------------------------------
+// Code for other architectures that don't handle unaligned accesses.
+#define MIN_MAX_COMPXCHG(TYPE_ID, OP_ID, TYPE, BITS, OP, LCK_ID, MASK,         \
+                         GOMP_FLAG)                                            \
+  ATOMIC_BEGIN(TYPE_ID, OP_ID, TYPE, void)                                     \
+  if (*lhs OP rhs) {                                                           \
+    GOMP_MIN_MAX_CRITSECT(OP, GOMP_FLAG)                                       \
+    if (!((kmp_uintptr_t)lhs & 0x##MASK)) {                                    \
+      MIN_MAX_CMPXCHG(TYPE, BITS, OP) /* aligned address */                    \
+    } else {                                                                   \
+      KMP_CHECK_GTID;                                                          \
+      MIN_MAX_CRITSECT(OP, LCK_ID) /* unaligned address */                     \
+    }                                                                          \
+  }                                                                            \
+  }
+#endif /* KMP_ARCH_X86 || KMP_ARCH_X86_64 */
+
+MIN_MAX_COMPXCHG(fixed1, max, char, 8, <, 1i, 0,
+                 KMP_ARCH_X86) // __kmpc_atomic_fixed1_max
+MIN_MAX_COMPXCHG(fixed1, min, char, 8, >, 1i, 0,
+                 KMP_ARCH_X86) // __kmpc_atomic_fixed1_min
+MIN_MAX_COMPXCHG(fixed2, max, short, 16, <, 2i, 1,
+                 KMP_ARCH_X86) // __kmpc_atomic_fixed2_max
+MIN_MAX_COMPXCHG(fixed2, min, short, 16, >, 2i, 1,
+                 KMP_ARCH_X86) // __kmpc_atomic_fixed2_min
+MIN_MAX_COMPXCHG(fixed4, max, kmp_int32, 32, <, 4i, 3,
+                 0) // __kmpc_atomic_fixed4_max
+MIN_MAX_COMPXCHG(fixed4, min, kmp_int32, 32, >, 4i, 3,
+                 0) // __kmpc_atomic_fixed4_min
+MIN_MAX_COMPXCHG(fixed8, max, kmp_int64, 64, <, 8i, 7,
+                 KMP_ARCH_X86) // __kmpc_atomic_fixed8_max
+MIN_MAX_COMPXCHG(fixed8, min, kmp_int64, 64, >, 8i, 7,
+                 KMP_ARCH_X86) // __kmpc_atomic_fixed8_min
+MIN_MAX_COMPXCHG(float4, max, kmp_real32, 32, <, 4r, 3,
+                 KMP_ARCH_X86) // __kmpc_atomic_float4_max
+MIN_MAX_COMPXCHG(float4, min, kmp_real32, 32, >, 4r, 3,
+                 KMP_ARCH_X86) // __kmpc_atomic_float4_min
+MIN_MAX_COMPXCHG(float8, max, kmp_real64, 64, <, 8r, 7,
+                 KMP_ARCH_X86) // __kmpc_atomic_float8_max
+MIN_MAX_COMPXCHG(float8, min, kmp_real64, 64, >, 8r, 7,
+                 KMP_ARCH_X86) // __kmpc_atomic_float8_min
+#if KMP_HAVE_QUAD
+MIN_MAX_CRITICAL(float16, max, QUAD_LEGACY, <, 16r,
+                 1) // __kmpc_atomic_float16_max
+MIN_MAX_CRITICAL(float16, min, QUAD_LEGACY, >, 16r,
+                 1) // __kmpc_atomic_float16_min
+#if (KMP_ARCH_X86)
+MIN_MAX_CRITICAL(float16, max_a16, Quad_a16_t, <, 16r,
+                 1) // __kmpc_atomic_float16_max_a16
+MIN_MAX_CRITICAL(float16, min_a16, Quad_a16_t, >, 16r,
+                 1) // __kmpc_atomic_float16_min_a16
+#endif
+#endif
+// ------------------------------------------------------------------------
+// Need separate macros for .EQV. because of the need of complement (~)
+// OP ignored for critical sections, ^=~ used instead
+#define ATOMIC_CRIT_EQV(TYPE_ID, OP_ID, TYPE, OP, LCK_ID, GOMP_FLAG)           \
+  ATOMIC_BEGIN(TYPE_ID, OP_ID, TYPE, void)                                     \
+  OP_GOMP_CRITICAL(^= ~, GOMP_FLAG) /* send assignment */                      \
+  OP_CRITICAL(^= ~, LCK_ID) /* send assignment and complement */               \
+  }
+
+// ------------------------------------------------------------------------
+#if KMP_ARCH_X86 || KMP_ARCH_X86_64
+// ------------------------------------------------------------------------
+// X86 or X86_64: no alignment problems ===================================
+#define ATOMIC_CMPX_EQV(TYPE_ID, OP_ID, TYPE, BITS, OP, LCK_ID, MASK,          \
+                        GOMP_FLAG)                                             \
+  ATOMIC_BEGIN(TYPE_ID, OP_ID, TYPE, void)                                     \
+  OP_GOMP_CRITICAL(^= ~, GOMP_FLAG) /* send assignment */                      \
+  OP_CMPXCHG(TYPE, BITS, OP)                                                   \
+  }
+// ------------------------------------------------------------------------
+#else
+// ------------------------------------------------------------------------
+// Code for other architectures that don't handle unaligned accesses.
+#define ATOMIC_CMPX_EQV(TYPE_ID, OP_ID, TYPE, BITS, OP, LCK_ID, MASK,          \
+                        GOMP_FLAG)                                             \
+  ATOMIC_BEGIN(TYPE_ID, OP_ID, TYPE, void)                                     \
+  OP_GOMP_CRITICAL(^= ~, GOMP_FLAG)                                            \
+  if (!((kmp_uintptr_t)lhs & 0x##MASK)) {                                      \
+    OP_CMPXCHG(TYPE, BITS, OP) /* aligned address */                           \
+  } else {                                                                     \
+    KMP_CHECK_GTID;                                                            \
+    OP_CRITICAL(^= ~, LCK_ID) /* unaligned address - use critical */           \
+  }                                                                            \
+  }
+#endif /* KMP_ARCH_X86 || KMP_ARCH_X86_64 */
+
+ATOMIC_CMPXCHG(fixed1, neqv, kmp_int8, 8, ^, 1i, 0,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed1_neqv
+ATOMIC_CMPXCHG(fixed2, neqv, kmp_int16, 16, ^, 2i, 1,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed2_neqv
+ATOMIC_CMPXCHG(fixed4, neqv, kmp_int32, 32, ^, 4i, 3,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed4_neqv
+ATOMIC_CMPXCHG(fixed8, neqv, kmp_int64, 64, ^, 8i, 7,
+               KMP_ARCH_X86) // __kmpc_atomic_fixed8_neqv
+ATOMIC_CMPX_EQV(fixed1, eqv, kmp_int8, 8, ^~, 1i, 0,
+                KMP_ARCH_X86) // __kmpc_atomic_fixed1_eqv
+ATOMIC_CMPX_EQV(fixed2, eqv, kmp_int16, 16, ^~, 2i, 1,
+                KMP_ARCH_X86) // __kmpc_atomic_fixed2_eqv
+ATOMIC_CMPX_EQV(fixed4, eqv, kmp_int32, 32, ^~, 4i, 3,
+                KMP_ARCH_X86) // __kmpc_atomic_fixed4_eqv
+ATOMIC_CMPX_EQV(fixed8, eqv, kmp_int64, 64, ^~, 8i, 7,
+                KMP_ARCH_X86) // __kmpc_atomic_fixed8_eqv
+
+// ------------------------------------------------------------------------
+// Routines for Extended types: long double, _Quad, complex flavours (use
+// critical section)
+//     TYPE_ID, OP_ID, TYPE - detailed above
+//     OP      - operator
+//     LCK_ID  - lock identifier, used to possibly distinguish lock variable
+#define ATOMIC_CRITICAL(TYPE_ID, OP_ID, TYPE, OP, LCK_ID, GOMP_FLAG)           \
+  ATOMIC_BEGIN(TYPE_ID, OP_ID, TYPE, void)                                     \
+  OP_GOMP_CRITICAL(OP## =, GOMP_FLAG) /* send assignment */                    \
+  OP_CRITICAL(OP## =, LCK_ID) /* send assignment */                            \
+  }
+
+/* ------------------------------------------------------------------------- */
+// routines for long double type
+ATOMIC_CRITICAL(float10, add, long double, +, 10r,
+                1) // __kmpc_atomic_float10_add
+ATOMIC_CRITICAL(float10, sub, long double, -, 10r,
+                1) // __kmpc_atomic_float10_sub
+ATOMIC_CRITICAL(float10, mul, long double, *, 10r,
+                1) // __kmpc_atomic_float10_mul
+ATOMIC_CRITICAL(float10, div, long double, /, 10r,
+                1) // __kmpc_atomic_float10_div
+#if KMP_HAVE_QUAD
+// routines for _Quad type
+ATOMIC_CRITICAL(float16, add, QUAD_LEGACY, +, 16r,
+                1) // __kmpc_atomic_float16_add
+ATOMIC_CRITICAL(float16, sub, QUAD_LEGACY, -, 16r,
+                1) // __kmpc_atomic_float16_sub
+ATOMIC_CRITICAL(float16, mul, QUAD_LEGACY, *, 16r,
+                1) // __kmpc_atomic_float16_mul
+ATOMIC_CRITICAL(float16, div, QUAD_LEGACY, /, 16r,
+                1) // __kmpc_atomic_float16_div
+#if (KMP_ARCH_X86)
+ATOMIC_CRITICAL(float16, add_a16, Quad_a16_t, +, 16r,
+                1) // __kmpc_atomic_float16_add_a16
+ATOMIC_CRITICAL(float16, sub_a16, Quad_a16_t, -, 16r,
+                1) // __kmpc_atomic_float16_sub_a16
+ATOMIC_CRITICAL(float16, mul_a16, Quad_a16_t, *, 16r,
+                1) // __kmpc_atomic_float16_mul_a16
+ATOMIC_CRITICAL(float16, div_a16, Quad_a16_t, /, 16r,
+                1) // __kmpc_atomic_float16_div_a16
+#endif
+#endif
+// routines for complex types
+
+#if USE_CMPXCHG_FIX
+// workaround for C78287 (complex(kind=4) data type)
+ATOMIC_CMPXCHG_WORKAROUND(cmplx4, add, kmp_cmplx32, 64, +, 8c, 7,
+                          1) // __kmpc_atomic_cmplx4_add
+ATOMIC_CMPXCHG_WORKAROUND(cmplx4, sub, kmp_cmplx32, 64, -, 8c, 7,
+                          1) // __kmpc_atomic_cmplx4_sub
+ATOMIC_CMPXCHG_WORKAROUND(cmplx4, mul, kmp_cmplx32, 64, *, 8c, 7,
+                          1) // __kmpc_atomic_cmplx4_mul
+ATOMIC_CMPXCHG_WORKAROUND(cmplx4, div, kmp_cmplx32, 64, /, 8c, 7,
+                          1) // __kmpc_atomic_cmplx4_div
+// end of the workaround for C78287
+#else
+ATOMIC_CRITICAL(cmplx4, add, kmp_cmplx32, +, 8c, 1) // __kmpc_atomic_cmplx4_add
+ATOMIC_CRITICAL(cmplx4, sub, kmp_cmplx32, -, 8c, 1) // __kmpc_atomic_cmplx4_sub
+ATOMIC_CRITICAL(cmplx4, mul, kmp_cmplx32, *, 8c, 1) // __kmpc_atomic_cmplx4_mul
+ATOMIC_CRITICAL(cmplx4, div, kmp_cmplx32, /, 8c, 1) // __kmpc_atomic_cmplx4_div
+#endif // USE_CMPXCHG_FIX
+
+ATOMIC_CRITICAL(cmplx8, add, kmp_cmplx64, +, 16c, 1) // __kmpc_atomic_cmplx8_add
+ATOMIC_CRITICAL(cmplx8, sub, kmp_cmplx64, -, 16c, 1) // __kmpc_atomic_cmplx8_sub
+ATOMIC_CRITICAL(cmplx8, mul, kmp_cmplx64, *, 16c, 1) // __kmpc_atomic_cmplx8_mul
+ATOMIC_CRITICAL(cmplx8, div, kmp_cmplx64, /, 16c, 1) // __kmpc_atomic_cmplx8_div
+ATOMIC_CRITICAL(cmplx10, add, kmp_cmplx80, +, 20c,
+                1) // __kmpc_atomic_cmplx10_add
+ATOMIC_CRITICAL(cmplx10, sub, kmp_cmplx80, -, 20c,
+                1) // __kmpc_atomic_cmplx10_sub
+ATOMIC_CRITICAL(cmplx10, mul, kmp_cmplx80, *, 20c,
+                1) // __kmpc_atomic_cmplx10_mul
+ATOMIC_CRITICAL(cmplx10, div, kmp_cmplx80, /, 20c,
+                1) // __kmpc_atomic_cmplx10_div
+#if KMP_HAVE_QUAD
+ATOMIC_CRITICAL(cmplx16, add, CPLX128_LEG, +, 32c,
+                1) // __kmpc_atomic_cmplx16_add
+ATOMIC_CRITICAL(cmplx16, sub, CPLX128_LEG, -, 32c,
+                1) // __kmpc_atomic_cmplx16_sub
+ATOMIC_CRITICAL(cmplx16, mul, CPLX128_LEG, *, 32c,
+                1) // __kmpc_atomic_cmplx16_mul
+ATOMIC_CRITICAL(cmplx16, div, CPLX128_LEG, /, 32c,
+                1) // __kmpc_atomic_cmplx16_div
+#if (KMP_ARCH_X86)
+ATOMIC_CRITICAL(cmplx16, add_a16, kmp_cmplx128_a16_t, +, 32c,
+                1) // __kmpc_atomic_cmplx16_add_a16
+ATOMIC_CRITICAL(cmplx16, sub_a16, kmp_cmplx128_a16_t, -, 32c,
+                1) // __kmpc_atomic_cmplx16_sub_a16
+ATOMIC_CRITICAL(cmplx16, mul_a16, kmp_cmplx128_a16_t, *, 32c,
+                1) // __kmpc_atomic_cmplx16_mul_a16
+ATOMIC_CRITICAL(cmplx16, div_a16, kmp_cmplx128_a16_t, /, 32c,
+                1) // __kmpc_atomic_cmplx16_div_a16
+#endif
+#endif
+
+#if OMP_40_ENABLED
+
+// OpenMP 4.0: x = expr binop x for non-commutative operations.
+// Supported only on IA-32 architecture and Intel(R) 64
+#if KMP_ARCH_X86 || KMP_ARCH_X86_64
+
+// ------------------------------------------------------------------------
+// Operation on *lhs, rhs bound by critical section
+//     OP     - operator (it's supposed to contain an assignment)
+//     LCK_ID - lock identifier
+// Note: don't check gtid as it should always be valid
+// 1, 2-byte - expect valid parameter, other - check before this macro
+#define OP_CRITICAL_REV(OP, LCK_ID)                                            \
+  __kmp_acquire_atomic_lock(&ATOMIC_LOCK##LCK_ID, gtid);                       \
+                                                                               \
+  (*lhs) = (rhs)OP(*lhs);                                                      \
+                                                                               \
+  __kmp_release_atomic_lock(&ATOMIC_LOCK##LCK_ID, gtid);
+
+#ifdef KMP_GOMP_COMPAT
+#define OP_GOMP_CRITICAL_REV(OP, FLAG)                                         \
+  if ((FLAG) && (__kmp_atomic_mode == 2)) {                                    \
+    KMP_CHECK_GTID;                                                            \
+    OP_CRITICAL_REV(OP, 0);                                                    \
+    return;                                                                    \
+  }
+#else
+#define OP_GOMP_CRITICAL_REV(OP, FLAG)
+#endif /* KMP_GOMP_COMPAT */
+
+// Beginning of a definition (provides name, parameters, gebug trace)
+//     TYPE_ID - operands type and size (fixed*, fixed*u for signed, unsigned
+//     fixed)
+//     OP_ID   - operation identifier (add, sub, mul, ...)
+//     TYPE    - operands' type
+#define ATOMIC_BEGIN_REV(TYPE_ID, OP_ID, TYPE, RET_TYPE)                       \
+  RET_TYPE __kmpc_atomic_##TYPE_ID##_##OP_ID##_rev(ident_t *id_ref, int gtid,  \
+                                                   TYPE *lhs, TYPE rhs) {      \
+    KMP_DEBUG_ASSERT(__kmp_init_serial);                                       \
+    KA_TRACE(100, ("__kmpc_atomic_" #TYPE_ID "_" #OP_ID "_rev: T#%d\n", gtid));
+
+// ------------------------------------------------------------------------
+// Operation on *lhs, rhs using "compare_and_store" routine
+//     TYPE    - operands' type
+//     BITS    - size in bits, used to distinguish low level calls
+//     OP      - operator
+// Note: temp_val introduced in order to force the compiler to read
+//       *lhs only once (w/o it the compiler reads *lhs twice)
+#define OP_CMPXCHG_REV(TYPE, BITS, OP)                                         \
+  {                                                                            \
+    TYPE KMP_ATOMIC_VOLATILE temp_val;                                         \
+    TYPE old_value, new_value;                                                 \
+    temp_val = *lhs;                                                           \
+    old_value = temp_val;                                                      \
+    new_value = rhs OP old_value;                                              \
+    while (!KMP_COMPARE_AND_STORE_ACQ##BITS(                                   \
+        (kmp_int##BITS *)lhs, *VOLATILE_CAST(kmp_int##BITS *) & old_value,     \
+        *VOLATILE_CAST(kmp_int##BITS *) & new_value)) {                        \
+      KMP_DO_PAUSE;                                                            \
+                                                                               \
+      temp_val = *lhs;                                                         \
+      old_value = temp_val;                                                    \
+      new_value = rhs OP old_value;                                            \
+    }                                                                          \
+  }
+
+// -------------------------------------------------------------------------
+#define ATOMIC_CMPXCHG_REV(TYPE_ID, OP_ID, TYPE, BITS, OP, LCK_ID, GOMP_FLAG)  \
+  ATOMIC_BEGIN_REV(TYPE_ID, OP_ID, TYPE, void)                                 \
+  OP_GOMP_CRITICAL_REV(OP, GOMP_FLAG)                                          \
+  OP_CMPXCHG_REV(TYPE, BITS, OP)                                               \
+  }
+
+// ------------------------------------------------------------------------
+// Entries definition for integer operands
+//     TYPE_ID - operands type and size (fixed4, float4)
+//     OP_ID   - operation identifier (add, sub, mul, ...)
+//     TYPE    - operand type
+//     BITS    - size in bits, used to distinguish low level calls
+//     OP      - operator (used in critical section)
+//     LCK_ID  - lock identifier, used to possibly distinguish lock variable
+
+//               TYPE_ID,OP_ID,  TYPE,   BITS,OP,LCK_ID,GOMP_FLAG
+// ------------------------------------------------------------------------
+// Routines for ATOMIC integer operands, other operators
+// ------------------------------------------------------------------------
+//                  TYPE_ID,OP_ID, TYPE,    BITS, OP, LCK_ID, GOMP_FLAG
+ATOMIC_CMPXCHG_REV(fixed1, div, kmp_int8, 8, /, 1i,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed1_div_rev
+ATOMIC_CMPXCHG_REV(fixed1u, div, kmp_uint8, 8, /, 1i,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed1u_div_rev
+ATOMIC_CMPXCHG_REV(fixed1, shl, kmp_int8, 8, <<, 1i,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed1_shl_rev
+ATOMIC_CMPXCHG_REV(fixed1, shr, kmp_int8, 8, >>, 1i,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed1_shr_rev
+ATOMIC_CMPXCHG_REV(fixed1u, shr, kmp_uint8, 8, >>, 1i,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed1u_shr_rev
+ATOMIC_CMPXCHG_REV(fixed1, sub, kmp_int8, 8, -, 1i,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed1_sub_rev
+
+ATOMIC_CMPXCHG_REV(fixed2, div, kmp_int16, 16, /, 2i,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed2_div_rev
+ATOMIC_CMPXCHG_REV(fixed2u, div, kmp_uint16, 16, /, 2i,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed2u_div_rev
+ATOMIC_CMPXCHG_REV(fixed2, shl, kmp_int16, 16, <<, 2i,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed2_shl_rev
+ATOMIC_CMPXCHG_REV(fixed2, shr, kmp_int16, 16, >>, 2i,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed2_shr_rev
+ATOMIC_CMPXCHG_REV(fixed2u, shr, kmp_uint16, 16, >>, 2i,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed2u_shr_rev
+ATOMIC_CMPXCHG_REV(fixed2, sub, kmp_int16, 16, -, 2i,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed2_sub_rev
+
+ATOMIC_CMPXCHG_REV(fixed4, div, kmp_int32, 32, /, 4i,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed4_div_rev
+ATOMIC_CMPXCHG_REV(fixed4u, div, kmp_uint32, 32, /, 4i,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed4u_div_rev
+ATOMIC_CMPXCHG_REV(fixed4, shl, kmp_int32, 32, <<, 4i,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed4_shl_rev
+ATOMIC_CMPXCHG_REV(fixed4, shr, kmp_int32, 32, >>, 4i,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed4_shr_rev
+ATOMIC_CMPXCHG_REV(fixed4u, shr, kmp_uint32, 32, >>, 4i,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed4u_shr_rev
+ATOMIC_CMPXCHG_REV(fixed4, sub, kmp_int32, 32, -, 4i,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed4_sub_rev
+
+ATOMIC_CMPXCHG_REV(fixed8, div, kmp_int64, 64, /, 8i,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed8_div_rev
+ATOMIC_CMPXCHG_REV(fixed8u, div, kmp_uint64, 64, /, 8i,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed8u_div_rev
+ATOMIC_CMPXCHG_REV(fixed8, shl, kmp_int64, 64, <<, 8i,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed8_shl_rev
+ATOMIC_CMPXCHG_REV(fixed8, shr, kmp_int64, 64, >>, 8i,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed8_shr_rev
+ATOMIC_CMPXCHG_REV(fixed8u, shr, kmp_uint64, 64, >>, 8i,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed8u_shr_rev
+ATOMIC_CMPXCHG_REV(fixed8, sub, kmp_int64, 64, -, 8i,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed8_sub_rev
+
+ATOMIC_CMPXCHG_REV(float4, div, kmp_real32, 32, /, 4r,
+                   KMP_ARCH_X86) // __kmpc_atomic_float4_div_rev
+ATOMIC_CMPXCHG_REV(float4, sub, kmp_real32, 32, -, 4r,
+                   KMP_ARCH_X86) // __kmpc_atomic_float4_sub_rev
+
+ATOMIC_CMPXCHG_REV(float8, div, kmp_real64, 64, /, 8r,
+                   KMP_ARCH_X86) // __kmpc_atomic_float8_div_rev
+ATOMIC_CMPXCHG_REV(float8, sub, kmp_real64, 64, -, 8r,
+                   KMP_ARCH_X86) // __kmpc_atomic_float8_sub_rev
+//                  TYPE_ID,OP_ID, TYPE,     BITS,OP,LCK_ID, GOMP_FLAG
+
+// ------------------------------------------------------------------------
+// Routines for Extended types: long double, _Quad, complex flavours (use
+// critical section)
+//     TYPE_ID, OP_ID, TYPE - detailed above
+//     OP      - operator
+//     LCK_ID  - lock identifier, used to possibly distinguish lock variable
+#define ATOMIC_CRITICAL_REV(TYPE_ID, OP_ID, TYPE, OP, LCK_ID, GOMP_FLAG)       \
+  ATOMIC_BEGIN_REV(TYPE_ID, OP_ID, TYPE, void)                                 \
+  OP_GOMP_CRITICAL_REV(OP, GOMP_FLAG)                                          \
+  OP_CRITICAL_REV(OP, LCK_ID)                                                  \
+  }
+
+/* ------------------------------------------------------------------------- */
+// routines for long double type
+ATOMIC_CRITICAL_REV(float10, sub, long double, -, 10r,
+                    1) // __kmpc_atomic_float10_sub_rev
+ATOMIC_CRITICAL_REV(float10, div, long double, /, 10r,
+                    1) // __kmpc_atomic_float10_div_rev
+#if KMP_HAVE_QUAD
+// routines for _Quad type
+ATOMIC_CRITICAL_REV(float16, sub, QUAD_LEGACY, -, 16r,
+                    1) // __kmpc_atomic_float16_sub_rev
+ATOMIC_CRITICAL_REV(float16, div, QUAD_LEGACY, /, 16r,
+                    1) // __kmpc_atomic_float16_div_rev
+#if (KMP_ARCH_X86)
+ATOMIC_CRITICAL_REV(float16, sub_a16, Quad_a16_t, -, 16r,
+                    1) // __kmpc_atomic_float16_sub_a16_rev
+ATOMIC_CRITICAL_REV(float16, div_a16, Quad_a16_t, /, 16r,
+                    1) // __kmpc_atomic_float16_div_a16_rev
+#endif
+#endif
+
+// routines for complex types
+ATOMIC_CRITICAL_REV(cmplx4, sub, kmp_cmplx32, -, 8c,
+                    1) // __kmpc_atomic_cmplx4_sub_rev
+ATOMIC_CRITICAL_REV(cmplx4, div, kmp_cmplx32, /, 8c,
+                    1) // __kmpc_atomic_cmplx4_div_rev
+ATOMIC_CRITICAL_REV(cmplx8, sub, kmp_cmplx64, -, 16c,
+                    1) // __kmpc_atomic_cmplx8_sub_rev
+ATOMIC_CRITICAL_REV(cmplx8, div, kmp_cmplx64, /, 16c,
+                    1) // __kmpc_atomic_cmplx8_div_rev
+ATOMIC_CRITICAL_REV(cmplx10, sub, kmp_cmplx80, -, 20c,
+                    1) // __kmpc_atomic_cmplx10_sub_rev
+ATOMIC_CRITICAL_REV(cmplx10, div, kmp_cmplx80, /, 20c,
+                    1) // __kmpc_atomic_cmplx10_div_rev
+#if KMP_HAVE_QUAD
+ATOMIC_CRITICAL_REV(cmplx16, sub, CPLX128_LEG, -, 32c,
+                    1) // __kmpc_atomic_cmplx16_sub_rev
+ATOMIC_CRITICAL_REV(cmplx16, div, CPLX128_LEG, /, 32c,
+                    1) // __kmpc_atomic_cmplx16_div_rev
+#if (KMP_ARCH_X86)
+ATOMIC_CRITICAL_REV(cmplx16, sub_a16, kmp_cmplx128_a16_t, -, 32c,
+                    1) // __kmpc_atomic_cmplx16_sub_a16_rev
+ATOMIC_CRITICAL_REV(cmplx16, div_a16, kmp_cmplx128_a16_t, /, 32c,
+                    1) // __kmpc_atomic_cmplx16_div_a16_rev
+#endif
+#endif
+
+#endif // KMP_ARCH_X86 || KMP_ARCH_X86_64
+// End of OpenMP 4.0: x = expr binop x for non-commutative operations.
+
+#endif // OMP_40_ENABLED
+
+/* ------------------------------------------------------------------------ */
+/* Routines for mixed types of LHS and RHS, when RHS is "larger"            */
+/* Note: in order to reduce the total number of types combinations          */
+/*       it is supposed that compiler converts RHS to longest floating type,*/
+/*       that is _Quad, before call to any of these routines                */
+/* Conversion to _Quad will be done by the compiler during calculation,     */
+/*    conversion back to TYPE - before the assignment, like:                */
+/*    *lhs = (TYPE)( (_Quad)(*lhs) OP rhs )                                 */
+/* Performance penalty expected because of SW emulation use                 */
+/* ------------------------------------------------------------------------ */
+
+#define ATOMIC_BEGIN_MIX(TYPE_ID, TYPE, OP_ID, RTYPE_ID, RTYPE)                \
+  void __kmpc_atomic_##TYPE_ID##_##OP_ID##_##RTYPE_ID(                         \
+      ident_t *id_ref, int gtid, TYPE *lhs, RTYPE rhs) {                       \
+    KMP_DEBUG_ASSERT(__kmp_init_serial);                                       \
+    KA_TRACE(100,                                                              \
+             ("__kmpc_atomic_" #TYPE_ID "_" #OP_ID "_" #RTYPE_ID ": T#%d\n",   \
+              gtid));
+
+// -------------------------------------------------------------------------
+#define ATOMIC_CRITICAL_FP(TYPE_ID, TYPE, OP_ID, OP, RTYPE_ID, RTYPE, LCK_ID,  \
+                           GOMP_FLAG)                                          \
+  ATOMIC_BEGIN_MIX(TYPE_ID, TYPE, OP_ID, RTYPE_ID, RTYPE)                      \
+  OP_GOMP_CRITICAL(OP## =, GOMP_FLAG) /* send assignment */                    \
+  OP_CRITICAL(OP## =, LCK_ID) /* send assignment */                            \
+  }
+
+// -------------------------------------------------------------------------
+#if KMP_ARCH_X86 || KMP_ARCH_X86_64
+// -------------------------------------------------------------------------
+// X86 or X86_64: no alignment problems ====================================
+#define ATOMIC_CMPXCHG_MIX(TYPE_ID, TYPE, OP_ID, BITS, OP, RTYPE_ID, RTYPE,    \
+                           LCK_ID, MASK, GOMP_FLAG)                            \
+  ATOMIC_BEGIN_MIX(TYPE_ID, TYPE, OP_ID, RTYPE_ID, RTYPE)                      \
+  OP_GOMP_CRITICAL(OP## =, GOMP_FLAG)                                          \
+  OP_CMPXCHG(TYPE, BITS, OP)                                                   \
+  }
+// -------------------------------------------------------------------------
+#else
+// ------------------------------------------------------------------------
+// Code for other architectures that don't handle unaligned accesses.
+#define ATOMIC_CMPXCHG_MIX(TYPE_ID, TYPE, OP_ID, BITS, OP, RTYPE_ID, RTYPE,    \
+                           LCK_ID, MASK, GOMP_FLAG)                            \
+  ATOMIC_BEGIN_MIX(TYPE_ID, TYPE, OP_ID, RTYPE_ID, RTYPE)                      \
+  OP_GOMP_CRITICAL(OP## =, GOMP_FLAG)                                          \
+  if (!((kmp_uintptr_t)lhs & 0x##MASK)) {                                      \
+    OP_CMPXCHG(TYPE, BITS, OP) /* aligned address */                           \
+  } else {                                                                     \
+    KMP_CHECK_GTID;                                                            \
+    OP_CRITICAL(OP## =, LCK_ID) /* unaligned address - use critical */         \
+  }                                                                            \
+  }
+#endif /* KMP_ARCH_X86 || KMP_ARCH_X86_64 */
+
+// -------------------------------------------------------------------------
+#if KMP_ARCH_X86 || KMP_ARCH_X86_64
+// -------------------------------------------------------------------------
+#define ATOMIC_CMPXCHG_REV_MIX(TYPE_ID, TYPE, OP_ID, BITS, OP, RTYPE_ID,       \
+                               RTYPE, LCK_ID, MASK, GOMP_FLAG)                 \
+  ATOMIC_BEGIN_MIX(TYPE_ID, TYPE, OP_ID, RTYPE_ID, RTYPE)                      \
+  OP_GOMP_CRITICAL_REV(OP, GOMP_FLAG)                                          \
+  OP_CMPXCHG_REV(TYPE, BITS, OP)                                               \
+  }
+#define ATOMIC_CRITICAL_REV_FP(TYPE_ID, TYPE, OP_ID, OP, RTYPE_ID, RTYPE,      \
+                               LCK_ID, GOMP_FLAG)                              \
+  ATOMIC_BEGIN_MIX(TYPE_ID, TYPE, OP_ID, RTYPE_ID, RTYPE)                      \
+  OP_GOMP_CRITICAL_REV(OP, GOMP_FLAG)                                          \
+  OP_CRITICAL_REV(OP, LCK_ID)                                                  \
+  }
+#endif /* KMP_ARCH_X86 || KMP_ARCH_X86_64 */
+
+// RHS=float8
+ATOMIC_CMPXCHG_MIX(fixed1, char, mul, 8, *, float8, kmp_real64, 1i, 0,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed1_mul_float8
+ATOMIC_CMPXCHG_MIX(fixed1, char, div, 8, /, float8, kmp_real64, 1i, 0,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed1_div_float8
+ATOMIC_CMPXCHG_MIX(fixed2, short, mul, 16, *, float8, kmp_real64, 2i, 1,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed2_mul_float8
+ATOMIC_CMPXCHG_MIX(fixed2, short, div, 16, /, float8, kmp_real64, 2i, 1,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed2_div_float8
+ATOMIC_CMPXCHG_MIX(fixed4, kmp_int32, mul, 32, *, float8, kmp_real64, 4i, 3,
+                   0) // __kmpc_atomic_fixed4_mul_float8
+ATOMIC_CMPXCHG_MIX(fixed4, kmp_int32, div, 32, /, float8, kmp_real64, 4i, 3,
+                   0) // __kmpc_atomic_fixed4_div_float8
+ATOMIC_CMPXCHG_MIX(fixed8, kmp_int64, mul, 64, *, float8, kmp_real64, 8i, 7,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed8_mul_float8
+ATOMIC_CMPXCHG_MIX(fixed8, kmp_int64, div, 64, /, float8, kmp_real64, 8i, 7,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed8_div_float8
+ATOMIC_CMPXCHG_MIX(float4, kmp_real32, add, 32, +, float8, kmp_real64, 4r, 3,
+                   KMP_ARCH_X86) // __kmpc_atomic_float4_add_float8
+ATOMIC_CMPXCHG_MIX(float4, kmp_real32, sub, 32, -, float8, kmp_real64, 4r, 3,
+                   KMP_ARCH_X86) // __kmpc_atomic_float4_sub_float8
+ATOMIC_CMPXCHG_MIX(float4, kmp_real32, mul, 32, *, float8, kmp_real64, 4r, 3,
+                   KMP_ARCH_X86) // __kmpc_atomic_float4_mul_float8
+ATOMIC_CMPXCHG_MIX(float4, kmp_real32, div, 32, /, float8, kmp_real64, 4r, 3,
+                   KMP_ARCH_X86) // __kmpc_atomic_float4_div_float8
+
+// RHS=float16 (deprecated, to be removed when we are sure the compiler does not
+// use them)
+#if KMP_HAVE_QUAD
+ATOMIC_CMPXCHG_MIX(fixed1, char, add, 8, +, fp, _Quad, 1i, 0,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed1_add_fp
+ATOMIC_CMPXCHG_MIX(fixed1u, uchar, add, 8, +, fp, _Quad, 1i, 0,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed1u_add_fp
+ATOMIC_CMPXCHG_MIX(fixed1, char, sub, 8, -, fp, _Quad, 1i, 0,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed1_sub_fp
+ATOMIC_CMPXCHG_MIX(fixed1u, uchar, sub, 8, -, fp, _Quad, 1i, 0,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed1u_sub_fp
+ATOMIC_CMPXCHG_MIX(fixed1, char, mul, 8, *, fp, _Quad, 1i, 0,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed1_mul_fp
+ATOMIC_CMPXCHG_MIX(fixed1u, uchar, mul, 8, *, fp, _Quad, 1i, 0,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed1u_mul_fp
+ATOMIC_CMPXCHG_MIX(fixed1, char, div, 8, /, fp, _Quad, 1i, 0,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed1_div_fp
+ATOMIC_CMPXCHG_MIX(fixed1u, uchar, div, 8, /, fp, _Quad, 1i, 0,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed1u_div_fp
+
+ATOMIC_CMPXCHG_MIX(fixed2, short, add, 16, +, fp, _Quad, 2i, 1,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed2_add_fp
+ATOMIC_CMPXCHG_MIX(fixed2u, ushort, add, 16, +, fp, _Quad, 2i, 1,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed2u_add_fp
+ATOMIC_CMPXCHG_MIX(fixed2, short, sub, 16, -, fp, _Quad, 2i, 1,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed2_sub_fp
+ATOMIC_CMPXCHG_MIX(fixed2u, ushort, sub, 16, -, fp, _Quad, 2i, 1,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed2u_sub_fp
+ATOMIC_CMPXCHG_MIX(fixed2, short, mul, 16, *, fp, _Quad, 2i, 1,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed2_mul_fp
+ATOMIC_CMPXCHG_MIX(fixed2u, ushort, mul, 16, *, fp, _Quad, 2i, 1,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed2u_mul_fp
+ATOMIC_CMPXCHG_MIX(fixed2, short, div, 16, /, fp, _Quad, 2i, 1,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed2_div_fp
+ATOMIC_CMPXCHG_MIX(fixed2u, ushort, div, 16, /, fp, _Quad, 2i, 1,
+                   KMP_ARCH_X86) // __kmpc_atomic_fixed2u_div_fp
+
+ATOMIC_CMPXCHG_MIX(fixed4, kmp_int32, add, 32, +, fp, _Quad, 4i, 3,
+                   0) // __kmpc_atomic_fixed4_add_fp
+ATOMIC_CMPXCHG_MIX(fixed4u, kmp_uint32, add, 32, +, fp, _Quad, 4i, 3,
+        

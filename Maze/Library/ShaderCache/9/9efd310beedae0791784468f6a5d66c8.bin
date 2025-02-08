@@ -1,0 +1,82 @@
+//////////////////////////////////////////////////////////////////////////////
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  IncrementalClean Targets
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  -->
+
+  <!--
+  ==================================================================================================
+  IncrementalClean
+
+    Remove files that were produced in a prior build but weren't produced in the current build.
+    The reason is that if, for example, the name of the .msi/.msm has changed we want to delete the
+    old copy.
+
+    Leave the Clean cache file containing only the files produced in the current build.
+  ==================================================================================================
+  -->
+  <Target
+    Name="IncrementalClean"
+    DependsOnTargets="_CleanGetCurrentAndPriorFileWrites">
+
+    <!-- Subtract list of files produced in this build from list of files produced in prior builds. -->
+    <CreateItem Include="@(_CleanPriorFileWrites)" Exclude="@(_CleanCurrentFileWrites)">
+      <Output TaskParameter="Include" ItemName="_CleanOrphanFileWrites" />
+    </CreateItem>
+
+    <!-- Find all files in the final output directory. -->
+    <FindUnderPath Path="$(OutDir)" Files="@(_CleanOrphanFileWrites)">
+      <Output TaskParameter="InPath" ItemName="_CleanOrphanFileWritesInOutput" />
+    </FindUnderPath>
+
+    <!-- Find all files in the intermediate output directory. -->
+    <FindUnderPath Path="$(IntermediateOutputPath)" Files="@(_CleanOrphanFileWrites)">
+      <Output TaskParameter="InPath" ItemName="_CleanOrphanFileWritesInIntermediate" />
+    </FindUnderPath>
+
+    <!-- Delete the orphaned files. -->
+    <Delete
+      Files="@(_CleanOrphanFileWritesInIntermediate);@(_CleanOrphanFileWritesInOutput)"
+      TreatErrorsAsWarnings="true">
+
+      <Output TaskParameter="DeletedFiles" ItemName="_CleanOrphanFilesDeleted" />
+    </Delete>
+
+    <!-- Create a list of everything that wasn't deleted. -->
+    <CreateItem Include="@(_CleanPriorFileWrites);@(_CleanCurrentFileWrites)" Exclude="@(_CleanOrphanFilesDeleted)">
+      <Output TaskParameter="Include" ItemName="_CleanRemainingFileWritesAfterIncrementalClean" />
+    </CreateItem>
+
+    <!-- Remove duplicates. -->
+    <RemoveDuplicates Inputs="@(_CleanRemainingFileWritesAfterIncrementalClean)">
+      <Output TaskParameter="Filtered" ItemName="_CleanUniqueRemainingFileWritesAfterIncrementalClean" />
+    </RemoveDuplicates>
+
+    <!-- Make sure the directory exists. -->
+    <MakeDir Directories="$(IntermediateOutputPath)" />
+
+    <!-- Write new list of current files back to disk, replacing the existing list.-->
+    <WriteLinesToFile
+      File="$(IntermediateOutputPath)$(CleanFile)"
+      Lines="@(_CleanUniqueRemainingFileWritesAfterIncrementalClean)"
+      Overwrite="true" />
+
+  </Target>
+
+  <!--
+  ==================================================================================================
+  _CleanGetCurrentAndPriorFileWrites
+
+    Get the list of files built in a prior build and the current build.
+  ==================================================================================================
+  -->
+  <Target
+    Name="_CleanGetCurrentAndPriorFileWrites">
+
+    <!-- Read the list of files produced by a prior build from disk. -->
+    <ReadLinesFromFile File="$(IntermediateOutputPath)$(CleanFile)">
+      <Output TaskParameter="Lines" ItemName="_CleanPriorFileWrites" />
+    </ReadLinesFromFile>
+
+    <!-- Find all files in the final output dire

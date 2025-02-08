@@ -1,0 +1,222 @@
+          case MemberAttributes.Final:
+                    Output.Write("");
+                    break;
+                case MemberAttributes.Static:
+                    // ignore Static for members in a Module since all members in a module are already
+                    //  static and it is a syntax error to explicitly mark them as static
+                    //
+                    if (!IsCurrentModule)
+                    {
+                        Output.Write("Shared ");
+                    }
+                    break;
+                case MemberAttributes.Override:
+                    Output.Write("Overrides ");
+                    break;
+                case MemberAttributes.Private:
+                    Output.Write("Private ");
+                    break;
+                default:
+                    switch (attributes & MemberAttributes.AccessMask)
+                    {
+                        case MemberAttributes.Family:
+                        case MemberAttributes.Public:
+                        case MemberAttributes.Assembly:
+                            Output.Write("Overridable ");
+                            break;
+                        default:
+                            // nothing;
+                            break;
+                    }
+                    break;
+            }
+        }
+
+        protected override void OutputOperator(CodeBinaryOperatorType op)
+        {
+            switch (op)
+            {
+                case CodeBinaryOperatorType.IdentityInequality:
+                    Output.Write("<>");
+                    break;
+                case CodeBinaryOperatorType.IdentityEquality:
+                    Output.Write("Is");
+                    break;
+                case CodeBinaryOperatorType.BooleanOr:
+                    Output.Write("OrElse");
+                    break;
+                case CodeBinaryOperatorType.BooleanAnd:
+                    Output.Write("AndAlso");
+                    break;
+                case CodeBinaryOperatorType.ValueEquality:
+                    Output.Write('=');
+                    break;
+                case CodeBinaryOperatorType.Modulus:
+                    Output.Write("Mod");
+                    break;
+                case CodeBinaryOperatorType.BitwiseOr:
+                    Output.Write("Or");
+                    break;
+                case CodeBinaryOperatorType.BitwiseAnd:
+                    Output.Write("And");
+                    break;
+                default:
+                    base.OutputOperator(op);
+                    break;
+            }
+        }
+
+        private void GenerateNotIsNullExpression(CodeExpression e)
+        {
+            Output.Write("(Not (");
+            GenerateExpression(e);
+            Output.Write(") Is ");
+            Output.Write(NullToken);
+            Output.Write(')');
+        }
+
+        protected override void GenerateBinaryOperatorExpression(CodeBinaryOperatorExpression e)
+        {
+            if (e.Operator != CodeBinaryOperatorType.IdentityInequality)
+            {
+                base.GenerateBinaryOperatorExpression(e);
+                return;
+            }
+
+            // "o <> nothing" should be "not o is nothing"
+            if (e.Right is CodePrimitiveExpression && ((CodePrimitiveExpression)e.Right).Value == null)
+            {
+                GenerateNotIsNullExpression(e.Left);
+                return;
+            }
+            if (e.Left is CodePrimitiveExpression && ((CodePrimitiveExpression)e.Left).Value == null)
+            {
+                GenerateNotIsNullExpression(e.Right);
+                return;
+            }
+
+            base.GenerateBinaryOperatorExpression(e);
+        }
+
+        protected override string GetResponseFileCmdArgs(CompilerParameters options, string cmdArgs)
+        {
+            // Always specify the /noconfig flag (outside of the response file) 
+            return "/noconfig " + base.GetResponseFileCmdArgs(options, cmdArgs);
+        }
+
+        protected override void OutputIdentifier(string ident)
+        {
+            Output.Write(CreateEscapedIdentifier(ident));
+        }
+
+        protected override void OutputType(CodeTypeReference typeRef)
+        {
+            Output.Write(GetTypeOutputWithoutArrayPostFix(typeRef));
+        }
+
+        private void OutputTypeAttributes(CodeTypeDeclaration e)
+        {
+            if ((e.Attributes & MemberAttributes.New) != 0)
+            {
+                Output.Write("Shadows ");
+            }
+
+            TypeAttributes attributes = e.TypeAttributes;
+
+            if (e.IsPartial)
+            {
+                Output.Write("Partial ");
+            }
+
+            switch (attributes & TypeAttributes.VisibilityMask)
+            {
+                case TypeAttributes.Public:
+                case TypeAttributes.NestedPublic:
+                    Output.Write("Public ");
+                    break;
+                case TypeAttributes.NestedPrivate:
+                    Output.Write("Private ");
+                    break;
+
+                case TypeAttributes.NestedFamily:
+                    Output.Write("Protected ");
+                    break;
+                case TypeAttributes.NotPublic:
+                case TypeAttributes.NestedAssembly:
+                case TypeAttributes.NestedFamANDAssem:
+                    Output.Write("Friend ");
+                    break;
+                case TypeAttributes.NestedFamORAssem:
+                    Output.Write("Protected Friend ");
+                    break;
+            }
+
+            if (e.IsStruct)
+            {
+                Output.Write("Structure ");
+            }
+            else if (e.IsEnum)
+            {
+                Output.Write("Enum ");
+            }
+            else
+            {
+                switch (attributes & TypeAttributes.ClassSemanticsMask)
+                {
+                    case TypeAttributes.Class:
+                        // if this "class" should generate as a module, then don't check
+                        //  inheritance flags since modules can't inherit
+                        if (IsCurrentModule)
+                        {
+                            Output.Write("Module ");
+                        }
+                        else
+                        {
+                            if ((attributes & TypeAttributes.Sealed) == TypeAttributes.Sealed)
+                            {
+                                Output.Write("NotInheritable ");
+                            }
+                            if ((attributes & TypeAttributes.Abstract) == TypeAttributes.Abstract)
+                            {
+                                Output.Write("MustInherit ");
+                            }
+                            Output.Write("Class ");
+                        }
+                        break;
+                    case TypeAttributes.Interface:
+                        Output.Write("Interface ");
+                        break;
+                }
+            }
+        }
+
+        protected override void OutputTypeNamePair(CodeTypeReference typeRef, string name)
+        {
+            if (string.IsNullOrEmpty(name))
+                name = "__exception";
+
+            OutputIdentifier(name);
+            OutputArrayPostfix(typeRef);
+            Output.Write(" As ");
+            OutputType(typeRef);
+        }
+
+        private string GetArrayPostfix(CodeTypeReference typeRef)
+        {
+            string s = "";
+            if (typeRef.ArrayElementType != null)
+            {
+                // Recurse up
+                s = GetArrayPostfix(typeRef.ArrayElementType);
+            }
+
+            if (typeRef.ArrayRank > 0)
+            {
+                char[] results = new char[typeRef.ArrayRank + 1];
+                results[0] = '(';
+                results[typeRef.ArrayRank] = ')';
+                for (int i = 1; i < typeRef.ArrayRank; i++)
+                {
+                    results[i] = ',';
+                }
+           

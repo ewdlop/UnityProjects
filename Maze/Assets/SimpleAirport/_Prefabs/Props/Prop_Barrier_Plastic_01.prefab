@@ -1,0 +1,80 @@
+//===- llvm/unittest/IR/PassManager.cpp - PassManager tests ---------------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+
+#include "llvm/IR/PassManager.h"
+#include "llvm/AsmParser/Parser.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/Support/SourceMgr.h"
+#include "gtest/gtest.h"
+
+using namespace llvm;
+
+namespace {
+
+class TestFunctionAnalysis : public AnalysisInfoMixin<TestFunctionAnalysis> {
+public:
+  struct Result {
+    Result(int Count) : InstructionCount(Count) {}
+    int InstructionCount;
+  };
+
+  TestFunctionAnalysis(int &Runs) : Runs(Runs) {}
+
+  /// \brief Run the analysis pass over the function and return a result.
+  Result run(Function &F, FunctionAnalysisManager &AM) {
+    ++Runs;
+    int Count = 0;
+    for (Function::iterator BBI = F.begin(), BBE = F.end(); BBI != BBE; ++BBI)
+      for (BasicBlock::iterator II = BBI->begin(), IE = BBI->end(); II != IE;
+           ++II)
+        ++Count;
+    return Result(Count);
+  }
+
+private:
+  friend AnalysisInfoMixin<TestFunctionAnalysis>;
+  static AnalysisKey Key;
+
+  int &Runs;
+};
+
+AnalysisKey TestFunctionAnalysis::Key;
+
+class TestModuleAnalysis : public AnalysisInfoMixin<TestModuleAnalysis> {
+public:
+  struct Result {
+    Result(int Count) : FunctionCount(Count) {}
+    int FunctionCount;
+  };
+
+  TestModuleAnalysis(int &Runs) : Runs(Runs) {}
+
+  Result run(Module &M, ModuleAnalysisManager &AM) {
+    ++Runs;
+    int Count = 0;
+    for (Module::iterator I = M.begin(), E = M.end(); I != E; ++I)
+      ++Count;
+    return Result(Count);
+  }
+
+private:
+  friend AnalysisInfoMixin<TestModuleAnalysis>;
+  static AnalysisKey Key;
+
+  int &Runs;
+};
+
+AnalysisKey TestModuleAnalysis::Key;
+
+struct TestModulePass : PassInfoMixin<TestModulePass> {
+  TestModulePass(int &RunCount) : RunCount(RunCount) {}
+
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &) 

@@ -1,0 +1,82 @@
+s)
+            {
+                if (!t.IsSetKeyDerivation(requireDerivedKeys))
+                    return false;
+            }
+            foreach (SupportingTokenParameters t in this.OptionalOperationSupportingTokenParameters.Values)
+            {
+                if (!t.IsSetKeyDerivation(requireDerivedKeys))
+                    return false;
+            }
+            return true;
+        }
+
+        internal ChannelProtectionRequirements GetProtectionRequirements(AddressingVersion addressing, ProtectionLevel defaultProtectionLevel)
+        {
+            if (addressing == null)
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgumentNull("addressing");
+
+            ChannelProtectionRequirements result = new ChannelProtectionRequirements();
+            ProtectionLevel supportedRequestProtectionLevel = this.GetIndividualProperty<ISecurityCapabilities>().SupportedRequestProtectionLevel;
+            ProtectionLevel supportedResponseProtectionLevel = this.GetIndividualProperty<ISecurityCapabilities>().SupportedResponseProtectionLevel;
+
+            bool canSupportMoreThanTheDefault = 
+                (ProtectionLevelHelper.IsStrongerOrEqual(supportedRequestProtectionLevel, defaultProtectionLevel)
+                && ProtectionLevelHelper.IsStrongerOrEqual(supportedResponseProtectionLevel, defaultProtectionLevel));
+            if (canSupportMoreThanTheDefault)
+            {
+                MessagePartSpecification signedParts = new MessagePartSpecification();
+                MessagePartSpecification encryptedParts = new MessagePartSpecification();
+                if (defaultProtectionLevel != ProtectionLevel.None)
+                {
+                    signedParts.IsBodyIncluded = true;
+                    if (defaultProtectionLevel == ProtectionLevel.EncryptAndSign)
+                    {
+                        encryptedParts.IsBodyIncluded = true;
+                    }
+                }
+                signedParts.MakeReadOnly();
+                encryptedParts.MakeReadOnly();
+                if (addressing.FaultAction != null)
+                {
+                    // Addressing faults
+                    result.IncomingSignatureParts.AddParts(signedParts, addressing.FaultAction);
+                    result.OutgoingSignatureParts.AddParts(signedParts, addressing.FaultAction);
+                    result.IncomingEncryptionParts.AddParts(encryptedParts, addressing.FaultAction);
+                    result.OutgoingEncryptionParts.AddParts(encryptedParts, addressing.FaultAction);
+                }
+                if (addressing.DefaultFaultAction != null)
+                {
+                    // Faults that do not specify a particular action
+                    result.IncomingSignatureParts.AddParts(signedParts, addressing.DefaultFaultAction);
+                    result.OutgoingSignatureParts.AddParts(signedParts, addressing.DefaultFaultAction);
+                    result.IncomingEncryptionParts.AddParts(encryptedParts, addressing.DefaultFaultAction);
+                    result.OutgoingEncryptionParts.AddParts(encryptedParts, addressing.DefaultFaultAction);
+                }
+                // Infrastructure faults
+                result.IncomingSignatureParts.AddParts(signedParts, FaultCodeConstants.Actions.NetDispatcher);
+                result.OutgoingSignatureParts.AddParts(signedParts, FaultCodeConstants.Actions.NetDispatcher);
+                result.IncomingEncryptionParts.AddParts(encryptedParts, FaultCodeConstants.Actions.NetDispatcher);
+                result.OutgoingEncryptionParts.AddParts(encryptedParts, FaultCodeConstants.Actions.NetDispatcher);
+            }
+
+            return result;
+        }
+
+        public override T GetProperty<T>(BindingContext context)
+        {
+            if (context == null)
+            {
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgumentNull("context");
+            }
+            if (typeof(T) == typeof(ISecurityCapabilities))
+            {
+                return (T)(object)GetSecurityCapabilities(context);
+            }
+            else if (typeof(T) == typeof(IdentityVerifier))
+            {
+                return (T)(object)this.localClientSettings.IdentityVerifier;
+            }
+            else
+            {
+       

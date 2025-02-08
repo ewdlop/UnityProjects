@@ -1,0 +1,662 @@
+;
+		}
+
+		public void AddTryBlock(TryBlock tryBlock) 
+		{
+			if (exceptions == null) 
+				exceptions = new ArrayList();
+			else if (exceptions.Contains(tryBlock)) return;
+			exceptions.Add(tryBlock);
+			tryBlock.ResolveCatchBlocks (metaData);
+		}
+
+		/// <summary>
+		/// Create a new label at this position in the code buffer
+		/// </summary>
+		/// <returns>the label at the current position</returns>
+		public CILLabel NewCodedLabel() 
+		{
+			CILLabel lab = new CILLabel();
+			AddToBuffer(new LabelInstr(lab));
+			return lab;
+		}
+
+		/// <summary>
+		/// Mark this position as the start of a new block
+		/// (try, catch, filter, finally or fault)
+		/// </summary>
+		public void StartBlock() 
+		{
+			if (blockStack == null) blockStack = new ArrayList();
+			blockStack.Insert(0,NewCodedLabel());
+		}
+
+		/// <summary>
+		/// Mark this position as the end of the last started block and
+		/// make it a try block.  This try block is added to the current 
+		/// instructions (ie do not need to call AddTryBlock)
+		/// </summary>
+		/// <returns>The try block just ended</returns>
+		public TryBlock EndTryBlock() 
+		{
+			TryBlock tBlock = new TryBlock((CILLabel)blockStack[0],NewCodedLabel());
+			blockStack.RemoveAt(0);
+			AddTryBlock(tBlock);
+			return tBlock;
+		}
+
+		/// <summary>
+		/// Mark this position as the end of the last started block and
+		/// make it a catch block.  This catch block is associated with the
+		/// specified try block.
+		/// </summary>
+		/// <param name="exceptType">the exception type to be caught</param>
+		/// <param name="tryBlock">the try block associated with this catch block</param>
+		public void EndCatchBlock(Class exceptType, TryBlock tryBlock) 
+		{
+			Catch catchBlock = new Catch(exceptType,(CILLabel)blockStack[0],
+					NewCodedLabel());
+			tryBlock.AddHandler(catchBlock);
+		}
+
+		/// <summary>
+		/// Mark this position as the end of the last started block and
+		/// make it a filter block.  This filter block is associated with the
+		/// specified try block.
+		/// </summary>
+		/// <param name="filterLab">the label where the filter code is</param>
+		/// <param name="tryBlock">the try block associated with this filter block</param>
+		public void EndFilterBlock(CILLabel filterLab, TryBlock tryBlock) 
+		{
+			Filter filBlock = new Filter(filterLab,(CILLabel)blockStack[0],NewCodedLabel());
+			tryBlock.AddHandler(filBlock);
+		}
+
+		/// <summary>
+		/// Mark this position as the end of the last started block and
+		/// make it a finally block.  This finally block is associated with the
+		/// specified try block.
+		/// </summary>
+		/// <param name="tryBlock">the try block associated with this finally block</param>
+		public void EndFinallyBlock(TryBlock tryBlock) 
+		{
+			Finally finBlock= new Finally((CILLabel)blockStack[0],NewCodedLabel());
+			tryBlock.AddHandler(finBlock);
+		}
+
+		/// <summary>
+		/// Mark this position as the end of the last started block and
+		/// make it a fault block.  This fault block is associated with the
+		/// specified try block.
+		/// </summary>
+		/// <param name="tryBlock">the try block associated with this fault block</param>
+		public void EndFaultBlock(TryBlock tryBlock) 
+		{
+			Fault fBlock= new Fault((CILLabel)blockStack[0],NewCodedLabel());
+			tryBlock.AddHandler(fBlock);
+		}
+
+		internal uint GetCodeSize() 
+		{
+			return codeSize + paddingNeeded + exceptSize;
+		}
+
+		internal void CheckCode(uint locSigIx, bool initLocals, int maxStack) 
+		{
+			if (tide == 0) return;
+			bool changed = true;
+			while (changed) {
+				changed = false;
+				for (int i=0; i < tide; i++) {
+					changed = buffer[i].Check(metaData) || changed;
+				}
+				if (changed) {
+					for (int i=1; i < tide; i++) {
+						buffer[i].offset = buffer[i-1].offset + buffer[i-1].size;
+					}
+					offset = buffer[tide-1].offset + buffer[tide-1].size;
+				}
+			}
+			codeSize = offset;
+			// Console.WriteLine("codeSize before header added = " + codeSize);
+			if ((offset < smallSize) && (maxStack <= 8) && (locSigIx == 0) && (exceptions == null)) {
+				// can use tiny header
+				//Console.WriteLine("Tiny Header");
+				tinyFormat = true;
+				headerFlags = (ushort)(TinyFormat | ((ushort)codeSize << 2));
+				codeSize++;
+				if ((codeSize % 4) != 0) { paddingNeeded = 4 - (codeSize % 4); }
+			} else {
+				//Console.WriteLine("Fat Header");
+				tinyFormat = false;
+				localSigIx = locSigIx;
+				this.maxStack = (short)maxStack;
+				headerFlags = FatFormat;
+				if (exceptions != null) {
+					// Console.WriteLine("Got exceptions");
+					headerFlags |= MoreSects;
+					uint numExceptClauses = 0;
+					for (int i=0; i < exceptions.Count; i++) {
+						TryBlock tryBlock = (TryBlock)exceptions[i];
+						tryBlock.SetSize();
+						numExceptClauses += (uint)tryBlock.NumHandlers();
+						if (tryBlock.isFat()) fatExceptionFormat = true;
+					}
+
+					uint data_size = ExHeaderSize + numExceptClauses *
+						(fatExceptionFormat ? FatExClauseSize : SmlExClauseSize);
+
+					if (data_size > 255)
+						fatExceptionFormat = true;
+
+					// Console.WriteLine("numexceptclauses = " + numExceptClauses);
+					if (fatExceptionFormat) {
+						// Console.WriteLine("Fat exception format");
+						exceptHeader = FatExceptTable;
+						exceptSize = ExHeaderSize + numExceptClauses * FatExClauseSize;
+					} else {
+						// Console.WriteLine("Tiny exception format");
+						exceptHeader = SmlExceptTable;
+						exceptSize = ExHeaderSize + numExceptClauses * SmlExClauseSize;
+					}
+					// Console.WriteLine("exceptSize = " + exceptSize);
+				}
+				if (initLocals) headerFlags |= InitLocals;
+				if ((offset % 4) != 0) { paddingNeeded = 4 - (offset % 4); }
+				codeSize += FatSize;
+			}
+			// Console.WriteLine("codeSize = " + codeSize + "  headerFlags = " + 
+			//                   Hex.Short(headerFlags));
+		}
+
+		internal void Write(FileImage output) 
+		{
+			// Console.WriteLine("Writing header flags = " + Hex.Short(headerFlags));
+			if (tinyFormat) {
+				// Console.WriteLine("Writing tiny code");
+				output.Write((byte)headerFlags);
+			} else {
+				// Console.WriteLine("Writing fat code");
+				output.Write(headerFlags);
+				output.Write((ushort)maxStack);
+				output.Write(offset);
+				output.Write(localSigIx);
+			}
+			// Console.WriteLine(Hex.Int(tide) + " CIL instructions");
+			// Console.WriteLine("starting instructions at " + output.Seek(0,SeekOrigin.Current));
+			for (int i=0; i < tide; i++) {
+				buffer[i].Write(output);
+			}
+			// Console.WriteLine("ending instructions at " + output.Seek(0,SeekOrigin.Current));
+			for (int i=0; i < paddingNeeded; i++) { output.Write((byte)0); }
+			if (exceptions != null) {
+				// Console.WriteLine("Writing exceptions");
+				// Console.WriteLine("header = " + Hex.Short(exceptHeader) + " exceptSize = " + Hex.Int(exceptSize));
+				output.Write(exceptHeader);
+				output.Write3Bytes((uint)exceptSize);
+				for (int i=0; i < exceptions.Count; i++) {
+					TryBlock tryBlock = (TryBlock)exceptions[i];
+					tryBlock.Write(output,fatExceptionFormat);
+				}
+			}
+		}
+
+	}
+
+	/**************************************************************************/  
+	public abstract class CodeBlock {
+
+		private static readonly int maxCodeSize = 255;
+		protected CILLabel start, end;
+		protected bool small = true;
+
+		public CodeBlock(CILLabel start, CILLabel end) 
+		{
+			this.start = start;
+			this.end = end;
+		}
+
+		internal virtual bool isFat() 
+		{
+			// Console.WriteLine("block start = " + start.GetLabelOffset() +
+			//                  "  block end = " + end.GetLabelOffset());
+			return (end.GetLabelOffset() - start.GetLabelOffset()) > maxCodeSize;
+		}
+
+		internal virtual void Write(FileImage output, bool fatFormat) 
+		{
+			if (fatFormat) output.Write(start.GetLabelOffset());
+			else output.Write((short)start.GetLabelOffset());
+			uint len = end.GetLabelOffset() - start.GetLabelOffset();
+			if (fatFormat) output.Write(len);
+			else output.Write((byte)len);
+		}
+
+	}
+
+	/// <summary>
+	/// The descriptor for a guarded block (.try)
+	/// </summary>
+	public class TryBlock : CodeBlock {
+		protected bool fatFormat = false;
+		protected int flags = 0;
+		ArrayList handlers = new ArrayList();
+
+		/// <summary>
+		/// Create a new try block
+		/// </summary>
+		/// <param name="start">start label for the try block</param>
+		/// <param name="end">end label for the try block</param>
+		public TryBlock(CILLabel start, CILLabel end) : base(start,end) { }
+
+		/// <summary>
+		/// Add a handler to this try block
+		/// </summary>
+		/// <param name="handler">a handler to be added to the try block</param>
+		public void AddHandler(HandlerBlock handler) 
+		{
+			flags = handler.GetFlag();
+			handlers.Add(handler);
+		}
+
+		internal void SetSize() 
+		{
+			fatFormat = base.isFat();
+			if (fatFormat) return;
+			for (int i=0; i < handlers.Count; i++) {
+				HandlerBlock handler = (HandlerBlock)handlers[i];
+				if (handler.isFat()) {
+					fatFormat = true;
+					return;
+				}
+			}
+		}
+
+		internal int NumHandlers() 
+		{
+			return handlers.Count;
+		}
+
+		internal override bool isFat() 
+		{
+			return fatFormat;
+		}
+
+		//Hackish
+		internal void ResolveCatchBlocks (MetaData md)
+		{
+			for (int i=0; i < handlers.Count; i++) {
+				Catch c = handlers [i] as Catch;
+				if (c != null)
+					c.ResolveType (md);
+			}
+		}
+
+		internal override void Write(FileImage output, bool fatFormat) 
+		{
+			// Console.WriteLine("writing exception details");
+			for (int i=0; i < handlers.Count; i++) {
+				// Console.WriteLine("Except block " + i);
+				HandlerBlock handler = (HandlerBlock)handlers[i];
+				if (fatFormat) output.Write(flags);
+				else output.Write((short)flags);
+				// Console.WriteLine("flags = " + Hex.Short(flags));
+				base.Write(output,fatFormat);
+				handler.Write(output,fatFormat);
+			}
+		}
+	}
+
+	public abstract class HandlerBlock : CodeBlock  {
+
+		protected static readonly short ExceptionFlag = 0;
+		protected static readonly short FilterFlag = 0x01;
+		protected static readonly short FinallyFlag = 0x02;
+		protected static readonly short FaultFlag = 0x04;
+
+		public HandlerBlock(CILLabel start, CILLabel end) : base(start,end) { }
+
+		internal virtual short GetFlag() { return ExceptionFlag; }
+
+		internal override void Write(FileImage output, bool fatFormat) 
+		{
+			base.Write(output,fatFormat);
+		}
+
+	}
+
+	/// <summary>
+	/// The descriptor for a catch clause (.catch)
+	/// </summary>
+	public class Catch : HandlerBlock  {
+
+		MetaDataElement exceptType;
+
+		/// <summary>
+		/// Create a new catch clause
+		/// </summary>
+		/// <param name="except">the exception to be caught</param>
+		/// <param name="handlerStart">start of the handler code</param>
+		/// <param name="handlerEnd">end of the handler code</param>
+		public Catch(Class except, CILLabel handlerStart, CILLabel handlerEnd)
+			: base(handlerStart, handlerEnd)
+		{
+			exceptType = except;
+		}
+
+		public Catch(Type except, CILLabel handlerStart, CILLabel handlerEnd)
+			: base(handlerStart,handlerEnd) 
+		{
+			exceptType = except;
+		}
+
+		internal void ResolveType (MetaData md)
+		{
+		       exceptType = ((Type) exceptType).GetTypeSpec (md);
+		}
+
+		internal override void Write(FileImage output, bool fatFormat) 
+		{
+			base.Write(output,fatFormat);
+			output.Write(exceptType.Token());
+		}
+	}
+
+	/// <summary>
+	/// The descriptor for a filter clause (.filter)
+	/// </summary>
+	public class Filter : HandlerBlock  {
+
+		CILLabel filterLabel;
+
+		/// <summary>
+		/// Create a new filter clause
+		/// </summary>
+		/// <param name="filterLabel">the label where the filter code starts</param>
+		/// <param name="handlerStart">the start of the handler code</param>
+		/// <param name="handlerEnd">the end of the handler code</param>
+		public Filter(CILLabel filterLabel, CILLabel handlerStart, 
+				CILLabel handlerEnd) : base(handlerStart,handlerEnd) 
+				{
+			this.filterLabel = filterLabel;
+		}
+
+		internal override short GetFlag() 
+		{
+			return FilterFlag; 
+		}
+
+		internal override void Write(FileImage output, bool fatFormat) 
+		{
+			base.Write(output,fatFormat);
+			output.Write(filterLabel.GetLabelOffset());
+		}
+
+	}
+
+	/// <summary>
+	/// Descriptor for a finally block (.finally)
+	/// </summary>
+	public class Finally : HandlerBlock  {
+
+		/// <summary>
+		/// Create a new finally clause
+		/// </summary>
+		/// <param name="finallyStart">start of finally code</param>
+		/// <param name="finallyEnd">end of finally code</param>
+		public Finally(CILLabel finallyStart, CILLabel finallyEnd)
+			: base(finallyStart,finallyEnd) { }
+
+		internal override short GetFlag() 
+		{
+			return FinallyFlag; 
+		}
+
+		internal override void Write(FileImage output, bool fatFormat) 
+		{
+			base.Write(output,fatFormat);
+			output.Write((int)0);
+		}
+
+	}
+
+	/// <summary>
+	/// Descriptor for a fault block (.fault)
+	/// </summary>
+	public class Fault : HandlerBlock  {
+
+		/// <summary>
+		/// Create a new fault clause
+		/// </summary>
+		/// <param name="faultStart">start of the fault code</param>
+		/// <param name="faultEnd">end of the fault code</param>
+		public Fault(CILLabel faultStart, CILLabel faultEnd)
+			: base(faultStart,faultEnd) { }
+
+		internal override short GetFlag() 
+		{
+			return FaultFlag; 
+		}
+
+		internal override void Write(FileImage output, bool fatFormat) 
+		{
+			base.Write(output,fatFormat);
+			output.Write((int)0);
+
+		}
+	}
+
+	/**************************************************************************/  
+	/// <summary>
+	/// Descriptor for the locals for a method
+	/// </summary>
+	public class LocalSig : Signature {
+
+		private static readonly byte LocalSigByte = 0x7;
+		Local[] locals;
+
+		public LocalSig(Local[] locals)         
+		{
+			this.locals = locals;
+			tabIx = MDTable.StandAloneSig;
+		}
+
+		internal sealed override void BuildTables(MetaData md) 
+		{
+			if (done) return;
+			MemoryStream sig = new MemoryStream();
+			sig.WriteByte(LocalSigByte);
+			MetaData.CompressNum((uint)locals.Length,sig);
+			for (int i=0; i < locals.Length; i++) {
+				((Local)locals[i]).TypeSig(sig);
+			}
+			sigIx = md.AddToBlobHeap(sig.ToArray());
+			done = true;
+		}
+
+	}
+
+	/**************************************************************************/  
+	/// <summary>
+	/// Signature for calli instruction
+	/// </summary>
+	public class CalliSig : Signature {
+
+		private static readonly byte Sentinel = 0x41;
+		CallConv callConv;
+		Type returnType;
+		Type[] parameters, optParams;
+		uint numPars = 0, numOptPars = 0;
+
+		/// <summary>
+		/// Create a signature for a calli instruction
+		/// </summary>
+		/// <param name="cconv">calling conventions</param>
+		/// <param name="retType">return type</param>
+		/// <param name="pars">parameter types</param>
+		public CalliSig(CallConv cconv, Type retType, Type[] pars) 
+		{
+			tabIx = MDTable.StandAloneSig;
+			callConv = cconv;
+			returnType = retType;
+			parameters = pars;
+			if (pars != null) numPars = (uint)pars.Length;
+		}
+
+		/// <summary>
+		/// Add the optional parameters to a vararg method
+		/// This method sets the vararg calling convention
+		/// </summary>
+		/// <param name="optPars">the optional pars for the vararg call</param>
+		public void AddVarArgs(Type[] optPars) 
+		{
+			optParams = optPars;
+			if (optPars != null) numOptPars = (uint)optPars.Length;
+			callConv |= CallConv.Vararg;
+		}
+
+		/// <summary>
+		/// Add extra calling conventions to this callsite signature
+		/// </summary>
+		/// <param name="cconv"></param>
+		public void AddCallingConv(CallConv cconv) 
+		{
+			callConv |= cconv;
+		}
+
+		internal sealed override void BuildTables(MetaData md) 
+		{
+			if (done) return;
+			MemoryStream sig = new MemoryStream();
+			sig.WriteByte((byte)callConv);
+			MetaData.CompressNum(numPars+numOptPars,sig);
+			returnType.TypeSig(sig);
+			for (int i=0; i < numPars; i++) {
+				parameters[i].TypeSig(sig);
+			}
+			sigIx = md.AddToBlobHeap(sig.ToArray());
+			if (numOptPars > 0) {
+				sig.WriteByte(Sentinel);
+				for (int i=0; i < numOptPars; i++) {
+					optParams[i].TypeSig(sig);
+				}
+			}
+			done = true;
+		}
+
+	}
+
+	/**************************************************************************/  
+	/// <summary>
+	/// Descriptor for a local of a method
+	/// </summary>
+	public class Local {
+
+		private static readonly byte Pinned = 0x45;
+		string name;
+		Type type;
+		bool pinned = false, byref = false;
+
+		/// <summary>
+		/// Create a new local variable 
+		/// </summary>
+		/// <param name="lName">name of the local variable</param>
+		/// <param name="lType">type of the local variable</param>
+		public Local(string lName, Type lType) 
+		{
+			name = lName;
+			type = lType;
+		}
+
+		/// <summary>
+		/// Create a new local variable that is byref and/or pinned
+		/// </summary>
+		/// <param name="lName">local name</param>
+		/// <param name="lType">local type</param>
+		/// <param name="byRef">is byref</param>
+		/// <param name="isPinned">has pinned attribute</param>
+		public Local(string lName, Type lType, bool byRef, bool isPinned)
+		{
+			name = lName;
+			type = lType;
+			byref = byRef;
+			pinned = isPinned;
+		}
+
+		internal void TypeSig(MemoryStream str) 
+		{
+			if (pinned) str.WriteByte(Pinned);
+			type.TypeSig(str);
+		}
+
+	}
+
+	/**************************************************************************/  
+	/// <summary>
+	/// A label in the IL
+	/// </summary>
+	public class CILLabel {
+
+		CILInstruction branch;
+		CILInstruction[] multipleBranches;
+		int tide = 0;
+		CILInstruction labInstr;
+		uint offset = 0;
+		bool absolute;
+
+
+		public CILLabel (uint offset, bool absolute) 
+		{
+			this.offset = offset;
+			this.absolute = absolute;
+		}
+
+		public CILLabel (uint offset) : this (offset, false)
+		{
+		}
+
+
+		internal CILLabel() 
+		{
+		}
+
+		internal void AddBranch(CILInstruction instr) 
+		{
+			if (branch == null) {
+				branch = instr;
+				return;
+			}
+			if (multipleBranches == null) {
+				multipleBranches = new CILInstruction[2];
+			} else if (tide >= multipleBranches.Length) {
+				CILInstruction[] tmp = multipleBranches;
+				multipleBranches = new CILInstruction[tmp.Length*2];
+				for (int i=0; i < tide; i++) {
+					multipleBranches[i] = tmp[i];
+				}
+			}
+			multipleBranches[tide++] = instr;
+		}
+
+		internal void AddLabelInstr(LabelInstr lInstr) 
+		{
+			labInstr = lInstr;
+		}
+
+		internal uint GetLabelOffset() 
+		{
+			if (absolute) return offset;
+			if (labInstr == null) return 0;
+			return labInstr.offset + offset;
+		}
+
+	}
+
+
+}
+
+
+                                                                                                                                                                                                                                                                                                                        Fwà Fwð Iw€IwIw I w°f
+àßÞÝÜÛÚÙØ×AÃAÄAÅBÌBÍAÆFt   DË §üÿã    Q†ZA…C„awEw Fw0FwÀ FwÐ Fwà Fwð Iw€IwI w QàßÞÝÜÛÚÙØ×AÄAÅAÆ t   ¼Ë ¨üÿã    Q†ZA…C„awEw Fw0FwÀ FwÐ Fwà Fwð Iw€IwI w QàßÞÝÜÛÚÙØ×AÄAÅAÆ t   4Ì €¨üÿã    Q†ZA…C„awEw Fw0FwÀ FwÐ Fwà Fwð Iw€IwI w QàßÞÝÜÛÚÙØ×AÄAÅAÆ t   ¬Ì ø¨üÿâ    Q†ZA…C„`wEw Fw0FwÀ FwÐ Fwà Fwð Iw€IwI w QàßÞÝÜÛÚÙØ×AÄAÅAÆ t   $Í p©üÿÐ    Q†YA…C„Vw EwFw Fw0FwÀ FwÐ Fwà Fwð Iw€I wMàßÞÝÜÛÚÙØ×AÄAÅAÆ  t   œÍ È©üÿÊ    Q†VA…C„Vw EwFw Fw0FwÀ FwÐ Fwà Fwð Iw€I wJàßÞÝÜÛÚÙØ×AÄAÅAÆ  t   Î  ªüÿÊ    Q†VA…C„Vw EwFw Fw0FwÀ FwÐ Fwà Fwð Iw€I wJàßÞÝÜÛÚÙØ×AÄAÅAÆ  t   ŒÎ xªüÿÊ    Q†VA…C„Vw EwFw Fw0FwÀ FwÐ Fwà Fwð Iw€I wJàßÞÝÜÛÚÙØ×AÄAÅAÆ  t   Ï ÐªüÿÊ    Q†VA…C„Vw EwFw Fw0FwÀ FwÐ Fwà Fwð Iw€I wJàßÞÝÜÛÚÙØ×AÄAÅAÆ  t   |Ï («üÿÊ    Q†VA…C„Vw EwFw Fw0FwÀ FwÐ Fwà Fwð Iw€I wJàßÞÝÜÛÚÙØ×AÄAÅAÆ  t   ôÏ €«üÿã    Q†ZA…C„awEw Fw0FwÀ FwÐ Fwà Fwð Iw€IwI w QàßÞÝÜÛÚÙØ×AÄAÅAÆ t   lÐ ø«üÿã    Q†ZA…C„awEw Fw0FwÀ FwÐ Fwà Fwð Iw€IwI w QàßÞÝÜÛÚÙØ×AÄAÅAÆ t   äÐ p¬üÿÐ    Q†YA…C„Vw EwFw Fw0FwÀ FwÐ Fwà Fwð Iw€I wMàßÞÝÜÛÚÙØ×AÄAÅAÆ  t   \Ñ È¬üÿÐ    Q†YA…C„Vw EwFw Fw0FwÀ FwÐ Fwà Fwð Iw€I wMàßÞÝÜÛÚÙØ×AÄAÅAÆ  t   ÔÑ  ­üÿÐ    Q†YA…C„Vw EwFw Fw0FwÀ FwÐ Fwà Fwð Iw€I wMàßÞÝÜÛÚÙØ×AÄAÅAÆ  t   LÒ x­üÿâ    Q†ZA…C„`wEw Fw0FwÀ FwÐ Fwà Fwð Iw€IwI w QàßÞÝÜÛÚÙØ×AÄAÅAÆ t   ÄÒ ð­üÿà    Q†iA…C„Vw EwFw Fw0F‰PNG
+
+   IHDR   (   (   &÷pæ   gAMA  ±üa  IDATHÇ­×_h•uðÏ9gf:ËÒœà’¶©‘EÐû3qÎAƒ.T‚….¢ ª«s$%AtS]’ËI„ÆÖšÐ´.”0óŠn5‰¶3Ô½]œwogç}ß³Mz®ž÷y~¿ïï÷

@@ -1,0 +1,226 @@
+               Array2D<unsigned int*>& uData,
+                         Array2D<float*>& fData,
+                         Array2D<half*>& hData,
+                         int width, int height)
+{
+    switch (pixelType)
+    {
+        case 0:
+            uData.resizeErase(height, width);
+            frameBuffer.insert ("UINT",
+                                DeepSlice (IMF::UINT,
+                                (char *) (&uData[0][0]),
+                                sizeof (uData[0][0]) * 1,
+                                sizeof (uData[0][0]) * width,
+                                sizeof (unsigned int)));
+            break;
+        case 1:
+            fData.resizeErase(height, width);
+            frameBuffer.insert ("FLOAT",
+                                DeepSlice (IMF::FLOAT,
+                                (char *) (&fData[0][0]),
+                                sizeof (fData[0][0]) * 1,
+                                sizeof (fData[0][0]) * width,
+                                sizeof (float)));
+            break;
+        case 2:
+            hData.resizeErase(height, width);
+            frameBuffer.insert ("HALF",
+                                DeepSlice (IMF::HALF,
+                                (char *) (&hData[0][0]),
+                                sizeof (hData[0][0]) * 1,
+                                sizeof (hData[0][0]) * width,
+                                sizeof (half)));
+            break;
+    }
+}
+
+void
+generateRandomFile (int partCount)
+{
+    //
+    // Init data.
+    //
+    Array2D<half> halfData;
+    Array2D<float> floatData;
+    Array2D<unsigned int> uintData;
+
+    Array2D<unsigned int> sampleCount;
+    Array2D<half*> deepHalfData;
+    Array2D<float*> deepFloatData;
+    Array2D<unsigned int*> deepUintData;
+
+    vector<GenericOutputFile*> outputfiles;
+
+    pixelTypes.resize(partCount);
+    partTypes.resize(partCount);
+    levelModes.resize(partCount);
+
+    //
+    // Generate headers and data.
+    //
+    generateRandomHeaders(partCount, headers);
+
+    remove(filename.c_str());
+    MultiPartOutputFile file(filename.c_str(), &headers[0],headers.size());
+
+    //
+    // Writing files.
+    //
+    cout << "Writing files " << flush;
+
+    //
+    // Pre-generating frameBuffers.
+    //
+    for (int i = 0; i < partCount; i++)
+    {
+        switch (partTypes[i])
+        {
+            case 0:
+            {
+                OutputPart part(file, i);
+
+                FrameBuffer frameBuffer;
+
+                fillPixels <unsigned int> (uintData, width, height);
+                fillPixels <float> (floatData, width, height);
+                fillPixels <half> (halfData, width, height);
+
+                setOutputFrameBuffer(frameBuffer, pixelTypes[i], uintData, floatData, halfData, width);
+
+                part.setFrameBuffer(frameBuffer);
+
+                part.writePixels(height);
+
+                break;
+            }
+            case 1:
+            {
+                TiledOutputPart part(file, i);
+
+                int numXLevels = part.numXLevels();
+                int numYLevels = part.numYLevels();
+
+                for (int xLevel = 0; xLevel < numXLevels; xLevel++)
+                    for (int yLevel = 0; yLevel < numYLevels; yLevel++)
+                    {
+                        if (!part.isValidLevel(xLevel, yLevel))
+                            continue;
+
+                        int w = part.levelWidth(xLevel);
+                        int h = part.levelHeight(yLevel);
+
+                        FrameBuffer frameBuffer;
+
+                        fillPixels <unsigned int> (uintData, w, h);
+                        fillPixels <float> (floatData, w, h);
+                        fillPixels <half> (halfData, w, h);
+                        setOutputFrameBuffer(frameBuffer, pixelTypes[i],
+                                             uintData, floatData, halfData,
+                                             w);
+
+                        part.setFrameBuffer(frameBuffer);
+
+                        part.writeTiles(0, part.numXTiles(xLevel) - 1,
+                                        0, part.numYTiles(yLevel) - 1,
+                                        xLevel, yLevel);
+                    }
+
+                break;
+            }
+            case 2:
+            {
+                DeepScanLineOutputPart part(file, i);
+
+                DeepFrameBuffer frameBuffer;
+
+                sampleCount.resizeErase(height, width);
+                for (int j = 0; j < height; j++)
+                    for (int k = 0; k < width; k++)
+                        sampleCount[j][k] = (j * width + k) % 10 + 1;
+
+                frameBuffer.insertSampleCountSlice (Slice (IMF::UINT,
+                                                    (char *) (&sampleCount[0][0]),
+                                                    sizeof (unsigned int) * 1,
+                                                    sizeof (unsigned int) * width));
+
+                if (pixelTypes[i] == 0)
+                    fillPixels <unsigned int> (sampleCount, deepUintData, width, height);
+                if (pixelTypes[i] == 1)
+                    fillPixels <float> (sampleCount, deepFloatData, width, height);
+                if (pixelTypes[i] == 2)
+                    fillPixels <half> (sampleCount, deepHalfData, width, height);
+                setOutputDeepFrameBuffer(frameBuffer, pixelTypes[i],
+                                         deepUintData, deepFloatData, deepHalfData,
+                                         width);
+
+                part.setFrameBuffer(frameBuffer);
+
+                part.writePixels(height);
+
+                releasePixels(pixelTypes[i], deepUintData, deepFloatData, deepHalfData, width, height);
+
+                break;
+            }
+            case 3:
+            {
+                DeepTiledOutputPart part(file, i);
+
+                int numXLevels = part.numXLevels();
+                int numYLevels = part.numYLevels();
+
+                for (int xLevel = 0; xLevel < numXLevels; xLevel++)
+                    for (int yLevel = 0; yLevel < numYLevels; yLevel++)
+                    {
+                        if (!part.isValidLevel(xLevel, yLevel))
+                            continue;
+
+                        int w = part.levelWidth(xLevel);
+                        int h = part.levelHeight(yLevel);
+
+                        DeepFrameBuffer frameBuffer;
+
+                        sampleCount.resizeErase(h, w);
+                        for (int j = 0; j < h; j++)
+                            for (int k = 0; k < w; k++)
+                                sampleCount[j][k] = (j * w + k) % 10 + 1;
+
+                        frameBuffer.insertSampleCountSlice (Slice (IMF::UINT,
+                                                            (char *) (&sampleCount[0][0]),
+                                                            sizeof (unsigned int) * 1,
+                                                            sizeof (unsigned int) * w));
+
+                        if (pixelTypes[i] == 0)
+                            fillPixels <unsigned int> (sampleCount, deepUintData, w, h);
+                        if (pixelTypes[i] == 1)
+                            fillPixels <float> (sampleCount, deepFloatData, w, h);
+                        if (pixelTypes[i] == 2)
+                            fillPixels <half> (sampleCount, deepHalfData, w, h);
+                        setOutputDeepFrameBuffer(frameBuffer, pixelTypes[i],
+                                                 deepUintData, deepFloatData, deepHalfData,
+                                                 w);
+
+                        part.setFrameBuffer(frameBuffer);
+
+                        part.writeTiles(0, part.numXTiles(xLevel) - 1,
+                                        0, part.numYTiles(yLevel) - 1,
+                                        xLevel, yLevel);
+
+                        releasePixels(pixelTypes[i], deepUintData, deepFloatData, deepHalfData, w, h);
+                    }
+
+                break;
+            }
+        }
+    }
+}
+
+void
+readWholeFiles (int modification)
+{
+    Array2D<unsigned int> uData;
+    Array2D<float> fData;
+    Array2D<half> hData;
+
+    Array2D<unsigned int*> deepUData;
+    Array2D<float

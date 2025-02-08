@@ -1,0 +1,87 @@
+eType");
+            ContractUtils.RequiresNotNull(binder, "binder");
+            if (!delegateType.IsSubclassOf(typeof(MulticastDelegate))) throw Error.TypeMustBeDerivedFromSystemDelegate();
+
+            var ctors = _SiteCtors;
+            if (ctors == null) {
+                // It's okay to just set this, worst case we're just throwing away some data
+                _SiteCtors = ctors = new CacheDict<Type, Func<CallSiteBinder, CallSite>>(100);
+            }
+
+            Func<CallSiteBinder, CallSite> ctor;
+            MethodInfo method = null;
+            if (!ctors.TryGetValue(delegateType, out ctor)) {
+                method = typeof(CallSite<>).MakeGenericType(delegateType).GetMethod("Create");
+
+                if (TypeUtils.CanCache(delegateType)) {
+                    ctor = (Func<CallSiteBinder, CallSite>)Delegate.CreateDelegate(typeof(Func<CallSiteBinder, CallSite>), method);
+                    ctors.Add(delegateType, ctor);
+                }
+            }
+
+            if (ctor != null) {
+                return ctor(binder);
+            }
+
+            // slow path
+            return (CallSite)method.Invoke(null, new object[] { binder });
+        }
+    }
+
+    /// <summary>
+    /// Dynamic site type.
+    /// </summary>
+    /// <typeparam name="T">The delegate type.</typeparam>
+    public partial class CallSite<T> : CallSite where T : class {
+        /// <summary>
+        /// The update delegate. Called when the dynamic site experiences cache miss.
+        /// </summary>
+        /// <returns>The update delegate.</returns>
+        public T Update {
+            get {
+                // if this site is set up for match making, then use NoMatch as an Update 
+                if (_match) {
+                    Debug.Assert(_CachedNoMatch != null, "all normal sites should have Update cached once there is an instance.");
+                    return _CachedNoMatch;
+                } else {
+                    Debug.Assert(_CachedUpdate != null, "all normal sites should have Update cached once there is an instance.");
+                    return _CachedUpdate;
+                }
+            }
+        }
+
+        /// <summary>
+        /// The Level 0 cache - a delegate specialized based on the site history.
+        /// </summary>
+        [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Design", "CA1051:DoNotDeclareVisibleInstanceFields")]
+        public T Target;
+
+
+        /// <summary>
+        /// The Level 1 cache - a history of the dynamic site.
+        /// </summary>
+        internal T[] Rules;
+
+
+        // Cached update delegate for all sites with a given T
+        private static T _CachedUpdate;
+
+        // Cached noMatch delegate for all sites with a given T
+        private static volatile T _CachedNoMatch;
+
+        private CallSite(CallSiteBinder binder)
+            : base(binder) {
+            Target = GetUpdateDelegate();
+        }
+
+        private CallSite()
+            : base(null) {
+        }
+
+        [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Performance", "CA1822:MarkMembersAsStatic")]
+        internal CallSite<T> CreateMatchMaker() {
+            return new CallSite<T>();
+        }
+
+        /// <summary>
+        /// Creates an instance of the dynamic call site, initialized with the binder res

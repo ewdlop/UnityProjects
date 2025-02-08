@@ -1,0 +1,65 @@
+//===----- RuntimeDyldMachOARM.h ---- MachO/ARM specific code. ----*- C++ -*-=//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef LLVM_LIB_EXECUTIONENGINE_RUNTIMEDYLD_TARGETS_RUNTIMEDYLDMACHOARM_H
+#define LLVM_LIB_EXECUTIONENGINE_RUNTIMEDYLD_TARGETS_RUNTIMEDYLDMACHOARM_H
+
+#include "../RuntimeDyldMachO.h"
+#include <string>
+
+#define DEBUG_TYPE "dyld"
+
+namespace llvm {
+
+class RuntimeDyldMachOARM
+    : public RuntimeDyldMachOCRTPBase<RuntimeDyldMachOARM> {
+private:
+  typedef RuntimeDyldMachOCRTPBase<RuntimeDyldMachOARM> ParentT;
+
+public:
+
+  typedef uint32_t TargetPtrT;
+
+  RuntimeDyldMachOARM(RuntimeDyld::MemoryManager &MM,
+                      JITSymbolResolver &Resolver)
+    : RuntimeDyldMachOCRTPBase(MM, Resolver) {}
+
+  unsigned getMaxStubSize() override { return 8; }
+
+  unsigned getStubAlignment() override { return 4; }
+
+  JITSymbolFlags getJITSymbolFlags(const BasicSymbolRef &SR) override {
+    auto Flags = RuntimeDyldImpl::getJITSymbolFlags(SR);
+    Flags.getTargetFlags() = ARMJITSymbolFlags::fromObjectSymbol(SR);
+    return Flags;
+  }
+
+  uint64_t modifyAddressBasedOnFlags(uint64_t Addr,
+                                     JITSymbolFlags Flags) const override {
+    if (Flags.getTargetFlags() & ARMJITSymbolFlags::Thumb)
+      Addr |= 0x1;
+    return Addr;
+  }
+
+  Expected<int64_t> decodeAddend(const RelocationEntry &RE) const {
+    const SectionEntry &Section = Sections[RE.SectionID];
+    uint8_t *LocalAddress = Section.getAddressWithOffset(RE.Offset);
+
+    switch (RE.RelType) {
+      default:
+        return memcpyAddend(RE);
+      case MachO::ARM_RELOC_BR24: {
+        uint32_t Temp = readBytesUnaligned(LocalAddress, 4);
+        Temp &= 0x00ffffff; // Mask out the opcode.
+        // Now we've got the shifted immediate, shift by 2, sign extend and ret.
+        return SignExtend32<26>(Temp << 2);
+      }
+
+      case MachO::ARM_THUMB_RELOC_BR22: {
+        //

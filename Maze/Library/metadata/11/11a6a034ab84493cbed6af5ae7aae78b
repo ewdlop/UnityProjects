@@ -1,0 +1,697 @@
+e/sampler/event keywords aren't returned by the lexer for HLSL
+      goto HLSLReservedKeyword;
+    }
+    // HLSL Change Ends
+    if (!getLangOpts().CPlusPlus) {
+      Diag(Tok, diag::err_expected_expression);
+      return ExprError();
+    }
+
+    if (SavedKind == tok::kw_typename) {
+      // postfix-expression: typename-specifier '(' expression-list[opt] ')'
+      //                     typename-specifier braced-init-list
+      if (TryAnnotateTypeOrScopeToken())
+        return ExprError();
+
+      if (!Actions.isSimpleTypeSpecifier(Tok.getKind()))
+        // We are trying to parse a simple-type-specifier but might not get such
+        // a token after error recovery.
+        return ExprError();
+    }
+
+    // postfix-expression: simple-type-specifier '(' expression-list[opt] ')'
+    //                     simple-type-specifier braced-init-list
+    //
+    DeclSpec DS(AttrFactory);
+
+    ParseCXXSimpleTypeSpecifier(DS);
+    if (Tok.isNot(tok::l_paren) &&
+        (!getLangOpts().CPlusPlus11 || Tok.isNot(tok::l_brace)))
+      return ExprError(Diag(Tok, diag::err_expected_lparen_after_type)
+                         << DS.getSourceRange());
+
+    if (Tok.is(tok::l_brace))
+      Diag(Tok, diag::warn_cxx98_compat_generalized_initializer_lists);
+
+    Res = ParseCXXTypeConstructExpression(DS);
+    break;
+  }
+
+  case tok::annot_cxxscope: { // [C++] id-expression: qualified-id
+    // If TryAnnotateTypeOrScopeToken annotates the token, tail recurse.
+    // (We can end up in this situation after tentative parsing.)
+    if (TryAnnotateTypeOrScopeToken())
+      return ExprError();
+    if (!Tok.is(tok::annot_cxxscope))
+      return ParseCastExpression(isUnaryExpression, isAddressOfOperand,
+                                 NotCastExpr, isTypeCast);
+
+    Token Next = NextToken();
+    if (Next.is(tok::annot_template_id)) {
+      TemplateIdAnnotation *TemplateId = takeTemplateIdAnnotation(Next);
+      if (TemplateId->Kind == TNK_Type_template) {
+        // We have a qualified template-id that we know refers to a
+        // type, translate it into a type and continue parsing as a
+        // cast expression.
+        CXXScopeSpec SS;
+        ParseOptionalCXXScopeSpecifier(SS, ParsedType(), 
+                                       /*EnteringContext=*/false);
+        AnnotateTemplateIdTokenAsType();
+        return ParseCastExpression(isUnaryExpression, isAddressOfOperand,
+                                   NotCastExpr, isTypeCast);
+      }
+    }
+
+    // Parse as an id-expression.
+    Res = ParseCXXIdExpression(isAddressOfOperand);
+    break;
+  }
+
+  case tok::annot_template_id: { // [C++]          template-id
+    TemplateIdAnnotation *TemplateId = takeTemplateIdAnnotation(Tok);
+    if (TemplateId->Kind == TNK_Type_template) {
+      // We have a template-id that we know refers to a type,
+      // translate it into a type and continue parsing as a cast
+      // expression.
+      AnnotateTemplateIdTokenAsType();
+      return ParseCastExpression(isUnaryExpression, isAddressOfOperand,
+                                 NotCastExpr, isTypeCast);
+    }
+
+    // Fall through to treat the template-id as an id-expression.
+  }
+
+  case tok::kw_operator: // [C++] id-expression: operator/conversion-function-id
+    if (getLangOpts().HLSL && SavedKind == tok::kw_operator) goto HLSLReservedKeyword; // HLSL Change - 'operator' is reserved
+    Res = ParseCXXIdExpression(isAddressOfOperand);
+    break;
+
+  case tok::coloncolon: {
+    // ::foo::bar -> global qualified name etc.   If TryAnnotateTypeOrScopeToken
+    // annotates the token, tail recurse.
+    if (TryAnnotateTypeOrScopeToken())
+      return ExprError();
+    if (!Tok.is(tok::coloncolon))
+      return ParseCastExpression(isUnaryExpression, isAddressOfOperand);
+
+    // ::new -> [C++] new-expression
+    // ::delete -> [C++] delete-expression
+    SourceLocation CCLoc = ConsumeToken();
+    if (Tok.is(tok::kw_new)) {
+      if (getLangOpts().HLSL) goto HLSLReservedKeyword; // HLSL Change - 'new' is reserved
+      return ParseCXXNewExpression(true, CCLoc);
+    }
+    if (Tok.is(tok::kw_delete)) {
+      if (getLangOpts().HLSL) goto HLSLReservedKeyword; // HLSL Change - 'delete' is reserved
+      return ParseCXXDeleteExpression(true, CCLoc);
+    }
+
+    // This is not a type name or scope specifier, it is an invalid expression.
+    Diag(CCLoc, diag::err_expected_expression);
+    return ExprError();
+  }
+
+  case tok::kw_new: // [C++] new-expression
+    if (getLangOpts().HLSL) goto HLSLReservedKeyword; // HLSL Change - 'new' is reserved
+    return ParseCXXNewExpression(false, Tok.getLocation());
+
+  case tok::kw_delete: // [C++] delete-expression
+    if (getLangOpts().HLSL) goto HLSLReservedKeyword; // HLSL Change - 'delete' is reserved
+    return ParseCXXDeleteExpression(false, Tok.getLocation());
+
+  case tok::kw_noexcept: { // [C++0x] 'noexcept' '(' expression ')'
+    if (getLangOpts().HLSL) goto HLSLReservedKeyword; // HLSL Change - reserved keyword
+    Diag(Tok, diag::warn_cxx98_compat_noexcept_expr);
+    SourceLocation KeyLoc = ConsumeToken();
+    BalancedDelimiterTracker T(*this, tok::l_paren);
+
+    if (T.expectAndConsume(diag::err_expected_lparen_after, "noexcept"))
+      return ExprError();
+    // C++11 [expr.unary.noexcept]p1:
+    //   The noexcept operator determines whether the evaluation of its operand,
+    //   which is an unevaluated operand, can throw an exception.
+    EnterExpressionEvaluationContext Unevaluated(Actions, Sema::Unevaluated);
+    ExprResult Result = ParseExpression();
+
+    T.consumeClose();
+
+    if (!Result.isInvalid())
+      Result = Actions.ActOnNoexceptExpr(KeyLoc, T.getOpenLocation(), 
+                                         Result.get(), T.getCloseLocation());
+    return Result;
+  }
+
+#define TYPE_TRAIT(N,Spelling,K) \
+  case tok::kw_##Spelling:
+#include "clang/Basic/TokenKinds.def"
+    return ParseTypeTrait();
+      
+  case tok::kw___array_rank:
+  case tok::kw___array_extent:
+    return ParseArrayTypeTrait();
+
+  case tok::kw___is_lvalue_expr:
+  case tok::kw___is_rvalue_expr:
+    return ParseExpressionTrait();
+      
+  case tok::at: {
+    // HLSL Change Starts
+    assert(!getLangOpts().HLSL && "HLSL does not recognize '@' as a token");
+    if (getLangOpts().HLSL) goto tok_default_case;
+    // HLSL Change Ends
+    SourceLocation AtLoc = ConsumeToken();
+    return ParseObjCAtExpression(AtLoc);
+  }
+  case tok::caret:
+    // HLSL Change Starts
+    if (getLangOpts().HLSL) {
+      Diag(Tok, diag::err_hlsl_unsupported_construct) << "block";
+      return ExprError();
+    }
+    // HLSL Change Ends
+    Res = ParseBlockLiteralExpression();
+    break;
+  case tok::code_completion: {
+    Actions.CodeCompleteOrdinaryName(getCurScope(), Sema::PCC_Expression);
+    cutOffParsing();
+    return ExprError();
+  }
+  case tok::l_square:
+    if (getLangOpts().CPlusPlus11) {
+      if (getLangOpts().ObjC1) {
+        // C++11 lambda expressions and Objective-C message sends both start with a
+        // square bracket.  There are three possibilities here:
+        // we have a valid lambda expression, we have an invalid lambda
+        // expression, or we have something that doesn't appear to be a lambda.
+        // If we're in the last case, we fall back to ParseObjCMessageExpression.
+        Res = TryParseLambdaExpression();
+        if (!Res.isInvalid() && !Res.get())
+          Res = ParseObjCMessageExpression();
+        break;
+      }
+      Res = ParseLambdaExpression();
+      break;
+    }
+    if (getLangOpts().ObjC1) {
+      Res = ParseObjCMessageExpression();
+      break;
+    }
+    // FALL THROUGH.
+  tok_default_case: // HLSL Change - add to target cases dead-code'd by HLSL
+  default:
+    NotCastExpr = true;
+    return ExprError();
+  }
+
+  // These can be followed by postfix-expr pieces.
+  return ParsePostfixExpressionSuffix(Res);
+}
+
+/// \brief Once the leading part of a postfix-expression is parsed, this
+/// method parses any suffixes that apply.
+///
+/// \verbatim
+///       postfix-expression: [C99 6.5.2]
+///         primary-expression
+///         postfix-expression '[' expression ']'
+///         postfix-expression '[' braced-init-list ']'
+///         postfix-expression '(' argument-expression-list[opt] ')'
+///         postfix-expression '.' identifier
+///         postfix-expression '->' identifier
+///         postfix-expression '++'
+///         postfix-expression '--'
+///         '(' type-name ')' '{' initializer-list '}'
+///         '(' type-name ')' '{' initializer-list ',' '}'
+///
+///       argument-expression-list: [C99 6.5.2]
+///         argument-expression ...[opt]
+///         argument-expression-list ',' assignment-expression ...[opt]
+/// \endverbatim
+ExprResult
+Parser::ParsePostfixExpressionSuffix(ExprResult LHS) {
+  // Now that the primary-expression piece of the postfix-expression has been
+  // parsed, see if there are any postfix-expression pieces here.
+  SourceLocation Loc;
+  while (1) {
+    switch (Tok.getKind()) {
+    case tok::code_completion:
+      if (InMessageExpression)
+        return LHS;
+        
+      Actions.CodeCompletePostfixExpression(getCurScope(), LHS);
+      cutOffParsing();
+      return ExprError();
+        
+    case tok::identifier:
+      // If we see identifier: after an expression, and we're not already in a
+      // message send, then this is probably a message send with a missing
+      // opening bracket '['.
+      if (getLangOpts().ObjC1 && !InMessageExpression && 
+          (NextToken().is(tok::colon) || NextToken().is(tok::r_square))) {
+        LHS = ParseObjCMessageExpressionBody(SourceLocation(), SourceLocation(),
+                                             ParsedType(), LHS.get());
+        break;
+      }
+        
+      // Fall through; this isn't a message send.
+                
+    default:  // Not a postfix-expression suffix.
+      return LHS;
+    case tok::l_square: {  // postfix-expression: p-e '[' expression ']'
+      // If we have a array postfix expression that starts on a new line and
+      // Objective-C is enabled, it is highly likely that the user forgot a
+      // semicolon after the base expression and that the array postfix-expr is
+      // actually another message send.  In this case, do some look-ahead to see
+      // if the contents of the square brackets are obviously not a valid
+      // expression and recover by pretending there is no suffix.
+      if (getLangOpts().ObjC1 && Tok.isAtStartOfLine() &&
+          isSimpleObjCMessageExpression())
+        return LHS;
+
+      // Reject array indices starting with a lambda-expression. '[[' is
+      // reserved for attributes.
+      if (CheckProhibitedCXX11Attribute())
+        return ExprError();
+
+      BalancedDelimiterTracker T(*this, tok::l_square);
+      T.consumeOpen();
+      Loc = T.getOpenLocation();
+      ExprResult Idx;
+      if (getLangOpts().CPlusPlus11 && Tok.is(tok::l_brace)) {
+        Diag(Tok, diag::warn_cxx98_compat_generalized_initializer_lists);
+        Idx = ParseBraceInitializer();
+      } else
+        Idx = ParseExpression();
+
+      SourceLocation RLoc = Tok.getLocation();
+
+      if (!LHS.isInvalid() && !Idx.isInvalid() && Tok.is(tok::r_square)) {
+        LHS = Actions.ActOnArraySubscriptExpr(getCurScope(), LHS.get(), Loc,
+                                              Idx.get(), RLoc);
+      } else {
+        (void)Actions.CorrectDelayedTyposInExpr(LHS);
+        (void)Actions.CorrectDelayedTyposInExpr(Idx);
+        LHS = ExprError();
+        Idx = ExprError();
+      }
+
+      // Match the ']'.
+      T.consumeClose();
+      break;
+    }
+
+    case tok::l_paren:         // p-e: p-e '(' argument-expression-list[opt] ')'
+    case tok::lesslessless: {  // p-e: p-e '<<<' argument-expression-list '>>>'
+                               //   '(' argument-expression-list[opt] ')'
+      tok::TokenKind OpKind = Tok.getKind();
+      InMessageExpressionRAIIObject InMessage(*this, false);
+
+      Expr *ExecConfig = nullptr;
+
+      BalancedDelimiterTracker PT(*this, tok::l_paren);
+
+      if (getLangOpts().HLSL && OpKind == tok::lesslessless) { // HLSL Change: <<< is not supported in HLSL
+        ExprVector ExecConfigExprs;
+        CommaLocsTy ExecConfigCommaLocs;
+        SourceLocation OpenLoc = ConsumeToken();
+
+        if (ParseSimpleExpressionList(ExecConfigExprs, ExecConfigCommaLocs)) {
+          (void)Actions.CorrectDelayedTyposInExpr(LHS);
+          LHS = ExprError();
+        }
+
+        SourceLocation CloseLoc;
+        if (TryConsumeToken(tok::greatergreatergreater, CloseLoc)) {
+        } else if (LHS.isInvalid()) {
+          SkipUntil(tok::greatergreatergreater, StopAtSemi);
+        } else {
+          // There was an error closing the brackets
+          Diag(Tok, diag::err_expected) << tok::greatergreatergreater;
+          Diag(OpenLoc, diag::note_matching) << tok::lesslessless;
+          SkipUntil(tok::greatergreatergreater, StopAtSemi);
+          LHS = ExprError();
+        }
+
+        if (!LHS.isInvalid()) {
+          if (ExpectAndConsume(tok::l_paren))
+            LHS = ExprError();
+          else
+            Loc = PrevTokLocation;
+        }
+
+        if (!LHS.isInvalid()) {
+          ExprResult ECResult = Actions.ActOnCUDAExecConfigExpr(getCurScope(),
+                                    OpenLoc, 
+                                    ExecConfigExprs, 
+                                    CloseLoc);
+          if (ECResult.isInvalid())
+            LHS = ExprError();
+          else
+            ExecConfig = ECResult.get();
+        }
+      } else {
+        PT.consumeOpen();
+        Loc = PT.getOpenLocation();
+      }
+
+      ExprVector ArgExprs;
+      CommaLocsTy CommaLocs;
+      
+      if (Tok.is(tok::code_completion)) {
+        Actions.CodeCompleteCall(getCurScope(), LHS.get(), None);
+        cutOffParsing();
+        return ExprError();
+      }
+
+      if (OpKind == tok::l_paren || !LHS.isInvalid()) {
+        if (Tok.isNot(tok::r_paren)) {
+          if (ParseExpressionList(ArgExprs, CommaLocs, [&] {
+                Actions.CodeCompleteCall(getCurScope(), LHS.get(), ArgExprs);
+             })) {
+            (void)Actions.CorrectDelayedTyposInExpr(LHS);
+            LHS = ExprError();
+          } else if (LHS.isInvalid()) {
+            for (auto &E : ArgExprs)
+              Actions.CorrectDelayedTyposInExpr(E);
+          }
+        }
+      }
+
+      // Match the ')'.
+      if (LHS.isInvalid()) {
+        SkipUntil(tok::r_paren, StopAtSemi);
+      } else if (Tok.isNot(tok::r_paren)) {
+        bool HadDelayedTypo = false;
+        if (Actions.CorrectDelayedTyposInExpr(LHS).get() != LHS.get())
+          HadDelayedTypo = true;
+        for (auto &E : ArgExprs)
+          if (Actions.CorrectDelayedTyposInExpr(E).get() != E)
+            HadDelayedTypo = true;
+        // If there were delayed typos in the LHS or ArgExprs, call SkipUntil
+        // instead of PT.consumeClose() to avoid emitting extra diagnostics for
+        // the unmatched l_paren.
+        if (HadDelayedTypo)
+          SkipUntil(tok::r_paren, StopAtSemi);
+        else
+          PT.consumeClose();
+        LHS = ExprError();
+      } else {
+        assert((ArgExprs.size() == 0 || 
+                ArgExprs.size()-1 == CommaLocs.size())&&
+               "Unexpected number of commas!");
+        LHS = Actions.ActOnCallExpr(getCurScope(), LHS.get(), Loc,
+                                    ArgExprs, Tok.getLocation(),
+                                    ExecConfig);
+        PT.consumeClose();
+      }
+
+      break;
+    }
+    case tok::arrow:
+    case tok::period: {
+      // postfix-expression: p-e '->' template[opt] id-expression
+      // postfix-expression: p-e '.' template[opt] id-expression
+      tok::TokenKind OpKind = Tok.getKind();
+      SourceLocation OpLoc = ConsumeToken();  // Eat the "." or "->" token.
+
+      CXXScopeSpec SS;
+      ParsedType ObjectType;
+      bool MayBePseudoDestructor = false;
+      if (getLangOpts().CPlusPlus && !LHS.isInvalid()) {
+        Expr *Base = LHS.get();
+        const Type* BaseType = Base->getType().getTypePtrOrNull();
+        if (BaseType && Tok.is(tok::l_paren) &&
+            (BaseType->isFunctionType() ||
+             BaseType->isSpecificPlaceholderType(BuiltinType::BoundMember))) {
+          Diag(OpLoc, diag::err_function_is_not_record)
+              << OpKind << Base->getSourceRange()
+              << FixItHint::CreateRemoval(OpLoc);
+          return ParsePostfixExpressionSuffix(Base);
+        }
+
+        LHS = Actions.ActOnStartCXXMemberReference(getCurScope(), Base,
+                                                   OpLoc, OpKind, ObjectType,
+                                                   MayBePseudoDestructor);
+        if (LHS.isInvalid())
+          break;
+
+        ParseOptionalCXXScopeSpecifier(SS, ObjectType, 
+                                       /*EnteringContext=*/false,
+                                       &MayBePseudoDestructor);
+        if (SS.isNotEmpty())
+          ObjectType = ParsedType();
+      }
+
+      // HLSL Change Starts
+      // At this point, if we have an arrow, a diagnostic has been emitted, and
+      // we recover parsing by treating this as a period.
+      if (getLangOpts().HLSL) {
+        OpKind = tok::period;
+      }
+      // HLSL Change Ends
+
+      if (Tok.is(tok::code_completion)) {
+        // Code completion for a member access expression.
+        Actions.CodeCompleteMemberReferenceExpr(getCurScope(), LHS.get(),
+                                                OpLoc, OpKind == tok::arrow);
+        
+        cutOffParsing();
+        return ExprError();
+      }
+
+      if (MayBePseudoDestructor && !LHS.isInvalid()) {
+        LHS = ParseCXXPseudoDestructor(LHS.get(), OpLoc, OpKind, SS, 
+                                       ObjectType);
+        break;
+      }
+
+      // HLSL Change Starts
+      // 'sample' and others are keywords when used as modifiers, but they are
+      // also built-in field of some types. By the time we're considering a
+      // field access, update the token if necessary to reflect this.
+      if (getLangOpts().HLSL) {
+        switch (auto tk = Tok.getKind()) {
+        case tok::kw_center:
+        case tok::kw_globallycoherent:
+        case tok::kw_precise:
+        case tok::kw_sample:
+        case tok::kw_indices:
+        case tok::kw_vertices:
+        case tok::kw_primitives:
+        case tok::kw_payload:
+          Tok.setKind(tok::identifier);
+          Tok.setIdentifierInfo(PP.getIdentifierInfo(getKeywordSpelling(tk)));
+          break;
+        default:
+          break;
+        }
+      }
+      // HLSL Change Ends
+
+      // Either the action has told us that this cannot be a
+      // pseudo-destructor expression (based on the type of base
+      // expression), or we didn't see a '~' in the right place. We
+      // can still parse a destructor name here, but in that case it
+      // names a real destructor.
+      // Allow explicit constructor calls in Microsoft mode.
+      // FIXME: Add support for explicit call of template constructor.
+      SourceLocation TemplateKWLoc;
+      UnqualifiedId Name;
+      if (getLangOpts().ObjC2 && OpKind == tok::period &&
+          Tok.is(tok::kw_class)) {
+        // Objective-C++:
+        //   After a '.' in a member access expression, treat the keyword
+        //   'class' as if it were an identifier.
+        //
+        // This hack allows property access to the 'class' method because it is
+        // such a common method name. For other C++ keywords that are 
+        // Objective-C method names, one must use the message send syntax.
+        IdentifierInfo *Id = Tok.getIdentifierInfo();
+        SourceLocation Loc = ConsumeToken();
+        Name.setIdentifier(Id, Loc);
+      } else if (ParseUnqualifiedId(SS, 
+                                    /*EnteringContext=*/false, 
+                                    /*AllowDestructorName=*/true,
+                                    /*AllowConstructorName=*/
+                                      getLangOpts().MicrosoftExt, 
+                                    ObjectType, TemplateKWLoc, Name)) {
+        (void)Actions.CorrectDelayedTyposInExpr(LHS);
+        LHS = ExprError();
+      }
+      
+      if (!LHS.isInvalid())
+        LHS = Actions.ActOnMemberAccessExpr(getCurScope(), LHS.get(), OpLoc, 
+                                            OpKind, SS, TemplateKWLoc, Name,
+                                 CurParsedObjCImpl ? CurParsedObjCImpl->Dcl
+                                                   : nullptr);
+      break;
+    }
+    case tok::plusplus:    // postfix-expression: postfix-expression '++'
+    case tok::minusminus:  // postfix-expression: postfix-expression '--'
+      if (!LHS.isInvalid()) {
+        LHS = Actions.ActOnPostfixUnaryOp(getCurScope(), Tok.getLocation(),
+                                          Tok.getKind(), LHS.get());
+      }
+      ConsumeToken();
+      break;
+    }
+  }
+}
+
+/// ParseExprAfterUnaryExprOrTypeTrait - We parsed a typeof/sizeof/alignof/
+/// vec_step and we are at the start of an expression or a parenthesized
+/// type-id. OpTok is the operand token (typeof/sizeof/alignof). Returns the
+/// expression (isCastExpr == false) or the type (isCastExpr == true).
+///
+/// \verbatim
+///       unary-expression:  [C99 6.5.3]
+///         'sizeof' unary-expression
+///         'sizeof' '(' type-name ')'
+/// [GNU]   '__alignof' unary-expression
+/// [GNU]   '__alignof' '(' type-name ')'
+/// [C11]   '_Alignof' '(' type-name ')'
+/// [C++0x] 'alignof' '(' type-id ')'
+///
+/// [GNU]   typeof-specifier:
+///           typeof ( expressions )
+///           typeof ( type-name )
+/// [GNU/C++] typeof unary-expression
+///
+/// [OpenCL 1.1 6.11.12] vec_step built-in function:
+///           vec_step ( expressions )
+///           vec_step ( type-name )
+/// \endverbatim
+ExprResult
+Parser::ParseExprAfterUnaryExprOrTypeTrait(const Token &OpTok,
+                                           bool &isCastExpr,
+                                           ParsedType &CastTy,
+                                           SourceRange &CastRange) {
+  // HLSL Change Begin
+  assert((!getLangOpts().HLSL || OpTok.getKind() == tok::kw_sizeof)
+    && "not supported for HLSL - unreachable");
+  // HLSL Change End
+
+  assert(OpTok.isOneOf(tok::kw_typeof, tok::kw_sizeof, tok::kw___alignof,
+                       tok::kw_alignof, tok::kw__Alignof, tok::kw_vec_step,
+                       tok::kw___builtin_omp_required_simd_align) &&
+         "Not a typeof/sizeof/alignof/vec_step expression!");
+
+  ExprResult Operand;
+
+  // If the operand doesn't start with an '(', it must be an expression.
+  if (Tok.isNot(tok::l_paren)) {
+    // If construct allows a form without parenthesis, user may forget to put
+    // pathenthesis around type name.
+    if (OpTok.isOneOf(tok::kw_sizeof, tok::kw___alignof, tok::kw_alignof,
+                      tok::kw__Alignof)) {
+      if (isTypeIdUnambiguously()) {
+        DeclSpec DS(AttrFactory);
+        ParseSpecifierQualifierList(DS);
+        Declarator DeclaratorInfo(DS, Declarator::TypeNameContext);
+        ParseDeclarator(DeclaratorInfo);
+
+        SourceLocation LParenLoc = PP.getLocForEndOfToken(OpTok.getLocation());
+        SourceLocation RParenLoc = PP.getLocForEndOfToken(PrevTokLocation);
+        Diag(LParenLoc, diag::err_expected_parentheses_around_typename)
+          << OpTok.getName()
+          << FixItHint::CreateInsertion(LParenLoc, "(")
+          << FixItHint::CreateInsertion(RParenLoc, ")");
+        isCastExpr = true;
+        return ExprEmpty();
+      }
+    }
+
+    isCastExpr = false;
+    if (OpTok.is(tok::kw_typeof) && !getLangOpts().CPlusPlus) {
+      Diag(Tok, diag::err_expected_after) << OpTok.getIdentifierInfo()
+                                          << tok::l_paren;
+      return ExprError();
+    }
+
+    Operand = ParseCastExpression(true/*isUnaryExpression*/);
+  } else {
+    // If it starts with a '(', we know that it is either a parenthesized
+    // type-name, or it is a unary-expression that starts with a compound
+    // literal, or starts with a primary-expression that is a parenthesized
+    // expression.
+    ParenParseOption ExprType = CastExpr;
+    SourceLocation LParenLoc = Tok.getLocation(), RParenLoc;
+
+    Operand = ParseParenExpression(ExprType, true/*stopIfCastExpr*/, 
+                                   false, CastTy, RParenLoc);
+    CastRange = SourceRange(LParenLoc, RParenLoc);
+
+    // If ParseParenExpression parsed a '(typename)' sequence only, then this is
+    // a type.
+    if (ExprType == CastExpr) {
+      isCastExpr = true;
+      return ExprEmpty();
+    }
+
+    if (getLangOpts().CPlusPlus || OpTok.isNot(tok::kw_typeof)) {
+      // GNU typeof in C requires the expression to be parenthesized. Not so for
+      // sizeof/alignof or in C++. Therefore, the parenthesized expression is
+      // the start of a unary-expression, but doesn't include any postfix 
+      // pieces. Parse these now if present.
+      if (!Operand.isInvalid())
+        Operand = ParsePostfixExpressionSuffix(Operand.get());
+    }
+  }
+
+  // If we get here, the operand to the typeof/sizeof/alignof was an expresion.
+  isCastExpr = false;
+  return Operand;
+}
+
+
+/// \brief Parse a sizeof or alignof expression.
+///
+/// \verbatim
+///       unary-expression:  [C99 6.5.3]
+///         'sizeof' unary-expression
+///         'sizeof' '(' type-name ')'
+/// [C++11] 'sizeof' '...' '(' identifier ')'
+/// [GNU]   '__alignof' unary-expression
+/// [GNU]   '__alignof' '(' type-name ')'
+/// [C11]   '_Alignof' '(' type-name ')'
+/// [C++11] 'alignof' '(' type-id ')'
+/// \endverbatim
+ExprResult Parser::ParseUnaryExprOrTypeTraitExpression() {
+  // HLSL Change Begin
+  assert((!getLangOpts().HLSL || Tok.getKind() == tok::kw_sizeof)
+    && "not supported for HLSL - unreachable");
+  // HLSL Change End
+  assert(Tok.isOneOf(tok::kw_sizeof, tok::kw___alignof, tok::kw_alignof,
+                     tok::kw__Alignof, tok::kw_vec_step,
+                     tok::kw___builtin_omp_required_simd_align) &&
+         "Not a sizeof/alignof/vec_step expression!");
+  Token OpTok = Tok;
+  ConsumeToken();
+
+  // [C++11] 'sizeof' '...' '(' identifier ')'
+  if (Tok.is(tok::ellipsis) && OpTok.is(tok::kw_sizeof) && !getLangOpts().HLSL) { // HLSL Change
+    SourceLocation EllipsisLoc = ConsumeToken();
+    SourceLocation LParenLoc, RParenLoc;
+    IdentifierInfo *Name = nullptr;
+    SourceLocation NameLoc;
+    if (Tok.is(tok::l_paren)) {
+      BalancedDelimiterTracker T(*this, tok::l_paren);
+      T.consumeOpen();
+      LParenLoc = T.getOpenLocation();
+      if (Tok.is(tok::identifier)) {
+        Name = Tok.getIdentifierInfo();
+        NameLoc = ConsumeToken();
+        T.consumeClose();
+        RParenLoc = T.getCloseLocation();
+        if (RParenLoc.isInvalid())
+          RParenLoc = PP.getLocForEndOfToken(NameLoc);
+      } else {
+        Diag(Tok, diag::err_expected_parameter_pack);
+        SkipUntil(tok::r_paren, StopAtSemi);
+      }
+    } else if (Tok.is(tok::identifier)) {
+      Name = Tok.getIdentifierInfo();
+      NameLoc = ConsumeToken();
+      LParenLoc = PP.getLocForEndOfToken(EllipsisLoc);
+      RParenLoc = PP.getLocForEndOfToken(NameLoc);
+      Diag(LParenLoc, diag::er

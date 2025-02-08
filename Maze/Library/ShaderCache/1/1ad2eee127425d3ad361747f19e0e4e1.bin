@@ -1,0 +1,169 @@
+Enter))
+            {
+                ExpandTryView();
+                e.Handled = true;
+            }
+        }
+
+        void OnTryAddActivityKeyDown(object sender, KeyEventArgs e)
+        {
+            if (!LocalAppContextSwitches.UseLegacyAccessibilityFeatures)
+            {
+                if (sender == e.OriginalSource && (e.Key == Key.Space || e.Key == Key.Enter))
+                {
+                    ExpandTryView();
+                    e.Handled = true;
+                }
+            }
+        }
+
+        void OnFinallyViewKeyDown(object sender, KeyEventArgs e)
+        {
+            if (sender == e.OriginalSource && (e.Key == Key.Space || e.Key == Key.Enter))
+            {
+                ExpandFinallyView();
+                e.Handled = true;
+            }
+        }
+
+        void OnFinallyAddActivityKeyDown(object sender, KeyEventArgs e)
+        {
+            if (!LocalAppContextSwitches.UseLegacyAccessibilityFeatures)
+            {
+                if (sender == e.OriginalSource && (e.Key == Key.Space || e.Key == Key.Enter))
+                {
+                    ExpandFinallyView();
+                    e.Handled = true;
+                }
+            }
+        }
+
+        #region AddCatch Label & TypePresenter
+
+        void OnAddCatchMouseDown(object sender, MouseButtonEventArgs e)
+        {
+            if (e.LeftButton == MouseButtonState.Pressed)
+            {
+                this.SwitchToChooseException();
+                e.Handled = true;
+            }
+        }
+
+        void OnAddCatchGotFocus(object sender, RoutedEventArgs e)
+        {
+            this.SwitchToChooseException();
+            e.Handled = true;
+        }
+
+        void SwitchToChooseException()
+        {
+            this.ShowTypePresenterExpanded = true;
+            this.typePresenter.FocusOnVisibleControl();
+        }
+
+        void SwitchToHintText()
+        {
+            this.typePresenter.Type = null;
+            this.ShowTypePresenterExpanded = false;
+            Keyboard.Focus((IInputElement)this);
+        }
+
+        void OnAddCatchHintLabelLoaded(object sender, RoutedEventArgs e)
+        {
+            this.addCatchHintLabel = (Label)sender;
+        }
+
+        void OnAddCatchHintLabelUnloaded(object sender, RoutedEventArgs e)
+        {
+            this.addCatchHintLabel = null;
+        }
+
+        void OnTypePresenterLoaded(object sender, RoutedEventArgs e)
+        {
+            TypePresenter tp = (TypePresenter)sender;
+            Fx.Assert(tp != null, "sender must be a TypePresenter.");
+
+            this.typePresenter = tp;
+            this.typePresenter.Filter = this.ExceptionTypeFilter;
+            this.typePresenter.MostRecentlyUsedTypes = MostRecentlyUsedTypes;
+            //UnRegistering because of 137896: Inside tab control multiple Loaded events happen without an Unloaded event.
+            this.typePresenter.TypeBrowserClosed -= OnTypePresenterTypeBrowserClosed;
+            this.typePresenter.TypeBrowserClosed += OnTypePresenterTypeBrowserClosed;
+        }
+
+        void OnTypePresenterUnloaded(object sender, RoutedEventArgs e)
+        {
+            if (this.typePresenter != null)
+            {
+                this.typePresenter.TypeBrowserClosed -= OnTypePresenterTypeBrowserClosed;
+                this.typePresenter = null;
+            }
+        }
+
+        void OnTypePresenterTypeBrowserClosed(object sender, RoutedEventArgs e)
+        {
+            this.typePresenter.FocusOnVisibleControl();
+        }
+
+        void OnTypePresenterKeyDown(object sender, KeyEventArgs e)
+        {
+            switch (e.Key)
+            {
+                case Key.Escape:
+                    this.SwitchToHintText();
+                    e.Handled = true;
+                    break;
+
+                case Key.Enter:
+                    this.AddCatch();
+                    e.Handled = true;
+                    break;
+            }
+        }
+
+        void OnTypePresenterLostFocus(object sender, RoutedEventArgs e)
+        {
+            if (this.ShowTypePresenterExpanded)
+            {
+                this.AddCatch();
+                e.Handled = true;
+            }
+        }
+
+        void AddCatch()
+        {
+            if (this.typePresenter != null)
+            {
+                Type type = this.typePresenter.Type;
+                if (type != null && this.ExceptionTypeFilter(type))
+                {
+                    CreateCatch(type);
+                }
+                this.SwitchToHintText();
+            }
+        }
+
+        #endregion
+
+        bool ExceptionTypeFilter(Type type)
+        {
+            if (type == null)
+            {
+                return false;
+            }
+
+            if (type != typeof(Exception) && !type.IsSubclassOf(typeof(Exception)))
+            {
+                return false;
+            }
+
+            ModelProperty catchesProperty = this.ModelItem.Properties[CatchesPropertyName];
+            Fx.Assert(catchesProperty != null, "TryCatch.Catches could not be null");
+            ModelItemCollection catches = catchesProperty.Collection;
+            Fx.Assert(catches != null, "Catches.Collection could not be null");
+            foreach (ModelItem catchItem in catches)
+            {
+                ModelProperty exceptionTypeProperty = catchItem.Properties[ExceptionTypePropertyName];
+                Fx.Assert(exceptionTypeProperty != null, "Catch.ExceptionType could not be null");
+                Type exceptionType = exceptionTypeProperty.ComputedValue as Type;
+                Fx.Assert(exceptionType != null, "Catch.ExceptionTyp

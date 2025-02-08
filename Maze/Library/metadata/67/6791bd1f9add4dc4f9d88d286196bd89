@@ -1,0 +1,103 @@
+            Task<Task> outer = outerTcs.Task;
+
+            Task unwrappedInner = outer.Unwrap();
+            Assert.False(unwrappedInner.IsCompleted);
+
+            outerTcs.SetResult(inner);
+            AssertTasksAreEqual(inner, unwrappedInner);
+        }
+
+        /// <summary>
+        /// Tests Unwrap when the generic inner task has completed but the outer task has not completed by the time Unwrap is called.
+        /// </summary>
+        /// <param name="inner">The inner task.</param>
+        [Theory]
+        [MemberData(nameof(CompletedStringTasks))]
+        public void Generic_NotCompleted_Completed(Task<string> inner)
+        {
+            var outerTcs = new TaskCompletionSource<Task<string>>();
+            Task<Task<string>> outer = outerTcs.Task;
+
+            Task<string> unwrappedInner = outer.Unwrap();
+            Assert.False(unwrappedInner.IsCompleted);
+
+            outerTcs.SetResult(inner);
+            AssertTasksAreEqual(inner, unwrappedInner);
+        }
+
+        /// <summary>
+        /// Tests Unwrap when the non-generic inner task has not yet completed but the outer task has completed by the time Unwrap is called.
+        /// </summary>
+        /// <param name="innerStatus">How the inner task should be completed.</param>
+        [Theory]
+        [InlineData(TaskStatus.RanToCompletion)]
+        [InlineData(TaskStatus.Faulted)]
+        [InlineData(TaskStatus.Canceled)]
+        public void NonGeneric_Completed_NotCompleted(TaskStatus innerStatus) 
+        {
+            var innerTcs = new TaskCompletionSource<bool>();
+            Task inner = innerTcs.Task;
+
+            Task<Task> outer = Task.FromResult(inner);
+            Task unwrappedInner = outer.Unwrap();
+            Assert.False(unwrappedInner.IsCompleted);
+
+            switch (innerStatus)
+            {
+                case TaskStatus.RanToCompletion:
+                    innerTcs.SetResult(true);
+                    break;
+                case TaskStatus.Faulted:
+                    innerTcs.SetException(new InvalidProgramException());
+                    break;
+                case TaskStatus.Canceled:
+                    innerTcs.SetCanceled();
+                    break;
+            }
+
+            AssertTasksAreEqual(inner, unwrappedInner);
+        }
+
+        /// <summary>
+        /// Tests Unwrap when the non-generic inner task has not yet completed but the outer task has completed by the time Unwrap is called.
+        /// </summary>
+        /// <param name="innerStatus">How the inner task should be completed.</param>
+        [Theory]
+        [InlineData(TaskStatus.RanToCompletion)]
+        [InlineData(TaskStatus.Faulted)]
+        [InlineData(TaskStatus.Canceled)]
+        public void Generic_Completed_NotCompleted(TaskStatus innerStatus)
+        {
+            var innerTcs = new TaskCompletionSource<int>();
+            Task<int> inner = innerTcs.Task;
+
+            Task<Task<int>> outer = Task.FromResult(inner);
+            Task<int> unwrappedInner = outer.Unwrap();
+            Assert.False(unwrappedInner.IsCompleted);
+
+            switch (innerStatus)
+            {
+                case TaskStatus.RanToCompletion:
+                    innerTcs.SetResult(42);
+                    break;
+                case TaskStatus.Faulted:
+                    innerTcs.SetException(new InvalidProgramException());
+                    break;
+                case TaskStatus.Canceled:
+                    innerTcs.SetCanceled();
+                    break;
+            }
+
+            AssertTasksAreEqual(inner, unwrappedInner);
+        }
+
+        /// <summary>
+        /// Tests Unwrap when neither the non-generic inner task nor the outer task has completed by the time Unwrap is called.
+        /// </summary>
+        /// <param name="outerCompletesFirst">Whether the outer task or the inner task completes first.</param>
+        /// <param name="innerStatus">How the inner task should be completed.</param>
+        [Theory]
+        [InlineData(true, TaskStatus.RanToCompletion)]
+        [InlineData(true, TaskStatus.Canceled)]
+        [InlineData(true, TaskStatus.Faulted)]
+        [InlineData(false, TaskStatus.RanToCo

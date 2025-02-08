@@ -1,0 +1,354 @@
+isl_error_invalid,
+			"not a sequence node",
+			return isl_schedule_node_free(node));
+	child = isl_schedule_node_copy(node);
+	node = isl_schedule_node_parent(node);
+	filter = isl_schedule_node_filter_get_filter(node);
+	n = isl_schedule_node_n_children(child);
+	for (i = 0; i < n; ++i) {
+		child = isl_schedule_node_child(child, i);
+		child = isl_schedule_node_filter_intersect_filter(child,
+						isl_union_set_copy(filter));
+		child = isl_schedule_node_parent(child);
+	}
+	isl_union_set_free(filter);
+	tree = isl_schedule_node_get_tree(child);
+	isl_schedule_node_free(child);
+	node = isl_schedule_node_parent(node);
+	node = isl_schedule_node_sequence_splice(node, pos, tree);
+
+	return node;
+}
+
+/* Update the ancestors of "node" to point to the tree that "node"
+ * now points to.
+ * That is, replace the child in the original parent that corresponds
+ * to the current tree position by node->tree and continue updating
+ * the ancestors in the same way until the root is reached.
+ *
+ * If "fn" is not NULL, then it is called on each ancestor as we move up
+ * the tree so that it can modify the ancestor before it is added
+ * to the list of ancestors of the modified node.
+ * The additional "pos" argument records the position
+ * of the "tree" argument in the original schedule tree.
+ *
+ * If "node" originally points to a leaf of the schedule tree, then make sure
+ * that in the end it points to a leaf in the updated schedule tree.
+ */
+static __isl_give isl_schedule_node *update_ancestors(
+	__isl_take isl_schedule_node *node,
+	__isl_give isl_schedule_tree *(*fn)(__isl_take isl_schedule_tree *tree,
+		__isl_keep isl_schedule_node *pos, void *user), void *user)
+{
+	int i, n;
+	int is_leaf;
+	isl_schedule_tree *tree;
+	isl_schedule_node *pos = NULL;
+
+	if (fn)
+		pos = isl_schedule_node_copy(node);
+
+	node = isl_schedule_node_cow(node);
+	if (!node)
+		return isl_schedule_node_free(pos);
+
+	n = isl_schedule_tree_list_n_schedule_tree(node->ancestors);
+	tree = isl_schedule_tree_copy(node->tree);
+
+	for (i = n - 1; i >= 0; --i) {
+		isl_schedule_tree *parent;
+
+		parent = isl_schedule_tree_list_get_schedule_tree(
+						    node->ancestors, i);
+		parent = isl_schedule_tree_replace_child(parent,
+						    node->child_pos[i], tree);
+		if (fn) {
+			pos = isl_schedule_node_parent(pos);
+			parent = fn(parent, pos, user);
+		}
+		node->ancestors = isl_schedule_tree_list_set_schedule_tree(
+			    node->ancestors, i, isl_schedule_tree_copy(parent));
+
+		tree = parent;
+	}
+
+	if (fn)
+		isl_schedule_node_free(pos);
+
+	is_leaf = isl_schedule_tree_is_leaf(node->tree);
+	node->schedule = isl_schedule_set_root(node->schedule, tree);
+	if (is_leaf) {
+		isl_schedule_tree_free(node->tree);
+		node->tree = isl_schedule_node_get_leaf(node);
+	}
+
+	if (!node->schedule || !node->ancestors)
+		return isl_schedule_node_free(node);
+
+	return node;
+}
+
+/* Replace the subtree that "pos" points to by "tree", updating
+ * the ancestors to maintain a consistent state.
+ */
+__isl_give isl_schedule_node *isl_schedule_node_graft_tree(
+	__isl_take isl_schedule_node *pos, __isl_take isl_schedule_tree *tree)
+{
+	if (!tree || !pos)
+		goto error;
+	if (pos->tree == tree) {
+		isl_schedule_tree_free(tree);
+		return pos;
+	}
+
+	pos = isl_schedule_node_cow(pos);
+	if (!pos)
+		goto error;
+
+	isl_schedule_tree_free(pos->tree);
+	pos->tree = tree;
+
+	return update_ancestors(pos, NULL, NULL);
+error:
+	isl_schedule_node_free(pos);
+	isl_schedule_tree_free(tree);
+	return NULL;
+}
+
+/* Make sure we can insert a node between "node" and its parent.
+ * Return -1 on error, reporting the reason why we cannot insert a node.
+ */
+static int check_insert(__isl_keep isl_schedule_node *node)
+{
+	int has_parent;
+	enum isl_schedule_node_type type;
+
+	has_parent = isl_schedule_node_has_parent(node);
+	if (has_parent < 0)
+		return -1;
+	if (!has_parent)
+		isl_die(isl_schedule_node_get_ctx(node), isl_error_invalid,
+			"cannot insert node outside of root", return -1);
+
+	type = isl_schedule_node_get_parent_type(node);
+	if (type == isl_schedule_node_error)
+		return -1;
+	if (type == isl_schedule_node_set || type == isl_schedule_node_sequence)
+		isl_die(isl_schedule_node_get_ctx(node), isl_error_invalid,
+			"cannot insert node between set or sequence node "
+			"and its filter children", return -1);
+
+	return 0;
+}
+
+/* Insert a band node with partial schedule "mupa" between "node" and
+ * its parent.
+ * Return a pointer to the new band node.
+ *
+ * If any of the nodes in the subtree rooted at "node" depend on
+ * the set of outer band nodes then we refuse to insert the band node.
+ */
+__isl_give isl_schedule_node *isl_schedule_node_insert_partial_schedule(
+	__isl_take isl_schedule_node *node,
+	__isl_take isl_multi_union_pw_aff *mupa)
+{
+	int anchored;
+	isl_schedule_band *band;
+	isl_schedule_tree *tree;
+
+	if (check_insert(node) < 0)
+		node = isl_schedule_node_free(node);
+	anchored = isl_schedule_node_is_subtree_anchored(node);
+	if (anchored < 0)
+		goto error;
+	if (anchored)
+		isl_die(isl_schedule_node_get_ctx(node), isl_error_invalid,
+			"cannot insert band node in anchored subtree",
+			goto error);
+
+	tree = isl_schedule_node_get_tree(node);
+	band = isl_schedule_band_from_multi_union_pw_aff(mupa);
+	tree = isl_schedule_tree_insert_band(tree, band);
+	node = isl_schedule_node_graft_tree(node, tree);
+
+	return node;
+error:
+	isl_schedule_node_free(node);
+	isl_multi_union_pw_aff_free(mupa);
+	return NULL;
+}
+
+/* Insert a context node with context "context" between "node" and its parent.
+ * Return a pointer to the new context node.
+ */
+__isl_give isl_schedule_node *isl_schedule_node_insert_context(
+	__isl_take isl_schedule_node *node, __isl_take isl_set *context)
+{
+	isl_schedule_tree *tree;
+
+	if (check_insert(node) < 0)
+		node = isl_schedule_node_free(node);
+
+	tree = isl_schedule_node_get_tree(node);
+	tree = isl_schedule_tree_insert_context(tree, context);
+	node = isl_schedule_node_graft_tree(node, tree);
+
+	return node;
+}
+
+/* Insert an expansion node with the given "contraction" and "expansion"
+ * between "node" and its parent.
+ * Return a pointer to the new expansion node.
+ *
+ * Typically the domain and range spaces of the expansion are different.
+ * This means that only one of them can refer to the current domain space
+ * in a consistent tree.  It is up to the caller to ensure that the tree
+ * returns to a consistent state.
+ */
+__isl_give isl_schedule_node *isl_schedule_node_insert_expansion(
+	__isl_take isl_schedule_node *node,
+	__isl_take isl_union_pw_multi_aff *contraction,
+	__isl_take isl_union_map *expansion)
+{
+	isl_schedule_tree *tree;
+
+	if (check_insert(node) < 0)
+		node = isl_schedule_node_free(node);
+
+	tree = isl_schedule_node_get_tree(node);
+	tree = isl_schedule_tree_insert_expansion(tree, contraction, expansion);
+	node = isl_schedule_node_graft_tree(node, tree);
+
+	return node;
+}
+
+/* Insert an extension node with extension "extension" between "node" and
+ * its parent.
+ * Return a pointer to the new extension node.
+ */
+__isl_give isl_schedule_node *isl_schedule_node_insert_extension(
+	__isl_take isl_schedule_node *node,
+	__isl_take isl_union_map *extension)
+{
+	isl_schedule_tree *tree;
+
+	tree = isl_schedule_node_get_tree(node);
+	tree = isl_schedule_tree_insert_extension(tree, extension);
+	node = isl_schedule_node_graft_tree(node, tree);
+
+	return node;
+}
+
+/* Insert a filter node with filter "filter" between "node" and its parent.
+ * Return a pointer to the new filter node.
+ */
+__isl_give isl_schedule_node *isl_schedule_node_insert_filter(
+	__isl_take isl_schedule_node *node, __isl_take isl_union_set *filter)
+{
+	isl_schedule_tree *tree;
+
+	if (check_insert(node) < 0)
+		node = isl_schedule_node_free(node);
+
+	tree = isl_schedule_node_get_tree(node);
+	tree = isl_schedule_tree_insert_filter(tree, filter);
+	node = isl_schedule_node_graft_tree(node, tree);
+
+	return node;
+}
+
+/* Insert a guard node with guard "guard" between "node" and its parent.
+ * Return a pointer to the new guard node.
+ */
+__isl_give isl_schedule_node *isl_schedule_node_insert_guard(
+	__isl_take isl_schedule_node *node, __isl_take isl_set *guard)
+{
+	isl_schedule_tree *tree;
+
+	if (check_insert(node) < 0)
+		node = isl_schedule_node_free(node);
+
+	tree = isl_schedule_node_get_tree(node);
+	tree = isl_schedule_tree_insert_guard(tree, guard);
+	node = isl_schedule_node_graft_tree(node, tree);
+
+	return node;
+}
+
+/* Insert a mark node with mark identifier "mark" between "node" and
+ * its parent.
+ * Return a pointer to the new mark node.
+ */
+__isl_give isl_schedule_node *isl_schedule_node_insert_mark(
+	__isl_take isl_schedule_node *node, __isl_take isl_id *mark)
+{
+	isl_schedule_tree *tree;
+
+	if (check_insert(node) < 0)
+		node = isl_schedule_node_free(node);
+
+	tree = isl_schedule_node_get_tree(node);
+	tree = isl_schedule_tree_insert_mark(tree, mark);
+	node = isl_schedule_node_graft_tree(node, tree);
+
+	return node;
+}
+
+/* Attach the current subtree of "node" to a sequence of filter tree nodes
+ * with filters described by "filters", attach this sequence
+ * of filter tree nodes as children to a new tree of type "type" and
+ * replace the original subtree of "node" by this new tree.
+ * Each copy of the original subtree is simplified with respect
+ * to the corresponding filter.
+ */
+static __isl_give isl_schedule_node *isl_schedule_node_insert_children(
+	__isl_take isl_schedule_node *node,
+	enum isl_schedule_node_type type,
+	__isl_take isl_union_set_list *filters)
+{
+	int i, n;
+	isl_ctx *ctx;
+	isl_schedule_tree *tree;
+	isl_schedule_tree_list *list;
+
+	if (check_insert(node) < 0)
+		node = isl_schedule_node_free(node);
+
+	if (!node || !filters)
+		goto error;
+
+	ctx = isl_schedule_node_get_ctx(node);
+	n = isl_union_set_list_n_union_set(filters);
+	list = isl_schedule_tree_list_alloc(ctx, n);
+	for (i = 0; i < n; ++i) {
+		isl_schedule_node *node_i;
+		isl_schedule_tree *tree;
+		isl_union_set *filter;
+
+		filter = isl_union_set_list_get_union_set(filters, i);
+		node_i = isl_schedule_node_copy(node);
+		node_i = isl_schedule_node_gist(node_i,
+						isl_union_set_copy(filter));
+		tree = isl_schedule_node_get_tree(node_i);
+		isl_schedule_node_free(node_i);
+		tree = isl_schedule_tree_insert_filter(tree, filter);
+		list = isl_schedule_tree_list_add(list, tree);
+	}
+	tree = isl_schedule_tree_from_children(type, list);
+	node = isl_schedule_node_graft_tree(node, tree);
+
+	isl_union_set_list_free(filters);
+	return node;
+error:
+	isl_union_set_list_free(filters);
+	isl_schedule_node_free(node);
+	return NULL;
+}
+
+/* Insert a sequence node with child filters "filters" between "node" and
+ * its parent.  That is, the tree that "node" points to is attached
+ * to each of the child nodes of the filter nodes.
+ * Return a pointer to the new sequence node.
+ */
+__isl_give isl_schedule_node *isl_schedule_node_insert_sequence(
+	__isl_t

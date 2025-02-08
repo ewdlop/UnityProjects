@@ -1,0 +1,68 @@
+ return a.Value;
+                    }
+                    while (a != e.lastAttr);
+                }
+                e = e.parent as XElement;
+            }
+            return null;
+        }
+
+        internal override int GetDeepHashCode()
+        {
+            int h = name.GetHashCode();
+            h ^= ContentsHashCode();
+            XAttribute a = lastAttr;
+            if (a != null)
+            {
+                do
+                {
+                    a = a.next;
+                    h ^= a.GetDeepHashCode();
+                } while (a != lastAttr);
+            }
+            return h;
+        }
+
+        private void ReadElementFrom(XmlReader r, LoadOptions o)
+        {
+            ReadElementFromImpl(r, o);
+
+            if (!r.IsEmptyElement)
+            {
+                r.Read();
+                ReadContentFrom(r, o);
+            }
+
+            r.Read();
+        }
+
+        private async Task ReadElementFromAsync(XmlReader r, LoadOptions o, CancellationToken cancellationTokentoken)
+        {
+            ReadElementFromImpl(r, o);
+
+            if (!r.IsEmptyElement)
+            {
+                cancellationTokentoken.ThrowIfCancellationRequested();
+                await r.ReadAsync().ConfigureAwait(false);
+
+                await ReadContentFromAsync(r, o, cancellationTokentoken).ConfigureAwait(false);
+            }
+
+            cancellationTokentoken.ThrowIfCancellationRequested();
+            await r.ReadAsync().ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Shared implementation between ReadElementFrom / ReadElementFromAsync.
+        /// </summary>
+        private void ReadElementFromImpl(XmlReader r, LoadOptions o)
+        {
+            if(r.ReadState != ReadState.Interactive) throw new InvalidOperationException(SR.InvalidOperation_ExpectedInteractive);
+            name = XNamespace.Get(r.NamespaceURI).GetName(r.LocalName);
+            if ((o & LoadOptions.SetBaseUri) != 0)
+            {
+                string baseUri = r.BaseURI;
+                if (!string.IsNullOrEmpty(baseUri))
+                {
+                    SetBaseUri(baseUri);
+              

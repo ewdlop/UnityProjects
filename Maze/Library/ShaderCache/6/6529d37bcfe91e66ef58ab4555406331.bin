@@ -1,0 +1,250 @@
+ecurityVersion = MessageSecurityVersion.Default;
+            }
+            result.LocalClientSettings.DetectReplays = false;
+            result.LocalServiceSettings.DetectReplays = false;
+            result.IncludeTimestamp = true;
+
+            return result;
+        }
+
+        // this method reverses CreateIssuedTokenOverTransportBindingElement() logic
+        internal static bool IsIssuedTokenOverTransportBinding(SecurityBindingElement sbe, out IssuedSecurityTokenParameters issuedTokenParameters)
+        {
+            issuedTokenParameters = null;
+            if (!(sbe is TransportSecurityBindingElement))
+                return false;
+
+            if (!sbe.IncludeTimestamp)
+                return false;
+
+            // do not check local settings: sbe.LocalServiceSettings and sbe.LocalClientSettings
+
+            SupportingTokenParameters parameters = sbe.EndpointSupportingTokenParameters;
+            if (parameters.SignedEncrypted.Count != 0 || (parameters.Signed.Count == 0 && parameters.Endorsing.Count == 0) || parameters.SignedEndorsing.Count != 0)
+                return false;
+            if ((parameters.Signed.Count == 1) && (parameters.Endorsing.Count == 0))
+            {
+                issuedTokenParameters = parameters.Signed[0] as IssuedSecurityTokenParameters;
+                if (issuedTokenParameters != null && issuedTokenParameters.KeyType != SecurityKeyType.BearerKey)
+                    return false;
+            }
+            else if ((parameters.Endorsing.Count == 1) && (parameters.Signed.Count == 0))
+            {
+                issuedTokenParameters = parameters.Endorsing[0] as IssuedSecurityTokenParameters;
+                if (issuedTokenParameters != null && (issuedTokenParameters.KeyType != SecurityKeyType.SymmetricKey && issuedTokenParameters.KeyType != SecurityKeyType.AsymmetricKey))
+                    return false;
+            }
+            if (issuedTokenParameters == null)
+                return false;
+            if (issuedTokenParameters.RequireDerivedKeys)
+                return false;
+
+            return true;
+        }
+
+        // If any changes are made to this method, please make sure that they are
+        // reflected in the corresponding IsSecureConversationBinding() method.
+        static public SecurityBindingElement CreateSecureConversationBindingElement(SecurityBindingElement bootstrapSecurity)
+        {
+            return CreateSecureConversationBindingElement(bootstrapSecurity, SecureConversationSecurityTokenParameters.defaultRequireCancellation, null);
+        }
+
+        // this method reverses CreateSecureConversationBindingElement() logic
+        internal static bool IsSecureConversationBinding(SecurityBindingElement sbe, out SecurityBindingElement bootstrapSecurity)
+        {
+            return IsSecureConversationBinding(sbe, SecureConversationSecurityTokenParameters.defaultRequireCancellation, out bootstrapSecurity);
+        }
+
+        static public SecurityBindingElement CreateSecureConversationBindingElement(SecurityBindingElement bootstrapSecurity, bool requireCancellation)
+        {
+            return CreateSecureConversationBindingElement(bootstrapSecurity, requireCancellation, null);
+        }
+
+        // If any changes are made to this method, please make sure that they are
+        // reflected in the corresponding IsSecureConversationBinding() method.
+        static public SecurityBindingElement CreateSecureConversationBindingElement(SecurityBindingElement bootstrapSecurity, bool requireCancellation, ChannelProtectionRequirements bootstrapProtectionRequirements)
+        {
+            if (bootstrapSecurity == null)
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgumentNull("bootstrapBinding");
+
+            SecurityBindingElement result;
+
+            if (bootstrapSecurity is TransportSecurityBindingElement)
+            {
+                // there is no need to do replay detection or key derivation for transport bindings
+                TransportSecurityBindingElement primary = new TransportSecurityBindingElement();                
+                SecureConversationSecurityTokenParameters scParameters = new SecureConversationSecurityTokenParameters(
+                        bootstrapSecurity,
+                        requireCancellation,
+                        bootstrapProtectionRequirements);
+                scParameters.RequireDerivedKeys = false;
+                primary.EndpointSupportingTokenParameters.Endorsing.Add(
+                    scParameters);                
+                primary.LocalClientSettings.DetectReplays = false;
+                primary.LocalServiceSettings.DetectReplays = false;
+                primary.IncludeTimestamp = true;
+                result = primary;
+            }
+            else // Symmetric- or AsymmetricSecurityBindingElement
+            {
+                SymmetricSecurityBindingElement primary = new SymmetricSecurityBindingElement(
+                    new SecureConversationSecurityTokenParameters(
+                        bootstrapSecurity,
+                        requireCancellation,
+                        bootstrapProtectionRequirements));
+                // there is no need for signature confirmation on the steady state binding
+                primary.RequireSignatureConfirmation = false;
+                result = primary;
+            }
+
+            return result;
+        }
+
+        // this method reverses CreateSecureConversationBindingElement() logic
+        internal static bool IsSecureConversationBinding(SecurityBindingElement sbe, bool requireCancellation, out SecurityBindingElement bootstrapSecurity)
+        {
+            bootstrapSecurity = null;
+            SymmetricSecurityBindingElement ssbe = sbe as SymmetricSecurityBindingElement;
+            if (ssbe != null)
+            {
+                if (ssbe.RequireSignatureConfirmation)
+                    return false;
+
+                SecureConversationSecurityTokenParameters parameters = ssbe.ProtectionTokenParameters as SecureConversationSecurityTokenParameters;
+                if (parameters == null)
+                    return false;
+                if (parameters.RequireCancellation != requireCancellation)
+                    return false;
+                bootstrapSecurity = parameters.BootstrapSecurityBindingElement;
+            }
+            else
+            {
+                if (!sbe.IncludeTimestamp)
+                    return false;
+
+                // do not check local settings: sbe.LocalServiceSettings and sbe.LocalClientSettings
+
+                if (!(sbe is TransportSecurityBindingElement))
+                    return false;
+
+                SupportingTokenParameters parameters = sbe.EndpointSupportingTokenParameters;
+                if (parameters.Signed.Count != 0 || parameters.SignedEncrypted.Count != 0 || parameters.Endorsing.Count != 1 || parameters.SignedEndorsing.Count != 0)
+                    return false;
+                SecureConversationSecurityTokenParameters scParameters = parameters.Endorsing[0] as SecureConversationSecurityTokenParameters;
+                if (scParameters == null)
+                    return false;
+
+                if (scParameters.RequireCancellation != requireCancellation)
+                    return false;
+
+                bootstrapSecurity = scParameters.BootstrapSecurityBindingElement;
+
+            }
+
+            if (bootstrapSecurity != null && bootstrapSecurity.SecurityHeaderLayout != SecurityProtocolFactory.defaultSecurityHeaderLayout)
+                return false;
+
+            return bootstrapSecurity != null;
+        }
+
+        public override string ToString()
+        {
+            StringBuilder sb = new StringBuilder();
+
+            sb.AppendLine(String.Format(CultureInfo.InvariantCulture, "{0}:", this.GetType().ToString()));
+            sb.AppendLine(String.Format(CultureInfo.InvariantCulture, "DefaultAlgorithmSuite: {0}", this.defaultAlgorithmSuite.ToString()));
+            sb.AppendLine(String.Format(CultureInfo.InvariantCulture, "IncludeTimestamp: {0}", this.includeTimestamp.ToString()));
+            sb.AppendLine(String.Format(CultureInfo.InvariantCulture, "KeyEntropyMode: {0}", this.keyEntropyMode.ToString()));
+            sb.AppendLine(String.Format(CultureInfo.InvariantCulture, "MessageSecurityVersion: {0}", this.MessageSecurityVersion.ToString()));
+            sb.AppendLine(String.Format(CultureInfo.InvariantCulture, "SecurityHeaderLayout: {0}", this.securityHeaderLayout.ToString()));
+            sb.AppendLine(String.Format(CultureInfo.InvariantCulture, "ProtectTokens: {0}", this.protectTokens.ToString()));
+            sb.AppendLine("EndpointSupportingTokenParameters:");
+            sb.AppendLine("  " + this.EndpointSupportingTokenParameters.ToString().Trim().Replace("\n", "\n  "));
+            sb.AppendLine("OptionalEndpointSupportingTokenParameters:");
+            sb.AppendLine("  " + this.OptionalEndpointSupportingTokenParameters.ToString().Trim().Replace("\n", "\n  "));
+            if (this.operationSupportingTokenParameters.Count == 0)
+            {
+                sb.AppendLine(String.Format(CultureInfo.InvariantCulture, "OperationSupportingTokenParameters: none"));
+            }
+            else
+            {
+                foreach (string requestAction in this.OperationSupportingTokenParameters.Keys)
+                {
+                    sb.AppendLine(String.Format(CultureInfo.InvariantCulture, "OperationSupportingTokenParameters[\"{0}\"]:", requestAction));
+                    sb.AppendLine("  " + this.OperationSupportingTokenParameters[requestAction].ToString().Trim().Replace("\n", "\n  "));
+                }
+            }
+            if (this.optionalOperationSupportingTokenParameters.Count == 0)
+            {
+                sb.AppendLine(String.Format(CultureInfo.InvariantCulture, "OptionalOperationSupportingTokenParameters: none"));
+            }
+            else
+            {
+                foreach (string requestAction in this.OptionalOperationSupportingTokenParameters.Keys)
+                {
+                    sb.AppendLine(String.Format(CultureInfo.InvariantCulture, "OptionalOperationSupportingTokenParameters[\"{0}\"]:", requestAction));
+                    sb.AppendLine("  " + this.OptionalOperationSupportingTokenParameters[requestAction].ToString().Trim().Replace("\n", "\n  "));
+                }
+            }
+
+            return sb.ToString().Trim();
+        }
+
+
+        internal static ChannelProtectionRequirements ComputeProtectionRequirements(SecurityBindingElement security, BindingParameterCollection parameterCollection, BindingElementCollection bindingElements, bool isForService)
+        {
+            if (parameterCollection == null)
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgumentNull("parameterCollection");
+            if (bindingElements == null)
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgumentNull("bindingElements");
+            if (security == null)
+            {
+                return null;
+            }
+
+            ChannelProtectionRequirements result = null;
+            if ((security is SymmetricSecurityBindingElement) || (security is AsymmetricSecurityBindingElement))
+            {
+                result = new ChannelProtectionRequirements();
+                ChannelProtectionRequirements contractRequirements = parameterCollection.Find<ChannelProtectionRequirements>();
+
+                if (contractRequirements != null)
+                    result.Add(contractRequirements);
+
+                AddBindingProtectionRequirements(result, bindingElements, !isForService);
+            }
+
+            return result;
+        }
+
+        static void AddBindingProtectionRequirements(ChannelProtectionRequirements requirements, BindingElementCollection bindingElements, bool isForChannel)
+        {
+            // Gather custom requirements from bindingElements
+            CustomBinding binding = new CustomBinding(bindingElements);
+            BindingContext context = new BindingContext(binding, new BindingParameterCollection());
+            // In theory, we can just do 
+            //     context.GetInnerProperty<ChannelProtectionRequirements>()
+            // but that relies on each binding element to correctly union-up its own requirements with
+            // those of the rest of the stack.  So instead, we ask each BE individually, and we do the 
+            // work of combining the results.  This protects us against this scenario: someone authors "FooBE"
+            // with a a GetProperty implementation that always returns null (oops), and puts FooBE on the 
+            // top of the stack, and so FooBE "hides" important protection requirements that inner BEs
+            // require, resulting in an insecure binding.
+            foreach (BindingElement bindingElement in bindingElements)
+            {
+                if (bindingElement != null)
+                {
+                    // ask each element individually for its requirements
+                    context.RemainingBindingElements.Clear();
+                    context.RemainingBindingElements.Add(bindingElement);
+                    ChannelProtectionRequirements s = context.GetInnerProperty<ChannelProtectionRequirements>();
+                    if (s != null)
+                    {
+                        //if (isForChannel)
+                        //{
+                        //    requirements.Add(s.CreateInverse());
+                        //}
+                        //else
+                        //{
+                            requirements.Add(s);
+    

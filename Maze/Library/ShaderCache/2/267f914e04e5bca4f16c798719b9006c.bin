@@ -1,0 +1,97 @@
+/setup the reply buffer
+            if (replyBuffer == null) {
+                replyBuffer = SafeLocalFree.LocalAlloc (MaxUdpPacket);
+            }
+
+            //queue the event
+            int error;
+
+            try
+            {
+                if (async) {
+                    if (pingEvent == null)
+                        pingEvent = new ManualResetEvent (false);
+                    else
+                        pingEvent.Reset();
+                
+                    registeredWait = ThreadPool.RegisterWaitForSingleObject (pingEvent, new WaitOrTimerCallback (PingCallback), this, -1, true);
+                }
+
+                //Copy user dfata into the native world
+                SetUnmanagedStructures (buffer);
+
+                if (!ipv6) {
+                    if (async) {
+                        error = (int)UnsafeNetInfoNativeMethods.IcmpSendEcho2 (handlePingV4, pingEvent.SafeWaitHandle, IntPtr.Zero, IntPtr.Zero, (uint)address.m_Address, requestBuffer, (ushort)buffer.Length, ref ipOptions, replyBuffer, MaxUdpPacket, (uint)timeout);
+                    }
+                    else{
+                        error = (int)UnsafeNetInfoNativeMethods.IcmpSendEcho2 (handlePingV4, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, (uint)address.m_Address, requestBuffer, (ushort)buffer.Length, ref ipOptions, replyBuffer, MaxUdpPacket, (uint)timeout);
+                    }
+                }
+                else {                                                   
+                    IPEndPoint ep = new IPEndPoint (address, 0);
+                    SocketAddress remoteAddr = ep.Serialize ();
+                    byte[] sourceAddr = new byte[28];
+                    if(async){
+                        error = (int)UnsafeNetInfoNativeMethods.Icmp6SendEcho2 (handlePingV6, pingEvent.SafeWaitHandle, IntPtr.Zero, IntPtr.Zero, sourceAddr, remoteAddr.m_Buffer, requestBuffer, (ushort)buffer.Length, ref ipOptions, replyBuffer, MaxUdpPacket, (uint)timeout);
+                    }
+                    else{
+                        error = (int)UnsafeNetInfoNativeMethods.Icmp6SendEcho2 (handlePingV6, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, sourceAddr, remoteAddr.m_Buffer, requestBuffer, (ushort)buffer.Length, ref ipOptions, replyBuffer, MaxUdpPacket, (uint)timeout);
+                    }
+                }
+            }
+            catch
+            {
+                UnregisterWaitHandle();
+                throw;
+            }
+
+            //need this if something is bogus.
+            if (error == 0) {
+                error = (int)Marshal.GetLastWin32Error();
+                
+                // Only skip Async IO Pending error value
+                if (async && error == UnsafeNclNativeMethods.ErrorCodes.ERROR_IO_PENDING)
+                    return null; // Expected async return value
+                
+                // Cleanup
+                FreeUnmanagedStructures();
+                UnregisterWaitHandle();
+
+                if (async // No IPStatus async errors
+                    || error < (int)IPStatus.DestinationNetworkUnreachable // Min
+                    || error > (int)IPStatus.DestinationScopeMismatch) // Max // Out of IPStatus range
+                    throw new Win32Exception(error);
+
+                return new PingReply((IPStatus)error); // Synchronous IPStatus errors 
+            }
+
+            if (async) {
+                return null;
+            }
+
+            FreeUnmanagedStructures ();
+
+            //return the reply
+            PingReply reply;
+            if (ipv6) {
+                Icmp6EchoReply icmp6Reply = (Icmp6EchoReply)Marshal.PtrToStructure(replyBuffer.DangerousGetHandle(), typeof(Icmp6EchoReply));
+                reply = new PingReply(icmp6Reply, replyBuffer.DangerousGetHandle(), sendSize);
+            }
+            else {
+                IcmpEchoReply icmpReply = (IcmpEchoReply)Marshal.PtrToStructure(replyBuffer.DangerousGetHandle(), typeof(IcmpEchoReply));
+                reply = new PingReply(icmpReply);
+            }
+
+            // IcmpEchoReply still has an unsafe IntPtr reference into replybuffer
+            // and replybuffer was being freed prematurely by the GC, causing AccessViolationExceptions.
+            GC.KeepAlive(replyBuffer);
+
+            return reply;
+        }
+        
+        // Tests if the current machine supports the given ip protocol family
+        private void TestIsIpSupported(IPAddress ip) {
+            // Catches if IPv4 has been uninstalled on Vista+
+            if (ip.AddressFamily == AddressFamily.InterNetwork && !Socket.OSSupportsIPv4)
+                throw new NotSupportedExcept

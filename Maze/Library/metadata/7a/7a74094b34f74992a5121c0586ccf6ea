@@ -1,0 +1,136 @@
+nt(value);
+            }
+
+            // Fallback contract is 0->0
+            return Log2SoftwareFallback(value);
+        }
+
+        /// <summary>
+        /// Returns the integer (floor) log of the specified value, base 2.
+        /// Note that by convention, input value 0 returns 0 since Log(0) is undefined.
+        /// </summary>
+        /// <param name="value">The value.</param>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [CLSCompliant(false)]
+        public static int Log2(ulong value)
+        {
+            if (Lzcnt.X64.IsSupported)
+            {
+                // Enforce conventional contract 0->0 (Log(0) is undefined)
+                if (value == 0)
+                {
+                    return 0;
+                }
+
+                // LZCNT contract is 0->64
+                return 63 - (int)Lzcnt.X64.LeadingZeroCount(value);
+            }
+
+            uint hi = (uint)(value >> 32);
+
+            if (hi == 0)
+            {
+                return Log2((uint)value);
+            }
+
+            return 32 + Log2(hi);
+        }
+
+        /// <summary>
+        /// Returns the integer (floor) log of the specified value, base 2.
+        /// Note that by convention, input value 0 returns 0 since Log(0) is undefined.
+        /// Does not directly use any hardware intrinsics, nor does it incur branching.
+        /// </summary>
+        /// <param name="value">The value.</param>
+        private static int Log2SoftwareFallback(uint value)
+        {
+            // No AggressiveInlining due to large method size
+            // Has conventional contract 0->0 (Log(0) is undefined)
+
+            // Fill trailing zeros with ones, eg 00010010 becomes 00011111
+            value |= value >> 01;
+            value |= value >> 02;
+            value |= value >> 04;
+            value |= value >> 08;
+            value |= value >> 16;
+
+            // uint.MaxValue >> 27 is always in range [0 - 31] so we use Unsafe.AddByteOffset to avoid bounds check
+            return Unsafe.AddByteOffset(
+                // Using deBruijn sequence, k=2, n=5 (2^5=32) : 0b_0000_0111_1100_0100_1010_1100_1101_1101u
+                ref MemoryMarshal.GetReference(Log2DeBruijn),
+                // uint|long -> IntPtr cast on 32-bit platforms does expensive overflow checks not needed here
+                (IntPtr)(int)((value * 0x07C4ACDDu) >> 27));
+        }
+
+        /// <summary>
+        /// Returns the population count (number of bits set) of a mask.
+        /// Similar in behavior to the x86 instruction POPCNT.
+        /// </summary>
+        /// <param name="value">The value.</param>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [CLSCompliant(false)]
+        public static int PopCount(uint value)
+        {
+            if (Popcnt.IsSupported)
+            {
+                return (int)Popcnt.PopCount(value);
+            }
+
+            return SoftwareFallback(value);
+
+            static int SoftwareFallback(uint value)
+            {
+                const uint c1 = 0x_55555555u;
+                const uint c2 = 0x_33333333u;
+                const uint c3 = 0x_0F0F0F0Fu;
+                const uint c4 = 0x_01010101u;
+
+                value -= (value >> 1) & c1;
+                value = (value & c2) + ((value >> 2) & c2);
+                value = (((value + (value >> 4)) & c3) * c4) >> 24;
+
+                return (int)value;
+            }
+        }
+
+        /// <summary>
+        /// Returns the population count (number of bits set) of a mask.
+        /// Similar in behavior to the x86 instruction POPCNT.
+        /// </summary>
+        /// <param name="value">The value.</param>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [CLSCompliant(false)]
+        public static int PopCount(ulong value)
+        {
+            if (Popcnt.X64.IsSupported)
+            {
+                return (int)Popcnt.X64.PopCount(value);
+            }
+
+#if BIT32
+            return PopCount((uint)value) // lo
+                + PopCount((uint)(value >> 32)); // hi
+#else
+            return SoftwareFallback(value);
+
+            static int SoftwareFallback(ulong value)
+            {
+                const ulong c1 = 0x_55555555_55555555ul;
+                const ulong c2 = 0x_33333333_33333333ul;
+                const ulong c3 = 0x_0F0F0F0F_0F0F0F0Ful;
+                const ulong c4 = 0x_01010101_01010101ul;
+
+                value -= (value >> 1) & c1;
+                value = (value & c2) + ((value >> 2) & c2);
+                value = (((value + (value >> 4)) & c3) * c4) >> 56;
+
+                return (int)value;
+            }
+#endif
+        }
+
+        /// <summary>
+        /// Count the number of trailing zero bits in an integer value.
+        /// Similar in behavior to the x86 instruction TZCNT.
+        /// </summary>
+        /// <param na

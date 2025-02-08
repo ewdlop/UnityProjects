@@ -1,0 +1,72 @@
+           therefore, fallback values cannot be assigned to byte
+ *                  sequences that result in this action code
+ *        7  illegal byte sequence
+ *           19..16 not used, 0
+ *           15..0  16-bit Unicode BMP code point U+ffff (new with version 2)
+ *        8  state change only
+ *           19..0  not used, 0
+ *           useful for state changes in simple stateful encodings,
+ *           at Shift-In/Shift-Out codes
+ *
+ *
+ *        9..15 reserved for future use
+ *           current implementations will only perform a state change
+ *           and ignore bits 19..0
+ *
+ * An encoding with contiguous ranges of unassigned byte sequences, like
+ * Shift-JIS and especially EUC-TW, can be stored efficiently by having
+ * at least two states for the trail bytes:
+ * One trail byte state that results in code points, and one that only
+ * has "unassigned" and "illegal" terminal states.
+ *
+ * Note: partly by accident, this data structure supports simple stateful
+ * encodings without any additional logic.
+ * Currently, only simple Shift-In/Shift-Out schemes are handled with
+ * appropriate state tables (especially EBCDIC_STATEFUL!).
+ *
+ * MBCS version 2 added:
+ * unassigned and illegal action codes have U+fffe and U+ffff
+ * instead of unused bits; this is useful for _MBCS_SINGLE_SIMPLE_GET_NEXT_BMP()
+ *
+ * Converting from Unicode to codepage bytes --------------------------------***
+ *
+ * The conversion data structure for fromUnicode is designed for the known
+ * structure of Unicode. It maps from 21-bit code points (0..0x10ffff) to
+ * a sequence of 1..4 bytes, in addition to a flag that indicates if there is
+ * a roundtrip mapping.
+ *
+ * The lookup is done with a 3-stage trie, using 11/6/4 bits for stage 1/2/3
+ * like in the character properties table.
+ * The beginning of the trie is at offsetFromUTable, the beginning of stage 3
+ * with the resulting bytes is at offsetFromUBytes.
+ *
+ * Beginning with version 4, single-byte codepages have a significantly different
+ * trie compared to other codepages.
+ * In all cases, the entry in stage 1 is directly the index of the block of
+ * 64 entries in stage 2.
+ *
+ * Single-byte lookup:
+ *
+ * Stage 2 only contains 16-bit indexes directly to the 16-blocks in stage 3.
+ * Stage 3 contains one 16-bit word per result:
+ * Bits 15..8 indicate the kind of result:
+ *    f  roundtrip result
+ *    c  fallback result from private-use code point
+ *    8  fallback result from other code points
+ *    0  unassigned
+ * Bits 7..0 contain the codepage byte. A zero byte is always possible.
+ *
+ * In version 4.3, the runtime code can build an sbcsIndex for a utf8Friendly
+ * file. For 2-byte UTF-8 byte sequences and some 3-byte sequences the lookup
+ * becomes a 2-stage (single-index) trie lookup with 6 bits for stage 3.
+ * ASCII code points can be looked up with a linear array access into stage 3.
+ * See maxFastUChar and other details in ucnvmbcs.h.
+ *
+ * Multi-byte lookup:
+ *
+ * Stage 2 contains a 32-bit word for each 16-block in stage 3:
+ * Bits 31..16 contain flags for which stage 3 entries contain roundtrip results
+ *             test: MBCS_FROM_U_IS_ROUNDTRIP(stage2Entry, c)
+ *             If this test is false, then a non-zero result will be interpreted as
+ *             a fallback mapping.
+ * Bits 15..0  contain the index to stage 3, w

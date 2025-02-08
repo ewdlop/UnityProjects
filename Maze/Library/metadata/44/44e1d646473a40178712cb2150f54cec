@@ -1,0 +1,385 @@
+
+        protected override Material[] GetSharedMaterials()
+        {
+            int materialCount = m_textInfo.materialCount;
+
+            if (m_fontSharedMaterials == null)
+                m_fontSharedMaterials = new Material[materialCount];
+            else if (m_fontSharedMaterials.Length != materialCount)
+                TMP_TextInfo.Resize(ref m_fontSharedMaterials, materialCount, false);
+
+            for (int i = 0; i < materialCount; i++)
+            {
+                if (i == 0)
+                    m_fontSharedMaterials[i] = m_sharedMaterial;
+                else
+                    m_fontSharedMaterials[i] = m_subTextObjects[i].sharedMaterial;
+            }
+
+            return m_fontSharedMaterials;
+        }
+
+
+        /// <summary>
+        /// Method used to assign new materials to the text and sub text objects.
+        /// </summary>
+        protected override void SetSharedMaterials(Material[] materials)
+        {
+            int materialCount = m_textInfo.materialCount;
+
+            // Check allocation of the fontSharedMaterials array.
+            if (m_fontSharedMaterials == null)
+                m_fontSharedMaterials = new Material[materialCount];
+            else if (m_fontSharedMaterials.Length != materialCount)
+                TMP_TextInfo.Resize(ref m_fontSharedMaterials, materialCount, false);
+
+            // Only assign as many materials as the text object contains.
+            for (int i = 0; i < materialCount; i++)
+            {
+                if (i == 0)
+                {
+                    // Only assign new material if the font atlas textures match.
+                    if (materials[i].GetTexture(ShaderUtilities.ID_MainTex) == null || materials[i].GetTexture(ShaderUtilities.ID_MainTex).GetInstanceID() != m_sharedMaterial.GetTexture(ShaderUtilities.ID_MainTex).GetInstanceID())
+                        continue;
+
+                    m_sharedMaterial = m_fontSharedMaterials[i] = materials[i];
+                    m_padding = GetPaddingForMaterial(m_sharedMaterial);
+                }
+                else
+                {
+                    // Only assign new material if the font atlas textures match.
+                    if (materials[i].GetTexture(ShaderUtilities.ID_MainTex) == null || materials[i].GetTexture(ShaderUtilities.ID_MainTex).GetInstanceID() != m_subTextObjects[i].sharedMaterial.GetTexture(ShaderUtilities.ID_MainTex).GetInstanceID())
+                        continue;
+
+                    // Only assign a new material if none were specified in the text input.
+                    if (m_subTextObjects[i].isDefaultMaterial)
+                        m_subTextObjects[i].sharedMaterial = m_fontSharedMaterials[i] = materials[i];
+                }
+            }
+        }
+
+
+        // This function will create an instance of the Font Material.
+        protected override void SetOutlineThickness(float thickness)
+        {
+            // Use material instance if one exists. Otherwise, create a new instance of the shared material.
+            if (m_fontMaterial != null && m_sharedMaterial.GetInstanceID() != m_fontMaterial.GetInstanceID())
+            {
+                m_sharedMaterial = m_fontMaterial;
+                m_canvasRenderer.SetMaterial(m_sharedMaterial, m_sharedMaterial.GetTexture(ShaderUtilities.ID_MainTex));
+            }
+            else if(m_fontMaterial == null)
+            {
+                m_fontMaterial = CreateMaterialInstance(m_sharedMaterial);
+                m_sharedMaterial = m_fontMaterial;
+                m_canvasRenderer.SetMaterial(m_sharedMaterial, m_sharedMaterial.GetTexture(ShaderUtilities.ID_MainTex));
+            }
+
+            thickness = Mathf.Clamp01(thickness);
+            m_sharedMaterial.SetFloat(ShaderUtilities.ID_OutlineWidth, thickness);
+            m_padding = GetPaddingForMaterial();
+        }
+
+
+        // This function will create an instance of the Font Material.
+        protected override void SetFaceColor(Color32 color)
+        {
+            // Use material instance if one exists. Otherwise, create a new instance of the shared material.
+            if (m_fontMaterial == null)
+                m_fontMaterial = CreateMaterialInstance(m_sharedMaterial);
+
+            m_sharedMaterial = m_fontMaterial;
+            m_padding = GetPaddingForMaterial();
+
+            m_sharedMaterial.SetColor(ShaderUtilities.ID_FaceColor, color);
+        }
+
+
+        // This function will create an instance of the Font Material.
+        protected override void SetOutlineColor(Color32 color)
+        {
+            // Use material instance if one exists. Otherwise, create a new instance of the shared material.
+            if (m_fontMaterial == null)
+                m_fontMaterial = CreateMaterialInstance(m_sharedMaterial);
+
+            m_sharedMaterial = m_fontMaterial;
+            m_padding = GetPaddingForMaterial();
+
+            m_sharedMaterial.SetColor(ShaderUtilities.ID_OutlineColor, color);
+        }
+
+
+        // Sets the Render Queue and Ztest mode 
+        protected override void SetShaderDepth()
+        {
+            if (m_canvas == null || m_sharedMaterial == null)
+                return;
+
+            if (m_canvas.renderMode == RenderMode.ScreenSpaceOverlay || m_isOverlay)
+            {
+                // Should this use an instanced material?
+                m_sharedMaterial.SetFloat(ShaderUtilities.ShaderTag_ZTestMode, 0);
+            }
+            else
+            {   // TODO: This section needs to be tested.
+                m_sharedMaterial.SetFloat(ShaderUtilities.ShaderTag_ZTestMode, 4);
+            }
+        }
+
+
+        // Sets the Culling mode of the material
+        protected override void SetCulling()
+        {
+            if (m_isCullingEnabled)
+            {
+                Material mat = materialForRendering;
+
+                if (mat != null)
+                    mat.SetFloat("_CullMode", 2);
+
+                for (int i = 1; i < m_subTextObjects.Length && m_subTextObjects[i] != null; i++)
+                {
+                    mat = m_subTextObjects[i].materialForRendering;
+
+                    if (mat != null)
+                    {
+                        mat.SetFloat(ShaderUtilities.ShaderTag_CullMode, 2);
+                    }
+                }
+            }
+            else
+            {
+                Material mat = materialForRendering;
+
+                if (mat != null)
+                    mat.SetFloat("_CullMode", 0);
+
+                for (int i = 1; i < m_subTextObjects.Length && m_subTextObjects[i] != null; i++)
+                {
+                    mat = m_subTextObjects[i].materialForRendering;
+
+                    if (mat != null)
+                    {
+                        mat.SetFloat(ShaderUtilities.ShaderTag_CullMode, 0);
+                    }
+                }
+            }
+        }
+
+
+        // Set Perspective Correction Mode based on whether Camera is Orthographic or Perspective
+        void SetPerspectiveCorrection()
+        {
+            if (m_isOrthographic)
+                m_sharedMaterial.SetFloat(ShaderUtilities.ID_PerspectiveFilter, 0.0f);
+            else
+                m_sharedMaterial.SetFloat(ShaderUtilities.ID_PerspectiveFilter, 0.875f);
+        }
+
+
+        /// <summary>
+        /// Get the padding value for the currently assigned material.
+        /// </summary>
+        /// <returns></returns>
+        protected override float GetPaddingForMaterial(Material mat)
+        {
+            m_padding = ShaderUtilities.GetPadding(mat, m_enableExtraPadding, m_isUsingBold);
+            m_isMaskingEnabled = ShaderUtilities.IsMaskingEnabled(m_sharedMaterial);
+            m_isSDFShader = mat.HasProperty(ShaderUtilities.ID_WeightNormal);
+
+            return m_padding;
+        }
+
+
+        /// <summary>
+        /// Get the padding value for the currently assigned material.
+        /// </summary>
+        /// <returns></returns>
+        protected override float GetPaddingForMaterial()
+        {
+            ShaderUtilities.GetShaderPropertyIDs();
+
+            m_padding = ShaderUtilities.GetPadding(m_sharedMaterial, m_enableExtraPadding, m_isUsingBold);
+            m_isMaskingEnabled = ShaderUtilities.IsMaskingEnabled(m_sharedMaterial);
+            m_isSDFShader = m_sharedMaterial.HasProperty(ShaderUtilities.ID_WeightNormal);
+
+            return m_padding;
+        }
+
+        // Function to allocate the necessary buffers to render the text. This function is called whenever the buffer size needs to be increased.
+        void SetMeshArrays(int size)
+        {
+            m_textInfo.meshInfo[0].ResizeMeshInfo(size);
+
+            m_canvasRenderer.SetMesh(m_textInfo.meshInfo[0].mesh);
+        }
+
+
+        // This function parses through the Char[] to determine how many characters will be visible. It then makes sure the arrays are large enough for all those characters.
+        protected override int SetArraySizes(int[] chars)
+        {
+            //Debug.Log("*** SetArraySizes() on Instance ID (" + GetInstanceID() + ") ***");
+            #if TMP_PROFILE_ON
+            Profiler.BeginSample("SetArraySizes");
+            #endif
+
+            int tagEnd = 0;
+            int spriteCount = 0;
+
+            m_totalCharacterCount = 0;
+            m_isUsingBold = false;
+            m_isParsingText = false;
+            tag_NoParsing = false;
+            m_style = m_fontStyle;
+
+            m_fontWeightInternal = (m_style & FontStyles.Bold) == FontStyles.Bold ? 700 : m_fontWeight;
+            m_fontWeightStack.SetDefault(m_fontWeightInternal);
+
+            m_currentFontAsset = m_fontAsset;
+            m_currentMaterial = m_sharedMaterial;
+            m_currentMaterialIndex = 0;
+
+            m_materialReferenceStack.SetDefault(new MaterialReference(m_currentMaterialIndex, m_currentFontAsset, null, m_currentMaterial, m_padding));
+
+            m_materialReferenceIndexLookup.Clear();
+            MaterialReference.AddMaterialReference(m_currentMaterial, m_currentFontAsset, m_materialReferences, m_materialReferenceIndexLookup);
+
+            if (m_textInfo == null) m_textInfo = new TMP_TextInfo();
+            m_textElementType = TMP_TextElementType.Character;
+
+            // Clear Linked Text object if we have one.
+            if (m_linkedTextComponent != null)
+            {
+                m_linkedTextComponent.text = string.Empty; // SetText(string.Empty, false);
+                m_linkedTextComponent.ForceMeshUpdate();
+            }
+
+            // Parsing XML tags in the text
+            for (int i = 0; i < chars.Length && chars[i] != 0; i++)
+            {
+                //Make sure the characterInfo array can hold the next text element.
+                if (m_textInfo.characterInfo == null || m_totalCharacterCount >= m_textInfo.characterInfo.Length)
+                    TMP_TextInfo.Resize(ref m_textInfo.characterInfo, m_totalCharacterCount + 1, true);
+
+                int c = chars[i];
+
+                // PARSE XML TAGS
+                #region PARSE XML TAGS
+                if (m_isRichText && c == 60) // if Char '<'
+                {
+                    int prev_MaterialIndex = m_currentMaterialIndex;
+
+                    // Check if Tag is Valid
+                    if (ValidateHtmlTag(chars, i + 1, out tagEnd))
+                    {
+                        i = tagEnd;
+
+                        if ((m_style & FontStyles.Bold) == FontStyles.Bold) m_isUsingBold = true;
+
+                        if (m_textElementType == TMP_TextElementType.Sprite)
+                        {
+                            m_materialReferences[m_currentMaterialIndex].referenceCount += 1;
+
+                            m_textInfo.characterInfo[m_totalCharacterCount].character = (char)(57344 + m_spriteIndex);
+                            m_textInfo.characterInfo[m_totalCharacterCount].spriteIndex = m_spriteIndex;
+                            m_textInfo.characterInfo[m_totalCharacterCount].fontAsset = m_currentFontAsset;
+                            m_textInfo.characterInfo[m_totalCharacterCount].spriteAsset = m_currentSpriteAsset;
+                            m_textInfo.characterInfo[m_totalCharacterCount].materialReferenceIndex = m_currentMaterialIndex;
+                            m_textInfo.characterInfo[m_totalCharacterCount].elementType = m_textElementType;
+
+                            // Restore element type and material index to previous values.
+                            m_textElementType = TMP_TextElementType.Character;
+                            m_currentMaterialIndex = prev_MaterialIndex;
+
+                            spriteCount += 1;
+                            m_totalCharacterCount += 1;
+                        }
+
+                        continue;
+                    }
+                }
+                #endregion
+
+
+                bool isUsingFallback = false;
+                bool isUsingAlternativeTypeface = false;
+
+                TMP_Glyph glyph;
+                TMP_FontAsset tempFontAsset;
+                TMP_FontAsset prev_fontAsset = m_currentFontAsset;
+                Material prev_material = m_currentMaterial;
+                int prev_materialIndex = m_currentMaterialIndex;
+
+
+                // Handle Font Styles like LowerCase, UpperCase and SmallCaps.
+                #region Handling of LowerCase, UpperCase and SmallCaps Font Styles
+                if (m_textElementType == TMP_TextElementType.Character)
+                {
+                    if ((m_style & FontStyles.UpperCase) == FontStyles.UpperCase)
+                    {
+                        // If this character is lowercase, switch to uppercase.
+                        if (char.IsLower((char)c))
+                            c = char.ToUpper((char)c);
+
+                    }
+                    else if ((m_style & FontStyles.LowerCase) == FontStyles.LowerCase)
+                    {
+                        // If this character is uppercase, switch to lowercase.
+                        if (char.IsUpper((char)c))
+                            c = char.ToLower((char)c);
+                    }
+                    else if ((m_fontStyle & FontStyles.SmallCaps) == FontStyles.SmallCaps || (m_style & FontStyles.SmallCaps) == FontStyles.SmallCaps)
+                    {
+                        // Only convert lowercase characters to uppercase.
+                        if (char.IsLower((char)c))
+                            c = char.ToUpper((char)c);
+                    }
+                }
+                #endregion
+
+
+                // Handling of font weights.
+                #region HANDLING OF FONT WEIGHT
+                tempFontAsset = GetFontAssetForWeight(m_fontWeightInternal);
+                if (tempFontAsset != null)
+                {
+                    isUsingFallback = true;
+                    isUsingAlternativeTypeface = true;
+                    m_currentFontAsset = tempFontAsset;
+                    //m_currentMaterialIndex = MaterialReference.AddMaterialReference(m_currentMaterial, tempFontAsset, m_materialReferences, m_materialReferenceIndexLookup);
+                }
+                #endregion
+
+
+                // Lookup the Glyph data for each character and cache it.
+                #region LOOKUP GLYPH
+                tempFontAsset = TMP_FontUtilities.SearchForGlyph(m_currentFontAsset, c, out glyph);
+
+                // Search for the glyph in the Sprite Asset assigned to the text object.
+                if (glyph == null)
+                {
+                    TMP_SpriteAsset spriteAsset = this.spriteAsset;
+
+                    if (spriteAsset != null)
+                    {
+                        int spriteIndex = -1;
+
+                        // Check Default Sprite Asset and its Fallbacks
+                        spriteAsset = TMP_SpriteAsset.SearchForSpriteByUnicode(spriteAsset, c, true, out spriteIndex);
+
+                        if (spriteIndex != -1)
+                        {
+                            m_textElementType = TMP_TextElementType.Sprite;
+                            m_textInfo.characterInfo[m_totalCharacterCount].elementType = m_textElementType;
+
+                            m_currentMaterialIndex = MaterialReference.AddMaterialReference(spriteAsset.material, spriteAsset, m_materialReferences, m_materialReferenceIndexLookup);
+                            m_materialReferences[m_currentMaterialIndex].referenceCount += 1;
+
+                            m_textInfo.characterInfo[m_totalCharacterCount].character = (char)c;
+                            m_textInfo.characterInfo[m_totalCharacterCount].spriteIndex = spriteIndex;
+                            m_textInfo.characterInfo[m_totalCharacterCount].fontAsset = m_currentFontAsset;
+                            m_textInfo.characterInfo[m_totalCharacterCount].spriteAsset = spriteAsset;
+                            m_textInfo.characterInfo[m_totalCharacterCount].materialReferenceIndex = m_currentMaterialIndex;
+
+                            // Restore element type and material index to previous values.
+                            m_textElementType = TMP_TextElementType.Cha

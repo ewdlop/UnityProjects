@@ -1,0 +1,124 @@
+RCE)
+!if $(TKINSTALL)
+MSG = ^
+*** Warning: This extension requires the source distribution of Tk.^
+*** Please set the TKDIR macro to point to the Tk sources.
+!error $(MSG)
+!endif
+!endif
+
+
+# If INSTALLDIR set to Tcl installation root dir then reset to the
+# lib dir for installing extensions 
+!if exist("$(_INSTALLDIR)\include\tcl.h")
+_INSTALLDIR=$(_INSTALLDIR)\lib
+!endif
+
+# END Case 2(c) or (d) - Building an extension
+!endif # if $(DOING_TCL)
+
+################################################################
+# 3. Determine compiler version and architecture
+# In this section, we figure out the compiler version and the
+# architecture for which we are building. This sets the
+# following macros:
+# VCVERSION - the internal compiler version as 1200, 1400, 1910 etc.
+#     This is also printed by the compiler in dotted form 19.10 etc.
+# VCVER - the "marketing version", for example Visual C++ 6 for internal
+#     compiler version 1200. This is kept only for legacy reasons as it
+#     does not make sense for recent Microsoft compilers. Only used for
+#     output directory names.
+# ARCH - set to IX86 or AMD64 depending on 32- or 64-bit target
+# NATIVE_ARCH - set to IX86 or AMD64 for the host machine
+# MACHINE - same as $(ARCH) - legacy
+# _VC_MANIFEST_EMBED_{DLL,EXE} - commands for embedding a manifest if needed
+# CFG_ENCODING - set to an character encoding.
+#   TBD - this is passed to compiler as TCL_CFGVAL_ENCODING but can't
+#   see where it is used
+
+cc32		= $(CC)   # built-in default.
+link32		= link
+lib32		= lib
+rc32		= $(RC)   # built-in default.
+
+#----------------------------------------------------------------
+# Figure out the compiler architecture and version by writing
+# the C macros to a file, preprocessing them with the C
+# preprocessor and reading back the created file
+
+_HASH=^#
+_VC_MANIFEST_EMBED_EXE=
+_VC_MANIFEST_EMBED_DLL=
+VCVER=0
+!if ![echo VCVERSION=_MSC_VER > vercl.x] \
+    && ![echo $(_HASH)if defined(_M_IX86) >> vercl.x] \
+    && ![echo ARCH=IX86 >> vercl.x] \
+    && ![echo $(_HASH)elif defined(_M_AMD64) >> vercl.x] \
+    && ![echo ARCH=AMD64 >> vercl.x] \
+    && ![echo $(_HASH)endif >> vercl.x] \
+    && ![$(cc32) -nologo -TC -P vercl.x 2>NUL]
+!include vercl.i
+!if $(VCVERSION) < 1900
+!if ![echo VCVER= ^\> vercl.vc] \
+    && ![set /a $(VCVERSION) / 100 - 6 >> vercl.vc]
+!include vercl.vc
+!endif
+!else
+# The simple calculation above does not apply to new Visual Studio releases
+# Keep the compiler version in its native form.
+VCVER = $(VCVERSION)
+!endif
+!endif
+
+!if ![del 2>NUL /q/f vercl.x vercl.i vercl.vc]
+!endif
+
+#----------------------------------------------------------------
+# The MACHINE macro is used by legacy makefiles so set it as well
+!ifdef MACHINE
+!if "$(MACHINE)" == "x86"
+!undef MACHINE
+MACHINE = IX86
+!elseif "$(MACHINE)" == "x64"
+!undef MACHINE
+MACHINE = AMD64
+!endif
+!if "$(MACHINE)" != "$(ARCH)"
+!error Specified MACHINE macro $(MACHINE) does not match detected target architecture $(ARCH).
+!endif
+!else
+MACHINE=$(ARCH)
+!endif
+
+#------------------------------------------------------------
+# Figure out the *host* architecture by reading the registry
+
+!if ![reg query HKLM\Hardware\Description\System\CentralProcessor\0 /v Identifier | findstr /i x86]
+NATIVE_ARCH=IX86
+!else
+NATIVE_ARCH=AMD64
+!endif
+
+# Since MSVC8 we must deal with manifest resources.
+!if $(VCVERSION) >= 1400
+_VC_MANIFEST_EMBED_EXE=if exist $@.manifest mt -nologo -manifest $@.manifest -outputresource:$@;1
+_VC_MANIFEST_EMBED_DLL=if exist $@.manifest mt -nologo -manifest $@.manifest -outputresource:$@;2
+!endif
+
+!ifndef CFG_ENCODING
+CFG_ENCODING	= \"cp1252\"
+!endif
+
+################################################################
+# 4. Build the nmakehlp program
+# This is a helper app we need to overcome nmake's limiting
+# environment. We will call out to it to get various bits of
+# information about supported compiler options etc.
+#
+# Tcl itself will always use the nmakehlp.c program which is
+# in its own source. This is the "master" copy and kept updated.
+#
+# Extensions built against an installed Tcl will use the installed
+# copy of Tcl's nmakehlp.c if there is one and their own version
+# otherwise. In the latter case, they would also be using their own
+# rules.vc. Note 

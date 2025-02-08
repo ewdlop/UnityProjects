@@ -1,0 +1,46 @@
+edundant frames can be removed safely
+				TArray<int32> FramesToDelete;
+				for (int32 FrameIndex = 1; FrameIndex < NumFrames - 2; ++FrameIndex)
+				{
+					const FDatasmithTransformFrameInfo& PreviousFrameInfo = Animation->GetFrame(TransformType, FrameIndex - 1);
+					const FDatasmithTransformFrameInfo& CurrentFrameInfo = Animation->GetFrame(TransformType, FrameIndex);
+					const FDatasmithTransformFrameInfo& NextFrameInfo = Animation->GetFrame(TransformType, FrameIndex + 1);
+
+					// Remove the in-between frames that have the same transform as the previous and following frames
+					// Need to keep the frames on the boundaries of sharp transitions to avoid interpolated frames at import
+					if (CurrentFrameInfo.IsValid() && PreviousFrameInfo.IsValid() && NextFrameInfo.IsValid() && CurrentFrameInfo == PreviousFrameInfo && CurrentFrameInfo == NextFrameInfo)
+					{
+						FramesToDelete.Add(FrameIndex);
+					}
+				}
+				// Second pass: remove the frames determined in the previous pass
+				for (int32 FrameIndex = FramesToDelete.Num() - 1; FrameIndex > 0; --FrameIndex)
+				{
+					Animation->RemoveFrame(TransformType, FramesToDelete[FrameIndex]);
+				}
+			}
+			// Note that a one-frame animation could be an instantaneous state change (eg. teleport), so keep it
+			return Animation->GetFramesCount(TransformType);
+		}
+
+		void CleanUpLevelSequences()
+		{
+			int32 LevelSequencesLastIndex = Scene->GetLevelSequencesCount() - 1;
+
+			// Remove level seequences without animation
+			for (int32 SequenceIndex = LevelSequencesLastIndex; SequenceIndex >= 0; --SequenceIndex)
+			{
+				TSharedPtr< IDatasmithLevelSequenceElement > LevelSequence = Scene->GetLevelSequence(SequenceIndex);
+
+				if (!LevelSequence.IsValid())
+				{
+					continue;
+				}
+
+				int32 NumAnims = LevelSequence->GetAnimationsCount();
+				for (int32 AnimIndex = NumAnims - 1; AnimIndex >= 0; --AnimIndex)
+				{
+					TSharedPtr< IDatasmithBaseAnimationElement > Animation = LevelSequence->GetAnimation(AnimIndex);
+					if (Animation.IsValid() && Animation->IsA(EDatasmithElementType::Animation) && Animation->IsSubType((uint64)EDatasmithElementAnimationSubType::TransformAnimation))
+					{
+						const TSharedRef< IDatasmithTransformAnimationElement > TransformAnimation = St

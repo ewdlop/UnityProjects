@@ -1,0 +1,294 @@
+ ") vtable address --\n";
+      } else {
+        CharUnits BaseOffset =
+          AddressPointsByIndex.lower_bound(NextIndex)->second.getBaseOffset();
+        
+        // We store the class names in a set to get a stable order.
+        std::set<std::string> ClassNames;
+        for (const auto &I :
+             llvm::make_range(AddressPointsByIndex.equal_range(NextIndex))) {
+          assert(I.second.getBaseOffset() == BaseOffset &&
+                 "Invalid base offset!");
+          const CXXRecordDecl *RD = I.second.getBase();
+          ClassNames.insert(RD->getQualifiedNameAsString());
+        }
+
+        for (const std::string &Name : ClassNames) {
+          Out << "       -- (" << Name;
+          Out << ", " << BaseOffset.getQuantity() << ") vtable address --\n";
+        }
+      }
+    }
+  }
+
+  Out << '\n';
+  
+  if (isBuildingConstructorVTable())
+    return;
+  
+  if (MostDerivedClass->getNumVBases()) {
+    // We store the virtual base class names and their offsets in a map to get
+    // a stable order.
+
+    std::map<std::string, CharUnits> ClassNamesAndOffsets;
+    for (const auto &I : VBaseOffsetOffsets) {
+      std::string ClassName = I.first->getQualifiedNameAsString();
+      CharUnits OffsetOffset = I.second;
+      ClassNamesAndOffsets.insert(std::make_pair(ClassName, OffsetOffset));
+    }
+    
+    Out << "Virtual base offset offsets for '";
+    MostDerivedClass->printQualifiedName(Out);
+    Out << "' (";
+    Out << ClassNamesAndOffsets.size();
+    Out << (ClassNamesAndOffsets.size() == 1 ? " entry" : " entries") << ").\n";
+
+    for (const auto &I : ClassNamesAndOffsets)
+      Out << "   " << I.first << " | " << I.second.getQuantity() << '\n';
+
+    Out << "\n";
+  }
+  
+  if (!Thunks.empty()) {
+    // We store the method names in a map to get a stable order.
+    std::map<std::string, const CXXMethodDecl *> MethodNamesAndDecls;
+
+    for (const auto &I : Thunks) {
+      const CXXMethodDecl *MD = I.first;
+      std::string MethodName = 
+        PredefinedExpr::ComputeName(PredefinedExpr::PrettyFunctionNoVirtual,
+                                    MD);
+      
+      MethodNamesAndDecls.insert(std::make_pair(MethodName, MD));
+    }
+
+    for (const auto &I : MethodNamesAndDecls) {
+      const std::string &MethodName = I.first;
+      const CXXMethodDecl *MD = I.second;
+
+      ThunkInfoVectorTy ThunksVector = Thunks[MD];
+      std::sort(ThunksVector.begin(), ThunksVector.end(),
+                [](const ThunkInfo &LHS, const ThunkInfo &RHS) {
+        assert(LHS.Method == nullptr && RHS.Method == nullptr);
+        return std::tie(LHS.This, LHS.Return) < std::tie(RHS.This, RHS.Return);
+      });
+
+      Out << "Thunks for '" << MethodName << "' (" << ThunksVector.size();
+      Out << (ThunksVector.size() == 1 ? " entry" : " entries") << ").\n";
+      
+      for (unsigned I = 0, E = ThunksVector.size(); I != E; ++I) {
+        const ThunkInfo &Thunk = ThunksVector[I];
+
+        Out << llvm::format("%4d | ", I);
+        
+        // If this function pointer has a return pointer adjustment, dump it.
+        if (!Thunk.Return.isEmpty()) {
+          Out << "return adjustment: " << Thunk.Return.NonVirtual;
+          Out << " non-virtual";
+          if (Thunk.Return.Virtual.Itanium.VBaseOffsetOffset) {
+            Out << ", " << Thunk.Return.Virtual.Itanium.VBaseOffsetOffset;
+            Out << " vbase offset offset";
+          }
+
+          if (!Thunk.This.isEmpty())
+            Out << "\n       ";
+        }
+
+        // If this function pointer has a 'this' pointer adjustment, dump it.
+        if (!Thunk.This.isEmpty()) {
+          Out << "this adjustment: ";
+          Out << Thunk.This.NonVirtual << " non-virtual";
+          
+          if (Thunk.This.Virtual.Itanium.VCallOffsetOffset) {
+            Out << ", " << Thunk.This.Virtual.Itanium.VCallOffsetOffset;
+            Out << " vcall offset offset";
+          }
+        }
+        
+        Out << '\n';
+      }
+      
+      Out << '\n';
+    }
+  }
+
+  // Compute the vtable indices for all the member functions.
+  // Store them in a map keyed by the index so we'll get a sorted table.
+  std::map<uint64_t, std::string> IndicesMap;
+
+  for (const auto *MD : MostDerivedClass->methods()) {
+    // We only want virtual member functions.
+    if (!MD->isVirtual())
+      continue;
+    MD = MD->getCanonicalDecl();
+
+    std::string MethodName =
+      PredefinedExpr::ComputeName(PredefinedExpr::PrettyFunctionNoVirtual,
+                                  MD);
+
+    if (const CXXDestructorDecl *DD = dyn_cast<CXXDestructorDecl>(MD)) {
+      GlobalDecl GD(DD, Dtor_Complete);
+      assert(MethodVTableIndices.count(GD));
+      uint64_t VTableIndex = MethodVTableIndices[GD];
+      IndicesMap[VTableIndex] = MethodName + " [complete]";
+      IndicesMap[VTableIndex + 1] = MethodName + " [deleting]";
+    } else {
+      assert(MethodVTableIndices.count(MD));
+      IndicesMap[MethodVTableIndices[MD]] = MethodName;
+    }
+  }
+
+  // Print the vtable indices for all the member functions.
+  if (!IndicesMap.empty()) {
+    Out << "VTable indices for '";
+    MostDerivedClass->printQualifiedName(Out);
+    Out << "' (" << IndicesMap.size() << " entries).\n";
+
+    for (const auto &I : IndicesMap) {
+      uint64_t VTableIndex = I.first;
+      const std::string &MethodName = I.second;
+
+      Out << llvm::format("%4" PRIu64 " | ", VTableIndex) << MethodName
+          << '\n';
+    }
+  }
+
+  Out << '\n';
+}
+}
+
+VTableLayout::VTableLayout(ArrayRef<size_t> VTableIndices,
+                           ArrayRef<VTableComponent> VTableComponents,
+                           ArrayRef<VTableThunkTy> VTableThunks,
+                           const AddressPointsMapTy &AddressPoints)
+    : VTableComponents(VTableComponents), VTableThunks(VTableThunks),
+      AddressPoints(AddressPoints) {
+  if (VTableIndices.size() <= 1)
+    assert(VTableIndices.size() == 1 && VTableIndices[0] == 0);
+  else
+    this->VTableIndices = OwningArrayRef<size_t>(VTableIndices);
+
+  std::sort(this->VTableThunks.begin(), this->VTableThunks.end(),
+            [](const VTableLayout::VTableThunkTy &LHS,
+               const VTableLayout::VTableThunkTy &RHS) {
+              assert((LHS.first != RHS.first || LHS.second == RHS.second) &&
+                     "Different thunks should have unique indices!");
+              return LHS.first < RHS.first;
+            });
+}
+
+VTableLayout::~VTableLayout() { }
+
+ItaniumVTableContext::ItaniumVTableContext(ASTContext &Context)
+    : VTableContextBase(/*MS=*/false) {}
+
+ItaniumVTableContext::~ItaniumVTableContext() {}
+
+uint64_t ItaniumVTableContext::getMethodVTableIndex(GlobalDecl GD) {
+  MethodVTableIndicesTy::iterator I = MethodVTableIndices.find(GD);
+  if (I != MethodVTableIndices.end())
+    return I->second;
+  
+  const CXXRecordDecl *RD = cast<CXXMethodDecl>(GD.getDecl())->getParent();
+
+  computeVTableRelatedInformation(RD);
+
+  I = MethodVTableIndices.find(GD);
+  assert(I != MethodVTableIndices.end() && "Did not find index!");
+  return I->second;
+}
+
+CharUnits
+ItaniumVTableContext::getVirtualBaseOffsetOffset(const CXXRecordDecl *RD,
+                                                 const CXXRecordDecl *VBase) {
+  ClassPairTy ClassPair(RD, VBase);
+  
+  VirtualBaseClassOffsetOffsetsMapTy::iterator I = 
+    VirtualBaseClassOffsetOffsets.find(ClassPair);
+  if (I != VirtualBaseClassOffsetOffsets.end())
+    return I->second;
+
+  VCallAndVBaseOffsetBuilder Builder(RD, RD, /*FinalOverriders=*/nullptr,
+                                     BaseSubobject(RD, CharUnits::Zero()),
+                                     /*BaseIsVirtual=*/false,
+                                     /*OffsetInLayoutClass=*/CharUnits::Zero());
+
+  for (const auto &I : Builder.getVBaseOffsetOffsets()) {
+    // Insert all types.
+    ClassPairTy ClassPair(RD, I.first);
+
+    VirtualBaseClassOffsetOffsets.insert(std::make_pair(ClassPair, I.second));
+  }
+  
+  I = VirtualBaseClassOffsetOffsets.find(ClassPair);
+  assert(I != VirtualBaseClassOffsetOffsets.end() && "Did not find index!");
+  
+  return I->second;
+}
+
+static std::unique_ptr<VTableLayout>
+CreateVTableLayout(const ItaniumVTableBuilder &Builder) {
+  SmallVector<VTableLayout::VTableThunkTy, 1>
+    VTableThunks(Builder.vtable_thunks_begin(), Builder.vtable_thunks_end());
+
+  return llvm::make_unique<VTableLayout>(
+      Builder.VTableIndices, Builder.vtable_components(), VTableThunks,
+      Builder.getAddressPoints());
+}
+
+void
+ItaniumVTableContext::computeVTableRelatedInformation(const CXXRecordDecl *RD) {
+  std::unique_ptr<const VTableLayout> &Entry = VTableLayouts[RD];
+
+  // Check if we've computed this information before.
+  if (Entry)
+    return;
+
+  ItaniumVTableBuilder Builder(*this, RD, CharUnits::Zero(),
+                               /*MostDerivedClassIsVirtual=*/0, RD);
+  Entry = CreateVTableLayout(Builder);
+
+  MethodVTableIndices.insert(Builder.vtable_indices_begin(),
+                             Builder.vtable_indices_end());
+
+  // Add the known thunks.
+  Thunks.insert(Builder.thunks_begin(), Builder.thunks_end());
+
+  // If we don't have the vbase information for this class, insert it.
+  // getVirtualBaseOffsetOffset will compute it separately without computing
+  // the rest of the vtable related information.
+  if (!RD->getNumVBases())
+    return;
+  
+  const CXXRecordDecl *VBase =
+    RD->vbases_begin()->getType()->getAsCXXRecordDecl();
+  
+  if (VirtualBaseClassOffsetOffsets.count(std::make_pair(RD, VBase)))
+    return;
+
+  for (const auto &I : Builder.getVBaseOffsetOffsets()) {
+    // Insert all types.
+    ClassPairTy ClassPair(RD, I.first);
+
+    VirtualBaseClassOffsetOffsets.insert(std::make_pair(ClassPair, I.second));
+  }
+}
+
+std::unique_ptr<VTableLayout>
+ItaniumVTableContext::createConstructionVTableLayout(
+    const CXXRecordDecl *MostDerivedClass, CharUnits MostDerivedClassOffset,
+    bool MostDerivedClassIsVirtual, const CXXRecordDecl *LayoutClass) {
+  ItaniumVTableBuilder Builder(*this, MostDerivedClass, MostDerivedClassOffset,
+                               MostDerivedClassIsVirtual, LayoutClass);
+  return CreateVTableLayout(Builder);
+}
+
+namespace {
+
+// Vtables in the Microsoft ABI are different from the Itanium ABI.
+//
+// The main differences are:
+//  1. Separate vftable and vbtable.
+//
+//  2. Each subobject with a vfptr gets its own vftable rather than an address
+//     point in a single vtable shared between all the subob

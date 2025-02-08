@@ -1,0 +1,243 @@
+INT_0_DYNAMIC | InternalParticleFlag::eCONSTRAINT_1_DYNAMIC));
+	}
+
+	//
+	// Collide with dynamic shapes
+
+	PxU32 numDynamicShapes = 0;
+	for(PxU32 i = 0; i < numContactManagers; i++)
+	{
+		const ParticleStreamContactManager& cm = contactManagers[i];
+		if(!cm.isDynamic)
+			continue;
+
+		updateFluidBodyContactPair(particlesSp, numParticlesSp, collDataSp, constraintBufs, perParticleCacheLocal,
+		                           localCellHash, packetCorner, cm, w2sTransforms[i]);
+
+		numDynamicShapes++;
+	}
+
+	PxF32 maxMotionDistanceSqr = mParams.maxMotionDistance * mParams.maxMotionDistance;
+
+	if(numDynamicShapes > 0)
+	{
+		bool isTwoWay = (mParams.flags & PxParticleBaseFlag::eCOLLISION_TWOWAY) != 0;
+		for(PxU32 p = 0; p < numParticlesSp; p++)
+		{
+			ParticleCollData& collData = collDataSp[p];
+			collisionResponse(collData, isTwoWay, false, mParams);
+			clampToMaxMotion(collData.newPos, collData.oldPos, mParams.maxMotionDistance, maxMotionDistanceSqr);
+			collData.flags &= ~ParticleCollisionFlags::CC;
+			collData.flags &= ~ParticleCollisionFlags::DC;
+			collData.flags |= ParticleCollisionFlags::RESET_SNORMAL;
+			collData.surfacePos = PxVec3(0);
+			// we need to keep the dynamic surface velocity for providing collision velocities in finalization
+			// collData.surfaceVel = PxVec3(0);
+			collData.ccTime = 1.0f;
+		}
+	}
+
+	//
+	// Collide with static shapes
+	// (Static shapes need to be processed after dynamic shapes to avoid that dynamic shapes push
+	//  particles into static shapes)
+	//
+
+	bool loadedCache = false;
+	for(PxU32 i = 0; i < numContactManagers; i++)
+	{
+		const ParticleStreamContactManager& cm = contactManagers[i];
+		if(cm.isDynamic)
+			continue;
+
+		const Gu::GeometryUnion& shape = cm.shapeCore->geometry;
+		if(perParticleCacheLocal && (!loadedCache) && (shape.getType() == PxGeometryType::eTRIANGLEMESH))
+		{
+			for(PxU32 p = 0; p < numParticlesSp; p++)
+			{
+				PxU32 particleIndex = particleIndicesSp[p];
+				perParticleCacheLocal[p] = perParticleCacheGlobal[particleIndex];
+			}
+			loadedCache = true;
+		}
+
+		updateFluidBodyContactPair(particlesSp, numParticlesSp, collDataSp, constraintBufs, perParticleCacheLocal,
+		                           localCellHash, packetCorner, cm, w2sTransforms[i]);
+	}
+
+	if(loadedCache)
+	{
+		for(PxU32 p = 0; p < numParticlesSp; p++)
+		{
+			PxU32 particleIndex = particleIndicesSp[p];
+			perParticleCacheGlobal[particleIndex] = perParticleCacheLocal[p];
+		}
+	}
+
+	for(PxU32 p = 0; p < numParticlesSp; p++)
+	{
+		ParticleCollData& collData = collDataSp[p];
+		Particle& particle = particlesSp[p];
+
+		collisionResponse(collData, false, true, mParams);
+
+		// Clamp new particle position to maximum motion.
+		clampToMaxMotion(collData.newPos, collData.oldPos, mParams.maxMotionDistance, maxMotionDistanceSqr);
+
+		// Update particle
+		updateParticle(particle, collData, (mParams.flags & PxParticleBaseFlag::ePROJECT_TO_PLANE) != 0,
+		               mParams.projectionPlane, worldBounds);
+	}
+
+	if(transientBuf)
+	{
+		for(PxU32 p = 0; p < numParticlesSp; p++)
+		{
+			ParticleCollData& collData = collDataSp[p];
+			transientBuf[collData.origParticleIndex] = collData.surfaceNormal;
+		}
+	}
+
+	if(collisionVelocities)
+	{
+		for(PxU32 p = 0; p < numParticlesSp; p++)
+		{
+			ParticleCollData& collData = collDataSp[p];
+			PxVec3 collisionVelocity = particlesSp[p].velocity - collData.surfaceVel;
+			collisionVelocities[collData.origParticleIndex] = collisionVelocity;
+		}
+	}
+
+	if(fluidTwoWayData)
+	{
+		for(PxU32 p = 0; p < numParticlesSp; p++)
+		{
+			ParticleCollData& collData = collDataSp[p];
+			PX_ASSERT(!collData.twoWayBody || (particlesSp[p].flags.api & PxParticleFlag::eCOLLISION_WITH_DYNAMIC));
+			fluidTwoWayData[collData.origParticleIndex].body = collData.twoWayBody;
+			fluidTwoWayData[collData.origParticleIndex].impulse = collData.twoWayImpulse;
+		}
+	}
+
+	PX_FREE(collDataSp);
+}
+
+void Collision::updateFluidBodyContactPair(const Particle* particles, PxU32 numParticles,
+                                           ParticleCollData* particleCollData, ConstraintBuffers& constraintBufs,
+                                           ParticleOpcodeCache* opcodeCacheLocal, LocalCellHash& localCellHash,
+                                           const PxVec3& packetCorner, const ParticleStreamContactManager& contactManager,
+                                           const W2STransformTemp& w2sTransform)
+{
+	PX_ASSERT(particles);
+	PX_ASSERT(particleCollData);
+
+	bool isStaticMeshType = false;
+
+	const Gu::GeometryUnion& shape = contactManager.shapeCore->geometry;
+	const PxsBodyCore* body = contactManager.isDynamic ? static_cast<const PxsBodyCore*>(contactManager.rigidCore) : NULL;
+
+	const PxTransform& world2Shape = w2sTransform.w2sNew;
+	const PxTransform& world2ShapeOld = w2sTransform.w2sOld;
+	const PxTransform shape2World = world2Shape.getInverse();
+
+	for(PxU32 p = 0; p < numParticles; p++)
+	{
+		ParticleCollData& collData = particleCollData[p];
+
+		collData.localFlags = (collData.flags & ParticleCollisionFlags::CC);
+		// Transform position from world to shape space
+		collData.localNewPos = world2Shape.transform(collData.newPos);
+		collData.localOldPos = world2ShapeOld.transform(collData.oldPos);
+		collData.c0 = constraintBufs.constraint0Buf + collData.origParticleIndex;
+		collData.c1 = constraintBufs.constraint1Buf + collData.origParticleIndex;
+		collData.localSurfaceNormal = PxVec3(0.0f);
+		collData.localSurfacePos = PxVec3(0.0f);
+	}
+
+	switch(shape.getType())
+	{
+	case PxGeometryType::eSPHERE:
+	{
+		collideWithSphere(particleCollData, numParticles, shape, mParams.contactOffset);
+		break;
+	}
+	case PxGeometryType::ePLANE:
+	{
+		collideWithPlane(particleCollData, numParticles, shape, mParams.contactOffset);
+		break;
+	}
+	case PxGeometryType::eCAPSULE:
+	{
+		collideWithCapsule(particleCollData, numParticles, shape, mParams.contactOffset);
+		break;
+	}
+	case PxGeometryType::eBOX:
+	{
+		collideWithBox(particleCollData, numParticles, shape, mParams.contactOffset);
+		break;
+	}
+	case PxGeometryType::eCONVEXMESH:
+	{
+		const PxConvexMeshGeometryLL& convexShapeData = shape.get<const PxConvexMeshGeometryLL>();
+		const Gu::ConvexHullData* convexHullData = convexShapeData.hullData;
+		PX_ASSERT(convexHullData);
+
+		PX_ALLOCA(scaledPlanesBuf, PxPlane, convexHullData->mNbPolygons);
+		collideWithConvex(scaledPlanesBuf, particleCollData, numParticles, shape, mParams.contactOffset);
+		break;
+	}
+	case PxGeometryType::eTRIANGLEMESH:
+	{
+		if(opcodeCacheLocal)
+		{
+			collideWithStaticMesh(numParticles, particleCollData, opcodeCacheLocal, shape, world2Shape, shape2World,
+			                      mParams.cellSize, mParams.collisionRange, mParams.contactOffset);
+		}
+		else
+		{
+			// Compute cell hash if needed
+			if(!localCellHash.isHashValid)
+			{
+				PX_ALLOCA(hashKeyArray, PxU16, numParticles * sizeof(PxU16)); // save the hashkey for reorder
+				PX_ASSERT(hashKeyArray);
+				computeLocalCellHash(localCellHash, hashKeyArray, particles, numParticles, packetCorner,
+				                     mParams.cellSizeInv);
+			}
+
+			collideCellsWithStaticMesh(particleCollData, localCellHash, shape, world2Shape, shape2World,
+			                           mParams.cellSize, mParams.collisionRange, mParams.contactOffset, packetCorner);
+		}
+		isStaticMeshType = true;
+		break;
+	}
+	case PxGeometryType::eHEIGHTFIELD:
+	{
+		collideWithStaticHeightField(particleCollData, numParticles, shape, mParams.contactOffset, shape2World);
+		isStaticMeshType = true;
+		break;
+	}
+	case PxGeometryType::eGEOMETRY_COUNT:
+	case PxGeometryType::eINVALID:
+		PX_ASSERT(0);
+	}
+
+	if(isStaticMeshType)
+	{
+		for(PxU32 p = 0; p < numParticles; p++)
+		{
+			ParticleCollData& collData = particleCollData[p];
+			updateCollDataStaticMesh(collData, shape2World, mParams.timeStep);
+		}
+	}
+	else if(body)
+	{
+		for(PxU32 p = 0; p < numParticles; p++)
+		{
+			ParticleCollData& collData = particleCollData[p];
+			ConstraintDynamic cdTemp;
+			ConstraintDynamic& c0Dynamic = constraintBufs.constraint0DynamicBuf
+			                                   ? constraintBufs.constraint0DynamicBuf[collData.origParticleIndex]
+			                                   : cdTemp;
+			ConstraintDynamic& c1Dynamic = constraintBufs.constraint1DynamicBuf
+			                                   ? constraintBufs.constraint1DynamicBuf[collData.origParticleIndex]
+			                               

@@ -1,0 +1,86 @@
+ter as the result of a function or method call.
+
+.. admonition:: Rationale
+
+  While this might seem uncontroversial, it is actually unsafe when multiple
+  expressions are evaluated in "parallel", as with binary operators and calls,
+  because (for example) one expression might load from an object while another
+  writes to it.  However, C and C++ already call this undefined behavior
+  because the evaluations are unsequenced, and ARC simply exploits that here to
+  avoid needing to retain arguments across a large number of calls.
+
+The remainder of this section describes exceptions to these rules, how those
+exceptions are detected, and what those exceptions imply semantically.
+
+.. _arc.objects.operands.consumed:
+
+Consumed parameters
+^^^^^^^^^^^^^^^^^^^
+
+A function or method parameter of retainable object pointer type may be marked
+as :arc-term:`consumed`, signifying that the callee expects to take ownership
+of a +1 retain count.  This is done by adding the ``ns_consumed`` attribute to
+the parameter declaration, like so:
+
+.. code-block:: objc
+
+  void foo(__attribute((ns_consumed)) id x);
+  - (void) foo: (id) __attribute((ns_consumed)) x;
+
+This attribute is part of the type of the function or method, not the type of
+the parameter.  It controls only how the argument is passed and received.
+
+When passing such an argument, ARC retains the argument prior to making the
+call.
+
+When receiving such an argument, ARC releases the argument at the end of the
+function, subject to the usual optimizations for local values.
+
+.. admonition:: Rationale
+
+  This formalizes direct transfers of ownership from a caller to a callee.  The
+  most common scenario here is passing the ``self`` parameter to ``init``, but
+  it is useful to generalize.  Typically, local optimization will remove any
+  extra retains and releases: on the caller side the retain will be merged with
+  a +1 source, and on the callee side the release will be rolled into the
+  initialization of the parameter.
+
+The implicit ``self`` parameter of a method may be marked as consumed by adding
+``__attribute__((ns_consumes_self))`` to the method declaration.  Methods in
+the ``init`` :ref:`family <arc.method-families>` are treated as if they were
+implicitly marked with this attribute.
+
+It is undefined behavior if an Objective-C message send to a method with
+``ns_consumed`` parameters (other than self) is made with a null receiver.  It
+is undefined behavior if the method to which an Objective-C message send
+statically resolves to has a different set of ``ns_consumed`` parameters than
+the method it dynamically resolves to.  It is undefined behavior if a block or
+function call is made through a static type with a different set of
+``ns_consumed`` parameters than the implementation of the called block or
+function.
+
+.. admonition:: Rationale
+
+  Consumed parameters with null receiver are a guaranteed leak.  Mismatches
+  with consumed parameters will cause over-retains or over-releases, depending
+  on the direction.  The rule about function calls is really just an
+  application of the existing C/C++ rule about calling functions through an
+  incompatible function type, but it's useful to state it explicitly.
+
+.. _arc.object.operands.retained-return-values:
+
+Retained return values
+^^^^^^^^^^^^^^^^^^^^^^
+
+A function or method which returns a retainable object pointer type may be
+marked as returning a retained value, signifying that the caller expects to take
+ownership of a +1 retain count.  This is done by adding the
+``ns_returns_retained`` attribute to the function or method declaration, like
+so:
+
+.. code-block:: objc
+
+  id foo(void) __attribute((ns_returns_retained));
+  - (id) foo __attribute((ns_returns_retained));
+
+T

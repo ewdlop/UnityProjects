@@ -1,0 +1,120 @@
+oto overflow_label;
+			BINOP_CAST(l, -, guint64);
+			MINT_IN_BREAK;
+		MINT_IN_CASE(MINT_START_ABORT_PROT)
+			mono_threads_begin_abort_protected_block ();
+			ip ++;
+			MINT_IN_BREAK;
+		MINT_IN_CASE(MINT_ENDFINALLY) {
+			gboolean pending_abort = mono_threads_end_abort_protected_block ();
+			ip ++;
+
+			// After mono_threads_end_abort_protected_block to conserve stack.
+			const int clause_index = *ip;
+
+			if (clause_args && clause_index == clause_args->exit_clause)
+				goto exit_frame;
+
+#if DEBUG_INTERP // This assert causes Linux/amd64/clang to use more stack.
+			g_assert (sp >= frame->stack);
+#endif
+			sp = frame->stack;
+
+			if (finally_ips) {
+				ip = (const guint16*)finally_ips->data;
+				finally_ips = g_slist_remove (finally_ips, ip);
+				/* Throw abort after the last finally block to avoid confusing EH */
+				if (pending_abort && !finally_ips)
+					EXCEPTION_CHECKPOINT;
+				// goto main_loop instead of MINT_IN_DISPATCH helps the compiler and therefore conserves stack.
+				// This is a slow/rare path and conserving stack is preferred over its performance otherwise.
+				goto main_loop;
+			}
+			ves_abort();
+			MINT_IN_BREAK;
+		}
+
+		MINT_IN_CASE(MINT_LEAVE)
+		MINT_IN_CASE(MINT_LEAVE_S)
+		MINT_IN_CASE(MINT_LEAVE_CHECK)
+		MINT_IN_CASE(MINT_LEAVE_S_CHECK) {
+			int dummy;
+			// Leave is split into pieces in order to consume less stack,
+			// but not have to change how exception handling macros access labels and locals.
+
+			g_assert (sp >= frame->stack);
+			sp = frame->stack; /* spec says stack should be empty at endfinally so it should be at the start too */
+
+			frame->ip = ip;
+
+			int opcode = *ip;
+			gboolean const check = opcode == MINT_LEAVE_CHECK || opcode == MINT_LEAVE_S_CHECK;
+
+			if (check && frame->imethod->method->wrapper_type != MONO_WRAPPER_RUNTIME_INVOKE) {
+				child_frame = alloc_frame (context, &dummy, frame, NULL, NULL, NULL);
+				MonoException *abort_exc = mono_interp_leave (child_frame);
+				if (abort_exc)
+					THROW_EX (abort_exc, frame->ip);
+			}
+
+			opcode = *ip; // Refetch to avoid register/stack pressure.
+			gboolean const short_offset = opcode == MINT_LEAVE_S || opcode == MINT_LEAVE_S_CHECK;
+			ip += short_offset ? (short)*(ip + 1) : (gint32)READ32 (ip + 1);
+			const guint16 *endfinally_ip = ip;
+			GSList *old_list = finally_ips;
+			MonoMethod *method = frame->imethod->method;
+#if DEBUG_INTERP
+			if (tracing)
+				g_print ("* Handle finally IL_%04x\n", endfinally_ip - frame->imethod->code);
+#endif
+			// FIXME Null check for frame->imethod follows deref.
+			if (frame->imethod == NULL || (method->flags & METHOD_ATTRIBUTE_PINVOKE_IMPL)
+					|| (method->iflags & (METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL | METHOD_IMPL_ATTRIBUTE_RUNTIME)))
+				goto exit_frame;
+			guint32 const ip_offset = frame->ip - frame->imethod->code;
+
+			finally_ips = g_slist_prepend (finally_ips, (void *)endfinally_ip);
+
+			for (int i = frame->imethod->num_clauses - 1; i >= 0; i--) {
+				MonoExceptionClause* const clause = &frame->imethod->clauses [i];
+				if (MONO_OFFSET_IN_CLAUSE (clause, ip_offset) && !(MONO_OFFSET_IN_CLAUSE (clause, endfinally_ip - frame->imethod->code))) {
+					if (clause->flags == MONO_EXCEPTION_CLAUSE_FINALLY) {
+						ip = frame->imethod->code + clause->handler_offset;
+						finally_ips = g_slist_prepend (finally_ips, (gpointer) ip);
+#if DEBUG_INTERP
+						if (tracing)
+							g_print ("* Found finally at IL_%04x with exception: %s\n", clause->handler_offset, context->has_resume_state ? "yes": "no");
+#endif
+					}
+				}
+			}
+
+			if (old_list != finally_ips && finally_ips) {
+				ip = (const guint16*)finally_ips->data;
+				finally_ips = g_slist_remove (finally_ips, ip);
+				// we set vt_sp later here so we relieve stack pressure
+				vt_sp = (unsigned char*)sp + frame->imethod->stack_size;
+				// goto main_loop instead of MINT_IN_DISPATCH helps the compiler and therefore conserves stack.
+				// This is a slow/rare path and conserving stack is preferred over its performance otherwise.
+				goto main_loop;
+			}
+
+			ves_abort();
+			MINT_IN_BREAK;
+		}
+		MINT_IN_CASE(MINT_ICALL_V_V) 
+		MINT_IN_CASE(MINT_ICALL_V_P)
+		MINT_IN_CASE(MINT_ICALL_P_V) 
+		MINT_IN_CASE(MINT_ICALL_P_P)
+		MINT_IN_CASE(MINT_ICALL_PP_V)
+		MINT_IN_CASE(MINT_ICALL_PP_P)
+		MINT_IN_CASE(MINT_ICALL_PPP_V)
+		MINT_IN_CASE(MINT_ICALL_PPP_P)
+		MINT_IN_CASE(MINT_ICALL_PPPP_V)
+		MINT_IN_CASE(MINT_ICALL_PPPP_P)
+		MINT_IN_CASE(MINT_ICALL_PPPPP_V)
+		MINT_IN_CASE(MINT_ICALL_PPPPP_P)
+		MINT_IN_CASE(MINT_ICALL_PPPPPP_V)
+		MINT_IN_CASE(MINT_ICALL_PPPPPP_P)
+			frame->ip = ip;
+			sp = do_icall_wrapper (frame, NULL, *ip, sp, frame->imethod->data_items [ip [1]], FALSE);

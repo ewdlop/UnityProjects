@@ -1,0 +1,87 @@
+
+			return n;
+		}
+
+		private void ReadAttribute (AttrListImpl a)
+		{
+			SkipWhitespaces (true);
+			if (Peek () == '/' || Peek () == '>')
+			// came here just to spend trailing whitespaces
+				return;
+
+			string name = ReadName ();
+			string value;
+			SkipWhitespaces ();
+			Expect ('=');
+			SkipWhitespaces ();
+			switch (Read ()) {
+			case '\'':
+				value = ReadUntil ('\'', true);
+				break;
+			case '"':
+				value = ReadUntil ('"', true);
+				break;
+			default:
+				throw Error ("Invalid attribute value markup.");
+			}
+			if (name == "xml:space")
+				xmlSpace = value;
+			a.Add (name, value);
+		}
+
+		private void ReadCDATASection ()
+		{
+			int nBracket = 0;
+			while (true) {
+				if (Peek () < 0)
+					throw UnexpectedEndError ();
+				char c = (char) Read ();
+				if (c == ']')
+					nBracket++;
+				else if (c == '>' && nBracket > 1) {
+					for (int i = nBracket; i > 2; i--)
+						buffer.Append (']');
+					break;
+				}
+				else {
+					for (int i = 0; i < nBracket; i++)
+						buffer.Append (']');
+					nBracket = 0;
+					buffer.Append (c);
+				}
+			}
+		}
+
+		private void ReadComment ()
+		{
+			Expect ('-');
+			Expect ('-');
+			while (true) {
+				if (Read () != '-')
+					continue;
+				if (Read () != '-')
+					continue;
+				if (Read () != '>')
+					throw Error ("'--' is not allowed inside comment markup.");
+				break;
+			}
+		}
+	}
+
+	internal sealed class SmallXmlParserException : SystemException
+	{
+		int line;
+		int column;
+
+		public SmallXmlParserException (string msg, int line, int column)
+		: base (String.Format ("{0}. At ({1},{2})", msg, line, column))
+		{
+			this.line = line;
+			this.column = column;
+		}
+
+		public int Line {
+			get { return line; }
+		}
+
+		public int

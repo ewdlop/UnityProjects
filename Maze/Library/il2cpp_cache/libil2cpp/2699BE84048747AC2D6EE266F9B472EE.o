@@ -1,0 +1,86 @@
+ngest frame's function.
+                     "FUNC 4000 1000 10 enchiridion\n"
+                     // Initially, nothing has been pushed on the stack,
+                     // and the return address is still in the link register.
+                     "STACK CFI INIT 4000 100 .cfa: sp .ra: lr\n"
+                     // Push r4, the frame pointer, and the link register.
+                     "STACK CFI 4001 .cfa: sp 12 + r4: .cfa 12 - ^"
+                     " r11: .cfa 8 - ^ .ra: .cfa 4 - ^\n"
+                     // Save r4..r7 in r0..r3: verify that we populate
+                     // the youngest frame with all the values we have.
+                     "STACK CFI 4002 r4: r0 r5: r1 r6: r2 r7: r3\n"
+                     // Restore r4..r7. Save the non-callee-saves register r1.
+                     "STACK CFI 4003 .cfa: sp 16 + r1: .cfa 16 - ^"
+                     " r4: r4 r5: r5 r6: r6 r7: r7\n"
+                     // Move the .cfa back four bytes, to point at the return
+                     // address, and restore the sp explicitly.
+                     "STACK CFI 4005 .cfa: sp 12 + r1: .cfa 12 - ^"
+                     " r11: .cfa 4 - ^ .ra: .cfa ^ sp: .cfa 4 +\n"
+                     // Recover the PC explicitly from a new stack slot;
+                     // provide garbage for the .ra.
+                     "STACK CFI 4006 .cfa: sp 16 + pc: .cfa 16 - ^\n"
+
+                     // The calling function.
+                     "FUNC 5000 1000 10 epictetus\n"
+                     // Mark it as end of stack.
+                     "STACK CFI INIT 5000 1000 .cfa: 0 .ra: 0\n"
+
+                     // A function whose CFI makes the stack pointer
+                     // go backwards.
+                     "FUNC 6000 1000 20 palinal\n"
+                     "STACK CFI INIT 6000 1000 .cfa: sp 4 - .ra: lr\n"
+
+                     // A function with CFI expressions that can't be
+                     // evaluated.
+                     "FUNC 7000 1000 20 rhetorical\n"
+                     "STACK CFI INIT 7000 1000 .cfa: moot .ra: ambiguous\n");
+
+    // Provide some distinctive values for the caller's registers.
+    expected.iregs[MD_CONTEXT_ARM_REG_PC] = 0x40005510;
+    expected.iregs[MD_CONTEXT_ARM_REG_SP] = 0x80000000;
+    expected.iregs[4] = 0xb5d55e68;
+    expected.iregs[5] = 0xebd134f3;
+    expected.iregs[6] = 0xa31e74bc;
+    expected.iregs[7] = 0x2dcb16b3;
+    expected.iregs[8] = 0x2ada2137;
+    expected.iregs[9] = 0xbbbb557d;
+    expected.iregs[10] = 0x48bf8ca7;
+    expected.iregs[MD_CONTEXT_ARM_REG_FP] = 0x8112e110;
+
+    // Expect CFI to recover all callee-saves registers. Since CFI is the
+    // only stack frame construction technique we have, aside from the
+    // context frame itself, there's no way for us to have a set of valid
+    // registers smaller than this.
+    expected_validity = (StackFrameARM::CONTEXT_VALID_PC |
+                         StackFrameARM::CONTEXT_VALID_SP |
+                         StackFrameARM::CONTEXT_VALID_R4 |
+                         StackFrameARM::CONTEXT_VALID_R5 |
+                         StackFrameARM::CONTEXT_VALID_R6 |
+                         StackFrameARM::CONTEXT_VALID_R7 |
+                         StackFrameARM::CONTEXT_VALID_R8 |
+                         StackFrameARM::CONTEXT_VALID_R9 |
+                         StackFrameARM::CONTEXT_VALID_R10 |
+                         StackFrameARM::CONTEXT_VALID_FP);
+
+    // By default, context frames provide all registers, as normal.
+    context_frame_validity = StackFrameARM::CONTEXT_VALID_ALL;
+
+    // By default, registers are unchanged.
+    raw_context = expected;
+  }
+
+  // Walk the stack, using stack_section as the contents of the stack
+  // and raw_context as the current register values. (Set the stack
+  // pointer to the stack's starting address.) Expect two stack
+  // frames; in the older frame, expect the callee-saves registers to
+  // have values matching those in 'expected'.
+  void CheckWalk() {
+    RegionFromSection();
+    raw_context.iregs[MD_CONTEXT_ARM_REG_SP] = stack_section.start().Value();
+
+    StackFrameSymbolizer frame_symbolizer(&supplier, &resolver);
+    StackwalkerARM walker(&system_info, &raw_context, -1, &stack_region,
+                          &modules, &frame_symbolizer);
+    walker.SetContextFrameValidity(context_frame_validity);
+    vector<const CodeModule*> modules_without_symbols;
+    vector<const Cod

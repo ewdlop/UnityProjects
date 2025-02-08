@@ -1,0 +1,308 @@
+#usda 1.0
+(
+    "This file describes the USD Shader (RSL) schemata for code generation."
+    subLayers = [
+        @usd/schema.usda@,
+        @usdShade/schema.usda@,
+        @usdLux/schema.usda@,
+    ]
+)
+
+def "GLOBAL" (
+    customData = {
+        string libraryName      = "usdRi"
+        string libraryPath      = "pxr/usd/usdRi"
+        # string libraryPrefix  = "UsdRi"
+        # string tokensPrefix   = "UsdRi"
+        # dictionary libraryTokens = {}
+        dictionary libraryTokens = {
+            dictionary spline = {
+                string doc = "UsdSplineAPI - Namespace for spline attributes"
+            }
+            dictionary interpolation = {
+                string doc = "UsdSplineAPI - Interpolation attribute name"
+            }
+            dictionary positions = {
+                string doc = "UsdSplineAPI - Positions attribute name"
+            }
+            dictionary values = {
+                string doc = "UsdSplineAPI - values attribute name"
+            }
+            dictionary linear = {
+                string doc = "UsdSplineAPI - Linear spline interpolation"
+            }
+            dictionary bspline = {
+                string doc = "UsdSplineAPI - BSpline spline interpolation"
+            }
+            dictionary "catmull_rom" = {
+                string value = "catmull-rom"
+                string doc = "UsdSplineAPI - Catmull-Rom spline interpolation"
+            }
+            dictionary constant = {
+                string doc = "UsdSplineAPI - Constant-value spline interpolation"
+            }
+        }
+    }
+)
+{
+}
+
+class "StatementsAPI" (
+    inherits = </APISchemaBase>
+    doc = """Container namespace schema for all renderman statements.
+
+    \\note The longer term goal is for clients to go directly to primvar
+    or render-attribute API's, instead of using UsdRi StatementsAPI
+    for inherited attributes.  Anticpating this, StatementsAPI
+    can smooth the way via a few environment variables:
+
+    * USDRI_STATEMENTS_WRITE_NEW_ENCODING: Causes StatementsAPI to write
+      attributes to primvars in the "ri:" namespace.
+    * USDRI_STATEMENTS_READ_OLD_ENCODING: Causes StatementsAPI to read
+      old-style attributes instead of primvars in the "ri:"
+      namespace.
+    """ 
+    customData = {
+        string extraIncludes = """
+#include "pxr/usd/usdGeom/primvarsAPI.h"
+"""
+    }
+) {
+}
+
+##### RSL #####
+
+class RslShader "RslShader" (
+    inherits = [</Shader>]
+) {
+    asset info:sloPath (
+        customData = {
+            string apiName = "sloPath"
+        }
+    )
+}
+
+##### RIS #####
+
+class RisObject "RisObject" (
+    inherits = [</Shader>]
+    doc = """\\deprecated Specialized RIS shader schemas have been deprecated in 
+    favor of all shader prims being simple UsdShadeShader.
+    Represents a ris object with connectable parameters. """ 
+) {
+    asset info:filePath (
+        customData = { 
+            string apiName = "filePath"
+        }
+    )
+    asset info:argsPath (
+        customData = {
+            string apiName = "argsPath"
+        }
+    )
+}
+
+class RisPattern "RisPattern" (
+    inherits = [</RisObject>]
+    doc = """\\deprecated Specialized RIS shader schemas have been deprecated in 
+    favor of all shader prims being simple UsdShadeShader.
+    Represents a ris pattern object. Multiple of these can be assigned.""" 
+) {
+}
+
+class RisOslPattern "RisOslPattern" (
+    inherits = [</RisPattern>]
+    doc = """\\deprecated Specialized RIS shader schemas have been deprecated in 
+    favor of all shader prims being simple UsdShadeShader.
+    Represents a ris osl pattern object.""" 
+) {
+    asset info:filePath = @PxrOSL@ (
+        hidden = true
+        customData = {
+            string apiName = "filePath"
+        }
+    )
+    asset info:oslPath (
+        customData = {
+            string apiName = "oslPath"
+        }
+    )
+}
+
+class RisBxdf "RisBxdf" (
+    inherits = [</RisObject>]
+    doc = """\\deprecated Specialized RIS shader schemas have been deprecated in 
+    favor of all shader prims being simple UsdShadeShader.
+    Represents a ris bxdf object. One of these is assigned at one time.""" 
+) {
+}
+
+class RisIntegrator "RisIntegrator" (
+    inherits = </Typed>
+    doc = """Integrator. Only one can be declared in a rib scene.""" 
+) {
+    asset filePath
+    asset argsPath
+}
+
+### Material API common to both RSL and RIS ###
+
+class "RiMaterialAPI" (
+    inherits = </APISchemaBase>
+    doc = """This API provides outputs that connect a material prim to prman 
+    shaders and RIS objects."""
+    customData = {
+        # We want the class name to be UsdRiMaterialAPI
+        string className = "MaterialAPI"    
+        string extraIncludes = """
+#include "pxr/usd/usdShade/input.h"
+#include "pxr/usd/usdShade/output.h"
+#include "pxr/usd/usdShade/material.h"
+"""
+    }
+) {
+    token outputs:ri:surface (
+        displayGroup = "Outputs"
+        customData = {
+            string apiName = "surface"
+        }
+    )
+    token outputs:ri:displacement (
+        displayGroup = "Outputs"
+        customData = {
+            string apiName = "displacement"
+        }
+    )
+    token outputs:ri:volume (
+        displayGroup = "Outputs"
+        customData = {
+            string apiName = "volume"
+        }
+    )
+}
+
+
+########################################################################
+# Lighting API
+
+class "RiLightAPI" (
+    inherits = </APISchemaBase>
+    doc = """RiLightAPI is an API schema that provides an interface
+    to add Renderman-specific attributes to lights."""
+    customData = {
+        string className = "LightAPI"
+    }
+) {
+    int ri:sampling:fixedSampleCount (
+        displayGroup = "Advanced"
+        displayName = "Light Samples"
+        doc = """Specifies an override of the number of light samples to be
+        taken for this light source. If set to something other than zero,
+        it will override the sampling performed by the integrator and can 
+        result in a performance impact. For scenes that have lots of lights,
+        resulting in some lights that are under-sampled, you may want to set
+        it to non-zero."""
+    )
+    float ri:sampling:importanceMultiplier = 1 (
+        displayGroup = "Advanced"
+        displayName = "Importance Multiplier"
+        doc = "Importance of this light for noise control."
+    )
+    float ri:intensityNearDist (
+        displayGroup = "Refine"
+        displayName = "Intensity Near Dist"
+        doc = """Near distance between the point being illuminated and the
+        light at which the sample doesn't get brighter. This may help you
+        avoid hot spots and sampling issues where a light is near a
+        surface."""
+    )
+    string ri:lightGroup (
+        displayGroup = "Advanced"
+        displayName = "Light Group"
+        doc = """Specify the light group name used for light group LPEs.
+        This is useful to generate per-light AOVs for later adjustment
+        in compositing."""
+    )
+    bool ri:shadow:thinShadow (
+        displayGroup = "Advanced"
+        displayName = "Thin Shadow"
+        doc = """Enable thin shadow and disable refraction caustics for this
+        light. This parameter will ignored if Trace Light Paths is
+        enabled. This is a non-physical control that creates "fake"
+        colored shadows for transmissive objects without needing to
+        generate photons for caustics."""
+    )
+    bool ri:trace:lightPaths (
+        displayGroup = "Advanced"
+        displayName = "Trace Light Paths"
+        doc = """Enable light and photon tracing from this light. This
+        value enforces a physically-based light and as a side-effect
+        disables the above Shadows controls. Users may use this feature
+        to selectively decide which lights emit photons when using the
+        PxrVCM or PxrUPBP Integrators."""
+    )
+}
+
+class "RiLightFilterAPI" (
+    inherits = </APISchemaBase>
+    doc = """Renderman-specific attributes for light filters."""
+    customData = {
+        string className = "LightFilterAPI"
+    }
+)
+{
+    token ri:combineMode = "multiply" (
+        allowedTokens = ["multiply", "max", "min", "screen"]
+        doc = """Specifies how this filter combines with others.
+        Valid values are:
+
+        - multiply: The results of filters are multiplied together
+        - max: The maximum result of the filters is used.  This
+          works best for grey-scale filters.
+        - min: The minimum result of the filters is used. This
+          works best for grey-scale filters.
+        - screen: Similar to max, but combines gradients in a smoother
+          way by using a screen operation:
+          <pre>screen(a,b) = 1-(1-a)(1-b)</pre>
+          This works best for grey-scale filters.
+
+        Light filters on a light are grouped by their combine mode.
+        Each group is executed and combined using that mode.  Then,
+        the final results of each group are multiplied together.
+
+        Fallback: multiply
+        """
+    )
+    float ri:density = 1 (
+        doc = """Scales the strength of the filter."""
+    )
+    bool ri:invert = False (
+        doc = """When true, inverts the output of the light filter."""
+    )
+    float ri:intensity = 0 (
+        doc = """Multipier for the diffuse and specular result."""
+    )
+    float ri:exposure = 0 (
+        doc = """Exposure control for the multiplier."""
+    )
+    float ri:diffuse = 1 (
+        doc = """A multiplier for the effect of this light on the diffuse
+        response of materials.  This is a non-physical control."""
+    )
+    float ri:specular = 1 (
+        doc = """A multiplier for the effect of this light on the specular
+        response of materials.  This is a non-physical control."""
+    )
+}
+
+class "RiLightPortalAPI" (
+    inherits = </APISchemaBase>
+    doc = """Renderman-specific attributes for light portals."""
+    customData = {
+        string className = "LightPortalAPI"
+    }
+)
+{
+    float ri:portal:intensity (
+        displayGroup = "Basic"
+        doc = """Intensity adjustment re

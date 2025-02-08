@@ -1,0 +1,506 @@
+ative.  The name should be camel case,
+  and start with a lower case letter (e.g. ``openFile()`` or ``isFoo()``).
+
+* **Enum declarations** (e.g. ``enum Foo {...}``) are types, so they should
+  follow the naming conventions for types.  A common use for enums is as a
+  discriminator for a union, or an indicator of a subclass.  When an enum is
+  used for something like this, it should have a ``Kind`` suffix
+  (e.g. ``ValueKind``).
+  
+* **Enumerators** (e.g. ``enum { Foo, Bar }``) and **public member variables**
+  should start with an upper-case letter, just like types.  Unless the
+  enumerators are defined in their own small namespace or inside a class,
+  enumerators should have a prefix corresponding to the enum declaration name.
+  For example, ``enum ValueKind { ... };`` may contain enumerators like
+  ``VK_Argument``, ``VK_BasicBlock``, etc.  Enumerators that are just
+  convenience constants are exempt from the requirement for a prefix.  For
+  instance:
+
+  .. code-block:: c++
+
+      enum {
+        MaxSize = 42,
+        Density = 12
+      };
+  
+As an exception, classes that mimic STL classes can have member names in STL's
+style of lower-case words separated by underscores (e.g. ``begin()``,
+``push_back()``, and ``empty()``). Classes that provide multiple
+iterators should add a singular prefix to ``begin()`` and ``end()``
+(e.g. ``global_begin()`` and ``use_begin()``).
+
+Here are some examples of good and bad names:
+
+.. code-block:: c++
+
+  class VehicleMaker {
+    ...
+    Factory<Tire> F;            // Bad -- abbreviation and non-descriptive.
+    Factory<Tire> Factory;      // Better.
+    Factory<Tire> TireFactory;  // Even better -- if VehicleMaker has more than one
+                                // kind of factories.
+  };
+
+  Vehicle MakeVehicle(VehicleType Type) {
+    VehicleMaker M;                         // Might be OK if having a short life-span.
+    Tire Tmp1 = M.makeTire();               // Bad -- 'Tmp1' provides no information.
+    Light Headlight = M.makeLight("head");  // Good -- descriptive.
+    ...
+  }
+
+Assert Liberally
+^^^^^^^^^^^^^^^^
+
+Use the "``assert``" macro to its fullest.  Check all of your preconditions and
+assumptions, you never know when a bug (not necessarily even yours) might be
+caught early by an assertion, which reduces debugging time dramatically.  The
+"``<cassert>``" header file is probably already included by the header files you
+are using, so it doesn't cost anything to use it.
+
+To further assist with debugging, make sure to put some kind of error message in
+the assertion statement, which is printed if the assertion is tripped. This
+helps the poor debugger make sense of why an assertion is being made and
+enforced, and hopefully what to do about it.  Here is one complete example:
+
+.. code-block:: c++
+
+  inline Value *getOperand(unsigned I) {
+    assert(I < Operands.size() && "getOperand() out of range!");
+    return Operands[I];
+  }
+
+Here are more examples:
+
+.. code-block:: c++
+
+  assert(Ty->isPointerType() && "Can't allocate a non-pointer type!");
+
+  assert((Opcode == Shl || Opcode == Shr) && "ShiftInst Opcode invalid!");
+
+  assert(idx < getNumSuccessors() && "Successor # out of range!");
+
+  assert(V1.getType() == V2.getType() && "Constant types must be identical!");
+
+  assert(isa<PHINode>(Succ->front()) && "Only works on PHId BBs!");
+
+You get the idea.
+
+In the past, asserts were used to indicate a piece of code that should not be
+reached.  These were typically of the form:
+
+.. code-block:: c++
+
+  assert(0 && "Invalid radix for integer literal");
+
+This has a few issues, the main one being that some compilers might not
+understand the assertion, or warn about a missing return in builds where
+assertions are compiled out.
+
+Today, we have something much better: ``llvm_unreachable``:
+
+.. code-block:: c++
+
+  llvm_unreachable("Invalid radix for integer literal");
+
+When assertions are enabled, this will print the message if it's ever reached
+and then exit the program. When assertions are disabled (i.e. in release
+builds), ``llvm_unreachable`` becomes a hint to compilers to skip generating
+code for this branch. If the compiler does not support this, it will fall back
+to the "abort" implementation.
+
+Another issue is that values used only by assertions will produce an "unused
+value" warning when assertions are disabled.  For example, this code will warn:
+
+.. code-block:: c++
+
+  unsigned Size = V.size();
+  assert(Size > 42 && "Vector smaller than it should be");
+
+  bool NewToSet = Myset.insert(Value);
+  assert(NewToSet && "The value shouldn't be in the set yet");
+
+These are two interesting different cases. In the first case, the call to
+``V.size()`` is only useful for the assert, and we don't want it executed when
+assertions are disabled.  Code like this should move the call into the assert
+itself.  In the second case, the side effects of the call must happen whether
+the assert is enabled or not.  In this case, the value should be cast to void to
+disable the warning.  To be specific, it is preferred to write the code like
+this:
+
+.. code-block:: c++
+
+  assert(V.size() > 42 && "Vector smaller than it should be");
+
+  bool NewToSet = Myset.insert(Value); (void)NewToSet;
+  assert(NewToSet && "The value shouldn't be in the set yet");
+
+Do Not Use ``using namespace std``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+In LLVM, we prefer to explicitly prefix all identifiers from the standard
+namespace with an "``std::``" prefix, rather than rely on "``using namespace
+std;``".
+
+In header files, adding a ``'using namespace XXX'`` directive pollutes the
+namespace of any source file that ``#include``\s the header.  This is clearly a
+bad thing.
+
+In implementation files (e.g. ``.cpp`` files), the rule is more of a stylistic
+rule, but is still important.  Basically, using explicit namespace prefixes
+makes the code **clearer**, because it is immediately obvious what facilities
+are being used and where they are coming from. And **more portable**, because
+namespace clashes cannot occur between LLVM code and other namespaces.  The
+portability rule is important because different standard library implementations
+expose different symbols (potentially ones they shouldn't), and future revisions
+to the C++ standard will add more symbols to the ``std`` namespace.  As such, we
+never use ``'using namespace std;'`` in LLVM.
+
+The exception to the general rule (i.e. it's not an exception for the ``std``
+namespace) is for implementation files.  For example, all of the code in the
+LLVM project implements code that lives in the 'llvm' namespace.  As such, it is
+ok, and actually clearer, for the ``.cpp`` files to have a ``'using namespace
+llvm;'`` directive at the top, after the ``#include``\s.  This reduces
+indentation in the body of the file for source editors that indent based on
+braces, and keeps the conceptual context cleaner.  The general form of this rule
+is that any ``.cpp`` file that implements code in any namespace may use that
+namespace (and its parents'), but should not use any others.
+
+Provide a Virtual Method Anchor for Classes in Headers
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+If a class is defined in a header file and has a vtable (either it has virtual
+methods or it derives from classes with virtual methods), it must always have at
+least one out-of-line virtual method in the class.  Without this, the compiler
+will copy the vtable and RTTI into every ``.o`` file that ``#include``\s the
+header, bloating ``.o`` file sizes and increasing link times.
+
+Don't use default labels in fully covered switches over enumerations
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``-Wswitch`` warns if a switch, without a default label, over an enumeration
+does not cover every enumeration value. If you write a default label on a fully
+covered switch over an enumeration then the ``-Wswitch`` warning won't fire
+when new elements are added to that enumeration. To help avoid adding these
+kinds of defaults, Clang has the warning ``-Wcovered-switch-default`` which is
+off by default but turned on when building LLVM with a version of Clang that
+supports the warning.
+
+A knock-on effect of this stylistic requirement is that when building LLVM with
+GCC you may get warnings related to "control may reach end of non-void function"
+if you return from each case of a covered switch-over-enum because GCC assumes
+that the enum expression may take any representable value, not just those of
+individual enumerators. To suppress this warning, use ``llvm_unreachable`` after
+the switch.
+
+Don't evaluate ``end()`` every time through a loop
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Because C++ doesn't have a standard "``foreach``" loop (though it can be
+emulated with macros and may be coming in C++'0x) we end up writing a lot of
+loops that manually iterate from begin to end on a variety of containers or
+through other data structures.  One common mistake is to write a loop in this
+style:
+
+.. code-block:: c++
+
+  BasicBlock *BB = ...
+  for (BasicBlock::iterator I = BB->begin(); I != BB->end(); ++I)
+    ... use I ...
+
+The problem with this construct is that it evaluates "``BB->end()``" every time
+through the loop.  Instead of writing the loop like this, we strongly prefer
+loops to be written so that they evaluate it once before the loop starts.  A
+convenient way to do this is like so:
+
+.. code-block:: c++
+
+  BasicBlock *BB = ...
+  for (BasicBlock::iterator I = BB->begin(), E = BB->end(); I != E; ++I)
+    ... use I ...
+
+The observant may quickly point out that these two loops may have different
+semantics: if the container (a basic block in this case) is being mutated, then
+"``BB->end()``" may change its value every time through the loop and the second
+loop may not in fact be correct.  If you actually do depend on this behavior,
+please write the loop in the first form and add a comment indicating that you
+did it intentionally.
+
+Why do we prefer the second form (when correct)?  Writing the loop in the first
+form has two problems. First it may be less efficient than evaluating it at the
+start of the loop.  In this case, the cost is probably minor --- a few extra
+loads every time through the loop.  However, if the base expression is more
+complex, then the cost can rise quickly.  I've seen loops where the end
+expression was actually something like: "``SomeMap[X]->end()``" and map lookups
+really aren't cheap.  By writing it in the second form consistently, you
+eliminate the issue entirely and don't even have to think about it.
+
+The second (even bigger) issue is that writing the loop in the first form hints
+to the reader that the loop is mutating the container (a fact that a comment
+would handily confirm!).  If you write the loop in the second form, it is
+immediately obvious without even looking at the body of the loop that the
+container isn't being modified, which makes it easier to read the code and
+understand what it does.
+
+While the second form of the loop is a few extra keystrokes, we do strongly
+prefer it.
+
+``#include <iostream>`` is Forbidden
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The use of ``#include <iostream>`` in library files is hereby **forbidden**,
+because many common implementations transparently inject a `static constructor`_
+into every translation unit that includes it.
+  
+Note that using the other stream headers (``<sstream>`` for example) is not
+problematic in this regard --- just ``<iostream>``. However, ``raw_ostream``
+provides various APIs that are better performing for almost every use than
+``std::ostream`` style APIs.
+
+.. note::
+
+  New code should always use `raw_ostream`_ for writing, or the
+  ``llvm::MemoryBuffer`` API for reading files.
+
+.. _raw_ostream:
+
+Use ``raw_ostream``
+^^^^^^^^^^^^^^^^^^^
+
+LLVM includes a lightweight, simple, and efficient stream implementation in
+``llvm/Support/raw_ostream.h``, which provides all of the common features of
+``std::ostream``.  All new code should use ``raw_ostream`` instead of
+``ostream``.
+
+Unlike ``std::ostream``, ``raw_ostream`` is not a template and can be forward
+declared as ``class raw_ostream``.  Public headers should generally not include
+the ``raw_ostream`` header, but use forward declarations and constant references
+to ``raw_ostream`` instances.
+
+Avoid ``std::endl``
+^^^^^^^^^^^^^^^^^^^
+
+The ``std::endl`` modifier, when used with ``iostreams`` outputs a newline to
+the output stream specified.  In addition to doing this, however, it also
+flushes the output stream.  In other words, these are equivalent:
+
+.. code-block:: c++
+
+  std::cout << std::endl;
+  std::cout << '\n' << std::flush;
+
+Most of the time, you probably have no reason to flush the output stream, so
+it's better to use a literal ``'\n'``.
+
+Don't use ``inline`` when defining a function in a class definition
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A member function defined in a class definition is implicitly inline, so don't
+put the ``inline`` keyword in this case.
+
+Don't:
+
+.. code-block:: c++
+
+  class Foo {
+  public:
+    inline void bar() {
+      // ...
+    }
+  };
+
+Do:
+
+.. code-block:: c++
+
+  class Foo {
+  public:
+    void bar() {
+      // ...
+    }
+  };
+
+Microscopic Details
+-------------------
+
+This section describes preferred low-level formatting guidelines along with
+reasoning on why we prefer them.
+
+Spaces Before Parentheses
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+We prefer to put a space before an open parenthesis only in control flow
+statements, but not in normal function call expressions and function-like
+macros.  For example, this is good:
+
+.. code-block:: c++
+
+  if (X) ...
+  for (I = 0; I != 100; ++I) ...
+  while (LLVMRocks) ...
+
+  somefunc(42);
+  assert(3 != 4 && "laws of math are failing me");
+  
+  A = foo(42, 92) + bar(X);
+
+and this is bad:
+
+.. code-block:: c++
+
+  if(X) ...
+  for(I = 0; I != 100; ++I) ...
+  while(LLVMRocks) ...
+
+  somefunc (42);
+  assert (3 != 4 && "laws of math are failing me");
+  
+  A = foo (42, 92) + bar (X);
+
+The reason for doing this is not completely arbitrary.  This style makes control
+flow operators stand out more, and makes expressions flow better. The function
+call operator binds very tightly as a postfix operator.  Putting a space after a
+function name (as in the last example) makes it appear that the code might bind
+the arguments of the left-hand-side of a binary operator with the argument list
+of a function and the name of the right side.  More specifically, it is easy to
+misread the "``A``" example as:
+
+.. code-block:: c++
+
+  A = foo ((42, 92) + bar) (X);
+
+when skimming through the code.  By avoiding a space in a function, we avoid
+this misinterpretation.
+
+Prefer Preincrement
+^^^^^^^^^^^^^^^^^^^
+
+Hard fast rule: Preincrement (``++X``) may be no slower than postincrement
+(``X++``) and could very well be a lot faster than it.  Use preincrementation
+whenever possible.
+
+The semantics of postincrement include making a copy of the value being
+incremented, returning it, and then preincrementing the "work value".  For
+primitive types, this isn't a big deal. But for iterators, it can be a huge
+issue (for example, some iterators contains stack and set objects in them...
+copying an iterator could invoke the copy ctor's of these as well).  In general,
+get in the habit of always using preincrement, and you won't have a problem.
+
+
+Namespace Indentation
+^^^^^^^^^^^^^^^^^^^^^
+
+In general, we strive to reduce indentation wherever possible.  This is useful
+because we want code to `fit into 80 columns`_ without wrapping horribly, but
+also because it makes it easier to understand the code. To facilitate this and
+avoid some insanely deep nesting on occasion, don't indent namespaces. If it
+helps readability, feel free to add a comment indicating what namespace is
+being closed by a ``}``.  For example:
+
+.. code-block:: c++
+
+  namespace llvm {
+  namespace knowledge {
+
+  /// This class represents things that Smith can have an intimate
+  /// understanding of and contains the data associated with it.
+  class Grokable {
+  ...
+  public:
+    explicit Grokable() { ... }
+    virtual ~Grokable() = 0;
+  
+    ...
+
+  };
+
+  } // end namespace knowledge
+  } // end namespace llvm
+
+
+Feel free to skip the closing comment when the namespace being closed is
+obvious for any reason. For example, the outer-most namespace in a header file
+is rarely a source of confusion. But namespaces both anonymous and named in
+source files that are being closed half way through the file probably could use
+clarification.
+
+.. _static:
+
+Anonymous Namespaces
+^^^^^^^^^^^^^^^^^^^^
+
+After talking about namespaces in general, you may be wondering about anonymous
+namespaces in particular.  Anonymous namespaces are a great language feature
+that tells the C++ compiler that the contents of the namespace are only visible
+within the current translation unit, allowing more aggressive optimization and
+eliminating the possibility of symbol name collisions.  Anonymous namespaces are
+to C++ as "static" is to C functions and global variables.  While "``static``"
+is available in C++, anonymous namespaces are more general: they can make entire
+classes private to a file.
+
+The problem with anonymous namespaces is that they naturally want to encourage
+indentation of their body, and they reduce locality of reference: if you see a
+random function definition in a C++ file, it is easy to see if it is marked
+static, but seeing if it is in an anonymous namespace requires scanning a big
+chunk of the file.
+
+Because of this, we have a simple guideline: make anonymous namespaces as small
+as possible, and only use them for class declarations.  For example, this is
+good:
+
+.. code-block:: c++
+
+  namespace {
+  class StringSort {
+  ...
+  public:
+    StringSort(...)
+    bool operator<(const char *RHS) const;
+  };
+  } // end anonymous namespace
+
+  static void runHelper() { 
+    ... 
+  }
+
+  bool StringSort::operator<(const char *RHS) const {
+    ...
+  }
+
+This is bad:
+
+.. code-block:: c++
+
+  namespace {
+
+  class StringSort {
+  ...
+  public:
+    StringSort(...)
+    bool operator<(const char *RHS) const;
+  };
+
+  void runHelper() { 
+    ... 
+  }
+
+  bool StringSort::operator<(const char *RHS) const {
+    ...
+  }
+
+  } // end anonymous namespace
+
+This is bad specifically because if you're looking at "``runHelper``" in the middle
+of a large C++ file, that you have no immediate way to tell if it is local to
+the file.  When it is marked static explicitly, this is immediately obvious.
+Also, there is no reason to enclose the definition of "``operator<``" in the
+namespace just because it was declared there.
+
+See Also
+========
+
+A lot of these comments and recommendations have been culled from other sources.
+Two particularly important books for our work are:
+
+#. `Effective C++
+   <http://www.amazon.com/Effective-Specific-Addison-Wesley-Professional-Computing/dp/0321334876>`_
+   by Scott Meyers.  Also interesting and useful are "More Effective C+

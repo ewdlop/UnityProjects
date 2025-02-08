@@ -1,0 +1,50 @@
+
+    return Result;
+
+  auto Domain = getDomainFor(Stmt);
+  Result = computeScalarReachingDefinition(Schedule, Domain, false, true);
+  simplify(Result);
+
+  return Result;
+}
+
+isl::map ZoneAlgorithm::getScalarReachingDefinition(isl::set DomainDef) {
+  auto DomId = give(isl_set_get_tuple_id(DomainDef.keep()));
+  auto *Stmt = static_cast<ScopStmt *>(isl_id_get_user(DomId.keep()));
+
+  auto StmtResult = getScalarReachingDefinition(Stmt);
+
+  return give(isl_map_intersect_range(StmtResult.take(), DomainDef.take()));
+}
+
+isl::map ZoneAlgorithm::makeUnknownForDomain(ScopStmt *Stmt) const {
+  return ::makeUnknownForDomain(getDomainFor(Stmt));
+}
+
+isl::id ZoneAlgorithm::makeValueId(Value *V) {
+  if (!V)
+    return nullptr;
+
+  auto &Id = ValueIds[V];
+  if (Id.is_null()) {
+    auto Name = getIslCompatibleName("Val_", V, ValueIds.size() - 1,
+                                     std::string(), UseInstructionNames);
+    Id = give(isl_id_alloc(IslCtx.get(), Name.c_str(), V));
+  }
+  return Id;
+}
+
+isl::space ZoneAlgorithm::makeValueSpace(Value *V) {
+  auto Result = give(isl_space_set_from_params(ParamSpace.copy()));
+  return give(isl_space_set_tuple_id(Result.take(), isl_dim_set,
+                                     makeValueId(V).take()));
+}
+
+isl::set ZoneAlgorithm::makeValueSet(Value *V) {
+  auto Space = makeValueSpace(V);
+  return give(isl_set_universe(Space.take()));
+}
+
+isl::map ZoneAlgorithm::makeValInst(Value *Val, ScopStmt *UserStmt, Loop *Scope,
+                                    bool IsCertain) {
+  // If the

@@ -1,0 +1,65 @@
+//------------------------------------------------------------
+// Copyright (c) Microsoft Corporation.  All rights reserved.
+//------------------------------------------------------------
+
+namespace System.ServiceModel.Channels
+{
+    using System.Runtime;
+    using System.ServiceModel;
+
+    abstract class LayeredChannelFactory<TChannel> : ChannelFactoryBase<TChannel>
+    {
+        IChannelFactory innerChannelFactory;
+
+        public LayeredChannelFactory(IDefaultCommunicationTimeouts timeouts, IChannelFactory innerChannelFactory)
+            : base(timeouts)
+        {
+            this.innerChannelFactory = innerChannelFactory;
+        }
+
+        protected IChannelFactory InnerChannelFactory
+        {
+            get { return this.innerChannelFactory; }
+        }
+
+        public override T GetProperty<T>()
+        {
+            if (typeof(T) == typeof(IChannelFactory<TChannel>))
+            {
+                return (T)(object)this;
+            }
+
+            T baseProperty = base.GetProperty<T>();
+            if (baseProperty != null)
+            {
+                return baseProperty;
+            }
+
+            return this.innerChannelFactory.GetProperty<T>();
+        }
+
+        protected override IAsyncResult OnBeginOpen(TimeSpan timeout, AsyncCallback callback, object state)
+        {
+            return this.innerChannelFactory.BeginOpen(timeout, callback, state);
+        }
+
+        protected override void OnEndOpen(IAsyncResult result)
+        {
+            this.innerChannelFactory.EndOpen(result);
+        }
+
+        protected override IAsyncResult OnBeginClose(TimeSpan timeout, AsyncCallback callback, object state)
+        {
+            return new ChainedCloseAsyncResult(timeout, callback, state, base.OnBeginClose, base.OnEndClose, this.innerChannelFactory);
+        }
+
+        protected override void OnEndClose(IAsyncResult result)
+        {
+            ChainedCloseAsyncResult.End(result);
+        }
+
+        protected override void OnClose(TimeSpan timeout)
+        {
+            TimeoutHelper timeoutHelper = new TimeoutHelper(timeout);
+            base.OnClose(timeoutHelper.RemainingTime());
+            this.innerChannelFactory.Close(

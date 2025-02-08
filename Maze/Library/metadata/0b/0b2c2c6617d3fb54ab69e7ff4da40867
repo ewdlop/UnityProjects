@@ -1,0 +1,171 @@
+kUnifiedPlan;
+  }
+
+  // Is there an RtpSender of the given type?
+  bool HasRtpSender(cricket::MediaType type) const;
+
+  // Return the RtpSender with the given track attached.
+  rtc::scoped_refptr<RtpSenderProxyWithInternal<RtpSenderInternal>>
+  FindSenderForTrack(MediaStreamTrackInterface* track) const;
+
+  // Return the RtpSender with the given id, or null if none exists.
+  rtc::scoped_refptr<RtpSenderProxyWithInternal<RtpSenderInternal>>
+  FindSenderById(const std::string& sender_id) const;
+
+  // Return the RtpReceiver with the given id, or null if none exists.
+  rtc::scoped_refptr<RtpReceiverProxyWithInternal<RtpReceiverInternal>>
+  FindReceiverById(const std::string& receiver_id) const;
+
+  std::vector<RtpSenderInfo>* GetRemoteSenderInfos(
+      cricket::MediaType media_type);
+  std::vector<RtpSenderInfo>* GetLocalSenderInfos(
+      cricket::MediaType media_type);
+  const RtpSenderInfo* FindSenderInfo(const std::vector<RtpSenderInfo>& infos,
+                                      const std::string& stream_id,
+                                      const std::string sender_id) const;
+
+  // Returns the specified SCTP DataChannel in sctp_data_channels_,
+  // or nullptr if not found.
+  DataChannel* FindDataChannelBySid(int sid) const;
+
+  // Called when first configuring the port allocator.
+  bool InitializePortAllocator_n(
+      const cricket::ServerAddresses& stun_servers,
+      const std::vector<cricket::RelayServerConfig>& turn_servers,
+      const RTCConfiguration& configuration);
+  // Called when SetConfiguration is called to apply the supported subset
+  // of the configuration on the network thread.
+  bool ReconfigurePortAllocator_n(
+      const cricket::ServerAddresses& stun_servers,
+      const std::vector<cricket::RelayServerConfig>& turn_servers,
+      IceTransportsType type,
+      int candidate_pool_size,
+      bool prune_turn_ports,
+      webrtc::TurnCustomizer* turn_customizer,
+      absl::optional<int> stun_candidate_keepalive_interval);
+
+  // Starts output of an RTC event log to the given output object.
+  // This function should only be called from the worker thread.
+  bool StartRtcEventLog_w(std::unique_ptr<RtcEventLogOutput> output,
+                          int64_t output_period_ms);
+
+  // Stops recording an RTC event log.
+  // This function should only be called from the worker thread.
+  void StopRtcEventLog_w();
+
+  // Ensures the configuration doesn't have any parameters with invalid values,
+  // or values that conflict with other parameters.
+  //
+  // Returns RTCError::OK() if there are no issues.
+  RTCError ValidateConfiguration(const RTCConfiguration& config) const;
+
+  cricket::ChannelManager* channel_manager() const;
+
+  enum class SessionError {
+    kNone,       // No error.
+    kContent,    // Error in BaseChannel SetLocalContent/SetRemoteContent.
+    kTransport,  // Error from the underlying transport.
+  };
+
+  // Returns the last error in the session. See the enum above for details.
+  SessionError session_error() const { return session_error_; }
+  const std::string& session_error_desc() const { return session_error_desc_; }
+
+  cricket::BaseChannel* GetChannel(const std::string& content_name);
+
+  // Get current SSL role used by SCTP's underlying transport.
+  bool GetSctpSslRole(rtc::SSLRole* role);
+
+  cricket::IceConfig ParseIceConfig(
+      const PeerConnectionInterface::RTCConfiguration& config) const;
+
+  // Implements DataChannelProviderInterface.
+  bool SendData(const cricket::SendDataParams& params,
+                const rtc::CopyOnWriteBuffer& payload,
+                cricket::SendDataResult* result) override;
+  bool ConnectDataChannel(DataChannel* webrtc_data_channel) override;
+  void DisconnectDataChannel(DataChannel* webrtc_data_channel) override;
+  void AddSctpDataStream(int sid) override;
+  void RemoveSctpDataStream(int sid) override;
+  bool ReadyToSendData() const override;
+
+  cricket::DataChannelType data_channel_type() const;
+
+  // Called when an RTCCertificate is generated or retrieved by
+  // WebRTCSessionDescriptionFactory. Should happen before setLocalDescription.
+  void OnCertificateReady(
+      const rtc::scoped_refptr<rtc::RTCCertificate>& certificate);
+  void OnDtlsSrtpSetupFailure(cricket::BaseChannel*, bool rtcp);
+
+  // Non-const versions of local_description()/remote_description(), for use
+  // internally.
+  SessionDescriptionInterface* mutable_local_description() {
+    return pending_local_description_ ? pending_local_description_.get()
+                                      : current_local_description_.get();
+  }
+  SessionDescriptionInterface* mutable_remote_description() {
+    return pending_remote_description_ ? pending_remote_description_.get()
+                                       : current_remote_description_.get();
+  }
+
+  // Updates the error state, signaling if necessary.
+  void SetSessionError(SessionError error, const std::string& error_desc);
+
+  RTCError UpdateSessionState(SdpType type,
+                              cricket::ContentSource source,
+                              const cricket::SessionDescription* description);
+  // Push the media parts of the local or remote session description
+  // down to all of the channels.
+  RTCError PushdownMediaDescription(SdpType type,
+                                    cricket::ContentSource source);
+  bool PushdownSctpParameters_n(cricket::ContentSource source);
+
+  RTCError PushdownTransportDescription(cricket::ContentSource source,
+                                        SdpType type);
+
+  // Returns true and the TransportInfo of the given |content_name|
+  // from |description|. Returns false if it's not available.
+  static bool GetTransportDescription(
+      const cricket::SessionDescription* description,
+      const std::string& content_name,
+      cricket::TransportDescription* info);
+
+  // Enables media channels to allow sending of media.
+  // This enables media to flow on all configured audio/video channels and the
+  // RtpDataChannel.
+  void EnableSending();
+
+  // Destroys all BaseChannels and destroys the SCTP data channel, if present.
+  void DestroyAllChannels();
+
+  // Returns the media index for a local ice candidate given the content name.
+  // Returns false if the local session description does not have a media
+  // content called  |content_name|.
+  bool GetLocalCandidateMediaIndex(const std::string& content_name,
+                                   int* sdp_mline_index);
+  // Uses all remote candidates in |remote_desc| in this session.
+  bool UseCandidatesInSessionDescription(
+      const SessionDescriptionInterface* remote_desc);
+  // Uses |candidate| in this session.
+  bool UseCandidate(const IceCandidateInterface* candidate);
+  // Deletes the corresponding channel of contents that don't exist in |desc|.
+  // |desc| can be null. This means that all channels are deleted.
+  void RemoveUnusedChannels(const cricket::SessionDescription* desc);
+
+  // Allocates media channels based on the |desc|. If |desc| doesn't have
+  // the BUNDLE option, this method will disable BUNDLE in PortAllocator.
+  // This method will also delete any existing media channels before creating.
+  RTCError CreateChannels(const cricket::SessionDescription& desc);
+
+  // If the BUNDLE policy is max-bundle, then we know for sure that all
+  // transports will be bundled from the start. This method returns the BUNDLE
+  // group if that's the case, or null if BUNDLE will be negotiated later. An
+  // error is returned if max-bundle is specified but the session description
+  // does not have a BUNDLE group.
+  RTCErrorOr<const cricket::ContentGroup*> GetEarlyBundleGroup(
+      const cricket::SessionDescription& desc) const;
+
+  // Helper methods to create media channels.
+  cricket::VoiceChannel* CreateVoiceChannel(const std::string& mid);
+  cricket::VideoChannel* CreateVideoChannel(const std::string& mid);
+  bool CreateDataChannel(const std::string& mid)

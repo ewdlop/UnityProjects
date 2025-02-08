@@ -1,0 +1,602 @@
+           }
+
+            void CallComplete(bool completedSynchronously, Exception exception)
+            {
+                this.Rpc.Channel.CompletedIOOperation();
+                this.Complete(completedSynchronously, exception);
+            }
+
+            public static void End(SendAsyncResult result)
+            {
+                try
+                {
+                    AsyncResult.End<SendAsyncResult>(result);
+                }
+                finally
+                {
+                    ConcurrencyBehavior.LockInstanceAfterCallout(result.operationContext);
+                }
+            }
+        }
+
+        interface ICallOnce
+        {
+            void Call(ServiceChannel channel, TimeSpan timeout);
+            IAsyncResult BeginCall(ServiceChannel channel, TimeSpan timeout, AsyncCallback callback, object state);
+            void EndCall(ServiceChannel channel, IAsyncResult result);
+        }
+
+        class CallDisplayUIOnce : ICallOnce
+        {
+            static CallDisplayUIOnce instance;
+
+            internal static CallDisplayUIOnce Instance
+            {
+                get
+                {
+                    if (CallDisplayUIOnce.instance == null)
+                    {
+                        CallDisplayUIOnce.instance = new CallDisplayUIOnce();
+                    }
+                    return CallDisplayUIOnce.instance;
+                }
+            }
+
+            [Conditional("DEBUG")]
+            void ValidateTimeoutIsMaxValue(TimeSpan timeout)
+            {
+                if (timeout != TimeSpan.MaxValue)
+                {
+                    Fx.Assert("non-MaxValue timeout for displaying interactive initialization UI");
+                }
+            }
+
+            void ICallOnce.Call(ServiceChannel channel, TimeSpan timeout)
+            {
+                this.ValidateTimeoutIsMaxValue(timeout);
+                channel.DisplayInitializationUI();
+            }
+
+            IAsyncResult ICallOnce.BeginCall(ServiceChannel channel, TimeSpan timeout, AsyncCallback callback, object state)
+            {
+                this.ValidateTimeoutIsMaxValue(timeout);
+                return channel.BeginDisplayInitializationUI(callback, state);
+            }
+
+            void ICallOnce.EndCall(ServiceChannel channel, IAsyncResult result)
+            {
+                channel.EndDisplayInitializationUI(result);
+            }
+        }
+
+        class CallOpenOnce : ICallOnce
+        {
+            static CallOpenOnce instance;
+
+            internal static CallOpenOnce Instance
+            {
+                get
+                {
+                    if (CallOpenOnce.instance == null)
+                    {
+                        CallOpenOnce.instance = new CallOpenOnce();
+                    }
+                    return CallOpenOnce.instance;
+                }
+            }
+
+            void ICallOnce.Call(ServiceChannel channel, TimeSpan timeout)
+            {
+                channel.Open(timeout);
+            }
+
+            IAsyncResult ICallOnce.BeginCall(ServiceChannel channel, TimeSpan timeout, AsyncCallback callback, object state)
+            {
+                return channel.BeginOpen(timeout, callback, state);
+            }
+
+            void ICallOnce.EndCall(ServiceChannel channel, IAsyncResult result)
+            {
+                channel.EndOpen(result);
+            }
+        }
+
+        class CallOnceManager
+        {
+            readonly ICallOnce callOnce;
+            readonly ServiceChannel channel;
+            bool isFirst = true;
+            Queue<IWaiter> queue;
+
+            static Action<object> signalWaiter = new Action<object>(CallOnceManager.SignalWaiter);
+
+            internal CallOnceManager(ServiceChannel channel, ICallOnce callOnce)
+            {
+                this.callOnce = callOnce;
+                this.channel = channel;
+                this.queue = new Queue<IWaiter>();
+            }
+
+            object ThisLock
+            {
+                get { return this; }
+            }
+
+            internal void CallOnce(TimeSpan timeout, CallOnceManager cascade)
+            {
+                SyncWaiter waiter = null;
+                bool first = false;
+
+                if (this.queue != null)
+                {
+                    lock (this.ThisLock)
+                    {
+                        if (this.queue != null)
+                        {
+                            if (this.isFirst)
+                            {
+                                first = true;
+                                this.isFirst = false;
+                            }
+                            else
+                            {
+                                waiter = new SyncWaiter(this);
+                                this.queue.Enqueue(waiter);
+                            }
+                        }
+                    }
+                }
+
+                CallOnceManager.SignalNextIfNonNull(cascade);
+
+                if (first)
+                {
+                    bool throwing = true;
+                    try
+                    {
+                        this.callOnce.Call(this.channel, timeout);
+                        throwing = false;
+                    }
+                    finally
+                    {
+                        if (throwing)
+                        {
+                            this.SignalNext();
+                        }
+                    }
+                }
+                else if (waiter != null)
+                {
+                    waiter.Wait(timeout);
+                }
+            }
+
+            internal IAsyncResult BeginCallOnce(TimeSpan timeout, CallOnceManager cascade,
+                                                AsyncCallback callback, object state)
+            {
+                AsyncWaiter waiter = null;
+                bool first = false;
+
+                if (this.queue != null)
+                {
+                    lock (this.ThisLock)
+                    {
+                        if (this.queue != null)
+                        {
+                            if (this.isFirst)
+                            {
+                                first = true;
+                                this.isFirst = false;
+                            }
+                            else
+                            {
+                                waiter = new AsyncWaiter(this, timeout, callback, state);
+                                this.queue.Enqueue(waiter);
+                            }
+                        }
+                    }
+                }
+
+                CallOnceManager.SignalNextIfNonNull(cascade);
+
+                if (first)
+                {
+                    bool throwing = true;
+                    try
+                    {
+                        IAsyncResult result = this.callOnce.BeginCall(this.channel, timeout, callback, state);
+                        throwing = false;
+                        return result;
+                    }
+                    finally
+                    {
+                        if (throwing)
+                        {
+                            this.SignalNext();
+                        }
+                    }
+                }
+                else if (waiter != null)
+                {
+                    return waiter;
+                }
+                else
+                {
+                    return new CallOnceCompletedAsyncResult(callback, state);
+                }
+            }
+
+            internal void EndCallOnce(IAsyncResult result)
+            {
+                if (result is CallOnceCompletedAsyncResult)
+                {
+                    CallOnceCompletedAsyncResult.End(result);
+                }
+                else if (result is AsyncWaiter)
+                {
+                    AsyncWaiter.End(result);
+                }
+                else
+                {
+                    bool throwing = true;
+                    try
+                    {
+                        this.callOnce.EndCall(this.channel, result);
+                        throwing = false;
+                    }
+                    finally
+                    {
+                        if (throwing)
+                        {
+                            this.SignalNext();
+                        }
+                    }
+                }
+            }
+
+            static internal void SignalNextIfNonNull(CallOnceManager manager)
+            {
+                if (manager != null)
+                {
+                    manager.SignalNext();
+                }
+            }
+
+            internal void SignalNext()
+            {
+                if (this.queue == null)
+                {
+                    return;
+                }
+
+                IWaiter waiter = null;
+
+                lock (this.ThisLock)
+                {
+                    if (this.queue != null)
+                    {
+                        if (this.queue.Count > 0)
+                        {
+                            waiter = this.queue.Dequeue();
+                        }
+                        else
+                        {
+                            this.queue = null;
+                        }
+                    }
+                }
+
+                if (waiter != null)
+                {
+                    ActionItem.Schedule(CallOnceManager.signalWaiter, waiter);
+                }
+            }
+
+            static void SignalWaiter(object state)
+            {
+                ((IWaiter)state).Signal();
+            }
+
+            interface IWaiter
+            {
+                void Signal();
+            }
+
+            class SyncWaiter : IWaiter
+            {
+                ManualResetEvent wait = new ManualResetEvent(false);
+                CallOnceManager manager;
+                bool isTimedOut = false;
+                bool isSignaled = false;
+                int waitCount = 0;
+
+                internal SyncWaiter(CallOnceManager manager)
+                {
+                    this.manager = manager;
+                }
+
+                bool ShouldSignalNext
+                {
+                    get { return this.isTimedOut && this.isSignaled; }
+                }
+
+                void IWaiter.Signal()
+                {
+                    wait.Set();
+                    this.CloseWaitHandle();
+
+                    bool signalNext;
+                    lock (this.manager.ThisLock)
+                    {
+                        this.isSignaled = true;
+                        signalNext = this.ShouldSignalNext;
+                    }
+                    if (signalNext)
+                    {
+                        this.manager.SignalNext();
+                    }
+                }
+
+                internal bool Wait(TimeSpan timeout)
+                {
+                    try
+                    {
+                        if (!TimeoutHelper.WaitOne(this.wait, timeout))
+                        {
+                            bool signalNext;
+                            lock (this.manager.ThisLock)
+                            {
+                                this.isTimedOut = true;
+                                signalNext = this.ShouldSignalNext;
+                            }
+                            if (signalNext)
+                            {
+                                this.manager.SignalNext();
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        this.CloseWaitHandle();
+                    }
+
+                    return !this.isTimedOut;
+                }
+
+                void CloseWaitHandle()
+                {
+                    if (Interlocked.Increment(ref this.waitCount) == 2)
+                    {
+                        this.wait.Close();
+                    }
+                }
+            }
+
+            class AsyncWaiter : AsyncResult, IWaiter
+            {
+                static Action<object> timerCallback = new Action<object>(AsyncWaiter.TimerCallback);
+
+                CallOnceManager manager;
+                TimeSpan timeout;
+                IOThreadTimer timer;
+
+                internal AsyncWaiter(CallOnceManager manager, TimeSpan timeout,
+                                     AsyncCallback callback, object state)
+                    : base(callback, state)
+                {
+                    this.manager = manager;
+                    this.timeout = timeout;
+
+                    if (timeout != TimeSpan.MaxValue)
+                    {
+                        this.timer = new IOThreadTimer(timerCallback, this, false);
+                        this.timer.Set(timeout);
+                    }
+                }
+
+                internal static void End(IAsyncResult result)
+                {
+                    AsyncResult.End<AsyncWaiter>(result);
+                }
+
+                void IWaiter.Signal()
+                {
+                    if ((this.timer == null) || this.timer.Cancel())
+                    {
+                        this.Complete(false);
+                        this.manager.channel.Closed -= this.OnClosed;
+                    }
+                    else
+                    {
+                        this.manager.SignalNext();
+                    }
+                }
+
+                void OnClosed(object sender, EventArgs e)
+                {
+                    if ((this.timer == null) || this.timer.Cancel())
+                    {
+                        this.Complete(false, this.manager.channel.CreateClosedException());
+                    }
+                }
+
+                static void TimerCallback(object state)
+                {
+                    AsyncWaiter _this = (AsyncWaiter)state;
+                    _this.Complete(false, _this.manager.channel.GetOpenTimeoutException(_this.timeout));
+                }
+            }
+        }
+
+        class CallOnceCompletedAsyncResult : AsyncResult
+        {
+            internal CallOnceCompletedAsyncResult(AsyncCallback callback, object state)
+                : base(callback, state)
+            {
+                this.Complete(true);
+            }
+
+            static internal void End(IAsyncResult result)
+            {
+                AsyncResult.End<CallOnceCompletedAsyncResult>(result);
+            }
+        }
+
+        internal class SessionIdleManager
+        {
+            readonly IChannelBinder binder;
+            ServiceChannel channel;
+            readonly long idleTicks;
+            long lastActivity;
+            readonly IOThreadTimer timer;
+            static Action<object> timerCallback;
+            bool didIdleAbort;
+            bool isTimerCancelled;
+            object thisLock;
+
+            SessionIdleManager(IChannelBinder binder, TimeSpan idle)
+            {
+                this.binder = binder;
+                this.timer = new IOThreadTimer(GetTimerCallback(), this, false);
+                this.idleTicks = Ticks.FromTimeSpan(idle);
+                this.timer.SetAt(Ticks.Now + this.idleTicks);
+                this.thisLock = new Object();
+            }
+
+            internal static SessionIdleManager CreateIfNeeded(IChannelBinder binder, TimeSpan idle)
+            {
+                if (binder.HasSession && (idle != TimeSpan.MaxValue))
+                {
+                    return new SessionIdleManager(binder, idle);
+                }
+                else
+                {
+                    return null;
+                }
+            }
+
+            internal bool DidIdleAbort
+            {
+                get
+                {
+                    lock (thisLock)
+                    {
+                        return this.didIdleAbort;
+                    }
+                }
+            }
+
+            internal void CancelTimer()
+            {
+                lock (thisLock)
+                {
+                    this.isTimerCancelled = true;
+                    this.timer.Cancel();
+                }
+            }
+
+            internal void CompletedActivity()
+            {
+                Interlocked.Exchange(ref this.lastActivity, Ticks.Now);
+            }
+
+            internal void RegisterChannel(ServiceChannel channel, out bool didIdleAbort)
+            {
+                lock (thisLock)
+                {
+                    this.channel = channel;
+                    didIdleAbort = this.didIdleAbort;
+                }
+            }
+
+            static Action<object> GetTimerCallback()
+            {
+                if (SessionIdleManager.timerCallback == null)
+                {
+                    SessionIdleManager.timerCallback = SessionIdleManager.TimerCallback;
+                }
+                return SessionIdleManager.timerCallback;
+            }
+
+            static void TimerCallback(object state)
+            {
+                ((SessionIdleManager)state).TimerCallback();
+            }
+
+            void TimerCallback()
+            {
+                // This reads lastActivity atomically without changing its value.
+                // (it only sets if it is zero, and then it sets it to zero).
+                long last = Interlocked.CompareExchange(ref this.lastActivity, 0, 0);
+                long abortTime = last + this.idleTicks;
+
+                lock (thisLock)
+                {
+                    if (Ticks.Now > abortTime)
+                    {
+                        if (TD.SessionIdleTimeoutIsEnabled())
+                        {
+                            string listenUri = string.Empty;
+                            if (this.binder.ListenUri != null)
+                            {
+                                listenUri = this.binder.ListenUri.AbsoluteUri;                                
+                            }
+
+                            TD.SessionIdleTimeout(listenUri); 
+                        }
+
+                        this.didIdleAbort = true;
+                        if (this.channel != null)
+                        {
+                            this.channel.Abort();
+                        }
+                        else
+                        {
+                            this.binder.Abort();
+                        }
+                    }
+                    else
+                    {
+                        if (!this.isTimerCancelled && binder.Channel.State != CommunicationState.Faulted && binder.Channel.State != CommunicationState.Closed)
+                        {
+                            this.timer.SetAt(abortTime);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+                      level_alloc_callbackE _ZN11__sanitizerL25allocator_may_return_nullE _ZN11__sanitizerL26internal_alloc_placeholderE _ZN11__sanitizerL27internal_allocator_cache_muE _ZN11__sanitizerL29low_level_alloc_min_alignmentE _ZN11__sanitizerL30internal_allocator_initializedE _ZN11__sanitizerL34ReportInternalAllocatorOutOfMemoryEm _ZN11__sanitizer10UnmapOrDieEPvm _ZN11__sanitizer11CheckFailedEPKciS1_yy _ZN11__sanitizer11GetPageSizeEv _ZN11__sanitizer12InternalFreeEPvPNS_28SizeClassAllocatorLocalCacheINS_20SizeClassAllocator32INS_4AP32EEEEE _ZN11__sanitizer13InternalAllocEmPNS_28SizeClassAllocatorLocalCacheINS_20SizeClassAllocator32INS_4AP32EEEEEm _ZN11__sanitizer14InternalCallocEmmPNS_28SizeClassAllocatorLocalCacheINS_20SizeClassAllocator32INS_4AP32EEEEE _ZN11__sanitizer14PageSizeCachedE _ZN11__sanitizer15InternalReallocEPvmPNS_28SizeClassAllocatorLocalCacheINS_20SizeClassAllocator32INS_4AP32EEEEE _ZN11__sanitizer15StaticSpinMutex8LockSlowEv _ZN11__sanitizer15internal_memcpyEPvPKvm _ZN11__sanitizer15internal_memsetEPvim _ZN11__sanitizer17CombinedAllocatorINS_20SizeClassAllocator32INS_4AP32EEENS_28SizeClassAllocatorLocalCacheIS3_EENS_18LargeMmapAllocatorINS_20NoOpMapUnmapCallbackENS_32LargeMmapAllocatorPtrArrayStaticEEEE10ReallocateEPS5_Pvmm _ZN11__sanitizer17CombinedAllocatorINS_20SizeClassAllocator32INS_4AP32EEENS_28SizeClassAllocatorLocalCacheIS3_EENS_18LargeMmapAllocatorINS_20NoOpMapUnmapCallbackENS_32LargeMmapAllocatorPtrArrayStaticEEEE24GetActuallyAllocatedSizeEPv _ZN11__sanitizer17CombinedAllocatorINS_20SizeClassAllocator32INS_4AP32EEENS_28SizeClassAllocatorLocalCacheIS3_EENS_18LargeMmapAllocatorINS_20NoOpMapUnmapCallbackENS_32LargeMmapAllocatorPtrArrayStaticEEEE8AllocateEPS5_mm _ZN11__sanitizer17SanitizerToolNameE _ZN11__sanitizer18LargeMmapAllocatorINS_20NoOpMapUnmapCallbackENS_32LargeMmapAllocatorPtrArrayStaticEE10DeallocateEPNS_14AllocatorStatsEPv _ZN11__sanitizer18LargeMmapAllocatorINS_20NoOpMapUnmapCallbackENS_32LargeMmapAllocatorPtrArrayStaticEE13GetBlockBeginEPKv _ZN11__sanitizer18LargeMmapAllocatorINS_20NoOpMap/*
+ *  Copyright 2004 The WebRTC Project Authors. All rights reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+#ifndef WEBRTC_BASE_DISKCACHE_H__
+#define WEBRTC_BASE_DISKCACHE_H__
+
+#include <map>
+#include <string>
+
+#if defined(WEBRTC_WIN)
+#undef UnlockResource
+#endif  // WEBRTC_WIN 
+
+namespace rtc {
+
+class StreamInterface;
+
+///////////////////////////////////////////////////////////////////////////////
+// DiskCache - An LRU cache of streams, stored on disk.
+//
+// Streams are identified by a unique resource id.  Multiple streams can be
+// associated with each resource id, distinguished by an index.  When old
+// resources are flushed from the cache, all streams associated with those
+// resources are removed together.
+// DiskCache is designed to persist across executions of the program.  It is
+// safe for us

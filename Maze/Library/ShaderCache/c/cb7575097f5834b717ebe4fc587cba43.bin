@@ -1,0 +1,122 @@
+ then
+	HAVE_BOUNDS_SAN=0
+	"$CXX" -DCRYPTOPP_ADHOC_MAIN -fsanitize=bounds-strict adhoc.cpp -o "$TMP/adhoc.exe" > /dev/null 2>&1
+	if [[ ("$?" -eq "0") ]]; then
+		"$TMP/adhoc.exe" > /dev/null 2>&1
+		if [[ ("$?" -eq "0") ]]; then
+			HAVE_BOUNDS_SAN=1
+		fi
+	fi
+fi
+
+rm -f "$TMP/adhoc.exe" > /dev/null 2>&1
+if [[ (-z "$HAVE_OMP") ]]; then
+	HAVE_OMP=0
+	if [[ "$GCC_COMPILER" -ne "0" ]]; then
+		"$CXX" -DCRYPTOPP_ADHOC_MAIN -fopenmp -O3 adhoc.cpp -o "$TMP/adhoc.exe" > /dev/null 2>&1
+		if [[ "$?" -eq "0" ]]; then
+			HAVE_OMP=1
+			OMP_FLAGS=(-fopenmp -O3)
+		fi
+	elif [[ "$INTEL_COMPILER" -ne "0" ]]; then
+		"$CXX" -DCRYPTOPP_ADHOC_MAIN -openmp -O3 adhoc.cpp -o "$TMP/adhoc.exe" > /dev/null 2>&1
+		if [[ "$?" -eq "0" ]]; then
+			HAVE_OMP=1
+			OMP_FLAGS=(-openmp -O3)
+		fi
+	elif [[ "$CLANG_COMPILER" -ne "0" ]]; then
+		"$CXX" -DCRYPTOPP_ADHOC_MAIN -fopenmp=libomp -O3 adhoc.cpp -o "$TMP/adhoc.exe" > /dev/null 2>&1
+		if [[ "$?" -eq "0" ]]; then
+			HAVE_OMP=1
+			OMP_FLAGS=(-fopenmp=libomp -O3)
+		fi
+	elif [[ "$SUN_COMPILER" -ne "0" ]]; then
+		"$CXX" -DCRYPTOPP_ADHOC_MAIN -xopenmp=parallel -xO3 adhoc.cpp -o "$TMP/adhoc.exe" > /dev/null 2>&1
+		if [[ "$?" -eq "0" ]]; then
+			HAVE_OMP=1
+			OMP_FLAGS=(-xopenmp=parallel -xO3)
+		fi
+	fi
+fi
+
+rm -f "$TMP/adhoc.exe" > /dev/null 2>&1
+if [[ (-z "$HAVE_INTEL_MULTIARCH") ]]; then
+	HAVE_INTEL_MULTIARCH=0
+	if [[ ("$IS_DARWIN" -ne "0") && ("$IS_X86" -ne "0" || "$IS_X64" -ne "0") ]]; then
+		"$CXX" -DCRYPTOPP_ADHOC_MAIN -arch i386 -arch x86_64 adhoc.cpp -o "$TMP/adhoc.exe" > /dev/null 2>&1
+		if [[ "$?" -eq "0" ]]; then
+			HAVE_INTEL_MULTIARCH=1
+		fi
+	fi
+fi
+
+rm -f "$TMP/adhoc.exe" > /dev/null 2>&1
+if [[ (-z "$HAVE_PPC_MULTIARCH") ]]; then
+	HAVE_PPC_MULTIARCH=0
+	if [[ ("$IS_DARWIN" -ne "0") && ("$IS_PPC" -ne "0") ]]; then
+		"$CXX" -DCRYPTOPP_ADHOC_MAIN -arch ppc -arch ppc64 adhoc.cpp -o "$TMP/adhoc.exe" > /dev/null 2>&1
+		if [[ "$?" -eq "0" ]]; then
+			HAVE_PPC_MULTIARCH=1
+		fi
+	fi
+fi
+
+rm -f "$TMP/adhoc.exe" > /dev/null 2>&1
+if [[ (-z "$HAVE_X32") ]]; then
+	HAVE_X32=0
+	if [[ "$IS_X32" -ne "0" ]]; then
+		"$CXX" -DCRYPTOPP_ADHOC_MAIN -mx32 adhoc.cpp -o "$TMP/adhoc.exe" > /dev/null 2>&1
+		if [[ "$?" -eq "0" ]]; then
+			HAVE_X32=1
+		fi
+	fi
+fi
+
+# "Modern compiler, old hardware" combinations
+HAVE_X86_AES=0
+HAVE_X86_RDRAND=0
+HAVE_X86_RDSEED=0
+HAVE_X86_PCLMUL=0
+if [[ ("$IS_X86" -ne "0" || "$IS_X64" -ne "0") && ("$SUN_COMPILER" -eq "0") ]]; then
+	rm -f "$TMP/adhoc.exe" > /dev/null 2>&1
+	"$CXX" -DCRYPTOPP_ADHOC_MAIN -maes adhoc.cpp -o "$TMP/adhoc.exe" > /dev/null 2>&1
+	if [[ "$?" -eq "0" ]]; then
+		HAVE_X86_AES=1
+	fi
+
+	rm -f "$TMP/adhoc.exe" > /dev/null 2>&1
+	"$CXX" -DCRYPTOPP_ADHOC_MAIN -mrdrnd adhoc.cpp -o "$TMP/adhoc.exe" > /dev/null 2>&1
+	if [[ "$?" -eq "0" ]]; then
+		HAVE_X86_RDRAND=1
+	fi
+
+	rm -f "$TMP/adhoc.exe" > /dev/null 2>&1
+	"$CXX" -DCRYPTOPP_ADHOC_MAIN -mrdseed adhoc.cpp -o "$TMP/adhoc.exe" > /dev/null 2>&1
+	if [[ "$?" -eq "0" ]]; then
+		HAVE_X86_RDSEED=1
+	fi
+
+	rm -f "$TMP/adhoc.exe" > /dev/null 2>&1
+	"$CXX" -DCRYPTOPP_ADHOC_MAIN -mpclmul adhoc.cpp -o "$TMP/adhoc.exe" > /dev/null 2>&1
+	if [[ "$?" -eq "0" ]]; then
+		HAVE_X86_PCLMUL=1
+	fi
+fi
+
+# ld-gold linker testing
+if [[ (-z "$HAVE_LDGOLD") ]]; then
+	HAVE_LDGOLD=0
+	LD_GOLD=$(which ld.gold 2>&1 | "$GREP" -v "no ld.gold" | head -1)
+	ELF_FILE=$(which file 2>&1 | "$GREP" -v "no file" | head -1)
+	if [[ (! -z "$LD_GOLD") && (! -z "$ELF_FILE") ]]; then
+		LD_GOLD=$(file "$LD_GOLD" | cut -d":" -f 2 | "$EGREP" -i -c "elf")
+		if [[ ("$LD_GOLD" -ne "0") ]]; then
+			"$CXX" -DCRYPTOPP_ADHOC_MAIN -fuse-ld=gold adhoc.cpp -o "$TMP/adhoc.exe" > /dev/null 2>&1
+			if [[ "$?" -eq "0" ]]; then
+				HAVE_LDGOLD=1
+			fi
+		fi
+	fi
+fi
+
+# GCC unified syntax f

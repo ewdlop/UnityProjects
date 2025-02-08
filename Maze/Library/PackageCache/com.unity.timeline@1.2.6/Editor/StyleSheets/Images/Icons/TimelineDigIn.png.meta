@@ -1,0 +1,85 @@
+s.
+TEST(Error, ConsumeSuccess) {
+  Error E = Error::success();
+  consumeError(std::move(E));
+}
+
+TEST(Error, ConsumeError) {
+  Error E = make_error<CustomError>(7);
+  consumeError(std::move(E));
+}
+
+// Test that handleAllUnhandledErrors crashes if an error is not caught.
+// Test runs in debug mode only.
+#if LLVM_ENABLE_ABI_BREAKING_CHECKS
+TEST(Error, FailureToHandle) {
+  auto FailToHandle = []() {
+    handleAllErrors(make_error<CustomError>(7), [&](const CustomSubError &SE) {
+      errs() << "This should never be called";
+      exit(1);
+    });
+  };
+
+  EXPECT_DEATH(FailToHandle(),
+               "Failure value returned from cantFail wrapped call")
+      << "Unhandled Error in handleAllErrors call did not cause an "
+         "abort()";
+}
+#endif
+
+// Test that handleAllUnhandledErrors crashes if an error is returned from a
+// handler.
+// Test runs in debug mode only.
+#if LLVM_ENABLE_ABI_BREAKING_CHECKS
+TEST(Error, FailureFromHandler) {
+  auto ReturnErrorFromHandler = []() {
+    handleAllErrors(make_error<CustomError>(7),
+                    [&](std::unique_ptr<CustomSubError> SE) {
+                      return Error(std::move(SE));
+                    });
+  };
+
+  EXPECT_DEATH(ReturnErrorFromHandler(),
+               "Failure value returned from cantFail wrapped call")
+      << " Error returned from handler in handleAllErrors call did not "
+         "cause abort()";
+}
+#endif
+
+// Test that we can return values from handleErrors.
+TEST(Error, CatchErrorFromHandler) {
+  int ErrorInfo = 0;
+
+  Error E = handleErrors(
+      make_error<CustomError>(7),
+      [&](std::unique_ptr<CustomError> CE) { return Error(std::move(CE)); });
+
+  handleAllErrors(std::move(E),
+                  [&](const CustomError &CE) { ErrorInfo = CE.getInfo(); });
+
+  EXPECT_EQ(ErrorInfo, 7)
+      << "Failed to handle Error returned from handleErrors.";
+}
+
+TEST(Error, StringError) {
+  std::string Msg;
+  raw_string_ostream S(Msg);
+  logAllUnhandledErrors(make_error<StringError>("foo" + Twine(42),
+                                                inconvertibleErrorCode()),
+                        S, "");
+  EXPECT_EQ(S.str(), "foo42\n") << "Unexpected StringError log result";
+
+  auto EC =
+    errorToErrorCode(make_error<StringError>("", errc::invalid_argument));
+  EXPECT_EQ(EC, errc::invalid_argument)
+    << "Failed to convert StringError to error_code.";
+}
+
+// Test that the ExitOnError utility works as expected.
+TEST(Error, ExitOnError) {
+  ExitOnError ExitOnErr;
+  ExitOnErr.setBanner("Error in tool:");
+  ExitOnErr.setExitCodeMapper([](const Error &E) {
+    if (E.isA<CustomSubError>())
+      return 2;
+    retur

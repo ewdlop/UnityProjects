@@ -1,0 +1,207 @@
+//---------------------------------------------------------------------
+// <copyright file="TransformationRules.cs" company="Microsoft">
+//      Copyright (c) Microsoft Corporation.  All rights reserved.
+// </copyright>
+//
+// @owner  Microsoft
+// @backupOwner Microsoft
+//---------------------------------------------------------------------
+
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+//using System.Diagnostics; // Please use PlanCompiler.Assert instead of Debug.Assert in this class...
+
+// It is fine to use Debug.Assert in cases where you assert an obvious thing that is supposed
+// to prevent from simple mistakes during development (e.g. method argument validation 
+// in cases where it was you who created the variables or the variables had already been validated or 
+// in "else" clauses where due to code changes (e.g. adding a new value to an enum type) the default 
+// "else" block is chosen why the new condition should be treated separately). This kind of asserts are 
+// (can be) helpful when developing new code to avoid simple mistakes but have no or little value in 
+// the shipped product. 
+// PlanCompiler.Assert *MUST* be used to verify conditions in the trees. These would be assumptions 
+// about how the tree was built etc. - in these cases we probably want to throw an exception (this is
+// what PlanCompiler.Assert does when the condition is not met) if either the assumption is not correct 
+// or the tree was built/rewritten not the way we thought it was.
+// Use your judgment - if you rather remove an assert than ship it use Debug.Assert otherwise use
+// PlanCompiler.Assert.
+
+using System.Globalization;
+using System.Linq;
+using System.Data.Metadata.Edm;
+using System.Data.Query.InternalTrees;
+
+namespace System.Data.Query.PlanCompiler
+{
+    internal class TransformationRulesContext : RuleProcessingContext
+    {
+        #region public methods and properties
+
+        /// <summary>
+        /// Whether any rule was applied that may have caused modifications such that projection pruning 
+        /// may be useful
+        /// </summary>
+        internal bool ProjectionPruningRequired { get { return this.m_projectionPruningRequired; } }
+
+        /// <summary>
+        /// Whether any rule was applied that may have caused modifications such that reapplying
+        /// the nullability rules may be useful
+        /// </summary>
+        internal bool ReapplyNullabilityRules { get { return this.m_reapplyNullabilityRules; } }
+
+        /// <summary>
+        /// Remap the given subtree using the current remapper
+        /// </summary>
+        /// <param name="subTree"></param>
+        internal void RemapSubtree(Node subTree)
+        {
+            this.m_remapper.RemapSubtree(subTree);
+        }
+
+        /// <summary>
+        /// Adds a mapping from oldVar to newVar
+        /// </summary>
+        /// <param name="oldVar"></param>
+        /// <param name="newVar"></param>
+        internal void AddVarMapping(Var oldVar, Var newVar)
+        {
+            m_remapper.AddMapping(oldVar, newVar);
+            m_remappedVars.Set(oldVar);
+        }
+
+        /// <summary>
+        /// "Remap" an expression tree, replacing all references to vars in varMap with
+        /// copies of the corresponding expression
+        /// The subtree is modified *inplace* - it is the caller's responsibility to make
+        /// a copy of the subtree if necessary. 
+        /// The "replacement" expression (the replacement for the VarRef) is copied and then
+        /// inserted into the appropriate location into the subtree. 
+        /// 
+        /// Note: we only support replacements in simple ScalarOp trees. This must be 
+        /// validated by the caller.
+        /// 
+        /// </summary>
+        /// <param name="node">Current subtree to process</param>
+        /// <param name="varMap"></param>
+        /// <returns>The updated subtree</returns>
+        internal Node ReMap(Node node, Dictionary<Var, Node> varMap)
+        {
+            PlanCompiler.Assert(node.Op.IsScalarOp, "Expected a scalarOp: Found " + Dump.AutoString.ToString(node.Op.OpType));
+
+            // Replace varRefOps by the corresponding expression in the map, if any
+            if (node.Op.OpType == OpType.VarRef)
+            {
+                VarRefOp varRefOp = node.Op as VarRefOp;
+                Node newNode = null;
+                if (varMap.TryGetValue(varRefOp.Var, out newNode))
+                {
+                    newNode = this.Copy(newNode);
+                    return newNode;
+                }
+                else
+                {
+                    return node;
+                }
+            }
+
+            // Simply process the result of the children.
+            for (int i = 0; i < node.Children.Count; i++)
+            {
+                node.Children[i] = ReMap(node.Children[i], varMap);
+            }
+
+            // We may have changed something deep down
+            this.Command.RecomputeNodeInfo(node);
+            return node;
+        }
+
+        /// <summary>
+        /// Makes a copy of the appropriate subtree - with a simple accelerator for VarRefOp
+        /// since that's likely to be the most command case
+        /// </summary>
+        /// <param name="node">the subtree to copy</param>
+        /// <returns>the copy of the subtree</returns>
+        internal Node Copy(Node node)
+        {
+            if (node.Op.OpType == OpType.VarRef)
+            {
+                VarRefOp op = node.Op as VarRefOp;
+                return this.Command.CreateNode(this.Command.CreateVarRefOp(op.Var));
+            }
+            else
+            {
+                return OpCopier.Copy(this.Command, node);
+            }
+        }
+
+        /// <summary>
+        /// Checks to see if the current subtree only contains ScalarOps
+        /// </summary>
+        /// <param name="node">current subtree</param>
+        /// <returns>true, if the subtree contains only ScalarOps</returns>
+        internal bool IsScalarOpTree(Node node)
+        {
+            int nodeCount = 0;
+            return IsScalarOpTree(node, null, ref nodeCount);
+        }
+
+        /// <summary>
+        /// Is the given var guaranteed to be non-nullable with regards to the node
+        /// that is currently being processed.
+        /// True, if it is listed as such on any on the node infos on any of the 
+        /// current relop ancestors.
+        /// </summary>
+        /// <param name="var"></param>
+        /// <returns></returns>
+        internal bool IsNonNullable(Var var)
+        {
+            foreach (Node relOpAncestor in m_relOpAncestors)
+            {
+                // Rules applied to the children of the relOpAncestor may have caused it change. 
+                // Thus, if the node is used, it has to have its node info recomputed
+                Command.RecomputeNodeInfo(relOpAncestor);
+                ExtendedNodeInfo nodeInfo = Command.GetExtendedNodeInfo(relOpAncestor);
+                if (nodeInfo.NonNullableVisibleDefinitions.IsSet(var))
+                {
+                    return true;
+                }
+                else if (nodeInfo.LocalDefinitions.IsSet(var))
+                {
+                    //The var is defined on this ancestor but is not non-nullable,
+                    // therefore there is no need to further check other ancestors
+                    return false;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Is it safe to use a null sentinel with any value?
+        /// It may not be safe if:
+        /// 1. The top most sort includes null sentinels. If the null sentinel is replaced with a different value
+        /// and is used as a sort key it may change the sorting results 
+        /// 2. If any of the ancestors is Distinct, GroupBy, Intersect or Except,
+        /// because the null sentinel may be used as a key.  
+        /// 3. If the null sentinel is defined in the left child of an apply it may be used at the right side, 
+        /// thus in these cases we also verify that the right hand side does not have any Distinct, GroupBy, 
+        /// Intersect or Except.
+        /// </summary>
+        internal bool CanChangeNullSentinelValue
+        {
+            get
+            {
+                //Is there a sort that includes null sentinels
+                if (this.m_compilerState.HasSortingOnNullSentinels)
+                {
+                    return false;
+                }
+
+                //Is any of the ancestors Distinct, GroupBy, Intersect or Except
+                if (this.m_relOpAncestors.Any(a => IsOpNotSafeForNullSentinelValueChange(a.Op.OpType)))
+                {
+                    return false;
+                }
+
+                // Is the null sentinel defined in the left child of an apply and if so, 
+                // does the right hand side have any Distinct, GroupBy, Intersect or Except.
+                var applyAncestors = this.m_

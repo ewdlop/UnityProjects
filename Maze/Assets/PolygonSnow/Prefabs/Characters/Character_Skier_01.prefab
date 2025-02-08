@@ -1,0 +1,1298 @@
+//---------------------------------------------------------------------
+// <copyright file="TypeResolver.cs" company="Microsoft">
+//      Copyright (c) Microsoft Corporation.  All rights reserved.
+// </copyright>
+//
+// @owner  Microsoft
+// @backupOwner Microsoft
+//---------------------------------------------------------------------
+
+namespace System.Data.Common.EntitySql
+{
+    using System;
+    using System.Collections.Generic;
+    using System.Data.Entity;
+    using System.Data.Metadata.Edm;
+    using System.Diagnostics;
+    using System.Linq;
+
+    /// <summary>
+    /// Represents eSQL metadata member expression class.
+    /// </summary>
+    internal enum MetadataMemberClass
+    {
+        Type,
+        FunctionGroup,
+        InlineFunctionGroup,
+        Namespace,
+        EnumMember
+    }
+
+    /// <summary>
+    /// Abstract class representing an eSQL expression classified as <see cref="ExpressionResolutionClass.MetadataMember"/>.
+    /// </summary>
+    internal abstract class MetadataMember : ExpressionResolution
+    {
+        protected MetadataMember(MetadataMemberClass @class, string name)
+            : base(ExpressionResolutionClass.MetadataMember)
+        {
+            Debug.Assert(!String.IsNullOrEmpty(name), "name must not be empty");
+
+            MetadataMemberClass = @class;
+            Name = name;
+        }
+
+        internal override string ExpressionClassName { get { return MetadataMemberExpressionClassName; } }
+        internal static string MetadataMemberExpressionClassName { get { return Strings.LocalizedMetadataMemberExpression; } }
+
+        internal readonly MetadataMemberClass MetadataMemberClass;
+        internal readonly string Name;
+        /// <summary>
+        /// Return the name of the <see cref="MetadataMemberClass"/> for error messages.
+        /// </summary>
+        internal abstract string MetadataMemberClassName { get; }
+
+        internal static IEqualityComparer<MetadataMember> CreateMetadataMemberNameEqualityComparer(StringComparer stringComparer)
+        {
+            return new MetadataMemberNameEqualityComparer(stringComparer);
+        }
+
+        private sealed class MetadataMemberNameEqualityComparer : IEqualityComparer<MetadataMember>
+        {
+            private readonly StringComparer _stringComparer;
+
+            internal MetadataMemberNameEqualityComparer(StringComparer stringComparer)
+            {
+                _stringComparer = stringComparer;
+            }
+
+            bool IEqualityComparer<MetadataMember>.Equals(MetadataMember x, MetadataMember y)
+            {
+                Debug.Assert(x != null && y != null, "metadata members must not be null");
+                return _stringComparer.Equals(x.Name, y.Name);
+            }
+
+            int IEqualityComparer<MetadataMember>.GetHashCode(MetadataMember obj)
+            {
+                Debug.Assert(obj != null, "metadata member must not be null");
+                return _stringComparer.GetHashCode(obj.Name);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Represents an eSQL metadata member expression classified as <see cref="MetadataMemberClass.Namespace"/>.
+    /// </summary>
+    internal sealed class MetadataNamespace : MetadataMember
+    {
+        internal MetadataNamespace(string name) : base(MetadataMemberClass.Namespace, name) { }
+
+        internal override string MetadataMemberClassName { get { return NamespaceClassName; } }
+        internal static string NamespaceClassName { get { return Strings.LocalizedNamespace; } }
+    }
+
+    /// <summary>
+    /// Represents an eSQL metadata member expression classified as <see cref="MetadataMemberClass.Type"/>.
+    /// </summary>
+    internal sealed class MetadataType : MetadataMember
+    {
+        internal MetadataType(string name, TypeUsage typeUsage)
+            : base(MetadataMemberClass.Type, name)
+        {
+            Debug.Assert(typeUsage != null, "typeUsage must not be null");
+            TypeUsage = typeUsage;
+        }
+
+        internal override string MetadataMemberClassName { get { return TypeClassName; } }
+        internal static string TypeClassName { get { return Strings.LocalizedType; } }
+
+        internal readonly TypeUsage TypeUsage;
+    }
+
+    /// <summary>
+    /// Represents an eSQL metadata member expression classified as <see cref="MetadataMemberClass.EnumMember"/>.
+    /// </summary>
+    internal sealed class MetadataEnumMember : MetadataMember
+    {
+        internal MetadataEnumMember(string name, TypeUsage enumType, EnumMember enumMember)
+            : base(MetadataMemberClass.EnumMember, name)
+        {
+            Debug.Assert(enumType != null, "enumType must not be null");
+            Debug.Assert(enumMember != null, "enumMember must not be null");
+            EnumType = enumType;
+            EnumMember = enumMember;
+        }
+
+        internal override string MetadataMemberClassName { get { return EnumMemberClassName; } }
+        internal static string EnumMemberClassName { get { return Strings.LocalizedEnumMember; } }
+
+        internal readonly TypeUsage EnumType;
+        internal readonly EnumMember EnumMember;
+    }
+
+    /// <summary>
+    /// Represents an eSQL metadata member expression classified as <see cref="MetadataMemberClass.FunctionGroup"/>.
+    /// </summary>
+    internal sealed class MetadataFunctionGroup : MetadataMember
+    {
+        internal MetadataFunctionGroup(string name, IList<EdmFunction> functionMetadata)
+            : base(MetadataMemberClass.FunctionGroup, name)
+        {
+            Debug.Assert(functionMetadata != null && functionMetadata.Count > 0, "FunctionMetadata must not be null or empty");
+            FunctionMetadata = functionMetadata;
+        }
+
+        internal override string MetadataMemberClassName { get { return FunctionGroupClassName; } }
+        internal static string FunctionGroupClassName { get { return Strings.LocalizedFunction; } }
+
+        internal readonly IList<EdmFunction> FunctionMetadata;
+    }
+
+    /// <summary>
+    /// Represents an eSQL metadata member expression classified as <see cref="MetadataMemberClass.InlineFunctionGroup"/>.
+    /// </summary>
+    internal sealed class InlineFunctionGroup : MetadataMember
+    {
+        internal InlineFunctionGroup(string name, IList<InlineFunctionInfo> functionMetadata)
+            : base(MetadataMemberClass.InlineFunctionGroup, name)
+        {
+            Debug.Assert(functionMetadata != null && functionMetadata.Count > 0, "FunctionMetadata must not be null or empty");
+            FunctionMetadata = functionMetadata;
+        }
+
+        internal override string MetadataMemberClassName { get { return InlineFunctionGroupClassName; } }
+        internal static string InlineFunctionGroupClassName { get { return Strings.LocalizedInlineFunction; } }
+
+        internal readonly IList<InlineFunctionInfo> FunctionMetadata;
+    }
+
+    /// <summary>
+    /// Represents eSQL type and namespace name resolver.
+    /// </summary>
+    internal sealed class TypeResolver
+    {
+        private readonly Perspective _perspective;
+        private readonly ParserOptions _parserOptions;
+        private readonly Dictionary<string, MetadataNamespace> _aliasedNamespaces;
+        private readonly HashSet<MetadataNamespace> _namespaces;
+        /// <summary>
+        /// name -> list(overload)
+        /// </summary>
+        private readonly Dictionary<string, List<InlineFunctionInfo>> _functionDefinitions;
+        private bool _includeInlineFunctions;
+        private bool _resolveLeftMostUnqualifiedNameAsNamespaceOnly;
+        
+        /// <summary>
+        /// Initializes TypeResolver instance
+        /// </summary>
+        internal TypeResolver(Perspective perspective, ParserOptions parserOptions)
+        {
+            EntityUtil.CheckArgumentNull(perspective, "perspective");
+
+            _perspective = perspective;
+            _parserOptions = parserOptions;
+            _aliasedNamespaces = new Dictionary<string, MetadataNamespace>(parserOptions.NameComparer);
+            _namespaces = new HashSet<MetadataNamespace>(MetadataMember.CreateMetadataMemberNameEqualityComparer(parserOptions.NameComparer));
+            _functionDefinitions = new Dictionary<string, List<InlineFunctionInfo>>(parserOptions.NameComparer);
+            _includeInlineFunctions = true;
+            _resolveLeftMostUnqualifiedNameAsNamespaceOnly = false;
+        }
+
+        /// <summary>
+        /// Returns perspective.
+        /// </summary>
+        internal Perspective Perspective
+        {
+            get { return _perspective; }
+        }
+
+        /// <summary>
+        /// Returns namespace imports.
+        /// </summary>
+        internal ICollection<MetadataNamespace> NamespaceImports
+        {
+            get { return _namespaces; }
+        }
+
+        /// <summary>
+        /// Returns <see cref="TypeUsage"/> for <see cref="PrimitiveTypeKind.String"/>.
+        /// </summary>
+        internal TypeUsage StringType
+        {
+            get { return _perspective.MetadataWorkspace.GetCanonicalModelTypeUsage(PrimitiveTypeKind.String); }
+        }
+
+        /// <summary>
+        /// Returns <see cref="TypeUsage"/> for <see cref="PrimitiveTypeKind.Boolean"/>.
+        /// </summary>
+        internal TypeUsage BooleanType
+        {
+            get { return _perspective.MetadataWorkspace.GetCanonicalModelTypeUsage(PrimitiveTypeKind.Boolean); }
+        }
+
+        /// <summary>
+        /// Returns <see cref="TypeUsage"/> for <see cref="PrimitiveTypeKind.Int64"/>.
+        /// </summary>
+        internal TypeUsage Int64Type
+        {
+            get { return _perspective.MetadataWorkspace.GetCanonicalModelTypeUsage(PrimitiveTypeKind.Int64); }
+        }
+
+        /// <summary>
+        /// Adds an aliased namespace import.
+        /// </summary>
+        internal void AddAliasedNamespaceImport(string alias, MetadataNamespace @namespace, ErrorContext errCtx)
+        {
+            if (_aliasedNamespaces.ContainsKey(alias))
+            {
+                throw EntityUtil.EntitySqlError(errCtx, Strings.NamespaceAliasAlreadyUsed(alias));
+            }
+            
+            _aliasedNamespaces.Add(alias, @namespace);
+        }
+
+        /// <summary>
+        /// Adds a non-aliased namespace import.
+        /// </summary>
+        internal void AddNamespaceImport(MetadataNamespace @namespace, ErrorContext errCtx)
+        {
+            if (_namespaces.Contains(@namespace))
+            {
+                throw EntityUtil.EntitySqlError(errCtx, Strings.NamespaceAlreadyImported(@namespace.Name));
+            }
+
+            _namespaces.Add(@namespace);
+        }
+
+        #region Inline function declarations
+        /// <summary>
+        /// Declares inline function in the query local metadata.
+        /// </summary>
+        internal void DeclareInlineFunction(string name, InlineFunctionInfo functionInfo)
+        {
+            Debug.Assert(!String.IsNullOrEmpty(name), "name must not be null or empty");
+            Debug.Assert(functionInfo != null, "functionInfo != null");
+
+            List<InlineFunctionInfo> overloads;
+            if (!_functionDefinitions.TryGetValue(name, out overloads))
+            {
+                overloads = new List<InlineFunctionInfo>();
+                _functionDefinitions.Add(name, overloads);
+            }
+
+            //
+            // Check overload uniqueness.
+            //
+            if (overloads.Exists(overload =>
+                overload.Parameters.Select(p => p.ResultType).SequenceEqual(functionInfo.Parameters.Select(p => p.ResultType), TypeUsageStructuralComparer.Instance)))
+            {
+                throw EntityUtil.EntitySqlError(functionInfo.FunctionDefAst.ErrCtx, Strings.DuplicatedInlineFunctionOverload(name));
+            }
+
+            overloads.Add(functionInfo);
+        }
+
+        private sealed class TypeUsageStructuralComparer : IEqualityComparer<TypeUsage>
+        {
+            internal static readonly TypeUsageStructuralComparer Instance = new TypeUsageStructuralComparer();
+
+            private TypeUsageStructuralComparer() { }
+
+            public bool Equals(TypeUsage x, TypeUsage y)
+            {
+                return TypeSemantics.IsStructurallyEqual(x, y);
+            }
+
+            public int GetHashCode(TypeUsage obj)
+            {
+                Debug.Fail("Not implemented");
+                return 0;
+            }
+        }
+        #endregion
+
+        internal IDisposable EnterFunctionNameResolution(bool includeInlineFunctions)
+        {
+            bool savedIncludeInlineFunctions = _includeInlineFunctions;
+            _includeInlineFunctions = includeInlineFunctions;
+            return new Disposer(delegate { this._includeInlineFunctions = savedIncludeInlineFunctions; });
+        }
+
+        internal IDisposable EnterBackwardCompatibilityResolution()
+        {
+            Debug.Assert(!_resolveLeftMostUnqualifiedNameAsNamespaceOnly, "EnterBackwardCompatibilityResolution() is not reentrant.");
+            _resolveLeftMostUnqualifiedNameAsNamespaceOnly = true;
+            return new Disposer(delegate
+            {
+                Debug.Assert(this._resolveLeftMostUnqualifiedNameAsNamespaceOnly, "_resolveLeftMostUnqualifiedNameAsNamespaceOnly must be true.");
+                this._resolveLeftMostUnqualifiedNameAsNamespaceOnly = false;
+            });
+        }
+
+        internal MetadataMember ResolveMetadataMemberName(string[] name, ErrorContext errCtx)
+        {
+            Debug.Assert(name != null && name.Length > 0, "name must not be empty");
+
+            MetadataMember metadataMember;
+            if (name.Length == 1)
+            {
+                metadataMember = ResolveUnqualifiedName(name[0], false /* partOfQualifiedName */, errCtx);
+            }
+            else
+            {
+                metadataMember = ResolveFullyQualifiedName(name, name.Length, errCtx);
+            }
+            Debug.Assert(metadataMember != null, "metadata member name resolution must not return null");
+
+            return metadataMember;
+        }
+
+        internal MetadataMember ResolveMetadataMemberAccess(MetadataMember qualifier, string name, ErrorContext errCtx)
+        {
+            string fullName = GetFullName(qualifier.Name, name);
+            if (qualifier.MetadataMemberClass == MetadataMemberClass.Namespace)
+            {
+                //
+                // Try resolving as a type.
+                //
+                MetadataType type;
+                if (TryGetTypeFromMetadata(fullName, out type))
+                {
+                    return type;
+                }
+
+                //
+                // Try resolving as a function.
+                //
+                MetadataFunctionGroup function;
+                if (TryGetFunctionFromMetadata(qualifier.Name, name, out function))
+                {
+                    return function;
+                }
+
+                //
+                // Otherwise, resolve as a namespace.
+                //
+                return new MetadataNamespace(fullName);
+            }
+            else if (qualifier.MetadataMemberClass == MetadataMemberClass.Type)
+            {
+                var type = (MetadataType)qualifier;
+                if (TypeSemantics.IsEnumerationType(type.TypeUsage))
+                {
+                    EnumMember member;
+                    if (_perspective.TryGetEnumMember((EnumType)type.TypeUsage.EdmType, name, _parserOptions.NameComparisonCaseInsensitive /*ignoreCase*/, out member))
+                    {
+                        Debug.Assert(member != null, "member != null");
+                        Debug.Assert(_parserOptions.NameComparer.Equals(name, member.Name), "_parserOptions.NameComparer.Equals(name, member.Name)");
+                        return new MetadataEnumMember(fullName, type.TypeUsage, member);
+                    }
+                    else
+                    {
+                        throw EntityUtil.EntitySqlError(errCtx, Strings.NotAMemberOfType(name, qualifier.Name));
+                    }
+                }
+            }
+
+            throw EntityUtil.EntitySqlError(errCtx, Strings.InvalidMetadataMemberClassResolution(
+                qualifier.Name, qualifier.MetadataMemberClassName, MetadataNamespace.NamespaceClassName));
+        }
+
+        internal MetadataMember ResolveUnqualifiedName(string name, bool partOfQualifiedName, ErrorContext errCtx)
+        {
+            Debug.Assert(!String.IsNullOrEmpty(name), "name must not be empty");
+
+            //
+            // In the case of Name1.Name2...NameN and if backward compatibility mode is on, then resolve Name1 as namespace only, ignore any other possible resolutions.
+            //
+            bool resolveAsNamespaceOnly = partOfQualifiedName && _resolveLeftMostUnqualifiedNameAsNamespaceOnly;
+
+            //
+            // In the case of Name1.Name2...NameN, ignore functions while resolving Name1: functions don't have members.
+            //
+            bool includeFunctions = !partOfQualifiedName;
+
+            //
+            // Try resolving as an inline function.
+            //
+            InlineFunctionGroup inlineFunctionGroup;
+            if (!resolveAsNamespaceOnly && 
+                includeFunctions && TryGetInlineFunction(name, out inlineFunctionGroup))
+            {
+                return inlineFunctionGroup;
+            }
+
+            //
+            // Try resolving as a namespace alias.
+            //
+            MetadataNamespace aliasedNamespaceImport;
+            if (_aliasedNamespaces.TryGetValue(name, out aliasedNamespaceImport))
+            {
+                return aliasedNamespaceImport;
+            }
+
+            if (!resolveAsNamespaceOnly)
+            {
+                //
+                // Try resolving as a type or functionGroup in the global namespace or as an imported member.
+                // Throw if ambiguous.
+                //
+                MetadataType type = null;
+                MetadataFunctionGroup functionGroup = null;
+
+                if (!TryGetTypeFromMetadata(name, out type))
+                {
+                    if (includeFunctions)
+                    {
+                        //
+                        // If name looks like a multipart identifier, try resolving it in the global namespace.
+                        // Escaped multipart identifiers usually appear in views: select [NS1.NS2.Product](...) from ...
+                        //
+                        var multipart = name.Split('.');
+                        if (multipart.Length > 1 && multipart.All(p => p.Length > 0))
+                        {
+                            var functionName = multipart[multipart.Length - 1];
+                            var namespaceName = name.Substring(0, name.Length - functionName.Length - 1);
+                            TryGetFunctionFromMetadata(namespaceName, functionName, out functionGroup);
+                        }
+                    }
+                }
+
+                //
+                // Try resolving as an imported member.
+                //
+                MetadataNamespace importedMemberNamespace = null;
+                foreach (MetadataNamespace namespaceImport in _namespaces)
+                {
+                    string fullName = GetFullName(namespaceImport.Name, name);
+
+                    MetadataType importedType;
+                    if (TryGetTypeFromMetadata(fullName, out importedType))
+                    {
+                        if (type == null && functionGroup == null)
+                        {
+                            type = importedType;
+                            importedMemberNamespace = namespaceImport;
+                        }
+                        else
+                        {
+                            throw AmbiguousMetadataMemberName(errCtx, name, namespaceImport, importedMemberNamespace);
+                        }
+                    }
+
+                    MetadataFunctionGroup importedFunctionGroup;
+                    if (includeFunctions && TryGetFunctionFromMetadata(namespaceImport.Name, name, out importedFunctionGroup))
+                    {
+                        if (type == null && functionGroup == null)
+                        {
+                            functionGroup = importedFunctionGroup;
+                            importedMemberNamespace = namespaceImport;
+                        }
+                        else
+                        {
+                            throw AmbiguousMetadataMemberName(errCtx, name, namespaceImport, importedMemberNamespace);
+                        }
+                    }
+                }
+                if (type != null)
+                {
+                    return type;
+                }
+                if (functionGroup != null)
+                {
+                    return functionGroup;
+                }
+            }
+
+            //
+            // Otherwise, resolve as a namespace.
+            //
+            return new MetadataNamespace(name);
+        }
+
+        private MetadataMember ResolveFullyQualifiedName(string[] name, int length, ErrorContext errCtx)
+        {
+            Debug.Assert(name != null && length > 1 && length <= name.Length, "name must not be empty");
+
+            //
+            // Resolve N in N.R
+            //
+            MetadataMember left;
+            if (length == 2)
+            {
+                //
+                // If N is a single name, ignore functions: functions don't have members.
+                //
+                left = ResolveUnqualifiedName(name[0], true /* partOfQualifiedName */, errCtx);
+            }
+            else
+            {
+                left = ResolveFullyQualifiedName(name, length - 1, errCtx);
+            }
+
+            //
+            // Get R in N.R
+            //
+            string rightName = name[length - 1];
+            Debug.Assert(!String.IsNullOrEmpty(rightName), "rightName must not be empty");
+
+            //
+            // Resolve R in the context of N
+            //
+            return ResolveMetadataMemberAccess(left, rightName, errCtx);
+        }
+
+        private static Exception AmbiguousMetadataMemberName(ErrorContext errCtx, string name, MetadataNamespace ns1, MetadataNamespace ns2)
+        {
+            throw EntityUtil.EntitySqlError(errCtx, Strings.AmbiguousMetadataMemberName(name, ns1.Name, ns2 != null ? ns2.Name : null));
+        }
+
+        /// <summary>
+        /// Try get type from the model using the fully qualified name.
+        /// </summary>
+        private bool TryGetTypeFromMetadata(string typeFullName, out MetadataType type)
+        {
+            TypeUsage typeUsage;
+            if (_perspective.TryGetTypeByName(typeFullName, _parserOptions.NameComparisonCaseInsensitive /* ignore case */, out typeUsage))
+            {
+                type = new MetadataType(typeFullName, typeUsage);
+                return true;
+            }
+            else
+            {
+                type = null;
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Try get function from the model using the fully qualified name.
+        /// </summary>
+        internal bool TryGetFunctionFromMetadata(string namespaceName, string functionName, out MetadataFunctionGroup functionGroup)
+        {
+            IList<EdmFunction> functionMetadata;
+            if (_perspective.TryGetFunctionByName(namespaceName, functionName, _parserOptions.NameComparisonCaseInsensitive /* ignore case */, out functionMetadata))
+            {
+                functionGroup = new MetadataFunctionGroup(GetFullName(namespaceName, functionName), functionMetadata);
+                return true;
+            }
+            else
+            {
+                functionGroup = null;
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Try get function from the local metadata using the fully qualified name.
+        /// </summary>
+        private bool TryGetInlineFunction(string functionName, out InlineFunctionGroup inlineFunctionGroup)
+        {
+            List<InlineFunctionInfo> inlineFunctionMetadata;
+            if (_includeInlineFunctions && _functionDefinitions.TryGetValue(functionName, out inlineFunctionMetadata))
+            {
+                inlineFunctionGroup = new InlineFunctionGroup(functionName, inlineFunctionMetadata);
+                return true;
+            }
+            else
+            {
+                inlineFunctionGroup = null;
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Builds a dot-separated multipart identifier off the provided <paramref name="names"/>.
+        /// </summary>
+        internal static string GetFullName(params string[] names)
+        {
+            Debug.Assert(names != null && names.Length > 0, "names must not be null or empty");
+            return String.Join(".", names);
+        }
+    }
+}
+                                                                                                                                                                                                                                                    return value is the result of invoking the <see cref="M:System.IConvertible.ToInt32(System.IFormatProvider)" /> method of the underlying type of <paramref name="value" />.</para>
+          <para>
+            <paramref name="provider" /> enables the user to specify culture-specific conversion information about the contents of <paramref name="value" />. For example, if <paramref name="value" /> is a <see cref="T:System.String" /> that represents a number, <paramref name="provider" /> could supply culture-specific information about the notation used to represent that number.</para>
+          <para>The base types ignore <paramref name="provider" />; however, the parameter may be used if <paramref name="value" /> is a user-defined type that implements the <see cref="T:System.IConvertible" /> interface.</para>
+        </remarks>
+        <summary>
+          <attribution license="cc4" from="Microsoft" modified="false" />
+          <para>Converts the value of the specified object to a 32-bit signed integer, using the specified culture-specific formatting information.</para>
+        </summary>
+        <returns>
+          <attribution license="cc4" from="Microsoft" modified="false" />
+          <para>A 32-bit signed integer that is equivalent to <paramref name="value" />, or zero if <paramref name="value" /> is null.</para>
+        </returns>
+        <param name="value">
+          <attribution license="cc4" from="Microsoft" modified="false" />An object that implements the <see cref="T:System.IConvertible" /> interface. </param>
+        <param name="provider">
+          <attribution license="cc4" from="Microsoft" modified="false" />An object that supplies culture-specific formatting information. </param>
+      </Docs>
+    </Member>
+    <Member MemberName="ToInt32">
+      <MemberSignature Language="ILASM" Value=".method public hidebysig static int32 ToInt32(string value, class System.IFormatProvider provider)" />
+      <MemberSignature Language="C#" Value="public static int ToInt32 (string value, IFormatProvider provider);" />
+      <MemberSignature Language="ILAsm" Value=".method public static hidebysig int32 ToInt32(string value, class System.IFormatProvider provider) cil managed" />
+      <MemberType>Method</MemberType>
+      <AssemblyInfo>
+        <AssemblyVersion>1.0.5000.0</AssemblyVersion>
+        <AssemblyVersion>2.0.0.0</AssemblyVersion>
+        <AssemblyVersion>4.0.0.0</AssemblyVersion>
+      </AssemblyInfo>
+      <ReturnValue>
+        <ReturnType>System.Int32</ReturnType>
+      </ReturnValue>
+      <Parameters>
+        <Parameter Name="value" Type="System.String" />
+        <Parameter Name="provider" Type="System.IFormatProvider" />
+      </Parameters>
+      <Docs>
+        <exception cref="T:System.ArgumentNullException">
+          <paramref name="value" /> is a null reference. </exception>
+        <exception cref="T:System.FormatException">
+          <paramref name="value" /> cannot be converted to a numeric value.</exception>
+        <exception cref="T:System.OverflowException">The numeric value of <paramref name="va; RUN: llc -march=amdgcn -mtriple=amdgcn---amdgiz -verify-machineinstrs < %s | FileCheck -check-prefix=GCN -check-prefix=SI -check-prefix=FUNC %s
+; RUN: llc -march=amdgcn -mtriple=amdgcn---amdgiz -mcpu=tonga -mattr=-flat-for-global -verify-machineinstrs < %s | FileCheck -check-prefix=GCN -check-prefix=VI -check-prefix=GFX89 -check-prefix=FUNC %s
+; RUN: llc -march=amdgcn -mtriple=amdgcn---amdgiz -mcpu=gfx900 -mattr=-flat-for-global -verify-machineinstrs < %s | FileCheck -check-prefix=GCN -check-prefix=GFX9 -check-prefix=GFX89 -check-prefix=FUNC %s
+; RUN: llc -march=r600 -mtriple=r600---amdgiz -mcpu=cypress -verify-machineinstrs < %s | FileCheck -check-prefix=EG -check-prefix=FUNC %s
+
+; FUNC-LABEL: {{^}}v_test_imin_sle_i32:
+; GCN: v_min_i32_e32
+
+; EG: MIN_INT
+define amdgpu_kernel void @v_test_imin_sle_i32(i32 addrspace(1)* %out, i32 addrspace(1)* %a.ptr, i32 addrspace(1)* %b.ptr) #0 {
+  %tid = call i32 @llvm.r600.read.tidig.x()
+  %a.gep = getelementptr inbounds i32, i32 addrspace(1)* %a.ptr, i32 %tid
+  %b.gep = getelementptr inbounds i32, i32 addrspace(1)* %b.ptr, i32 %tid
+  %out.gep = getelementptr inbounds i32, i32 addrspace(1)* %out, i32 %tid
+  %a = load i32, i32 addrspace(1)* %a.gep, align 4
+  %b = load i32, i32 addrspace(1)* %b.gep, align 4
+  %cmp = icmp sle i32 %a, %b
+  %val = select i1 %cmp, i32 %a, i32 %b
+  store i32 %val, i32 addrspace(1)* %out.gep, align 4
+  ret void
+}
+
+; FUNC-LABEL: {{^}}s_test_imin_sle_i32:
+; GCN: s_min_i32
+
+; EG: MIN_INT
+define amdgpu_kernel void @s_test_imin_sle_i32(i32 addrspace(1)* %out, i32 %a, i32 %b) #0 {
+  %cmp = icmp sle i32 %a, %b
+  %val = select i1 %cmp, i32 %a, i32 %b
+  store i32 %val, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; FUNC-LABEL: {{^}}s_test_imin_sle_v1i32:
+; GCN: s_min_i32
+
+; EG: MIN_INT
+define amdgpu_kernel void @s_test_imin_sle_v1i32(<1 x i32> addrspace(1)* %out, <1 x i32> %a, <1 x i32> %b) #0 {
+  %cmp = icmp sle <1 x i32> %a, %b
+  %val = select <1 x i1> %cmp, <1 x i32> %a, <1 x i32> %b
+  store <1 x i32> %val, <1 x i32> addrspace(1)* %out
+  ret void
+}
+
+; FUNC-LABEL: {{^}}s_test_imin_sle_v4i32:
+; GCN: s_min_i32
+; GCN: s_min_i32
+; GCN: s_min_i32
+; GCN: s_min_i32
+
+; EG: MIN_INT
+; EG: MIN_INT
+; EG: MIN_INT
+; EG: MIN_INT
+define amdgpu_kernel void @s_test_imin_sle_v4i32(<4 x i32> addrspace(1)* %out, <4 x i32> %a, <4 x i32> %b) #0 {
+  %cmp = icmp sle <4 x i32> %a, %b
+  %val = select <4 x i1> %cmp, <4 x i32> %a, <4 x i32> %b
+  store <4 x i32> %val, <4 x i32> addrspace(1)* %out
+  ret void
+}
+
+; FUNC-LABEL: {{^}}s_test_imin_sle_i8:
+; GCN: s_load_dword
+; GCN: s_load_dword
+; GCN: s_sext_i32_i8
+; GCN: s_sext_i32_i8
+; GCN: s_min_i32
+define amdgpu_kernel void @s_test_imin_sle_i8(i8 addrspace(1)* %out, i8 %a, i8 %b) #0 {
+  %cmp = icmp sle i8 %a, %b
+  %val = select i1 %cmp, i8 %a, i8 %b
+  store i8 %val, i8 addrspace(1)* %out
+  ret void
+}
+
+; XXX - should be able to use s_min if we stop unnecessarily doing
+; extloads with mubuf instructions.
+
+; FUNC-LABEL: {{^}}s_test_imin_sle_v4i8:
+; GCN: buffer_load_sbyte
+; GCN: buffer_load_sbyte
+; GCN: buffer_load_sbyte
+; GCN: buffer_load_sbyte
+; GCN: buffer_load_sbyte
+; GCN: buffer_load_sbyte
+; GCN: buffer_load_sbyte
+; GCN: buffer_load_sbyte
+
+; SI: v_min_i32
+; SI: v_min_i32
+; SI: v_min_i32
+; SI: v_min_i32
+
+; VI: v_min_i32
+; VI: v_min_i32
+; VI: v_min_i32
+; VI: v_min_i32
+
+; GFX9: v_min_i16
+; GFX9: v_min_i16
+; GFX9: v_min_i16
+; GFX9: v_min_i16
+
+; GCN: s_endpgm
+
+; EG: MIN_INT
+; EG: MIN_INT
+; EG: MIN_INT
+; EG: MIN_INT
+define amdgpu_kernel void @s_test_imin_sle_v4i8(<4 x i8> addrspace(1)* %out, <4 x i8> %a, <4 x i8> %b) #0 {
+  %cmp = icmp sle <4 x i8> %a, %b
+  %val = select <4 x i1> %cmp, <4 x i8> %a, <4 x i8> %b
+  store <4 x i8> %val, <4 x i8> addrspace(1)* %out
+  ret void
+}
+
+; FUNC-LABEL: {{^}}s_test_imin_sle_v2i16:
+; SI: v_min_i32
+; SI: v_min_i32
+
+; VI: v_min_i32
+; VI: v_min_i32
+
+; GFX9: v_pk_min_i16
+
+; EG: MIN_INT
+; EG: MIN_INT
+define amdgpu_kernel void @s_test_imin_sle_v2i16(<2 x i16> addrspace(1)* %out, <2 x i16> %a, <2 x i16> %b) #0 {
+  %cmp = icmp sle <2 x i16> %a, %b
+  %val = select <2 x i1> %cmp, <2 x i16> %a, <2 x i16> %b
+  store <2 x i16> %val, <2 x i16> addrspace(1)* %out
+  ret void
+}
+
+; FIXME: VI use s_min_i32
+; FUNC-LABEL: {{^}}s_test_imin_sle_v4i16:
+; SI: v_min_i32
+; SI: v_min_i32
+; SI: v_min_i32
+; SI: v_min_i32
+
+; VI: v_min_i32
+; VI: v_min_i32
+; VI: v_min_i32
+; VI: v_min_i32
+
+; GFX9: v_pk_min_i16
+; GFX9: v_pk_min_i16
+
+; EG: MIN_INT
+; EG: MIN_INT
+; EG: MIN_INT
+; EG: MIN_INT
+define amdgpu_kernel void @s_test_imin_sle_v4i16(<4 x i16> addrspace(1)* %out, <4 x i16> %a, <4 x i16> %b) #0 {
+  %cmp = icmp sle <4 x i16> %a, %b
+  %val = select <4 x i1> %cmp, <4 x i16> %a, <4 x i16> %b
+  store <4 x i16> %val, <4 x i16> addrspace(1)* %out
+  ret void
+}
+
+; FUNC-LABEL: @v_test_imin_slt_i32
+; GCN: v_min_i32_e32
+
+; EG: MIN_INT
+define amdgpu_kernel void @v_test_imin_slt_i32(i32 addrspace(1)* %out, i32 addrspace(1)* %aptr, i32 addrspace(1)* %bptr) #0 {
+  %tid = call i32 @llvm.r600.read.tidig.x()
+  %a.gep = getelementptr inbounds i32, i32 addrspace(1)* %aptr, i32 %tid
+  %b.gep = getelementptr inbounds i32, i32 addrspace(1)* %bptr, i32 %tid
+  %out.gep = getelementptr inbounds i32, i32 addrspace(1)* %out, i32 %tid
+  %a = load i32, i32 addrspace(1)* %a.gep, align 4
+  %b = load i32, i32 addrspace(1)* %b.gep, align 4
+  %cmp = icmp slt i32 %a, %b
+  %val = select i1 %cmp, i32 %a, i32 %b
+  store i32 %val, i32 addrspace(1)* %out.gep, align 4
+  ret void
+}
+
+; FUNC-LABEL: @v_test_imin_slt_i16
+; SI: v_min_i32_e32
+
+; GFX89: v_min_i16_e32
+
+; EG: MIN_INT
+define amdgpu_kernel void @v_test_imin_slt_i16(i16 addrspace(1)* %out, i16 addrspace(1)* %aptr, i16 addrspace(1)* %bptr) #0 {
+  %tid = call i32 @llvm.r600.read.tidig.x()
+  %a.gep = getelementptr inbounds i16, i16 addrspace(1)* %aptr, i32 %tid
+  %b.gep = getelementptr inbounds i16, i16 addrspace(1)* %bptr, i32 %tid
+  %out.gep = getelementptr inbounds i16, i16 addrspace(1)* %out, i32 %tid
+
+  %a = load i16, i16 addrspace(1)* %a.gep
+  %b = load i16, i16 addrspace(1)* %b.gep
+  %cmp = icmp slt i16 %a, %b
+  %val = select i1 %cmp, i16 %a, i16 %b
+  store i16 %val, i16 addrspace(1)* %out.gep
+  ret void
+}
+
+; FUNC-LABEL: @s_test_imin_slt_i32
+; GCN: s_min_i32
+
+; EG: MIN_INT
+define amdgpu_kernel void @s_test_imin_slt_i32(i32 addrspace(1)* %out, i32 %a, i32 %b) #0 {
+  %cmp = icmp slt i32 %a, %b
+  %val = select i1 %cmp, i32 %a, i32 %b
+  store i32 %val, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; FUNC-LABEL: {{^}}s_test_imin_slt_v2i32:
+; GCN: s_min_i32
+; GCN: s_min_i32
+
+; EG: MIN_INT
+; EG: MIN_INT
+define amdgpu_kernel void @s_test_imin_slt_v2i32(<2 x i32> addrspace(1)* %out, <2 x i32> %a, <2 x i32> %b) #0 {
+  %cmp = icmp slt <2 x i32> %a, %b
+  %val = select <2 x i1> %cmp, <2 x i32> %a, <2 x i32> %b
+  store <2 x i32> %val, <2 x i32> addrspace(1)* %out
+  ret void
+}
+
+; FUNC-LABEL: {{^}}s_test_imin_slt_imm_i32:
+; GCN: s_min_i32 {{s[0-9]+}}, {{s[0-9]+}}, 8
+
+; EG: MIN_INT {{.*}}literal.{{[xyzw]}}
+define amdgpu_kernel void @s_test_imin_slt_imm_i32(i32 addrspace(1)* %out, i32 %a) #0 {
+  %cmp = icmp slt i32 %a, 8
+  %val = select i1 %cmp, i32 %a, i32 8
+  store i32 %val, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; FUNC-LABEL: {{^}}s_test_imin_sle_imm_i32:
+; GCN: s_min_i32 {{s[0-9]+}}, {{s[0-9]+}}, 8
+
+; EG: MIN_INT {{.*}}literal.{{[xyzw]}}
+define amdgpu_kernel void @s_test_imin_sle_imm_i32(i32 addrspace(1)* %out, i32 %a) #0 {
+  %cmp = icmp sle i32 %a, 8
+  %val = select i1 %cmp, i32 %a, i32 8
+  store i32 %val, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; FUNC-LABEL: @v_test_umin_ule_i32
+; GCN: v_min_u32_e32
+
+; EG: MIN_UINT
+define amdgpu_kernel void @v_test_umin_ule_i32(i32 addrspace(1)* %out, i32 addrspace(1)* %a.ptr, i32 addrspace(1)* %b.ptr) #0 {
+  %tid = call i32 @llvm.r600.read.tidig.x()
+  %a.gep = getelementptr inbounds i32, i32 addrspace(1)* %a.ptr, i32 %tid
+  %b.gep = getelementptr inbounds i32, i32 addrspace(1)* %b.ptr, i32 %tid
+  %out.gep = getelementptr inbounds i32, i32 addrspace(1)* %out, i32 %tid
+  %a = load i32, i32 addrspace(1)* %a.gep, align 4
+  %b = load i32, i32 addrspace(1)* %b.gep, align 4
+  %cmp = icmp ule i32 %a, %b
+  %val = select i1 %cmp, i32 %a, i32 %b
+  store i32 %val, i32 addrspace(1)* %out.gep, align 4
+  ret void
+}
+
+; FUNC-LABEL: @v_test_umin_ule_v3i32
+; GCN: v_min_u32_e32
+; GCN: v_min_u32_e32
+; GCN: v_min_u32_e32
+; GCN-NOT: v_min_u32_e32
+; GCN: s_endpgm
+
+; EG: MIN_UINT
+; EG: MIN_UINT
+; EG: MIN_UINT
+define amdgpu_kernel void @v_test_umin_ule_v3i32(<3 x i32> addrspace(1)* %out, <3 x i32> addrspace(1)* %a.ptr, <3 x i32> addrspace(1)* %b.ptr) #0 {
+  %tid = call i32 @llvm.r600.read.tidig.x()
+  %a.gep = getelementptr inbounds <3 x i32>, <3 x i32> addrspace(1)* %a.ptr, i32 %tid
+  %b.gep = getelementptr inbounds <3 x i32>, <3 x i32> addrspace(1)* %b.ptr, i32 %tid
+  %out.gep = getelementptr inbounds <3 x i32>, <3 x i32> addrspace(1)* %out, i32 %tid
+
+  %a = load <3 x i32>, <3 x i32> addrspace(1)* %a.gep
+  %b = load <3 x i32>, <3 x i32> addrspace(1)* %b.gep
+  %cmp = icmp ule <3 x i32> %a, %b
+  %val = select <3 x i1> %cmp, <3 x i32> %a, <3 x i32> %b
+  store <3 x i32> %val, <3 x i32> addrspace(1)* %out.gep
+  ret void
+}
+
+; FIXME: Reduce unused packed component to scalar
+; FUNC-LABEL: @v_test_umin_ule_v3i16{{$}}
+; SI: v_min_u32_e32
+; SI: v_min_u32_e32
+; SI: v_min_u32_e32
+; SI-NOT: v_min_u32_e32
+
+; VI: v_min_u16_e32
+; VI: v_min_u16_sdwa
+; VI: v_min_u16_e32
+; VI-NOT: v_min_u16_e32
+
+; GFX9: v_pk_min_u16
+; GFX9: v_pk_min_u16
+
+; GCN: s_endpgm
+
+; EG: MIN_UINT
+; EG: MIN_UINT
+; EG: MIN_UINT
+define amdgpu_kernel void @v_test_umin_ule_v3i16(<3 x i16> addrspace(1)* %out, <3 x i16> addrspace(1)* %a.ptr, <3 x i16> addrspace(1)* %b.ptr) #0 {
+  %tid = call i32 @llvm.r600.read.tidig.x()
+  %a.gep = getelementptr inbounds <3 x i16>, <3 x i16> addrspace(1)* %a.ptr, i32 %tid
+  %b.gep = getelementptr inbounds <3 x i16>, <3 x i16> addrspace(1)* %b.ptr, i32 %tid
+  %out.gep = getelementptr inbounds <3 x i16>, <3 x i16> addrspace(1)* %out, i32 %tid
+
+  %a = load <3 x i16>, <3 x i16> addrspace(1)* %a.gep
+  %b = load <3 x i16>, <3 x i16> addrspace(1)* %b.gep
+  %cmp = icmp ule <3 x i16> %a, %b
+  %val = select <3 x i1> %cmp, <3 x i16> %a, <3 x i16> %b
+  store <3 x i16> %val, <3 x i16> addrspace(1)* %out.gep
+  ret void
+}
+
+; FUNC-LABEL: @s_test_umin_ule_i32
+; GCN: s_min_u32
+
+; EG: MIN_UINT
+define amdgpu_kernel void @s_test_umin_ule_i32(i32 addrspace(1)* %out, i32 %a, i32 %b) #0 {
+  %cmp = icmp ule i32 %a, %b
+  %val = select i1 %cmp, i32 %a, i32 %b
+  store i32 %val, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; FUNC-LABEL: @v_test_umin_ult_i32
+; GCN: v_min_u32_e32
+
+; EG: MIN_UINT
+define amdgpu_kernel void @v_test_umin_ult_i32(i32 addrspace(1)* %out, i32 addrspace(1)* %a.ptr, i32 addrspace(1)* %b.ptr) #0 {
+  %tid = call i32 @llvm.r600.read.tidig.x()
+  %a.gep = getelementptr inbounds i32, i32 addrspace(1)* %a.ptr, i32 %tid
+  %b.gep = getelementptr inbounds i32, i32 addrspace(1)* %b.ptr, i32 %tid
+  %out.gep = getelementptr inbounds i32, i32 addrspace(1)* %out, i32 %tid
+  %a = load i32, i32 addrspace(1)* %a.gep, align 4
+  %b = load i32, i32 addrspace(1)* %b.gep, align 4
+  %cmp = icmp ult i32 %a, %b
+  %val = select i1 %cmp, i32 %a, i32 %b
+  store i32 %val, i32 addrspace(1)* %out.gep, align 4
+  ret void
+}
+
+; FUNC-LABEL: {{^}}v_test_umin_ult_i8:
+; SI: buffer_load_ubyte
+; SI: buffer_load_ubyte
+; SI: v_min_u32_e32
+
+; GFX89: {{flat|global}}_load_ubyte
+; GFX89: {{flat|global}}_load_ubyte
+; GFX89: v_min_u16_e32
+
+; EG: MIN_UINT
+define amdgpu_kernel void @v_test_umin_ult_i8(i8 addrspace(1)* %out, i8 addrspace(1)* %a.ptr, i8 addrspace(1)* %b.ptr) #0 {
+  %tid = call i32 @llvm.r600.read.tidig.x()
+  %a.gep = getelementptr inbounds i8, i8 addrspace(1)* %a.ptr, i32 %tid
+  %b.gep = getelementptr inbounds i8, i8 addrspace(1)* %b.ptr, i32 %tid
+  %out.gep = getelementptr inbounds i8, i8 addrspace(1)* %out, i32 %tid
+
+  %a = load i8, i8 addrspace(1)* %a.gep, align 1
+  %b = load i8, i8 addrspace(1)* %b.gep, align 1
+  %cmp = icmp ult i8 %a, %b
+  %val = select i1 %cmp, i8 %a, i8 %b
+  store i8 %val, i8 addrspace(1)* %out.gep, align 1
+  ret void
+}
+
+; FUNC-LABEL: @s_test_umin_ult_i32
+; GCN: s_min_u32
+
+; EG: MIN_UINT
+define amdgpu_kernel void @s_test_umin_ult_i32(i32 addrspace(1)* %out, i32 %a, i32 %b) #0 {
+  %cmp = icmp ult i32 %a, %b
+  %val = select i1 %cmp, i32 %a, i32 %b
+  store i32 %val, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; FUNC-LABEL: @v_test_umin_ult_i32_multi_use
+; SI-NOT: v_min
+; GCN: v_cmp_lt_u32
+; SI-NEXT: v_cndmask_b32
+; SI-NOT: v_min
+; GCN: s_endpgm
+
+; EG-NOT: MIN_UINT
+define amdgpu_kernel void @v_test_umin_ult_i32_multi_use(i32 addrspace(1)* %out0, i1 addrspace(1)* %out1, i32 addrspace(1)* %aptr, i32 addrspace(1)* %bptr) #0 {
+  %a = load i32, i32 addrspace(1)* %aptr, align 4
+  %b = load i32, i32 addrspace(1)* %bptr, align 4
+  %cmp = icmp ult i32 %a, %b
+  %val = select i1 %cmp, i32 %a, i32 %b
+  store i32 %val, i32 addrspace(1)* %out0, align 4
+  store i1 %cmp, i1 addrspace(1)* %out1
+  ret void
+}
+
+; FUNC-LABEL: @v_test_umin_ult_i16_multi_use
+; GCN-NOT: v_min
+; GCN: v_cmp_lt_u32
+; GCN-NEXT: v_cndmask_b32
+; GCN-NOT: v_min
+; GCN: s_endpgm
+
+; EG-NOT: MIN_UINT
+define amdgpu_kernel void @v_test_umin_ult_i16_multi_use(i16 addrspace(1)* %out0, i1 addrspace(1)* %out1, i16 addrspace(1)* %aptr, i16 addrspace(1)* %bptr) #0 {
+  %a = load i16, i16 addrspace(1)* %aptr, align 2
+  %b = load i16, i16 addrspace(1)* %bptr, align 2
+  %cmp = icmp ult i16 %a, %b
+  %val = select i1 %cmp, i16 %a, i16 %b
+  store i16 %val, i16 addrspace(1)* %out0, align 2
+  store i1 %cmp, i1 addrspace(1)* %out1
+  ret void
+}
+
+
+; FUNC-LABEL: @s_test_umin_ult_v1i32
+; GCN: s_min_u32
+
+; EG: MIN_UINT
+define amdgpu_kernel void @s_test_umin_ult_v1i32(<1 x i32> addrspace(1)* %out, <1 x i32> %a, <1 x i32> %b) #0 {
+  %cmp = icmp ult <1 x i32> %a, %b
+  %val = select <1 x i1> %cmp, <1 x i32> %a, <1 x i32> %b
+  store <1 x i32> %val, <1 x i32> addrspace(1)* %out
+  ret void
+}
+
+; FUNC-LABEL: {{^}}s_test_umin_ult_v8i32:
+; GCN: s_min_u32
+; GCN: s_min_u32
+; GCN: s_min_u32
+; GCN: s_min_u32
+; GCN: s_min_u32
+; GCN: s_min_u32
+; GCN: s_min_u32
+; GCN: s_min_u32
+
+; EG: MIN_UINT
+; EG: MIN_UINT
+; EG: MIN_UINT
+; EG: MIN_UINT
+; EG: MIN_UINT
+; EG: MIN_UINT
+; EG: MIN_UINT
+; EG: MIN_UINT
+define amdgpu_kernel void @s_test_umin_ult_v8i32(<8 x i32> addrspace(1)* %out, <8 x i32> %a, <8 x i32> %b) #0 {
+  %cmp = icmp ult <8 x i32> %a, %b
+  %val = select <8 x i1> %cmp, <8 x i32> %a, <8 x i32> %b
+  store <8 x i32> %val, <8 x i32> addrspace(1)* %out
+  ret void
+}
+
+; FUNC-LABEL: {{^}}s_test_umin_ult_v8i16:
+; SI: v_min_u32
+; SI: v_min_u32
+; SI: v_min_u32
+; SI: v_min_u32
+; SI: v_min_u32
+; SI: v_min_u32
+; SI: v_min_u32
+; SI: v_min_u32
+
+; VI: v_min_u32
+; VI: v_min_u32
+; VI: v_min_u32
+; VI: v_min_u32
+; VI: v_min_u32
+; VI: v_min_u32
+; VI: v_min_u32
+; VI: v_min_u32
+
+; EG: MIN_UINT
+; EG: MIN_UINT
+; EG: MIN_UINT
+; EG: MIN_UINT
+; EG: MIN_UINT
+; EG: MIN_UINT
+; EG: MIN_UINT
+; EG: MIN_UINT
+define amdgpu_kernel void @s_test_umin_ult_v8i16(<8 x i16> addrspace(1)* %out, <8 x i16> %a, <8 x i16> %b) #0 {
+  %cmp = icmp ult <8 x i16> %a, %b
+  %val = select <8 x i1> %cmp, <8 x i16> %a, <8 x i16> %b
+  store <8 x i16> %val, <8 x i16> addrspace(1)* %out
+  ret void
+}
+
+; Make sure redundant and removed
+; FUNC-LABEL: {{^}}simplify_demanded_bits_test_umin_ult_i16:
+; GCN-DAG: s_load_dword [[A:s[0-9]+]], {{s\[[0-9]+:[0-9]+\]}}, {{0xb|0x2c}}
+; GCN-DAG: s_load_dword [[B:s[0-9]+]], {{s\[[0-9]+:[0-9]+\]}}, {{0xc|0x30}}
+; GCN: s_min_u32 [[MIN:s[0-9]+]], [[A]], [[B]]
+; GCN: v_mov_b32_e32 [[VMIN:v[0-9]+]], [[MIN]]
+; GCN: buffer_store_dword [[VMIN]]
+
+; EG: MIN_UINT
+define amdgpu_kernel void @simplify_demanded_bits_test_umin_ult_i16(i32 addrspace(1)* %out, i16 zeroext %a, i16 zeroext %b) #0 {
+  %a.ext = zext i16 %a to i32
+  %b.ext = zext i16 %b to i32
+  %cmp = icmp ult i32 %a.ext, %b.ext
+  %val = select i1 %cmp, i32 %a.ext, i32 %b.ext
+  %mask = and i32 %val, 65535
+  store i32 %mask, i32 addrspace(1)* %out
+  ret void
+}
+
+; Make sure redundant sign_extend_inreg removed.
+
+; FUNC-LABEL: {{^}}simplify_demanded_bits_test_min_slt_i16:
+; GCN-DAG: s_load_dword [[A:s[0-9]+]], {{s\[[0-9]+:[0-9]+\]}}, {{0xb|0x2c}}
+; GCN-DAG: s_load_dword [[B:s[0-9]+]], {{s\[[0-9]+:[0-9]+\]}}, {{0xc|0x30}}
+; GCN: s_min_i32 [[MIN:s[0-9]+]], [[A]], [[B]]
+; GCN: v_mov_b32_e32 [[VMIN:v[0-9]+]], [[MIN]]
+; GCN: buffer_store_dword [[VMIN]]
+
+; EG: MIN_INT
+define amdgpu_kernel void @simplify_demanded_bits_test_min_slt_i16(i32 addrspace(1)* %out, i16 signext %a, i16 signext %b) #0 {
+  %a.ext = sext i16 %a to i32
+  %b.ext = sext i16 %b to i32
+  %cmp = icmp slt i32 %a.ext, %b.ext
+  %val = select i1 %cmp, i32 %a.ext, i32 %b.ext
+  %shl = shl i32 %val, 16
+  %sextinreg = ashr i32 %shl, 16
+  store i32 %sextinreg, i32 addrspace(1)* %out
+  ret void
+}
+
+; FUNC-LABEL: {{^}}s_test_imin_sle_i16:
+; GCN: s_min_i32
+
+; EG: MIN_INT
+define amdgpu_kernel void @s_test_imin_sle_i16(i16 addrspace(1)* %out, i16 %a, i16 %b) #0 {
+  %cmp = icmp sle i16 %a, %b
+  %val = select i1 %cmp, i16 %a, i16 %b
+  store i16 %val, i16 addrspace(1)* %out
+  ret void
+}
+
+; 64 bit
+; FUNC-LABEL: {{^}}test_umin_ult_i64
+; GCN: s_endpgm
+
+; EG: MIN_UINT
+; EG: MIN_UINT
+define amdgpu_kernel void @test_umin_ult_i64(i64 addrspace(1)* %out, i64 %a, i64 %b) #0 {
+  %tmp = icmp ult i64 %a, %b
+  %val = select i1 %tmp, i64 %a, i64 %b
+  store i64 %val, i64 addrspace(1)* %out, align 8
+  ret void
+}
+
+; FUNC-LABEL: {{^}}test_umin_ule_i64
+; GCN: s_endpgm
+
+; EG: MIN_UINT
+; EG: MIN_UINT
+define amdgpu_kernel void @test_umin_ule_i64(i64 addrspace(1)* %out, i64 %a, i64 %b) #0 {
+  %tmp = icmp ule i64 %a, %b
+  %val = select i1 %tmp, i64 %a, i64 %b
+  store i64 %val, i64 addrspace(1)* %out, align 8
+  ret void
+}
+
+; FUNC-LABEL: {{^}}test_imin_slt_i64
+; GCN: s_endpgm
+
+; EG-DAG: MIN_UINT
+; EG-DAG: MIN_INT
+define amdgpu_kernel void @test_imin_slt_i64(i64 addrspace(1)* %out, i64 %a, i64 %b) #0 {
+  %tmp = icmp slt i64 %a, %b
+  %val = select i1 %tmp, i64 %a, i64 %b
+  store i64 %val, i64 addrspace(1)* %out, align 8
+  ret void
+}
+
+; FUNC-LABEL: {{^}}test_imin_sle_i64
+; GCN: s_endpgm
+
+; EG-DAG: MIN_UINT
+; EG-DAG: MIN_INT
+define amdgpu_kernel void @test_imin_sle_i64(i64 addrspace(1)* %out, i64 %a, i64 %b) #0 {
+  %tmp = icmp sle i64 %a, %b
+  %val = select i1 %tmp, i64 %a, i64 %b
+  store i64 %val, i64 addrspace(1)* %out, align 8
+  ret void
+}
+
+; FUNC-LABEL: {{^}}v_test_imin_sle_v2i16:
+; SI: v_min_i32
+; SI: v_min_i32
+
+; VI: v_min_i16
+; VI: v_min_i16
+
+; GFX9: v_pk_min_i16
+
+; EG: MIN_INT
+; EG: MIN_INT
+define amdgpu_kernel void @v_test_imin_sle_v2i16(<2 x i16> addrspace(1)* %out, <2 x i16> addrspace(1)* %a.ptr, <2 x i16> addrspace(1)* %b.ptr) #0 {
+  %tid = call i32 @llvm.r600.read.tidig.x()
+  %a.gep = getelementptr inbounds <2 x i16>, <2 x i16> addrspace(1)* %a.ptr, i32 %tid
+  %b.gep = getelementptr inbounds <2 x i16>, <2 x i16> addrspace(1)* %b.ptr, i32 %tid
+  %out.gep = getelementptr inbounds <2 x i16>, <2 x i16> addrspace(1)* %out, i32 %tid
+  %a = load <2 x i16>, <2 x i16> addrspace(1)* %a.gep
+  %b = load <2 x i16>, <2 x i16> addrspace(1)* %b.gep
+  %cmp = icmp sle <2 x i16> %a, %b
+  %val = select <2 x i1> %cmp, <2 x i16> %a, <2 x i16> %b
+  store <2 x i16> %val, <2 x i16> addrspace(1)* %out.gep
+  ret void
+}
+
+; FIXME: i16 min
+; FUNC-LABEL: {{^}}v_test_imin_ule_v2i16:
+; SI: v_min_u32
+; SI: v_min_u32
+
+; VI: v_min_u16
+; VI: v_min_u16
+
+; GFX9: v_pk_min_u16
+
+; EG: MIN_UINT
+; EG: MIN_UINT
+define amdgpu_kernel void @v_test_imin_ule_v2i16(<2 x i16> addrspace(1)* %out, <2 x i16> addrspace(1)* %a.ptr, <2 x i16> addrspace(1)* %b.ptr) #0 {
+  %tid = call i32 @llvm.r600.read.tidig.x()
+  %a.gep = getelementptr inbounds <2 x i16>, <2 x i16> addrspace(1)* %a.ptr, i32 %tid
+  %b.gep = getelementptr inbounds <2 x i16>, <2 x i16> addrspace(1)* %b.ptr, i32 %tid
+  %out.gep = getelementptr inbounds <2 x i16>, <2 x i16> addrspace(1)* %out, i32 %tid
+  %a = load <2 x i16>, <2 x i16> addrspace(1)* %a.gep
+  %b = load <2 x i16>, <2 x i16> addrspace(1)* %b.gep
+  %cmp = icmp ule <2 x i16> %a, %b
+  %val = select <2 x i1> %cmp, <2 x i16> %a, <2 x i16> %b
+  store <2 x i16> %val, <2 x i16> addrspace(1)* %out.gep
+  ret void
+}
+
+declare i32 @llvm.r600.read.tidig.x() #1
+
+attributes #0 = { nounwind }
+attributes #1 = { nounwind readnone }
+                                                                                                                                                                                                                                                                                  HâEÈt˝ˇˇÄ    HÉÏHç5  Hç5û∞ ∫   PLç√∞ Lç:æ h   Hç  VÈ´˛ˇˇËÉú¸ˇ AWAVAUATUHâıSHâ˚HÅÏË&  dHã%(   HâÑ$ÿ&  1¿Ë◊ˇˇË¨•¸ˇHÖ¿Ñc  Dã£  AÉ¸á¢  HÖÌÑŸ  HÉ}  Ñ^  Hã}HÖˇÑë  LçkpLâÓËµ™¸ˇÑ¿Ñ≈  Äª∞   Ö  HÉª®   Ö≤  AÉ¸Ñ8  HâﬂË@“ˇˇHâ«ËË©¸ˇHãEHâD$HãC0Hã∏Ä  ËÔ¶¸ˇHãT$H9¬áë   HÖ“ÑË  Lç¥$–   Hçt$HâﬂLâÚËp◊ˇˇAâƒÖ¿ÖÖ   HãD$H9EvHâELâÓHâÔËÀû¸ˇHâÈDâ‚LâˆHâﬂË˙ŸˇˇHâﬂË≤—ˇˇHâ«Ëöê¸ˇHãÑ$ÿ&  dH3%(   Ö◊  HÅƒË&  []A\A]A^A_√êLâÓHâ«Ë%~¸ˇHâ¬HâD$ÈWˇˇˇÑ     Lçã  É¯Ö–  HãD$H9Eá  Lç|$@IçVLâŒLâˇËò¸ˇˆÉå  ÖJˇˇˇ1ˆLâˇË6¸ˇÖ¿Ö8ˇˇˇHãÑ$‡   Hãº$–   foÑ$–   HâD$0)D$ Ë¶Ü¸ˇHãD$H9D$0vHâD$0æ   LâˇËË~¸ˇHçL$ Ö¿Ñ”  HâÔHâŒË0ñ¸ˇHã|$ Ëfô¸ˇÈ÷˛ˇˇêHÉÏHçÂ∆ Hç5Æ ∫  PLçQô Lç™ª h  Hçﬁ∆ VD  1ˇ1¿Ëä¸ˇHÉƒ Ë6Ä¸ˇfD  É{8áì˝ˇˇHÉÏHçã∆ Hç5¥≠ ∫  PLçèó LçPª h  HçÑ∆ VÎ©êLâÓHâÔËù¸ˇÈV˛ˇˇHÉÏHçE∆ Hç5n≠ ∫  PLç1ò Lç
+ª h  Hç>∆ VÈ`ˇˇˇÑ     HÉÏHç∆ Hç5.≠ ∫	  PLçﬁ“ Lç ∫ h	  Hç˛≈ VÈ ˇˇˇÑ     Hã} LâL$Ë‚Å¸ˇHEHÉÏMâËHâ¬∂Éå  DâÊLâ˜É‡PLãL$HãL$(Ë‘î¸ˇHã} HâEËÁÅ¸ˇXZÈe˝ˇˇHÉÏHçu≈ Hç5û¨ ∫
+  PLç˛≠ Lç:∫ h
+  Hçn≈ VÈê˛ˇˇÑ     HÉÏHç5≈ Hç5^¨ ∫  PLçœ≠ Lç˙π 1¿h  Hç,≈ VËvà¸ˇHÉƒ Ëç~¸ˇD  HÉÏHçÌƒ Hç5¨ ∫  PLçÅó Lç≤π h  HçÊƒ VÈ˛ˇˇHÉÏHçµƒ Hç5ﬁ´ ∫  PLç˘ñ Lçzπ h  HçÆƒ VÈ–˝ˇˇÑ     HâEÈÊ¸ˇˇÄ    HÉÏHçeƒ Hç5é´ ∫  PLç≥´ Lç*π h  Hç^ƒ VÈÄ˝ˇˇHâœ1ˆHâL$Ë9Ñ¸ˇHãL$Lâ˙LâÓHâœËV¢¸ˇHãL$È˝ˇˇËGó¸ˇÄ    AVAUIâ˝ATUHâıSHÉÏ dHã%(   HâD$1¿Ë…—ˇˇËt†¸ˇHÖ¿ÑC  Eã•  AÉ¸áä  HÖÌÑ¡  HÉ}  Ñˆ  Hã}HÖˇÑ)  MçupLâˆË}•¸ˇÑ¿Ñ]  AÄΩ∞   Öá  Iãù®  HÖ€Öè   AÉ¸Ñ  LâÔËÕˇˇHâ«Ë≠§¸ˇLãeMÖ‰t8IâÊêHãEÛoE LâˆLâÔHâD$)$H)\$H\$Ë©å¸ˇHãD$H√I)ƒuÃLâÔË¥ÃˇˇHâ«Ëúã¸ˇHãD$dH3%(   Ö0  HÉƒ []A\A]A^√ HÉÏHçç¬ Hç5ˆ© ∫c  PLç9ï Lçí∑ hc  HçÜ¬ VD  1ˇ1¿ËÜ¸ˇHÉƒ Ë|¸ˇfD  AÉ}8á≤˛ˇˇHÉÏHç2¬ Hç5õ© ∫[  PLç

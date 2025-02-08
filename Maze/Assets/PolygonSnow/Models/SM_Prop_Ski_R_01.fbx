@@ -1,0 +1,476 @@
+//------------------------------------------------------------------------------
+// <copyright file="HttpClientProtocol.cs" company="Microsoft">
+//     Copyright (c) Microsoft Corporation.  All rights reserved.
+// </copyright>                                                                
+//------------------------------------------------------------------------------
+
+namespace System.Web.Services.Protocols {
+    using System;
+    using System.Collections;
+    using System.IO;
+    using System.Reflection;
+    using System.Xml.Serialization;
+    using System.Net;
+    using System.Text;
+    using System.Threading;
+    using System.ComponentModel;
+    using System.Runtime.InteropServices;
+    using System.Diagnostics;
+    using System.Web.Services.Diagnostics;
+
+    internal class HttpClientMethod {
+        internal Type readerType;
+        internal object readerInitializer;
+        internal Type writerType;
+        internal object writerInitializer;
+        internal LogicalMethodInfo methodInfo;
+    }
+
+    internal class HttpClientType {
+        Hashtable methods = new Hashtable();
+
+        internal HttpClientType(Type type) {
+            LogicalMethodInfo[] methodInfos = LogicalMethodInfo.Create(type.GetMethods(), LogicalMethodTypes.Sync);
+
+            Hashtable formatterTypes = new Hashtable();
+            for (int i = 0; i < methodInfos.Length; i++) {
+                LogicalMethodInfo methodInfo = methodInfos[i];
+                try {
+                    object[] attributes = methodInfo.GetCustomAttributes(typeof(HttpMethodAttribute));
+                    if (attributes.Length == 0) continue;
+                    HttpMethodAttribute attribute = (HttpMethodAttribute)attributes[0];
+                    HttpClientMethod method = new HttpClientMethod();
+                    method.readerType = attribute.ReturnFormatter;
+                    method.writerType = attribute.ParameterFormatter;
+                    method.methodInfo = methodInfo;
+                    AddFormatter(formatterTypes, method.readerType, method);
+                    AddFormatter(formatterTypes, method.writerType, method);
+                    methods.Add(methodInfo.Name, method);
+                }
+                catch (Exception e) {
+                    if (e is ThreadAbortException || e is StackOverflowException || e is OutOfMemoryException) {
+                        throw;
+                    }
+                    throw new InvalidOperationException(Res.GetString(Res.WebReflectionError, methodInfo.DeclaringType.FullName, methodInfo.Name), e);
+                }
+            }
+
+            foreach (Type t in formatterTypes.Keys) {
+                ArrayList list = (ArrayList)formatterTypes[t];
+                LogicalMethodInfo[] m = new LogicalMethodInfo[list.Count];
+                for (int j = 0; j < list.Count; j++)
+                    m[j] = ((HttpClientMethod)list[j]).methodInfo;
+                object[] initializers = MimeFormatter.GetInitializers(t, m);
+                bool isWriter = typeof(MimeParameterWriter).IsAssignableFrom(t);
+                for (int j = 0; j < list.Count; j++) {
+                    if (isWriter) {
+                        ((HttpClientMethod)list[j]).writerInitializer = initializers[j];
+                    }
+                    else {
+                        ((HttpClientMethod)list[j]).readerInitializer = initializers[j];
+                    }
+                }
+            }
+        }
+
+        static void AddFormatter(Hashtable formatterTypes, Type formatterType, HttpClientMethod method) {
+            if (formatterType == null) return;
+            ArrayList list = (ArrayList)formatterTypes[formatterType];
+            if (list == null) {
+                list = new ArrayList();
+                formatterTypes.Add(formatterType, list);
+            }
+            list.Add(method);
+        }
+
+        internal HttpClientMethod GetMethod(string name) {
+            return (HttpClientMethod)methods[name];
+        }
+    }
+
+    /// <include file='doc\HttpClientProtocol.uex' path='docs/doc[@for="HttpSimpleClientProtocol"]/*' />
+    /// <devdoc>
+    ///    <para>
+    ///       Specifies
+    ///       most of the implementation for communicating with an HTTP web service over HTTP.
+    ///    </para>
+    /// </devdoc>
+    [ComVisible(true)]
+    public abstract class HttpSimpleClientProtocol : HttpWebClientProtocol {
+        HttpClientType clientType;
+
+        /// <include file='doc\HttpClientProtocol.uex' path='docs/doc[@for="HttpSimpleClientProtocol.HttpSimpleClientProtocol"]/*' />
+        /// <devdoc>
+        ///    <para>
+        ///       Initializes a new instance of the <see cref='System.Web.Services.Protocols.HttpSimpleClientProtocol'/> class.
+        ///    </para>
+        /// </devdoc>
+        protected HttpSimpleClientProtocol()
+            : base() {
+            Type type = this.GetType();
+            clientType = (HttpClientType)GetFromCache(type);
+            if (clientType == null) {
+                lock (InternalSyncObject) {
+                    clientType = (HttpClientType)GetFromCache(type);
+                    if (clientType == null) {
+                        clientType = new HttpClientType(type);
+                        AddToCache(type, clientType);
+                    }
+                }
+            }
+        }
+
+        /// <include file='doc\HttpClientProtocol.uex' path='docs/doc[@for="HttpSimpleClientProtocol.Invoke"]/*' />
+        /// <devdoc>
+        ///    <para>
+        ///       Invokes a method of a HTTP web service.
+        ///    </para>
+        /// </devdoc>
+        protected object Invoke(string methodName, string requestUrl, object[] parameters) {
+            WebResponse response = null;
+            HttpClientMethod method = GetClientMethod(methodName);
+            MimeParameterWriter paramWriter = GetParameterWriter(method);                
+            Uri requestUri = new Uri(requestUrl);
+            if (paramWriter != null) {
+                paramWriter.RequestEncoding = RequestEncoding;
+                requestUrl = paramWriter.GetRequestUrl(requestUri.AbsoluteUri, parameters);
+                requestUri = new Uri(requestUrl, true);
+            }
+            WebRequest request = null;
+            try {
+                request = GetWebRequest(requestUri);
+                NotifyClientCallOut(request);
+                PendingSyncRequest = request;
+                if (paramWriter != null) {
+                    paramWriter.InitializeRequest(request, parameters);      
+                    // 
+
+
+                    if (paramWriter.UsesWriteRequest) {                        
+                        if (parameters.Length == 0)
+                            request.ContentLength = 0;
+                        else {
+                            Stream requestStream = null;
+                            try {
+                                requestStream = request.GetRequestStream();
+                                paramWriter.WriteRequest(requestStream, parameters);
+                            }
+                            finally {
+                                if (requestStream != null) requestStream.Close();
+                            }                            
+                        }
+                    }
+                }
+                response = GetWebResponse(request);            
+                Stream responseStream = null;
+                if (response.ContentLength != 0)
+                    responseStream = response.GetResponseStream();
+
+                return ReadResponse(method, response, responseStream);
+            }
+            finally {
+                if (request == PendingSyncRequest)
+                    PendingSyncRequest = null;
+            }
+        }
+
+
+        /// <include file='doc\HttpClientProtocol.uex' path='docs/doc[@for="HttpSimpleClientProtocol.BeginInvoke"]/*' />
+        /// <devdoc>
+        ///    <para>
+        ///       Starts an asynchronous invocation of a method of a HTTP web service.
+        ///    </para>
+        /// </devdoc>
+        protected IAsyncResult BeginInvoke(string methodName, string requestUrl, object[] parameters, AsyncCallback callback, object asyncState) {
+            HttpClientMethod method = GetClientMethod(methodName);
+            MimeParameterWriter paramWriter = GetParameterWriter(method);
+            Uri requestUri = new Uri(requestUrl);            
+            if (paramWriter != null) {
+                paramWriter.RequestEncoding = RequestEncoding;
+                requestUrl = paramWriter.GetRequestUrl(requestUri.AbsoluteUri, parameters);
+                requestUri = new Uri(requestUrl, true);
+            }
+            InvokeAsyncState invokeState = new InvokeAsyncState(method, paramWriter, parameters);            
+            WebClientAsyncResult asyncResult = new WebClientAsyncResult(this, invokeState, null, callback, asyncState);
+            return BeginSend(requestUri, asyncResult, paramWriter.UsesWriteRequest);
+        }
+
+
+        /// <include file='doc\HttpClientProtocol.uex' path='docs/doc[@for="HttpSimpleClientProtocol.InitializeAsyncRequest"]/*' />
+        /// <devdoc>
+        ///    <para>[To be supplied.]</para>
+        /// </devdoc>
+        internal override void InitializeAsyncRequest(WebRequest request, object internalAsyncState) {
+            InvokeAsyncState invokeState = (InvokeAsyncState)internalAsyncState;
+            if (invokeState.ParamWriter.UsesWriteRequest && invokeState.Parameters.Length == 0) 
+                request.ContentLength = 0;
+        }
+
+        internal override void AsyncBufferedSerialize(WebRequest request, Stream requestStream, object internalAsyncState) {
+            InvokeAsyncState invokeState = (InvokeAsyncState)internalAsyncState;
+            if (invokeState.ParamWriter != null) {
+                invokeState.ParamWriter.InitializeRequest(request, invokeState.Parameters);
+                if (invokeState.ParamWriter.UsesWriteRequest && invokeState.Parameters.Length > 0)
+                    invokeState.ParamWriter.WriteRequest(requestStream, invokeState.Parameters);                        
+            }
+        }
+
+        class InvokeAsyncState {            
+            internal object[] Parameters;
+            internal MimeParameterWriter ParamWriter;
+            internal HttpClientMethod Method;            
+
+            internal InvokeAsyncState(HttpClientMethod method, MimeParameterWriter paramWriter, object[] parameters) {
+                this.Method = method;
+                this.ParamWriter = paramWriter;
+                this.Parameters = parameters;
+            }
+        }
+
+        /// <include file='doc\HttpClientProtocol.uex' path='docs/doc[@for="HttpSimpleClientProtocol.EndInvoke"]/*' />
+        /// <devdoc>
+        ///    <para>
+        ///       Ends an asynchronous invocation of a method of a HTTP web service.
+        ///    </para>
+        /// </devdoc>
+        protected object EndInvoke(IAsyncResult asyncResult) {            
+            object o = null;
+            Stream responseStream = null;
+            WebResponse response = EndSend(asyncResult, ref o, ref responseStream);
+            InvokeAsyncState invokeState = (InvokeAsyncState) o;
+            return ReadResponse(invokeState.Method, response, responseStream);
+        }
+
+        private void InvokeAsyncCallback(IAsyncResult result) {
+            object parameter = null;
+            Exception exception = null;
+            WebClientAsyncResult asyncResult = (WebClientAsyncResult)result;
+            if (asyncResult.Request != null) {
+                try {
+                    object o = null;
+                    Stream responseStream = null;
+                    WebResponse response = EndSend(asyncResult, ref o, ref responseStream);
+                    InvokeAsyncState invokeState = (InvokeAsyncState) o;
+                    parameter = ReadResponse(invokeState.Method, response, responseStream);
+                } 
+                catch (Exception e) {
+                    if (e is ThreadAbortException || e is StackOverflowException || e is OutOfMemoryException)
+                        throw;
+                    exception = e;
+                    if (Tracing.On) Tracing.ExceptionCatch(TraceEventType.Error, this, "InvokeAsyncCallback", e);
+                }
+            }
+            AsyncOperation asyncOp = (AsyncOperation)result.AsyncState;
+            UserToken token = (UserToken)asyncOp.UserSuppliedState;
+            OperationCompleted(token.UserState, new object[] { parameter }, exception, false);
+        }
+        /// <include file='doc\HttpClientProtocol.uex' path='docs/doc[@for="HttpSimpleClientProtocol.InvokeAsync"]/*' />
+        /// <devdoc>
+        ///    <para>[To be supplied.]</para>
+        /// </devdoc>
+        protected void InvokeAsync(string methodName, string requestUrl, object[] parameters, SendOrPostCallback callback) {
+            InvokeAsync(methodName, requestUrl, parameters, callback, null);
+        }
+
+        /// <include file='doc\HttpClientProtocol.uex' path='docs/doc[@for="HttpSimpleClientProtocol.InvokeAsync1"]/*' />
+        /// <devdoc>
+        ///    <para>[To be supplied.]</para>
+        /// </devdoc>
+        protected void InvokeAsync(string methodName, string requestUrl, object[] parameters, SendOrPostCallback callback, object userState) {
+            if (userState == null)
+                userState = NullToken;
+            AsyncOperation asyncOp = AsyncOperationManager.CreateOperation(new UserToken(callback, userState));
+            WebClientAsyncResult asyncResult = new WebClientAsyncResult(this, null, null, new AsyncCallback(InvokeAsyncCallback), asyncOp);
+            try {
+                AsyncInvokes.Add(userState, asyncResult);
+            }
+            catch (Exception e) {
+                if (e is ThreadAbortException || e is StackOverflowException || e is OutOfMemoryException)
+                    throw;
+                if (Tracing.On) Tracing.ExceptionCatch(TraceEventType.Error, this, "InvokeAsync", e);
+                Exception exception = new ArgumentException(Res.GetString(Res.AsyncDuplicateUserState), e);
+                InvokeCompletedEventArgs eventArgs = new InvokeCompletedEventArgs(new object[] { null }, exception, false, userState);
+                asyncOp.PostOperationCompleted(callback, eventArgs);
+                return;
+            }
+            try {
+                HttpClientMethod method = GetClientMethod(methodName);
+                MimeParameterWriter paramWriter = GetParameterWriter(method);
+                Uri requestUri = new Uri(requestUrl);            
+                if (paramWriter != null) {
+                    paramWriter.RequestEncoding = RequestEncoding;
+                    requestUrl = paramWriter.GetRequestUrl(requestUri.AbsoluteUri, parameters);
+                    requestUri = new Uri(requestUrl, true);
+                }
+                asyncResult.InternalAsyncState = new InvokeAsyncState(method, paramWriter, parameters);
+                BeginSend(requestUri, asyncResult, paramWriter.UsesWriteRequest);
+            } 
+            catch (Exception e) {
+                if (e is ThreadAbortException || e is StackOverflowException || e is OutOfMemoryException)
+                    throw;
+                if (Tracing.On) Tracing.ExceptionCatch(TraceEventType.Error, this, "InvokeAsync", e);
+                OperationCompleted(userState, new object[] { null }, e, false);
+            }
+        }
+
+        MimeParameterWriter GetParameterWriter(HttpClientMethod method) {
+            if (method.writerType == null)
+                return null;
+            return (MimeParameterWriter)MimeFormatter.CreateInstance(method.writerType, method.writerInitializer);                
+        }
+
+        HttpClientMethod GetClientMethod(string methodName) {
+            HttpClientMethod method = clientType.GetMethod(methodName);
+            if (method == null) throw new ArgumentException(Res.GetString(Res.WebInvalidMethodName, methodName), "methodName");
+            return method;
+        }
+
+        object ReadResponse(HttpClientMethod method, WebResponse response, Stream responseStream) {
+            HttpWebResponse httpResponse = response as HttpWebResponse;
+            if (httpResponse != null && (int)httpResponse.StatusCode >= 300)
+                throw new WebException(RequestResponseUtils.CreateResponseExceptionString(httpResponse, responseStream), null, 
+                    WebExceptionStatus.ProtocolError, httpResponse);
+
+            if (method.readerType == null)
+                return null;
+
+            // 
+
+
+            if (responseStream != null) {
+                MimeReturnReader reader = (MimeReturnReader)MimeFormatter.CreateInstance(method.readerType, method.readerInitializer);
+                return reader.Read(response, responseStream);                
+            }
+            else
+                return null;
+        }
+    }
+}
+                                                                                                                                                                               mnNumberTooLarge(this.name)));
+                return input;
+            }
+
+            // Truncate at 255 characters.
+            if (newFileName.Length > 255)
+            {
+                newFileName = newFileName.Substring(0, 255);
+                returnNewLocation = true;
+            }
+
+            if (ReplaceInvalidCharactersWithUnderscore(ref newFileName, Path.GetInvalidPathChars()))
+            {
+                returnNewLocation = true;
+            }
+
+            string fileNameOnly = Path.GetFileName(newFileName);
+            if (ReplaceInvalidCharactersWithUnderscore(ref fileNameOnly, Path.GetInvalidFileNameChars()))
+            {
+                // The filename portion has been munged. We need to make a new full name.
+                string path = Path.GetDirectoryName(newFileName);
+                newFileName = path + "\\" + fileNameOnly;
+                returnNewLocation = true;
+            }
+
+            if (returnNewLocation)
+            {
+                return new SourceLocation(newFileName, input.StartLine, input.StartColumn, input.EndLine, input.EndColumn);
+            }
+
+            return input;
+        }
+
+        static bool ReplaceInvalidCharactersWithUnderscore(ref string input, char[] invalidChars)
+        {
+            bool modified = false;
+            int invalidIndex = 0;
+            while ((invalidIndex = input.IndexOfAny(invalidChars)) != -1)
+            {
+                char[] charArray = input.ToCharArray();
+                charArray[invalidIndex] = '_';
+                input = new string(charArray);
+                modified = true;
+
+            }
+
+            return modified;
+        }
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                       iterator!„#uncbVREvent$Üï#uncbVREvent$ÇÆ#uncbVREvent$Ç™3uncaught_exceptions(~Q1uncaught_exception(~P7unauthoredValuesIndex"õ37unauthoredValuesIndex"àó9unary_transform_result!“Ï9unary_result_of_select*\I9unary_result_of_select*\C%unary_negate!∆9%unary_negate!∆6)unary_function(}%)unary_function!«)unary_function!∆Û)unary_function!∆¬)unary_function!∆ß)unary_function!∆ä)unary_function!∆y)unary_function!∆auname#iÀ-unaligned_uint32`»+unaligned_int32`«   ÓunalignedStore Üj)unalignedStore Ö˜)unalignedStore Öü)unalignedStore ÖG'unalignedLoad Üf'unalignedLoad ÖÛ'unalignedLoad Öõ'unalignedLoad ÖCunalign64&⁄⁄unalign64∫?unalign&⁄nunalign?Punalign†¯ *8    ‹ELòútK6 Ô˝Q
+÷8~ À¿ıÍﬂ‘…æ≥®ùíá|qf[PE:/$¯Ì‚◊Ã¡∂´†ïäti^SH=2'˚Â⁄œƒπÆ£òèÜ{peZOD9.#˜Ï·÷À¿µ™üîâ~sh]RG<1&˙Ô‰ŸŒ√∏≠¢óåÅvk`UJ?4)/*
+ *  Copyright (c) 2013 The WebRTC project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+#ifndef WEBRTC_MODULES_DESKTOP_CAPTURE_SCREEN_CAPTURE_FRAME_QUEUE_H_
+#define WEBRTC_MODULES_DESKTOP_CAPTURE_SCREEN_CAPTURE_FRAME_QUEUE_H_
+
+#include "webrtc/base/scoped_ptr.h"
+#include "webrtc/modules/desktop_capture/shared_desktop_frame.h"
+#include "webrtc/typedefs.h"
+
+namespace webrtc {
+class DesktopFrame;
+}  // namespace webrtc
+
+namespace webrtc {
+
+// Represents a queue of reusable video frames. Provides access to the 'current'
+// frame - the frame that the caller is working with at the moment, and to the
+// 'previous' frame - the predecessor of the current frame swapped by
+// MoveToNextFrame() call, if any.
+//
+// The caller is expected to (re)allocate frames if current_frame() returns
+// NULL. The caller can mark all frames in the queue for reallocation (when,
+// say, frame dimensions change). The queue records which frames need updating
+// which the caller can query.
+//
+// Frame consumer is expected to never hold more than kQueueLength frames
+// created by this function and it should release the earliest one before trying
+// to capture a new frame (i.e. before MoveToNextFrame() is called).
+class ScreenCaptureFrameQueue {
+ public:
+  ScreenCaptureFrameQueue();
+  ~ScreenCaptureFrameQueue();
+
+  // Moves to the next frame in the queue, moving the 'current' frame to become
+  // the 'previous' one.
+  void MoveToNextFrame();
+
+  // Replaces the current frame with a new one allocated by the caller. The
+  // existing frame (if any) is destroyed. Takes ownership of |frame|.
+  void ReplaceCurrentFrame(DesktopFrame* frame);
+
+  // Marks all frames obsolete and resets the previous frame pointer. No
+  // frames are freed though as the caller can still access them.
+  void Reset();
+
+  SharedDesktopFrame* current_frame() const {
+    return frames_[current_].get();
+  }
+
+  SharedDesktopFrame* previous_frame() const {
+    return frames_[(current_ + kQueueLength - 1) % kQueueLength].get();
+  }
+
+ private:
+  // Index of the current frame.
+  int current_;
+
+  static const int kQueueLength = 2;
+  rtc::scoped_ptr<SharedDesktopFrame> frames_[kQueueLength];
+
+  DISALLOW_COPY_AND_ASSIGN(ScreenCaptureFrameQueue);
+};
+
+}  // namespace webrtc
+
+#endif  // WEBRTC_MODULES_DESKTOP_CAPTURE_SCREEN_CAPTURE_FRAME_QUEUE_H_
+                                                                                                                                                                                                                                                                                                                                                                            5ãΩéı)<´§tiÉ xœ](^MXD≠iXE7*wû“«Ÿ k‰◊Ûvrlí2√Iß≤¸q>…‹«O´bøÀìﬂ4?$ù‘jóé\u:\!ùÀ¶õ`SünÀ(],&áœÕë
+™ny}¬∂‚É
+\¢0•Èó¥êß„Ä

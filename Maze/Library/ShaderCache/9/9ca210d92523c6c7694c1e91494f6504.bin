@@ -1,0 +1,34 @@
+ileSize = 0;
+  uint64_t VMSize = 0;
+  for (const MCSection &Sec : Asm) {
+    uint64_t Address = getSectionAddress(&Sec);
+    uint64_t Size = Layout.getSectionAddressSize(&Sec);
+    uint64_t FileSize = Layout.getSectionFileSize(&Sec);
+    FileSize += getPaddingSize(&Sec, Layout);
+
+    VMSize = std::max(VMSize, Address + Size);
+
+    if (Sec.isVirtualSection())
+      continue;
+
+    SectionDataSize = std::max(SectionDataSize, Address + Size);
+    SectionDataFileSize = std::max(SectionDataFileSize, Address + FileSize);
+  }
+
+  // The section data is padded to 4 bytes.
+  //
+  // FIXME: Is this machine dependent?
+  unsigned SectionDataPadding = OffsetToAlignment(SectionDataFileSize, 4);
+  SectionDataFileSize += SectionDataPadding;
+
+  // Write the prolog, starting with the header and load command...
+  writeHeader(MachO::MH_OBJECT, NumLoadCommands, LoadCommandsSize,
+              Asm.getSubsectionsViaSymbols());
+  uint32_t Prot =
+      MachO::VM_PROT_READ | MachO::VM_PROT_WRITE | MachO::VM_PROT_EXECUTE;
+  writeSegmentLoadCommand("", NumSections, 0, VMSize, SectionDataStart,
+                          SectionDataSize, Prot, Prot);
+
+  // ... and then the section headers.
+  uint64_t RelocTableEnd = SectionDataStart + SectionDataFileSize;
+  for (const MCSection &Sec

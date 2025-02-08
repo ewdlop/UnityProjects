@@ -1,0 +1,576 @@
+namespace System.Web.DynamicData {
+    using System;
+    using System.Collections.Specialized;
+    using System.ComponentModel;
+    using System.Diagnostics.CodeAnalysis;
+    using System.Web.UI;
+    using System.Web.UI.WebControls;
+    using System.Collections.Generic;
+    using System.Globalization;
+    using System.Web.Resources;
+    using System.Diagnostics;
+    
+    /// <summary>
+    /// Field type that can display DynamicData UI
+    /// </summary>
+    [Designer("System.Web.DynamicData.Design.DynamicFieldDesigner, " + AssemblyRef.SystemWebDynamicDataDesign)]
+    public class DynamicField : DataControlField, IAttributeAccessor, IFieldFormattingOptions {
+
+        private bool _customConvertEmptyStringToNullSet;
+        private bool _customApplyFormatInEditModeSet;
+        private MetaColumn _column;
+        private IDictionary<string, string> _attributes;
+
+        /// <summary>
+        /// same as base. uses column's display name if possible
+        /// </summary>
+        public override string HeaderText {
+            get {
+                object o = ViewState["HeaderText"];
+                if (o != null)
+                    return (string)o;
+
+                // Default to the Column's DisplayName
+                if (Column != null)
+                    return Column.DisplayName;
+
+                // If we couldn't get it, use the name if the data field
+                return DataField;
+            }
+            set {
+                base.HeaderText = value;
+            }
+        }
+
+        /// <summary>
+        /// same as base. uses column's SortExpression property, if possible.
+        /// </summary>
+        public override string SortExpression {
+            get {
+                object o = ViewState["SortExpression"];
+                if (o != null)
+                    return (string)o;
+
+                // Default to the Column's SortExpression
+                if (Column != null)
+                    return Column.SortExpression;
+
+                return String.Empty;
+            }
+            set {
+                base.SortExpression = value;
+            }
+        }
+
+        /// <summary>
+        /// Determines whether the control validates client input or not, defaults to inherit from parent.
+        /// </summary>
+        [
+        Category("Behavior"),
+        ResourceDescription("DynamicField_ValidateRequestMode"),
+        DefaultValue(ValidateRequestMode.Inherit)
+        ]
+        public new ValidateRequestMode ValidateRequestMode {
+            get {
+                return base.ValidateRequestMode;
+            }
+            set {
+                base.ValidateRequestMode = value;
+            }
+        }
+
+        [
+        SuppressMessage("Microsoft.Naming", "CA1716:IdentifiersShouldNotMatchKeywords", MessageId = "ReadOnly", Justification="Matches DataBoundControlMode value"),
+        DefaultValue(false),
+        Category("Behavior"),
+        ResourceDescription("DynamicField_ReadOnly"),
+        ]
+        /// <summary>
+        /// Forces this DynamicField to always load a ReadOnly template
+        /// </summary>
+        public virtual bool ReadOnly {
+            get {
+                object o = ViewState["ReadOnly"];
+                return (o == null ? false : (bool)o);
+            }
+            set {
+                ViewState["ReadOnly"] = value;
+            }
+        }
+
+        /// <summary>
+        /// The name of the column that this field handles
+        /// </summary>
+        [
+        Category("Data"),
+        DefaultValue(""),
+        ResourceDescription("DynamicControlFieldCommon_DataField")
+        ]
+        public virtual string DataField {
+            get {
+                object o = ViewState["DataField"];
+                return ((o == null) ? String.Empty : (string)o);
+            }
+            set {
+                if (!String.Equals(value, ViewState["DataField"])) {
+                    ViewState["DataField"] = value;
+                    OnFieldChanged();
+                }
+            }
+        }
+
+        /// <summary>
+        /// The MetaColumn that this fiedl is working with
+        /// </summary>
+        protected MetaColumn Column {
+            get {
+                // Don't do anything in Design mode. In some cases in the Designer (in the Edit field dialog),
+                // DesignMode actually returns true, so checking for a null Control provides an additional check.
+                if (DesignMode || Control == null)
+                    return null;
+
+                if (_column == null) {
+                    MetaTable table = Control.FindMetaTable();
+                    if (table == null) {
+                        throw new InvalidOperationException(String.Format(CultureInfo.CurrentCulture, DynamicDataResources.DynamicControl_ControlNeedsToExistInADataControlUsingDynamicDataSource));
+                    }
+                    _column = table.GetColumn(DataField);
+                }
+                return _column;
+            }
+        }
+
+        /// <summary>
+        /// An optional UIHint specified on the field
+        /// </summary>
+        [
+        Category("Behavior"),
+        DefaultValue(""),
+        ResourceDescription("DynamicControlFieldCommon_UIHint")
+        ]
+        public virtual string UIHint {
+            get {
+                object o = ViewState["UIHint"];
+                return ((o == null) ? String.Empty : (string)o);
+            }
+            set {
+                if (!String.Equals(value, ViewState["UIHint"])) {
+                    ViewState["UIHint"] = value;
+                    OnFieldChanged();
+                }
+            }
+        }
+
+        /// <summary>
+        /// The validation group that the field template needs to be in
+        /// </summary>
+        [
+        Category("Behavior"),
+        DefaultValue(""),
+        ResourceDescription("DynamicControlFieldCommon_ValidationGroup")
+        ]
+        public virtual string ValidationGroup {
+            get {
+                object o = ViewState["ValidationGroup"];
+                return ((o == null) ? String.Empty : (string)o);
+            }
+            set {
+                if (!String.Equals(value, ViewState["ValidationGroup"])) {
+                    ViewState["ValidationGroup"] = value;
+                    OnFieldChanged();
+                }
+            }
+        }
+
+        /// <summary>
+        /// See base class documentation
+        /// </summary>
+        protected override DataControlField CreateField() {
+            return new DynamicField();
+        }
+
+        /// <summary>
+        /// See base class documentation
+        /// </summary>
+        public override void InitializeCell(DataControlFieldCell cell, DataControlCellType cellType,
+            DataControlRowState rowState, int rowIndex) {
+
+            base.InitializeCell(cell, cellType, rowState, rowIndex);
+
+            if (cellType == DataControlCellType.DataCell) {
+                DynamicControl control = CreateDynamicControl();
+                control.DataField = DataField;
+                control.Mode = DetermineControlMode(rowState);
+                
+                // Copy various properties into the control
+                if (_customApplyFormatInEditModeSet) {
+                    control.ApplyFormatInEditMode = ApplyFormatInEditMode;
+                }
+                if (_customConvertEmptyStringToNullSet) {
+                    control.ConvertEmptyStringToNull = ConvertEmptyStringToNull;
+                }
+                control.DataFormatString = DataFormatString;
+                if (ViewState["HtmlEncode"] == null) {
+                    // There is no Column in Design Mode
+                    if (!DesignMode) {
+                        control.HtmlEncode = Column.HtmlEncode;
+                    }
+                }
+                else {
+                    control.HtmlEncode = HtmlEncode;
+                }
+                control.NullDisplayText = NullDisplayText;
+                control.UIHint = UIHint;
+                control.ValidationGroup = ValidationGroup;
+
+                // Pass it all the extra declarative attributes that we got
+                control.SetAttributes(_attributes);
+
+                ConfigureDynamicControl(control);
+
+                cell.Controls.Add(control);
+            }
+        }
+
+        /// <summary>
+        /// Provides a way for classes deriving from DynamicField to override how DynamicControl gets created.
+        /// </summary>
+        /// <returns></returns>
+        protected virtual DynamicControl CreateDynamicControl() {
+            return new DynamicControl();
+        }
+
+        /// <summary>
+        /// Provides a hook to further modify a DynamicControl that was created by the InitializeCell method
+        /// </summary>
+        /// <param name="control"></param>
+        protected virtual void ConfigureDynamicControl(DynamicControl control) {
+            Debug.Assert(control != null);
+        }
+
+        private DataBoundControlMode DetermineControlMode(DataControlRowState rowState) {
+            if (ReadOnly) {
+                return DataBoundControlMode.ReadOnly;
+            }
+
+            bool edit = (rowState & DataControlRowState.Edit) != 0;
+            bool insert = (rowState & DataControlRowState.Insert) != 0;
+
+            if (edit) {
+                return DataBoundControlMode.Edit;
+            } else if (insert) {
+                return DataBoundControlMode.Insert;
+            } else {
+                return DataBoundControlMode.ReadOnly;
+            }
+        }
+
+        /// <summary>
+        /// See base class documentation
+        /// </summary>
+        public override void ExtractValuesFromCell(IOrderedDictionary dictionary, DataControlFieldCell cell,
+            DataControlRowState rowState, bool includeReadOnly) {
+            Misc.ExtractValuesFromBindableControls(dictionary, cell);
+        }
+
+        /// <summary>
+        /// See base class documentation
+        /// </summary>
+        protected override void CopyProperties(DataControlField newField) {
+            base.CopyProperties(newField);
+            DynamicField field = ((DynamicField)newField);
+            field.DataField = DataField;
+            field.ApplyFormatInEditMode = ApplyFormatInEditMode;
+            field.ConvertEmptyStringToNull = ConvertEmptyStringToNull;
+            field.HtmlEncode = HtmlEncode;
+            field.ReadOnly = ReadOnly;
+            field.NullDisplayText = NullDisplayText;
+            field.UIHint = UIHint;
+            field.ValidationGroup = ValidationGroup;
+            field.DataFormatString = DataFormatString;
+        }
+
+        #region IAttributeAccessor Members
+
+        /// <summary>
+        /// See IAttributeAccessor
+        /// </summary>
+        public string GetAttribute(string key) {
+            if (_attributes == null)
+                return String.Empty;
+            return _attributes[key];
+        }
+
+        /// <summary>
+        /// See IAttributeAccessor
+        /// </summary>
+        public void SetAttribute(string key, string value) {
+            if (_attributes == null) {
+                _attributes = new Dictionary<string, string>();
+            }
+            _attributes[key] = value;
+        }
+
+        #endregion
+
+        #region IFieldFormattingOptions Members
+
+        /// <summary>
+        /// See IFieldFormattingOptions
+        /// </summary>
+        [
+        Category("Behavior"),
+        DefaultValue(false),
+        ResourceDescription("DynamicControlFieldCommon_ConvertEmptyStringToNull")
+        ]
+        public bool ConvertEmptyStringToNull {
+            get {
+                object o = ViewState["ConvertEmptyStringToNull"];
+                return (o == null ? false : (bool)o);
+            }
+            set {
+                _customConvertEmptyStringToNullSet = true;
+                ViewState["ConvertEmptyStringToNull"] = value;
+            }
+        }
+
+        /// <summary>
+        /// See IFieldFormattingOptions
+        /// </summary>
+        [
+        Category("Behavior"),
+        DefaultValue(false),
+        ResourceDescription("DynamicControlFieldCommon_ApplyFormatInEditMode")
+        ]
+        public bool ApplyFormatInEditMode {
+            get {
+                object o = ViewState["ApplyFormatInEditMode"];
+                return (o == null ? false : (bool)o);
+            }
+            set {
+                _customApplyFormatInEditModeSet = true;
+                ViewState["ApplyFormatInEditMode"] = value;
+            }
+        }
+
+        /// <summary>
+        /// See IFieldFormattingOptions
+        /// </summary>
+        [
+        Category("Data"),
+        DefaultValue(""),
+        ResourceDescription("DynamicControlFieldCommon_DataFormatString")
+        ]
+        public string DataFormatString {
+            get {
+                object o = ViewState["DataFormatString"];
+                return (o == null ? String.Empty : (string)o);
+            }
+            set {
+                ViewState["DataFormatString"] = value;
+            }
+        }
+
+        /// <summary>
+        /// See IFieldFormattingOptions
+        /// </summary>
+        [
+        Category("Behavior"),
+        DefaultValue(true),
+        ResourceDescription("DynamicControlFieldCommon_HtmlEncode")
+        ]
+        public bool HtmlEncode {
+            get {
+                object o = ViewState["HtmlEncode"];
+                return (o == null ? true : (bool)o);
+            }
+            set {
+                ViewState["HtmlEncode"] = value;
+            }
+        }
+
+        /// <summary>
+        /// See IFieldFormattingOptions
+        /// </summary>
+        [
+        Category("Behavior"),
+        DefaultValue(""),
+        ResourceDescription("DynamicControlFieldCommon_NullDisplayText")
+        ]
+        public string NullDisplayText {
+            get {
+                object o = ViewState["NullDisplayText"];
+                return (o == null ? String.Empty : (string)o);
+            }
+            set {
+                ViewState["NullDisplayText"] = value;
+            }
+        }
+
+        #endregion
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                     eadDegc+$IDirectionAngleThresholdDegrees˙r+DirectionAndPdfÃ!Direction1˘±!Direction1Û !Direction0˘∞!Direction0ÚˇDirectionøDirection§Direction‘nDirection‘/Direction”“DirectionpìDirectionpDirectionpDirectionpDirectionpDirectionpDirectionR≈DirectionR¬DirectionRøDirectionRºDirectionR∏DirectionR≤Direction%0Direction%'Direction#ŸDirectionÔDirectionÏDirectionÏDirectionÍˇDirection„Direction– Directionœ¬DirectionœeDirectionœQDirectionŒÈDirectionŒ√DirectionŒóDirectionŒnDirectionÕ—DirectionÕ¿DirectionÕ†DirectionÕåDirectionûƒDirectionûkDirectionûJDirectionâDirectionâDirectionQJDirection)¿Direction«ËDirectionêVDirection§(DirectionòhDirectionòJDirectionò1Direction;ÇDirection;rDirection7˜Direction7ÌDirection7ûDirection75Direction7Direction$ÂDirection$œDirection£DirectionöLDirection˙zDirection˙qDirectionÚDirectionÒ	Direction˛DirectionÎ(DirectionÍÅDirection‹©Direction‹ßDirection€‚Direction€–Direction⁄˝Direction⁄ÔDirectionÀVDirectionƒœDirectionƒöDirectionƒóDirection√RDirection√ODirection¿–Direction¿ÕDirectionºïDirectionªœDirectionªºDirection≠4DirectionóçDire//
+// XmlObjectSerializerTest.cs
+//
+// Author:
+//	Atsushi Enomoto <atsushi@ximian.com>
+//	Ankit Jain <JAnkit@novell.com>
+//
+// Copyright (C) 2005 Novell, Inc.  http://www.novell.com
+
+//
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+// 
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+//
+
+
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+#if !MOBILE
+using System.Data;
+#endif
+using System.IO;
+using System.Net;
+using System.Runtime.Serialization;
+using System.Text;
+using System.Xml;
+using System.Xml.Schema;
+using System.Xml.Serialization;
+using NUnit.Framework;
+
+namespace MonoTests.System.Runtime.Serialization
+{
+	[TestFixture]
+	public class DataContractResolverTest
+	{
+		[Test]
+		public void UseCase1 ()
+		{
+			var ds = new DataContractSerializer (typeof (Colors), null, 10000, false, false, null, new MyResolver ());
+			var sw = new StringWriter ();
+			using (var xw = XmlWriter.Create (sw))
+				ds.WriteObject (xw, new ResolvedClass ());
+
+			// xml and xml2 are equivalent in infoset, except for prefixes and position of namespace nodes. So the difference should not matter.
+			string xml = @"<?xml version='1.0' encoding='utf-16'?><Colors xmlns:i='http://www.w3.org/2001/XMLSchema-instance' xmlns:d1p1='urn:dummy' i:type='d1p1:ResolvedClass' xmlns='http://schemas.datacontract.org/2004/07/MonoTests.System.Runtime.Serialization'><Baz xmlns='http://schemas.datacontract.org/2004/07/'>c74376f0-5517-4cb7-8a07-35026423f565</Baz></Colors>".Replace ('\'', '"');
+			string xml2 = @"<?xml version='1.0' encoding='utf-16'?><Colors xmlns:i='http://www.w3.org/2001/XMLSchema-instance' xmlns:d1p1='urn:dummy' xmlns:d1p2='http://schemas.datacontract.org/2004/07/' i:type='d1p2:ResolvedClass' xmlns='http://schemas.datacontract.org/2004/07/MonoTests.System.Runtime.Serialization'><d1p2:Baz>c74376f0-5517-4cb7-8a07-35026423f565</d1p2:Baz></Colors>".Replace ('\'', '"');
+			try {
+				Assert.AreEqual (xml, sw.ToString (), "#1");
+			} catch (AssertionException) {
+				Assert.AreEqual (xml2, sw.ToString (), "#2");
+			}
+			using (var xr = XmlReader.Create (new StringReader (xml)))
+				Assert.AreEqual (typeof (ResolvedClass), ds.ReadObject (xr).GetType (), "#3");
+			using (var xr = XmlReader.Create (new StringReader (xml)))
+				Assert.AreEqual (typeof (ResolvedClass), ds.ReadObject (xr).GetType (), "#4");
+		}
+	}
+
+	public class MyResolver : DataContractResolver
+	{
+		public override bool TryResolveType (Type type, Type declaredType, DataContractResolver knownTypeResolver, out XmlDictionaryString typeName, out XmlDictionaryString typeNamespace)
+		{
+			//Console.WriteLine ("TryResolveType: {0} {1}", type, declaredType);
+			if (knownTypeResolver.TryResolveType (type, declaredType, null, out typeName, out typeNamespace))
+				return true;
+			return SafeResolveType (type, out typeName, out typeNamespace);
+		}
+
+		XmlDictionary dic = new XmlDictionary ();
+
+		bool SafeResolveType (Type type, out XmlDictionaryString name, out XmlDictionaryString ns)
+		{
+			// Console.WriteLine ("SafeResolveType: {0}", type);
+			name = dic.Add (type.Name);
+			ns = dic.Add (type.Namespace ?? "urn:dummy");
+			return true;
+		}
+
+		public override Type ResolveName (string typeName, string typeNamespace, Type declaredType, DataContractResolver knownTypeResolver)
+		{
+			//Console.WriteLine ("ResolveName: {0} {1} {2}", typeName, typeNamespace, declaredType);
+			return knownTypeResolver.ResolveName (typeName, typeNamespace, declaredType, null) ?? RecoveringResolveName (typeName, typeNamespace);
+		}
+		
+		Type RecoveringResolveName (string typeName, string typeNamespace)
+		{
+			if (typeNamespace == "urn:dummy")
+				return Type.GetType (typeName);
+			else
+				return Type.GetType (typeNamespace + '.' + typeName);
+		}
+	}
+}
+
+[DataContract]
+public class ResolvedClass
+{
+	[DataMember]
+	public Guid Baz = Guid.Parse ("c74376f0-5517-4cb7-8a07-35026423f565");
+}
+
+                                                                                                                            ();
+			Assert.AreEqual (name, FontFamily.GenericSansSerif.Name, "Name");
+		}
+
+		[Test]
+		public void GenericSerif ()
+		{
+			FontFamily ff = FontFamily.GenericSerif;
+			string name = ff.Name;
+			ff.Dispose ();
+			Assert.AreEqual (name, FontFamily.GenericSerif.Name, "Name");
+		}
+
+		[Test]
+		public void GetFamilies_Null ()
+		{
+			Assert.Throws<ArgumentNullException> (() => FontFamily.GetFamilies (null));
+		}
+
+		[Test]
+		public void GetFamilies ()
+		{
+			FontFamily[] ffc = FontFamily.GetFamilies (graphic);
+			Assert.AreEqual (ffc.Length, FontFamily.Families.Length, "Length");
+		}
+
+		[Test]
+		public void Dispose_Double ()
+		{
+			FontFamily ff = FontFamily.GenericSerif;
+			ff.Dispose ();
+			ff.Dispose ();
+		}
+
+		[Test]
+		public void Dispose_UseAfter ()
+		{
+			FontFamily ff = FontFamily.GenericMonospace;
+			ff.Dispose ();
+			Assert.Throws<ArgumentException> (() => { var x = ff.Name; });
+		}
+	}
+}
+                                                                                                                          übπÀ›≥ä≤˜ú$nà}*ıò}	%%Â£Q˝N#èc‘B‰∑ü¶¥≥kâhèT¥Huï)^=ΩÆØ˝U‘ä‘…X]w;ˇ£äççÂ¶x◊∂µö +Yº|qˆ‰˜ 
+C˚–‰úl†ivF€û˜ê`æ7âky€ÂÉóïéÅêÜè÷B| qÔ0£na“‰‡í¨,N[+u∑£Æ°ûtÉæ¥ªjŸsëO∞F¸| R™˚Xè∆ü◊„ª»Éí€/À:Q;6Ô∑°"j™êÌ˘˜!¨U%ö—…òt3∫c◊n§
+ãõ“º‡&÷÷Ñm‡•^ Æ˝ß=2~«„3G´È2÷Y°N√ﬁã Ω∏…\˜A¸Ì'KØJ‘êqX≥]M$®wæÅ˚

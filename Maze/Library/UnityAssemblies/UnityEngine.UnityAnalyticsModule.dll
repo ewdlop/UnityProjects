@@ -1,0 +1,421 @@
+import datetime
+import warnings
+import weakref
+import unittest
+from itertools import product
+
+
+class Test_Assertions(unittest.TestCase):
+    def test_AlmostEqual(self):
+        self.assertAlmostEqual(1.00000001, 1.0)
+        self.assertNotAlmostEqual(1.0000001, 1.0)
+        self.assertRaises(self.failureException,
+                          self.assertAlmostEqual, 1.0000001, 1.0)
+        self.assertRaises(self.failureException,
+                          self.assertNotAlmostEqual, 1.00000001, 1.0)
+
+        self.assertAlmostEqual(1.1, 1.0, places=0)
+        self.assertRaises(self.failureException,
+                          self.assertAlmostEqual, 1.1, 1.0, places=1)
+
+        self.assertAlmostEqual(0, .1+.1j, places=0)
+        self.assertNotAlmostEqual(0, .1+.1j, places=1)
+        self.assertRaises(self.failureException,
+                          self.assertAlmostEqual, 0, .1+.1j, places=1)
+        self.assertRaises(self.failureException,
+                          self.assertNotAlmostEqual, 0, .1+.1j, places=0)
+
+        self.assertAlmostEqual(float('inf'), float('inf'))
+        self.assertRaises(self.failureException, self.assertNotAlmostEqual,
+                          float('inf'), float('inf'))
+
+    def test_AmostEqualWithDelta(self):
+        self.assertAlmostEqual(1.1, 1.0, delta=0.5)
+        self.assertAlmostEqual(1.0, 1.1, delta=0.5)
+        self.assertNotAlmostEqual(1.1, 1.0, delta=0.05)
+        self.assertNotAlmostEqual(1.0, 1.1, delta=0.05)
+
+        self.assertAlmostEqual(1.0, 1.0, delta=0.5)
+        self.assertRaises(self.failureException, self.assertNotAlmostEqual,
+                          1.0, 1.0, delta=0.5)
+
+        self.assertRaises(self.failureException, self.assertAlmostEqual,
+                          1.1, 1.0, delta=0.05)
+        self.assertRaises(self.failureException, self.assertNotAlmostEqual,
+                          1.1, 1.0, delta=0.5)
+
+        self.assertRaises(TypeError, self.assertAlmostEqual,
+                          1.1, 1.0, places=2, delta=2)
+        self.assertRaises(TypeError, self.assertNotAlmostEqual,
+                          1.1, 1.0, places=2, delta=2)
+
+        first = datetime.datetime.now()
+        second = first + datetime.timedelta(seconds=10)
+        self.assertAlmostEqual(first, second,
+                               delta=datetime.timedelta(seconds=20))
+        self.assertNotAlmostEqual(first, second,
+                                  delta=datetime.timedelta(seconds=5))
+
+    def test_assertRaises(self):
+        def _raise(e):
+            raise e
+        self.assertRaises(KeyError, _raise, KeyError)
+        self.assertRaises(KeyError, _raise, KeyError("key"))
+        try:
+            self.assertRaises(KeyError, lambda: None)
+        except self.failureException as e:
+            self.assertIn("KeyError not raised", str(e))
+        else:
+            self.fail("assertRaises() didn't fail")
+        try:
+            self.assertRaises(KeyError, _raise, ValueError)
+        except ValueError:
+            pass
+        else:
+            self.fail("assertRaises() didn't let exception pass through")
+        with self.assertRaises(KeyError) as cm:
+            try:
+                raise KeyError
+            except Exception as e:
+                exc = e
+                raise
+        self.assertIs(cm.exception, exc)
+
+        with self.assertRaises(KeyError):
+            raise KeyError("key")
+        try:
+            with self.assertRaises(KeyError):
+                pass
+        except self.failureException as e:
+            self.assertIn("KeyError not raised", str(e))
+        else:
+            self.fail("assertRaises() didn't fail")
+        try:
+            with self.assertRaises(KeyError):
+                raise ValueError
+        except ValueError:
+            pass
+        else:
+            self.fail("assertRaises() didn't let exception pass through")
+
+    def test_assertRaises_frames_survival(self):
+        # Issue #9815: assertRaises should avoid keeping local variables
+        # in a traceback alive.
+        class A:
+            pass
+        wr = None
+
+        class Foo(unittest.TestCase):
+
+            def foo(self):
+                nonlocal wr
+                a = A()
+                wr = weakref.ref(a)
+                try:
+                    raise OSError
+                except OSError:
+                    raise ValueError
+
+            def test_functional(self):
+                self.assertRaises(ValueError, self.foo)
+
+            def test_with(self):
+                with self.assertRaises(ValueError):
+                    self.foo()
+
+        Foo("test_functional").run()
+        self.assertIsNone(wr())
+        Foo("test_with").run()
+        self.assertIsNone(wr())
+
+    def testAssertNotRegex(self):
+        self.assertNotRegex('Ala ma kota', r'r+')
+        try:
+            self.assertNotRegex('Ala ma kota', r'k.t', 'Message')
+        except self.failureException as e:
+            self.assertIn('Message', e.args[0])
+        else:
+            self.fail('assertNotRegex should have failed.')
+
+
+class TestLongMessage(unittest.TestCase):
+    """Test that the individual asserts honour longMessage.
+    This actually tests all the message behaviour for
+    asserts that use longMessage."""
+
+    def setUp(self):
+        class TestableTestFalse(unittest.TestCase):
+            longMessage = False
+            failureException = self.failureException
+
+            def testTest(self):
+                pass
+
+        class TestableTestTrue(unittest.TestCase):
+            longMessage = True
+            failureException = self.failureException
+
+            def testTest(self):
+                pass
+
+        self.testableTrue = TestableTestTrue('testTest')
+        self.testableFalse = TestableTestFalse('testTest')
+
+    def testDefault(self):
+        self.assertTrue(unittest.TestCase.longMessage)
+
+    def test_formatMsg(self):
+        self.assertEqual(self.testableFalse._formatMessage(None, "foo"), "foo")
+        self.assertEqual(self.testableFalse._formatMessage("foo", "bar"), "foo")
+
+        self.assertEqual(self.testableTrue._formatMessage(None, "foo"), "foo")
+        self.assertEqual(self.testableTrue._formatMessage("foo", "bar"), "bar : foo")
+
+        # This blows up if _formatMessage uses string concatenation
+        self.testableTrue._formatMessage(object(), 'foo')
+
+    def test_formatMessage_unicode_error(self):
+        one = ''.join(chr(i) for i in range(255))
+        # this used to cause a UnicodeDecodeError constructing msg
+        self.testableTrue._formatMessage(one, '\uFFFD')
+
+    def assertMessages(self, methodName, args, errors):
+        """
+        Check that methodName(*args) raises the correct error messages.
+        errors should be a list of 4 regex that match the error when:
+          1) longMessage = False and no msg passed;
+          2) longMessage = False and msg passed;
+          3) longMessage = True and no msg passed;
+          4) longMessage = True and msg passed;
+        """
+        def getMethod(i):
+            useTestableFalse  = i < 2
+            if useTestableFalse:
+                test = self.testableFalse
+            else:
+                test = self.testableTrue
+            return getattr(test, methodName)
+
+        for i, expected_regex in enumerate(errors):
+            testMethod = getMethod(i)
+            kwargs = {}
+            withMsg = i % 2
+            if withMsg:
+                kwargs = {"msg": "oops"}
+
+            with self.assertRaisesRegex(self.failureException,
+                                        expected_regex=expected_regex):
+                testMethod(*args, **kwargs)
+
+    def testAssertTrue(self):
+        self.assertMessages('assertTrue', (False,),
+                            ["^False is not true$", "^oops$", "^False is not true$",
+                             "^False is not true : oops$"])
+
+    def testAssertFalse(self):
+        self.assertMessages('assertFalse', (True,),
+                            ["^True is not false$", "^oops$", "^True is not false$",
+                             "^True is not false : oops$"])
+
+    def testNotEqual(self):
+        self.assertMessages('assertNotEqual', (1, 1),
+                            ["^1 == 1$", "^oops$", "^1 == 1$",
+                             "^1 == 1 : oops$"])
+
+    def testAlmostEqual(self):
+        self.assertMessages(
+            'assertAlmostEqual', (1, 2),
+            [r"^1 != 2 within 7 places \(1 difference\)$", "^oops$",
+             r"^1 != 2 within 7 places \(1 difference\)$",
+             r"^1 != 2 within 7 places \(1 difference\) : oops$"])
+
+    def testNotAlmostEqual(self):
+        self.assertMessages('assertNotAlmostEqual', (1, 1),
+                            ["^1 == 1 within 7 places$", "^oops$",
+                             "^1 == 1 within 7 places$", "^1 == 1 within 7 places : oops$"])
+
+    def test_baseAssertEqual(self):
+        self.assertMessages('_baseAssertEqual', (1, 2),
+                            ["^1 != 2$", "^oops$", "^1 != 2$", "^1 != 2 : oops$"])
+
+    def testAssertSequenceEqual(self):
+        # Error messages are multiline so not testing on full message
+        # assertTupleEqual and assertListEqual delegate to this method
+        self.assertMessages('assertSequenceEqual', ([], [None]),
+                            [r"\+ \[None\]$", "^oops$", r"\+ \[None\]$",
+                             r"\+ \[None\] : oops$"])
+
+    def testAssertSetEqual(self):
+        self.assertMessages('assertSetEqual', (set(), set([None])),
+                            ["None$", "^oops$", "None$",
+                             "None : oops$"])
+
+    def testAssertIn(self):
+        self.assertMessages('assertIn', (None, []),
+                            [r'^None not found in \[\]$', "^oops$",
+                             r'^None not found in \[\]$',
+                             r'^None not found in \[\] : oops$'])
+
+    def testAssertNotIn(self):
+        self.assertMessages('assertNotIn', (None, [None]),
+                            [r'^None unexpectedly found in \[None\]$', "^oops$",
+                             r'^None unexpectedly found in \[None\]$',
+                             r'^None unexpectedly found in \[None\] : oops$'])
+
+    def testAssertDictEqual(self):
+        self.assertMessages('assertDictEqual', ({}, {'key': 'value'}),
+                            [r"\+ \{'key': 'value'\}$", "^oops$",
+                             r"\+ \{'key': 'value'\}$",
+                             r"\+ \{'key': 'value'\} : oops$"])
+
+    def testAssertDictContainsSubset(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+
+            self.assertMessages('assertDictContainsSubset', ({'key': 'value'}, {}),
+                                ["^Missing: 'key'$", "^oops$",
+                                 "^Missing: 'key'$",
+                                 "^Missing: 'key' : oops$"])
+
+    def testAssertMultiLineEqual(self):
+        self.assertMessages('assertMultiLineEqual', ("", "foo"),
+                            [r"\+ foo$", "^oops$",
+                             r"\+ foo$",
+                             r"\+ foo : oops$"])
+
+    def testAssertLess(self):
+        self.assertMessages('assertLess', (2, 1),
+                            ["^2 not less than 1$", "^oops$",
+                             "^2 not less than 1$", "^2 not less than 1 : oops$"])
+
+    def testAssertLessEqual(self):
+        self.assertMessages('assertLessEqual', (2, 1),
+                            ["^2 not less than or equal to 1$", "^oops$",
+                             "^2 not less than or equal to 1$",
+                             "^2 not less than or equal to 1 : oops$"])
+
+    def testAssertGreater(self):
+        self.assertMessages('assertGreater', (1, 2),
+                            ["^1 not greater than 2$", "^oops$",
+                             "^1 not greater than 2$",
+                             "^1 not greater than 2 : oops$"])
+
+    def testAssertGreaterEqual(self):
+        self.assertMessages('assertGreaterEqual', (1, 2),
+                            ["^1 not greater than or equal to 2$", "^oops$",
+                             "^1 not greater than or equal to 2$",
+                             "^1 not greater than or equal to 2 : oops$"])
+
+    def testAssertIsNone(self):
+        self.assertMessages('assertIsNone', ('not None',),
+                            ["^'not None' is not None$", "^oops$",
+                             "^'not None' is not None$",
+                             "^'not None' is not None : oops$"])
+
+    def testAssertIsNotNone(self):
+        self.assertMessages('assertIsNotNone', (None,),
+                            ["^unexpectedly None$", "^oops$",
+                             "^unexpectedly None$",
+                             "^unexpectedly None : oops$"])
+
+    def testAssertIs(self):
+        self.assertMessages('assertIs', (None, 'foo'),
+                            ["^None is not 'foo'$", "^oops$",
+                             "^None is not 'foo'$",
+                             "^None is not 'foo' : oops$"])
+
+    def testAssertIsNot(self):
+        self.assertMessages('assertIsNot', (None, None),
+                            ["^unexpectedly identical: None$", "^oops$",
+                             "^unexpectedly identical: None$",
+                             "^unexpectedly identical: None : oops$"])
+
+    def testAssertRegex(self):
+        self.assertMessages('assertRegex', ('foo', 'bar'),
+                            ["^Regex didn't match:",
+                             "^oops$",
+                             "^Regex didn't match:",
+                             "^Regex didn't match: (.*) : oops$"])
+
+    def testAssertNotRegex(self):
+        self.assertMessages('assertNotRegex', ('foo', 'foo'),
+                            ["^Regex matched:",
+                             "^oops$",
+                             "^Regex matched:",
+                             "^Regex matched: (.*) : oops$"])
+
+
+    def assertMessagesCM(self, methodName, args, func, errors):
+        """
+        Check that the correct error messages are raised while executing:
+          with method(*args):
+              func()
+        *errors* should be a list of 4 regex that match the error when:
+          1) longMessage = False and no msg passed;
+          2) longMessage = False and msg passed;
+          3) longMessage = True and no msg passed;
+          4) longMessage = True and msg passed;
+        """
+        p = product((self.testableFalse, self.testableTrue),
+                    ({}, {"msg": "oops"}))
+        for (cls, kwargs), err in zip(p, errors):
+            method = getattr(cls, methodName)
+            with self.assertRaisesRegex(cls.failureException, err):
+                with method(*args, **kwargs) as cm:
+                    func()
+
+    def testAssertRaises(self):
+        self.assertMessagesCM('assertRaises', (TypeError,), lambda: None,
+                              ['^TypeError not raised$', '^oops$',
+                               '^TypeError not raised$',
+                               '^TypeError not raised : oops$'])
+
+    def testAssertRaisesRegex(self):
+        # test error not raised
+        self.assertMessagesCM('assertRaisesRegex', (TypeError, 'unused regex'),
+                              lambda: None,
+                              ['^TypeError not raised$', '^oops$',
+                               '^TypeError not raised$',
+                               '^TypeError not raised : oops$'])
+        # test error raised but with wrong message
+        def raise_wrong_message():
+            raise TypeError('foo')
+        self.assertMessagesCM('assertRaisesRegex', (TypeError, 'regex'),
+                              raise_wrong_message,
+                              ['^"regex" does not match "foo"$', '^oops$',
+                               '^"regex" does not match "foo"$',
+                               '^"regex" does not match "foo" : oops$'])
+
+    def testAssertWarns(self):
+        self.assertMessagesCM('assertWarns', (UserWarning,), lambda: None,
+                              ['^UserWarning not triggered$', '^oops$',
+                               '^UserWarning not triggered$',
+                               '^UserWarning not triggered : oops$'])
+
+    def testAssertWarnsRegex(self):
+        # test error not raised
+        self.assertMessagesCM('assertWarnsRegex', (UserWarning, 'unused regex'),
+                              lambda: None,
+                              ['^UserWarning not triggered$', '^oops$',
+                               '^UserWarning not triggered$',
+                               '^UserWarning not triggered : oops$'])
+        # test warning raised but with wrong message
+        def raise_wrong_message():
+            warnings.warn('foo')
+        self.assertMessagesCM('assertWarnsRegex', (UserWarning, 'regex'),
+                              raise_wrong_message,
+                              ['^"regex" does not match "foo"$', '^oops$',
+                               '^"regex" does not match "foo"$',
+                               '^"regex" does not match "foo" : oops$'])
+
+
+if __name__ == "__main__":
+    unittest.main()
+                                                                                                                                                                                                                                                                                                                                                                                                                                             §D¦gHí~@Ş±¬îæ	Ös2ÀBŒ×İ¡³ÍC$>ÉZj4ÈşºÒ‡¹ÅÔ'g(©0>šıÒ÷¹+Ü°ì–˜S›fZ:;ˆÙÎelC?œFşAş#w¦ö&ƒ}¹UõÀ+©œ¼ç[ŠÀËdwf ÊhÖ×8Ï<ôpÔ’Wg…ì@[¬o„`Œ +8…		6¸«oJ£BêÈáh‰•‡Uéws®‡o—BŸÉ¥uòí³â-¶õ@yçf p‘}9Æº£õëÀÌ’´º7ÌvÙlıæ9Úhdğm€@X¶E—8·GnÕ Ò—¨â§n…³MŒFË*ô6¦èN‘lıV-M#5FH:†şÄ\1¯O(ÂOj‡¬z6ƒïµqÍ^½¥d õ´9¬1  ˆ*«W«™Qõ€2Ã·xdÂyÒşˆ%8Ş+2Õ“ ³t½ĞJeîÔö®êwOæ¾>²¾¨!@ú™öoüAšÿæ5j-:BğE×Râ	vÌòÌ—¾2”ìÿŠH¬ßâyğçÿ¨çwiÌ	°­Aê™ÿùÏ{	îîïà#—øšdÛäÖ[’ÕÄŞï`ŞÊSRœ}bmi¶ÇãOppV¥È=½¸mz<Òª_4˜¶›~vê]ËñŠLÕşJË‚yİ©Dxô”7ÚeÌ—èY› æãĞ”"5´ŠÚ›önaù»sL(Â²DJ8¼¼
+úÍtFãDÚºÃ‰Ë™„î`bŞ
+yer²ÖZ6WÕ Fê…aÉ…ZëfõU‘7'g–çØïÑ~¡4ÙçÆ3ƒÜ³,mfóºâĞd¯ÒZ9©şE¿ş«2Ix€6êËËcJ¸ñ\)Š»ÈO´nÚóÀÙb¡Ç¥Áš‡n`+| ª›á•-¶-Ğ«¹ 1ø+Hüÿã0*Bõ}÷ZÈï:(”¬%gCw¾!ñl´Õ³VÏT$©m|Ä¬ü‡z'køIÔ¤©}ØÓ/àãÒŸ°méµ¯ì ®Øe­]¤W÷ü+é=£¦«/óÒtì€¸û)*'ìq'íúuè QnDµ´p<o]¡m¡£íÏƒK:øí2²ÆÔàš*ëx êÎ«Fä%·ÎÑSˆE»îÛó›'e¥ûh0Fo.oÒ'Ä|gËWTÙŠâ<Ä,X¸wˆµ…ªPöW‰”±@^Ò‡IÊn™DG3·«:«;è¨Ş—
+ª.• ØŞıç»¶!°„wÁ
+_u—ËãipÍ»Û¿ÏP~oÁc9¼´ˆäUrÒEâKùª(4âºÓµ²Wg}$©@’¥æ${ïÛæÄk:°÷xò yryìó¯¶M Ê+<“0VêÜFoÜã^kZ¹[öÈ'+q†‘€
+c÷{İ´˜SÒ°Ó)wP¦<fÃUuÄ¼or5;¿Á~Şxá[(:,Ó\³Míf}ƒ2ğ_§YQù.;”5'‚#Ö‰’=ëÓÅóÜª=ñ…Jkzz
+iúÈÏq#fÑ;ÏníÀ°¶XÀ3`šÂyİ¼kæNcäè[„ã)õw6WètÿUÔŒQ/›
+¶gÔ’€ë ‰ëOŞ·„ÏF!şÇXUæàùw·Ê†ĞÊE˜³”[ôYõ´;àù»ÿZì€Ë;¯ö/WáÖ«oóËX Ï·ğå5³uRa¬Ÿˆ³Õˆi>41Ö ¯ø0¤Q‰Qq6=Ö™·&¾Ša­öjQ+»~mmbb™Ä¼¤ÆÖígaQ?Ûµ/èÃ$¸F+/f&m¼ƒL™£ãª Ï#ÜDİKÖ0ãrğÉ¯Ö®9ø(HàKÓÊÔéêtÕ€	jp©N”D€=Î’û“˜?²~‹3¬sk¬ÊÄš>Ò/¿6Cı—¬2¢Gn¢ÖX>H©ş£xé-¬Iß_™ëÁEÄ9P\-øùxâÚ¥—aÉs$Âša¨#ñ

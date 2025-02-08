@@ -1,0 +1,42 @@
+024:
+    return COFF::IMAGE_SCN_ALIGN_1024BYTES;
+  case 2048:
+    return COFF::IMAGE_SCN_ALIGN_2048BYTES;
+  case 4096:
+    return COFF::IMAGE_SCN_ALIGN_4096BYTES;
+  case 8192:
+    return COFF::IMAGE_SCN_ALIGN_8192BYTES;
+  }
+  llvm_unreachable("unsupported section alignment");
+}
+
+/// This function takes a section data object from the assembler
+/// and creates the associated COFF section staging object.
+void WinCOFFObjectWriter::defineSection(const MCSectionCOFF &MCSec) {
+  COFFSection *Section = createSection(MCSec.getSectionName());
+  COFFSymbol *Symbol = createSymbol(MCSec.getSectionName());
+  Section->Symbol = Symbol;
+  Symbol->Section = Section;
+  Symbol->Data.StorageClass = COFF::IMAGE_SYM_CLASS_STATIC;
+
+  // Create a COMDAT symbol if needed.
+  if (MCSec.getSelection() != COFF::IMAGE_COMDAT_SELECT_ASSOCIATIVE) {
+    if (const MCSymbol *S = MCSec.getCOMDATSymbol()) {
+      COFFSymbol *COMDATSymbol = GetOrCreateCOFFSymbol(S);
+      if (COMDATSymbol->Section)
+        report_fatal_error("two sections have the same comdat");
+      COMDATSymbol->Section = Section;
+    }
+  }
+
+  // In this case the auxiliary symbol is a Section Definition.
+  Symbol->Aux.resize(1);
+  Symbol->Aux[0] = {};
+  Symbol->Aux[0].AuxType = ATSectionDefinition;
+  Symbol->Aux[0].Aux.SectionDefinition.Selection = MCSec.getSelection();
+
+  // Set section alignment.
+  Section->Header.Characteristics = MCSec.getCharacteristics();
+  Section->Header.Characteristics |= getAlignment(MCSec);
+
+  // Bind internal COFF section to 

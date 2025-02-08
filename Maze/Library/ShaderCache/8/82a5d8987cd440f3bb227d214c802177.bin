@@ -1,0 +1,39 @@
+erErrorCodes;
+
+  WriterContext(bool IsSparse, std::mutex &ErrLock,
+                SmallSet<instrprof_error, 4> &WriterErrorCodes)
+      : Lock(), Writer(IsSparse), Err(Error::success()), ErrWhence(""),
+        ErrLock(ErrLock), WriterErrorCodes(WriterErrorCodes) {}
+};
+
+/// Determine whether an error is fatal for profile merging.
+static bool isFatalError(instrprof_error IPE) {
+  switch (IPE) {
+  default:
+    return true;
+  case instrprof_error::success:
+  case instrprof_error::eof:
+  case instrprof_error::unknown_function:
+  case instrprof_error::hash_mismatch:
+  case instrprof_error::count_mismatch:
+  case instrprof_error::counter_overflow:
+  case instrprof_error::value_site_count_mismatch:
+    return false;
+  }
+}
+
+/// Load an input into a writer context.
+static void loadInput(const WeightedFile &Input, WriterContext *WC) {
+  std::unique_lock<std::mutex> CtxGuard{WC->Lock};
+
+  // If there's a pending hard error, don't do more work.
+  if (WC->Err)
+    return;
+
+  // Copy the filename, because llvm::ThreadPool copied the input "const
+  // WeightedFile &" by value, making a reference to the filename within it
+  // invalid outside of this packaged task.
+  WC->ErrWhence = Input.Filename;
+
+  auto ReaderOrErr = InstrProfReader::create(Input.Filename);
+  if (Error E = ReaderOrErr.t

@@ -1,0 +1,189 @@
+
+							}
+						}
+						else
+						{
+							// Stencil plane
+							expectedState = bStencilIsReadOnly ? D3D12_RESOURCE_STATE_DEPTH_READ : D3D12_RESOURCE_STATE_DEPTH_WRITE;
+							if (bSRVIntersectsWithStencil)
+							{
+								// Stencil SRVs just contain the stencil plane
+								check(bStencilIsReadOnly);
+								expectedState |=
+									D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+									D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+							}
+						}
+
+						bool bGoodState = !!pDebugCommandList->AssertResourceState(pResource->GetResource(), SubresourceIndex, expectedState);
+						if (!bGoodState)
+						{
+							return false;
+						}
+					}
+				}
+
+			}
+		}
+
+		// RTV
+		{
+			const uint32 numRTVs = UE_ARRAY_COUNT(PipelineState.Graphics.RenderTargetArray);
+			for (uint32 i = 0; i < numRTVs; i++)
+			{
+				FD3D12RenderTargetView* pCurrentView = PipelineState.Graphics.RenderTargetArray[i];
+				if (!AssertResourceState(pCommandList, pCurrentView, D3D12_RESOURCE_STATE_RENDER_TARGET))
+				{
+					return false;
+				}
+			}
+		}
+
+		// TODO: Verify vertex buffer, index buffer, and constant buffer state.
+	}
+
+	return true;
+#endif
+}
+
+template <EShaderFrequency ShaderStage>
+void FD3D12StateCacheBase::ClearUAVs()
+{
+	FD3D12UnorderedAccessViewCache& Cache = PipelineState.Common.UAVCache;
+	const bool bIsCompute = ShaderStage == SF_Compute;
+
+	for (uint32 i = 0; i < MAX_UAVS; ++i)
+	{
+		if(Cache.Views[ShaderStage][i] != nullptr)
+		{
+			FD3D12UnorderedAccessViewCache::DirtySlot(Cache.DirtySlotMask[ShaderStage], i);
+		}
+		Cache.Views[ShaderStage][i] = nullptr;
+	}
+}
+
+template <EShaderFrequency ShaderStage>
+void FD3D12StateCacheBase::SetUAVs(uint32 UAVStartSlot, uint32 NumSimultaneousUAVs, FD3D12UnorderedAccessView** UAVArray, uint32* UAVInitialCountArray)
+{
+	SCOPE_CYCLE_COUNTER(STAT_D3D12SetUnorderedAccessViewTime);
+	check(NumSimultaneousUAVs > 0);
+
+	FD3D12UnorderedAccessViewCache& Cache = PipelineState.Common.UAVCache;
+
+	// When setting UAV's for Graphics, it wipes out all existing bound resources.
+	const bool bIsCompute = ShaderStage == SF_Compute;
+	Cache.StartSlot[ShaderStage] = bIsCompute ? FMath::Min(UAVStartSlot, Cache.StartSlot[ShaderStage]) : 0;
+
+	for (uint32 i = 0; i < NumSimultaneousUAVs; ++i)
+	{
+		FD3D12UnorderedAccessView* UAV = UAVArray[i];
+
+		Cache.Views[ShaderStage][UAVStartSlot + i] = UAV;
+		FD3D12UnorderedAccessViewCache::DirtySlot(Cache.DirtySlotMask[ShaderStage], UAVStartSlot + i);
+
+		if (UAV)
+		{
+			Cache.ResidencyHandles[ShaderStage][i] = UAV->GetResidencyHandle();
+
+			if (UAV->CounterResource && (!UAV->CounterResourceInitialized || UAVInitialCountArray[i] != -1))
+			{
+				FD3D12ResourceLocation UploadBufferLocation(GetParentDevice());
+#if USE_STATIC_ROOT_SIGNATURE
+				uint32* CounterUploadHeapData = static_cast<uint32*>(CmdContext->ConstantsAllocator.Allocate(sizeof(uint32), UploadBufferLocation, nullptr));
+#else
+				uint32* CounterUploadHeapData = static_cast<uint32*>(CmdContext->ConstantsAllocator.Allocate(sizeof(uint32), UploadBufferLocation));
+#endif
+
+				// Initialize the counter to 0 if it's not been previously initialized and the UAVInitialCount is -1, if not use the value that was passed.
+				*CounterUploadHeapData = (!UAV->CounterResourceInitialized && UAVInitialCountArray[i] == -1) ? 0 : UAVInitialCountArray[i];
+
+				CmdContext->CommandListHandle->CopyBufferRegion(
+					UAV->CounterResource->GetResource(),
+					0,
+					UploadBufferLocation.GetResource()->GetResource(),
+					UploadBufferLocation.GetOffsetFromBaseOfResource(),
+					4);
+
+				CmdContext->CommandListHandle.UpdateResidency(UAV->CounterResource);
+
+				UAV->CounterResourceInitialized = true;
+			}
+		}
+		else
+		{
+			Cache.ResidencyHandles[ShaderStage][i] = nullptr;
+		}
+	}
+}
+
+void FD3D12StateCacheBase::SetBlendFactor(const float BlendFactor[4])
+{
+	if (FMemory::Memcmp(PipelineState.Graphics.CurrentBlendFactor, BlendFactor, sizeof(PipelineState.Graphics.CurrentBlendFactor)))
+	{
+		FMemory::Memcpy(PipelineState.Graphics.CurrentBlendFactor, BlendFactor, sizeof(PipelineState.Graphics.CurrentBlendFactor));
+		bNeedSetBlendFactor = true;
+	}
+}
+
+void FD3D12StateCacheBase::SetStencilRef(uint32 StencilRef)
+{
+	if (PipelineState.Graphics.CurrentReferenceStencil != StencilRef)
+	{
+		PipelineState.Graphics.CurrentReferenceStencil = StencilRef;
+		bNeedSetStencilRef = true;
+	}
+}
+
+void FD3D12StateCacheBase::SetComputeShader(FD3D12ComputeShader* Shader)
+{
+	FD3D12ComputeShader* CurrentShader = nullptr;
+	GetComputeShader(&CurrentShader);
+	if (CurrentShader != Shader)
+	{
+		// See if we need to change the root signature
+		const FD3D12RootSignature* const pCurrentRootSignature = CurrentShader ? CurrentShader->pRootSignature : nullptr;
+		const FD3D12RootSignature* const pNewRootSignature = Shader ? Shader->pRootSignature : nullptr;
+		if (pCurrentRootSignature != pNewRootSignature)
+		{
+			PipelineState.Compute.bNeedSetRootSignature = true;
+		}
+
+		PipelineState.Common.CurrentShaderSamplerCounts[SF_Compute] = (Shader) ? Shader->ResourceCounts.NumSamplers : 0;
+		PipelineState.Common.CurrentShaderSRVCounts[SF_Compute] = (Shader) ? Shader->ResourceCounts.NumSRVs : 0;
+		PipelineState.Common.CurrentShaderCBCounts[SF_Compute] = (Shader) ? Shader->ResourceCounts.NumCBs : 0;
+		PipelineState.Common.CurrentShaderUAVCounts[SF_Compute] = (Shader) ? Shader->ResourceCounts.NumUAVs : 0;
+
+		// Shader changed so its resource table is dirty
+		CmdContext->DirtyUniformBuffers[SF_Compute] = 0xffff;
+	}
+}
+
+void FD3D12StateCacheBase::InternalSetIndexBuffer(FD3D12Resource* Resource)
+{
+	FD3D12CommandListHandle& CommandListHandle = CmdContext->CommandListHandle;
+	CommandListHandle.UpdateResidency(Resource->GetResidencyHandle());
+	CommandListHandle->IASetIndexBuffer(&PipelineState.Graphics.IBCache.CurrentIndexBufferView);
+
+	if (Resource->RequiresResourceStateTracking())
+	{
+		check(Resource->GetSubresourceCount() == 1);
+		FD3D12DynamicRHI::TransitionResource(CommandListHandle, Resource, D3D12_RESOURCE_STATE_INDEX_BUFFER, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+	}
+}
+
+void FD3D12StateCacheBase::InternalSetStreamSource(FD3D12ResourceLocation* VertexBufferLocation, uint32 StreamIndex, uint32 Stride, uint32 Offset)
+{
+	// If we have a vertex buffer location, that location should also have an underlying resource.
+	check(VertexBufferLocation == nullptr || VertexBufferLocation->GetResource());
+
+	check(StreamIndex < ARRAYSIZE(PipelineState.Graphics.VBCache.CurrentVertexBufferResources));
+
+	__declspec(align(16)) D3D12_VERTEX_BUFFER_VIEW NewView;
+	NewView.BufferLocation = (VertexBufferLocation) ? VertexBufferLocation->GetGPUVirtualAddress() + Offset : 0;
+	NewView.StrideInBytes = Stride;
+	NewView.SizeInBytes = (VertexBufferLocation) ? VertexBufferLocation->GetSize() - Offset : 0; // Make sure we account for how much we offset into the VB
+
+	D3D12_VERTEX_BUFFER_VIEW& CurrentView = PipelineState.Graphics.VBCache.CurrentVertexBufferViews[StreamIndex];
+
+	if (NewView.BufferLocation != CurrentView.BufferLocation ||
+		New

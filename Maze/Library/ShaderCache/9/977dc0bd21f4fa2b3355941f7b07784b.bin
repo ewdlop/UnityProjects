@@ -1,0 +1,56 @@
+# changes by dscherer@cmu.edu
+#   - IOBinding.open() replaces the current window with the opened file,
+#     if the current window is both unmodified and unnamed
+#   - IOBinding.loadfile() interprets Windows, UNIX, and Macintosh
+#     end-of-line conventions, instead of relying on the standard library,
+#     which will only understand the local convention.
+
+import codecs
+from codecs import BOM_UTF8
+import os
+import pipes
+import re
+import sys
+import tempfile
+
+from Tkinter import *
+import tkFileDialog
+import tkMessageBox
+from SimpleDialog import SimpleDialog
+
+from idlelib.configHandler import idleConf
+
+# Try setting the locale, so that we can find out
+# what encoding to use
+try:
+    import locale
+    locale.setlocale(locale.LC_CTYPE, "")
+except (ImportError, locale.Error):
+    pass
+
+# Encoding for file names
+filesystemencoding = sys.getfilesystemencoding()
+
+encoding = "ascii"
+if sys.platform == 'win32':
+    # On Windows, we could use "mbcs". However, to give the user
+    # a portable encoding name, we need to find the code page
+    try:
+        encoding = locale.getdefaultlocale()[1]
+        codecs.lookup(encoding)
+    except LookupError:
+        pass
+else:
+    try:
+        # Different things can fail here: the locale module may not be
+        # loaded, it may not offer nl_langinfo, or CODESET, or the
+        # resulting codeset may be unknown to Python. We ignore all
+        # these problems, falling back to ASCII
+        encoding = locale.nl_langinfo(locale.CODESET)
+        if encoding is None or encoding is '':
+            # situation occurs on Mac OS X
+            encoding = 'ascii'
+        codecs.lookup(encoding)
+    except (NameError, AttributeError, LookupError):
+        # Try getdefaultlocale well: it parses environment variables,
+        # which may give a clue. Unfortunately, getdefaultlocale has

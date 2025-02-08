@@ -1,0 +1,86 @@
+tLength(desc[0]);
+	
+
+	while(currPtr < endPtr)
+	{
+		SolverFrictionHeader4* PX_RESTRICT hdr = reinterpret_cast<SolverFrictionHeader4*>(currPtr);
+
+		currPtr = reinterpret_cast<PxU8*>(hdr + 1);
+
+		Vec4V* appliedImpulses = reinterpret_cast<Vec4V*>(currPtr);
+
+		currPtr += hdr->numNormalConstr * sizeof(Vec4V);
+
+		Ps::prefetchLine(currPtr, 128);
+		Ps::prefetchLine(currPtr,256);
+		Ps::prefetchLine(currPtr,384);
+		
+		const PxU32	numFrictionConstr = hdr->numFrictionConstr;
+
+		SolverFriction4Base* PX_RESTRICT frictions = reinterpret_cast<SolverFriction4Base*>(currPtr);
+
+		currPtr = reinterpret_cast<PxU8*>(frictions + hdr->numFrictionConstr);
+
+		const PxU32 maxFrictionConstr = numFrictionConstr;
+	
+		const Vec4V staticFric = hdr->staticFriction;
+
+		const Vec4V invMass0D0 = hdr->invMassADom;
+		const Vec4V angD0 = hdr->angD0;
+
+		for(PxU32 i=0;i<maxFrictionConstr;i++)
+		{
+			SolverFriction4Base& f = frictions[i];
+			Ps::prefetchLine((&f)+1);
+			Ps::prefetchLine((&f)+1,128);
+			Ps::prefetchLine((&f)+1,256);
+
+			const Vec4V appliedImpulse = appliedImpulses[i>>hdr->frictionPerContact];
+
+			const Vec4V maxFriction =  V4Mul(staticFric, appliedImpulse);
+
+			const Vec4V nMaxFriction = V4Neg(maxFriction); 
+
+			const Vec4V normalX = f.normalX;
+			const Vec4V normalY = f.normalY;
+			const Vec4V normalZ = f.normalZ;
+
+			const Vec4V raXnX = f.raXnX;
+			const Vec4V raXnY = f.raXnY;
+			const Vec4V raXnZ = f.raXnZ;
+
+			const Vec4V appliedForce(f.appliedForce);
+			const Vec4V velMultiplier(f.velMultiplier);
+			const Vec4V targetVel(f.targetVelocity);
+	
+			//4 x 4 Dot3 products encoded as 8 M44 transposes, 4 MulV and 8 MulAdd ops
+
+			const Vec4V __normalVel1 = V4Mul(linVel0T0, normalX);
+			const Vec4V __normalVel2 = V4Mul(raXnX, angState0T0);
+
+			const Vec4V _normalVel1 = V4MulAdd(linVel0T1, normalY, __normalVel1);
+			const Vec4V _normalVel2 = V4MulAdd(raXnY, angState0T1, __normalVel2);
+
+			const Vec4V normalVel1 = V4MulAdd(linVel0T2, normalZ, _normalVel1);
+			const Vec4V normalVel2 = V4MulAdd(raXnZ, angState0T2, _normalVel2);
+
+			const Vec4V delLinVel00 = V4Mul(normalX, invMass0D0);
+
+			const Vec4V delLinVel10 = V4Mul(normalY, invMass0D0);
+
+			const Vec4V normalVel = V4Add(normalVel1, normalVel2);
+
+			const Vec4V delLinVel20 = V4Mul(normalZ, invMass0D0);
+
+			const Vec4V tmp = V4NegMulSub(targetVel, velMultiplier, appliedForce);
+
+			Vec4V newAppliedForce = V4MulAdd(normalVel, velMultiplier, tmp);
+			newAppliedForce = V4Clamp(newAppliedForce,nMaxFriction,  maxFriction);
+			const Vec4V deltaF = V4Sub(newAppliedForce, appliedForce);
+
+			const Vec4V deltaAngF0 = V4Mul(angD0, deltaF);
+
+			linVel0T0 = V4MulAdd(delLinVel00, deltaF, linVel0T0);
+			angState0T0 = V4MulAdd(raXnX, deltaAngF0, angState0T0);
+
+			linVel0T1 = V

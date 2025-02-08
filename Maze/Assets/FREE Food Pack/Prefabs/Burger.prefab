@@ -1,0 +1,49 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+#include "DatasmithUtils.h"
+
+#include "DatasmithCore.h"
+#include "DatasmithDefinitions.h"
+#include "DatasmithAnimationElements.h"
+#include "DatasmithMaterialElements.h"
+#include "DatasmithMesh.h"
+#include "DatasmithSceneFactory.h"
+#include "DatasmithVariantElements.h"
+#include "IDatasmithSceneElements.h"
+
+#include "HAL/FileManager.h"
+#include "HAL/PlatformFilemanager.h"
+#include "Math/UnrealMath.h"
+#include "Misc/EngineVersion.h"
+#include "Misc/Paths.h"
+#include "RawMesh.h"
+#include "StaticMeshAttributes.h"
+#include "StaticMeshOperations.h"
+#include "UObject/NameTypes.h"
+
+static const float DATASMITH_FORMAT_VERSION = 0.24f; // Major.Minor - A change in the major version means that backward compatibility is broken
+
+// List of invalid names copied from Engine/Source/Runtime/Core/Private/Misc/FileHelper.cpp
+static const FString InvalidNames[] = {
+	TEXT("CON"), TEXT("PRN"), TEXT("AUX"), TEXT("CLOCK$"), TEXT("NUL"), TEXT("NONE"),
+	TEXT("COM1"), TEXT("COM2"), TEXT("COM3"), TEXT("COM4"), TEXT("COM5"), TEXT("COM6"), TEXT("COM7"), TEXT("COM8"), TEXT("COM9"),
+	TEXT("LPT1"), TEXT("LPT2"), TEXT("LPT3"), TEXT("LPT4"), TEXT("LPT5"), TEXT("LPT6"), TEXT("LPT7"), TEXT("LPT8"), TEXT("LPT9")
+};
+
+template<typename T, int32 Size>
+static constexpr int GetArrayLength(T(&)[Size]) { return Size; }
+
+void FDatasmithUtils::SanitizeNameInplace(FString& InString)
+{
+	static const TCHAR Original[] = TEXT("ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿБбВвГгДдЁёЖжЗзИиЙйКкЛлМмНнОоПпРрСсТтУуФфХхЦцЧчШшЩщЪъЫыЬьЭэЮюЯя'\"");
+	static const TCHAR Modified[] = TEXT("AAAAAAECEEEEIIIIDNOOOOOx0UUUUYPsaaaaaaeceeeeiiiiOnoooood0uuuuypyBbVvGgDdEeJjZzIiYyKkLlMmNnOoPpRrSsTtUuFfJjTtCcSsSs__ii__EeYyYy__");
+	static_assert(!PLATFORM_DESKTOP || GetArrayLength(Original) == GetArrayLength(Modified), "array size mismatch");
+
+	for (int32 i = 0; i < GetArrayLength(Original); i++)
+	{
+		InString.ReplaceCharInline(Original[i], Modified[i], ESearchCase::CaseSensitive);
+	}
+
+	// Also remove control character and other oddities
+	for (TCHAR& InChar : InString)
+	{
+		InChar = FChar:

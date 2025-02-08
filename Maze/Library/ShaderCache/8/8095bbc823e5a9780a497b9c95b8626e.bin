@@ -1,0 +1,102 @@
+/*
+ *  Copyright 2004 The WebRTC Project Authors. All rights reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+#ifndef P2P_BASE_RELAYSERVER_H_
+#define P2P_BASE_RELAYSERVER_H_
+
+#include <map>
+#include <string>
+#include <vector>
+
+#include "p2p/base/port.h"
+#include "p2p/base/stun.h"
+#include "rtc_base/asyncudpsocket.h"
+#include "rtc_base/random.h"
+#include "rtc_base/socketaddresspair.h"
+#include "rtc_base/thread.h"
+#include "rtc_base/timeutils.h"
+
+namespace cricket {
+
+class RelayServerBinding;
+class RelayServerConnection;
+
+// Relays traffic between connections to the server that are "bound" together.
+// All connections created with the same username/password are bound together.
+class RelayServer : public rtc::MessageHandler, public sigslot::has_slots<> {
+ public:
+  // Creates a server, which will use this thread to post messages to itself.
+  explicit RelayServer(rtc::Thread* thread);
+  ~RelayServer() override;
+
+  rtc::Thread* thread() { return thread_; }
+
+  // Indicates whether we will print updates of the number of bindings.
+  bool log_bindings() const { return log_bindings_; }
+  void set_log_bindings(bool log_bindings) { log_bindings_ = log_bindings; }
+
+  // Updates the set of sockets that the server uses to talk to "internal"
+  // clients.  These are clients that do the "port allocations".
+  void AddInternalSocket(rtc::AsyncPacketSocket* socket);
+  void RemoveInternalSocket(rtc::AsyncPacketSocket* socket);
+
+  // Updates the set of sockets that the server uses to talk to "external"
+  // clients.  These are the clients that do not do allocations.  They do not
+  // know that these addresses represent a relay server.
+  void AddExternalSocket(rtc::AsyncPacketSocket* socket);
+  void RemoveExternalSocket(rtc::AsyncPacketSocket* socket);
+
+  // Starts listening for connections on this sockets. When someone
+  // tries to connect, the connection will be accepted and a new
+  // internal socket will be added.
+  void AddInternalServerSocket(rtc::AsyncSocket* socket,
+                               cricket::ProtocolType proto);
+
+  // Removes this server socket from the list.
+  void RemoveInternalServerSocket(rtc::AsyncSocket* socket);
+
+  // Methods for testing and debuging.
+  int GetConnectionCount() const;
+  rtc::SocketAddressPair GetConnection(int connection) const;
+  bool HasConnection(const rtc::SocketAddress& address) const;
+
+ private:
+  typedef std::vector<rtc::AsyncPacketSocket*> SocketList;
+  typedef std::map<rtc::AsyncSocket*, cricket::ProtocolType> ServerSocketMap;
+  typedef std::map<std::string, RelayServerBinding*> BindingMap;
+  typedef std::map<rtc::SocketAddressPair, RelayServerConnection*>
+      ConnectionMap;
+
+  rtc::Thread* thread_;
+  webrtc::Random random_;
+  bool log_bindings_;
+  SocketList internal_sockets_;
+  SocketList external_sockets_;
+  SocketList removed_sockets_;
+  ServerSocketMap server_sockets_;
+  BindingMap bindings_;
+  ConnectionMap connections_;
+
+  // Called when a packet is received by the server on one of its sockets.
+  void OnInternalPacket(rtc::AsyncPacketSocket* socket,
+                        const char* bytes,
+                        size_t size,
+                        const rtc::SocketAddress& remote_addr,
+                        const rtc::PacketTime& packet_time);
+  void OnExternalPacket(rtc::AsyncPacketSocket* socket,
+                        const char* bytes,
+                        size_t size,
+                        const rtc::SocketAddress& remote_addr,
+                        const rtc::PacketTime& packet_time);
+
+  void OnReadEvent(rtc::AsyncSocket* socket);
+
+  // Processes the relevant STUN request types from the client.
+  bool HandleStun(const c

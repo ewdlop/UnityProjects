@@ -1,0 +1,121 @@
+"""Extension to execute code outside the Python shell window.
+
+This adds the following commands:
+
+- Check module does a full syntax check of the current module.
+  It also runs the tabnanny to catch any inconsistent tabs.
+
+- Run module executes the module's code in the __main__ namespace.  The window
+  must have been saved previously. The module is added to sys.modules, and is
+  also added to the __main__ namespace.
+
+XXX GvR Redesign this interface (yet again) as follows:
+
+- Present a dialog box for ``Run Module''
+
+- Allow specify command line arguments in the dialog box
+
+"""
+
+import os
+import re
+import string
+import tabnanny
+import tokenize
+import tkMessageBox
+from idlelib import PyShell
+
+from idlelib.configHandler import idleConf
+from idlelib import macosxSupport
+
+IDENTCHARS = string.ascii_letters + string.digits + "_"
+
+indent_message = """Error: Inconsistent indentation detected!
+
+1) Your indentation is outright incorrect (easy to fix), OR
+
+2) Your indentation mixes tabs and spaces.
+
+To fix case 2, change all tabs to spaces by using Edit->Select All followed \
+by Format->Untabify Region and specify the number of columns used by each tab.
+"""
+
+class ScriptBinding:
+
+    menudefs = [
+        ('run', [None,
+                 ('Check Module', '<<check-module>>'),
+                 ('Run Module', '<<run-module>>'), ]), ]
+
+    def __init__(self, editwin):
+        self.editwin = editwin
+        # Provide instance variables referenced by Debugger
+        # XXX This should be done differently
+        self.flist = self.editwin.flist
+        self.root = self.editwin.root
+
+        if macosxSupport.isCocoaTk():
+            self.editwin.text_frame.bind('<<run-module-event-2>>', self._run_module_event)
+
+    def check_module_event(self, event):
+        filename = self.getfilename()
+        if not filename:
+            return 'break'
+        if not self.checksyntax(filename):
+            return 'break'
+        if not self.tabnanny(filename):
+            return 'break'
+
+    def tabnanny(self, filename):
+        f = open(filename, 'r')
+        try:
+            tabnanny.process_tokens(tokenize.generate_tokens(f.readline))
+        except tokenize.TokenError as msg:
+            msgtxt, (lineno, start) = msg.args
+            self.editwin.gotoline(lineno)
+            self.errorbox("Tabnanny Tokenizing Error",
+                          "Token Error: %s" % msgtxt)
+            return False
+        except tabnanny.NannyNag as nag:
+            # The error messages from tabnanny are too confusing...
+            self.editwin.gotoline(nag.get_lineno())
+            self.errorbox("Tab/space error", indent_message)
+            return False
+        return True
+
+    def checksyntax(self, filename):
+        self.shell = shell = self.flist.open_shell()
+        saved_stream = shell.get_warning_stream()
+        shell.set_warning_stream(shell.stderr)
+        with open(filename, 'r') as f:
+            source = f.read()
+        if '\r' in source:
+            source = re.sub(r"\r\n", "\n", source)
+            source = re.sub(r"\r", "\n", source)
+        if source and source[-1] != '\n':
+            source = source + '\n'
+        text = self.editwin.text
+        text.tag_remove("ERROR", "1.0", "end")
+        try:
+            try:
+                # If successful, return the compiled code
+                return compile(source, filename, "exec")
+            except (SyntaxError, OverflowError, ValueError) as err:
+                try:
+                    msg, (errorfilename, lineno, offset, line) = err
+                    if not errorfilename:
+                        err.args = msg, (filename, lineno, offset, line)
+                        err.filename = filename
+                    self.colorize_syntax_error(msg, lineno, offset)
+                except:
+                    msg = "*** " + str(err)
+                self.errorbox("Syntax error",
+                              "There's an error in your program:\n" + msg)
+                return False
+        finally:
+            shell.set_warning_stream(saved_stream)
+
+    def colorize_syntax_error(self, msg, lineno, offset):
+        text = self.editwin.text
+        pos = "0.0 + %d lines + %d chars" % (lineno-1, offset-1)
+        text.tag_add("ERROR", p

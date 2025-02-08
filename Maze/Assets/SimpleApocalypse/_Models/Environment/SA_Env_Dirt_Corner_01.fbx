@@ -1,0 +1,530 @@
+  UErrorCode status = U_ZERO_ERROR;
+    StringEnumeration *mzIDs = getAvailableMetaZoneIDs(tzCanonicalID, status);
+    if (U_SUCCESS(status) && mzIDs != NULL) {
+        const UnicodeString *mzID;
+        while ((mzID = mzIDs->snext(status))) {
+            if (U_FAILURE(status)) {
+                break;
+            }
+            loadMetaZoneNames(*mzID);
+        }
+        delete mzIDs;
+    }
+}
+
+TimeZoneNamesImpl::~TimeZoneNamesImpl() {
+    cleanup();
+}
+
+void
+TimeZoneNamesImpl::cleanup() {
+    if (fZoneStrings != NULL) {
+        ures_close(fZoneStrings);
+        fZoneStrings = NULL;
+    }
+    if (fMZNamesMap != NULL) {
+        uhash_close(fMZNamesMap);
+        fMZNamesMap = NULL;
+    }
+    if (fTZNamesMap != NULL) {
+        uhash_close(fTZNamesMap);
+        fTZNamesMap = NULL;
+    }
+}
+
+UBool
+TimeZoneNamesImpl::operator==(const TimeZoneNames& other) const {
+    if (this == &other) {
+        return TRUE;
+    }
+    // No implementation for now
+    return FALSE;
+}
+
+TimeZoneNames*
+TimeZoneNamesImpl::clone() const {
+    UErrorCode status = U_ZERO_ERROR;
+    return new TimeZoneNamesImpl(fLocale, status);
+}
+
+StringEnumeration*
+TimeZoneNamesImpl::getAvailableMetaZoneIDs(UErrorCode& status) const {
+    if (U_FAILURE(status)) {
+        return NULL;
+    }
+    const UVector* mzIDs = ZoneMeta::getAvailableMetazoneIDs();
+    if (mzIDs == NULL) {
+        return new MetaZoneIDsEnumeration();
+    }
+    return new MetaZoneIDsEnumeration(*mzIDs);
+}
+
+StringEnumeration*
+TimeZoneNamesImpl::getAvailableMetaZoneIDs(const UnicodeString& tzID, UErrorCode& status) const {
+    if (U_FAILURE(status)) {
+        return NULL;
+    }
+    const UVector* mappings = ZoneMeta::getMetazoneMappings(tzID);
+    if (mappings == NULL) {
+        return new MetaZoneIDsEnumeration();
+    }
+
+    MetaZoneIDsEnumeration *senum = NULL;
+    UVector* mzIDs = new UVector(NULL, uhash_compareUChars, status);
+    if (mzIDs == NULL) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+    }
+    if (U_SUCCESS(status)) {
+        U_ASSERT(mzIDs != NULL);
+        for (int32_t i = 0; U_SUCCESS(status) && i < mappings->size(); i++) {
+
+            OlsonToMetaMappingEntry *map = (OlsonToMetaMappingEntry *)mappings->elementAt(i);
+            const UChar *mzID = map->mzid;
+            if (!mzIDs->contains((void *)mzID)) {
+                mzIDs->addElement((void *)mzID, status);
+            }
+        }
+        if (U_SUCCESS(status)) {
+            senum = new MetaZoneIDsEnumeration(mzIDs);
+        } else {
+            delete mzIDs;
+        }
+    }
+    return senum;
+}
+
+UnicodeString&
+TimeZoneNamesImpl::getMetaZoneID(const UnicodeString& tzID, UDate date, UnicodeString& mzID) const {
+    ZoneMeta::getMetazoneID(tzID, date, mzID);
+    return mzID;
+}
+
+UnicodeString&
+TimeZoneNamesImpl::getReferenceZoneID(const UnicodeString& mzID, const char* region, UnicodeString& tzID) const {
+    ZoneMeta::getZoneIdByMetazone(mzID, UnicodeString(region, -1, US_INV), tzID);
+    return tzID;
+}
+
+UnicodeString&
+TimeZoneNamesImpl::getMetaZoneDisplayName(const UnicodeString& mzID,
+                                          UTimeZoneNameType type,
+                                          UnicodeString& name) const {
+    name.setToBogus();  // cleanup result.
+    if (mzID.isEmpty()) {
+        return name;
+    }
+
+    ZNames *znames = NULL;
+    TimeZoneNamesImpl *nonConstThis = const_cast<TimeZoneNamesImpl *>(this);
+
+    umtx_lock(&gLock);
+    {
+        znames = nonConstThis->loadMetaZoneNames(mzID);
+    }
+    umtx_unlock(&gLock);
+
+    if (znames != NULL) {
+        const UChar* s = znames->getName(type);
+        if (s != NULL) {
+            name.setTo(TRUE, s, -1);
+        }
+    }
+    return name;
+}
+
+UnicodeString&
+TimeZoneNamesImpl::getTimeZoneDisplayName(const UnicodeString& tzID, UTimeZoneNameType type, UnicodeString& name) const {
+    name.setToBogus();  // cleanup result.
+    if (tzID.isEmpty()) {
+        return name;
+    }
+
+    TZNames *tznames = NULL;
+    TimeZoneNamesImpl *nonConstThis = const_cast<TimeZoneNamesImpl *>(this);
+
+    umtx_lock(&gLock);
+    {
+        tznames = nonConstThis->loadTimeZoneNames(tzID);
+    }
+    umtx_unlock(&gLock);
+
+    if (tznames != NULL) {
+        const UChar *s = tznames->getName(type);
+        if (s != NULL) {
+            name.setTo(TRUE, s, -1);
+        }
+    }
+    return name;
+}
+
+UnicodeString&
+TimeZoneNamesImpl::getExemplarLocationName(const UnicodeString& tzID, UnicodeString& name) const {
+    name.setToBogus();  // cleanup result.
+    const UChar* locName = NULL;
+    TZNames *tznames = NULL;
+    TimeZoneNamesImpl *nonConstThis = const_cast<TimeZoneNamesImpl *>(this);
+
+    umtx_lock(&gLock);
+    {
+        tznames = nonConstThis->loadTimeZoneNames(tzID);
+    }
+    umtx_unlock(&gLock);
+
+    if (tznames != NULL) {
+        locName = tznames->getName(UTZNM_EXEMPLAR_LOCATION);
+    }
+    if (locName != NULL) {
+        name.setTo(TRUE, locName, -1);
+    }
+
+    return name;
+}
+
+
+// Merge the MZ_PREFIX and mzId
+static void mergeTimeZoneKey(const UnicodeString& mzID, char* result) {
+    if (mzID.isEmpty()) {
+        result[0] = '\0';
+        return;
+    }
+
+    char mzIdChar[ZID_KEY_MAX + 1];
+    int32_t keyLen;
+    int32_t prefixLen = uprv_strlen(gMZPrefix);
+    keyLen = mzID.extract(0, mzID.length(), mzIdChar, ZID_KEY_MAX + 1, US_INV);
+    uprv_memcpy((void *)result, (void *)gMZPrefix, prefixLen);
+    uprv_memcpy((void *)(result + prefixLen), (void *)mzIdChar, keyLen);
+    result[keyLen + prefixLen] = '\0';
+}
+
+/*
+ * This method updates the cache and must be called with a lock
+ */
+ZNames*
+TimeZoneNamesImpl::loadMetaZoneNames(const UnicodeString& mzID) {
+    if (mzID.length() > (ZID_KEY_MAX - MZ_PREFIX_LEN)) {
+        return NULL;
+    }
+
+    ZNames *znames = NULL;
+
+    UErrorCode status = U_ZERO_ERROR;
+    UChar mzIDKey[ZID_KEY_MAX + 1];
+    mzID.extract(mzIDKey, ZID_KEY_MAX + 1, status);
+    U_ASSERT(status == U_ZERO_ERROR);   // already checked length above
+    mzIDKey[mzID.length()] = 0;
+
+    void *cacheVal = uhash_get(fMZNamesMap, mzIDKey);
+    if (cacheVal == NULL) {
+        char key[ZID_KEY_MAX + 1];
+        mergeTimeZoneKey(mzID, key);
+        znames = ZNames::createInstance(fZoneStrings, key);
+
+        if (znames == NULL) {
+            cacheVal = (void *)EMPTY;
+        } else {
+            cacheVal = znames;
+        }
+        // Use the persistent ID as the resource key, so we can
+        // avoid duplications.
+        const UChar* newKey = ZoneMeta::findMetaZoneID(mzID);
+        if (newKey != NULL) {
+            uhash_put(fMZNamesMap, (void *)newKey, cacheVal, &status);
+            if (U_FAILURE(status)) {
+                if (znames != NULL) {
+                    delete znames;
+                }
+            } else if (znames != NULL) {
+                // put the name info into the trie
+                for (int32_t i = 0; ALL_NAME_TYPES[i] != UTZNM_UNKNOWN; i++) {
+                    const UChar* name = znames->getName(ALL_NAME_TYPES[i]);
+                    if (name != NULL) {
+                        ZNameInfo *nameinfo = (ZNameInfo *)uprv_malloc(sizeof(ZNameInfo));
+                        if (nameinfo != NULL) {
+                            nameinfo->type = ALL_NAME_TYPES[i];
+                            nameinfo->tzID = NULL;
+                            nameinfo->mzID = newKey;
+                            fNamesTrie.put(name, nameinfo, status);
+                        }
+                    }
+                }
+            }
+
+        } else {
+            // Should never happen with a valid input
+            if (znames != NULL) {
+                // It's not possible that we get a valid ZNames with unknown ID.
+                // But just in case..
+                delete znames;
+                znames = NULL;
+            }
+        }
+    } else if (cacheVal != EMPTY) {
+        znames = (ZNames *)cacheVal;
+    }
+
+    return znames;
+}
+
+/*
+ * This method updates the cache and must be called with a lock
+ */
+TZNames*
+TimeZoneNamesImpl::loadTimeZoneNames(const UnicodeString& tzID) {
+    if (tzID.length() > ZID_KEY_MAX) {
+        return NULL;
+    }
+
+    TZNames *tznames = NULL;
+
+    UErrorCode status = U_ZERO_ERROR;
+    UChar tzIDKey[ZID_KEY_MAX + 1];
+    int32_t tzIDKeyLen = tzID.extract(tzIDKey, ZID_KEY_MAX + 1, status);
+    U_ASSERT(status == U_ZERO_ERROR);   // already checked length above
+    tzIDKey[tzIDKeyLen] = 0;
+
+    void *cacheVal = uhash_get(fTZNamesMap, tzIDKey);
+    if (cacheVal == NULL) {
+        char key[ZID_KEY_MAX + 1];
+        UErrorCode status = U_ZERO_ERROR;
+        // Replace "/" with ":".
+        UnicodeString uKey(tzID);
+        for (int32_t i = 0; i < uKey.length(); i++) {
+            if (uKey.charAt(i) == (UChar)0x2F) {
+                uKey.setCharAt(i, (UChar)0x3A);
+            }
+        }
+        uKey.extract(0, uKey.length(), key, sizeof(key), US_INV);
+        tznames = TZNames::createInstance(fZoneStrings, key, tzID);
+
+        if (tznames == NULL) {
+            cacheVal = (void *)EMPTY;
+        } else {
+            cacheVal = tznames;
+        }
+        // Use the persistent ID as the resource key, so we can
+        // avoid duplications.
+        const UChar* newKey = ZoneMeta::findTimeZoneID(tzID);
+        if (newKey != NULL) {
+            uhash_put(fTZNamesMap, (void *)newKey, cacheVal, &status);
+            if (U_FAILURE(status)) {
+                if (tznames != NULL) {
+                    delete tznames;
+                }
+            } else if (tznames != NULL) {
+                // put the name info into the trie
+                for (int32_t i = 0; ALL_NAME_TYPES[i] != UTZNM_UNKNOWN; i++) {
+                    const UChar* name = tznames->getName(ALL_NAME_TYPES[i]);
+                    if (name != NULL) {
+                        ZNameInfo *nameinfo = (ZNameInfo *)uprv_malloc(sizeof(ZNameInfo));
+                        if (nameinfo != NULL) {
+                            nameinfo->type = ALL_NAME_TYPES[i];
+                            nameinfo->tzID = newKey;
+                            nameinfo->mzID = NULL;
+                            fNamesTrie.put(name, nameinfo, status);
+                        }
+                    }
+                }
+            }
+        } else {
+            // Should never happen with a valid input
+            if (tznames != NULL) {
+                // It's not possible that we get a valid TZNames with unknown ID.
+                // But just in case..
+                delete tznames;
+                tznames = NULL;
+            }
+        }
+    } else if (cacheVal != EMPTY) {
+        tznames = (TZNames *)cacheVal;
+    }
+
+    return tznames;
+}
+
+TimeZoneNames::MatchInfoCollection*
+TimeZoneNamesImpl::find(const UnicodeString& text, int32_t start, uint32_t types, UErrorCode& status) const {
+    ZNameSearchHandler handler(types);
+
+    TimeZoneNamesImpl *nonConstThis = const_cast<TimeZoneNamesImpl *>(this);
+
+    umtx_lock(&gLock);
+    {
+        fNamesTrie.search(text, start, (TextTrieMapSearchResultHandler *)&handler, status);
+    }
+    umtx_unlock(&gLock);
+
+    if (U_FAILURE(status)) {
+        return NULL;
+    }
+
+    int32_t maxLen = 0;
+    TimeZoneNames::MatchInfoCollection* matches = handler.getMatches(maxLen);
+    if (matches != NULL && ((maxLen == (text.length() - start)) || fNamesTrieFullyLoaded)) {
+        // perfect match
+        return matches;
+    }
+
+    delete matches;
+
+    // All names are not yet loaded into the trie
+    umtx_lock(&gLock);
+    {
+        if (!fNamesTrieFullyLoaded) {
+            const UnicodeString *id;
+
+            // load strings for all zones
+            StringEnumeration *tzIDs = TimeZone::createTimeZoneIDEnumeration(UCAL_ZONE_TYPE_CANONICAL, NULL, NULL, status);
+            if (U_SUCCESS(status)) {
+                while ((id = tzIDs->snext(status))) {
+                    if (U_FAILURE(status)) {
+                        break;
+                    }
+                    // loadStrings also load related metazone strings
+                    nonConstThis->loadStrings(*id);
+                }
+            }
+            if (tzIDs != NULL) {
+                delete tzIDs;
+            }
+            if (U_SUCCESS(status)) {
+                nonConstThis->fNamesTrieFullyLoaded = TRUE;
+            }
+        }
+    }
+    umtx_unlock(&gLock);
+
+    if (U_FAILURE(status)) {
+        return NULL;
+    }
+
+    umtx_lock(&gLock);
+    {
+        // now try it again
+        fNamesTrie.search(text, start, (TextTrieMapSearchResultHandler *)&handler, status);
+    }
+    umtx_unlock(&gLock);
+
+    return handler.getMatches(maxLen);
+}
+
+static const UChar gEtcPrefix[]         = { 0x45, 0x74, 0x63, 0x2F }; // "Etc/"
+static const int32_t gEtcPrefixLen      = 4;
+static const UChar gSystemVPrefix[]     = { 0x53, 0x79, 0x73, 0x74, 0x65, 0x6D, 0x56, 0x2F }; // "SystemV/
+static const int32_t gSystemVPrefixLen  = 8;
+static const UChar gRiyadh8[]           = { 0x52, 0x69, 0x79, 0x61, 0x64, 0x68, 0x38 }; // "Riyadh8"
+static const int32_t gRiyadh8Len       = 7;
+
+UnicodeString& U_EXPORT2
+TimeZoneNamesImpl::getDefaultExemplarLocationName(const UnicodeString& tzID, UnicodeString& name) {
+    if (tzID.isEmpty() || tzID.startsWith(gEtcPrefix, gEtcPrefixLen)
+        || tzID.startsWith(gSystemVPrefix, gSystemVPrefixLen) || tzID.indexOf(gRiyadh8, gRiyadh8Len, 0) > 0) {
+        name.setToBogus();
+        return name;
+    }
+
+    int32_t sep = tzID.lastIndexOf((UChar)0x2F /* '/' */);
+    if (sep > 0 && sep + 1 < tzID.length()) {
+        name.setTo(tzID, sep + 1);
+        name.findAndReplace(UnicodeString((UChar)0x5f /* _ */),
+                            UnicodeString((UChar)0x20 /* space */));
+    } else {
+        name.setToBogus();
+    }
+    return name;
+}
+
+U_NAMESPACE_END
+
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+//eof
+                                                                                                                                                                                                                                                                               ú¢E4©ö6>ûë˜Á,À›“\ÆbÄY¬ÿU¸üË¨±È\[_Ø‰D@µŞ­!ï×‰•Â…\ĞµUúõû=h‘jZ%"åöieÑ¶¾{"LèÁ»ÏNO¶hÁFMø;ì§fşXƒÙ`:¬sAÂJšÛüİ.ÿ´pmK
+T½=VŸüµG‰¯£Qæ‰åhò¯İŠÒ’Ó~•ŠƒóŒBÔÄì”CE«8şÊVÆ74- &	Á®—O!jU‰§— ûY–«[ô$;ò .î‚%I¾ú¾öñ·Å™xîŞ|¶Ğ/ñ±£jø­®ÀŠ;lŠ«dÎrHÜ±„}Úáèîö­H7£*ƒG¡ù*#\ĞB…ÒË™u” ?€‡û9«CQ@}~È0KšX<Íã@$¾ïK ÿ{Û‚aû?:T³ø4
+–øÚMåÓÑåõ^E`•ÌMd51®­	uøQ?jJGêı­aÛŒØş’ğª†2O½»–„ÎIú"_YiR×ğ¤”u'_Œ2íAqJàw]^ X.¶onÑÒ‘ç§B)¿!&š(ÉüÑ/CÈÉÈ°ÚÒf•>0¨¦"Íò¼xÒ,z‡’?ynşù*ŞKwvØ^ÈçPí’ßF{ƒåo/æBX­Ç®ßşxégÈuqÄÄßã”ŞĞSÇØBFì]]$)JëÊ–'êmˆİìø×Ò¼.æã¥)k$îog—Sd^m™WB+G©.WQÎP9^©€QèT4ÅWÿğV{›ïıd–Wª)bŒœ×`²7%[˜÷ÊÚñêëiSG~œ'@É7ë=¥úöÄÁ)õØ\7¸¹ê¥EïqÅ†nën¯JÜ‰„xëºŒŞÛ_ô”VDbSS¶uÚ;äiJ™Àğ~ñ–ÜVñ?D …ê}8b|¸Š	ükvĞ"†İÃ‡;)- ë86ø­çiÜJVbr¶.l
+—½Rf‰«šˆïeBíÏÕÛì¹²
+ô.¯ñ=ŞXåÙ¾Ñ×yù`@a¾`½%gZíHºï|“t#6?’µŒ“ĞÏø=v€ª	%&Øi÷¤«ö<X¿âÊ33†Üİ¬‘[BÁÁ‡$ÎˆUçƒØİ-Ótg
+ëcZºs4³Å ‚JŒÌGÑùadÅƒM¨=‚Î2•ü>–J=>¶kdÙâ'nŒLm$Ğg8ÆV$±¸ /s5f—ÜÏ¹MêÁ'­è>³í_´HZ7û´kRã·|ÆvÄÎä¾$ˆ7øjSÈõØ…nË1
+SşJ#–Ğƒ—hé“m¾$GÜ/:¤+ÂÓ
+öTÖœ,‚Şf¾ÕY@g"q
+j¯M¾/áÓMP‡wíe·ÃÈnò~i¢,‚íN÷Úøzç ;Â0áÖ…•%4Z¬/*¶Rc¹¤«Ø`û&/´ªHv]É¿OÄ]¯ŸÃåÎª¤B•õSJ>Õƒ2¹KuúâI¬ğ ätğ`¸ÔËª6—µÓøk¤1c	óbµFî‚IL¦¹CÊöÿbHw'ÛZóiÉo:yœ*Q4zc“M`£!·é–ô%NğWI¡u¹ùëc£æ0Š’ı9>Äéß{¹\#Âân€<—WŠ¡ıšƒk?B¡IÎ4Õ
+ÍIãWCõ×ø¨Ş¡1vúno€Ü`§“­‹òújóè=9ã·Ôß%ñ|¹!¾ ¶/ 	jrEfi!xİnîrO
+&»¥Éa³³KQôö£ÅôO/×˜‘ı`„ÕÃ>÷Ü»ÑZ´‰•ˆ™óòÈñˆ#º-,Â«èXvÏ±;.)ëG°Ò;<LbÒ©†İ…3Ğ"Cm³d=ùÊmDÙE¯]%ÑÇörkâ1—æí9µÔµ°yº`}ÇÆ7JÕ.F¾%Õgñ¸?RŠ%ì˜ùC;Ür³/¯Ÿ“yàë.CÍ7U.ŠCP‹Ñ#lú>Å-wóC=*³jèh•°:0ù?i²`éŠu€š±»kFŸSqf¢ß4›çÀBœiÕ«	¶¬6Á¨»js”äø˜“s¡~PØxæ³©q#cÍˆû—<Q[!ûbçj}RVÅõå‚Êô(º5/{,K§¢ÈKÅT/og"e¼³3çb¨le=”kQ~pß rò"Áğğß€¸gÖÈbX„¹ˆ¨îº½ ¼÷\³yú}À3ŸÔloAğg7kCÜ„:–A¼æ»›Nùá¾ ·5ò™^âo_ˆ9ÀÊ²mëw¶ˆ”–FÖ¿„Àk‰Óq¢NË¨ó&Øô[ü}WÕÆ­êŸtß³ë˜³ıxï­µŸÓçëL3 QQ"°æĞŒ:¶‚È…RO-¡ö€šåH«‡ÛqT¹#ó,Z.Î‹a!)àK1[]AÄØÔFøAbÃ% B·‡y2»PõOäí‚9€yjšª«°—R¢€I©DD2í!À³Óì—V' ¸H†C-‡gƒM	˜ ûæÊ²O2'œW?]U]HßAhB•šSt­¦—ZAò©€Ğ`§‚Ôu¸•(\‰Ku¥×ŠZ6}Ã;)/è~näi;@­^Ø’/†;qˆAEmCˆaİä’väk_aq^° ¿ÇZ%ò6®î¢ğ&¼)H%«Uu.b(OTï}·z
+x³¬ ¨“˜<ß_ÓŠ// Copyright (c) 2014 Marshall A. Greenblatt. Portions copyright (c) 2011
+// Google Inc. All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are
+// met:
+//
+//    * Redistributions of source code must retain the above copyright
+// notice, this list of conditions and the following disclaimer.
+//    * Redistributions in binary form must reproduce the above
+// copyright notice, this list of conditions and the following disclaimer
+// in the documentation and/or other materials provided with the
+// distribution.
+//    * Neither the name of Google Inc. nor the name Chromium Embedded
+// Framework nor the names of its contributors may be used to endorse
+// or promote products derived from this software without specific prior
+// written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+// A Tuple is a generic templatized container, similar in concept to std::pair.
+// There are classes Tuple0 to Tuple6, cooresponding to the number of elements
+// it contains.  The convenient MakeTuple() function takes 0 to 6 arguments,
+// and will construct and return the appropriate Tuple object.  The functions
+// DispatchToMethod and DispatchToFunction take a function pointer or instance
+// and method pointer, and unpack a tuple into arguments to the call.
+//
+// Tuple elements are copied by value, and stored in the tuple.  See the unit
+// tests for more details of how/when the values are copied.
+//
+// Example usage:
+//   // These two methods of creating a Tuple are identical.
+//   Tuple2<int, const char*> tuple_a(1, "wee");
+//   Tuple2<int, const char*> tuple_b = MakeTuple(1, "wee");
+//
+//   void SomeFunc(int a, const char* b) { }
+//   DispatchToFunction(&SomeFunc, tuple_a);  // SomeFunc(1, "wee")
+//   DispatchToFunction(
+//       &SomeFunc, MakeTuple(10, "foo"));    // SomeFunc(10, "foo")
+//
+//   struct { void SomeMeth(int a, int b, int c) { } } foo;
+//   DispatchToMethod(&foo, &Foo::SomeMeth, MakeTuple(1, 2, 3));
+//   // foo->SomeMeth(1, 2, 3);
+
+#ifndef CEF_INCLUDE_BASE_CEF_TUPLE_H_
+#define CEF_INCLUDE_BASE_CEF_TUPLE_H_
+#pragma once
+
+#if defined(BASE_TUPLE_H_)
+// The Chromium header has already been included.
+// This can happen in cases where Chromium code is used directly by the
+// client application. When using Chromium code directly always include
+// the Chromium header first to avoid type conflicts.
+
+// For legacy compatibility, we name the first 8 tuple elements "a", "b", ...
+// TODO(cef): Remove this code when cef_runnable.h is deleted.
+
+namespace base {
+
+#define DEFINE_TUPLE_LEAF(N, x)                                        \
+  template <typename T>                                                \
+  struct TupleLeaf<N, T> {                                             \
+    TupleLeaf() {}                                                     \
+    explicit TupleLeaf(typename TupleTraits<T>::ParamType x) : x(x) {} \
+                                                                       \
+    T& get() { return x; }                                             \
+    const T& get() const { return x; }            

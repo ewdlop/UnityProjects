@@ -1,0 +1,255 @@
+nfo.Utc, null);
+			}
+
+			[Test (Description="Fix for xambug https://bugzilla.xamarin.com/show_bug.cgi?id=17155")]
+			public void ConvertTime_AdjustmentRuleAfterNewYears ()
+			{
+				TimeZoneInfo tz = TimeZoneInfo.FindSystemTimeZoneById (MapTimeZoneId ("Pacific/Auckland"));
+
+				// DST start: 9/29/2013 2:00:00 AM
+				// DST end: 4/6/2014 3:00:00 AM
+				DateTime sdt = new DateTime (2014, 1, 9, 23, 0, 0, DateTimeKind.Utc);
+				DateTime ddt = TimeZoneInfo.ConvertTime (sdt, tz);
+				Assert.AreEqual (10, ddt.Day, "#1.1");
+				Assert.AreEqual (1, ddt.Month, "#1.2");
+				Assert.AreEqual (2014, ddt.Year, "#1.3");
+				Assert.AreEqual (12, ddt.Hour, "#1.4");
+				Assert.AreEqual (0, ddt.Minute, "#1.5");
+				Assert.AreEqual (0, ddt.Second, "#1.6");
+				
+				// DST start: 9/29/2014 2:00:00 AM
+				// DST end: 4/6/2015 3:00:00 AM
+				sdt = new DateTime (2014, 6, 9, 23, 0, 0, DateTimeKind.Utc);
+				ddt = TimeZoneInfo.ConvertTime (sdt, tz);
+				Assert.AreEqual (10, ddt.Day, "#2.1");
+				Assert.AreEqual (6, ddt.Month, "#2.2");
+				Assert.AreEqual (2014, ddt.Year, "#2.3");
+				Assert.AreEqual (11, ddt.Hour, "#2.4");
+				Assert.AreEqual (0, ddt.Minute, "#2.5");
+				Assert.AreEqual (0, ddt.Second, "#2.6");
+				
+				// DST start: 9/29/2014 2:00:00 AM
+				// DST end: 4/6/2015 3:00:00 AM
+				sdt = new DateTime (2014, 10, 9, 23, 0, 0, DateTimeKind.Utc);
+				ddt = TimeZoneInfo.ConvertTime (sdt, tz);
+				Assert.AreEqual (10, ddt.Day, "#3.1");
+				Assert.AreEqual (10, ddt.Month, "#3.2");
+				Assert.AreEqual (2014, ddt.Year, "#3.3");
+				Assert.AreEqual (12, ddt.Hour, "#3.4");
+				Assert.AreEqual (0, ddt.Minute, "#3.5");
+				Assert.AreEqual (0, ddt.Second, "#3.6");
+			}
+
+			[Test (Description="Fix the bug https://bugzilla.xamarin.com/show_bug.cgi?id=1849")]
+			public void ConvertTime_AjustmentConvertTimeWithSourceTimeZone () {
+				
+				TimeZoneInfo easternTimeZone = TimeZoneInfo.FindSystemTimeZoneById (MapTimeZoneId ("America/New_York"));
+				TimeZoneInfo pacificTimeZone = TimeZoneInfo.FindSystemTimeZoneById (MapTimeZoneId ("America/Los_Angeles"));
+
+				DateTime lastMidnight = new DateTime (new DateTime (2012, 06, 13).Ticks, DateTimeKind.Unspecified);
+				DateTime lastMidnightAsEST = TimeZoneInfo.ConvertTime (lastMidnight, pacificTimeZone, easternTimeZone);
+				DateTime lastMidnightAsPST = TimeZoneInfo.ConvertTime (lastMidnightAsEST, easternTimeZone, pacificTimeZone);
+			
+				// Last midnight in PST as EST should be 3AM
+				DateTime expectedDate = new DateTime (2012, 06, 13, 3, 0, 0);
+
+				Assert.AreEqual (expectedDate, lastMidnightAsEST);
+				Assert.AreEqual (lastMidnight, lastMidnightAsPST);
+			}
+
+			[Test]
+			public void ConvertTimeBySystemTimeZoneId_UtcId ()
+			{
+				DateTime localTime = TimeZoneInfo.ConvertTime (DateTime.UtcNow, TimeZoneInfo.Utc, TimeZoneInfo.Local);
+
+				TimeZoneInfo.ConvertTimeBySystemTimeZoneId (DateTime.UtcNow, TimeZoneInfo.Utc.Id, TimeZoneInfo.Local.Id);
+			}
+		}
+		
+		[TestFixture]
+		[Category ("NotWasm")]
+		public class IsInvalidTimeTests
+		{
+			TimeZoneInfo london;
+		
+			[SetUp]
+			public void CreateTimeZones ()
+			{
+				TimeZoneInfo.TransitionTime start = TimeZoneInfo.TransitionTime.CreateFloatingDateRule (new DateTime (1,1,1,1,0,0), 3, 5, DayOfWeek.Sunday);
+				TimeZoneInfo.TransitionTime end = TimeZoneInfo.TransitionTime.CreateFloatingDateRule (new DateTime (1,1,1,2,0,0), 10, 5, DayOfWeek.Sunday);
+				TimeZoneInfo.AdjustmentRule rule = TimeZoneInfo.AdjustmentRule.CreateAdjustmentRule (DateTime.MinValue.Date, DateTime.MaxValue.Date, new TimeSpan (1,0,0), start, end);
+				london = TimeZoneInfo.CreateCustomTimeZone ("Europe/London", new TimeSpan (0), "Europe/London", "British Standard Time", "British Summer Time", new TimeZoneInfo.AdjustmentRule [] {rule});
+			}
+		
+		#if SLOW_TESTS
+			[Test]
+			public void UTCDate ()
+			{
+				for (DateTime date = new DateTime (2007, 01, 01, 0, 0, 0); date < new DateTime (2007, 12, 31, 23, 59, 59); date += new TimeSpan (0,1,0)) {
+					date = DateTime.SpecifyKind (date, DateTimeKind.Utc);
+					Assert.IsFalse (london.IsInvalidTime (date));
+				}
+			}
+		#endif
+			[Test]
+			public void InvalidDates ()
+			{
+				Assert.IsFalse (london.IsInvalidTime (new DateTime (2007, 03, 25, 0, 59, 59)));
+				Assert.IsTrue (london.IsInvalidTime (new DateTime (2007, 03, 25, 1, 0, 0)));
+				Assert.IsTrue (london.IsInvalidTime (new DateTime (2007, 03, 25, 1, 59, 59)));
+				Assert.IsFalse (london.IsInvalidTime (new DateTime (2007, 03, 25, 2, 0, 0)));
+			}
+		}
+		
+		[TestFixture]
+		[Category ("NotWasm")]
+		public class IsAmbiguousTimeTests
+		{
+			TimeZoneInfo london;
+		
+			[SetUp]
+			public void CreateTimeZones ()
+			{
+				TimeZoneInfo.TransitionTime start = TimeZoneInfo.TransitionTime.CreateFloatingDateRule (new DateTime (1,1,1,1,0,0), 3, 5, DayOfWeek.Sunday);
+				TimeZoneInfo.TransitionTime end = TimeZoneInfo.TransitionTime.CreateFloatingDateRule (new DateTime (1,1,1,2,0,0), 10, 5, DayOfWeek.Sunday);
+				TimeZoneInfo.AdjustmentRule rule = TimeZoneInfo.AdjustmentRule.CreateAdjustmentRule (DateTime.MinValue.Date, DateTime.MaxValue.Date, new TimeSpan (1,0,0), start, end);
+				london = TimeZoneInfo.CreateCustomTimeZone ("Europe/London", new TimeSpan (0), "Europe/London", "British Standard Time", "British Summer Time", new TimeZoneInfo.AdjustmentRule [] {rule});
+			}
+		
+			[Test]
+			[Category ("MobileNotWorking")]
+			public void AmbiguousDates ()
+			{
+				Assert.IsTrue (london.IsAmbiguousTime (new DateTime (2007, 10, 28, 1, 0, 0)));
+				Assert.IsTrue (london.IsAmbiguousTime (new DateTime (2007, 10, 28, 1, 0, 1)));
+				Assert.IsFalse (london.IsAmbiguousTime (new DateTime (2007, 10, 28, 2, 0, 0)));
+				Assert.IsFalse (london.IsAmbiguousTime (new DateTime (2007, 10, 28, 2, 0, 1)));
+			}
+		
+			[Test]
+			[Category ("MobileNotWorking")]
+			public void AmbiguousUTCDates ()
+			{
+				Assert.IsTrue (london.IsAmbiguousTime (new DateTime (2007, 10, 28, 0, 0, 0, DateTimeKind.Utc)));
+				Assert.IsTrue (london.IsAmbiguousTime (new DateTime (2007, 10, 28, 0, 0, 1, DateTimeKind.Utc)));
+				Assert.IsTrue (london.IsAmbiguousTime (new DateTime (2007, 10, 28, 0, 59, 59, DateTimeKind.Utc)));
+				Assert.IsTrue (london.IsAmbiguousTime (new DateTime (2007, 10, 28, 1, 0, 0, DateTimeKind.Utc)));
+			}
+		
+		#if SLOW_TESTS
+			[Test]
+			public void AmbiguousInUTC ()
+			{
+				for (DateTime date = new DateTime (2007, 01, 01, 0, 0, 0); date < new DateTime (2007, 12, 31, 23, 59, 59); date += new TimeSpan (0,1,0)) {
+					Assert.IsFalse (TimeZoneInfo.Utc.IsAmbiguousTime (date));
+				}
+			}
+		#endif
+		}
+		
+		[TestFixture]
+		[Category ("NotWasm")]
+		public class GetSystemTimeZonesTests
+		{
+			[Test]
+			public void Identity ()
+			{
+				Assert.AreSame (TimeZoneInfo.GetSystemTimeZones (), TimeZoneInfo.GetSystemTimeZones ());
+			}
+
+			[Test]
+			public void NotEmpty ()
+			{
+				global::System.Collections.ObjectModel.ReadOnlyCollection<TimeZoneInfo> systemTZ = TimeZoneInfo.GetSystemTimeZones ();
+				Assert.IsNotNull(systemTZ, "SystemTZ is null");
+				Assert.IsFalse (systemTZ.Count == 0, "SystemTZ is empty");
+			}
+		
+			[Test]
+			public void ContainsBrussels ()
+			{
+				global::System.Collections.ObjectModel.ReadOnlyCollection<TimeZoneInfo> systemTZ = TimeZoneInfo.GetSystemTimeZones ();
+				foreach (TimeZoneInfo tz in systemTZ) {
+					if (tz.Id == MapTimeZoneId ("Europe/Brussels"))
+						return;
+				}
+				Assert.Fail ("Europe/Brussels not found in SystemTZ");
+			}
+
+			[Test]
+			public void ReflectionReturnsTheCorrectMethod ()
+			{
+				var method = (MethodInfo) typeof (TimeZoneInfo).GetMember ("GetSystemTimeZones", MemberTypes.Method, BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)[0];
+
+				var timeZones = (global::System.Collections.ObjectModel.ReadOnlyCollection<TimeZoneInfo>) method.Invoke (null, null);
+				Assert.IsTrue (timeZones.Count > 0, "GetSystemTimeZones should not return an empty collection.");
+			}
+
+#if !MOBILE
+			[Test]
+			public void WindowsRegistryTimezoneWithParentheses ()
+			{
+				var memberInfos = typeof (TimeZoneInfo).GetMember ("TrimSpecial", MemberTypes.Method, BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+
+				if (memberInfos.Length == 0)
+					Assert.Ignore ("TrimSpecial method not found");
+
+				var name = ((MethodInfo)memberInfos[0]).Invoke (null, new object [] { " <--->  Central Standard Time (Mexico)   ||<<>>" });
+				Assert.AreEqual (name, "Central Standard Time (Mexico)", "#1");
+			}
+#endif
+		}
+		
+		[TestFixture]
+		[Category ("NotWasm")]
+		public class FindSystemTimeZoneByIdTests
+		{
+			[Test]
+			[ExpectedException (typeof (ArgumentNullException))]
+			public void NullId ()
+			{
+				TimeZoneInfo.FindSystemTimeZoneById (null);
+			}
+		
+			[Test]
+			[ExpectedException (typeof (TimeZoneNotFoundException))]
+			public void NonSystemTimezone ()
+			{
+				TimeZoneInfo.FindSystemTimeZoneById ("Neverland/The_Lagoon");
+			}
+		
+			[Test]
+			public void FindBrusselsTZ ()
+			{
+				TimeZoneInfo brussels = TimeZoneInfo.FindSystemTimeZoneById (MapTimeZoneId ("Europe/Brussels"));
+				Assert.IsNotNull (brussels);
+			}
+		
+			[Test]
+			public void OffsetIsCorrectInKinshasa ()
+			{
+				TimeZoneInfo kin = TimeZoneInfo.FindSystemTimeZoneById (MapTimeZoneId ("Africa/Kinshasa"));
+				Assert.AreEqual (new TimeSpan (1,0,0), kin.BaseUtcOffset, "BaseUtcOffset in Kinshasa is not +1h");
+			}
+		
+			[Test]
+			public void OffsetIsCorrectInBrussels ()
+			{
+				TimeZoneInfo brussels = TimeZoneInfo.FindSystemTimeZoneById (MapTimeZoneId ("Europe/Brussels"));
+				Assert.AreEqual (new TimeSpan (1,0,0), brussels.BaseUtcOffset, "BaseUtcOffset for Brussels is not +1h");
+			}
+		
+			[Test]
+			[Category ("MobileNotWorking")]
+			[Category ("NotOnWindows")]
+			public void DSTInKinshasa ()
+			{
+				TimeZoneInfo kin = TimeZoneInfo.FindSystemTimeZoneById (MapTimeZoneId ("Africa/Kinshasa"));
+				Assert.IsTrue (kin.SupportsDaylightSavingTime);
+			}
+		
+			[Test]
+			public void BrusselsSupportsDST ()
+			{
+				TimeZoneInfo brussels = TimeZoneInfo.FindSystemTimeZoneById (MapTimeZoneId ("Europe/Brussels"));
+				Assert.IsTrue (brus

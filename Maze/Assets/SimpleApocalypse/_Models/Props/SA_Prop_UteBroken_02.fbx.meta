@@ -1,0 +1,47 @@
+ssignEdge(CE->getOperand(1), CE);
+        break;
+
+      default:
+        llvm_unreachable("Unknown instruction type encountered!");
+      }
+    }
+  };
+
+  // Helper functions
+
+  // Determines whether or not we an instruction is useless to us (e.g.
+  // FenceInst)
+  static bool hasUsefulEdges(Instruction *Inst) {
+    bool IsNonInvokeRetTerminator = isa<TerminatorInst>(Inst) &&
+                                    !isa<InvokeInst>(Inst) &&
+                                    !isa<ReturnInst>(Inst);
+    return !isa<CmpInst>(Inst) && !isa<FenceInst>(Inst) &&
+           !IsNonInvokeRetTerminator;
+  }
+
+  void addArgumentToGraph(Argument &Arg) {
+    if (Arg.getType()->isPointerTy()) {
+      Graph.addNode(InstantiatedValue{&Arg, 0},
+                    getGlobalOrArgAttrFromValue(Arg));
+      // Pointees of a formal parameter is known to the caller
+      Graph.addNode(InstantiatedValue{&Arg, 1}, getAttrCaller());
+    }
+  }
+
+  // Given an Instruction, this will add it to the graph, along with any
+  // Instructions that are potentially only available from said Instruction
+  // For example, given the following line:
+  //   %0 = load i16* getelementptr ([1 x i16]* @a, 0, 0), align 2
+  // addInstructionToGraph would add both the `load` and `getelementptr`
+  // instructions to the graph appropriately.
+  void addInstructionToGraph(GetEdgesVisitor &Visitor, Instruction &Inst) {
+    if (!hasUsefulEdges(&Inst))
+      return;
+
+    Visitor.visit(Inst);
+  }
+
+  // Builds the graph needed for constructing the StratifiedSets for the given
+  // function
+  void buildGraphFrom(Function &Fn) {
+    GetEdgesVisitor Visitor(*this, Fn.

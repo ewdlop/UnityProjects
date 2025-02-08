@@ -1,0 +1,106 @@
+tRunnable(testMethod, "Method is abstract");
+            }
+
+            if (!testMethod.Method.IsPublic)
+            {
+                return MarkAsNotRunnable(testMethod, "Method is not public");
+            }
+
+#if NETCF
+            // TODO: Get this to work
+            if (testMethod.Method.IsGenericMethodDefinition)
+            {
+                return MarkAsNotRunnable(testMethod, "Generic test methods are not yet supported under .NET CF");
+            }
+#endif
+
+            ParameterInfo[] parameters = testMethod.Method.GetParameters();
+            int argsNeeded = parameters.Length;
+
+            object[] arglist = null;
+            int argsProvided = 0;
+
+            if (parms != null)
+            {
+                testMethod.parms = parms;
+                testMethod.RunState = parms.RunState;
+
+                arglist = parms.Arguments;
+
+                if (arglist != null)
+                    argsProvided = arglist.Length;
+
+                if (testMethod.RunState != RunState.Runnable)
+                    return false;
+            }
+
+            Type returnType = testMethod.Method.ReturnType;
+            if (returnType.Equals(typeof(void)))
+            {
+                if (parms != null && parms.HasExpectedResult)
+                    return MarkAsNotRunnable(testMethod, "Method returning void cannot have an expected result");
+            }
+            else
+            {
+#if NET_4_5
+                if (MethodHelper.IsAsyncMethod(testMethod.Method))
+                {
+                    bool returnsGenericTask = returnType.IsGenericType && returnType.GetGenericTypeDefinition() == typeof(Task<>);
+                    if (returnsGenericTask && (parms == null|| !parms.HasExpectedResult && !parms.ExceptionExpected))
+                        return MarkAsNotRunnable(testMethod, "Async test method must have Task or void return type when no result is expected");
+                    else if (!returnsGenericTask && parms != null && parms.HasExpectedResult)
+                        return MarkAsNotRunnable(testMethod, "Async test method must have Task<T> return type when a result is expected");
+                }
+                else 
+#endif
+                if (parms == null || !parms.HasExpectedResult && !parms.ExceptionExpected)
+                    return MarkAsNotRunnable(testMethod, "Method has non-void return value, but no result is expected");
+            }
+
+            if (argsProvided > 0 && argsNeeded == 0)
+            {
+                return MarkAsNotRunnable(testMethod, "Arguments provided for method not taking any");
+            }
+
+            if (argsProvided == 0 && argsNeeded > 0)
+            {
+                return MarkAsNotRunnable(testMethod, "No arguments were provided");
+            }
+
+            if (argsProvided != argsNeeded)
+            {
+                return MarkAsNotRunnable(testMethod, "Wrong number of arguments provided");
+            }
+
+#if CLR_2_0 || CLR_4_0
+#if !NETCF
+            if (testMethod.Method.IsGenericMethodDefinition)
+            {
+                Type[] typeArguments = GetTypeArgumentsForMethod(testMethod.Method, arglist);
+                foreach (object o in typeArguments)
+                    if (o == null)
+                    {
+                        return MarkAsNotRunnable(testMethod, "Unable to determine type arguments for method");
+                    }
+
+                testMethod.method = testMethod.Method.MakeGenericMethod(typeArguments);
+                parameters = testMethod.Method.GetParameters();
+           }
+#endif
+#endif
+
+           if (arglist != null && parameters != null)
+               TypeHelper.ConvertArgumentList(arglist, parameters);
+
+            return true;
+        }
+
+#if CLR_2_0 || CLR_4_0
+#if !NETCF
+        private static Type[] GetTypeArgumentsForMethod(MethodInfo method, object[] arglist)
+        {
+            Type[] typeParameters = method.GetGenericArguments();
+            Type[] typeArguments = new Type[typeParameters.Length];
+            ParameterInfo[] parameters = method.GetParameters();
+
+            fo

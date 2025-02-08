@@ -1,0 +1,50 @@
+//===- llvm/unittest/Support/BinaryStreamTest.cpp -------------------------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+
+#include "llvm/Support/BinaryByteStream.h"
+#include "llvm/Support/BinaryItemStream.h"
+#include "llvm/Support/BinaryStreamArray.h"
+#include "llvm/Support/BinaryStreamReader.h"
+#include "llvm/Support/BinaryStreamRef.h"
+#include "llvm/Support/BinaryStreamWriter.h"
+#include "llvm/Testing/Support/Error.h"
+
+#include "gtest/gtest.h"
+
+
+using namespace llvm;
+using namespace llvm::support;
+
+namespace {
+
+class BrokenStream : public WritableBinaryStream {
+public:
+  BrokenStream(MutableArrayRef<uint8_t> Data, endianness Endian,
+                      uint32_t Align)
+      : Data(Data), PartitionIndex(alignDown(Data.size() / 2, Align)),
+        Endian(Endian) {}
+
+  endianness getEndian() const override { return Endian; }
+
+  Error readBytes(uint32_t Offset, uint32_t Size,
+                  ArrayRef<uint8_t> &Buffer) override {
+    if (auto EC = checkOffsetForRead(Offset, Size))
+      return EC;
+    uint32_t S = startIndex(Offset);
+    auto Ref = Data.drop_front(S);
+    if (Ref.size() >= Size) {
+      Buffer = Ref.take_front(Size);
+      return Error::success();
+    }
+
+    uint32_t BytesLeft = Size - Ref.size();
+    uint8_t *Ptr = Allocator.Allocate<uint8_t>(Size);
+    ::memcpy(Ptr, Ref.data(), Ref.size());
+    ::memcpy(Ptr + Ref.size(), Data.data(), BytesLeft);
+    Buffer = m

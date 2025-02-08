@@ -1,0 +1,38 @@
+              {
+                    activityId = Guid.Empty;
+                    relatedActivityId = Guid.Empty;
+                    if (etwLog.Debug)
+                        etwLog.DebugFacilityMessage("OnStartRET", "Fail");
+                    return;
+                }
+                // Check for recursion, and force-stop any activities if the activity already started.
+                if ((options & EventActivityOptions.Recursive) == 0)
+                {
+                    ActivityInfo existingActivity = FindActiveActivity(fullActivityName, currentActivity);
+                    if (existingActivity != null)
+                    {
+                        // 
+                        OnStop(providerName, activityName, task, ref activityId);
+                        currentActivity = m_current.Value;
+                    }
+                }
+            }
+
+            // Get a unique ID for this activity.
+            long id;
+            if (currentActivity == null)
+                id = Interlocked.Increment(ref m_nextId);
+            else
+                id = Interlocked.Increment(ref currentActivity.m_lastChildID);
+
+            // The previous ID is my 'causer' and becomes my related activity ID
+            relatedActivityId = EventSource.CurrentThreadActivityId;
+
+            // Add to the list of started but not stopped activities. 
+            ActivityInfo newActivity = new ActivityInfo(fullActivityName, id, currentActivity, relatedActivityId, options);
+            m_current.Value = newActivity;
+
+            // Remember the current ID so we can log it 
+            activityId = newActivity.ActivityId;
+
+            if

@@ -1,0 +1,197 @@
+ (MapTimeZoneId (tzId));
+				Assert.IsFalse (tzi.IsDaylightSavingTime (dstDeltaStart), $"{tzId}: #1");
+				Assert.AreEqual (baseOffset, tzi.GetUtcOffset (dstDeltaStart), $"{tzId}: #2");
+
+				Assert.IsFalse (tzi.IsDaylightSavingTime (inDstDelta), $"{tzId}: #3");
+				Assert.AreEqual (baseOffset, tzi.GetUtcOffset (inDstDelta), $"{tzId}: #4");
+
+				Assert.IsTrue (tzi.IsDaylightSavingTime (dstDeltaEnd), $"{tzId}: #5");
+				Assert.AreEqual (dstOffset, tzi.GetUtcOffset (dstDeltaEnd), $"{tzId}: #6");
+			}
+		}
+
+		[TestFixture]
+		[Category ("NotWasm")]
+		public class ConvertTimeTests_LocalUtc : ConvertTimeTests
+		{
+			static TimeZoneInfo oldLocal;
+
+			[SetUp]
+			public void SetLocal ()
+			{
+				base.CreateTimeZones ();
+
+				oldLocal = TimeZoneInfo.Local;
+				TimeZoneInfoTest.SetLocal (TimeZoneInfo.GetSystemTimeZones().First(t => t.BaseUtcOffset == TimeSpan.Zero));
+			}
+
+			[TearDown]
+			public void RestoreLocal ()
+			{
+				TimeZoneInfoTest.SetLocal (oldLocal);
+			}
+		}
+
+		[TestFixture]
+		[Category ("NotWasm")]
+		public class ConvertTimeTests
+		{
+			TimeZoneInfo london;
+		
+			[SetUp]
+			public void CreateTimeZones ()
+			{
+				TimeZoneInfo.TransitionTime start = TimeZoneInfo.TransitionTime.CreateFloatingDateRule (new DateTime (1,1,1,1,0,0), 3, 5, DayOfWeek.Sunday);
+				TimeZoneInfo.TransitionTime end = TimeZoneInfo.TransitionTime.CreateFloatingDateRule (new DateTime (1,1,1,2,0,0), 10, 5, DayOfWeek.Sunday);
+				TimeZoneInfo.AdjustmentRule rule = TimeZoneInfo.AdjustmentRule.CreateAdjustmentRule (DateTime.MinValue.Date, DateTime.MaxValue.Date, new TimeSpan (1,0,0), start, end);
+				london = TimeZoneInfo.CreateCustomTimeZone ("Europe/London", new TimeSpan (0), "Europe/London", "British Standard Time", "British Summer Time", new TimeZoneInfo.AdjustmentRule [] {rule});
+			}
+		
+			[Test]
+			[ExpectedException (typeof (ArgumentException))]
+			public void ConvertFromUtc_KindIsLocalException ()
+			{
+				TimeZoneInfo.ConvertTimeFromUtc (new DateTime (2007, 5, 3, 11, 8, 0, DateTimeKind.Local), TimeZoneInfo.Local);	
+			}
+		
+			[Test]
+			[ExpectedException (typeof (ArgumentNullException))]
+			public void ConvertFromUtc_DestinationTimeZoneIsNullException ()
+			{
+				TimeZoneInfo.ConvertTimeFromUtc (new DateTime (2007, 5, 3, 11, 8, 0), null);		
+			}
+		
+			[Test]
+			public void ConvertFromUtc_DestinationIsUTC ()
+			{
+				DateTime now = DateTime.UtcNow;
+				DateTime converted = TimeZoneInfo.ConvertTimeFromUtc (now, TimeZoneInfo.Utc);
+				Assert.AreEqual (now, converted);
+			}
+			
+			[Test]
+			public void ConvertFromUTC_ConvertInWinter ()
+			{
+				DateTime utc = new DateTime (2007, 12, 25, 12, 0, 0);
+				DateTime converted = TimeZoneInfo.ConvertTimeFromUtc (utc, london);
+				Assert.AreEqual (utc, converted);
+			}
+		
+			[Test]
+			public void ConvertFromUtc_ConvertInSummer ()
+			{
+				DateTime utc = new DateTime (2007, 06, 01, 12, 0, 0);
+				DateTime converted = TimeZoneInfo.ConvertTimeFromUtc (utc, london);
+				Assert.AreEqual (utc + new TimeSpan (1,0,0), converted);
+			}
+		
+			[Test]
+			public void ConvertToUTC_KindIsUtc ()
+			{
+				DateTime now = DateTime.UtcNow;
+				Assert.AreEqual (now.Kind, DateTimeKind.Utc);
+				DateTime converted = TimeZoneInfo.ConvertTimeToUtc (now);
+				Assert.AreEqual (now, converted);
+			}
+		
+			[Test]
+			[ExpectedException (typeof (ArgumentException))]
+			public void ConvertToUTC_KindIsUTCButSourceIsNot ()
+			{
+				TimeZoneInfo.ConvertTimeToUtc (new DateTime (2007, 5, 3, 12, 8, 0, DateTimeKind.Utc), london);
+			}
+		
+			[Test]
+			[ExpectedException (typeof (ArgumentException))]
+			public void ConvertToUTC_KindIsLocalButSourceIsNot ()
+			{
+				TimeZoneInfo.ConvertTimeToUtc (new DateTime (2007, 5, 3, 12, 8, 0, DateTimeKind.Local), london);	
+			}
+		
+			[Test]
+			[ExpectedException (typeof (ArgumentException))]
+			public void ConvertToUTC_InvalidDate ()
+			{
+				TimeZoneInfo.ConvertTimeToUtc (new DateTime (2007, 3, 25, 1, 30, 0), london);
+			}
+		
+			[Test]
+			[ExpectedException (typeof (ArgumentNullException))]
+			public void ConvertToUTC_SourceIsNull ()
+			{
+				TimeZoneInfo.ConvertTimeToUtc (new DateTime (2007, 5, 3, 12, 16, 0), null);
+			}
+		
+		#if SLOW_TESTS
+			[Test]
+			public void ConvertToUtc_MatchDateTimeBehavior ()
+			{
+				for (DateTime date = new DateTime (2007, 01, 01, 0, 0, 0); date < new DateTime (2007, 12, 31, 23, 59, 59); date += new TimeSpan (0,1,0)) {
+					Assert.AreEqual (TimeZoneInfo.ConvertTimeToUtc (date), date.ToUniversalTime ());
+				}
+			}
+		#endif
+		
+			[Test]
+			public void ConvertFromToUtc ()
+			{
+				DateTime utc = DateTime.UtcNow;
+				Assert.AreEqual (utc.Kind, DateTimeKind.Utc);
+				DateTime converted = TimeZoneInfo.ConvertTimeFromUtc (utc, london);
+				Assert.AreEqual (converted.Kind, DateTimeKind.Unspecified);
+				DateTime back = TimeZoneInfo.ConvertTimeToUtc (converted, london);
+				Assert.AreEqual (back.Kind, DateTimeKind.Utc);
+				Assert.AreEqual (utc, back);
+		
+			}
+
+			[Test]
+			public void ConvertTimeToUtc_Overflow ()
+			{
+				var res = TimeZoneInfo.ConvertTimeToUtc (new DateTime (0));
+				Assert.AreEqual (res.Kind, DateTimeKind.Utc, "#1");
+
+				res = TimeZoneInfo.ConvertTimeToUtc (DateTime.MaxValue);
+				Assert.AreEqual (res.Kind, DateTimeKind.Utc, "#2");
+			}
+
+			[Test]
+			public void ConvertFromToUtc_Utc ()
+			{
+				DateTime utc = DateTime.UtcNow;
+				Assert.AreEqual (utc.Kind, DateTimeKind.Utc);
+				DateTime converted = TimeZoneInfo.ConvertTimeFromUtc (utc, TimeZoneInfo.Utc);
+				Assert.AreEqual (DateTimeKind.Utc, converted.Kind);
+				DateTime back = TimeZoneInfo.ConvertTimeToUtc (converted, TimeZoneInfo.Utc);
+				Assert.AreEqual (back.Kind, DateTimeKind.Utc);
+				Assert.AreEqual (utc, back);
+			}
+
+			[Test]
+			public void ConvertFromToLocal ()
+			{
+				DateTime utc = DateTime.UtcNow;
+				Assert.AreEqual (utc.Kind, DateTimeKind.Utc);
+				DateTime converted = TimeZoneInfo.ConvertTimeFromUtc (utc, TimeZoneInfo.Local);
+				var expectedKind = (TimeZoneInfo.Local == TimeZoneInfo.Utc)? DateTimeKind.Utc : DateTimeKind.Local;
+				Assert.AreEqual (expectedKind, converted.Kind);
+				DateTime back = TimeZoneInfo.ConvertTimeToUtc (converted, TimeZoneInfo.Local);
+				Assert.AreEqual (back.Kind, DateTimeKind.Utc);
+				Assert.AreEqual (utc, back);
+			}
+
+			[Test]
+			public void ConvertToTimeZone ()
+			{
+				TimeZoneInfo.ConvertTime (DateTime.Now, TimeZoneInfo.FindSystemTimeZoneById (MapTimeZoneId ("Pacific/Auckland")));
+			}
+
+			[Test]
+			[ExpectedException (typeof (ArgumentNullException))]
+			public void ConvertTime_DateTime_TimeZoneInfo_DestinationTimeZoneIsNull ()
+			{
+				TimeZoneInfo.ConvertTime (DateTime.Now, null);
+			}
+
+			[Test]
+			[Category ("MobileNotWorking")]

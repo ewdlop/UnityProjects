@@ -1,0 +1,201 @@
+// ParallelEnumerableTests.cs
+//
+// Copyright (c) 2008 Jérémie "Garuma" Laval
+//
+// Based on Enumerable test suite by Jb Evain (jbevain@novell.com)
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+//
+
+
+using System;
+using System.Threading;
+using System.Linq;
+
+using System.Collections;
+using System.Collections.Generic;
+
+using NUnit.Framework;
+
+namespace MonoTests.System.Linq
+{
+	internal static class AsParallelHelper
+	{
+		internal static ParallelQuery<T> AsReallyParallel<T> (this IEnumerable<T> source)
+		{
+			return source.AsParallel ().WithExecutionMode (ParallelExecutionMode.ForceParallelism);
+		}
+	}
+
+	[TestFixtureAttribute]
+	public class ParallelEnumerableTests
+	{
+		IEnumerable<int> baseEnumerable;
+		
+		[SetUpAttribute]
+		public void Setup ()
+		{
+			baseEnumerable = Enumerable.Range(1, 1000);
+		}
+
+		static void AreEquivalent (IEnumerable syncEnumerable, IEnumerable async_resEnumerable)
+		{
+			Assert.That (async_resEnumerable, new NUnit.Framework.Constraints.CollectionEquivalentConstraint (syncEnumerable));
+		}
+		
+		static void AssertAreSame<T> (IEnumerable<T> expected, IEnumerable<T> actual)
+		{
+			if (expected == null) {
+				Assert.IsNull (actual);
+				return;
+			}
+
+			Assert.IsNotNull (actual);
+			int index = -1;
+
+			IEnumerator<T> ee = expected.GetEnumerator ();
+			IEnumerator<T> ea = actual.GetEnumerator ();
+
+			while (ee.MoveNext ()) {
+				Assert.IsTrue (ea.MoveNext (), "'" + ee.Current + "' expected at index '"+ ++index + "'.");
+				Assert.AreEqual (ee.Current, ea.Current, "at index '" + index + "'");
+			}
+
+			if (ea.MoveNext ())
+				Assert.Fail ("Unexpected element: " + ea.Current);
+		}
+		
+		public static void AssertException<T> (Action action) where T : Exception
+		{
+			try {
+				action ();
+			}
+			catch (T) {
+				return;
+			}
+			Assert.Fail ("Expected: " + typeof (T).Name);
+		}
+
+		static void AssertAreSame<K, V> (K expectedKey, IEnumerable<V> expectedValues, IGrouping<K, V> actual)
+		{
+			if (expectedValues == null) {
+				Assert.IsNull (actual);
+				return;
+			}
+
+			Assert.IsNotNull (actual);
+
+			Assert.AreEqual (expectedKey, actual.Key);
+
+			var ee = expectedValues.GetEnumerator ();
+			var ea = actual.GetEnumerator ();
+
+			while (ee.MoveNext ()) {
+				Assert.IsTrue (ea.MoveNext (), "'" + ee.Current + "' expected.");
+				Assert.AreEqual (ee.Current, ea.Current);
+			}
+
+			if (ea.MoveNext ())
+				Assert.Fail ("Unexpected element: " + ee.Current);
+		}
+
+		static void AssertAreSame<K, V> (IDictionary<K, IEnumerable<V>> expected, IEnumerable<IGrouping<K, V>> actual)
+		{
+			if (expected == null) {
+				Assert.IsNull (actual);
+				return;
+			}
+
+			Assert.IsNotNull (actual);
+
+			var ee = expected.GetEnumerator ();
+			var ea = actual.GetEnumerator ();
+
+			while (ee.MoveNext ()) {
+				Assert.IsTrue (ea.MoveNext (), "'" + ee.Current.Key + "' expected.");
+				AssertAreSame (ee.Current.Key, ee.Current.Value, ea.Current);
+			}
+
+			if (ea.MoveNext ())
+				Assert.Fail ("Unexpected element: " + ee.Current.Key);
+		}
+
+		static void AssertAreSame<K, V> (IDictionary<K, IEnumerable<V>> expected, ILookup<K, V> actual)
+		{
+			if (expected == null) {
+				Assert.IsNull (actual);
+				return;
+			}
+
+			Assert.IsNotNull (actual);
+
+			var ee = expected.GetEnumerator ();
+			var ea = actual.GetEnumerator ();
+
+			while (ee.MoveNext ()) {
+				Assert.IsTrue (ea.MoveNext (), "'" + ee.Current.Key + "' expected.");
+				AssertAreSame (ee.Current.Key, ee.Current.Value, ea.Current);
+			}
+
+			if (ea.MoveNext ())
+				Assert.Fail ("Unexpected element: " + ee.Current.Key);
+		}
+
+		static void AssertAreSame<K, V> (IDictionary<K, V> expected, IDictionary<K, V> actual)
+		{
+			if (expected == null) {
+				Assert.IsNull (actual);
+				return;
+			}
+
+			Assert.IsNotNull (actual);
+
+			var ee = expected.GetEnumerator ();
+			var ea = actual.GetEnumerator ();
+
+			while (ee.MoveNext ()) {
+				Assert.IsTrue (ea.MoveNext (), "'" + ee.Current.Key + ", " + ee.Current.Value + "' expected.");
+				Assert.AreEqual (ee.Current.Key, ea.Current.Key);
+				Assert.AreEqual (ee.Current.Value, ea.Current.Value);
+			}
+
+			if (ea.MoveNext ())
+				Assert.Fail ("Unexpected element: " + ee.Current.Key + ", " + ee.Current.Value);
+		}
+
+		[Test]
+		public void SelectTestCase ()
+		{
+			ParallelTestHelper.Repeat (() => {
+				IEnumerable<int> sync  = baseEnumerable.Select (i => i * i);
+				IEnumerable<int> async_res = baseEnumerable.AsParallel ().Select (i => i * i);
+				
+				AreEquivalent(sync, async_res);
+			});
+		}
+			
+		[Test]
+		public void WhereTestCase ()
+		{
+			ParallelTestHelper.Repeat (() => {
+				IEnumerable<int> sync  = baseEnumerable.Where(i => i % 2 == 0);
+				IEnumerable<int> async_res = baseEnumerable.AsParallel().Where(i => i % 2 == 0);
+				
+				AreE

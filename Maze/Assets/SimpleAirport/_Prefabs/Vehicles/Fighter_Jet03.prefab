@@ -1,0 +1,474 @@
+#region Copyright (c) Microsoft Corporation
+/// <copyright company='Microsoft Corporation'>
+///    Copyright (c) Microsoft Corporation. All Rights Reserved.
+///    Information Contained Herein is Proprietary and Confidential.
+/// </copyright>
+#endregion
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Xml;
+using System.Xml.Schema;
+using System.Xml.Serialization;
+
+#if WEB_EXTENSIONS_CODE
+using System.Web.Resources;
+#else
+using Microsoft.VSDesigner.WCF.Resources;
+#endif
+
+#if WEB_EXTENSIONS_CODE
+namespace System.Web.Compilation.WCFModel
+#else
+namespace Microsoft.VSDesigner.WCFModel
+#endif
+{
+    /// <summary>
+    /// Map file loader
+    /// </summary>
+    /// <remarks>
+    /// MapFileLoader instance and MapFile instance should be 1:1 mapping.
+    /// </remarks>
+#if WEB_EXTENSIONS_CODE
+    internal abstract class MapFileLoader
+#else
+    [CLSCompliant(true)]
+    public abstract class MapFileLoader
+#endif
+    {
+        /// <summary>
+        /// Save the given map file.
+        /// </summary>
+        /// <param name="mapFile">The map file to be saved</param>
+        public void SaveMapFile(MapFile mapFile)
+        {
+            Debug.Assert(mapFile != null, "mapFile is null!");
+
+            SaveExternalFiles(mapFile);
+
+            using (var mapFileWriter = GetMapFileWriter())
+            {
+                GetMapFileSerializer().Serialize(mapFileWriter, Unwrap(mapFile));
+            }
+        }
+
+        /// <summary>
+        /// Load the map file.
+        /// </summary>        
+        /// <returns>Concrete map file instance.</returns>
+        public MapFile LoadMapFile()
+        {
+            MapFile mapFile = null;
+
+            using (var mapFileReader = GetMapFileReader())
+            {
+                var proxyGenerationErrors = new List<ProxyGenerationError>();
+
+                ValidationEventHandler handler =
+                    (sender, e) =>
+                    {
+                        bool isError = (e.Severity == XmlSeverityType.Error);
+                        proxyGenerationErrors.Add(
+                            new ProxyGenerationError(ProxyGenerationError.GeneratorState.LoadMetadata,
+                                                     MapFileName,
+                                                     e.Exception,
+                                                     !isError));
+
+                        if (isError)
+                        {
+                            throw e.Exception;
+                        }
+                    };
+
+                var readerSettings = new XmlReaderSettings()
+                {
+                    Schemas = GetMapFileSchemaSet(),
+                    ValidationType = ValidationType.Schema,
+                    ValidationFlags = XmlSchemaValidationFlags.ReportValidationWarnings,
+                };
+
+                using (XmlReader reader = XmlReader.Create(mapFileReader, readerSettings, string.Empty))
+                {
+                    try
+                    {
+                        readerSettings.ValidationEventHandler += handler;
+
+                        mapFile = ReadMapFile(reader);
+
+                        SetMapFileLoadErrors(mapFile, proxyGenerationErrors);
+                    }
+                    finally
+                    {
+                        readerSettings.ValidationEventHandler -= handler;
+                    }
+                }
+            }
+
+            if (mapFile != null)
+            {
+                LoadExternalFiles(mapFile);
+            }
+
+            return mapFile;
+        }
+
+        /// <summary>
+        /// Load metadata file from file system
+        /// </summary>
+        public void LoadMetadataFile(MetadataFile metadataFile)
+        {
+            try
+            {
+                metadataFile.CleanUpContent();
+                metadataFile.LoadContent(ReadMetadataFile(metadataFile.FileName));
+            }
+            catch (Exception ex)
+            {
+                metadataFile.ErrorInLoading = ex;
+            }
+        }
+
+        /// <summary>
+        /// Load extension file
+        /// </summary>
+        public void LoadExtensionFile(ExtensionFile extensionFile)
+        {
+            try
+            {
+                extensionFile.CleanUpContent();
+                extensionFile.ContentBuffer = ReadExtensionFile(extensionFile.FileName);
+            }
+            catch (Exception ex)
+            {
+                extensionFile.ErrorInLoading = ex;
+            }
+        }
+
+        #region protected abstract methods
+
+        /// <summary>
+        /// The name of the file where the MapFile instance is loaded.
+        /// </summary>
+        protected abstract string MapFileName { get; }
+
+        /// <summary>
+        /// Wrap the map file impl.
+        /// </summary>
+        protected abstract MapFile Wrap(object mapFileImpl);
+
+        /// <summary>
+        /// Unwrap the map file.
+        /// </summary>
+        protected abstract object Unwrap(MapFile mapFile);
+
+        /// <summary>
+        /// Get the map file schema set
+        /// </summary>
+        /// <return>Xml schema set of the map file</return>
+        protected abstract XmlSchemaSet GetMapFileSchemaSet();
+
+        /// <summary>
+        /// Get the map file serializer
+        /// </summary>
+        /// <returns>Xml serializer of the map file</returns>
+        protected abstract XmlSerializer GetMapFileSerializer();
+
+        /// <summary>
+        /// Get access to a text reader that gets access to the map file byte stream
+        /// </summary>
+        /// <returns>Text reader of the map file</returns>
+        protected virtual TextReader GetMapFileReader()
+        {
+            throw new NotImplementedException();
+        }
+
+        /// <summary>
+        /// Get access to a text writer that writes the map file byte stream.
+        /// </summary>
+        /// <returns>Text writer of the map file</returns>
+        protected virtual TextWriter GetMapFileWriter()
+        {
+            throw new NotImplementedException();
+        }
+
+        /// <summary>
+        /// Get access to a byte array that contain the contents of the given metadata
+        /// file
+        /// </summary>
+        /// <param name="name">
+        /// Name of the metadata file. Could be a path relative to the svcmap file location
+        /// or the name of an item in a metadata storage.
+        /// </param>
+        /// <returns>Content of the metadata file</returns>
+        protected virtual byte[] ReadMetadataFile(string name)
+        {
+            throw new NotImplementedException();
+        }
+
+        /// <summary>
+        /// Write the metadata file.
+        /// </summary>
+        /// <param name="file">The metadata file to be written</param>
+        protected virtual void WriteMetadataFile(MetadataFile file)
+        {
+            throw new NotImplementedException();
+        }
+
+        /// <summary>
+        /// Get access to a byte array that contain the contents of the given extension
+        /// file
+        /// </summary>
+        /// <param name="name">
+        /// Name of the extension file. Could be a path relative to the svcmap file location
+        /// or the name of an item in a metadata storage.
+        /// </param>
+        /// <returns>Content of the extension file</returns>
+        protected virtual byte[] ReadExtensionFile(string name)
+        {
+            throw new NotImplementedException();
+        }
+
+        /// <summary>
+        /// Write the extension file.
+        /// </summary>
+        /// <param name="file">The extension file to be written</param>
+        protected virtual void WriteExtensionFile(ExtensionFile file)
+        {
+            throw new NotImplementedException();
+        }
+
+        #endregion protected abstract methods
+
+        #region private methods
+
+        private MapFile ReadMapFile(XmlReader reader)
+        {
+            try
+            {
+                return Wrap(GetMapFileSerializer().Deserialize(reader));
+            }
+            catch (InvalidOperationException ex)
+            {
+                XmlException xmlException = ex.InnerException as XmlException;
+                if (xmlException != null)
+                {
+                    // the innerException contains detail error message
+                    throw xmlException;
+                }
+
+                XmlSchemaException schemaException = ex.InnerException as XmlSchemaException;
+                if (schemaException != null)
+                {
+                    if (schemaException.LineNumber > 0)
+                    {
+                        // append line/position to the message
+                        throw new XmlSchemaException(String.Format(CultureInfo.CurrentCulture,
+                                                                   WCFModelStrings.ReferenceGroup_AppendLinePosition,
+                                                                   schemaException.Message,
+                                                                   schemaException.LineNumber,
+                                                                   schemaException.LinePosition),
+                                                     schemaException,
+                                                     schemaException.LineNumber,
+                                                     schemaException.LinePosition);
+                    }
+                    else
+                    {
+                        throw schemaException;
+                    }
+                }
+
+                // It's something we can't handle, throw it.
+                throw;
+            }
+        }
+
+        private void SaveExternalFiles(MapFile mapFile)
+        {
+            // KEEP the order! The name of metadata files could be adjusted when we save them.
+
+            foreach (MetadataFile metadataFile in mapFile.MetadataList)
+            {
+                if (metadataFile.ErrorInLoading == null)
+                {
+                    WriteMetadataFile(metadataFile);
+                }
+            }
+
+            foreach (ExtensionFile extensionFile in mapFile.Extensions)
+            {
+                if (extensionFile.ErrorInLoading == null)
+                {
+                    WriteExtensionFile(extensionFile);
+                }
+            }
+        }
+
+        private void LoadExternalFiles(MapFile mapFile)
+        {
+            // Do basic check for metadata files and extension files.
+            ValidateMapFile(mapFile);
+
+            foreach (MetadataFile metadataFile in mapFile.MetadataList)
+            {
+                metadataFile.IsExistingFile = true;
+                LoadMetadataFile(metadataFile);
+            }
+
+            foreach (ExtensionFile extensionFile in mapFile.Extensions)
+            {
+                extensionFile.IsExistingFile = true;
+                LoadExtensionFile(extensionFile);
+            }
+        }
+
+        private void ValidateMapFile(MapFile mapFile)
+        {
+            var metadataFileNames = mapFile.MetadataList.Select(p => p.FileName).Where(p => !string.IsNullOrEmpty(p));
+            var extensionFileNames = mapFile.Extensions.Select(p => p.FileName).Where(p => !string.IsNullOrEmpty(p));
+
+            var fileNameSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string fileName in metadataFileNames.Concat(extensionFileNames))
+            {
+                if (!fileNameSet.Contains(fileName))
+                {
+                    fileNameSet.Add(fileName);
+                }
+                else
+                {
+                    throw new FormatException(String.Format(CultureInfo.CurrentCulture,
+                                                            WCFModelStrings.ReferenceGroup_TwoExternalFilesWithSameName,
+                                                            fileName));
+                }
+            }
+        }
+
+        private void SetMapFileLoadErrors(MapFile mapFile, IEnumerable<ProxyGenerationError> proxyGenerationErrors)
+        {
+            mapFile.LoadErrors = proxyGenerationErrors;
+        }
+
+        #endregion private methods
+    }
+}
+                                                                                                                                                                                                                                                                                                                           {
+            if (_fileInput != null) {
+                _fileInput.ClearResult();
+            }
+
+            if (_locationInputs != null) {
+                foreach (SectionInput input in _locationInputs) {
+                    input.ClearResult();
+                }
+            }
+
+            _result = s_unevaluated;
+            _resultRuntimeObject = s_unevaluated;
+        }
+
+        //
+        // Error handling.
+        //
+
+        private List<ConfigurationException> GetAllErrors() {
+            List<ConfigurationException> allErrors = null;
+
+            if (HasLocationInputs) {
+                foreach (SectionInput input in LocationInputs) {
+                    ErrorsHelper.AddErrors(ref allErrors, input.Errors);
+                }
+            }
+
+            if (HasIndirectLocationInputs) {
+                foreach (SectionInput input in IndirectLocationInputs) {
+                    ErrorsHelper.AddErrors(ref allErrors, input.Errors);
+                }
+            }
+
+            if (HasFileInput) {
+                ErrorsHelper.AddErrors(ref allErrors, FileInput.Errors);
+            }
+
+            return allErrors;
+        }
+
+        internal bool HasErrors {
+            get {
+                if (HasLocationInputs) {
+                    foreach (SectionInput input in LocationInputs) {
+                        if (input.HasErrors) {
+                            return true;
+                        }
+                    }
+                }
+
+                if (HasIndirectLocationInputs) {
+                    foreach (SectionInput input in IndirectLocationInputs) {
+                        if (input.HasErrors) {
+                            return true;
+                        }
+                    }
+                }
+
+                if (HasFileInput) {
+                    if (FileInput.HasErrors) {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+        }
+
+        internal void ThrowOnErrors() {
+            if (HasErrors) {
+                throw new ConfigurationErrorsException(GetAllErrors());
+            }
+        }
+    }
+}
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                             Pad_DPadNorth,"® nx    ÜEL˜œtÔe‰!œS˜ýö {¹  bMt?2'ÍÝÆ°—kêÔ0ŽwbP6 
+òÜÌªŠ¹ûU4óV¤)†XöÚJrðÝ±tYFC/ïVÚÄ£†[0
+Ù
+µ
+˜
+s
+Y
+?
+%
+	ñ	Î	°	‘	r	S	;	ïÉ°ŽëÊ¦pP3ëÍ¯ŒqT7ì¾|cJ1ûâÈ®‡`B á½žƒb                                                                                                                                                                                         \K9EnableAdjTriFlagsGroup
+¨  dŸ/EncryptionKeyGuid³"   Œ“'EnableCommand»g €Ô	End³jD Eigen"P- £ElementÈò "  ±•	Endã³ FEncodingˆu lK#ElementSizeÛj  î“#ElementName ’\  ƒõ)ElementLocator
+t  ã,#ElementListŠQ  ài%ElementIndexêW …¢!ElementIDsÙB  G›#EncryptDataúÜ  nò-ElementAllocatorNF 7ÕElement^ÞÕ Õ , 7E    P!EfsVersion)B ud9EnsureLastPinTypeValidSÑ 2"-EnsureCompletion
+Gà \5EnqueueLatentCommandûð  Xð?EnhancedInputSubsys#!/bin/sh
+#
+# An example hook script to verify what is about to be committed.
+# Called by "git commit" with no arguments.  The hook should
+# exit with non-zero status after issuing an appropriate message if
+# it wants to stop the commit.
+#
+# To enable this hook, rename this file to "pre-commit".
+
+if git rev-parse --verify HEAD >/dev/null 2>&1
+then
+	against=HEAD
+else
+	# Initial commit: diff against an empty tree object
+	against=$(git hash-object -t tree /dev/null)
+fi
+
+# If you want to allow non-ASCII filenames set this variable to true.
+allownonascii=$(git config --type=bool hooks.allownonascii)
+
+# Redirect output to stderr.
+exec 1>&2
+
+# Cross platform projects tend to avoid non-ASCII filenames; prevent
+# them from being added to the repository. We exploit the fact that the
+# printable range starts at the space character and ends with tilde.
+if [ "$allownonascii" != "true" ] &&
+	# Note that the use of brackets around a tr range is ok here, (it's
+	# even required, for portability to Solaris 10's /us

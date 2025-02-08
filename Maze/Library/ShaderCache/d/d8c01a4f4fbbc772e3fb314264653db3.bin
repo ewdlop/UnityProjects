@@ -1,0 +1,91 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "Android/AndroidInputInterface.h"
+#if USE_ANDROID_INPUT
+//#include "AndroidInputDeviceMappings.h"
+#include "Misc/ConfigCacheIni.h"
+#include "IInputDevice.h"
+#include "GenericPlatform/GenericApplicationMessageHandler.h"
+#include "HAL/ThreadingBase.h"
+#include "Misc/CallbackDevice.h"
+#include "HAL/PlatformTime.h"
+#include "HAL/IConsoleManager.h"
+#include "IHapticDevice.h"
+
+#ifndef ANDROID_GAMEPAD_TRIGGER_THRESHOLD
+	#define ANDROID_GAMEPAD_TRIGGER_THRESHOLD	0.30f
+#endif
+
+TArray<TouchInput> FAndroidInputInterface::TouchInputStack = TArray<TouchInput>();
+FCriticalSection FAndroidInputInterface::TouchInputCriticalSection;
+
+FAndroidGamepadDeviceMapping FAndroidInputInterface::DeviceMapping[MAX_NUM_CONTROLLERS];
+
+bool FAndroidInputInterface::VibeIsOn;
+int32 FAndroidInputInterface::MaxVibeTime = 1000;
+double FAndroidInputInterface::LastVibeUpdateTime = 0.0;
+FForceFeedbackValues FAndroidInputInterface::VibeValues;
+
+bool FAndroidInputInterface::bAllowControllers = true;
+bool FAndroidInputInterface::bBlockAndroidKeysOnControllers = false;
+bool FAndroidInputInterface::bControllersBlockDeviceFeedback = false;
+
+FAndroidControllerData FAndroidInputInterface::OldControllerData[MAX_NUM_CONTROLLERS];
+FAndroidControllerData FAndroidInputInterface::NewControllerData[MAX_NUM_CONTROLLERS];
+
+FGamepadKeyNames::Type FAndroidInputInterface::ButtonMapping[MAX_NUM_CONTROLLER_BUTTONS];
+float FAndroidInputInterface::InitialButtonRepeatDelay;
+float FAndroidInputInterface::ButtonRepeatDelay;
+
+FDeferredAndroidMessage FAndroidInputInterface::DeferredMessages[MAX_DEFERRED_MESSAGE_QUEUE_SIZE];
+int32 FAndroidInputInterface::DeferredMessageQueueLastEntryIndex = 0;
+int32 FAndroidInputInterface::DeferredMessageQueueDroppedCount   = 0;
+
+TArray<FAndroidInputInterface::MotionData> FAndroidInputInterface::MotionDataStack
+	= TArray<FAndroidInputInterface::MotionData>();
+
+TArray<FAndroidInputInterface::MouseData> FAndroidInputInterface::MouseDataStack
+	= TArray<FAndroidInputInterface::MouseData>();
+
+int32 GAndroidOldXBoxWirelessFirmware = 0;
+static FAutoConsoleVariableRef CVarAndroidOldXBoxWirelessFirmware(
+	TEXT("Android.OldXBoxWirelessFirmware"),
+	GAndroidOldXBoxWirelessFirmware,
+	TEXT("Determines how XBox Wireless controller mapping is handled. 0 assumes new firmware, 1 will use old firmware mapping (Default: 0)"),
+	ECVF_Default);
+
+TSharedRef< FAndroidInputInterface > FAndroidInputInterface::Create(const TSharedRef< FGenericApplicationMessageHandler >& InMessageHandler, const TSharedPtr< ICursor >& InCursor)
+{
+	return MakeShareable(new FAndroidInputInterface(InMessageHandler, InCursor));
+}
+
+FAndroidInputInterface::~FAndroidInputInterface()
+{
+}
+
+namespace AndroidKeyNames
+{
+	const FGamepadKeyNames::Type Android_Back("Android_Back");
+	const FGamepadKeyNames::Type Android_Menu("Android_Menu");
+}
+
+FAndroidInputInterface::FAndroidInputInterface(const TSharedRef< FGenericApplicationMessageHandler >& InMessageHandler, const TSharedPtr< ICursor >& InCursor)
+	: MessageHandler( InMessageHandler )
+	, Cursor(InCursor)
+{
+	GConfig->GetBool(TEXT("/Script/AndroidRuntimeSettings.AndroidRuntimeSettings"), TEXT("bAllowControllers"), bAllowControllers, GEngineIni);
+	GConfig->GetBool(TEXT("/Script/AndroidRuntimeSettings.AndroidRuntimeSettings"), TEXT("bBlockAndroidKeysOnControllers"), bBlockAndroidKeysOnControllers, GEngineIni);
+	GConfig->GetBool(TEXT("/Script/AndroidRuntimeSettings.AndroidRuntimeSettings"), TEXT("bControllersBlockDeviceFeedback"), bControllersBlockDeviceFeedback, GEngineIni);
+
+	ButtonMapping[0] = FGamepadKeyNames::FaceButtonBottom;
+	ButtonMapping[1] = FGamepadKeyNames::FaceButtonRight;
+	ButtonMapping[2] = FGamepadKeyNames::FaceButtonLeft;
+	ButtonMapping[3] = FGamepadKeyNames::FaceButtonTop;
+	ButtonMapping[4] = FGamepadKeyNames::LeftShoulder;
+	ButtonMapping[5] = FGamepadKeyNames::RightShoulder;
+	ButtonMapping[6] = FGamepadKeyNames::SpecialRight;
+	ButtonMapping[7] = FGamepadKeyNames::SpecialLeft;
+	ButtonMapping[8] = FGamepadKeyNames::LeftThumb;
+	ButtonMapping[9] = FGamepadKeyNames::RightThumb;
+	ButtonMapping[10] = FGamepadKeyNames::LeftTriggerThreshold;
+	ButtonMapping[11] = FGamepadKeyNames::RightTriggerThresh

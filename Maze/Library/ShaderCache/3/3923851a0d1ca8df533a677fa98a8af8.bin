@@ -1,0 +1,147 @@
+lementMembers;
+			if (members != null)
+			{
+				foreach (XmlTypeMapMemberElement member in members)
+				{
+					if (!MemberHasValue (member, ob, isValueList)) continue;
+					object memberValue = GetMemberValue (member, ob, isValueList);
+					Type memType = member.GetType();
+
+					if (memType == typeof(XmlTypeMapMemberList))
+					{
+						WriteMemberElement ((XmlTypeMapElementInfo) member.ElementInfo[0], memberValue);
+					}
+					else if (memType == typeof(XmlTypeMapMemberFlatList))
+					{
+						if (memberValue != null)
+							WriteListContent (ob, member.TypeData, ((XmlTypeMapMemberFlatList)member).ListMap, memberValue, null);
+					}
+					else if (memType == typeof(XmlTypeMapMemberAnyElement))
+					{
+						if (memberValue != null)
+							WriteAnyElementContent ((XmlTypeMapMemberAnyElement)member, memberValue);
+					}
+					else if (memType == typeof(XmlTypeMapMemberAnyAttribute))
+					{
+						// Ignore
+					}
+					else if (memType == typeof(XmlTypeMapMemberElement))
+					{
+						XmlTypeMapElementInfo elem = member.FindElement (ob, memberValue);
+						WriteMemberElement (elem, memberValue);
+					}
+					else
+						throw new InvalidOperationException ("Unknown member type");
+				}
+			}
+		}
+
+		object GetMemberValue (XmlTypeMapMember member, object ob, bool isValueList)
+		{
+			if (isValueList) return ((object[])ob)[member.GlobalIndex];
+			else return member.GetValue (ob);
+		}
+
+		bool MemberHasValue (XmlTypeMapMember member, object ob, bool isValueList)
+		{
+			if (isValueList) {
+				if (member.IsOptionalValueType && !member.GetValueSpecified (ob))
+					return false;
+				return member.GlobalIndex < ((object[])ob).Length;
+			}
+			else if (member.DefaultValue != System.DBNull.Value) {
+				object val = GetMemberValue (member, ob, isValueList);
+				if (val == null && member.DefaultValue == null) return false;
+				if (val != null && val.GetType().IsEnum)
+				{
+					if (val.Equals (member.DefaultValue)) return false;
+					Type t = Enum.GetUnderlyingType(val.GetType());
+					val = Convert.ChangeType (val, t, null);
+				}
+				if (val != null && val.Equals (member.DefaultValue)) return false;
+			}
+			else if (member.IsOptionalValueType)
+				return member.GetValueSpecified (ob);
+
+			return true;
+		}
+
+		void WriteMemberElement (XmlTypeMapElementInfo elem, object memberValue)
+		{
+			switch (elem.TypeData.SchemaType)
+			{
+				case SchemaTypes.XmlNode:
+					string elemName = elem.WrappedElement ? elem.ElementName : "";
+					if (_format == SerializationFormat.Literal) WriteElementLiteral(((XmlNode)memberValue), elemName, elem.Namespace, elem.IsNullable, false);
+					else WriteElementEncoded(((XmlNode)memberValue), elemName, elem.Namespace, elem.IsNullable, false);
+					break;
+
+				case SchemaTypes.Enum:
+				case SchemaTypes.Primitive:
+					if (_format == SerializationFormat.Literal) 
+						WritePrimitiveValueLiteral (memberValue, elem.ElementName, elem.Namespace, elem.MappedType, elem.TypeData, elem.WrappedElement, elem.IsNullable);
+					else 
+						WritePrimitiveValueEncoded (memberValue, elem.ElementName, elem.Namespace, new XmlQualifiedName (elem.DataTypeName, elem.DataTypeNamespace), elem.MappedType, elem.TypeData, elem.WrappedElement, elem.IsNullable);
+					break;
+
+				case SchemaTypes.Array:
+					if (memberValue == null) {
+						if (!elem.IsNullable) return;
+						if (_format == SerializationFormat.Literal) WriteNullTagLiteral (elem.ElementName, elem.Namespace);
+						else WriteNullTagEncoded (elem.ElementName, elem.Namespace);
+					}
+					else if (elem.MappedType.MultiReferenceType) 
+						WriteReferencingElement (elem.ElementName, elem.Namespace, memberValue, elem.IsNullable);
+					else {
+						WriteStartElement(elem.ElementName, elem.Namespace, memberValue);
+						WriteListContent (null, elem.TypeData, (ListMap) elem.MappedType.ObjectMap, memberValue, null);
+						WriteEndElement (memberValue);
+					}
+					break;
+
+				case SchemaTypes.Class:
+					if (elem.MappedType.MultiReferenceType)	{
+						if (elem.MappedType.TypeData.Type == typeof(object))
+							WritePotentiallyReferencingElement (elem.ElementName, elem.Namespace, memberValue, null, false, elem.IsNullable);
+						else
+							WriteReferencingElement (elem.ElementName, elem.Namespace, memberValue, elem.IsNullable);
+					}
+					else WriteObject (elem.MappedType, memberValue, elem.ElementName, elem.Namespace, elem.IsNullable, false, true);
+					break;
+
+				case SchemaTypes.XmlSerializable:
+					// bug #419973
+					if (!elem.MappedType.TypeData.Type.IsInstanceOfType (memberValue))
+						memberValue = ImplicitConvert (memberValue, elem.MappedType.TypeData.Type);
+					WriteSerializable ((IXmlSerializable) memberValue, elem.ElementName, elem.Namespace, elem.IsNullable);
+					break;
+
+				default:
+					throw new NotSupportedException ("Invalid value type");
+			}
+		}
+
+		internal static object ImplicitConvert (object obj, Type type)
+		{
+			if (obj == null)
+				return null;
+
+			for (Type t = obj.GetType (); t != typeof (object); t = t.BaseType) {
+				MethodInfo mi = t.GetMethod ("op_Implicit", new Type [] {t});
+				if (mi != null && mi.ReturnType == type)
+					return mi.Invoke (null, new object [] {obj});
+
+				mi = type.GetMethod ("op_Implicit", new Type [] {t});
+				if (mi != null && mi.ReturnType == type)
+					return mi.Invoke (null, new object [] {obj});
+			}
+			return obj;
+		}
+
+		void WritePrimitiveValueLiteral (object memberValue, string name, string ns, XmlTypeMapping mappedType, TypeData typeData, bool wrapped, bool isNullable)
+		{
+			if (!wrapped) {
+				WriteValue (GetStringValue (mappedType, typeData, memberValue));
+			}
+			else if (isNullable) {
+				if (typeData.Type == typeof(XmlQualifiedName)) WriteNullableQualifiedNameLiteral (name, ns, (XmlQuali

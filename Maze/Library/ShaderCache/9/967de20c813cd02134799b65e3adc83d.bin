@@ -1,0 +1,76 @@
+// Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+// See the LICENSE file in the project root for more information.
+
+using System.Buffers;
+using System.Diagnostics;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+#if !MONO
+using EditorBrowsableAttribute = System.ComponentModel.EditorBrowsableAttribute;
+using EditorBrowsableState = System.ComponentModel.EditorBrowsableState;
+#endif
+#if !FEATURE_PORTABLE_SPAN
+using Internal.Runtime.CompilerServices;
+#endif // FEATURE_PORTABLE_SPAN
+
+namespace System
+{
+    /// <summary>
+    /// Memory represents a contiguous region of arbitrary memory similar to <see cref="Span{T}"/>.
+    /// Unlike <see cref="Span{T}"/>, it is not a byref-like type.
+    /// </summary>
+    [DebuggerTypeProxy(typeof(MemoryDebugView<>))]
+    [DebuggerDisplay("{ToString(),raw}")]
+    public readonly struct Memory<T> : IEquatable<Memory<T>>
+    {
+        // NOTE: With the current implementation, Memory<T> and ReadOnlyMemory<T> must have the same layout,
+        // as code uses Unsafe.As to cast between them.
+
+        // The highest order bit of _index is used to discern whether _object is an array/string or an owned memory
+        // if (_index >> 31) == 1, object _object is an MemoryManager<T>
+        // else, object _object is a T[] or a string.
+        //     if (_length >> 31) == 1, _object is a pre-pinned array, so Pin() will not allocate a new GCHandle
+        //     else, Pin() needs to allocate a new GCHandle to pin the object.
+        // It can only be a string if the Memory<T> was created by
+        // using unsafe / marshaling code to reinterpret a ReadOnlyMemory<char> wrapped around a string as
+        // a Memory<T>.
+        private readonly object _object;
+        private readonly int _index;
+        private readonly int _length;
+
+        private const int RemoveFlagsBitMask = 0x7FFFFFFF;
+
+        /// <summary>
+        /// Creates a new memory over the entirety of the target array.
+        /// </summary>
+        /// <param name="array">The target array.</param>
+        /// <remarks>Returns default when <paramref name="array"/> is null.</remarks>
+        /// <exception cref="System.ArrayTypeMismatchException">Thrown when <paramref name="array"/> is covariant and array's type is not exactly T[].</exception>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Memory(T[] array)
+        {
+            if (array == null)
+            {
+                this = default;
+                return; // returns default
+            }
+            if (default(T) == null && array.GetType() != typeof(T[]))
+                ThrowHelper.ThrowArrayTypeMismatchException();
+
+            _object = array;
+            _index = 0;
+            _length = array.Length;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal Memory(T[] array, int start)
+        {
+            if (array == null)
+            {
+                if (start != 0)
+                    ThrowHelper.ThrowArgumentOutOfRangeException();
+                this = default;
+                return; // returns default
+            }
+            if (default(T) == null && array.Ge

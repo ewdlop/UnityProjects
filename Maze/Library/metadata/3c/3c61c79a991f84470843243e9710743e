@@ -1,0 +1,126 @@
+ivergence at a voxel location of
+    /// the iterator is out of range.
+    inline bool operator()(const VoxelIterT &iter) const
+    {
+        const Coord ijk = iter.getCoord();
+        return (*this)(invdx * math::ISDivergence<DiffScheme>::result(acc, ijk));
+    }
+
+    /// @brief Return a string describing a failed check.
+    std::string str() const
+    {
+        std::ostringstream ss;
+        ss << "outside the range of divergence ["<<minVal<<","<<maxVal<<"]";
+        return ss.str();
+    }
+
+    AccT acc;
+    const ValueType invdx, minVal, maxVal;
+};// CheckDivergence
+
+////////////////////////////////////////////////////////////////////////////////
+
+/// @brief Performs multithreaded diagnostics of a grid
+/// @note More documentation will be added soon!
+template <typename GridT>
+class Diagnose
+{
+  public:
+    typedef typename GridT::template ValueConverter<bool>::Type  MaskType;
+
+    Diagnose(const GridT& grid) : mGrid(&grid), mMask(new MaskType()), mCount(0)
+    {
+        mMask->setTransform(grid.transformPtr()->copy());
+    }
+
+    template <typename CheckT>
+    std::string check(const CheckT& check,
+                      bool updateMask = false,
+                      bool checkVoxels = true,
+                      bool checkTiles = true,
+                      bool checkBackground = true)
+    {
+        typename MaskType::TreeType* mask = updateMask ? &(mMask->tree()) : NULL;
+        CheckValues<CheckT> cc(mask, mGrid, check);
+        std::ostringstream ss;
+        if (checkBackground) ss << cc.checkBackground();
+        if (checkTiles)      ss << cc.checkTiles();
+        if (checkVoxels)     ss << cc.checkVoxels();
+        mCount += cc.mCount;
+        return ss.str();
+    }
+
+    //@{
+    /// @brief Return a boolean mask of all the values
+    /// (i.e. tiles and/or voxels) that have failed one or
+    /// more checks.
+    typename MaskType::ConstPtr mask() const { return mMask; }
+    typename MaskType::Ptr mask() { return mMask; }
+    //@}
+
+    /// @brief Return the number of values (i.e. background, tiles or
+    /// voxels) that have failed one or more checks.
+    Index64 valueCount() const { return mMask->activeVoxelCount(); }
+
+    /// @brief Return total number of failed checks
+    /// @note If only one check was performed and the mask was updated
+    /// failureCount equals valueCount.
+    Index64 failureCount() const { return mCount; }
+
+    /// @brief Return a const reference to the grid
+    const GridT& grid() const { return *mGrid; }
+
+    /// @brief Clear the mask and error counter
+    void clear() { mMask = new MaskType(); mCount = 0; }
+
+private:
+    // disallow copy construction and copy by assignment!
+    Diagnose(const Diagnose&);// not implemented
+    Diagnose& operator=(const Diagnose&);// not implemented
+
+    const GridT*           mGrid;
+    typename MaskType::Ptr mMask;
+    Index64                mCount;
+
+    /// @brief Private class that performs the multithreaded checks
+    template <typename CheckT>
+    struct CheckValues
+    {
+        typedef typename MaskType::TreeType MaskT;
+        typedef typename GridT::TreeType::LeafNodeType LeafT;
+        typedef typename tree::LeafManager<const typename GridT::TreeType> LeafManagerT;
+        const bool      mOwnsMask;
+        MaskT*          mMask;
+        const GridT*    mGrid;
+        const CheckT    mCheck;
+        Index64         mCount;
+
+        CheckValues(MaskT* mask, const GridT* grid, const CheckT& check)
+            : mOwnsMask(false)
+            , mMask(mask)
+            , mGrid(grid)
+            , mCheck(check)
+            , mCount(0)
+        {
+        }
+        CheckValues(CheckValues& other, tbb::split)
+            : mOwnsMask(true)
+            , mMask(other.mMask ? new MaskT() : NULL)
+            , mGrid(other.mGrid)
+            , mCheck(other.mCheck)
+            , mCount(0)
+        {
+        }
+        ~CheckValues() { if (mOwnsMask) delete mMask; }
+
+        std::string checkBackground()
+        {
+            std::ostringstream ss;
+            if (mCheck(mGrid->background())) {
+                ++mCount;
+                ss << "Background is " + mCheck.str() << std::endl;
+            }
+            return ss.str();
+        }
+
+        std::s

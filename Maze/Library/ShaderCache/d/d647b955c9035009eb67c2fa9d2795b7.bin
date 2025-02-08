@@ -1,0 +1,74 @@
+        /* not mappable or buffer overflow */
+                break;
+            }
+        }
+    }
+
+    /* set the converter state back into UConverter */
+    cnv->toUnicodeStatus=offset;
+    cnv->mode=state;
+    cnv->toULength=byteIndex;
+
+    /* write back the updated pointers */
+    pArgs->source=(const char *)source;
+    pArgs->target=target;
+    pArgs->offsets=offsets;
+}
+
+/*
+ * This version of ucnv_MBCSGetNextUChar() is optimized for single-byte, single-state codepages.
+ * We still need a conversion loop in case we find reserved action codes, which are to be ignored.
+ */
+static UChar32
+ucnv_MBCSSingleGetNextUChar(UConverterToUnicodeArgs *pArgs,
+                        UErrorCode *pErrorCode) {
+    UConverter *cnv;
+    const int32_t (*stateTable)[256];
+    const uint8_t *source, *sourceLimit;
+
+    int32_t entry;
+    uint8_t action;
+
+    /* set up the local pointers */
+    cnv=pArgs->converter;
+    source=(const uint8_t *)pArgs->source;
+    sourceLimit=(const uint8_t *)pArgs->sourceLimit;
+    if((cnv->options&UCNV_OPTION_SWAP_LFNL)!=0) {
+        stateTable=(const int32_t (*)[256])cnv->sharedData->mbcs.swapLFNLStateTable;
+    } else {
+        stateTable=cnv->sharedData->mbcs.stateTable;
+    }
+
+    /* conversion loop */
+    while(source<sourceLimit) {
+        entry=stateTable[0][*source++];
+        /* MBCS_ENTRY_IS_FINAL(entry) */
+
+        /* write back the updated pointer early so that we can return directly */
+        pArgs->source=(const char *)source;
+
+        if(MBCS_ENTRY_FINAL_IS_VALID_DIRECT_16(entry)) {
+            /* output BMP code point */
+            return (UChar)MBCS_ENTRY_FINAL_VALUE_16(entry);
+        }
+
+        /*
+         * An if-else-if chain provides more reliable performance for
+         * the most common cases compared to a switch.
+         */
+        action=(uint8_t)(MBCS_ENTRY_FINAL_ACTION(entry));
+        if( action==MBCS_STATE_VALID_DIRECT_20 ||
+            (action==MBCS_STATE_FALLBACK_DIRECT_20 && UCNV_TO_U_USE_FALLBACK(cnv))
+        ) {
+            /* output supplementary code point */
+            return (UChar32)(MBCS_ENTRY_FINAL_VALUE(entry)+0x10000);
+        } else if(action==MBCS_STATE_FALLBACK_DIRECT_16) {
+            if(UCNV_TO_U_USE_FALLBACK(cnv)) {
+                /* output BMP code point */
+                return (UChar)MBCS_ENTRY_FINAL_VALUE_16(entry);
+            }
+        } else if(action==MBCS_STATE_UNASSIGNED) {
+            /* just fall through */
+        } else if(action==MBCS_STATE_ILLEGAL) {
+            /* callback(illegal) */
+            *pErrorCode=U_ILLEGAL_CHAR

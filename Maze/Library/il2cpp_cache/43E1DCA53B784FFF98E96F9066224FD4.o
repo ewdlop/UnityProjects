@@ -1,0 +1,977 @@
+igationProperties)
+            {
+                RelatedEnd relatedEnd = this.WrappedEntity.RelationshipManager.GetRelatedEndInternal(n.RelationshipType.FullName, n.ToEndMember.Name);
+                Debug.Assert(relatedEnd != null, "relatedEnd is null");
+
+                object val = this.WrappedEntity.GetNavigationPropertyValue(relatedEnd);
+
+                HashSet<object> current = new HashSet<object>();
+                if (val != null)
+                {
+                    if (n.ToEndMember.RelationshipMultiplicity == RelationshipMultiplicity.Many)
+                    {
+                        // Collection
+                        IEnumerable collection = val as IEnumerable;
+                        if (collection == null)
+                        {
+                            throw new EntityException(System.Data.Entity.Strings.ObjectStateEntry_UnableToEnumerateCollection(n.Name, this.Entity.GetType().FullName));
+                        }
+                        foreach (object o in collection)
+                        {
+                            // Skip nulls in collections
+                            if (o != null)
+                            {
+                                current.Add(o);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // Reference
+                        current.Add(val);
+                    }
+                }
+
+                // find deleted entities
+                foreach (object o in relatedEnd.GetInternalEnumerable())
+                {
+                    if (!current.Contains(o))
+                    {
+                        this.AddRelationshipDetectedByGraph(
+                            this.ObjectStateManager.TransactionManager.DeletedRelationshipsByGraph, o, relatedEnd, verifyForAdd:false);
+                    }
+                    else
+                    {
+                        current.Remove(o);
+                    }
+                }
+
+                // "current" contains now only added entities
+                foreach (object o in current)
+                {
+                    this.AddRelationshipDetectedByGraph(
+                        this.ObjectStateManager.TransactionManager.AddedRelationshipsByGraph, o, relatedEnd, verifyForAdd:true);
+                }
+            }
+        }
+
+        private void AddRelationshipDetectedByGraph(
+            Dictionary<IEntityWrapper, Dictionary<RelatedEnd, HashSet<IEntityWrapper>>> relationships,
+            object relatedObject,
+            RelatedEnd relatedEndFrom,
+            bool verifyForAdd)
+        {
+            IEntityWrapper relatedWrapper = EntityWrapperFactory.WrapEntityUsingStateManager(relatedObject, this.ObjectStateManager);
+
+            this.AddDetectedRelationship(relationships, relatedWrapper, relatedEndFrom);
+
+            RelatedEnd relatedEndTo = relatedEndFrom.GetOtherEndOfRelationship(relatedWrapper);
+
+            if (verifyForAdd &&
+                relatedEndTo is EntityReference &&
+                this.ObjectStateManager.FindEntityEntry(relatedObject) == null)
+            {
+                // If the relatedObject is not tracked by the context, let's detect it before OSM.PerformAdd to avoid
+                // making RelatedEnd.Add() more complicated (it would have to know when the values in relatedEndTo can be overriden, and when not
+                relatedEndTo.VerifyNavigationPropertyForAdd(_wrappedEntity);
+            }
+
+            this.AddDetectedRelationship(relationships, _wrappedEntity, relatedEndTo);
+        }
+
+        private void AddRelationshipDetectedByForeignKey(
+            Dictionary<IEntityWrapper, Dictionary<RelatedEnd, HashSet<EntityKey>>> relationships,
+            Dictionary<IEntityWrapper, Dictionary<RelatedEnd, HashSet<EntityKey>>> principalRelationships,
+            EntityKey relatedKey,
+            EntityEntry relatedEntry,
+            RelatedEnd relatedEndFrom)
+        {
+            Debug.Assert(!relatedKey.IsTemporary, "the relatedKey was created by a method which returns only permaanent keys");
+            this.AddDetectedRelationship(relationships, relatedKey, relatedEndFrom);
+
+            if (relatedEntry != null)
+            {
+                IEntityWrapper relatedWrapper = relatedEntry.WrappedEntity; ;
+
+                RelatedEnd relatedEndTo = relatedEndFrom.GetOtherEndOfRelationship(relatedWrapper);
+
+                EntityKey permanentKeyOwner = this.ObjectStateManager.GetPermanentKey(relatedEntry.WrappedEntity, relatedEndTo, this.WrappedEntity);
+                this.AddDetectedRelationship(principalRelationships, permanentKeyOwner, relatedEndTo);
+            }
+        }
+
+        /// <summary>
+        /// Designed to be used by Change Detection methods to insert 
+        /// Added/Deleted relationships into <see cref="TransactionManager"/>
+        /// Creates new entries in the dictionaries if required
+        /// </summary>
+        /// <typeparam name="T">IEntityWrapper or EntityKey</typeparam>
+        /// <param name="relationships">The set of detected relationships to add this entry to</param>
+        /// <param name="relatedObject">The entity the relationship points to</param>
+        /// <param name="relatedEnd">The related end the relationship originates from</param>
+        private void AddDetectedRelationship<T>(
+            Dictionary<IEntityWrapper, Dictionary<RelatedEnd, HashSet<T>>> relationships,
+            T relatedObject,
+            RelatedEnd relatedEnd)
+        {
+            // Update info about changes to this/from side of the relationship
+            Dictionary<RelatedEnd, HashSet<T>> alreadyDetectedRelationshipsFrom;
+            if (!relationships.TryGetValue(relatedEnd.WrappedOwner, out alreadyDetectedRelationshipsFrom))
+            {
+                alreadyDetectedRelationshipsFrom = new Dictionary<RelatedEnd, HashSet<T>>();
+                relationships.Add(relatedEnd.WrappedOwner, alreadyDetectedRelationshipsFrom);
+            }
+
+            HashSet<T> objectsInRelatedEnd;
+            if (!alreadyDetectedRelationshipsFrom.TryGetValue(relatedEnd, out objectsInRelatedEnd))
+            {
+                objectsInRelatedEnd = new HashSet<T>();
+                alreadyDetectedRelationshipsFrom.Add(relatedEnd, objectsInRelatedEnd);
+            }
+            else
+            {
+                if (relatedEnd is EntityReference)
+                {
+                    Debug.Assert(objectsInRelatedEnd.Count() == 1, "unexpected number of entities for EntityReference");
+                    T existingRelatedObject = objectsInRelatedEnd.First();
+                    if (!Object.Equals(existingRelatedObject, relatedObject))
+                    {
+                        throw EntityUtil.CannotAddMoreThanOneEntityToEntityReference(
+                            relatedEnd.RelationshipNavigation.To, 
+                            relatedEnd.RelationshipNavigation.RelationshipName);
+                    }
+                }
+            }
+
+            objectsInRelatedEnd.Add(relatedObject);
+        }
+
+        /// <summary>
+        /// Detaches an entry and create in its place key entry if necessary
+        /// Removes relationships with another key entries and removes these key entries if necessary
+        /// </summary>
+        internal void Detach()
+        {
+            ValidateState();
+
+            Debug.Assert(!this.IsKeyEntry);
+
+            bool createKeyEntry = false;
+
+            RelationshipManager relationshipManager = _wrappedEntity.RelationshipManager;
+            Debug.Assert(relationshipManager != null, "Entity wrapper returned a null RelationshipManager");
+            // Key entry should be created only when current entity is not in Added state
+            // and if the entity is a "OneToOne" or "ZeroToOne" end of some existing relationship.
+            createKeyEntry =
+                    this.State != EntityState.Added &&
+                    this.IsOneEndOfSomeRelationship();
+
+            _cache.TransactionManager.BeginDetaching();
+            try
+            {
+                // Remove current entity from collections/references (on both ends of relationship)
+                // Relationship entries are removed from ObjectStateManager if current entity is in Added state
+                // or if current entity is a "Many" end of the relationship.
+                // NOTE In this step only relationship entries which have normal entity on the other end
+                //      can be detached.
+                // NOTE In this step no Deleted relationship entries are detached.
+                relationshipManager.DetachEntityFromRelationships(this.State);
+            }
+            finally
+            {
+                _cache.TransactionManager.EndDetaching();
+            }
+
+            // Remove relationship entries which has a key entry on the other end.
+            // If the key entry does not have any other relationship, it is removed from Object State Manager.
+            // NOTE Relationship entries which have a normal entity on the other end are detached only if the relationship state is Deleted.
+            this.DetachRelationshipsEntries(relationshipManager);
+
+            IEntityWrapper existingWrappedEntity = _wrappedEntity;
+            EntityKey key = _entityKey;
+            EntityState state = State;
+
+            if (createKeyEntry)
+            {
+                this.DegradeEntry();
+            }
+            else
+            {
+                // If entity is in state different than Added state, entityKey should not be set to null
+                // EntityKey is set to null in
+                //    ObjectStateManger.ChangeState() ->
+                //    ObjectStateEntry.Reset() ->
+                //    ObjectStateEntry.DetachObjectStateManagerFromEntity()
+
+                // Store data required to restore the entity key if needed.
+                _wrappedEntity.ObjectStateEntry = null;
+
+                _cache.ChangeState(this, this.State, EntityState.Detached);
+            }
+
+            // In case the detach event modifies the key.
+            if (state != EntityState.Added)
+            {
+                existingWrappedEntity.EntityKey = key;
+            }
+        }
+
+        //"doFixup" equals to False is called from EntityCollection & Ref code only
+        internal void Delete(bool doFixup)
+        {
+            ValidateState();
+
+            if (this.IsKeyEntry)
+            {
+                throw EntityUtil.CannotCallDeleteOnKeyEntry();
+            }
+
+            if (doFixup && this.State != EntityState.Deleted)
+            {
+                this.RelationshipManager.NullAllFKsInDependentsForWhichThisIsThePrincipal();
+                this.NullAllForeignKeys(); // May set conceptual nulls which will later be removed
+                this.FixupRelationships();
+            }
+
+            switch (State)
+            {
+                case EntityState.Added:
+                    Debug.Assert(EntityState.Added == State, "Expected ObjectStateEntry state is Added; make sure FixupRelationship did not corrupt cache entry state");
+
+                    _cache.ChangeState(this, EntityState.Added, EntityState.Detached);
+
+                    Debug.Assert(null == _modifiedFields, "There should not be any modified fields");
+
+                    break;
+                case EntityState.Modified:
+                    if (!doFixup)
+                    {
+                        // Even when we are not doing relationship fixup at the collection level, if the entry is not a relationship
+                        // we need to check to see if there are relationships that are referencing keys that should be removed
+                        // this mainly occurs in cascade delete scenarios
+                        DeleteRelationshipsThatReferenceKeys(null, null);
+                    }
+                    Debug.Assert(EntityState.Modified == State, "Expected ObjectStateEntry state is Modified; make sure FixupRelationship did not corrupt cache entry state");
+                    _cache.ChangeState(this, EntityState.Modified, EntityState.Deleted);
+                    State = EntityState.Deleted;
+
+                    break;
+                case EntityState.Unchanged:
+                    if (!doFixup)
+                    {
+                        // Even when we are not doing relationship fixup at the collection level, if the entry is not a relationship
+                        // we need to check to see if there are relationships that are referencing keys that should be removed
+                        // this mainly occurs in cascade delete scenarios
+                        DeleteRelationshipsThatReferenceKeys(null, null);
+                    }
+                    Debug.Assert(State == EntityState.Unchanged, "Unexpected state");
+                    Debug.Assert(EntityState.Unchanged == State, "Expected ObjectStateEntry state is Unchanged; make sure FixupRelationship did not corrupt cache entry state");
+                    _cache.ChangeState(this, EntityState.Unchanged, EntityState.Deleted);
+                    Debug.Assert(null == _modifiedFields, "There should not be any modified fields");
+                    State = EntityState.Deleted;
+
+                    break;
+                case EntityState.Deleted:
+                    // no-op
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// Nulls all FK values in this entity, or sets conceptual nulls if they are not nullable.
+        /// </summary>
+        private void NullAllForeignKeys()
+        {
+            foreach (var dependent in ForeignKeyDependents)
+            {
+                EntityReference relatedEnd = WrappedEntity.RelationshipManager.GetRelatedEndInternal(
+                    dependent.Item1.ElementType.FullName, dependent.Item2.FromRole.Name) as EntityReference;
+                Debug.Assert(relatedEnd != null, "Expected non-null EntityReference to principal.");
+                relatedEnd.NullAllForeignKeys();
+            }
+        }
+
+        private bool IsOneEndOfSomeRelationship()
+        {
+            foreach (RelationshipEntry relationshipEntry in _cache.FindRelationshipsByKey(EntityKey))
+            {
+                RelationshipMultiplicity multiplicity = this.GetAssociationEndMember(relationshipEntry).RelationshipMultiplicity;
+                if (multiplicity == RelationshipMultiplicity.One ||
+                    multiplicity == RelationshipMultiplicity.ZeroOrOne)
+                {
+                    EntityKey targetKey = relationshipEntry.RelationshipWrapper.GetOtherEntityKey(EntityKey);
+                    EntityEntry relatedEntry = _cache.GetEntityEntry(targetKey);
+                    // Relationships with KeyEntries don't count.
+                    if (!relatedEntry.IsKeyEntry)
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        // Detaches related relationship entries if other ends of these relationships are key entries.
+        // Detaches also related relationship entries if the entry is in Deleted state and the multiplicity is Many.
+        // Key entry from the other side of the relationship is removed if is not related to other entries.
+        private void DetachRelationshipsEntries(RelationshipManager relationshipManager)
+        {
+            Debug.Assert(relationshipManager != null, "Unexpected null RelationshipManager");
+            Debug.Assert(!this.IsKeyEntry, "Should only be detaching relationships with key entries if the source is not a key entry");
+
+            foreach (RelationshipEntry relationshipEntry in _cache.CopyOfRelationshipsByKey(EntityKey))
+            {
+                // Get state entry for other side of the relationship
+                EntityKey targetKey = relationshipEntry.RelationshipWrapper.GetOtherEntityKey(EntityKey);
+                Debug.Assert((object)targetKey != null, "EntityKey not on either side of relationship as expected");
+
+                EntityEntry relatedEntry = _cache.GetEntityEntry(targetKey);
+                if (relatedEntry.IsKeyEntry)
+                {
+                    // This must be an EntityReference, so set the DetachedEntityKey if the relationship is currently Added or Unchanged  
+                    // devnote: This assumes that we are in the middle of detaching the entity associated with this state entry, because
+                    //          we don't always want to preserve the EntityKey for every detached relationship, if the source entity itself isn't being detached
+                    if (relationshipEntry.State != EntityState.Deleted)
+                    {
+                        AssociationEndMember targetMember = relationshipEntry.RelationshipWrapper.GetAssociationEndMember(targetKey);
+                        // devnote: Since we know the target end of this relationship is a key entry, it has to be a reference, so just cast
+                        EntityReference entityReference = (EntityReference)relationshipManager.GetRelatedEndInternal(targetMember.DeclaringType.FullName, targetMember.Name);
+                        entityReference.DetachedEntityKey = targetKey;
+                    }
+                    // else do nothing -- we can't null out the key for Deleted state, because there could be other relationships with this same source in a different state
+
+                    // Remove key entry if necessary
+                    relationshipEntry.DeleteUnnecessaryKeyEntries();
+                    // Remove relationship entry
+                    relationshipEntry.DetachRelationshipEntry();
+                }
+                else
+                {
+                    // Detach deleted relationships
+                    if (relationshipEntry.State == EntityState.Deleted)
+                    {
+                        RelationshipMultiplicity multiplicity = this.GetAssociationEndMember(relationshipEntry).RelationshipMultiplicity;
+                        if (multiplicity == RelationshipMultiplicity.Many)
+                        {
+                            relationshipEntry.DetachRelationshipEntry();
+                        }
+                    }
+                }
+            }
+        }
+
+        private void FixupRelationships()
+        {
+            RelationshipManager relationshipManager = _wrappedEntity.RelationshipManager;
+            Debug.Assert(relationshipManager != null, "Entity wrapper returned a null RelationshipManager");
+            relationshipManager.RemoveEntityFromRelationships();
+            DeleteRelationshipsThatReferenceKeys(null, null);
+        }
+
+        /// <summary>
+        /// see if there are any relationship entries that point to key entries
+        /// if there are, remove the relationship entry
+        /// This is called when one of the ends of a relationship is being removed
+        /// </summary>
+        /// <param name="relationshipSet">An option relationshipSet; deletes only relationships that are part of this set</param>
+        internal void DeleteRelationshipsThatReferenceKeys(RelationshipSet relationshipSet, RelationshipEndMember endMember)
+        {
+            if (State != EntityState.Detached)
+            {
+                // devnote: Need to use a copy of the relationships list because we may be deleting Added
+                //          relationships, which will be removed from the list while we are still iterating
+                foreach (RelationshipEntry relationshipEntry in _cache.CopyOfRelationshipsByKey(EntityKey))
+                {
+                    // Only delete the relationship entry if it is not already deleted (in which case we cannot access its values)
+                    // and when the given (optionally) relationshipSet matches the one in teh relationship entry
+                    if ((relationshipEntry.State != EntityState.Deleted) &&
+                        (relationshipSet == null || relationshipSet == relationshipEntry.EntitySet))
+                    {
+                        EntityEntry otherEnd = this.GetOtherEndOfRelationship(relationshipEntry);
+                        if (endMember == null || endMember == otherEnd.GetAssociationEndMember(relationshipEntry))
+                        {
+                            for (int i = 0; i < 2; i++)
+                            {
+                                EntityKey entityKey = relationshipEntry.GetCurrentRelationValue(i) as EntityKey;
+                                if ((object)entityKey != null)
+                                {
+                                    EntityEntry relatedEntry = _cache.GetEntityEntry(entityKey);
+                                    if (relatedEntry.IsKeyEntry)
+                                    {
+                                        // remove the relationshipEntry
+                                        relationshipEntry.Delete(false);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Retrieve referential constraint properties from Principal entities (possibly recursively)
+        // and check referential constraint properties in the Dependent entities (1 level only)
+        // This code does not check the constraints on FKs because that work is instead done by
+        // the FK fixup code that is also called from AcceptChanges.
+        // Returns true if any FK relationships were skipped so that they can be checked again after fixup
+        private bool RetrieveAndCheckReferentialConstraintValuesInAcceptChanges()
+        {
+            RelationshipManager relationshipManager = _wrappedEntity.RelationshipManager;
+            Debug.Assert(relationshipManager != null, "Entity wrapper returned a null RelationshipManager");
+            // Find key property names which are part of referential integrity constraints
+            List<string> propertiesToRetrieve;  // names of properties which should be retrieved from Principal entities
+            bool propertiesToCheckExist;        // true iff there are properties which should be checked in dependent entities
+
+            // Get RI property names from metadata
+            bool skippedFKs = relationshipManager.FindNamesOfReferentialConstraintProperties(out propertiesToRetrieve, out propertiesToCheckExist, skipFK: true);
+
+            // Do not try to retrieve RI properties if entity doesn't participate in any RI Constraints
+            if (propertiesToRetrieve != null)
+            {
+                // Retrieve key values from related entities
+                Dictionary<string, KeyValuePair<object, IntBox>> properties;
+
+                // Create HashSet to store references to already visited entities, used to detect circular references
+                HashSet<object> visited = new HashSet<object>();
+
+                relationshipManager.RetrieveReferentialConstraintProperties(out properties, visited, includeOwnValues: false);
+
+                // Update properties
+                foreach (KeyValuePair<string, KeyValuePair<object, IntBox>> pair in properties)
+                {
+                    this.SetCurrentEntityValue(pair.Key /*name*/, pair.Value.Key /*value*/);
+                }
+            }
+
+            if (propertiesToCheckExist)
+            {
+                // Compare properties of current entity with properties of the dependent entities
+                this.CheckReferentialConstraintPropertiesInDependents();
+            }
+            return skippedFKs;
+        }
+
+
+        internal void RetrieveReferentialConstraintPropertiesFromKeyEntries(Dictionary<string, KeyValuePair<object, IntBox>> properties)
+        {
+            string thisRole;
+            AssociationSet association;
+
+            // Iterate through related relationship entries
+            foreach (RelationshipEntry relationshipEntry in _cache.FindRelationshipsByKey(EntityKey))
+            {
+                EntityEntry otherEnd = this.GetOtherEndOfRelationship(relationshipEntry);
+
+                // We only try to retrieve properties from key entries
+                if (otherEnd.IsKeyEntry)
+                {
+                    association = (AssociationSet)relationshipEntry.EntitySet;
+                    Debug.Assert(association != null, "relationship is not an association");
+
+                    // Iterate through referential constraints of the association of the relationship
+                    // NOTE PERFORMANCE This collection in current stack can have 0 or 1 elements
+                    foreach (ReferentialConstraint constraint in association.ElementType.ReferentialConstraints)
+                    {
+                        thisRole = this.GetAssociationEndMember(relationshipEntry).Name;
+
+                        // Check if curent entry is a dependent end of the referential constraint
+                        if (constraint.ToRole.Name == thisRole)
+                        {
+                            Debug.Assert(!otherEnd.EntityKey.IsTemporary, "key of key entry can't be temporary");
+                            IList<EntityKeyMember> otherEndKeyValues = otherEnd.EntityKey.EntityKeyValues;
+                            Debug.Assert(otherEndKeyValues != null, "key entry must have key values");
+
+                            // NOTE PERFORMANCE Number of key properties is supposed to be "small"
+                            foreach (EntityKeyMember pair in otherEndKeyValues)
+                            {
+                                for (int i = 0; i < constraint.FromProperties.Count; ++i)
+                                {
+                                    if (constraint.FromProperties[i].Name == pair.Key)
+                                    {
+                                        EntityEntry.AddOrIncreaseCounter(properties, constraint.ToProperties[i].Name, pair.Value);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        internal static void AddOrIncreaseCounter(Dictionary<string, KeyValuePair<object, IntBox>> properties, string propertyName, object propertyValue)
+        {
+            Debug.Assert(properties != null);
+            Debug.Assert(propertyName != null);
+            Debug.Assert(propertyValue != null);
+
+            if (properties.ContainsKey(propertyName))
+            {
+                // If this property already exists in the dictionary, check if value is the same then increase the counter
+
+                KeyValuePair<object, IntBox> valueCounterPair = properties[propertyName];
+
+                if (!ByValueEqualityComparer.Default.Equals(valueCounterPair.Key, propertyValue))
+                    throw EntityUtil.InconsistentReferentialConstraintProperties();
+                else
+                    valueCounterPair.Value.Value = valueCounterPair.Value.Value + 1;
+            }
+            else
+            {
+                // If property doesn't exist in the dictionary - add new entry with pair<value, counter>
+                properties[propertyName] = new KeyValuePair<object, IntBox>(propertyValue, new IntBox(1));
+            }
+        }
+
+        // Check if related dependent entities contain proper property values
+        // Only entities in Unchanged and Modified state are checked (including KeyEntries)
+        private void CheckReferentialConstraintPropertiesInDependents()
+        {
+            string thisRole;
+            AssociationSet association;
+
+            // Iterate through related relationship entries
+            foreach (RelationshipEntry relationshipEntry in _cache.FindRelationshipsByKey(EntityKey))
+            {
+                EntityEntry otherEnd = this.GetOtherEndOfRelationship(relationshipEntry);
+
+                // We only check entries which are in Unchanged or Modified state
+                // (including KeyEntries which are always in Unchanged State)
+                if (otherEnd.State == EntityState.Unchanged || otherEnd.State == EntityState.Modified)
+                {
+                    association = (AssociationSet)relationshipEntry.EntitySet;
+                    Debug.Assert(association != null, "relationship is not an association");
+
+                    // Iterate through referential constraints of the association of the relationship
+                    // NOTE PERFORMANCE This collection in current stack can have 0 or 1 elements
+                    foreach (ReferentialConstraint constraint in association.ElementType.ReferentialConstraints)
+                    {
+                        thisRole = this.GetAssociationEndMember(relationshipEntry).Name;
+
+                        // Check if curent entry is a principal end of the referential constraint
+                        if (constraint.FromRole.Name == thisRole)
+                        {
+                            Debug.Assert(!otherEnd.EntityKey.IsTemporary, "key of Unchanged or Modified entry can't be temporary");
+                            IList<EntityKeyMember> otherEndKeyValues = otherEnd.EntityKey.EntityKeyValues;
+                            // NOTE PERFORMANCE Number of key properties is supposed to be "small"
+                            foreach (EntityKeyMember pair in otherEndKeyValues)
+                            {
+                                for (int i = 0; i < constraint.FromProperties.Count; ++i)
+                                {
+                                    if (constraint.ToProperties[i].Name == pair.Key)
+                                    {
+                                        if (!ByValueEqualityComparer.Default.Equals(GetCurrentEntityValue(constraint.FromProperties[i].Name), pair.Value))
+                                        {
+                                            throw EntityUtil.InconsistentReferentialConstraintProperties();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        internal void PromoteKeyEntry(IEntityWrapper wrappedEntity, IExtendedDataRecord shadowValues, StateManagerTypeMetadata typeMetadata)
+        {
+            Debug.Assert(wrappedEntity != null, "entity wrapper cannot be null.");
+            Debug.Assert(wrappedEntity.Entity != null, "entity cannot be null.");
+            Debug.Assert(this.IsKeyEntry, "ObjectStateEntry should be a key.");
+            Debug.Assert(typeMetadata != null, "typeMetadata cannot be null.");
+
+            _wrappedEntity = wrappedEntity;
+            _wrappedEntity.ObjectStateEntry = this;
+
+            // Allow updating of cached metadata because the actual entity might be a derived type
+            _cacheTypeMetadata = typeMetadata;
+
+            SetChangeTrackingFlags();
+
+#if DEBUG   // performance, don't do this work in retail until shadow state is supported
+            if (shadowValues != null)
+            {
+                // shadowState always  coms from materializer, just copy the shadowstate values
+                Debug.Assert(shadowValues.DataRecordInfo.RecordType.EdmType.Equals(_cacheTypeMetadata.CdmMetadata.EdmType), "different cspace metadata instance");
+                for (int ordinal = 0; ordinal < _cacheTypeMetadata.FieldCount; ordinal++)
+                {
+                    if (_cacheTypeMetadata.IsMemberPartofShadowState(ordinal))
+                    {
+                        Debug.Assert(false, "shadowstate not supported");
+                    }
+                }
+            }
+#endif
+        }
+
+        /// <summary>
+        /// Turns this entry into a key entry (SPAN stub).
+        /// </summary>
+        internal void DegradeEntry()
+        {
+            Debug.Assert(!this.IsKeyEntry);
+            Debug.Assert((object)_entityKey != null);
+
+            _entityKey = EntityKey; //Performs validation.
+
+            RemoveFromForeignKeyIndex();
+
+            _wrappedEntity.SetChangeTracker(null);
+
+            _modifiedFields = null;
+            _originalValues = null;
+            _originalComplexObjects = null;
+
+            // we don't want temporary keys to exist outside of the context
+            if (State == EntityState.Added)
+            {
+                _wrappedEntity.EntityKey = null;
+                _entityKey = null;
+            }
+
+            if (State != EntityState.Unchanged)
+            {
+                _cache.ChangeState(this, this.State, EntityState.Unchanged);
+                State = EntityState.Unchanged;
+            }
+
+            _cache.RemoveEntryFromKeylessStore(_wrappedEntity);
+            _wrappedEntity.DetachContext();
+            _wrappedEntity.ObjectStateEntry = null;
+
+            object degradedEntity = _wrappedEntity.Entity;
+            _wrappedEntity = EntityWrapperFactory.NullWrapper;
+            
+            SetChangeTrackingFlags();
+
+            _cache.OnObjectStateManagerChanged(CollectionChangeAction.Remove, degradedEntity);
+
+            Debug.Assert(this.IsKeyEntry);
+        }
+
+        internal void AttachObjectStateManagerToEntity()
+        {
+            // This method should only be called in cases where we really have an entity to attach to
+            Debug.Assert(_wrappedEntity.Entity != null, "Cannot attach a null entity to the state manager");
+            _wrappedEntity.SetChangeTracker(this);
+            _wrappedEntity.TakeSnapshot(this);
+        }
+
+        // Get values of key properties which doesn't already exist in passed in 'properties'
+        internal void GetOtherKeyProperties(Dictionary<string, KeyValuePair<object, IntBox>> properties)
+        {
+            Debug.Assert(properties != null);
+            Debug.Assert(_cacheTypeMetadata != null);
+            Debug.Assert(_cacheTypeMetadata.DataRecordInfo != null);
+            Debug.Assert(_cacheTypeMetadata.DataRecordInfo.RecordType != null);
+
+            EntityType entityType = _cacheTypeMetadata.DataRecordInfo.RecordType.EdmType as EntityType;
+            Debug.Assert(entityType != null, "EntityType == null");
+
+            foreach (EdmMember member in entityType.KeyMembers)
+            {
+                if (!properties.ContainsKey(member.Name))
+                {
+                    properties[member.Name] = new KeyValuePair<object, IntBox>(this.GetCurrentEntityValue(member.Name), new IntBox(1));
+                }
+            }
+        }
+
+        internal void AddOriginalValue(StateManagerMemberMetadata memberMetadata, object userObject, object value)
+        {
+            if (null == _originalValues)
+            {
+                _originalValues = new List<StateManagerValue>();
+            }
+            _originalValues.Add(new StateManagerValue(memberMetadata, userObject, value));
+        }
+
+        internal void CompareKeyProperties(object changed)
+        {
+            Debug.Assert(changed != null, "changed object is null");
+            Debug.Assert(!this.IsKeyEntry);
+
+            StateManagerTypeMetadata metadata = this._cacheTypeMetadata;
+
+            int fieldCount = this.GetFieldCount(metadata);
+            object currentValueNew;
+            object currentValueOld;
+
+            for (int i = 0; i < fieldCount; i++)
+            {
+                StateManagerMemberMetadata member = metadata.Member(i);
+                if (member.IsPartOfKey)
+                {
+                    Debug.Assert(!member.IsComplex);
+
+                    currentValueNew = member.GetValue(changed);
+                    currentValueOld = member.GetValue(_wrappedEntity.Entity);
+
+                    if (!ByValueEqualityComparer.Default.Equals(currentValueNew, currentValueOld))
+                    {
+                        throw EntityUtil.CannotModifyKeyProperty(member.CLayerName);
+                    }
+                }
+            }
+        }
+
+        // helper method used to get value of property
+        internal object GetCurrentEntityValue(string memberName)
+        {
+            int ordinal = _cacheTypeMetadata.GetOrdinalforOLayerMemberName(memberName);
+            return GetCurrentEntityValue(_cacheTypeMetadata, ordinal, _wrappedEntity.Entity, ObjectStateValueRecord.CurrentUpdatable);
+        }
+
+        /// <summary>
+        /// Verifies that the property with the given ordinal is editable.
+        /// </summary>
+        /// <exception cref="InvalidOperationException">the property is not editable</exception>
+        internal void VerifyEntityValueIsEditable(StateManagerTypeMetadata typeMetadata, int ordinal, string memberName)
+        {
+            if (this.State == EntityState.Deleted)
+            {
+                throw EntityUtil.CantModifyDetachedDeletedEntries();
+            }
+
+            Debug.Assert(typeMetadata != null, "Cannot verify entity or complex object is editable if typeMetadata is null.");
+            StateManagerMemberMetadata member = typeMetadata.Member(ordinal);
+
+            Debug.Assert(member != null, "Member shouldn't be null.");
+
+            // Key fields are only editable if the entry is the Added state.
+            if (member.IsPartOfKey && State != EntityState.Added)
+            {
+                throw EntityUtil.CannotModifyKeyProperty(memberName);
+            }
+        }
+
+        // This API are mainly for DbDataRecord implementations to get and set the values
+        // also for loadoptions, setoldvalue will be used.
+        // we should handle just for C-space, we will not recieve a call from O-space for set
+        // We will not also return any value in term of O-Layer. all set and gets for us is in terms of C-layer.
+        // the only O-layer interaction we have is through delegates from entity.
+        internal void SetCurrentEntityValue(StateManagerTypeMetadata metadata, int ordinal, object userObject, object newValue)
+        {
+            // required to validate state because entity could be detatched from this context and added to another context
+            // and we want this to fail instead of setting the value which would redirect to the other context
+            ValidateState();
+
+            StateManagerMemberMetadata member = metadata.Member(ordinal);
+            Debug.Assert(member != null, "StateManagerMemberMetadata was not found for the given ordinal.");
+
+            if (member.IsComplex)
+            {
+                if (newValue == null || newValue == DBNull.Value)
+                {
+                    throw EntityUtil.NullableComplexTypesNotSupported(member.CLayerName);
+                }
+
+                IExtendedDataRecord newValueRecord = newValue as IExtendedDataRecord;
+                if (newValueRecord == null)
+                {
+                    throw EntityUtil.InvalidTypeForComplexTypeProperty("value");
+                }
+
+                newValue = _cache.ComplexTypeMaterializer.CreateComplex(newValueRecord, newValueRecord.DataRecordInfo, null);
+            }
+
+            _wrappedEntity.SetCurrentValue(this, member, ordinal, userObject, newValue);
+        }
+
+        private void TransitionRelationshipsForAdd()
+        {
+            foreach (RelationshipEntry relationshipEntry in _cache.CopyOfRelationshipsByKey(this.EntityKey))
+            {
+                // Unchanged -> Added
+                if (relationshipEntry.State == EntityState.Unchanged)
+                {
+                    this.ObjectStateManager.ChangeState(relationshipEntry, EntityState.Unchanged, EntityState.Added);
+                    relationshipEntry.State = EntityState.Added;
+                }
+                // Deleted -> Detached
+                else if (relationshipEntry.State == EntityState.Deleted)
+                {
+                    // Remove key entry if necessary
+                    relationshipEntry.DeleteUnnecessaryKeyEntries();
+                    // Remove relationship entry
+                    relationshipEntry.DetachRelationshipEntry();
+                }
+            }
+        }
+
+        [Conditional("DEBUG")]
+        private void VerifyIsNotRelated()
+        {
+            Debug.Assert(!this.IsKeyEntry, "shouldn't be called for a key entry");
+
+            this.WrappedEntity.RelationshipManager.VerifyIsNotRelated();
+        }
+
+        internal void ChangeObjectState(EntityState requestedState)
+        {
+            if (this.IsKeyEntry)
+            {
+                if (requestedState == EntityState.Unchanged)
+                {
+                    return; // No-op
+                }
+                throw EntityUtil.CannotModifyKeyEntryState();
+            }
+
+            switch (this.State)
+            {
+                case EntityState.Added:
+                    switch (requestedState)
+                    {
+                        case EntityState.Added:
+                            // Relationship fixup: Unchanged -> Added,  Deleted -> Detached
+                            this.TransitionRelationshipsForAdd();
+                            break;
+                        case EntityState.Unchanged:
+                            // Relationship fixup: none
+                            this.AcceptChanges();
+                            break;
+                        case EntityState.Modified:
+                            // Relationship fixup: none
+                            this.AcceptChanges();
+                            this.SetModified();
+                            this.SetModifiedAll();
+                            break;
+                        case EntityState.Deleted:
+                            // Need to forget conceptual nulls so that AcceptChanges does not throw.
+                            // Note that there should always be no conceptual nulls left when we get into the Deleted state.
+                            _cache.ForgetEntryWithConceptualNull(this, resetAllKeys: true);
+                            // Relationship fixup: Added -> Detached, Unchanged -> Deleted
+                            this.AcceptChanges();
+                            // NOTE: OSM.TransactionManager.IsLocalPublicAPI == true so cascade delete and RIC are disabled
+                            this.Delete(true);
+                            break;
+                        case EntityState.Detached:
+                            // Relationship fixup: * -> Detached
+                            this.Detach();
+                            break;
+                        default:
+                            throw EntityUtil.InvalidEntityStateArgument("state");
+                    }
+                    break;
+                case EntityState.Unchanged:
+                    switch (requestedState)
+                    {
+                        case EntityState.Added:
+                            this.ObjectStateManager.ReplaceKeyWithTemporaryKey(this);
+                            this._modifiedFields = null;
+                            this._originalValues = null;
+                            this._originalComplexObjects = null;
+                            this.State = EntityState.Added;
+                            // Relationship fixup: Unchanged -> Added,  Deleted -> Detached
+                            this.TransitionRelationshipsForAdd();
+                            break;
+                        case EntityState.Unchanged:
+                            // Relationship fixup: none
+                            break;
+                        case EntityState.Modified:
+                            // Relationship fixup: none
+                            this.SetModified();
+                            this.SetModifiedAll();
+                            break;
+                        case EntityState.Deleted:
+                            // Relationship fixup: Added -> Detached,  Unchanged -> Deleted
+                            // NOTE: OSM.TransactionManager.IsLocalPublicAPI == true so cascade delete and RIC are disabled
+                            this.Delete(true);
+                            break;
+                        case EntityState.Detached:
+                            // Relationship fixup: * -> Detached
+                            this.Detach();
+                            break;
+                        default:
+                            throw EntityUtil.InvalidEntityStateArgument("state");
+                    }
+                    break;
+                case EntityState.Modified:
+                    switch (requestedState)
+                    {
+                        case EntityState.Added:
+                            this.ObjectStateManager.ReplaceKeyWithTemporaryKey(this);
+                            this._modifiedFields = null;
+                            this._originalValues = null;
+                            this._originalComplexObjects = null;
+                            this.State = EntityState.Added;
+                            // Relationship fixup: Unchanged -> Added,  Deleted -> Detached
+                            this.TransitionRelationshipsForAdd();
+                            break;
+                        case EntityState.Unchanged:
+                            this.AcceptChanges();
+                            // Relationship fixup: none
+                            break;
+                        case EntityState.Modified:
+                            // Relationship fixup: none
+                            this.SetModified();
+                            this.SetModifiedAll();
+                            break;
+                        case EntityState.Deleted:
+                            // Relationship fixup: Added -> Detached,  Unchanged -> Deleted
+                            // NOTE: OSM.TransactionManager.IsLocalPublicAPI == true so cascade delete and RIC are disabled
+                            this.Delete(true);
+                            break;
+                        case EntityState.Detached:
+                            // Relationship fixup: * -> Detached
+                            this.Detach();
+                            break;
+                        default:
+                            throw EntityUtil.InvalidEntityStateArgument("state");
+                    }
+                    break;
+                case EntityState.Deleted:
+                    switch (requestedState)
+                    {
+                        case EntityState.Added:
+                            // Throw if the entry has some not-Deleted relationships
+                            this.VerifyIsNotRelated();
+                            this.TransitionRelationshipsForAdd();
+                            this.ObjectStateManager.ReplaceKeyWithTemporaryKey(this);
+                            this._modifiedFields = null;
+                            this._originalValues = null;
+                            this._originalComplexObjects = null;
+                            this.State = EntityState.Added;
+                            _cache.FixupReferencesByForeignKeys(this); // Make sure refs based on FK values are set
+                            _cache.OnObjectStateManagerChanged(CollectionChangeAction.Add, Entity);
+                            break;
+                        case EntityState.Unchanged:
+                            // Throw if the entry has some not-Deleted relationship
+                            this.VerifyIsNotRelated();
+                            this._modifiedFields = null;
+                            this._originalValues = null;
+                            this._originalComplexObjects = null;
+
+                            this.ObjectStateManager.ChangeState(this, EntityState.Deleted, EntityState.Unchanged);
+                            this.State = EntityState.Unchanged;
+
+                            _wrappedEntity.TakeSnapshot(this); // refresh snapshot
+
+                            _cache.FixupReferencesByForeignKeys(this); // Make sure refs based on FK values are set
+                            _cache.OnObjectStateManagerChanged(CollectionChangeAction.Add, Entity);
+
+                            // Relationship fixup: none
+                            break;
+                        case EntityState.Modified:
+                            // Throw if the entry has some not-Deleted relationship
+                            this.VerifyIsNotRelated();
+                            // Relationship fixup: none
+                            this.ObjectStateManager.ChangeState(this, EntityState.Deleted, EntityState.Modified);
+                            this.State = EntityState.Modified;
+                            this.SetModifiedAll();
+
+                            _cache.FixupReferencesByForeignKeys(this); // Make sure refs based on FK values are set
+                            _cache.OnObjectStateManagerChanged(CollectionChangeAction.Add, Entity);
+                            
+                            break;
+                        case EntityState.Deleted:
+                            // No-op
+                            break;
+                        case EntityState.Detached:
+                            // Relationship fixup: * -> Detached
+                            this.Detach();
+                            break;
+                        default:
+                            throw EntityUtil.InvalidEntityStateArgument("state");
+                 

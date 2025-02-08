@@ -1,0 +1,1210 @@
+   #
+
+#    dependencies = property(_get_dependencies, _set_dependencies)
+
+    def get_fullname(self, filesafe=False):
+        """Return the distribution name with version.
+
+        If filesafe is true, return a filename-escaped form."""
+        return _get_name_and_version(self['Name'], self['Version'], filesafe)
+
+    def is_field(self, name):
+        """return True if name is a valid metadata key"""
+        name = self._convert_name(name)
+        return name in _ALL_FIELDS
+
+    def is_multi_field(self, name):
+        name = self._convert_name(name)
+        return name in _LISTFIELDS
+
+    def read(self, filepath):
+        """Read the metadata values from a file path."""
+        fp = codecs.open(filepath, 'r', encoding='utf-8')
+        try:
+            self.read_file(fp)
+        finally:
+            fp.close()
+
+    def read_file(self, fileob):
+        """Read the metadata values from a file object."""
+        msg = message_from_file(fileob)
+        self._fields['Metadata-Version'] = msg['metadata-version']
+
+        # When reading, get all the fields we can
+        for field in _ALL_FIELDS:
+            if field not in msg:
+                continue
+            if field in _LISTFIELDS:
+                # we can have multiple lines
+                values = msg.get_all(field)
+                if field in _LISTTUPLEFIELDS and values is not None:
+                    values = [tuple(value.split(',')) for value in values]
+                self.set(field, values)
+            else:
+                # single line
+                value = msg[field]
+                if value is not None and value != 'UNKNOWN':
+                    self.set(field, value)
+        # logger.debug('Attempting to set metadata for %s', self)
+        # self.set_metadata_version()
+
+    def write(self, filepath, skip_unknown=False):
+        """Write the metadata fields to filepath."""
+        fp = codecs.open(filepath, 'w', encoding='utf-8')
+        try:
+            self.write_file(fp, skip_unknown)
+        finally:
+            fp.close()
+
+    def write_file(self, fileobject, skip_unknown=False):
+        """Write the PKG-INFO format data to a file object."""
+        self.set_metadata_version()
+
+        for field in _version2fieldlist(self['Metadata-Version']):
+            values = self.get(field)
+            if skip_unknown and values in ('UNKNOWN', [], ['UNKNOWN']):
+                continue
+            if field in _ELEMENTSFIELD:
+                self._write_field(fileobject, field, ','.join(values))
+                continue
+            if field not in _LISTFIELDS:
+                if field == 'Description':
+                    if self.metadata_version in ('1.0', '1.1'):
+                        values = values.replace('\n', '\n        ')
+                    else:
+                        values = values.replace('\n', '\n       |')
+                values = [values]
+
+            if field in _LISTTUPLEFIELDS:
+                values = [','.join(value) for value in values]
+
+            for value in values:
+                self._write_field(fileobject, field, value)
+
+    def update(self, other=None, **kwargs):
+        """Set metadata values from the given iterable `other` and kwargs.
+
+        Behavior is like `dict.update`: If `other` has a ``keys`` method,
+        they are looped over and ``self[key]`` is assigned ``other[key]``.
+        Else, ``other`` is an iterable of ``(key, value)`` iterables.
+
+        Keys that don't match a metadata field or that have an empty value are
+        dropped.
+        """
+        def _set(key, value):
+            if key in _ATTR2FIELD and value:
+                self.set(self._convert_name(key), value)
+
+        if not other:
+            # other is None or empty container
+            pass
+        elif hasattr(other, 'keys'):
+            for k in other.keys():
+                _set(k, other[k])
+        else:
+            for k, v in other:
+                _set(k, v)
+
+        if kwargs:
+            for k, v in kwargs.items():
+                _set(k, v)
+
+    def set(self, name, value):
+        """Control then set a metadata field."""
+        name = self._convert_name(name)
+
+        if ((name in _ELEMENTSFIELD or name == 'Platform') and
+            not isinstance(value, (list, tuple))):
+            if isinstance(value, string_types):
+                value = [v.strip() for v in value.split(',')]
+            else:
+                value = []
+        elif (name in _LISTFIELDS and
+              not isinstance(value, (list, tuple))):
+            if isinstance(value, string_types):
+                value = [value]
+            else:
+                value = []
+
+        if logger.isEnabledFor(logging.WARNING):
+            project_name = self['Name']
+
+            scheme = get_scheme(self.scheme)
+            if name in _PREDICATE_FIELDS and value is not None:
+                for v in value:
+                    # check that the values are valid
+                    if not scheme.is_valid_matcher(v.split(';')[0]):
+                        logger.warning(
+                            "'%s': '%s' is not valid (field '%s')",
+                            project_name, v, name)
+            # FIXME this rejects UNKNOWN, is that right?
+            elif name in _VERSIONS_FIELDS and value is not None:
+                if not scheme.is_valid_constraint_list(value):
+                    logger.warning("'%s': '%s' is not a valid version (field '%s')",
+                                   project_name, value, name)
+            elif name in _VERSION_FIELDS and value is not None:
+                if not scheme.is_valid_version(value):
+                    logger.warning("'%s': '%s' is not a valid version (field '%s')",
+                                   project_name, value, name)
+
+        if name in _UNICODEFIELDS:
+            if name == 'Description':
+                value = self._remove_line_prefix(value)
+
+        self._fields[name] = value
+
+    def get(self, name, default=_MISSING):
+        """Get a metadata field."""
+        name = self._convert_name(name)
+        if name not in self._fields:
+            if default is _MISSING:
+                default = self._default_value(name)
+            return default
+        if name in _UNICODEFIELDS:
+            value = self._fields[name]
+            return value
+        elif name in _LISTFIELDS:
+            value = self._fields[name]
+            if value is None:
+                return []
+            res = []
+            for val in value:
+                if name not in _LISTTUPLEFIELDS:
+                    res.append(val)
+                else:
+                    # That's for Project-URL
+                    res.append((val[0], val[1]))
+            return res
+
+        elif name in _ELEMENTSFIELD:
+            value = self._fields[name]
+            if isinstance(value, string_types):
+                return value.split(',')
+        return self._fields[name]
+
+    def check(self, strict=False):
+        """Check if the metadata is compliant. If strict is True then raise if
+        no Name or Version are provided"""
+        self.set_metadata_version()
+
+        # XXX should check the versions (if the file was loaded)
+        missing, warnings = [], []
+
+        for attr in ('Name', 'Version'):  # required by PEP 345
+            if attr not in self:
+                missing.append(attr)
+
+        if strict and missing != []:
+            msg = 'missing required metadata: %s' % ', '.join(missing)
+            raise MetadataMissingError(msg)
+
+        for attr in ('Home-page', 'Author'):
+            if attr not in self:
+                missing.append(attr)
+
+        # checking metadata 1.2 (XXX needs to check 1.1, 1.0)
+        if self['Metadata-Version'] != '1.2':
+            return missing, warnings
+
+        scheme = get_scheme(self.scheme)
+
+        def are_valid_constraints(value):
+            for v in value:
+                if not scheme.is_valid_matcher(v.split(';')[0]):
+                    return False
+            return True
+
+        for fields, controller in ((_PREDICATE_FIELDS, are_valid_constraints),
+                                   (_VERSIONS_FIELDS,
+                                    scheme.is_valid_constraint_list),
+                                   (_VERSION_FIELDS,
+                                    scheme.is_valid_version)):
+            for field in fields:
+                value = self.get(field, None)
+                if value is not None and not controller(value):
+                    warnings.append("Wrong value for '%s': %s" % (field, value))
+
+        return missing, warnings
+
+    def todict(self, skip_missing=False):
+        """Return fields as a dict.
+
+        Field names will be converted to use the underscore-lowercase style
+        instead of hyphen-mixed case (i.e. home_page instead of Home-page).
+        """
+        self.set_metadata_version()
+
+        mapping_1_0 = (
+            ('metadata_version', 'Metadata-Version'),
+            ('name', 'Name'),
+            ('version', 'Version'),
+            ('summary', 'Summary'),
+            ('home_page', 'Home-page'),
+            ('author', 'Author'),
+            ('author_email', 'Author-email'),
+            ('license', 'License'),
+            ('description', 'Description'),
+            ('keywords', 'Keywords'),
+            ('platform', 'Platform'),
+            ('classifiers', 'Classifier'),
+            ('download_url', 'Download-URL'),
+        )
+
+        data = {}
+        for key, field_name in mapping_1_0:
+            if not skip_missing or field_name in self._fields:
+                data[key] = self[field_name]
+
+        if self['Metadata-Version'] == '1.2':
+            mapping_1_2 = (
+                ('requires_dist', 'Requires-Dist'),
+                ('requires_python', 'Requires-Python'),
+                ('requires_external', 'Requires-External'),
+                ('provides_dist', 'Provides-Dist'),
+                ('obsoletes_dist', 'Obsoletes-Dist'),
+                ('project_url', 'Project-URL'),
+                ('maintainer', 'Maintainer'),
+                ('maintainer_email', 'Maintainer-email'),
+            )
+            for key, field_name in mapping_1_2:
+                if not skip_missing or field_name in self._fields:
+                    if key != 'project_url':
+                        data[key] = self[field_name]
+                    else:
+                        data[key] = [','.join(u) for u in self[field_name]]
+
+        elif self['Metadata-Version'] == '1.1':
+            mapping_1_1 = (
+                ('provides', 'Provides'),
+                ('requires', 'Requires'),
+                ('obsoletes', 'Obsoletes'),
+            )
+            for key, field_name in mapping_1_1:
+                if not skip_missing or field_name in self._fields:
+                    data[key] = self[field_name]
+
+        return data
+
+    def add_requirements(self, requirements):
+        if self['Metadata-Version'] == '1.1':
+            # we can't have 1.1 metadata *and* Setuptools requires
+            for field in ('Obsoletes', 'Requires', 'Provides'):
+                if field in self:
+                    del self[field]
+        self['Requires-Dist'] += requirements
+
+    # Mapping API
+    # TODO could add iter* variants
+
+    def keys(self):
+        return list(_version2fieldlist(self['Metadata-Version']))
+
+    def __iter__(self):
+        for key in self.keys():
+            yield key
+
+    def values(self):
+        return [self[key] for key in self.keys()]
+
+    def items(self):
+        return [(key, self[key]) for key in self.keys()]
+
+    def __repr__(self):
+        return '<%s %s %s>' % (self.__class__.__name__, self.name,
+                               self.version)
+
+
+METADATA_FILENAME = 'pydist.json'
+WHEEL_METADATA_FILENAME = 'metadata.json'
+LEGACY_METADATA_FILENAME = 'METADATA'
+
+
+class Metadata(object):
+    """
+    The metadata of a release. This implementation uses 2.0 (JSON)
+    metadata where possible. If not possible, it wraps a LegacyMetadata
+    instance which handles the key-value metadata format.
+    """
+
+    METADATA_VERSION_MATCHER = re.compile(r'^\d+(\.\d+)*$')
+
+    NAME_MATCHER = re.compile('^[0-9A-Z]([0-9A-Z_.-]*[0-9A-Z])?$', re.I)
+
+    VERSION_MATCHER = PEP440_VERSION_RE
+
+    SUMMARY_MATCHER = re.compile('.{1,2047}')
+
+    METADATA_VERSION = '2.0'
+
+    GENERATOR = 'distlib (%s)' % __version__
+
+    MANDATORY_KEYS = {
+        'name': (),
+        'version': (),
+        'summary': ('legacy',),
+    }
+
+    INDEX_KEYS = ('name version license summary description author '
+                  'author_email keywords platform home_page classifiers '
+                  'download_url')
+
+    DEPENDENCY_KEYS = ('extras run_requires test_requires build_requires '
+                       'dev_requires provides meta_requires obsoleted_by '
+                       'supports_environments')
+
+    SYNTAX_VALIDATORS = {
+        'metadata_version': (METADATA_VERSION_MATCHER, ()),
+        'name': (NAME_MATCHER, ('legacy',)),
+        'version': (VERSION_MATCHER, ('legacy',)),
+        'summary': (SUMMARY_MATCHER, ('legacy',)),
+    }
+
+    __slots__ = ('_legacy', '_data', 'scheme')
+
+    def __init__(self, path=None, fileobj=None, mapping=None,
+                 scheme='default'):
+        if [path, fileobj, mapping].count(None) < 2:
+            raise TypeError('path, fileobj and mapping are exclusive')
+        self._legacy = None
+        self._data = None
+        self.scheme = scheme
+        #import pdb; pdb.set_trace()
+        if mapping is not None:
+            try:
+                self._validate_mapping(mapping, scheme)
+                self._data = mapping
+            except MetadataUnrecognizedVersionError:
+                self._legacy = LegacyMetadata(mapping=mapping, scheme=scheme)
+                self.validate()
+        else:
+            data = None
+            if path:
+                with open(path, 'rb') as f:
+                    data = f.read()
+            elif fileobj:
+                data = fileobj.read()
+            if data is None:
+                # Initialised with no args - to be added
+                self._data = {
+                    'metadata_version': self.METADATA_VERSION,
+                    'generator': self.GENERATOR,
+                }
+            else:
+                if not isinstance(data, text_type):
+                    data = data.decode('utf-8')
+                try:
+                    self._data = json.loads(data)
+                    self._validate_mapping(self._data, scheme)
+                except ValueError:
+                    # Note: MetadataUnrecognizedVersionError does not
+                    # inherit from ValueError (it's a DistlibException,
+                    # which should not inherit from ValueError).
+                    # The ValueError comes from the json.load - if that
+                    # succeeds and we get a validation error, we want
+                    # that to propagate
+                    self._legacy = LegacyMetadata(fileobj=StringIO(data),
+                                                  scheme=scheme)
+                    self.validate()
+
+    common_keys = set(('name', 'version', 'license', 'keywords', 'summary'))
+
+    none_list = (None, list)
+    none_dict = (None, dict)
+
+    mapped_keys = {
+        'run_requires': ('Requires-Dist', list),
+        'build_requires': ('Setup-Requires-Dist', list),
+        'dev_requires': none_list,
+        'test_requires': none_list,
+        'meta_requires': none_list,
+        'extras': ('Provides-Extra', list),
+        'modules': none_list,
+        'namespaces': none_list,
+        'exports': none_dict,
+        'commands': none_dict,
+        'classifiers': ('Classifier', list),
+        'source_url': ('Download-URL', None),
+        'metadata_version': ('Metadata-Version', None),
+    }
+
+    del none_list, none_dict
+
+    def __getattribute__(self, key):
+        common = object.__getattribute__(self, 'common_keys')
+        mapped = object.__getattribute__(self, 'mapped_keys')
+        if key in mapped:
+            lk, maker = mapped[key]
+            if self._legacy:
+                if lk is None:
+                    result = None if maker is None else maker()
+                else:
+                    result = self._legacy.get(lk)
+            else:
+                value = None if maker is None else maker()
+                if key not in ('commands', 'exports', 'modules', 'namespaces',
+                               'classifiers'):
+                    result = self._data.get(key, value)
+                else:
+                    # special cases for PEP 459
+                    sentinel = object()
+                    result = sentinel
+                    d = self._data.get('extensions')
+                    if d:
+                        if key == 'commands':
+                            result = d.get('python.commands', value)
+                        elif key == 'classifiers':
+                            d = d.get('python.details')
+                            if d:
+                                result = d.get(key, value)
+                        else:
+                            d = d.get('python.exports')
+                            if not d:
+                                d = self._data.get('python.exports')
+                            if d:
+                                result = d.get(key, value)
+                    if result is sentinel:
+                        result = value
+        elif key not in common:
+            result = object.__getattribute__(self, key)
+        elif self._legacy:
+            result = self._legacy.get(key)
+        else:
+            result = self._data.get(key)
+        return result
+
+    def _validate_value(self, key, value, scheme=None):
+        if key in self.SYNTAX_VALIDATORS:
+            pattern, exclusions = self.SYNTAX_VALIDATORS[key]
+            if (scheme or self.scheme) not in exclusions:
+                m = pattern.match(value)
+                if not m:
+                    raise MetadataInvalidError("'%s' is an invalid value for "
+                                               "the '%s' property" % (value,
+                                                                    key))
+
+    def __setattr__(self, key, value):
+        self._validate_value(key, value)
+        common = object.__getattribute__(self, 'common_keys')
+        mapped = object.__getattribute__(self, 'mapped_keys')
+        if key in mapped:
+            lk, _ = mapped[key]
+            if self._legacy:
+                if lk is None:
+                    raise NotImplementedError
+                self._legacy[lk] = value
+            elif key not in ('commands', 'exports', 'modules', 'namespaces',
+                             'classifiers'):
+                self._data[key] = value
+            else:
+                # special cases for PEP 459
+                d = self._data.setdefault('extensions', {})
+                if key == 'commands':
+                    d['python.commands'] = value
+                elif key == 'classifiers':
+                    d = d.setdefault('python.details', {})
+                    d[key] = value
+                else:
+                    d = d.setdefault('python.exports', {})
+                    d[key] = value
+        elif key not in common:
+            object.__setattr__(self, key, value)
+        else:
+            if key == 'keywords':
+                if isinstance(value, string_types):
+                    value = value.strip()
+                    if value:
+                        value = value.split()
+                    else:
+                        value = []
+            if self._legacy:
+                self._legacy[key] = value
+            else:
+                self._data[key] = value
+
+    @property
+    def name_and_version(self):
+        return _get_name_and_version(self.name, self.version, True)
+
+    @property
+    def provides(self):
+        if self._legacy:
+            result = self._legacy['Provides-Dist']
+        else:
+            result = self._data.setdefault('provides', [])
+        s = '%s (%s)' % (self.name, self.version)
+        if s not in result:
+            result.append(s)
+        return result
+
+    @provides.setter
+    def provides(self, value):
+        if self._legacy:
+            self._legacy['Provides-Dist'] = value
+        else:
+            self._data['provides'] = value
+
+    def get_requirements(self, reqts, extras=None, env=None):
+        """
+        Base method to get dependencies, given a set of extras
+        to satisfy and an optional environment context.
+        :param reqts: A list of sometimes-wanted dependencies,
+                      perhaps dependent on extras and environment.
+        :param extras: A list of optional components being requested.
+        :param env: An optional environment for marker evaluation.
+        """
+        if self._legacy:
+            result = reqts
+        else:
+            result = []
+            extras = get_extras(extras or [], self.extras)
+            for d in reqts:
+                if 'extra' not in d and 'environment' not in d:
+                    # unconditional
+                    include = True
+                else:
+                    if 'extra' not in d:
+                        # Not extra-dependent - only environment-dependent
+                        include = True
+                    else:
+                        include = d.get('extra') in extras
+                    if include:
+                        # Not excluded because of extras, check environment
+                        marker = d.get('environment')
+                        if marker:
+                            include = interpret(marker, env)
+                if include:
+                    result.extend(d['requires'])
+            for key in ('build', 'dev', 'test'):
+                e = ':%s:' % key
+                if e in extras:
+                    extras.remove(e)
+                    # A recursive call, but it should terminate since 'test'
+                    # has been removed from the extras
+                    reqts = self._data.get('%s_requires' % key, [])
+                    result.extend(self.get_requirements(reqts, extras=extras,
+                                                        env=env))
+        return result
+
+    @property
+    def dictionary(self):
+        if self._legacy:
+            return self._from_legacy()
+        return self._data
+
+    @property
+    def dependencies(self):
+        if self._legacy:
+            raise NotImplementedError
+        else:
+            return extract_by_key(self._data, self.DEPENDENCY_KEYS)
+
+    @dependencies.setter
+    def dependencies(self, value):
+        if self._legacy:
+            raise NotImplementedError
+        else:
+            self._data.update(value)
+
+    def _validate_mapping(self, mapping, scheme):
+        if mapping.get('metadata_version') != self.METADATA_VERSION:
+            raise MetadataUnrecognizedVersionError()
+        missing = []
+        for key, exclusions in self.MANDATORY_KEYS.items():
+            if key not in mapping:
+                if scheme not in exclusions:
+                    missing.append(key)
+        if missing:
+            msg = 'Missing metadata items: %s' % ', '.join(missing)
+            raise MetadataMissingError(msg)
+        for k, v in mapping.items():
+            self._validate_value(k, v, scheme)
+
+    def validate(self):
+        if self._legacy:
+            missing, warnings = self._legacy.check(True)
+            if missing or warnings:
+                logger.warning('Metadata: missing: %s, warnings: %s',
+                               missing, warnings)
+        else:
+            self._validate_mapping(self._data, self.scheme)
+
+    def todict(self):
+        if self._legacy:
+            return self._legacy.todict(True)
+        else:
+            result = extract_by_key(self._data, self.INDEX_KEYS)
+            return result
+
+    def _from_legacy(self):
+        assert self._legacy and not self._data
+        result = {
+            'metadata_version': self.METADATA_VERSION,
+            'generator': self.GENERATOR,
+        }
+        lmd = self._legacy.todict(True)     # skip missing ones
+        for k in ('name', 'version', 'license', 'summary', 'description',
+                  'classifier'):
+            if k in lmd:
+                if k == 'classifier':
+                    nk = 'classifiers'
+                else:
+                    nk = k
+                result[nk] = lmd[k]
+        kw = lmd.get('Keywords', [])
+        if kw == ['']:
+            kw = []
+        result['keywords'] = kw
+        keys = (('requires_dist', 'run_requires'),
+                ('setup_requires_dist', 'build_requires'))
+        for ok, nk in keys:
+            if ok in lmd and lmd[ok]:
+                result[nk] = [{'requires': lmd[ok]}]
+        result['provides'] = self.provides
+        author = {}
+        maintainer = {}
+        return result
+
+    LEGACY_MAPPING = {
+        'name': 'Name',
+        'version': 'Version',
+        'license': 'License',
+        'summary': 'Summary',
+        'description': 'Description',
+        'classifiers': 'Classifier',
+    }
+
+    def _to_legacy(self):
+        def process_entries(entries):
+            reqts = set()
+            for e in entries:
+                extra = e.get('extra')
+                env = e.get('environment')
+                rlist = e['requires']
+                for r in rlist:
+                    if not env and not extra:
+                        reqts.add(r)
+                    else:
+                        marker = ''
+                        if extra:
+                            marker = 'extra == "%s"' % extra
+                        if env:
+                            if marker:
+                                marker = '(%s) and %s' % (env, marker)
+                            else:
+                                marker = env
+                        reqts.add(';'.join((r, marker)))
+            return reqts
+
+        assert self._data and not self._legacy
+        result = LegacyMetadata()
+        nmd = self._data
+        for nk, ok in self.LEGACY_MAPPING.items():
+            if nk in nmd:
+                result[ok] = nmd[nk]
+        r1 = process_entries(self.run_requires + self.meta_requires)
+        r2 = process_entries(self.build_requires + self.dev_requires)
+        if self.extras:
+            result['Provides-Extra'] = sorted(self.extras)
+        result['Requires-Dist'] = sorted(r1)
+        result['Setup-Requires-Dist'] = sorted(r2)
+        # TODO: other fields such as contacts
+        return result
+
+    def write(self, path=None, fileobj=None, legacy=False, skip_unknown=True):
+        if [path, fileobj].count(None) != 1:
+            raise ValueError('Exactly one of path and fileobj is needed')
+        self.validate()
+        if legacy:
+            if self._legacy:
+                legacy_md = self._legacy
+            else:
+                legacy_md = self._to_legacy()
+            if path:
+                legacy_md.write(path, skip_unknown=skip_unknown)
+            else:
+                legacy_md.write_file(fileobj, skip_unknown=skip_unknown)
+        else:
+            if self._legacy:
+                d = self._from_legacy()
+            else:
+                d = self._data
+            if fileobj:
+                json.dump(d, fileobj, ensure_ascii=True, indent=2,
+                          sort_keys=True)
+            else:
+                with codecs.open(path, 'w', 'utf-8') as f:
+                    json.dump(d, f, ensure_ascii=True, indent=2,
+                              sort_keys=True)
+
+    def add_requirements(self, requirements):
+        if self._legacy:
+            self._legacy.add_requirements(requirements)
+        else:
+            run_requires = self._data.setdefault('run_requires', [])
+            always = None
+            for entry in run_requires:
+                if 'environment' not in entry and 'extra' not in entry:
+                    always = entry
+                    break
+            if always is None:
+                always = { 'requires': requirements }
+                run_requires.insert(0, always)
+            else:
+                rset = set(always['requires']) | set(requirements)
+                always['requires'] = sorted(rset)
+
+    def __repr__(self):
+        name = self.name or '(no name)'
+        version = self.version or 'no version'
+        return '<%s %s %s (%s)>' % (self.__class__.__name__,
+                                    self.metadata_version, name, version)
+                                                                                                                                              >¬À"–ﬁLí4)ÌØû˘¸€9cª&mfûı†Ñ?/tπ¥q”¬√cˆ÷[:@O'8à√h0EKt†^'*QmøÄ¯⁄˛ÓÆ˙60cü% Ë¶KäôY‹” õ·ùÖ”xw*ÖXÑ^øG§ú≠E”^Ö≥Å¯[J∫>¸Gòw¸ëŸî?· YyÅÎ†õ∏5¨rzjìO»∑ƒ:ΩåÙ∂ó/sdı·…Ê∂˚3∏ÜWÈR3}πX˙u4é–-A%ÌWN+¡ÒgÃ√Åíã@Z®€˛©Ω‹) ÄyŸÙ„áÒÜ´ºIÚ1¿Bœ1Ïy∑H·¿Ä¶´2Àe‰~‘„÷9ë.A¯ê∆¢mÁâ∑ZoÒ’J`ìeπr¥íå•£'˚∏Á±ÑIÑ,C«§át¬'ªH”ÉÔ≤∫B25∆ˇ˚Wü“ÖCocnÁq?Ü87	¨πf¶2ì3©*Ü‘lrA=ø°äKªnV¿!¿Ú|Ô€c^°æäÇ∞…∏\}⁄Sæ˚˚±<T*¡’\ (¬*-àS∂ÈR$ @Cò,à¸úvW=√!á´%ÃóPŒ≈äπ⁄Ës∑¯µ´WM˜ò…n%Ïx@ d•ü¯û—˚ñ⁄OèOÖÿV/ñ¥, °¡ª+˛
+‹úŒ0Fá<Ò÷—≠oE ‘Ìlz2dË_M\È˜ŒBçöÂ‰© ˚˘ZWØ€‡vˇ•ÃlA∫0∑öÊä»Ò.xΩ'∆ûzöé§“Nàù±±Çf>Oæ–<òQ´ªÎº
+u]ƒÕn2‡°¡'’X/¬∂Ô\¥≠>£¨qÃ)≈\	hÈökß¿&›†è?˛3Ë∏~™ııè%1«≥efùÂ§÷ä¿"ÅÇE«l⁄∑'åﬁ˜à Wûô°Ÿ´÷˘BMÀ∏aﬂıyPaWÂ:√ò+#„·£3¨"Øà¸ÃÙsLìd\xıLsŒË:îvjNr%ˇ¢™6’Uçu$kËæELA9ÔÊÄ7.xÕÆÃ)Ié*oJ≥a∂åÛ=L)…Ñz`a5Òúí¶°Õw·dﬂ)ä‰2RŒ&+Øäj>¿MH˙SççT:Ò⁄¥….íÇ86V≤⁄fG#ı÷∑≈ÂIÿ&AÔÁG|*≤`≈‚JÏæûÜl&*y˙gÈå Ó¡Dª^ÍÏfrÖ¢R«√ﬂë≈N&+Ï◊√º;Ué(ºÅ˚öﬁ·âé%Üiªi‘∫gÓ&ñd°6ZÄŒ/4Tìâî……ö\¨˘˘ÉÓUÒy9iK«Ì—	l†Qé!í<Ú·ƒK•Ñ–Aö<f8˘ñ`°HØ>;
+8õÖàÏ®∫t±N]ﬁ¬«êÙ?X‡Jsæ˚RôÖà»~[ú¯hÍÔ‰wà>dE6ÅÆ˝˙‚ÎU(∂ÓGS0¿÷H∫≥úô†⁄>IˆÆr ∞ÀÅ\Açp‹Û’~m°
+`6_
+uµ˙ÙÄ…—îî∑À˙8ÿ‹™AÆ~ıÙıÇ-±êª&ÎÎıa˘¬ ùp,Fe'π≠vèQò∏´0(p9>dˆ√ó-ÔÛQø3$(Ù]‘R¿¢…ø8fÆ_óA¬i‘!UFp“9£ÅÛë˛n’püÜ8jN…VÄ$®ƒ}ZÑk€Mt?ø,âÂ>òÀ56+Sÿ¡_ÇöØûiÿ(#‚∏Ωî≤f’≈µ?ƒ=Y"vÿåòòÕûƒ&7¬~4ç¡±Vå·L9~∞>Põñ‘/ n èW<˛˙–´YØ˙µú±#`ˆ"<cx∏¬WP…c* qr¬. ª÷∆•£∫ÇÊØù—Z£C`áÂ©Ω,¡+•ÆÉ∑∑©ˇúﬂÎ_bt˚∆£êjòıj–ˇ¢˜*ÓiÚOé∆wIÚKŒZUÿ€5ÇÇÕÖ»x∫ÎN
+(¸∫7™y‹—OCFd‰dÓÌÙÓ‡yfôEç©F„d^64Ôò˘…lÃÔ~tÕ`˛vRLÓ:∂)Ê’%øØåo∫yXaf%%Ñ>S–€÷?»˘Ã˛¨Ël'πå;tÕ"ÓD˛ƒÛ%+ﬂt“Y˘ù5ÁaëÈÉU“Ó"Ì^p‹\°öÇÚo"~÷9ı_„`[·∂ˇI§ãƒ_≠Àx∫ €”s«Ipƒò
+{YÎgu†ö&>,[Öc’:æÁhnÆ—Ω•0Æ≥*Î_K
+É¶ß>Q.0{uOÛvk≤nUmLE@q?ih«àg$îûÂ'ªÏAÎ/'Ïˆ<ÚÙ∂ö
+Öùv-ˇW◊ƒuh”ë=ﬂÅ+ÒÙ≥ÆRå‰96H|–äg@≠F“«˙üπ—∞¢jè¥ù]—DtãhXx3Ñ;N(489,ÛöÈÑZ+,\+ŒUr`≠ßdÃ≤Xí∫€“ÇD)ÓâˆÉ“x_E»XqI;k¸,Ï»J0X £°dw∏ZÕÃ’»÷û	8Í€>≤s∆Î"z,ç÷É,¿C OüÖgú¨ÇEAÖ£⁄
+„äˇ¡EÅh„™Á≥¶Ÿ&ﬁŒ Ì:=W)4ª ö◊Ê¿R¢ú¡PrÓ‘õU3h≠çc\Fã±h⁄œˇ]=º>$/öÚû’I3¯eÊë÷ˆYµ≥ø@˘õr<-GÂßœ´Lë]0≥¢ zÁ¯˚0—R—%ºa
+UÎ$û≠fG¿•Bt”WâîàÛ´wËR¡¬¨¥ÆŸe9[ô~ày
+∑+Å–ï¡	:F)]˜®+{ÓsÌ.ãU9ó&ÔÑç“a—Ï∂eØßu“zc‚mx.¸A*wô˜ﬁ∂E@1Ÿé—õ»‹~w˙%˜>¿Ó‘A;˛‹JÈ–[Áü6nrŸ;;ﬁÚ>[“y£√{^•+àÑ3ÒÅ›ä	∆Fôz`‘Fn6N;Ê¢ààKÃPñ9sv∞f]˝'òC4^ûQQ={Ÿ>wbÄWƒﬂy^Lﬁ–n*˘ë√ú:≥≠„©l`V«…≤ßÑ∆πç«®Ä,cñLá˙ƒ]r®´∞Ëı≠˚˘NÄﬁ¸›c"¯°ÓsÁå˜ß‘ªhÄ\qóıªK/∂9,¸ÜËd ﬂ∞H∆)¢wqYÄ=©ÖycÃCó –7‚ÂóÉÕh¢r$P÷?¯îTZ É|…ÕR§SÙƒÉ ™h∑?±∞"ég…ﬂÓΩóø5µ,Ïp‡ìãºM?§Ê#©ià.Ïé–c∫ø9Å¡HΩOXÌ™t¡¡¡"?∆§†-ﬁz†SΩ"÷£µ°ëèXd|Ì<‚(‹í·ì@áUù,ˆI[œ¿÷ÚÏ≠Úûπ82ØIÍ^‘âç,pıN≠Üœµ,~˝%_•Ä“U3ó€ó¨ä C¿‰"êÚ(¬æ-eØü‰)–yÔòy kCC∞)?ç|Òˆª/U7A˛P4oÚl-ÇôöD˝˛†|î@˜5øÁ5Ù5Y: –¢a~„§≥EL¸ÆˆbLìí¨≈»üÏËh‡Jîwxà§´ÒÈ€Ó√≤¯Hg0hªıÂ_/¯Ó¶§úR+äHÿ¬)aM,‚Â‹bwî:≥–Œ◊øggﬂ®ë∏˚h√Aì{[ΩÇííﬂì:„C–E?Ê⁄ÿ»x∆*Ê•á#ëmteEáøULigŸΩÔJª‰æ¯úÖtòÀ$2:õÏçmËB}äÒ3ÿk˘2¬´q2ïíH:±ñ3]m<Ê∆ıUi‘á∫3sÍÎˆò„˘ﬁ«©Ω#≤ÀµÓbWå–≈ï.≤”É≤¢ΩÙçY~,âè˝>#Ã…‚‡Û`˛¢^ÿ‘mÙr„7Ö1∫QT˝u§Be∆<#SiïoC∂¶pãÁ·˚d'˚˜:Îˆˆ⁄3¥‘Ï˝ÿ‹Áéí›¥g©d°æ·ªÖ˚◊™π7	Í¶äõôè©ˆÌä@aÑsëFG
+°…Æà…PX`*ÛI?*3¯ÓhYoú’&·&êe⁄õ∂≤˙8¢V	úµltÏ∂]MØ˜	5GÜW_±°,¿ıÆÓDCvﬂÑ^Ç]*™˚“fÍÖS$•åÚeû®ﬁË⁄ıøYh—√°ø¥£ΩRH
+PGIêc=:◊«?Ø$= wŒ	†I ó˘èï·é√#NìÓYä0ä∑Ã™ÇŸÈHtáΩÌ'{€ë™e&óV≠Û˝¨óq≠".∞êçú Ñl∫;.Äƒ>Ë[1r”·Ô
+çD.$4ÓÁj·¥Eåπo@„™∑ì°i]dc ˝†ª–>°‰4tS‰4ep :´Fy%U95⁄ú+m°n¨[È‡ÙãÑùIãÄ¬âÎ{ﬁ¸3¯÷‘^&¶ ÍObZT ∞¸›™Ãë{îo”Å>Q ÿ˙Çò:.AS[*¶˛¨ù¶¸™,[∞øù.•>”®ì†®.|˜%¯÷@ÇÙ€$TÛ“˙®¸Pv¨îWoÆ8†u{°t%V*†VEÎáüµ4fÑy√MJÛπëëyıƒ√H5†ÌåÎ{ç/x˙=ﬁi$g=$∏æØß  î]~†jSË pM≠ÏÂ§¿íñ*îVÄeÑäö≥ú0W¸;.l∑´“˜æg}@P<√≈∆;∆—Ç».™ iµ\X¯?ﬁ|7õ3t3ÄE˙d8yä>ˆ‘5Ω]¿öÁ˚Ì=µ<#·{7-j‰@äMÇôë}Ï˙GŒ°È }R≤Ã∆‚.î(Ä∏'√Ã)U[¢æºä”⁄¡:Ü‹≤˙çGYiãKCŸ?›¶|ã}0÷T<uñbÍ9u¡tºqÿú‡Ùb˝ÊVíRóäÕÉè°ıèÊSPº4–ƒüªÜºZg„Q6xÉ!Gª'†’c ÊÆÇjS…aOÕ˛êπÁMZê       ˇˇ  ∏       @                                   Ä   ∫ ¥	Õ!∏LÕ!This program cannot be run in DOS mode.
+$       PE  L nﬁ@¿        ‡ " 0  
+         r(       @                           Ä          @Ö                            (  O    @  ®                   `     (                                                               H           .text   x       
+                    `.rsrc   ®   @                    @  @.reloc      `                    @  B                T(      H     P   4  	               Ñ'  Ä                                   BSJB         v4.0.30319     l   ¥  #~     ¥  #Strings    ‘     #US ÿ     #GUID   Ë  L  #Blob         T  â    ˙3                                ©      - Ò $   aŸ +Ÿ ‘ Ÿ ∑ Ÿ X Ÿ u Ÿ Ÿ A Ÿ Ú  F z  Ü õ Ü  ¢           	 Î  Î ! Î ) Î 1 Î 9 Î A Î I Î Q Î Y Î a Î i Î y Î Å Î ' s %.  f.  o.  Ç. # ¿. + ¿. 3 Ê. ; Ê. C Û. K ¿. S . [ %. c *  ∆ Ä            $ 3              
+             PŸ         òŸ         jŸ      <Module> mscorlib UnverifiableCodeAttribute DebuggableAttribute AssemblyTitleAttribute AssemblyFileVersionAttribute AssemblyInformationalVersionAttribute SecurityPermissionAttribute AssemblyDescriptionAttribute AssemblyDefaultAliasAttribute CompilationRelaxationsAttribute AssemblyProductAttribute AssemblyCopyrightAttribute ReferenceAssemblyAttribute AssemblyCompanyAttribute RuntimeCompatibilityAttribute InterfaceMapping System.Reflection.Extensions.dll SecurityAction System.Reflection .ctor System.Diagnostics System.Runtime.CompilerServices DebuggingModes System.Reflection.Extensions CustomAttributeExtensions RuntimeReflectionExtensions System.Security.Permissions System.Security       ÕÒ≥e\i^B¢ûó6Ã®8  	     9∑z\V4‡âÄ† $  Ä  î      $  RSA1     —˙WƒÆŸ£.Ñ™Æ˝ÈË˝jÏèá˚vlÉLôí≤;ÁöŸ’‹¡›ö“6!êr<˘Äïƒ·wè∆wO)Ë2íÍÏ‰Ë!¿•ÔËÒd\Lì¡´ô(]b,™e,˙÷=t]o-ÂÒ~^Øƒñ=&äCe m¿ì4MZ“ìÄû.ÄÑSystem.Security.Permissions.SecurityPermissionAttribute, mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089TSkipVerification       Xamarin, Inc.  = 8Copyright (c) 2013 Xamarin Inc. (http://www.xamarin.com)  %  System.Reflection.Extensions.dll   4.0.0.0  ( #Mono Common Language Infrastructure             TWrapNonExceptionThrows                                                                                                                                                              H(          b(                          T(            _CorDllMain mscoree.dll     ˇ%                                                                                                                                                                                                                                                                                                                                                                                                                               Ä                  0  Ä                   H   X@  L          L4   V S _ V E R S I O N _ I N F O     ΩÔ˛                 ?                         D    V a r F i l e I n f o     $    T r a n s l a t i o n       ∞¨   S t r i n g F i l e I n f o   à   0 0 0 0 0 4 b 0   Z !  C o m m e n t s   S y s t e m . R e f l e c t i o n . E x t e n s i o n s . d l l     <   C o m p a n y N a m e     X a m a r i n ,   I n c .   j !  F i l e D e s c r i p t i o n     S y s t e m . R e f l e c t i o n . E x t e n s i o n s . d l l     0   F i l e V e r s i o n     4 . 0 . 0 . 0   b !  I n t e r n a l N a m e   S y s t e m . R e f l e c t i o n . E x t e n s i o n s . d l l     ñ 9  L e g a l C o p y r i g h t   C o p y r i g h t   ( c )   2 0 1 3   X a m a r i n   I n c .   ( h t t p : / / w w w . x a m a r i n . c o m )     j !  O r i g i n a l F i l e n a m e   S y s t e m . R e f l e c t i o n . E x t e n s i o n s . d l l     h $  P r o d u c t N a m e     M o n o   C o m m o n   L a n g u a g e   I n f r a s t r u c t u r e   4   P r o d u c t V e r s i o n   4 . 0 . 0 . 0   8   A s s e m b l y   V e r s i o n   4 . 0 . 0 . 0                                                                                                                                                                                                                                                                                                                                                                      t8                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  E               E                                           	                                   
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  
+                                                                      	                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           	                                                                                                                                                              // Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+// See the LICENSE file in the project root for more information.
+
+using System.Collections.Generic;
+using Xunit;
+
+namespace System.Text.Tests
+{
+    public class ASCIIEncodingDecode
+    {
+        public static IEnumerable<object[]> Decode_TestData()
+        {
+            // All ASCII chars
+            for (int i = 0; i <= 0x7F; i++)
+            {
+                byte b = (byte)i;
+                yield return new object[] { new byte[] { b }, 0, 1 };
+                yield return new object[] { new byte[] { 96, b, 97 }, 1, 1 };
+                yield return new object[] { new byte[] { 96, b, 98 }, 2, 1 };
+                yield return new object[] { new byte[] { 97, b, 97 }, 0, 3 };
+            }
+            
+            // Empty strings
+            yield return new object[] { new byte[0], 0, 0 };
+            yield return new object[] { new byte[10], 5, 0 };
+            yield return new object[] { new byte[10], 5, 5 };
+        }
+
+        [Theory]
+        [MemberData(nameof(Decode_TestData))]
+        public void Decode(byte[] bytes, int index, int count)
+        {
+            string expected = GetString(bytes, index, count);
+            EncodingHelpers.Decode(new ASCIIEncoding(), bytes, index, count, expected);
+
+            // Decoding valid bytes should not throw with a DecoderExceptionFallback
+            Encoding exceptionEncoding = Encoding.GetEncoding("ascii", new EncoderReplacementFallback("?"), new DecoderExceptionFallback());
+            EncodingHelpers.Decode(exceptionEncoding, bytes, index, count, expected);
+        }
+
+        public static IEnumerable<object[]> Decode_InvalidBytes_TestData()
+        {
+            // All Latin-1 Supplement bytes
+            for (int i = 0x80; i <= byte.MaxValue; i++)
+            {
+                byte b = (byte)i;
+                yield return new object[] { new byte[] { b }, 0, 1 };
+                yield return new object[] { new byte[] { 96, b, 97 }, 1, 1 };
+                yield return new object[] { new byte[] { 97, b, 97 }, 0, 3 };
+            }
+
+            yield return new object[] { new byte[] { 0xC1, 0x41, 0xF0, 0x42 }, 0, 4 };
+        }
+
+        [Theory]
+        [MemberData(nameof(Decode_InvalidBytes_TestData))]
+        public void Decode_InvalidBytes(byte[] bytes, int index, int count)
+        {
+            string expected = GetString(bytes, index, count);
+            EncodingHelpers.Decode(new ASCIIEncoding(), bytes, index, count, expected);
+
+            // Decoding invalid bytes should throw with a DecoderExceptionFallback
+            Encoding exceptionEncoding = Encoding.GetEncoding("ascii", new EncoderReplacementFallback("?"), new DecoderExceptionFallback());
+            NegativeEncodingTests.Decode_Invalid(exceptionEncoding, bytes, index, count);
+        }
+
+        public static string GetString(byte[] bytes, int index, int count)
+        {
+            char[] chars = new char[count];
+            for (int i = 0; i < count; i++)
+            {
+                byte b = bytes[i + index];
+                chars[i] = b <= 0x7F ? (char)b : '?';
+            }
+            return new string(chars);
+        }
+    }
+}
+                                                                                                                                                                                                                                                               ≈Èäi¸ˇf.Ñ     HÉÏ@∂ˆËc·˚ˇHÖ¿t&Hã/á% Hã5PÑ% H«¡ˇˇˇˇHâ«HÉƒÈ›˚ˇD  1¿HÉƒ√êSHÉ? Hâ˚tHâÿ[√êHãÈh% HâGËê0¸ˇHâﬂHâ∆Ë%«˚ˇHâÿ[√AWIâ◊AVAUAâÕATUHâıSHâ˚LçuHÉÏ(Hã=#v% dHã%(   HâD$1¿Iâ‰Ëì¸ˇLâÁHâ∆Ëò‰˙ˇLâ‚LâˆHâﬂËÍ:˚ˇLâÁËBk˚ˇHãE Lâ˛HâﬂHâHã@ËHãï  HâHãÖ  A∂’HâCHãÖ   HâCHãÖ(  HâC Ë,‡˚ˇHãD$dH3%(   uHÉƒ([]A\A]A^A_√Ë˚ˇHâ≈Èûh¸ˇHâ√È©h¸ˇÑ     AWIâ˜AVAULçopATAâ‘USHâ˚LâÔLçsPHÉÏ(dHã%(   HâD$1¿Ë”˙ˇHã‚à% 1“Lâ˜Hç∞0  Ë··˙ˇHã=u% Ëï¸ˇHâÂHâ∆HâÔËó„˙ˇHã∞à% HâÍHâﬂHçpË·9˚ˇHâÔË9j˚ˇHãrå% Lâ˛HâﬂHçP HâHçêà// <copyright>
+//     Copyright (c) Microsoft Corporation.  All rights reserved.
+// </copyright>
+
+namespace System.ServiceModel.Description
+{
+    using System.Collections.Generic;
+    using System.Diagnostics.CodeAnalysis;
+    using System.Globalization;
+    using System.IO;
+    using System.Linq;
+    using System.Runtime;
+    using System.Text;
+    using System.Xml;
+    using System.Xml.Schema;
+    using System.Xml.Serialization;
+    using WsdlNS = System.Web.Services.Description;
+
+    internal static class WsdlHelper
+    {
+        public static WsdlNS.ServiceDescription GetSingleWsdl(MetadataSet metadataSet)
+        {
+            if (metadataSet.MetadataSections.Count < 1)
+            {
+                return null;
+            }
+
+            List<WsdlNS.ServiceDescription> wsdls = new List<WsdlNS.ServiceDescription>();
+            List<XmlSchema> xsds = new List<XmlSchema>();
+
+            foreach (MetadataSection section in metadataSet.MetadataSections)
+            {
+                if (section.Metadata is WsdlNS.ServiceDescription)
+                {
+                    wsdls.Add((WsdlNS.ServiceDescription)section.Metadata);
+                }
+
+                if (section.Metadata is XmlSchema)
+                {
+                    xsds.Add((XmlSchema)section.Metadata);
+                }
+            }
+
+            VerifyContractNamespace(wsdls);
+            WsdlNS.ServiceDescription singleWsdl = GetSingleWsdl(CopyServiceDescriptionCollection(wsdls));
+
+            // Inline XML schemas
+            foreach (XmlSchema schema in xsds)
+            {
+                XmlSchema newSchema = CloneXsd(schema);
+                RemoveSchemaLocations(newSchema);
+                singleWsdl.Types.Schemas.Add(newSchema);
+            }
+
+            return singleWsdl;
+        }
+
+        private static void RemoveSchemaLocations(XmlSchema schema)
+        {
+            foreach (XmlSchemaObject schemaObject in schema.Includes)
+            {
+                XmlSchemaExternal external = schemaObject as XmlSchemaExternal;
+                if (external != null)
+                {
+                    external.SchemaLocation = null;
+                }
+            }
+        }
+
+        private static WsdlNS.ServiceDescription GetSingleWsdl(List<WsdlNS.ServiceDescription> wsdls)
+        {
+            // Use WSDL that has the contracts as the base for single WSDL
+            WsdlNS.ServiceDescription singleWsdl = wsdls.First(wsdl => wsdl.PortTypes.Count > 0);
+            if (singleWsdl == null)
+            {
+                singleWsdl = new WsdlNS.ServiceDescription();
+            }
+            else
+            {
+                singleWsdl.Types.Schemas.Clear();
+                singleWsdl.Imports.Clear();
+            }
+
+            Dictionary<XmlQualifiedName, XmlQualifiedName> bindingReferenceChanges = new Dictionary<XmlQualifiedName, XmlQualifiedName>();
+            foreach (WsdlNS.ServiceDescription wsdl in wsdls)
+            {
+                if (wsdl != singleWsdl)
+                {
+                    MergeWsdl(singleWsdl, wsdl, bindingReferenceChanges);
+                }              
+            }
+
+            EnsureSingleNamespace(singleWsdl, bindingReferenceChanges);
+            return singleWsdl;
+        }
+
+        private static List<WsdlNS.ServiceDescription> CopyServiceDescriptionCollection(List<WsdlNS.ServiceDescription> wsdls)
+        {
+            List<WsdlNS.ServiceDescription> newWsdls = new List<WsdlNS.ServiceDescription>();
+            foreach (WsdlNS.ServiceDescription wsdl in wsdls)
+            {
+                newWsdls.Add(CloneWsdl(wsdl));
+            }
+
+            return newWsdls;
+        }
+
+        private static void MergeWsdl(WsdlNS.ServiceDescription singleWsdl, WsdlNS.ServiceDescription wsdl, Dictionary<XmlQualifiedName, XmlQualifiedName> bindingReferenceChanges)
+        {
+            if (wsdl.Services.Count > 0)
+            {
+                singleWsdl.Name = wsdl.Name;
+            }
+
+            foreach (WsdlNS.Binding binding in wsdl.Bindings)
+            {
+                string uniqueBindingName = NamingHelper.GetUniqueName(binding.Name, WsdlHelper.IsBindingNameUsed, singleWsdl.Bindings);
+                if (binding.Name != uniqueBindingName)
+                {
+                    bindingReferenceChanges.Add(
+                        new XmlQualifiedName(binding.Name, binding.ServiceDescription.TargetNamespace),
+                        new XmlQualifiedName(uniqueBindingName, singleWsdl.TargetNamespace));
+                    UpdatePolicyKeys(binding, uniqueBindingName, wsdl);
+                    binding.Name = uniqueBindingName;
+                }
+
+                singleWsdl.Bindings.Add(binding);
+            }
+
+            foreach (object extension in wsdl.Extensions)
+            {
+                singleWsdl.Extensions.Add(extension);
+            }
+
+            foreach (WsdlNS.Message message in wsdl.Messages)
+            {
+                singleWsdl.Messages.Add(message);
+            }
+
+            foreach (WsdlNS.Service service in wsdl.Services)
+            {
+                singleWsdl.Services.Add(service);
+            }
+
+            foreach (string warning in wsdl.ValidationWarnings)
+            {
+                singleWsdl.ValidationWarnings.Add(warning);
+            }
+        }
+
+        private static void UpdatePolicyKeys(WsdlNS.Binding binding, string newBindingName, WsdlNS.ServiceDescription wsdl)
+        {
+            string oldBindingName = binding.Name;
+
+            // policy
+            IEnumerable<XmlElement> bindingPolicies = FindAllElements(wsdl.Extensions, MetadataStrings.WSPolicy.Elements.Policy);
+            string policyIdStringPrefixFormat = "{0}_";
+            foreach (XmlElement policyElement in bindingPolicies)
+            {
+                XmlNode policyId = policyElement.Attributes.GetNamedItem(MetadataStrings.Wsu.Attributes.Id, MetadataStrings.Wsu.NamespaceUri);
+                string policyIdString = policyId.Value;
+                string policyIdStringWithOldBindingName = string.Format(CultureInfo.InvariantCulture, policyIdStringPrefixFormat, oldBindingName);
+                string policyIdStringWithNewBindingName = string.Format(CultureInfo.InvariantCulture, policyIdStringPrefixFormat, newBindingName);
+                if (policyId != null && policyIdString != null && policyIdString.StartsWith(policyIdStringWithOldBindingName, StringComparison.Ordinal))
+                {
+                    policyId.Value = policyIdStringWithNewBindingName + policyIdString.Substring(policyIdStringWithOldBindingName.Length);
+                }
+            }
+
+            // policy reference
+            UpdatePolicyReference(binding.Extensions, oldBindingName, newBindingName);
+            foreach (WsdlNS.OperationBinding operationBinding in binding.Operations)
+            {
+                UpdatePolicyReference(operationBinding.Extensions, oldBindingName, newBindingName);
+                if (operationBinding.Input != null)
+                {
+                    UpdatePolicyReference(operationBinding.Input.Extensions, oldBindingName, newBindingName);
+                }
+
+                if (operationBinding.Output != null)
+                {
+                    UpdatePolicyReference(operationBinding.Output.Extensions, oldBindingName, newBindingName);
+                }
+
+                foreach (WsdlNS.FaultBinding fault in operationBinding.Faults)
+                {
+                    UpdatePolicyReference(fault.Extensions, oldBindingName, newBindingName);
+                }
+            }
+        }
+
+        private static void UpdatePolicyReference(WsdlNS.ServiceDescriptionFormatExtensionCollection extensions, string oldBindingName, string newBindingName)
+        {
+            IEnumerable<XmlElement> bindingPolicyReferences = FindAllElements(extensions, MetadataStrings.WSPolicy.Elements.PolicyReference);
+            string policyReferencePrefixFormat = "#{0}_";
+            foreach (XmlElement policyReferenceElement in bindingPolicyReferences)
+            {
+                XmlNode policyReference = policyReferenceElement.Attributes.GetNamedItem(MetadataStrings.WSPolicy.Attributes.URI);
+                string policyReferenceValue = policyReference.Value;
+                string policyReferenceValueWithOldBindingName = string.Format(CultureInfo.InvariantCulture, policyReferencePrefixFormat, oldBindingName);
+                string policyReferenceValueWithNewBindingName = string.Format(CultureInfo.InvariantCulture, policyReferencePrefixFormat, newBindingName);
+                if (policyReference != null && policyReferenceValue != null && policyReferenceValue.StartsWith(policyReferenceValueWithOldBindingName, StringComparison.Ordinal))
+                {
+                    policyReference.Value = policyReferenceValueWithNewBindingName + policyReference.Value.Substring(policyReferenceValueWithOldBindingName.Length);
+                }
+            }
+        }
+
+        private static IEnumerable<XmlElement> FindAllElements(WsdlNS.ServiceDescriptionFormatExtensionCollection extensions, string elementName)
+        {
+            List<XmlElement> policyReferences = new List<XmlElement>();
+            for (int i = 0; i < extensions.Count; i++)
+            {
+                XmlElement element = extensions[i] as XmlElement;
+                if (element != null && element.LocalName == elementName)
+                {
+                    policyReferences.Add(element);
+                }
+            }
+
+            return policyReferences;
+        }
+
+        private static void VerifyContractNamespace(List<WsdlNS.ServiceDescription> wsdls)
+        {
+            IEnumerable<WsdlNS.ServiceDescription> contractWsdls = wsdls.Where(serviceDescription => serviceDescription.PortTypes.Count > 0);
+            if (contractWsdls.Count() > 1)
+            {
+                IEnumerable<string> namespaces = contractWsdls.Select<WsdlNS.ServiceDescription, string>(wsdl => wsdl.TargetNamespace);
+                string contractNamespaces = string.Join(", ", namespaces);
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new NotSupportedException(SR.GetString(SR.SingleWsdlNotGenerated, contractNamespaces)));
+            }
+        }
+
+        private static void EnsureSingleNamespace(WsdlNS.ServiceDescription wsdl, Dictionary<XmlQualifiedName, XmlQualifiedName> bindingReferenceChanges)
+        {
+            string targetNamespace = wsdl.TargetNamespace;
+            foreach (WsdlNS.Binding binding in wsdl.Bindings)
+            {
+                if (binding.Type.Namespace != targetNamespace)
+                {
+                    binding.Type = new XmlQualifiedName(binding.Type.Name, targetNamespace);
+                }
+            }
+
+            foreach (WsdlNS.PortType portType in wsdl.PortTypes)
+            {
+                foreach (WsdlNS.Operation operation in portType.Operations)
+                {
+                    WsdlNS.OperationInput messageInput = operation.Messages.Input;
+                    if (messageInput != null && messageInput.Message.Namespace != targetNamespace)
+                    {
+                        messageInput.Message = new XmlQualifiedName(messageInput.Message.Name, targetNamespace);
+                    }
+
+                    WsdlNS.OperationOutput messageOutput = operation.Messages.Output;
+                    if (messageOutput != null && messageOutput.Message.Namespace != targetNamespace)
+                    {
+                        messageOutput.Message = new XmlQualifiedName(messageOutput.Message.Name, targetNamespace);
+                    }
+
+                    foreach (WsdlNS.OperationFault fault in operation.Faults)
+                    {
+                        if (fault.Message.Namespace != targetNamespace)
+                        {
+                            fault.Message = new XmlQualifiedName(fault.Message.Name, targetNamespace);
+                        }
+                    }
+                }
+            }
+
+            foreach (WsdlNS.Service service in wsdl.Services)
+            {
+                foreach (WsdlNS.Port port in service.Ports)
+                {
+                    XmlQualifiedName newPortBinding;
+                    if (bindingReferenceChanges.TryGetValue(port.Binding, out newPortBinding))
+                    {
+                        port.Binding = newPortBinding;
+                    }
+                    else if (port.Binding.Namespace != targetNamespace)
+                    {
+                        port.Binding = new XmlQualifiedName(port.Binding.Name, targetNamespace);
+                    }
+                }
+            }
+        }
+
+        private static bool IsBindingNameUsed(string name, object collection)
+        {
+            WsdlNS.BindingCollection bindings = (WsdlNS.BindingCollection)collection;
+            foreach (WsdlNS.Binding binding in bindings)
+            {
+                if (binding.Name == name)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static WsdlNS.ServiceDescription CloneWsdl(WsdlNS.ServiceDescription originalWsdl)
+        {
+            Fx.Assert(originalWsdl != null, "originalWsdl must not be null");
+            WsdlNS.ServiceDescription newWsdl;
+            using (MemoryStream memoryStream = new MemoryStream())
+            {
+                originalWsdl.Write(memoryStream);
+                memoryStream.Seek(0, SeekOrigin.Begin);
+                newWsdl = WsdlNS.ServiceDescription.Read(memoryStream);
+            }
+
+            return newWsdl;
+        }
+
+        [SuppressMessage("Microsoft.Security.Xml", "CA3054:DoNotAllowDtdOnXmlTextReader")]
+        [SuppressMessage("Microsoft.Security.Xml", "CA3069:ReviewDtdProcessingAssignment", Justification = "This is trusted server code from the application only. We should allow the customer add dtd.")]
+        private static XmlSchema CloneXsd(XmlSchema originalXsd)
+        {
+            Fx.Assert(originalXsd != null, "originalXsd must not be null");
+            XmlSchema newXsd;
+            using (MemoryStream memoryStream = new MemoryStream())
+            {
+                originalXsd.Write(memoryStream);
+                memoryStream.Seek(0, SeekOrigin.Begin);
+                newXsd = XmlSchema.Read(new XmlTextReader(memoryStream) { DtdProcessing = DtdProcessing.Parse }, null);
+            }
+
+            return newXsd;
+        }
+    }
+}
+                                                                                                        e, CharSet=CharSet.Unicode)]
+		extern static bool GetConsoleMode (IntPtr handle, out int mode);
+
+		[DllImport ("kernel32.dll", EntryPoint="SetConsoleMode", SetLastError=true, CharSet=CharSet.Unicode)]
+		extern static bool SetConsoleMode (IntPtr handle, int mode);
+
+		[DllImport ("kernel32.dll", EntryPoint="PeekConsoleInput", SetLastError=true, CharSet=CharSet.Unicode)]
+		extern static bool PeekConsoleInput (IntPtr handle, out InputRecord record, int length, out int eventsRead);
+
+		[DllImport ("kernel32.dll", EntryPoint="ReadConsoleInput", SetLastError=true, CharSet=CharSet.Unicode)]
+		extern static bool ReadConsoleInput (IntPtr handle, out InputRecord record, int length, out int nread);
+
+		[DllImport ("kernel32.dll", EntryPoint="GetLargestConsoleWindowSize", SetLastError=true, CharSet=CharSet.Unicode)]
+		extern static Coord GetLargestConsoleWindowSize (IntPtr handle);
+
+		[DllImport ("kernel32.dll", EntryPoint="ReadConsoleOutput", SetLastError=true, CharSet=CharSet.Unicode)]
+		extern static bool ReadConsoleOutput (IntPtr handl

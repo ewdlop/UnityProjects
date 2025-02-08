@@ -1,0 +1,109 @@
+XXFLAGS+=("-DCRYPTOPP_NO_BACKWARDS_COMPATIBILITY_562" "-DCRYPTOPP_NO_UNALIGNED_DATA_ACCESS" "-Wall" "-Wextra")
+	ELEVATED_CXXFLAGS+=("-Wno-unknown-pragmas" "-Wstrict-overflow" "-Wcast-align" "-Wwrite-strings" "-Wformat=2" "-Wformat-security")
+fi
+
+echo | tee -a "$TEST_RESULTS"
+echo "DEBUG_CXXFLAGS: $DEBUG_CXXFLAGS" | tee -a "$TEST_RESULTS"
+echo "RELEASE_CXXFLAGS: $RELEASE_CXXFLAGS" | tee -a "$TEST_RESULTS"
+echo "VALGRIND_CXXFLAGS: $VALGRIND_CXXFLAGS" | tee -a "$TEST_RESULTS"
+if [[ (! -z "$USER_CXXFLAGS") ]]; then
+	echo "USER_CXXFLAGS: $USER_CXXFLAGS" | tee -a "$TEST_RESULTS"
+fi
+if [[ ("${#PLATFORM_CXXFLAGS[@]}" -ne "0") ]]; then
+	echo "PLATFORM_CXXFLAGS: ${PLATFORM_CXXFLAGS[@]}" | tee -a "$TEST_RESULTS"
+fi
+
+#############################################
+#############################################
+############### BEGIN TESTING ###############
+#############################################
+#############################################
+
+TEST_BEGIN=$(date)
+echo | tee -a "$TEST_RESULTS"
+echo "Start time: $TEST_BEGIN" | tee -a "$TEST_RESULTS"
+
+############################################
+# Posix NDEBUG and assert
+if true; then
+
+	echo
+	echo "************************************" | tee -a "$TEST_RESULTS"
+	echo "Testing: No Posix NDEBUG or assert" | tee -a "$TEST_RESULTS"
+	echo
+
+	FAILED=0
+
+	# Filter out C++ and Doxygen comments.
+	COUNT=$(cat *.h *.cpp | "$GREP" -v '//' | "$GREP" -c '(assert.h|cassert)')
+	if [[ "$COUNT" -ne "0" ]]; then
+		FAILED=1
+		echo "FAILED: found Posix assert headers" | tee -a "$TEST_RESULTS"
+	fi
+
+	# Filter out C++ and Doxygen comments.
+	COUNT=$(cat *.h *.cpp | "$GREP" -v '//' | "$EGREP" -c 'assert[[:space:]]*\(')
+	if [[ "$COUNT" -ne "0" ]]; then
+		FAILED=1
+		echo "FAILED: found use of Posix assert" | tee -a "$TEST_RESULTS"
+	fi
+
+	# Filter out C++ and Doxygen comments.
+	COUNT=$(cat *.h *.cpp | "$GREP" -v '//' | "$GREP" -c 'NDEBUG')
+	if [[ "$COUNT" -ne "0" ]]; then
+		FAILED=1
+		echo "FAILED: found use of Posix NDEBUG" | tee -a "$TEST_RESULTS"
+	fi
+
+	if [[ ("$FAILED" -eq "0") ]]; then
+		echo "Verified no Posix NDEBUG or assert" | tee -a "$TEST_RESULTS"
+	fi
+fi
+
+############################################
+# C++ std::min and std::max
+# This is due to Windows.h and NOMINMAX. Linux test fine, while Windows breaks.
+if true; then
+
+	echo
+	echo "************************************" | tee -a "$TEST_RESULTS"
+	echo "Testing: C++ std::min and std::max" | tee -a "$TEST_RESULTS"
+	echo
+
+	FAILED=0
+
+	# If this fires, then use the library's STDMIN(a,b) or (std::min)(a, b);
+	COUNT=$(cat *.h *.cpp | "$GREP" -v '//' | "$EGREP" -c 'std::min[[:space:]]*\(')
+	if [[ "$COUNT" -ne "0" ]]; then
+		FAILED=1
+		echo "FAILED: found std::min" | tee -a "$TEST_RESULTS"
+	fi
+
+	# If this fires, then use the library's STDMAX(a,b) or (std::max)(a, b);
+	COUNT=$(cat *.h *.cpp | "$GREP" -v '//' | "$EGREP" -c 'std::max[[:space:]]*\(')
+	if [[ "$COUNT" -ne "0" ]]; then
+		FAILED=1
+		echo "FAILED: found std::max" | tee -a "$TEST_RESULTS"
+	fi
+
+	if [[ ("$FAILED" -eq "0") ]]; then
+		echo "Verified std::min and std::max" | tee -a "$TEST_RESULTS"
+	fi
+fi
+
+############################################
+# X86 code generation tests
+if [[ ("$HAVE_DISASS" -ne "0" && ("$IS_X86" -ne "0" || "$IS_X64" -ne "0")) ]]; then
+
+	############################################
+	# X86 rotate immediate code generation
+
+	X86_ROTATE_IMM=1
+	if [[ ("$X86_ROTATE_IMM" -ne "0") ]]; then
+		echo
+		echo "************************************" | tee -a "$TEST_RESULTS"
+		echo "Testing: X86 rotate immediate code generation" | tee -a "$TEST_RESULTS"
+		echo
+
+		OBJFILE=sha.o; rm -f "$OBJFILE" 2>/dev/null
+		CXX="$CXX" CXXFLAG

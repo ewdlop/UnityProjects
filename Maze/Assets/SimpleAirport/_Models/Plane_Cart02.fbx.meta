@@ -1,0 +1,62 @@
+r.NumberOfRelocations = Sec->Relocations.size();
+      }
+      Sec->Header.PointerToRelocations = Offset;
+
+      if (RelocationsOverflow) {
+        // Reloc #0 will contain actual count, so make room for it.
+        Offset += COFF::RelocationSize;
+      }
+
+      Offset += COFF::RelocationSize * Sec->Relocations.size();
+
+      for (auto &Relocation : Sec->Relocations) {
+        assert(Relocation.Symb->getIndex() != -1);
+        Relocation.Data.SymbolTableIndex = Relocation.Symb->getIndex();
+      }
+    }
+
+    assert(Sec->Symbol->Aux.size() == 1 &&
+           "Section's symbol must have one aux!");
+    AuxSymbol &Aux = Sec->Symbol->Aux[0];
+    assert(Aux.AuxType == ATSectionDefinition &&
+           "Section's symbol's aux symbol must be a Section Definition!");
+    Aux.Aux.SectionDefinition.Length = Sec->Header.SizeOfRawData;
+    Aux.Aux.SectionDefinition.NumberOfRelocations =
+        Sec->Header.NumberOfRelocations;
+    Aux.Aux.SectionDefinition.NumberOfLinenumbers =
+        Sec->Header.NumberOfLineNumbers;
+  }
+
+  Header.PointerToSymbolTable = Offset;
+}
+
+void WinCOFFObjectWriter::writeObject(MCAssembler &Asm,
+                                      const MCAsmLayout &Layout) {
+  if (Sections.size() > INT32_MAX)
+    report_fatal_error(
+        "PE COFF object files can't have more than 2147483647 sections");
+
+  UseBigObj = Sections.size() > COFF::MaxNumberOfSections16;
+  Header.NumberOfSections = Sections.size();
+  Header.NumberOfSymbols = 0;
+
+  assignSectionNumbers();
+  createFileSymbols(Asm);
+
+  for (auto &Symbol : Symbols) {
+    // Update section number & offset for symbols that have them.
+    if (Symbol->Section)
+      Symbol->Data.SectionNumber = Symbol->Section->Number;
+    Symbol->setIndex(Header.NumberOfSymbols++);
+    // Update auxiliary symbol info.
+    Symbol->Data.NumberOfAuxSymbols = Symbol->Aux.size();
+    Header.NumberOfSymbols += Symbol->Data.NumberOfAuxSymbols;
+  }
+
+  // Build string table.
+  for (const auto &S : Sections)
+    if (S->Name.size() > COFF::NameSize)
+      Strings.add(S->Name);
+  for (const auto &S : Symbols)
+    if (S->Name.size() > COFF::NameSize)
+      Strings.add(S->

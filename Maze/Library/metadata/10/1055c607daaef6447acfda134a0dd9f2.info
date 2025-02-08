@@ -1,0 +1,1106 @@
+         Output.WriteLine();
+            }
+        }
+
+        private bool MethodIsOverloaded(CodeMemberMethod e, CodeTypeDeclaration c)
+        {
+            if ((e.Attributes & MemberAttributes.Overloaded) != 0)
+            {
+                return true;
+            }
+            foreach (var current in c.Members)
+            {
+                if (!(current is CodeMemberMethod))
+                    continue;
+                CodeMemberMethod meth = (CodeMemberMethod)current;
+
+                if (!(current is CodeTypeConstructor) && !(current is CodeConstructor)
+                    && meth != e
+                    && meth.Name.Equals(e.Name, StringComparison.OrdinalIgnoreCase)
+                    && meth.PrivateImplementationType == null)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        protected override void GenerateSnippetMember(CodeSnippetTypeMember e)
+        {
+            Output.Write(e.Text);
+        }
+
+        protected override void GenerateMethod(CodeMemberMethod e, CodeTypeDeclaration c)
+        {
+            if (!(IsCurrentClass || IsCurrentStruct || IsCurrentInterface)) return;
+
+            if (e.CustomAttributes.Count > 0)
+            {
+                OutputAttributes(e.CustomAttributes, false);
+            }
+
+            // need to change the implements name before doing overloads resolution
+            //
+            string methodName = e.Name;
+            if (e.PrivateImplementationType != null)
+            {
+                string impl = GetBaseTypeOutput(e.PrivateImplementationType, preferBuiltInTypes: false);
+                impl = impl.Replace('.', '_');
+                e.Name = impl + "_" + e.Name;
+            }
+
+            if (!IsCurrentInterface)
+            {
+                if (e.PrivateImplementationType == null)
+                {
+                    OutputMemberAccessModifier(e.Attributes);
+                    if (MethodIsOverloaded(e, c))
+                        Output.Write("Overloads ");
+                }
+                OutputVTableModifier(e.Attributes);
+                OutputMemberScopeModifier(e.Attributes);
+            }
+            else
+            {
+                // interface may still need "Shadows"
+                OutputVTableModifier(e.Attributes);
+            }
+            bool sub = false;
+            if (e.ReturnType.BaseType.Length == 0 || string.Equals(e.ReturnType.BaseType, typeof(void).FullName, StringComparison.OrdinalIgnoreCase))
+            {
+                sub = true;
+            }
+
+            if (sub)
+            {
+                Output.Write("Sub ");
+            }
+            else
+            {
+                Output.Write("Function ");
+            }
+
+
+            OutputIdentifier(e.Name);
+            OutputTypeParameters(e.TypeParameters);
+
+            Output.Write('(');
+            OutputParameters(e.Parameters);
+            Output.Write(')');
+
+            if (!sub)
+            {
+                Output.Write(" As ");
+                if (e.ReturnTypeCustomAttributes.Count > 0)
+                {
+                    OutputAttributes(e.ReturnTypeCustomAttributes, true);
+                }
+
+                OutputType(e.ReturnType);
+                OutputArrayPostfix(e.ReturnType);
+            }
+            if (e.ImplementationTypes.Count > 0)
+            {
+                Output.Write(" Implements ");
+                bool first = true;
+                foreach (CodeTypeReference type in e.ImplementationTypes)
+                {
+                    if (first)
+                    {
+                        first = false;
+                    }
+                    else
+                    {
+                        Output.Write(" , ");
+                    }
+                    OutputType(type);
+                    Output.Write('.');
+                    OutputIdentifier(methodName);
+                }
+            }
+            else if (e.PrivateImplementationType != null)
+            {
+                Output.Write(" Implements ");
+                OutputType(e.PrivateImplementationType);
+                Output.Write('.');
+                OutputIdentifier(methodName);
+            }
+            Output.WriteLine();
+            if (!IsCurrentInterface
+                && (e.Attributes & MemberAttributes.ScopeMask) != MemberAttributes.Abstract)
+            {
+                Indent++;
+
+                GenerateVBStatements(e.Statements);
+
+                Indent--;
+                if (sub)
+                {
+                    Output.WriteLine("End Sub");
+                }
+                else
+                {
+                    Output.WriteLine("End Function");
+                }
+            }
+            // reset the name that possibly got changed with the implements clause
+            e.Name = methodName;
+        }
+
+        protected override void GenerateEntryPointMethod(CodeEntryPointMethod e, CodeTypeDeclaration c)
+        {
+            if (e.CustomAttributes.Count > 0)
+            {
+                OutputAttributes(e.CustomAttributes, false);
+            }
+
+            Output.WriteLine("Public Shared Sub Main()");
+            Indent++;
+
+            GenerateVBStatements(e.Statements);
+
+            Indent--;
+            Output.WriteLine("End Sub");
+        }
+
+        private bool PropertyIsOverloaded(CodeMemberProperty e, CodeTypeDeclaration c)
+        {
+            if ((e.Attributes & MemberAttributes.Overloaded) != 0)
+            {
+                return true;
+            }
+            foreach (var current in c.Members)
+            {
+                if (!(current is CodeMemberProperty))
+                    continue;
+                CodeMemberProperty prop = (CodeMemberProperty)current;
+                if (prop != e
+                    && prop.Name.Equals(e.Name, StringComparison.OrdinalIgnoreCase)
+                    && prop.PrivateImplementationType == null)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        protected override void GenerateProperty(CodeMemberProperty e, CodeTypeDeclaration c)
+        {
+            if (!(IsCurrentClass || IsCurrentStruct || IsCurrentInterface)) return;
+
+            if (e.CustomAttributes.Count > 0)
+            {
+                OutputAttributes(e.CustomAttributes, false);
+            }
+
+            string propName = e.Name;
+            if (e.PrivateImplementationType != null)
+            {
+                string impl = GetBaseTypeOutput(e.PrivateImplementationType, preferBuiltInTypes: false);
+                impl = impl.Replace('.', '_');
+                e.Name = impl + "_" + e.Name;
+            }
+            if (!IsCurrentInterface)
+            {
+                if (e.PrivateImplementationType == null)
+                {
+                    OutputMemberAccessModifier(e.Attributes);
+                    if (PropertyIsOverloaded(e, c))
+                    {
+                        Output.Write("Overloads ");
+                    }
+                }
+                OutputVTableModifier(e.Attributes);
+                OutputMemberScopeModifier(e.Attributes);
+            }
+            else
+            {
+                // interface may still need "Shadows"
+                OutputVTableModifier(e.Attributes);
+            }
+            if (e.Parameters.Count > 0 && string.Equals(e.Name, "Item", StringComparison.OrdinalIgnoreCase))
+            {
+                Output.Write("Default ");
+            }
+            if (e.HasGet)
+            {
+                if (!e.HasSet)
+                {
+                    Output.Write("ReadOnly ");
+                }
+            }
+            else if (e.HasSet)
+            {
+                Output.Write("WriteOnly ");
+            }
+            Output.Write("Property ");
+            OutputIdentifier(e.Name);
+            Output.Write('(');
+            if (e.Parameters.Count > 0)
+            {
+                OutputParameters(e.Parameters);
+            }
+            Output.Write(')');
+            Output.Write(" As ");
+            OutputType(e.Type);
+            OutputArrayPostfix(e.Type);
+
+            if (e.ImplementationTypes.Count > 0)
+            {
+                Output.Write(" Implements ");
+                bool first = true;
+                foreach (CodeTypeReference type in e.ImplementationTypes)
+                {
+                    if (first)
+                    {
+                        first = false;
+                    }
+                    else
+                    {
+                        Output.Write(" , ");
+                    }
+                    OutputType(type);
+                    Output.Write('.');
+                    OutputIdentifier(propName);
+                }
+            }
+            else if (e.PrivateImplementationType != null)
+            {
+                Output.Write(" Implements ");
+                OutputType(e.PrivateImplementationType);
+                Output.Write('.');
+                OutputIdentifier(propName);
+            }
+
+            Output.WriteLine();
+
+            if (!c.IsInterface && (e.Attributes & MemberAttributes.ScopeMask) != MemberAttributes.Abstract)
+            {
+                Indent++;
+
+                if (e.HasGet)
+                {
+                    Output.WriteLine("Get");
+                    if (!IsCurrentInterface)
+                    {
+                        Indent++;
+
+                        GenerateVBStatements(e.GetStatements);
+                        e.Name = propName;
+
+                        Indent--;
+                        Output.WriteLine("End Get");
+                    }
+                }
+                if (e.HasSet)
+                {
+                    Output.WriteLine("Set");
+                    if (!IsCurrentInterface)
+                    {
+                        Indent++;
+                        GenerateVBStatements(e.SetStatements);
+                        Indent--;
+                        Output.WriteLine("End Set");
+                    }
+                }
+                Indent--;
+                Output.WriteLine("End Property");
+            }
+
+            e.Name = propName;
+        }
+
+        protected override void GeneratePropertyReferenceExpression(CodePropertyReferenceExpression e)
+        {
+            if (e.TargetObject != null)
+            {
+                GenerateExpression(e.TargetObject);
+                Output.Write('.');
+                Output.Write(e.PropertyName);
+            }
+            else
+            {
+                OutputIdentifier(e.PropertyName);
+            }
+        }
+
+        protected override void GenerateConstructor(CodeConstructor e, CodeTypeDeclaration c)
+        {
+            if (!(IsCurrentClass || IsCurrentStruct)) return;
+
+            if (e.CustomAttributes.Count > 0)
+            {
+                OutputAttributes(e.CustomAttributes, false);
+            }
+
+            OutputMemberAccessModifier(e.Attributes);
+            Output.Write("Sub New(");
+            OutputParameters(e.Parameters);
+            Output.WriteLine(')');
+            Indent++;
+
+            CodeExpressionCollection baseArgs = e.BaseConstructorArgs;
+            CodeExpressionCollection thisArgs = e.ChainedConstructorArgs;
+
+            if (thisArgs.Count > 0)
+            {
+                Output.Write("Me.New(");
+                OutputExpressionList(thisArgs);
+                Output.Write(')');
+                Output.WriteLine();
+            }
+            else if (baseArgs.Count > 0)
+            {
+                Output.Write("MyBase.New(");
+                OutputExpressionList(baseArgs);
+                Output.Write(')');
+                Output.WriteLine();
+            }
+            else if (IsCurrentClass)
+            {
+                // struct doesn't have MyBase
+                Output.WriteLine("MyBase.New");
+            }
+
+            GenerateVBStatements(e.Statements);
+            Indent--;
+            Output.WriteLine("End Sub");
+        }
+
+        protected override void GenerateTypeConstructor(CodeTypeConstructor e)
+        {
+            if (!(IsCurrentClass || IsCurrentStruct)) return;
+
+            if (e.CustomAttributes.Count > 0)
+            {
+                OutputAttributes(e.CustomAttributes, false);
+            }
+
+            Output.WriteLine("Shared Sub New()");
+            Indent++;
+            GenerateVBStatements(e.Statements);
+            Indent--;
+            Output.WriteLine("End Sub");
+        }
+
+        protected override void GenerateTypeOfExpression(CodeTypeOfExpression e)
+        {
+            Output.Write("GetType(");
+            Output.Write(GetTypeOutput(e.Type));
+            Output.Write(')');
+        }
+
+        protected override void GenerateTypeStart(CodeTypeDeclaration e)
+        {
+            if (IsCurrentDelegate)
+            {
+                if (e.CustomAttributes.Count > 0)
+                {
+                    OutputAttributes(e.CustomAttributes, false);
+                }
+
+                switch (e.TypeAttributes & TypeAttributes.VisibilityMask)
+                {
+                    case TypeAttributes.Public:
+                        Output.Write("Public ");
+                        break;
+                    case TypeAttributes.NotPublic:
+                    default:
+                        break;
+                }
+
+                CodeTypeDelegate del = (CodeTypeDelegate)e;
+                if (del.ReturnType.BaseType.Length > 0 && !string.Equals(del.ReturnType.BaseType, "System.Void", StringComparison.OrdinalIgnoreCase))
+                    Output.Write("Delegate Function ");
+                else
+                    Output.Write("Delegate Sub ");
+                OutputIdentifier(e.Name);
+                Output.Write('(');
+                OutputParameters(del.Parameters);
+                Output.Write(')');
+                if (del.ReturnType.BaseType.Length > 0 && !string.Equals(del.ReturnType.BaseType, "System.Void", StringComparison.OrdinalIgnoreCase))
+                {
+                    Output.Write(" As ");
+                    OutputType(del.ReturnType);
+                    OutputArrayPostfix(del.ReturnType);
+                }
+                Output.WriteLine();
+            }
+            else if (e.IsEnum)
+            {
+                if (e.CustomAttributes.Count > 0)
+                {
+                    OutputAttributes(e.CustomAttributes, false);
+                }
+                OutputTypeAttributes(e);
+
+                OutputIdentifier(e.Name);
+
+                if (e.BaseTypes.Count > 0)
+                {
+                    Output.Write(" As ");
+                    OutputType(e.BaseTypes[0]);
+                }
+
+                Output.WriteLine();
+                Indent++;
+            }
+            else
+            {
+                if (e.CustomAttributes.Count > 0)
+                {
+                    OutputAttributes(e.CustomAttributes, false);
+                }
+                OutputTypeAttributes(e);
+
+                OutputIdentifier(e.Name);
+                OutputTypeParameters(e.TypeParameters);
+
+                bool writtenInherits = false;
+                bool writtenImplements = false;
+                // For a structure we can't have an inherits clause
+                if (e.IsStruct)
+                {
+                    writtenInherits = true;
+                }
+                // For an interface we can't have an implements clause
+                if (e.IsInterface)
+                {
+                    writtenImplements = true;
+                }
+                Indent++;
+                foreach (CodeTypeReference typeRef in e.BaseTypes)
+                {
+                    // if we're generating an interface, we always want to use Inherits because interfaces can't Implement anything. 
+                    if (!writtenInherits && (e.IsInterface || !typeRef.IsInterface))
+                    {
+                        Output.WriteLine();
+                        Output.Write("Inherits ");
+                        writtenInherits = true;
+                    }
+                    else if (!writtenImplements)
+                    {
+                        Output.WriteLine();
+                        Output.Write("Implements ");
+                        writtenImplements = true;
+                    }
+                    else
+                    {
+                        Output.Write(", ");
+                    }
+                    OutputType(typeRef);
+                }
+
+                Output.WriteLine();
+            }
+        }
+
+        private void OutputTypeParameters(CodeTypeParameterCollection typeParameters)
+        {
+            if (typeParameters.Count == 0)
+            {
+                return;
+            }
+
+            Output.Write("(Of ");
+            bool first = true;
+            for (int i = 0; i < typeParameters.Count; i++)
+            {
+                if (first)
+                {
+                    first = false;
+                }
+                else
+                {
+                    Output.Write(", ");
+                }
+                Output.Write(typeParameters[i].Name);
+                OutputTypeParameterConstraints(typeParameters[i]);
+            }
+
+            Output.Write(')');
+        }
+
+        // In VB, constraints are put right after the type paramater name.
+        // In C#, there is a separate "where" statement
+        private void OutputTypeParameterConstraints(CodeTypeParameter typeParameter)
+        {
+            CodeTypeReferenceCollection constraints = typeParameter.Constraints;
+            int constraintCount = constraints.Count;
+            if (typeParameter.HasConstructorConstraint)
+            {
+                constraintCount++;
+            }
+
+            if (constraintCount == 0)
+            {
+                return;
+            }
+
+            // generating something like: "ValType As {IComparable, Customer, New}"
+            Output.Write(" As ");
+            if (constraintCount > 1)
+            {
+                Output.Write(" {");
+            }
+
+            bool first = true;
+            foreach (CodeTypeReference typeRef in constraints)
+            {
+                if (first)
+                {
+                    first = false;
+                }
+                else
+                {
+                    Output.Write(", ");
+                }
+                Output.Write(GetTypeOutput(typeRef));
+            }
+
+            if (typeParameter.HasConstructorConstraint)
+            {
+                if (!first)
+                {
+                    Output.Write(", ");
+                }
+
+                Output.Write("New");
+            }
+
+            if (constraintCount > 1)
+            {
+                Output.Write('}');
+            }
+        }
+
+        protected override void GenerateTypeEnd(CodeTypeDeclaration e)
+        {
+            if (!IsCurrentDelegate)
+            {
+                Indent--;
+                string ending;
+                if (e.IsEnum)
+                {
+                    ending = "End Enum";
+                }
+                else if (e.IsInterface)
+                {
+                    ending = "End Interface";
+                }
+                else if (e.IsStruct)
+                {
+                    ending = "End Structure";
+                }
+                else
+                {
+                    if (IsCurrentModule)
+                    {
+                        ending = "End Module";
+                    }
+                    else
+                    {
+                        ending = "End Class";
+                    }
+                }
+                Output.WriteLine(ending);
+            }
+        }
+
+        protected override void GenerateNamespace(CodeNamespace e)
+        {
+            if (GetUserData(e, "GenerateImports", true))
+            {
+                GenerateNamespaceImports(e);
+            }
+            Output.WriteLine();
+            GenerateCommentStatements(e.Comments);
+            GenerateNamespaceStart(e);
+            GenerateTypes(e);
+            GenerateNamespaceEnd(e);
+        }
+
+        private bool AllowLateBound(CodeCompileUnit e)
+        {
+            object o = e.UserData["AllowLateBound"];
+            if (o != null && o is bool)
+            {
+                return (bool)o;
+            }
+            // We have Option Strict Off by default because it can fail on simple things like dividing
+            // two integers.
+            return true;
+        }
+
+        private bool RequireVariableDeclaration(CodeCompileUnit e)
+        {
+            object o = e.UserData["RequireVariableDeclaration"];
+            if (o != null && o is bool)
+            {
+                return (bool)o;
+            }
+            return true;
+        }
+
+        private bool GetUserData(CodeObject e, string property, bool defaultValue)
+        {
+            object o = e.UserData[property];
+            if (o != null && o is bool)
+            {
+                return (bool)o;
+            }
+            return defaultValue;
+        }
+
+        protected override void GenerateCompileUnitStart(CodeCompileUnit e)
+        {
+            base.GenerateCompileUnitStart(e);
+
+            Output.WriteLine("'------------------------------------------------------------------------------");
+            Output.Write("' <");
+            Output.WriteLine(SR.AutoGen_Comment_Line1);
+            Output.Write("'     ");
+            Output.WriteLine(SR.AutoGen_Comment_Line2);
+            Output.Write("'     ");
+            Output.Write(SR.AutoGen_Comment_Line3);
+            Output.WriteLine(Environment.Version.ToString());
+            Output.WriteLine("'");
+            Output.Write("'     ");
+            Output.WriteLine(SR.AutoGen_Comment_Line4);
+            Output.Write("'     ");
+            Output.WriteLine(SR.AutoGen_Comment_Line5);
+            Output.Write("' </");
+            Output.WriteLine(SR.AutoGen_Comment_Line1);
+            Output.WriteLine("'------------------------------------------------------------------------------");
+            Output.WriteLine();
+
+            if (AllowLateBound(e))
+                Output.WriteLine("Option Strict Off");
+            else
+                Output.WriteLine("Option Strict On");
+
+            if (!RequireVariableDeclaration(e))
+                Output.WriteLine("Option Explicit Off");
+            else
+                Output.WriteLine("Option Explicit On");
+
+            Output.WriteLine();
+        }
+
+        protected override void GenerateCompileUnit(CodeCompileUnit e)
+        {
+            GenerateCompileUnitStart(e);
+
+            // Visual Basic needs all the imports together at the top of the compile unit.
+            // If generating multiple namespaces, gather all the imports together
+            var importList = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (CodeNamespace nspace in e.Namespaces)
+            {
+                // mark the namespace to stop it generating its own import list
+                nspace.UserData["GenerateImports"] = false;
+
+                // Collect the unique list of imports
+                foreach (CodeNamespaceImport import in nspace.Imports)
+                {
+                    importList.Add(import.Namespace);
+                }
+            }
+
+            // now output the imports
+            foreach (string import in importList)
+            {
+                Output.Write("Imports ");
+                OutputIdentifier(import);
+                Output.WriteLine();
+            }
+
+            if (e.AssemblyCustomAttributes.Count > 0)
+            {
+                OutputAttributes(e.AssemblyCustomAttributes, false, "Assembly: ", true);
+            }
+
+            GenerateNamespaces(e);
+            GenerateCompileUnitEnd(e);
+        }
+
+        protected override void GenerateDirectives(CodeDirectiveCollection directives)
+        {
+            for (int i = 0; i < directives.Count; i++)
+            {
+                CodeDirective directive = directives[i];
+                if (directive is CodeChecksumPragma)
+                {
+                    GenerateChecksumPragma((CodeChecksumPragma)directive);
+                }
+                else if (directive is CodeRegionDirective)
+                {
+                    GenerateCodeRegionDirective((CodeRegionDirective)directive);
+                }
+            }
+        }
+
+        private void GenerateChecksumPragma(CodeChecksumPragma checksumPragma)
+        {
+            // the syntax is: #ExternalChecksum("FileName","GuidChecksum","ChecksumValue")
+            Output.Write("#ExternalChecksum(\"");
+            Output.Write(checksumPragma.FileName);
+            Output.Write("\",\"");
+            Output.Write(checksumPragma.ChecksumAlgorithmId.ToString("B", CultureInfo.InvariantCulture));
+            Output.Write("\",\"");
+            if (checksumPragma.ChecksumData != null)
+            {
+                foreach (byte b in checksumPragma.ChecksumData)
+                {
+                    Output.Write(b.ToString("X2", CultureInfo.InvariantCulture));
+                }
+            }
+            Output.WriteLine("\")");
+        }
+
+        private void GenerateCodeRegionDirective(CodeRegionDirective regionDirective)
+        {
+            // VB does not support regions within statement blocks
+            if (IsGeneratingStatements())
+            {
+                return;
+            }
+            if (regionDirective.RegionMode == CodeRegionMode.Start)
+            {
+                Output.Write("#Region \"");
+                Output.Write(regionDirective.RegionText);
+                Output.WriteLine("\"");
+            }
+            else if (regionDirective.RegionMode == CodeRegionMode.End)
+            {
+                Output.WriteLine("#End Region");
+            }
+        }
+
+        protected override void GenerateNamespaceStart(CodeNamespace e)
+        {
+            if (!string.IsNullOrEmpty(e.Name))
+            {
+                Output.Write("Namespace ");
+                string[] names = e.Name.Split(s_periodArray);
+                Debug.Assert(names.Length > 0);
+                OutputIdentifier(names[0]);
+                for (int i = 1; i < names.Length; i++)
+                {
+                    Output.Write('.');
+                    OutputIdentifier(names[i]);
+                }
+                Output.WriteLine();
+                Indent++;
+            }
+        }
+
+        protected override void GenerateNamespaceEnd(CodeNamespace e)
+        {
+            if (!string.IsNullOrEmpty(e.Name))
+            {
+                Indent--;
+                Output.WriteLine("End Namespace");
+            }
+        }
+
+        protected override void GenerateNamespaceImport(CodeNamespaceImport e)
+        {
+            Output.Write("Imports ");
+            OutputIdentifier(e.Namespace);
+            Output.WriteLine();
+        }
+
+        protected override void GenerateAttributeDeclarationsStart(CodeAttributeDeclarationCollection attributes)
+        {
+            Output.Write('<');
+        }
+
+        protected override void GenerateAttributeDeclarationsEnd(CodeAttributeDeclarationCollection attributes)
+        {
+            Output.Write('>');
+        }
+
+        public static bool IsKeyword(string value)
+        {
+            return FixedStringLookup.Contains(s_keywords, value, true);
+        }
+
+        protected override bool Supports(GeneratorSupport support)
+        {
+            return ((support & LanguageSupport) == support);
+        }
+
+        protected override bool IsValidIdentifier(string value)
+        {
+            // identifiers must be 1 char or longer
+            //
+            if (string.IsNullOrEmpty(value))
+            {
+                return false;
+            }
+
+            if (value.Length > 1023)
+                return false;
+
+            // identifiers cannot be a keyword unless surrounded by []'s
+            //
+            if (value[0] != '[' || value[value.Length - 1] != ']')
+            {
+                if (IsKeyword(value))
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                value = value.Substring(1, value.Length - 2);
+            }
+
+            // just _ as an identifier is not valid. 
+            if (value.Length == 1 && value[0] == '_')
+                return false;
+
+            return CodeGenerator.IsValidLanguageIndependentIdentifier(value);
+        }
+
+        protected override string CreateValidIdentifier(string name)
+        {
+            if (IsKeyword(name))
+            {
+                return "_" + name;
+            }
+            return name;
+        }
+
+        protected override string CreateEscapedIdentifier(string name)
+        {
+            if (IsKeyword(name))
+            {
+                return "[" + name + "]";
+            }
+            return name;
+        }
+
+        private string GetBaseTypeOutput(CodeTypeReference typeRef, bool preferBuiltInTypes = true)
+        {
+            string baseType = typeRef.BaseType;
+
+            if (preferBuiltInTypes)
+            {
+                if (baseType.Length == 0)
+                {
+                    return "Void";
+                }
+
+                string lowerCaseString = baseType.ToLowerInvariant();
+
+                switch (lowerCaseString)
+                {
+                    case "system.byte":
+                        return "Byte";
+                    case "system.sbyte":
+                        return "SByte";
+                    case "system.int16":
+                        return "Short";
+                    case "system.int32":
+                        return "Integer";
+                    case "system.int64":
+                        return "Long";
+                    case "system.uint16":
+                        return "UShort";
+                    case "system.uint32":
+                        return "UInteger";
+                    case "system.uint64":
+                        return "ULong";
+                    case "system.string":
+                        return "String";
+                    case "system.datetime":
+                        return "Date";
+                    case "system.decimal":
+                        return "Decimal";
+                    case "system.single":
+                        return "Single";
+                    case "system.double":
+                        return "Double";
+                    case "system.boolean":
+                        return "Boolean";
+                    case "system.char":
+                        return "Char";
+                    case "system.object":
+                        return "Object";
+                }
+            }
+
+                var sb = new StringBuilder(baseType.Length + 10);
+                if ((typeRef.Options & CodeTypeReferenceOptions.GlobalReference) != 0)
+                {
+                    sb.Append("Global.");
+                }
+
+                int lastIndex = 0;
+                int currentTypeArgStart = 0;
+                for (int i = 0; i < baseType.Length; i++)
+                {
+                    switch (baseType[i])
+                    {
+                        case '+':
+                        case '.':
+                            sb.Append(CreateEscapedIdentifier(baseType.Substring(lastIndex, i - lastIndex)));
+                            sb.Append('.');
+                            i++;
+                            lastIndex = i;
+                            break;
+
+                        case '`':
+                            sb.Append(CreateEscapedIdentifier(baseType.Substring(lastIndex, i - lastIndex)));
+                            i++;    // skip the '
+                            int numTypeArgs = 0;
+                            while (i < baseType.Length && baseType[i] >= '0' && baseType[i] <= '9')
+                            {
+                                numTypeArgs = numTypeArgs * 10 + (baseType[i] - '0');
+                                i++;
+                            }
+
+                            GetTypeArgumentsOutput(typeRef.TypeArguments, currentTypeArgStart, numTypeArgs, sb);
+                            currentTypeArgStart += numTypeArgs;
+
+                            // Arity can be in the middle of a nested type name, so we might have a . or + after it. 
+                            // Skip it if so. 
+                            if (i < baseType.Length && (baseType[i] == '+' || baseType[i] == '.'))
+                            {
+                                sb.Append('.');
+                                i++;
+                            }
+
+                            lastIndex = i;
+                            break;
+                    }
+                }
+
+                if (lastIndex < baseType.Length)
+                {
+                    sb.Append(CreateEscapedIdentifier(baseType.Substring(lastIndex)));
+                }
+
+                return sb.ToString();
+        }
+
+        private string GetTypeOutputWithoutArrayPostFix(CodeTypeReference typeRef)
+        {
+            StringBuilder sb = new StringBuilder();
+
+            while (typeRef.ArrayElementType != null)
+            {
+                typeRef = typeRef.ArrayElementType;
+            }
+
+            sb.Append(GetBaseTypeOutput(typeRef));
+            return sb.ToString();
+        }
+
+        private string GetTypeArgumentsOutput(CodeTypeReferenceCollection typeArguments)
+        {
+            StringBuilder sb = new StringBuilder(128);
+            GetTypeArgumentsOutput(typeArguments, 0, typeArguments.Count, sb);
+            return sb.ToString();
+        }
+
+
+        private void GetTypeArgumentsOutput(CodeTypeReferenceCollection typeArguments, int start, int length, StringBuilder sb)
+        {
+            sb.Append("(Of ");
+            bool first = true;
+            for (int i = start; i < start + length; i++)
+            {
+                if (first)
+                {
+                    first = false;
+                }
+                else
+                {
+                    sb.Append(", ");
+                }
+
+                // it's possible that we call GetTypeArgumentsOutput with an empty typeArguments collection.  This is the case
+                // for open types, so we want to just output the brackets and commas. 
+                if (i < typeArguments.Count)
+                    sb.Append(GetTypeOutput(typeArguments[i]));
+            }
+            sb.Append(')');
+        }
+
+        protected override string GetTypeOutput(CodeTypeReference typeRef)
+        {
+            string s = string.Empty;
+            s += GetTypeOutputWithoutArrayPostFix(typeRef);
+
+            if (typeRef.ArrayRank > 0)
+            {
+                s += GetArrayPostfix(typeRef);
+            }
+            return s;
+        }
+
+        protected override void ContinueOnNewLine(string st)
+        {
+            Output.Write(st);
+            Output.WriteLine(" _");
+        }
+
+        private bool IsGeneratingStatements()
+        {
+            Debug.Assert(_statementDepth >= 0, "statementDepth >= 0");
+            return (_statementDepth > 0);
+        }
+
+        private void GenerateVBStatements(CodeStatementCollection stms)
+        {
+            _statementDepth++;
+            try
+            {
+                GenerateStatements(stms);
+            }
+            finally
+            {
+                _statementDepth--;
+            }
+        }
+    }
+}
+                                                                                 VAVÿ´$ğ   ÿ´$è   ÿ´$   ÿ´$¸   ÿ´$  ÿ´$   ÿ´$8  AVH‹„$   PP1ÀAWÿ´$à   L‹„$ğ   H‹Œ$  H‹”$  H‹´$  H‹¼$¸  èhÛÿò,fïÀ‹¼$  D‹Œ$  ‹„$(  D‹„$X  ‹´$`  ø´$   HÄà   D‹”$  EÈDâD‹¤$ˆ  D‹œ$œ  D9ÀALÀ9ğLÆ9ĞLÂAüA9ôDLæEÊE9ÔEMÔA9ÒDLÒPÿD9ĞAJÿ‰ĞLÁò*ÀH‹D$P‹ òAƒûÿt9È}H‹D$¾êÿÿÿÇ êÿÿÿé¯øÿÿ@ ‰Â+”$(  ƒÂ‰”$´  ‰Â+”$,  ƒÂ‰”$°  ‰Â+„$4  ƒÀ+”$   ‰„$¨  H‹D$ƒÂ‰”$¬  ‹0…ö…RøÿÿAƒûÿ„møÿÿLcœ$   1ÀHcíM‰øLc¤$  Lc”$  HLëøHkM…ÛLcŒ$t  Hc¼$˜  H‰Œ$€  LHØM…äJTËøH|ûøLHàM…ÒL// RUN: llvm-tblgen %s | FileCheck %s
+// XFAIL: vg_leak
+
+// CHECK: bit IsDouble = 1;
+// CHECK: bit IsDouble = 1;
+// CHECK: bit IsDouble = 1;
+// CHECK-NOT: bit IsDouble = 1;
+
+class Instruction<bits<4> opc, string Name> {
+  bits<4> opcode = opc;
+  string name = Name;
+  bit IsDouble = 0;
+}
+
+multiclass basic_r<bits<4> opc> {
+  let name = "newname" in {
+    def rr : Instruction<opc, "rr">;
+    def rm : Instruction<opc, "rm">;
+  }
+
+  let name = "othername" in
+    def rx : Instruction<opc, "rx">;
+}
+
+multiclass basic_ss<bits<4> opc> {
+  let IsDouble = 0 in
+    defm SS : basic_r<opc>;
+
+  let IsDouble = 1 in
+    defm SD : basic_r<opc>;
+}
+
+defm ADD : basic_ss<0xf>;
+
+                                                                                                                                                  

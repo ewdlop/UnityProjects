@@ -1,0 +1,410 @@
+terms is such that for any value
+ * of the other values, there is always at least one integer value of the
+ * div, i.e., if one plus this sum is greater than or equal to
+ * the (absolute value) of the coefficient of the div in the constraints,
+ * then we can also simply drop the div.
+ *
+ * If an existentially quantified variable does not have an explicit
+ * representation, appears in only a single lower bound that does not
+ * involve any other such existentially quantified variables and appears
+ * in this lower bound with coefficient 1,
+ * then fix the variable to the value of the lower bound.  That is,
+ * turn the inequality into an equality.
+ * If for any value of the other variables, there is any value
+ * for the existentially quantified variable satisfying the constraints,
+ * then this lower bound also satisfies the constraints.
+ * It is therefore safe to pick this lower bound.
+ *
+ * The same reasoning holds even if the coefficient is not one.
+ * However, fixing the variable to the value of the lower bound may
+ * in general introduce an extra integer division, in which case
+ * it may be better to pick another value.
+ * If this integer division has a known constant value, then plugging
+ * in this constant value removes the existentially quantified variable
+ * completely.  In particular, if the lower bound is of the form
+ * ceil((-f(x) - c)/n) and there are two constraints, f(x) + c0 >= 0 and
+ * -f(x) + c1 >= 0 such that ceil((-c1 - c)/n) = ceil((c0 - c)/n),
+ * then the existentially quantified variable can be assigned this
+ * shared value.
+ *
+ * We skip divs that appear in equalities or in the definition of other divs.
+ * Divs that appear in the definition of other divs usually occur in at least
+ * 4 constraints, but the constraints may have been simplified.
+ *
+ * If any divs are left after these simple checks then we move on
+ * to more complicated cases in drop_more_redundant_divs.
+ */
+static __isl_give isl_basic_map *isl_basic_map_drop_redundant_divs_ineq(
+	__isl_take isl_basic_map *bmap)
+{
+	int i, j;
+	unsigned off;
+	int *pairs = NULL;
+	int n = 0;
+
+	if (!bmap)
+		goto error;
+	if (bmap->n_div == 0)
+		return bmap;
+
+	off = isl_space_dim(bmap->dim, isl_dim_all);
+	pairs = isl_calloc_array(bmap->ctx, int, bmap->n_div);
+	if (!pairs)
+		goto error;
+
+	for (i = 0; i < bmap->n_div; ++i) {
+		int pos, neg;
+		int last_pos, last_neg;
+		int redundant;
+		int defined;
+		isl_bool opp, set_div;
+
+		defined = !isl_int_is_zero(bmap->div[i][0]);
+		for (j = i; j < bmap->n_div; ++j)
+			if (!isl_int_is_zero(bmap->div[j][1 + 1 + off + i]))
+				break;
+		if (j < bmap->n_div)
+			continue;
+		for (j = 0; j < bmap->n_eq; ++j)
+			if (!isl_int_is_zero(bmap->eq[j][1 + off + i]))
+				break;
+		if (j < bmap->n_eq)
+			continue;
+		++n;
+		pos = neg = 0;
+		for (j = 0; j < bmap->n_ineq; ++j) {
+			if (isl_int_is_pos(bmap->ineq[j][1 + off + i])) {
+				last_pos = j;
+				++pos;
+			}
+			if (isl_int_is_neg(bmap->ineq[j][1 + off + i])) {
+				last_neg = j;
+				++neg;
+			}
+		}
+		pairs[i] = pos * neg;
+		if (pairs[i] == 0) {
+			for (j = bmap->n_ineq - 1; j >= 0; --j)
+				if (!isl_int_is_zero(bmap->ineq[j][1+off+i]))
+					isl_basic_map_drop_inequality(bmap, j);
+			bmap = isl_basic_map_drop_div(bmap, i);
+			return drop_redundant_divs_again(bmap, pairs, 0);
+		}
+		if (pairs[i] != 1)
+			opp = isl_bool_false;
+		else
+			opp = is_opposite(bmap, last_pos, last_neg);
+		if (opp < 0)
+			goto error;
+		if (!opp) {
+			int lower;
+			isl_bool single, one;
+
+			if (pos != 1)
+				continue;
+			single = single_unknown(bmap, last_pos, i);
+			if (single < 0)
+				goto error;
+			if (!single)
+				continue;
+			one = has_coef_one(bmap, i, last_pos);
+			if (one < 0)
+				goto error;
+			if (one)
+				return set_eq_and_try_again(bmap, last_pos,
+							    pairs);
+			lower = lower_bound_is_cst(bmap, i, last_pos);
+			if (lower >= 0)
+				return fix_cst_lower(bmap, i, last_pos, lower,
+						pairs);
+			continue;
+		}
+
+		isl_int_add(bmap->ineq[last_pos][0],
+			    bmap->ineq[last_pos][0], bmap->ineq[last_neg][0]);
+		isl_int_add_ui(bmap->ineq[last_pos][0],
+			       bmap->ineq[last_pos][0], 1);
+		redundant = isl_int_ge(bmap->ineq[last_pos][0],
+				bmap->ineq[last_pos][1+off+i]);
+		isl_int_sub_ui(bmap->ineq[last_pos][0],
+			       bmap->ineq[last_pos][0], 1);
+		isl_int_sub(bmap->ineq[last_pos][0],
+			    bmap->ineq[last_pos][0], bmap->ineq[last_neg][0]);
+		if (redundant)
+			return drop_div_and_try_again(bmap, i,
+						    last_pos, last_neg, pairs);
+		if (defined)
+			set_div = isl_bool_false;
+		else
+			set_div = ok_to_set_div_from_bound(bmap, i, last_pos);
+		if (set_div < 0)
+			return isl_basic_map_free(bmap);
+		if (set_div) {
+			bmap = set_div_from_lower_bound(bmap, i, last_pos);
+			return drop_redundant_divs_again(bmap, pairs, 1);
+		}
+		pairs[i] = 0;
+		--n;
+	}
+
+	if (n > 0)
+		return coalesce_or_drop_more_redundant_divs(bmap, pairs, n);
+
+	free(pairs);
+	return bmap;
+error:
+	free(pairs);
+	isl_basic_map_free(bmap);
+	return NULL;
+}
+
+/* Consider the coefficients at "c" as a row vector and replace
+ * them with their product with "T".  "T" is assumed to be a square matrix.
+ */
+static isl_stat preimage(isl_int *c, __isl_keep isl_mat *T)
+{
+	int n;
+	isl_ctx *ctx;
+	isl_vec *v;
+
+	if (!T)
+		return isl_stat_error;
+	n = isl_mat_rows(T);
+	if (isl_seq_first_non_zero(c, n) == -1)
+		return isl_stat_ok;
+	ctx = isl_mat_get_ctx(T);
+	v = isl_vec_alloc(ctx, n);
+	if (!v)
+		return isl_stat_error;
+	isl_seq_swp_or_cpy(v->el, c, n);
+	v = isl_vec_mat_product(v, isl_mat_copy(T));
+	if (!v)
+		return isl_stat_error;
+	isl_seq_swp_or_cpy(c, v->el, n);
+	isl_vec_free(v);
+
+	return isl_stat_ok;
+}
+
+/* Plug in T for the variables in "bmap" starting at "pos".
+ * T is a linear unimodular matrix, i.e., without constant term.
+ */
+static __isl_give isl_basic_map *isl_basic_map_preimage_vars(
+	__isl_take isl_basic_map *bmap, unsigned pos, __isl_take isl_mat *T)
+{
+	int i;
+	unsigned n, total;
+
+	bmap = isl_basic_map_cow(bmap);
+	if (!bmap || !T)
+		goto error;
+
+	n = isl_mat_cols(T);
+	if (n != isl_mat_rows(T))
+		isl_die(isl_mat_get_ctx(T), isl_error_invalid,
+			"expecting square matrix", goto error);
+
+	total = isl_basic_map_dim(bmap, isl_dim_all);
+	if (pos + n > total || pos + n < pos)
+		isl_die(isl_mat_get_ctx(T), isl_error_invalid,
+			"invalid range", goto error);
+
+	for (i = 0; i < bmap->n_eq; ++i)
+		if (preimage(bmap->eq[i] + 1 + pos, T) < 0)
+			goto error;
+	for (i = 0; i < bmap->n_ineq; ++i)
+		if (preimage(bmap->ineq[i] + 1 + pos, T) < 0)
+			goto error;
+	for (i = 0; i < bmap->n_div; ++i) {
+		if (isl_basic_map_div_is_marked_unknown(bmap, i))
+			continue;
+		if (preimage(bmap->div[i] + 1 + 1 + pos, T) < 0)
+			goto error;
+	}
+
+	isl_mat_free(T);
+	return bmap;
+error:
+	isl_basic_map_free(bmap);
+	isl_mat_free(T);
+	return NULL;
+}
+
+/* Remove divs that are not strictly needed.
+ *
+ * First look for an equality constraint involving two or more
+ * existentially quantified variables without an explicit
+ * representation.  Replace the combination that appears
+ * in the equality constraint by a single existentially quantified
+ * variable such that the equality can be used to derive
+ * an explicit representation for the variable.
+ * If there are no more such equality constraints, then continue
+ * with isl_basic_map_drop_redundant_divs_ineq.
+ *
+ * In particular, if the equality constraint is of the form
+ *
+ *	f(x) + \sum_i c_i a_i = 0
+ *
+ * with a_i existentially quantified variable without explicit
+ * representation, then apply a transformation on the existentially
+ * quantified variables to turn the constraint into
+ *
+ *	f(x) + g a_1' = 0
+ *
+ * with g the gcd of the c_i.
+ * In order to easily identify which existentially quantified variables
+ * have a complete explicit representation, i.e., without being defined
+ * in terms of other existentially quantified variables without
+ * an explicit representation, the existentially quantified variables
+ * are first sorted.
+ *
+ * The variable transformation is computed by extending the row
+ * [c_1/g ... c_n/g] to a unimodular matrix, obtaining the transformation
+ *
+ *	[a_1']   [c_1/g ... c_n/g]   [ a_1 ]
+ *	[a_2']                       [ a_2 ]
+ *	 ...   =         U             ....
+ *	[a_n']            	     [ a_n ]
+ *
+ * with [c_1/g ... c_n/g] representing the first row of U.
+ * The inverse of U is then plugged into the original constraints.
+ * The call to isl_basic_map_simplify makes sure the explicit
+ * representation for a_1' is extracted from the equality constraint.
+ */
+__isl_give isl_basic_map *isl_basic_map_drop_redundant_divs(
+	__isl_take isl_basic_map *bmap)
+{
+	int first;
+	int i;
+	unsigned o_div, n_div;
+	int l;
+	isl_ctx *ctx;
+	isl_mat *T;
+
+	if (!bmap)
+		return NULL;
+	if (isl_basic_map_divs_known(bmap))
+		return isl_basic_map_drop_redundant_divs_ineq(bmap);
+	if (bmap->n_eq == 0)
+		return isl_basic_map_drop_redundant_divs_ineq(bmap);
+	bmap = isl_basic_map_sort_divs(bmap);
+	if (!bmap)
+		return NULL;
+
+	first = isl_basic_map_first_unknown_div(bmap);
+	if (first < 0)
+		return isl_basic_map_free(bmap);
+
+	o_div = isl_basic_map_offset(bmap, isl_dim_div);
+	n_div = isl_basic_map_dim(bmap, isl_dim_div);
+
+	for (i = 0; i < bmap->n_eq; ++i) {
+		l = isl_seq_first_non_zero(bmap->eq[i] + o_div + first,
+					    n_div - (first));
+		if (l < 0)
+			continue;
+		l += first;
+		if (isl_seq_first_non_zero(bmap->eq[i] + o_div + l + 1,
+					    n_div - (l + 1)) == -1)
+			continue;
+		break;
+	}
+	if (i >= bmap->n_eq)
+		return isl_basic_map_drop_redundant_divs_ineq(bmap);
+
+	ctx = isl_basic_map_get_ctx(bmap);
+	T = isl_mat_alloc(ctx, n_div - l, n_div - l);
+	if (!T)
+		return isl_basic_map_free(bmap);
+	isl_seq_cpy(T->row[0], bmap->eq[i] + o_div + l, n_div - l);
+	T = isl_mat_normalize_row(T, 0);
+	T = isl_mat_unimodular_complete(T, 1);
+	T = isl_mat_right_inverse(T);
+
+	for (i = l; i < n_div; ++i)
+		bmap = isl_basic_map_mark_div_unknown(bmap, i);
+	bmap = isl_basic_map_preimage_vars(bmap, o_div - 1 + l, T);
+	bmap = isl_basic_map_simplify(bmap);
+
+	return isl_basic_map_drop_redundant_divs(bmap);
+}
+
+/* Does "bmap" satisfy any equality that involves more than 2 variables
+ * and/or has coefficients different from -1 and 1?
+ */
+static int has_multiple_var_equality(__isl_keep isl_basic_map *bmap)
+{
+	int i;
+	unsigned total;
+
+	total = isl_basic_map_dim(bmap, isl_dim_all);
+
+	for (i = 0; i < bmap->n_eq; ++i) {
+		int j, k;
+
+		j = isl_seq_first_non_zero(bmap->eq[i] + 1, total);
+		if (j < 0)
+			continue;
+		if (!isl_int_is_one(bmap->eq[i][1 + j]) &&
+		    !isl_int_is_negone(bmap->eq[i][1 + j]))
+			return 1;
+
+		j += 1;
+		k = isl_seq_first_non_zero(bmap->eq[i] + 1 + j, total - j);
+		if (k < 0)
+			continue;
+		j += k;
+		if (!isl_int_is_one(bmap->eq[i][1 + j]) &&
+		    !isl_int_is_negone(bmap->eq[i][1 + j]))
+			return 1;
+
+		j += 1;
+		k = isl_seq_first_non_zero(bmap->eq[i] + 1 + j, total - j);
+		if (k >= 0)
+			return 1;
+	}
+
+	return 0;
+}
+
+/* Remove any common factor g from the constraint coefficients in "v".
+ * The constant term is stored in the first position and is replaced
+ * by floor(c/g).  If any common factor is removed and if this results
+ * in a tightening of the constraint, then set *tightened.
+ */
+static __isl_give isl_vec *normalize_constraint(__isl_take isl_vec *v,
+	int *tightened)
+{
+	isl_ctx *ctx;
+
+	if (!v)
+		return NULL;
+	ctx = isl_vec_get_ctx(v);
+	isl_seq_gcd(v->el + 1, v->size - 1, &ctx->normalize_gcd);
+	if (isl_int_is_zero(ctx->normalize_gcd))
+		return v;
+	if (isl_int_is_one(ctx->normalize_gcd))
+		return v;
+	v = isl_vec_cow(v);
+	if (!v)
+		return NULL;
+	if (tightened && !isl_int_is_divisible_by(v->el[0], ctx->normalize_gcd))
+		*tightened = 1;
+	isl_int_fdiv_q(v->el[0], v->el[0], ctx->normalize_gcd);
+	isl_seq_scale_down(v->el + 1, v->el + 1, ctx->normalize_gcd,
+				v->size - 1);
+	return v;
+}
+
+/* If "bmap" is an integer set that satisfies any equality involving
+ * more than 2 variables and/or has coefficients different from -1 and 1,
+ * then use variable compression to reduce the coefficients by removing
+ * any (hidden) common factor.
+ * In particular, apply the variable compression to each constraint,
+ * factor out any common factor in the non-constant coefficients and
+ * then apply the inverse of the compression.
+ * At the end, we mark the basic map as having reduced constants.
+ * If this flag is still set on the next invocation of this function,
+ * then we skip the computation.
+ *
+ * Removing a common factor ma

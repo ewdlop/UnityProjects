@@ -1,0 +1,112 @@
+' != '' ">
+
+    <!-- Assign a project configuration to each project reference if we're building a solution file. -->
+    <AssignProjectConfiguration
+      ProjectReferences="@(ProjectReference)"
+      SolutionConfigurationContents="$(CurrentSolutionConfigurationContents)"
+      Condition=" '$(BuildingSolutionFile)' == 'true' ">
+
+      <Output TaskParameter="AssignedProjects" ItemName="_ProjectReferenceWithConfiguration" />
+    </AssignProjectConfiguration>
+
+    <!--
+    Otherwise (regular command line build or building inside the IDE) just copy the references
+    as we don't need their configurations.
+    -->
+    <CreateItem Include="@(ProjectReference)" Condition=" '$(BuildingSolutionFile)' != 'true' ">
+      <Output TaskParameter="Include" ItemName="_ProjectReferenceWithConfiguration" />
+    </CreateItem>
+
+    <!-- Copy all VC project references to the VCProjectReference item list (using the VC project extension) -->
+    <CreateItem
+      Include="@(_ProjectReferenceWithConfiguration)"
+      Condition=" '%(Extension)' == '.vcproj' "
+      AdditionalMetadata="MSBuildSourceProjectFileFullPath=%(FullPath)">
+
+      <Output TaskParameter="Include" ItemName="VCProjectReference" />
+    </CreateItem>
+
+    <!-- Copy the rest of the project references to the NonVCProjectReference item list -->
+    <CreateItem
+      Include="@(_ProjectReferenceWithConfiguration)"
+      Condition=" '%(Extension)' != '.vcproj' "
+      AdditionalMetadata="MSBuildSourceProjectFileFullPath=%(FullPath)">
+
+      <Output TaskParameter="Include" ItemName="NonVCProjectReference" />
+    </CreateItem>
+  </Target>
+
+
+  <!--
+  ==================================================================================================
+  _SplitProjectReferencesByFileExistence
+
+    Split referenced projects into two lists: those that exist on  disk and those that don't.
+
+    [IN]
+    @(NonVCProjectReference) - the list of non-VC project references (MSBuild and potentially VSIP projects)
+
+    [OUT]
+    @(_MSBuildProjectReferenceExistent) - the list of non-VC project references that exist on disk
+    @(_MSBuildProjectReferenceNonexistent) - the list of non-VC project references that don't exist on disk
+  ==================================================================================================
+  -->
+  <Target
+    Name="_SplitProjectReferencesByFileExistence"
+    DependsOnTargets="SplitProjectReferencesByType"
+    Condition=" '@(NonVCProjectReference)' != '' ">
+
+    <!--
+    Use this task for matching projects with pre-resolved project outputs set by the IDE if building
+    inside the IDE. The IDE only includes non-MSBuild projects in the output list. We'll use MSBuild
+    to resolve MSBuild projects. This task will resolve VSIP (3rd party) project references and
+    create a new item list with only project references to projects in the MSBuild format.
+    -->
+    <ResolveNonMSBuildProjectOutput
+      ProjectReferences="@(NonVCProjectReference)"
+      PreresolvedProjectOutputs="$(VSIDEResolvedNonMSBuildProjectOutputs)"
+      Condition=" '$(BuildingInsideVisualStudio)' == 'true' ">
+
+      <Output TaskParameter="ResolvedOutputPaths" ItemName="_ResolvedProjectReferencePaths" />
+      <Output TaskParameter="UnresolvedProjectReferences" ItemName="_MSBuildProjectReference" />
+
+    </ResolveNonMSBuildProjectOutput>
+
+    <!--
+    If building from the command line, simply copy the NonVCProjectReference item list to
+    _MSBuildProjectReference, since we have to assume all non-VC projects are in the MSBuild format.
+    We have no way of building VSIP (3rd party) projects from the command line.
+    -->
+    <CreateItem Include="@(NonVCProjectReference)" Condition=" '$(BuildingInsideVisualStudio)' != 'true' ">
+      <Output TaskParameter="Include" ItemName="_MSBuildProjectReference" />
+    </CreateItem>
+
+    <!-- Break the project list into two lists: those that exist on disk and those that don't. -->
+    <CreateItem Include="@(_MSBuildProjectReference)" Condition="Exists('%(Identity)')">
+      <Output TaskParameter="Include" ItemName="_MSBuildProjectReferenceExistent" />
+    </CreateItem>
+
+    <CreateItem Include="@(_MSBuildProjectReference)" Condition="!Exists('%(Identity)')">
+      <Output TaskParameter="Include" ItemName="_MSBuildProjectReferenceNonexistent" />
+    </CreateItem>
+
+  </Target>
+
+  <!--
+  ================================================================================================
+  ResolveProjectReferences
+
+    Builds all of the referenced projects to get their outputs.
+
+    [IN]
+    @(NonVCProjectReference) - The list of non-VC project references.
+
+    [OUT]
+    @(_ResolvedProjectReferencePaths) - Paths to referenced projects.
+    @(WixLibProjects) - Paths to any .wixlibs that were built by referenced projects.
+  ================================================================================================
+  -->
+  <Target
+    Name="ResolveProjectReferences"
+    DependsOnTargets="_SplitProjectReferencesByFileExistence"
+    Condition="

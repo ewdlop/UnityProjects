@@ -1,0 +1,113 @@
+)
+			{
+				TimeZoneInfo tz = TimeZoneInfo.CreateCustomTimeZone ("mytimezone", new TimeSpan (6,0,0),null,null,null,null);
+				Assert.IsFalse (tz.SupportsDaylightSavingTime);
+			}
+
+			[Test]
+			public void SupportsDaylightSavingTime_NonEmptyAdjustmentRule_DisableDaylightSavingTime ()
+			{
+				TimeZoneInfo.TransitionTime s1 = TimeZoneInfo.TransitionTime.CreateFloatingDateRule (new DateTime (1,1,1,4,0,0), 3, 2, DayOfWeek.Sunday);
+				TimeZoneInfo.TransitionTime e1 = TimeZoneInfo.TransitionTime.CreateFloatingDateRule (new DateTime (1,1,1,4,0,0), 10, 2, DayOfWeek.Sunday);
+				TimeZoneInfo.AdjustmentRule r1 = TimeZoneInfo.AdjustmentRule.CreateAdjustmentRule (new DateTime (2000,1,1), new DateTime (2005,1,1), new TimeSpan (1,0,0), s1, e1);
+				TimeZoneInfo tz = TimeZoneInfo.CreateCustomTimeZone ("mytimezone", new TimeSpan (6,0,0),null,null,null,new TimeZoneInfo.AdjustmentRule[] {r1}, true);
+				Assert.IsFalse (tz.SupportsDaylightSavingTime);
+			}
+
+			[Test]
+			public void SupportsDaylightSavingTime_EmptyAdjustmentRule_DisableDaylightSavingTime ()
+			{
+				TimeZoneInfo tz = TimeZoneInfo.CreateCustomTimeZone ("mytimezone", new TimeSpan (6,0,0),null,null,null,null,true);
+				Assert.IsFalse (tz.SupportsDaylightSavingTime);
+			}
+		}
+		
+		[TestFixture]
+		[Category ("NotWasm")]
+		public class IsDaylightSavingTimeTests
+		{
+			TimeZoneInfo london;
+		
+			[SetUp]
+			public void CreateTimeZones ()
+			{
+				TimeZoneInfo.TransitionTime start = TimeZoneInfo.TransitionTime.CreateFloatingDateRule (new DateTime (1,1,1,1,0,0), 3, 5, DayOfWeek.Sunday);
+				TimeZoneInfo.TransitionTime end = TimeZoneInfo.TransitionTime.CreateFloatingDateRule (new DateTime (1,1,1,2,0,0), 10, 5, DayOfWeek.Sunday);
+				TimeZoneInfo.AdjustmentRule rule = TimeZoneInfo.AdjustmentRule.CreateAdjustmentRule (DateTime.MinValue.Date, DateTime.MaxValue.Date, new TimeSpan (1,0,0), start, end);
+				london = TimeZoneInfo.CreateCustomTimeZone ("Europe/London", new TimeSpan (0), "Europe/London", "British Standard Time", "British Summer Time", new TimeZoneInfo.AdjustmentRule [] {rule});
+			}
+		
+			[Test]
+			public void NoDSTInUTC ()
+			{
+				DateTime june01 = new DateTime (2007, 06, 01);
+				Assert.IsFalse (TimeZoneInfo.Utc.IsDaylightSavingTime (june01));
+			}
+		
+			[Test]
+			public void DSTInLondon ()
+			{
+				DateTime june01 = new DateTime (2007, 06, 01);
+				DateTime xmas = new DateTime (2007, 12, 25);
+				Assert.IsTrue (london.IsDaylightSavingTime (june01), "June 01 is DST in London");
+				Assert.IsFalse (london.IsDaylightSavingTime (xmas), "Xmas is not DST in London");
+			}
+		
+			[Test]
+			[Category ("MobileNotWorking")]
+			public void DSTTransitions ()
+			{
+				DateTime beforeDST = new DateTime (2007, 03, 25, 0, 59, 59, DateTimeKind.Unspecified);
+				DateTime startDST = new DateTime (2007, 03, 25, 2, 0, 0, DateTimeKind.Unspecified);
+				DateTime endDST = new DateTime (2007, 10, 28, 1, 59, 59, DateTimeKind.Unspecified);
+				DateTime afterDST = new DateTime (2007, 10, 28, 2, 0, 0, DateTimeKind.Unspecified);
+				Assert.IsFalse (london.IsDaylightSavingTime (beforeDST), "Just before DST");
+				Assert.IsTrue (london.IsDaylightSavingTime (startDST), "the first seconds of DST");
+				Assert.IsFalse (london.IsDaylightSavingTime (endDST), "The last seconds of DST");
+				Assert.IsFalse (london.IsDaylightSavingTime (afterDST), "Just after DST");
+			}
+		
+			[Test]
+			public void DSTTransitionsUTC ()
+			{
+				DateTime beforeDST = new DateTime (2007, 03, 25, 0, 59, 59, DateTimeKind.Utc);
+				DateTime startDST = new DateTime (2007, 03, 25, 1, 0, 0, DateTimeKind.Utc);
+				DateTime endDST = new DateTime (2007, 10, 28, 0, 59, 59, DateTimeKind.Utc);
+				DateTime afterDST = new DateTime (2007, 10, 28, 1, 0, 0, DateTimeKind.Utc);
+				Assert.IsFalse (london.IsDaylightSavingTime (beforeDST), "Just before DST");
+				Assert.IsTrue (london.IsDaylightSavingTime (startDST), "the first seconds of DST");
+				Assert.IsTrue (london.IsDaylightSavingTime (endDST), "The last seconds of DST");
+				Assert.IsFalse (london.IsDaylightSavingTime (afterDST), "Just after DST");
+			}
+		
+		#if SLOW_TESTS
+			[Test]
+			public void MatchTimeZoneBehavior ()
+			{
+				TimeZone tzone = TimeZone.CurrentTimeZone;
+				TimeZoneInfo local = TimeZoneInfo.Local;
+				for (DateTime date = new DateTime (2007, 01, 01, 0, 0, 0, DateTimeKind.Local); date < new DateTime (2007, 12, 31, 23, 59, 59); date += new TimeSpan (0,1,0)) {
+					date = DateTime.SpecifyKind (date, DateTimeKind.Local);
+					if (local.IsInvalidTime (date))
+						continue;
+					Assert.IsTrue (tzone.IsDaylightSavingTime (date) == local.IsDaylightSavingTime (date));
+				}
+			}
+		#endif
+			[Test (Description="Description xambug #17155")]
+			public void AdjustmentRuleAfterNewYears ()
+			{
+				TimeZoneInfo tz = TimeZoneInfo.FindSystemTimeZoneById (MapTimeZoneId ("Pacific/Auckland"));
+				// DST start: 9/29/2013 2:00:00 AM
+				// DST end: 4/6/2014 3:00:00 AM
+				DateTime dt = new DateTime (2014, 1, 9, 23, 0, 0, DateTimeKind.Utc);
+				Assert.IsTrue (tz.IsDaylightSavingTime (dt), "#1.1");
+
+				// DST start: 9/29/2014 2:00:00 AM
+				// DST end: 4/6/2015 3:00:00 AM
+				dt = new DateTime (2014, 6, 9, 23, 0, 0, DateTimeKind.Utc);
+				Assert.IsFalse (tz.IsDaylightSavingTime (dt), "#2.1");
+
+				// DST start: 9/29/2014 2:00:00 AM
+				// DST end: 4/6/2015 3:00:00 AM
+				dt = new DateTime (2

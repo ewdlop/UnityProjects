@@ -1,0 +1,176 @@
+#ifndef CRYPTOPP_FILTERS_H
+#define CRYPTOPP_FILTERS_H
+
+//! \file
+
+#include "simple.h"
+#include "secblock.h"
+#include "misc.h"
+#include "smartptr.h"
+#include "queue.h"
+#include "algparam.h"
+#include <deque>
+
+NAMESPACE_BEGIN(CryptoPP)
+
+/// provides an implementation of BufferedTransformation's attachment interface
+class CRYPTOPP_DLL CRYPTOPP_NO_VTABLE Filter : public BufferedTransformation, public NotCopyable
+{
+public:
+	Filter(BufferedTransformation *attachment = NULL);
+
+	bool Attachable() {return true;}
+	BufferedTransformation *AttachedTransformation();
+	const BufferedTransformation *AttachedTransformation() const;
+	void Detach(BufferedTransformation *newAttachment = NULL);
+
+	size_t TransferTo2(BufferedTransformation &target, lword &transferBytes, const std::string &channel=DEFAULT_CHANNEL, bool blocking=true);
+	size_t CopyRangeTo2(BufferedTransformation &target, lword &begin, lword end=LWORD_MAX, const std::string &channel=DEFAULT_CHANNEL, bool blocking=true) const;
+
+	void Initialize(const NameValuePairs &parameters=g_nullNameValuePairs, int propagation=-1);
+	bool Flush(bool hardFlush, int propagation=-1, bool blocking=true);
+	bool MessageSeriesEnd(int propagation=-1, bool blocking=true);
+
+protected:
+	virtual BufferedTransformation * NewDefaultAttachment() const;
+	void Insert(Filter *nextFilter);	// insert filter after this one
+
+	virtual bool ShouldPropagateMessageEnd() const {return true;}
+	virtual bool ShouldPropagateMessageSeriesEnd() const {return true;}
+
+	void PropagateInitialize(const NameValuePairs &parameters, int propagation);
+
+	size_t Output(int outputSite, const byte *inString, size_t length, int messageEnd, bool blocking, const std::string &channel=DEFAULT_CHANNEL);
+	size_t OutputModifiable(int outputSite, byte *inString, size_t length, int messageEnd, bool blocking, const std::string &channel=DEFAULT_CHANNEL);
+	bool OutputMessageEnd(int outputSite, int propagation, bool blocking, const std::string &channel=DEFAULT_CHANNEL);
+	bool OutputFlush(int outputSite, bool hardFlush, int propagation, bool blocking, const std::string &channel=DEFAULT_CHANNEL);
+	bool OutputMessageSeriesEnd(int outputSite, int propagation, bool blocking, const std::string &channel=DEFAULT_CHANNEL);
+
+private:
+	member_ptr<BufferedTransformation> m_attachment;
+	
+protected:
+	size_t m_inputPosition;
+	int m_continueAt;
+};
+
+struct CRYPTOPP_DLL FilterPutSpaceHelper
+{
+	// desiredSize is how much to ask target, bufferSize is how much to allocate in m_tempSpace
+	byte *HelpCreatePutSpace(BufferedTransformation &target, const std::string &channel, size_t minSize, size_t desiredSize, size_t &bufferSize)
+	{
+		assert(desiredSize >= minSize && bufferSize >= minSize);
+		if (m_tempSpace.size() < minSize)
+		{
+			byte *result = target.ChannelCreatePutSpace(channel, desiredSize);
+			if (desiredSize >= minSize)
+			{
+				bufferSize = desiredSize;
+				return result;
+			}
+			m_tempSpace.New(bufferSize);
+		}
+
+		bufferSize = m_tempSpace.size();
+		return m_tempSpace.begin();
+	}
+	byte *HelpCreatePutSpace(BufferedTransformation &target, const std::string &channel, size_t minSize)
+		{return HelpCreatePutSpace(target, channel, minSize, minSize, minSize);}
+	byte *HelpCreatePutSpace(BufferedTransformation &target, const std::string &channel, size_t minSize, size_t bufferSize)
+		{return HelpCreatePutSpace(target, channel, minSize, minSize, bufferSize);}
+	SecByteBlock m_tempSpace;
+};
+
+//! measure how many byte and messages pass through, also serves as valve
+class CRYPTOPP_DLL MeterFilter : public Bufferless<Filter>
+{
+public:
+	MeterFilter(BufferedTransformation *attachment=NULL, bool transparent=true)
+		: m_transparent(transparent) {Detach(attachment); ResetMeter();}
+
+	void SetTransparent(bool transparent) {m_transparent = transparent;}
+	void AddRangeToSkip(unsigned int message, lword position, lword size, bool sortNow = true);
+	void ResetMeter();
+	void IsolatedInitialize(const NameValuePairs &parameters) {ResetMeter();}
+
+	lword GetCurrentMessageBytes() const {return m_currentMessageBytes;}
+	lword GetTotalBytes() {return m_totalBytes;}
+	unsigned int GetCurrentSeriesMessages() {return m_currentSeriesMessages;}
+	unsigned int GetTotalMessages() {return m_totalMessages;}
+	unsigned int GetTotalMessageSeries() {return m_totalMessageSeries;}
+
+	byte * CreatePutSpace(size_t &size)
+		{return AttachedTransformation()->CreatePutSpace(size);}
+	size_t Put2(const byte *begin, size_t length, int messageEnd, bool blocking);
+	size_t PutModifiable2(byte *inString, size_t length, int messageEnd, bool blocking);
+	bool IsolatedMessageSeriesEnd(bool blocking);
+
+private:
+	size_t PutMaybeModifiable(byte *inString, size_t length, int messageEnd, bool blocking, bool modifiable);
+	bool ShouldPropagateMessageEnd() const {return m_transparent;}
+	bool ShouldPropagateMessageSeriesEnd() const {return m_transparent;}
+
+	struct MessageRange
+	{
+		inline bool operator<(const MessageRange &b) const	// BCB2006 workaround: this has to be a member function
+			{return message < b.message || (message == b.message && position < b.position);}
+		unsigned int message; lword position; lword size;
+	};
+
+	bool m_transparent;
+	lword m_currentMessageBytes, m_totalBytes;
+	unsigned int m_currentSeriesMessages, m_totalMessages, m_totalMessageSeries;
+	std::deque<MessageRange> m_rangesToSkip;
+	byte *m_begin;
+	size_t m_length;
+};
+
+//! _
+class CRYPTOPP_DLL TransparentFilter : public MeterFilter
+{
+public:
+	TransparentFilter(BufferedTransformation *attachment=NULL) : MeterFilter(attachment, true) {}
+};
+
+//! _
+class CRYPTOPP_DLL OpaqueFilter : public MeterFilter
+{
+public:
+	OpaqueFilter(BufferedTransformation *attachment=NULL) : MeterFilter(attachment, false) {}
+};
+
+/*! FilterWithBufferedInput divides up the input stream into
+	a first block, a number of middle blocks, and a last block.
+	First and last blocks are optional, and middle blocks may
+	be a stream instead (i.e. blockSize == 1).
+*/
+class CRYPTOPP_DLL FilterWithBufferedInput : public Filter
+{
+public:
+	FilterWithBufferedInput(BufferedTransformation *attachment);
+	//! firstSize and lastSize may be 0, blockSize must be at least 1
+	FilterWithBufferedInput(size_t firstSize, size_t blockSize, size_t lastSize, BufferedTransformation *attachment);
+
+	void IsolatedInitialize(const NameValuePairs &parameters);
+	size_t Put2(const byte *inString, size_t length, int messageEnd, bool blocking)
+	{
+		return PutMaybeModifiable(const_cast<byte *>(inString), length, messageEnd, blocking, false);
+	}
+	size_t PutModifiable2(byte *inString, size_t length, int messageEnd, bool blocking)
+	{
+		return PutMaybeModifiable(inString, length, messageEnd, blocking, true);
+	}
+	/*! calls ForceNextPut() if hardFlush is true */
+	bool IsolatedFlush(bool hardFlush, bool blocking);
+
+	/*! The input buffer may contain more than blockSize bytes if lastSize != 0.
+		ForceNextPut() forces a call to NextPut() if this is the case.
+	*/
+	void ForceNextPut();
+
+protected:
+	bool DidFirstPut() {return m_firstInputDone;}
+
+	virtual void InitializeDerivedAndReturnNewSizes(const NameValuePairs &parameters, size_t &firstSize, size_t &blockSize, size_t &lastSize)
+		{InitializeDerived(parameters);}
+	virtual void InitializeDerived(const NameVa

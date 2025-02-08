@@ -1,0 +1,98 @@
+ng(2, 0)
+		.MaxWidth(100.0f)
+		[
+			SAssignNew(AssetPickerAnchor, SComboButton)
+			.ButtonStyle(FEditorStyle::Get(), "PropertyEditor.AssetComboStyle")
+			.ContentPadding(FMargin(2, 2, 2, 1))
+			.MenuPlacement(MenuPlacement_BelowAnchor)
+			.ButtonContent()
+			[
+				SNew(STextBlock)
+				.TextStyle(FEditorStyle::Get(), "PropertyEditor.AssetClass")
+				.Font(FEditorStyle::GetFontStyle("PropertyWindow.NormalFont"))
+				.Text(this, &FDataprepSpawnActorsAtLocationDetails::OnGetComboTextValue)
+				.ToolTipText(this, &FDataprepSpawnActorsAtLocationDetails::GetObjectToolTip)
+			]
+			.OnGetMenuContent(this, &FDataprepSpawnActorsAtLocationDetails::GenerateAssetPicker)
+		];
+}
+
+const FAssetData& FDataprepSpawnActorsAtLocationDetails::GetAssetData() const
+{
+	if (DataprepOperation->SelectedAsset)
+	{
+		if (!DataprepOperation->SelectedAsset->GetPathName().Equals(CachedAssetData.ObjectPath.ToString(), ESearchCase::CaseSensitive))
+		{
+			// This always uses the exact object pointed at
+			CachedAssetData = FAssetData(DataprepOperation->SelectedAsset, true);
+		}
+	}
+	else
+	{
+		if (CachedAssetData.IsValid())
+		{
+			CachedAssetData = FAssetData();
+		}
+	}
+
+	return CachedAssetData;
+}
+
+FText FDataprepSpawnActorsAtLocationDetails::GetObjectToolTip() const
+{
+	FText Value = FText::GetEmpty();
+	const FAssetData& CurrentAssetData = GetAssetData();
+	
+	if (CurrentAssetData.IsValid())
+	{
+		Value = FText::FromString(CurrentAssetData.GetFullName());
+	}
+	return Value;
+}
+
+FText FDataprepSpawnActorsAtLocationDetails::OnGetComboTextValue() const
+{
+	FText Value = LOCTEXT( "DefaultComboText", "Select Asset" );
+
+	if (DataprepOperation->SelectedAsset != nullptr)
+	{
+		const FAssetData& CurrentAssetData = GetAssetData();
+		if (CurrentAssetData.IsValid())
+		{
+			Value = FText::FromString(CurrentAssetData.AssetName.ToString());
+		}
+	}
+	return Value;
+}
+
+TSharedRef<SWidget> FDataprepSpawnActorsAtLocationDetails::GenerateAssetPicker()
+{
+	FContentBrowserModule& ContentBrowserModule = FModuleManager::Get().LoadModuleChecked<FContentBrowserModule>(TEXT("ContentBrowser"));
+
+	FAssetPickerConfig AssetPickerConfig;
+	AssetPickerConfig.Filter.ClassNames.Add(UStaticMesh::StaticClass()->GetFName());
+	AssetPickerConfig.Filter.ClassNames.Add(UBlueprint::StaticClass()->GetFName());
+	AssetPickerConfig.bAllowNullSelection = true;
+	AssetPickerConfig.Filter.bRecursiveClasses = true;
+	AssetPickerConfig.OnAssetSelected = FOnAssetSelected::CreateSP(this, &FDataprepSpawnActorsAtLocationDetails::OnAssetSelectedFromPicker);
+	AssetPickerConfig.OnAssetEnterPressed = FOnAssetEnterPressed::CreateSP(this, &FDataprepSpawnActorsAtLocationDetails::OnAssetEnterPressedInPicker);
+	AssetPickerConfig.InitialAssetViewType = EAssetViewType::List;
+	AssetPickerConfig.bAllowDragging = false;
+
+	return
+		SNew(SBox)
+		.HeightOverride(300)
+		.WidthOverride(300)
+		[
+			SNew(SBorder)
+			.BorderImage(FEditorStyle::GetBrush("Menu.Background"))
+			[
+				ContentBrowserModule.Get().CreateAssetPicker(AssetPickerConfig)
+			]
+		];
+}
+
+void FDataprepSpawnActorsAtLocationDetails::OnAssetSelectedFromPicker(const struct FAssetData& AssetData)
+{
+	if (AssetPickerAnchor.IsValid())
+	{

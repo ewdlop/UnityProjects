@@ -1,0 +1,421 @@
+Node VisitParent(QilUnary ndParent) {
+            // XPathNavigator navParent;
+            LocalBuilder locNav = this.helper.DeclareLocal("$$$navParent", typeof(XPathNavigator));
+
+            // navParent = SyncToNavigator(navParent, navCtxt);
+            SyncToNavigator(locNav, ndParent.Child);
+
+            // if (!navParent.MoveToParent()) goto LabelNextCtxt;
+            this.helper.Emit(OpCodes.Ldloc, locNav);
+            this.helper.Call(XmlILMethods.NavMoveParent);
+            this.helper.Emit(OpCodes.Brfalse, this.iterCurr.GetLabelNext());
+
+            this.iterCurr.Storage = StorageDescriptor.Local(locNav, typeof(XPathNavigator), false);
+            return ndParent;
+        }
+
+        /// <summary>
+        /// Generate code for for QilNodeType.Root.
+        /// </summary>
+        protected override QilNode VisitRoot(QilUnary ndRoot) {
+            // XPathNavigator navRoot;
+            LocalBuilder locNav = this.helper.DeclareLocal("$$$navRoot", typeof(XPathNavigator));
+
+            // navRoot = SyncToNavigator(navRoot, navCtxt);
+            SyncToNavigator(locNav, ndRoot.Child);
+
+            // navRoot.MoveToRoot();
+            this.helper.Emit(OpCodes.Ldloc, locNav);
+            this.helper.Call(XmlILMethods.NavMoveRoot);
+
+            this.iterCurr.Storage = StorageDescriptor.Local(locNav, typeof(XPathNavigator), false);
+            return ndRoot;
+        }
+
+        /// <summary>
+        /// Generate code for QilNodeType.XmlContext.
+        /// </summary>
+        /// <remarks>
+        /// Generates code to retrieve the default document using the XmlResolver.
+        /// </remarks>
+        protected override QilNode VisitXmlContext(QilNode ndCtxt) {
+            // runtime.ExternalContext.DefaultDataSource
+            this.helper.LoadQueryContext();
+            this.helper.Call(XmlILMethods.GetDefaultDataSource);
+            this.iterCurr.Storage = StorageDescriptor.Stack(typeof(XPathNavigator), false);
+            return ndCtxt;
+        }
+
+        /// <summary>
+        /// Find physical query plan for QilNodeType.Descendant.
+        /// </summary>
+        protected override QilNode VisitDescendant(QilUnary ndDesc) {
+            CreateFilteredIterator(ndDesc.Child, "$$$iterDesc", typeof(DescendantIterator), XmlILMethods.DescCreate, XmlILMethods.DescNext,
+                                   XmlNodeKindFlags.Any, null, TriState.False, null);
+            return ndDesc;
+        }
+
+        /// <summary>
+        /// Generate code for for QilNodeType.DescendantOrSelf.
+        /// </summary>
+        protected override QilNode VisitDescendantOrSelf(QilUnary ndDesc) {
+            CreateFilteredIterator(ndDesc.Child, "$$$iterDesc", typeof(DescendantIterator), XmlILMethods.DescCreate, XmlILMethods.DescNext,
+                                   XmlNodeKindFlags.Any, null, TriState.True, null);
+            return ndDesc;
+        }
+
+        /// <summary>
+        /// Find physical query plan for QilNodeType.Ancestor.
+        /// </summary>
+        protected override QilNode VisitAncestor(QilUnary ndAnc) {
+            CreateFilteredIterator(ndAnc.Child, "$$$iterAnc", typeof(AncestorIterator), XmlILMethods.AncCreate, XmlILMethods.AncNext,
+                                   XmlNodeKindFlags.Any, null, TriState.False, null);
+            return ndAnc;
+        }
+
+        /// <summary>
+        /// Find physical query plan for QilNodeType.AncestorOrSelf.
+        /// </summary>
+        protected override QilNode VisitAncestorOrSelf(QilUnary ndAnc) {
+            CreateFilteredIterator(ndAnc.Child, "$$$iterAnc", typeof(AncestorIterator), XmlILMethods.AncCreate, XmlILMethods.AncNext,
+                                   XmlNodeKindFlags.Any, null, TriState.True, null);
+            return ndAnc;
+        }
+
+        /// <summary>
+        /// Find physical query plan for QilNodeType.Preceding.
+        /// </summary>
+        protected override QilNode VisitPreceding(QilUnary ndPrec) {
+            CreateFilteredIterator(ndPrec.Child, "$$$iterPrec", typeof(PrecedingIterator), XmlILMethods.PrecCreate, XmlILMethods.PrecNext,
+                                   XmlNodeKindFlags.Any, null, TriState.Unknown, null);
+            return ndPrec;
+        }
+
+        /// <summary>
+        /// Find physical query plan for QilNodeType.FollowingSibling.
+        /// </summary>
+        protected override QilNode VisitFollowingSibling(QilUnary ndFollSib) {
+            CreateFilteredIterator(ndFollSib.Child, "$$$iterFollSib", typeof(FollowingSiblingIterator), XmlILMethods.FollSibCreate, XmlILMethods.FollSibNext,
+                                   XmlNodeKindFlags.Any, null, TriState.Unknown, null);
+            return ndFollSib;
+        }
+
+        /// <summary>
+        /// Find physical query plan for QilNodeType.PrecedingSibling.
+        /// </summary>
+        protected override QilNode VisitPrecedingSibling(QilUnary ndPreSib) {
+            CreateFilteredIterator(ndPreSib.Child, "$$$iterPreSib", typeof(PrecedingSiblingIterator), XmlILMethods.PreSibCreate, XmlILMethods.PreSibNext,
+                                   XmlNodeKindFlags.Any, null, TriState.Unknown, null);
+            return ndPreSib;
+        }
+
+        /// <summary>
+        /// Find physical query plan for QilNodeType.NodeRange.
+        /// </summary>
+        protected override QilNode VisitNodeRange(QilBinary ndRange) {
+            CreateFilteredIterator(ndRange.Left, "$$$iterRange", typeof(NodeRangeIterator), XmlILMethods.NodeRangeCreate, XmlILMethods.NodeRangeNext,
+                                   XmlNodeKindFlags.Any, null, TriState.Unknown, ndRange.Right);
+            return ndRange;
+        }
+
+        /// <summary>
+        /// Generate code for for QilNodeType.Deref.
+        /// </summary>
+        protected override QilNode VisitDeref(QilBinary ndDeref) {
+            // IdIterator iterId;
+            LocalBuilder locIter = this.helper.DeclareLocal("$$$iterId", typeof(IdIterator));
+
+            // iterId.Create(navCtxt, value);
+            this.helper.Emit(OpCodes.Ldloca, locIter);
+            NestedVisitEnsureStack(ndDeref.Left);
+            NestedVisitEnsureStack(ndDeref.Right);
+            this.helper.Call(XmlILMethods.IdCreate);
+
+            GenerateSimpleIterator(typeof(XPathNavigator), locIter, XmlILMethods.IdNext);
+
+            return ndDeref;
+        }
+
+        /// <summary>
+        /// Generate code for QilNodeType.ElementCtor.
+        /// </summary>
+        protected override QilNode VisitElementCtor(QilBinary ndElem) {
+            XmlILConstructInfo info = XmlILConstructInfo.Read(ndElem);
+            bool callChk;
+            GenerateNameType nameType;
+            Debug.Assert(XmlILConstructInfo.Read(ndElem).PushToWriterFirst, "Element contruction should always be pushed to writer.");
+
+            // Runtime checks must be made in the following cases:
+            //   1. Xml state is not known at compile-time, or is illegal
+            //   2. Element's namespace must be declared
+            //   3. Element's attributes might be duplicates of one another, or namespaces might follow attributes
+            callChk = CheckWithinContent(info) || !info.IsNamespaceInScope || ElementCachesAttributes(info);
+
+            // If it is not known whether element content was output, then make this check at run-time
+            if (XmlILConstructInfo.Read(ndElem.Right).FinalStates == PossibleXmlStates.Any)
+                callChk = true;
+
+            // If runtime state after EndElement is called is not known, then call XmlQueryOutput.WriteEndElementChk
+            if (info.FinalStates == PossibleXmlStates.Any)
+                callChk = true;
+
+            // If WriteStartElementChk will *not* be called, then code must be generated to ensure valid state transitions
+            if (!callChk)
+                BeforeStartChecks(ndElem);
+
+            // Generate call to WriteStartElement
+            nameType = LoadNameAndType(XPathNodeType.Element, ndElem.Left, true, callChk);
+            this.helper.CallWriteStartElement(nameType, callChk);
+
+            // Recursively construct content
+            NestedVisit(ndElem.Right);
+
+            // If runtime state is guaranteed to be EnumAttrs, and an element is being constructed, call XmlQueryOutput.StartElementContent
+            if (XmlILConstructInfo.Read(ndElem.Right).FinalStates == PossibleXmlStates.EnumAttrs && !callChk)
+                this.helper.CallStartElementContent();
+
+            // Generate call to WriteEndElement
+            nameType = LoadNameAndType(XPathNodeType.Element, ndElem.Left, false, callChk);
+            this.helper.CallWriteEndElement(nameType, callChk);
+
+            if (!callChk)
+                AfterEndChecks(ndElem);
+
+            this.iterCurr.Storage = StorageDescriptor.None();
+            return ndElem;
+        }
+
+        /// <summary>
+        /// Generate code for QilNodeType.AttributeCtor.
+        /// </summary>
+        protected override QilNode VisitAttributeCtor(QilBinary ndAttr) {
+            XmlILConstructInfo info = XmlILConstructInfo.Read(ndAttr);
+            bool callChk;
+            GenerateNameType nameType;
+            Debug.Assert(XmlILConstructInfo.Read(ndAttr).PushToWriterFirst, "Attribute construction should always be pushed to writer.");
+
+            // Runtime checks must be made in the following cases:
+            //   1. Xml state is not known at compile-time, or is illegal
+            //   2. Attribute's namespace must be declared
+            callChk = CheckEnumAttrs(info) || !info.IsNamespaceInScope;
+
+            // If WriteStartAttributeChk will *not* be called, then code must be generated to ensure well-formedness
+            // and track namespace scope.
+            if (!callChk)
+                BeforeStartChecks(ndAttr);
+
+            // Generate call to WriteStartAttribute
+            nameType = LoadNameAndType(XPathNodeType.Attribute, ndAttr.Left, true, callChk);
+            this.helper.CallWriteStartAttribute(nameType, callChk);
+
+            // Recursively construct content
+            NestedVisit(ndAttr.Right);
+
+            // Generate call to WriteEndAttribute
+            this.helper.CallWriteEndAttribute(callChk);
+
+            if (!callChk)
+                AfterEndChecks(ndAttr);
+
+            this.iterCurr.Storage = StorageDescriptor.None();
+            return ndAttr;
+        }
+
+        /// <summary>
+        /// Generate code for QilNodeType.CommentCtor.
+        /// </summary>
+        protected override QilNode VisitCommentCtor(QilUnary ndComment) {
+            Debug.Assert(XmlILConstructInfo.Read(ndComment).PushToWriterFirst, "Comment construction should always be pushed to writer.");
+
+            // Always call XmlQueryOutput.WriteStartComment
+            this.helper.CallWriteStartComment();
+
+            // Recursively construct content
+            NestedVisit(ndComment.Child);
+
+            // Always call XmlQueryOutput.WriteEndComment
+            this.helper.CallWriteEndComment();
+
+            this.iterCurr.Storage = StorageDescriptor.None();
+            return ndComment;
+        }
+
+        /// <summary>
+        /// Generate code for QilNodeType.PICtor.
+        /// </summary>
+        protected override QilNode VisitPICtor(QilBinary ndPI) {
+            Debug.Assert(XmlILConstructInfo.Read(ndPI).PushToWriterFirst, "PI construction should always be pushed to writer.");
+
+            // Always call XmlQueryOutput.WriteStartPI
+            this.helper.LoadQueryOutput();
+            NestedVisitEnsureStack(ndPI.Left);
+            this.helper.CallWriteStartPI();
+
+            // Recursively construct content
+            NestedVisit(ndPI.Right);
+
+            // Always call XmlQueryOutput.WriteEndPI
+            this.helper.CallWriteEndPI();
+
+            this.iterCurr.Storage = StorageDescriptor.None();
+            return ndPI;
+        }
+
+        /// <summary>
+        /// Generate code for QilNodeType.TextCtor.
+        /// </summary>
+        protected override QilNode VisitTextCtor(QilUnary ndText) {
+            return VisitTextCtor(ndText, false);
+        }
+
+        /// <summary>
+        /// Generate code for QilNodeType.RawTextCtor.
+        /// </summary>
+        protected override QilNode VisitRawTextCtor(QilUnary ndText) {
+            return VisitTextCtor(ndText, true);
+        }
+
+        /// <summary>
+        /// Generate code for QilNodeType.TextCtor and QilNodeType.RawTextCtor.
+        /// </summary>
+        private QilNode VisitTextCtor(QilUnary ndText, bool disableOutputEscaping) {
+            XmlILConstructInfo info = XmlILConstructInfo.Read(ndText);
+            bool callChk;
+            Debug.Assert(info.PushToWriterFirst, "Text construction should always be pushed to writer.");
+
+            // Write out text in different contexts (within attribute, within element, within comment, etc.)
+            switch (info.InitialStates) {
+                case PossibleXmlStates.WithinAttr:
+                case PossibleXmlStates.WithinComment:
+                case PossibleXmlStates.WithinPI:
+                    callChk = false;
+                    break;
+
+                default:
+                    callChk = CheckWithinContent(info);
+                    break;
+            }
+
+            if (!callChk)
+                BeforeStartChecks(ndText);
+
+            this.helper.LoadQueryOutput();
+
+            // Push string value of text onto IL stack
+            NestedVisitEnsureStack(ndText.Child);
+
+            // Write out text in different contexts (within attribute, within element, within comment, etc.)
+            switch (info.InitialStates) {
+                case PossibleXmlStates.WithinAttr:
+                    // Ignore hints when writing out attribute text
+                    this.helper.CallWriteString(false, callChk);
+                    break;
+
+                case PossibleXmlStates.WithinComment:
+                    // Call XmlQueryOutput.WriteCommentString
+                    this.helper.Call(XmlILMethods.CommentText);
+                    break;
+
+                case PossibleXmlStates.WithinPI:
+                    // Call XmlQueryOutput.WriteProcessingInstructionString
+                    this.helper.Call(XmlILMethods.PIText);
+                    break;
+
+                default:
+                    // Call XmlQueryOutput.WriteTextBlockChk, XmlQueryOutput.WriteTextBlockNoEntities, or XmlQueryOutput.WriteTextBlock
+                    this.helper.CallWriteString(disableOutputEscaping, callChk);
+                    break;
+            }
+
+            if (!callChk)
+                AfterEndChecks(ndText);
+
+            this.iterCurr.Storage = StorageDescriptor.None();
+            return ndText;
+        }
+
+        /// <summary>
+        /// Generate code for QilNodeType.DocumentCtor.
+        /// </summary>
+        protected override QilNode VisitDocumentCtor(QilUnary ndDoc) {
+            Debug.Assert(XmlILConstructInfo.Read(ndDoc).PushToWriterFirst, "Document root construction should always be pushed to writer.");
+
+            // Generate call to XmlQueryOutput.WriteStartRootChk
+            this.helper.CallWriteStartRoot();
+
+            // Recursively construct content
+            NestedVisit(ndDoc.Child);
+
+            // Generate call to XmlQueryOutput.WriteEndRootChk
+            this.helper.CallWriteEndRoot();
+
+            this.iterCurr.Storage = StorageDescriptor.None();
+
+            return ndDoc;
+        }
+
+        /// <summary>
+        /// Generate code for QilNodeType.NamespaceDecl.
+        /// </summary>
+        protected override QilNode VisitNamespaceDecl(QilBinary ndNmsp) {
+            XmlILConstructInfo info = XmlILConstructInfo.Read(ndNmsp);
+            bool callChk;
+            Debug.Assert(info.PushToWriterFirst, "Namespace construction should always be pushed to writer.");
+
+            // Runtime checks must be made in the following cases:
+            //   1. Xml state is not known at compile-time, or is illegal
+            //   2. Namespaces might be added to element after attributes have already been added
+            callChk = CheckEnumAttrs(info) || MightHaveNamespacesAfterAttributes(info);
+
+            // If WriteNamespaceDeclarationChk will *not* be called, then code must be generated to ensure well-formedness
+            // and track namespace scope.
+            if (!callChk)
+                BeforeStartChecks(ndNmsp);
+
+            this.helper.LoadQueryOutput();
+
+            // Recursively construct prefix and ns
+            NestedVisitEnsureStack(ndNmsp.Left);
+            NestedVisitEnsureStack(ndNmsp.Right);
+
+            // Generate call to WriteNamespaceDecl
+            this.helper.CallWriteNamespaceDecl(callChk);
+
+            if (!callChk)
+                AfterEndChecks(ndNmsp);
+
+            this.iterCurr.Storage = StorageDescriptor.None();
+            return ndNmsp;
+        }
+
+        /// <summary>
+        /// Generate code for for QilNodeType.RtfCtor.
+        /// </summary>
+        protected override QilNode VisitRtfCtor(QilBinary ndRtf) {
+            OptimizerPatterns patt = OptimizerPatterns.Read(ndRtf);
+            string baseUri = (string) (QilLiteral) ndRtf.Right;
+
+            if (patt.MatchesPattern(OptimizerPatternName.SingleTextRtf)) {
+                // Special-case Rtf containing a root node and a single text node child
+                this.helper.LoadQueryRuntime();
+                NestedVisitEnsureStack((QilNode) patt.GetArgument(OptimizerPatternArgument.RtfText));
+                this.helper.Emit(OpCodes.Ldstr, baseUri);
+                this.helper.Call(XmlILMethods.RtfConstr);
+            }
+            else {
+                // Start nested construction of an Rtf
+                this.helper.CallStartRtfConstruction(baseUri);
+
+                // Write content of Rtf to writer
+                NestedVisit(ndRtf.Left);
+
+                // Get the result Rtf
+                this.helper.CallEndRtfConstruction();
+            }
+
+            this.iterCurr.Storage = StorageDescriptor.Stack(typeof(XPathNavigator), false);
+            return ndRtf;
+        }
+
+        /// <summary>
+ 

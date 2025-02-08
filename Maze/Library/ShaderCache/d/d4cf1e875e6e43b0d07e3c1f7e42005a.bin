@@ -1,0 +1,46 @@
+ctly or actually need to be preceeded by
+                 * one of the two Single-Shift codes. With this, the third stage
+                 * stores one byte fewer per character than the actual maximum length of
+                 * EUC byte sequences.
+                 *
+                 * Other than that, leading zero bytes are removed and the other
+                 * bytes output. A single zero byte may be output if the "assigned"
+                 * bit in stage 2 was on.
+                 * The data structure does not support zero byte output as a fallback,
+                 * and also does not allow output of leading zeros.
+                 */
+                stage2Entry=MBCS_STAGE_2_FROM_U(table, c);
+
+                /* get the bytes and the length for the output */
+                switch(outputType) {
+                case MBCS_OUTPUT_2:
+                    value=MBCS_VALUE_2_FROM_STAGE_2(bytes, stage2Entry, c);
+                    if(value<=0xff) {
+                        length=1;
+                    } else {
+                        length=2;
+                    }
+                    break;
+                case MBCS_OUTPUT_2_SISO:
+                    /* 1/2-byte stateful with Shift-In/Shift-Out */
+                    /*
+                     * Save the old state in the converter object
+                     * right here, then change the local prevLength state variable if necessary.
+                     * Then, if this character turns out to be unassigned or a fallback that
+                     * is not taken, the callback code must not save the new state in the converter
+                     * because the new state is for a character that is not output.
+                     * However, the callback must still restore the state from the converter
+                     * in case the callback function changed it for its output.
+                     */
+                    cnv->fromUnicodeStatus=prevLength; /* save the old state */
+                    value=MBCS_VALUE_2_FROM_STAGE_2(bytes, stage2Entry, c);
+                    if(value<=0xff) {
+                        if(value==0 && MBCS_FROM_U_IS_ROUNDTRIP(stage2Entry, c)==0) {
+                            /* no mapping, leave value==0 */
+                            length=0;
+                        } else if(prevLength<=1) {
+                            length=1;
+                        } else {
+                            /* change from double-byte mode to single-byte */
+                            if (siLength == 1) {
+                                value|=(uint32_t)siBytes[0]<<8;

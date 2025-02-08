@@ -1,0 +1,707 @@
+taStore : IChannelDataStore
+    {
+        String[]           _channelURIs;  // list of channel uri's that map to this channel
+        
+        DictionaryEntry[]  _extraData;    // sink data
+
+        // private constructor for shallow clone    
+        private ChannelDataStore(String[] channelUrls, DictionaryEntry[] extraData)
+        {
+            _channelURIs = channelUrls;
+            _extraData = extraData;
+        }
+
+        public ChannelDataStore(String[] channelURIs)
+        {
+            _channelURIs = channelURIs;
+            _extraData = null;
+        }
+
+        [System.Security.SecurityCritical]  // auto-generated
+        internal ChannelDataStore InternalShallowCopy()
+        {
+            return new ChannelDataStore(_channelURIs, _extraData);
+        }
+
+
+        public String[] ChannelUris
+        {
+            [System.Security.SecurityCritical]
+            get { return _channelURIs; }
+            set { _channelURIs = value; }
+        }
+
+        // implementation of IChannelDataStore
+        public Object this[Object key]
+        {
+            [System.Security.SecurityCritical]
+            get 
+            {
+                // look for matching key in extra data list
+                foreach (DictionaryEntry entry in _extraData)
+                {
+                    if (entry.Key.Equals(key))
+                        return entry.Value;                    
+                }
+
+                // entry not found
+                return null;
+            } // get
+
+            [System.Security.SecurityCritical]
+            set
+            {
+                if (_extraData == null)
+                {
+                    _extraData = new DictionaryEntry[1];
+                    _extraData[0] = new DictionaryEntry(key, value);
+                }
+                else
+                {
+                    int length =_extraData.Length;
+                    DictionaryEntry[] newList = new DictionaryEntry[length + 1];
+                    int co = 0;
+                    for (; co < length; co++)
+                        newList[co] = _extraData[co];
+                    newList[co] = new DictionaryEntry(key, value); // set last value
+                    _extraData = newList;
+                }
+            } // set
+        } // Object this[Object key]
+        
+    } // class ChannelDataStore
+
+
+
+
+[System.Runtime.InteropServices.ComVisible(true)]
+    public interface ITransportHeaders
+    {
+        // Should add headers in order, and remove them if somebody tries to set
+        //   it to null.
+        Object this[Object key]
+        { 
+            [System.Security.SecurityCritical]  // auto-generated_required
+            get;
+            [System.Security.SecurityCritical]  // auto-generated_required
+            set;
+        }
+
+        // This is required to handback an enumerator which iterates over all entries
+        //   in the headers.
+        [System.Security.SecurityCritical]  // auto-generated_required
+        IEnumerator GetEnumerator();
+    } // interface ITransportHeaders
+
+
+    // TransportHeaders is used to store a collection of headers that is used in the channel sinks.
+    // The header list preserves order, and keeps headers in the order that they were originally
+    // added. You can use the foreach statement to iterate over the contents of the header list 
+    // which contains objects of type DictionaryEntry. Keys are required to be strings, and
+    // comparisons are done on a case-insensitive basis.
+    [System.Security.SecurityCritical]  // auto-generated_required
+    [Serializable]
+    [SecurityPermissionAttribute(SecurityAction.InheritanceDemand, Flags=SecurityPermissionFlag.Infrastructure)]         
+    [System.Runtime.InteropServices.ComVisible(true)]
+    public class TransportHeaders : ITransportHeaders
+    {
+        private ArrayList _headerList; // array of type DictionaryEntry
+    
+        public TransportHeaders()
+        {
+            // The default capacity is larger than we'll typically need so start off at 6.
+            _headerList = new ArrayList(6);
+        } // TransportHeaders
+
+
+        // dictionary like interface
+        public Object this[Object key]
+        {
+            [System.Security.SecurityCritical]
+            get 
+            {
+                String strKey = (String)key;
+                
+                // look for matching key in header list
+                foreach (DictionaryEntry entry in _headerList)
+                {
+                    if (String.Compare((String)entry.Key, strKey, StringComparison.OrdinalIgnoreCase) == 0)
+                        return entry.Value;                    
+                }
+
+                // entry not found
+                return null;
+            } // get
+
+            [System.Security.SecurityCritical]
+            set
+            {
+                if (key == null)
+                    return;
+
+                String strKey = (String)key;
+
+                // remove this entry if it's already in the list
+                int co = _headerList.Count - 1;
+                while (co >= 0)
+                {                
+                    String headerKey = (String)((DictionaryEntry)_headerList[co]).Key;
+                    if (String.Compare(headerKey, strKey, StringComparison.OrdinalIgnoreCase) == 0)
+                    {
+                        _headerList.RemoveAt(co);
+                        break;
+                    }
+                    co--;
+                }
+
+                // otherwise, add this entry
+                if (value != null)
+                {
+                    _headerList.Add(new DictionaryEntry(key, value));
+                }
+            } // set
+        } // Object this[Object key]
+        
+        [System.Security.SecurityCritical]
+        public IEnumerator GetEnumerator() 
+        {
+            return _headerList.GetEnumerator(); 
+        } // GetEnumerator
+        
+    } // TransportHeaders
+
+
+
+    // All sink providers must have a constructor that accepts a hashtable and 
+    //   an ArrayList of these structures if they want to be used from a config file.
+[System.Runtime.InteropServices.ComVisible(true)]
+    public class SinkProviderData
+    {
+        private String _name;
+        private Hashtable _properties = new Hashtable(StringComparer.InvariantCultureIgnoreCase);
+        private ArrayList _children = new ArrayList();
+
+        public SinkProviderData(String name) 
+        {
+            _name = name;
+        }
+
+        public String Name { get { return _name; } }
+        public IDictionary Properties { get { return _properties; } }
+        public IList Children { get { return _children; } }
+    } // class SinkProviderData
+
+
+
+
+
+    // Base implementation for channel sinks that want to supply properties.
+    // The derived class only needs to implement the Keys property and this[].
+    [System.Security.SecurityCritical]  // auto-generated_required
+    [SecurityPermissionAttribute(SecurityAction.InheritanceDemand, Flags=SecurityPermissionFlag.Infrastructure)]
+    [System.Runtime.InteropServices.ComVisible(true)]
+    public abstract class BaseChannelSinkWithProperties : BaseChannelObjectWithProperties
+    {       
+        protected BaseChannelSinkWithProperties() : base()
+        {
+        }    
+    } // class BaseChannelSinkWithProperties
+
+
+    // This provides a base implementation of a channel that wants
+    // to provide a dictionary interface. It handles the complexity
+    // of asking a channel sink chain for their properties.
+    // Once the channel constructs its sink chain (usually only applicable
+    // for server channels) it should set the SinksWithProperties property.
+    // The properties only get chained for channel sinks when the users asks
+    // for the "Properties" dictionary. If you just go through the dictionary interface
+    // you'll only get the channel specific properties.
+    // The derived class only needs to implement the Keys property and this[].
+    [System.Security.SecurityCritical]  // auto-generated_required
+    [SecurityPermissionAttribute(SecurityAction.InheritanceDemand, Flags=SecurityPermissionFlag.Infrastructure)]
+    [System.Runtime.InteropServices.ComVisible(true)]
+    public abstract class BaseChannelWithProperties : BaseChannelObjectWithProperties
+    {    
+        protected IChannelSinkBase SinksWithProperties = null;
+
+        protected BaseChannelWithProperties() : base()
+        {
+        }
+
+        // This is overridden so that server channels can expose the properties
+        //   of their channel sinks through a flat dictionary interface.
+        public override IDictionary Properties 
+        {
+            [System.Security.SecurityCritical]  // auto-generated_required
+            get
+            {
+                // collect dictionaries for all channel sinks and return
+                //   aggregate dictionary
+                ArrayList dictionaries = new ArrayList();
+
+                // add the channel itself
+                dictionaries.Add(this);
+
+                if (SinksWithProperties != null)
+                {
+                    IServerChannelSink srvSink = SinksWithProperties as IServerChannelSink;
+                    if (srvSink != null)
+                    {
+                        while (srvSink != null)
+                        {
+                            IDictionary dict = srvSink.Properties;
+                            if (dict != null)
+                                dictionaries.Add(dict);
+
+                            srvSink = srvSink.NextChannelSink;
+                        }
+                    }
+                    else
+                    {
+                        // we know it's a client channel sink
+                        IClientChannelSink chnlSink = (IClientChannelSink)SinksWithProperties;                        
+                        
+                        while (chnlSink != null)
+                        {
+                            IDictionary dict = chnlSink.Properties;
+                            if (dict != null)
+                                dictionaries.Add(dict);
+
+                            chnlSink = chnlSink.NextChannelSink;
+                        }
+                    }                    
+                }
+
+                // return a dictionary that spans all dictionaries provided
+                return new AggregateDictionary(dictionaries);
+            }
+        } 
+
+    } // class BaseChannelWithProperties
+
+    
+
+
+
+
+
+    // Base implementation for channel sinks that want to supply properties.
+    // The derived class only needs to implement the Keys property and this[].
+    [System.Security.SecurityCritical]  // auto-generated_required
+    [SecurityPermissionAttribute(SecurityAction.InheritanceDemand, Flags=SecurityPermissionFlag.Infrastructure)]
+    [System.Runtime.InteropServices.ComVisible(true)]
+    public abstract class BaseChannelObjectWithProperties : IDictionary
+    {
+        protected BaseChannelObjectWithProperties()
+        {
+        }   
+
+        public virtual IDictionary Properties { 
+            [System.Security.SecurityCritical]  // auto-generated_required
+            get { return this; } 
+        }
+
+        // 
+        // IDictionary implementation        
+        //
+
+        public virtual Object this[Object key]
+        {
+            [System.Security.SecuritySafeCritical] // overrides public transparent member
+            get { return null; }
+            [System.Security.SecuritySafeCritical] // overrides public transparent member
+            set { throw new NotImplementedException(); } 
+        } // Object this[Object key]
+
+        public virtual ICollection Keys
+        {
+            [System.Security.SecuritySafeCritical] // overrides public transparent member
+            get { return null; }
+        }
+        
+        public virtual ICollection Values
+        {
+            [System.Security.SecuritySafeCritical] // overrides public transparent member
+            get
+            {
+                ICollection keys = Keys;
+                if (keys == null)
+                    return null;
+
+                ArrayList values = new ArrayList();
+                foreach (Object key in keys)
+                {
+                    values.Add(this[key]);
+                }                
+
+                return values;
+            }
+        }       
+
+        [System.Security.SecuritySafeCritical] // overrides public transparent member
+        public virtual bool Contains(Object key) 
+        {
+            if (key == null)
+                return false;
+
+            ICollection keySet = Keys;
+            if (keySet == null)
+                return false;
+
+            String keyStr = key as String;
+        
+            foreach (Object someKey in keySet)
+            {
+                if (keyStr != null)
+                {
+                    String someKeyStr = someKey as String;
+                    if (someKeyStr != null)
+                    {
+                        // compare the key strings case-insensitively
+                        if (String.Compare(keyStr, someKeyStr, StringComparison.OrdinalIgnoreCase) == 0)
+                            return true;
+
+                        continue;
+                    }
+                }                
+            
+                if (key.Equals(someKey))
+                    return true;
+            }
+
+            return false;
+        } // Contains
+
+        public virtual bool IsReadOnly
+        {
+            [System.Security.SecuritySafeCritical] // overrides public transparent member
+            get { return false; }
+        }
+        public virtual bool IsFixedSize
+        {
+            [System.Security.SecuritySafeCritical] // overrides public transparent member
+            get { return true; }
+        } 
+
+        // The following three methods should never be implemented because
+        // they don't apply to the way IDictionary is being used in this case
+        // (plus, IsFixedSize returns true.)
+        [System.Security.SecuritySafeCritical] // overrides public transparent member
+        public virtual void Add(Object key, Object value) { throw new NotSupportedException(); }
+        [System.Security.SecuritySafeCritical] // overrides public transparent member
+        public virtual void Clear() { throw new NotSupportedException(); }
+        [System.Security.SecuritySafeCritical] // overrides public transparent member
+        public virtual void Remove(Object key) { throw new NotSupportedException(); }
+
+        [System.Security.SecuritySafeCritical] // overrides public transparent member
+        public virtual IDictionaryEnumerator GetEnumerator()
+        {
+            return new DictionaryEnumeratorByKeys(this);
+        } // GetEnumerator
+                            
+
+        //
+        // end of IDictionary implementation 
+        //
+
+        //
+        // ICollection implementation 
+        //
+
+         //ICollection
+
+        [System.Security.SecuritySafeCritical] // overrides public transparent member
+        public virtual void CopyTo(Array array, int index) { throw new NotSupportedException(); }
+
+        public virtual int Count
+        {
+            [System.Security.SecuritySafeCritical] // overrides public transparent member
+            get 
+            {
+                ICollection keySet = Keys;
+                if (keySet == null)
+                    return 0;
+                    
+                return keySet.Count; 
+            }
+        } // Count
+
+        public virtual Object SyncRoot
+        {
+            [System.Security.SecuritySafeCritical] // overrides public transparent member
+            get { return this; }
+        }
+        public virtual bool IsSynchronized
+        {
+            [System.Security.SecuritySafeCritical] // overrides public transparent member
+            get { return false; }
+        }
+
+        //
+        // end of ICollection implementation
+        //
+
+        //IEnumerable
+        /// <internalonly/>
+        [System.Security.SecuritySafeCritical] // overrides public transparent member
+        IEnumerator IEnumerable.GetEnumerator()
+        {
+            return new DictionaryEnumeratorByKeys(this);
+        }
+    
+    } // class BaseChannelObjectWithProperties
+
+
+
+    // an enumerator based off of a key set
+    internal class DictionaryEnumeratorByKeys : IDictionaryEnumerator
+    {
+        IDictionary _properties;
+        IEnumerator _keyEnum;
+    
+        public DictionaryEnumeratorByKeys(IDictionary properties)
+        {
+            _properties = properties;
+            _keyEnum = properties.Keys.GetEnumerator();
+        } // PropertyEnumeratorByKeys
+
+        public bool MoveNext() { return _keyEnum.MoveNext(); }        
+        public void Reset() { _keyEnum.Reset(); }        
+        public Object Current { get { return Entry; } }
+
+        public DictionaryEntry Entry { get { return new DictionaryEntry(Key, Value); } }
+        
+        public Object Key { get { return _keyEnum.Current; } }
+        public Object Value { get { return _properties[Key]; } }       
+        
+    } // DictionaryEnumeratorByKeys
+
+
+    // combines multiple dictionaries into one
+    //   (used for channel sink properties
+    internal class AggregateDictionary : IDictionary
+    {
+        private ICollection _dictionaries;
+            
+        public AggregateDictionary(ICollection dictionaries)
+        { 
+            _dictionaries = dictionaries;
+        } // AggregateDictionary  
+
+        // 
+        // IDictionary implementation        
+        //
+
+        public virtual Object this[Object key]
+        {
+            get 
+            {
+                foreach (IDictionary dict in _dictionaries)
+                {
+                    if (dict.Contains(key))
+                        return dict[key];
+                }
+            
+                return null; 
+            }
+                
+            set
+            {
+                foreach (IDictionary dict in _dictionaries)
+                {
+                    if (dict.Contains(key))
+                        dict[key] = value;
+                }
+            } 
+        } // Object this[Object key]
+
+        public virtual ICollection Keys 
+        {
+            get
+            {
+                ArrayList keys = new ArrayList();
+                // add keys from every dictionary
+                foreach (IDictionary dict in _dictionaries)
+                {
+                    ICollection dictKeys = dict.Keys;
+                    if (dictKeys != null)
+                    {
+                        foreach (Object key in dictKeys)
+                        {
+                            keys.Add(key);
+                        }
+                    }
+                }
+
+                return keys;
+            }
+        } // Keys
+        
+        public virtual ICollection Values
+        {
+            get
+            {
+                ArrayList values = new ArrayList();
+                // add values from every dictionary
+                foreach (IDictionary dict in _dictionaries)
+                {
+                    ICollection dictValues = dict.Values;
+                    if (dictValues != null)
+                    {
+                        foreach (Object value in dictValues)
+                        {
+                            values.Add(value);
+                        }
+                    }
+                }
+
+                return values;
+            }
+        } // Values
+
+        public virtual bool Contains(Object key) 
+        {
+            foreach (IDictionary dict in _dictionaries)
+            {
+                if (dict.Contains(key))
+                    return true;
+            }
+            
+            return false; 
+        } // Contains
+
+        public virtual bool IsReadOnly { get { return false; } }
+        public virtual bool IsFixedSize { get { return true; } } 
+
+        // The following three methods should never be implemented because
+        // they don't apply to the way IDictionary is being used in this case
+        // (plus, IsFixedSize returns true.)
+        public virtual void Add(Object key, Object value) { throw new NotSupportedException(); }
+        public virtual void Clear() { throw new NotSupportedException(); }
+        public virtual void Remove(Object key) { throw new NotSupportedException(); }
+        
+        public virtual IDictionaryEnumerator GetEnumerator()
+        {
+            return new DictionaryEnumeratorByKeys(this);
+        } // GetEnumerator
+                            
+
+        //
+        // end of IDictionary implementation 
+        //
+
+        //
+        // ICollection implementation 
+        //
+
+        //ICollection
+
+        public virtual void CopyTo(Array array, int index) { throw new NotSupportedException(); }
+
+        public virtual int Count 
+        {
+            get 
+            {
+                int count = 0;
+            
+                foreach (IDictionary dict in _dictionaries)
+                {
+                    count += dict.Count;
+                }
+
+                return count;
+            }
+        } // Count
+        
+        public virtual Object SyncRoot { get { return this; } }
+        public virtual bool IsSynchronized { get { return false; } }
+
+        //
+        // end of ICollection implementation
+        //
+
+        //IEnumerable
+        IEnumerator IEnumerable.GetEnumerator()
+        {
+            return new DictionaryEnumeratorByKeys(this);
+        }
+    
+    } // class AggregateDictionary
+
+
+    
+} // namespace System.Runtime.Remoting
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                            ‹}8D‰|$(D‹}@D‰|$0L‹}HL‰|$8H‹ÎH‹×L‹ÃM‹Îÿ”êüÿHeØ[^_A^A_]ÃÌÌÌÌÌÌHƒì(ÿ†èüÿHƒÄ(ÃWVSHƒì H‹ñI‹øI‹ÙH‹Îÿgèüÿ‹WH‹ÎL‹Ãÿ°èüÿHƒÄ [^_ÃÌÌÌÌÌÌÌÌÌÌÌÌÌÌÌWVUSHƒì(H‹ñH‹úI‹ØI‹éH‹Îÿ#èüÿH‹ÎH‹×L‹ÃL‹ÍÿéüÿHƒÄ([]^_ÃÌÌÌÌÌÌÌHƒì(ÿ„   ÿğçüÿHƒÄ(ÃÌÌÌÌÌÌÌÌÌÌÿ„   ÃÌÌÌÌÌÌÌÌÌHƒì(ÿÆçüÿHƒÄ(ÃWVSHƒì H‹ñH‹úA‹ØH‹Îÿ§çüÿH‹ÎH‹×D‹ÃÿxèüÿHƒÄ [^_ÃÌÌÌÌÌÌÌÌÌÌÌÌÌÌÌVH‹ñ‰VD‰FHNI‹ÑÿÀŞüÿHNH‹T$0ÿ±Şüÿ^ÃÌÌÌÌÌÌÃÌÌÌÌÌÌÌÌÌÌÌÌÌÌÌHƒì(H‹•ùüÿH‰L$0H‹H‹JH‹T$09	ÿãåüÿHƒÄ(ÃÌÌÌÌÌUAWAVWVSHƒìHHl$pH‹ÙL‹òI‹ğI‹ùH‹Ïÿ‚åüÿL‹øH‰|$ H‹}0H‰|$(H‹}8H‰|$0H‹}@H‰|$8I‹ÏH‹ÓM‹ÆL‹Î9	ÿSåüÿI‹ÇHeØ[^_A^A_]ÃÌÌÌAVWVUSHƒì@H‹ÙH‹êI‹ğI‹ùH‹ÏÿåüÿL‹ğH‰|$ H‹¼$   H‰|$(H‹¼$˜   H‰|$0I‹ÎH‹ÓL‹ÅL‹Î9	ÿ“æüÿI‹ÆHƒÄ@[]^_A^ÃÌÌÌÌÌÌÌÌÌÌÌÌÌÃÌÌÌÌÌÌÌÌÌÌÌÌÌÌÌH‹IùüÿH‹H…ÀuH‹ùüÿH‹H‹@ÃH‹	ùüÿH‹H…ÀuH‹ñøüÿH‹H‹@ÃHƒì(H‰T$8H…Òt59	L‹ÁLÖøüÿL‹øüÿJ‹	L‹ÉLáøüÿH‹L$8Lğüÿ9	ÿıïüÿHƒÄ(ÃÌÌÌÌÌÌÌHƒì(H‹I9	ÿHäüÿHƒÄ(ÃÌÌÌÌÌÌÌÌÌÌÃÌÌÌÌÌÌÌÌÌÌÌÌÌÌÌÃÌÌÌÌÌÌÌÌÌÌÌÌÌÌÌH‹qûüÿ3Ò‰ÃÌÌÌAWAVATWVUSHƒì03ÀH‰D$ H‹ùH‹ÚI‹ğI‹éL‹´$   I‹ÎÿêüÿL‹øL‹&‹vH‹ŞúüÿIH‹×ÿIÜüÿH‹ÒúüÿIH‹Õÿ5ÜüÿI‹ïH-ÃúüÿH‹ÍI‹ÔÿÜüÿ‰uH‹µúüÿII‹ÖÿÜüÿH‹©úüÿIH‹”$˜   ÿïÛüÿH‹˜úüÿ‹¬$    Aˆ,H‹×L‹ÃHL$ L‰!‰qI‹ÏLL$ ÿîéüÿI‹ÇHƒÄ0[]^_A\A^A_ÃÌÌÌÌAWAVATWVUSHƒì03ÀH‰D$ H‹ÙL‹òM‹øI‹éH‹úüÿHI‹ÖÿsÛüÿH‹üùüÿHH‹”$   ÿZÛüÿH‹ûH=èùüÿH‹õÿ_ÛüÿH¥H‹ŞùüÿHH‹”$˜   ÿ,ÛüÿH‹ÍùüÿHH‹”$    ÿÛüÿH‹¼ùüÿD‹¤$¨   Dˆ$I‹ÖM‹ÇóoE óD$ H‹ËLL$ ÿéüÿHƒÄ0[]^_A\A^A_ÃÌÌÌÌÌÌÌÌÌAWAVAUATWVUSHƒì83ÀH‰D$(H‹ùH‹ÚI‹ğI‹éL‹´$    L‹¼$°   I‹Ïÿ´èüÿL‹àM‹.E‹vH‹ùüÿIH‹×ÿnÚüÿH‹÷øüÿIH‹”$¨   ÿUÚüÿH‹ùüÿIH‹ÓÿAÚüÿH‹ùüÿIH‹Öÿ-ÚüÿI‹ÜH»øüÿH‹ËI‹ÕÿÚüÿD‰sH‹¬øüÿII‹×ÿÿÙüÿH‹ øüÿIH‹”$¸   ÿæÙüÿH‹øüÿ‹œ$À   AˆH…ötH‹ÈøüÿAÆH…ÿt H‹×L‹ÅHL$(L‰)D‰qI‹ÌLL$(ÿÎçüÿI‹ÄHƒÄ8[]^_A\A]A^A_ÃÌÌAWAVATWVUSHƒì03ÀH‰D$ H‹ÙH‹êI‹ğM‹ñL‹¼$˜   H‹à÷üÿHH‹ÕÿKÙüÿH‹Ô÷üÿHH‹”$    ÿ2ÙüÿH‹ë÷üÿHH‹ÖÿÙüÿH‹ß÷üÿHI‹Öÿ
+ÙüÿH‹ûH=˜÷üÿI‹÷ÿÙüÿH¥H‹÷üÿHH‹”$¨   ÿÜØüÿH‹}÷üÿHH‹”$°   ÿÃØüÿH‹l÷üÿD‹¤$¸   Dˆ$M…ötH‹¤÷üÿÆH…ít'H‹ÕH‹¬$   L‹ÅóAoóD$ H‹ËLL$ ÿ¤æüÿHƒÄ0[]^_A\A^A_ÃÌÌÌÌÌÌÌÌÌÌÌÌWVUSHƒì(3ÀH‰D$ H‹ñH‹ÚI‹èI‹ùH‹ËL3ëüÿ9	ÿ+ëüÿ„Àt/*
+ *  Copyright 2004 The WebRTC Project Authors. All rights reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+#ifndef WEBRTC_LIBJINGLE_XMPP_ASYNCSOCKET_H_
+#define WEBRTC_LIBJINGLE_XMPP_ASYNCSOCKET_H_
+
+#include <string>
+
+#include "webrtc/base/sigslot.h"
+
+namespace rtc {
+  class SocketAddress;
+}
+
+namespace buzz {
+
+class AsyncSocket {
+public:
+  enum State {
+    STATE_CLOSED = 0,      //!< Socket is not open.
+    STATE_CLOSING,         //!< Socket is closing but can have buffered data
+    STATE_CONNECTING,      //!< In the process of
+    STATE_OPEN,            //!< Socket is connected
+#if defined(FEATURE_ENABLE_SSL)
+    STATE_TLS_CONNECTING,  //!< Establishing TLS connection
+    STATE_TLS_OPEN,        //!< TLS connected
+#endif
+  };
+
+  enum Error {
+    ERROR_NONE = 0,         //!< No error
+    ERROR_WINSOCK,          //!< Winsock error
+    ERROR_DNS,              //!< Couldn't resolve host name
+    ERROR_WRONGSTATE,       //!< Call made while socket is in the wrong state
+#if defined(FEATURE_ENABLE_SSL)
+    ERROR_SSL,              //!< Something went wrong with OpenSSL
+#endif
+  };
+
+  virtual ~AsyncSocket() {}
+  virtual State state() = 0;
+  virtual Error error() = 0;
+  virtual int GetError() = 0;    // winsock error code
+
+  virtual bool Connect(const rtc::SocketAddress& addr) = 0;
+  virtual bool Read(char * data, size_t len, size_t* len_read) = 0;
+  virtual bool Write(const char * data, size_t len) = 0;
+  virtual bool Close() = 0;
+#if defined(FEATURE_ENABLE_SSL)
+  // We allow matching any passed domain.  This allows us to avoid
+  // handling the valuable certificates for logins into proxies.  If
+  // both names are passed as empty, we do not require a match.
+  virtual bool StartTls(const std::string & domainname) = 0;
+#endif
+
+  sigslot::signal0<> SignalConnected;
+  sigslot::signal0<> SignalSSLConnected;
+  sigslot::signal0<> SignalClosed;
+  sigslot::signal0<> SignalRead;
+  sigslot::signal0<> SignalError;
+};
+
+}
+
+#endif  // WEBRTC_LIBJINGLE_XMPP_ASYNCSOCKET_H_
+                                                                                                                                                                                                           j¤^Û¬µ;Ÿê6[º§">Ò»öÖ“ËÈy§RÜX½¾9çÛµ’ñ%hÒ` Äí—‰…8õ¶!¹İÍˆüÜÆÃå³ÊÈPwk«Y½ÚHh7.ñâÜmøHÀß”'<iÉIdñ9¹1?E!i‰;X/7*,ƒü+¶%ècxzNÓ?şÿø	úµ•Vêšâ¼€[HÖø®uºr”ò%yœæàã"¿eÔ´&şí²ª×\•Ğ?8SÌ¾¢.«ÔqüÍºÑî	œèÌ8A<s-;Tt=q¶ÕGPJ‰{.•A°VÇü€tç¨’Wl¬

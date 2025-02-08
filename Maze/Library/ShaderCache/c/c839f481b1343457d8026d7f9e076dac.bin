@@ -1,0 +1,46 @@
+##############
+	# Sun Studio 12.3/SunCC 5.12
+	if [[ (-e "/opt/solarisstudio12.3/bin/CC") ]]; then
+
+		# More workarounds... SunCC 5.12 only does SSE4, http://github.com/weidai11/cryptopp/issues/228
+		SUNCC_SSE_CXXFLAGS=$(echo -n "${SUNCC_CXXFLAGS[@]}" | "$AWK" '/__(SSE2|SSE3|SSSE3|SSE4_1|SSE4_2)__/' ORS=' ' RS=' ')
+
+		if [[ $(echo -n "$SUNCC_SSE_CXXFLAGS" | "$GREP" -i -c "sse4_2") != "0" ]]; then
+			SUNCC_SSE_CXXFLAGS="$SUNCC_SSE_CXXFLAGS -xarch=sse4_2";
+		elif [[ $(echo -n "$SUNCC_SSE_CXXFLAGS" | "$GREP" -i -c "sse4_1") != "0" ]]; then
+			SUNCC_SSE_CXXFLAGS="$SUNCC_SSE_CXXFLAGS -xarch=sse4_1";
+		elif [[ $(echo -n "$SUNCC_SSE_CXXFLAGS" | "$GREP" -i -c "ssse3") != "0" ]]; then
+			SUNCC_SSE_CXXFLAGS="$SUNCC_SSE_CXXFLAGS -xarch=ssse3";
+		elif [[ $(echo -n "$SUNCC_SSE_CXXFLAGS" | "$GREP" -i -c "sse3") != "0" ]]; then
+			SUNCC_SSE_CXXFLAGS="$SUNCC_SSE_CXXFLAGS -xarch=sse3";
+		else
+			SUNCC_SSE_CXXFLAGS="$SUNCC_SSE_CXXFLAGS -xarch=sse2";
+		fi
+
+		############################################
+		# Debug build
+		echo
+		echo "************************************" | tee -a "$TEST_RESULTS"
+		echo "Testing: Sun Studio 12.3, debug, platform CXXFLAGS" | tee -a "$TEST_RESULTS"
+		echo
+
+		"$MAKE" clean > /dev/null 2>&1
+		rm -f adhoc.cpp > /dev/null 2>&1
+
+		CXXFLAGS="-DDEBUG -g3 -xO0 $SUNCC_SSE_CXXFLAGS"
+		CXX=/opt/solarisstudio12.3/bin/CC CXXFLAGS="$CXXFLAGS" "$MAKE" "${MAKEARGS[@]}" static dynamic cryptest.exe 2>&1 | tee -a "$TEST_RESULTS"
+
+		if [[ ("${PIPESTATUS[0]}" -ne "0") ]]; then
+			echo "ERROR: failed to make cryptest.exe" | tee -a "$TEST_RESULTS"
+		else
+			./cryptest.exe v 2>&1 | tee -a "$TEST_RESULTS"
+			if [[ ("${PIPESTATUS[0]}" -ne "0") ]]; then
+				echo "ERROR: failed to execute validation suite" | tee -a "$TEST_RESULTS"
+			fi
+			./cryptest.exe tv all 2>&1 | tee -a "$TEST_RESULTS"
+			if [[ ("${PIPESTATUS[0]}" -ne "0") ]]; then
+				echo "ERROR: failed to execute test vectors" | tee -a "$TEST_RESULTS"
+			fi
+		fi
+
+		############################################

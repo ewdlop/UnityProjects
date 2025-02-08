@@ -1,0 +1,142 @@
+// File: crn_symbol_codec.cpp
+// See Copyright Notice and license at the end of inc/crnlib.h
+#include "crn_core.h"
+#include "crn_symbol_codec.h"
+#include "crn_huffman_codes.h"
+
+namespace crnlib {
+static float gProbCost[cSymbolCodecArithProbScale];
+
+//const uint cArithProbMulLenSigBits  = 8;
+//const uint cArithProbMulLenSigScale  = 1 << cArithProbMulLenSigBits;
+
+class arith_prob_cost_initializer {
+ public:
+  arith_prob_cost_initializer() {
+    const float cInvLn2 = 1.0f / 0.69314718f;
+
+    for (uint i = 0; i < cSymbolCodecArithProbScale; i++)
+      gProbCost[i] = -logf(i * (1.0f / cSymbolCodecArithProbScale)) * cInvLn2;
+  }
+};
+
+static arith_prob_cost_initializer g_prob_cost_initializer;
+
+double symbol_histogram::calc_entropy() const {
+  double total = 0.0f;
+  for (uint i = 0; i < m_hist.size(); i++)
+    total += m_hist[i];
+  if (total == 0.0f)
+    return 0.0f;
+
+  double entropy = 0.0f;
+  double neg_inv_log2 = -1.0f / log(2.0f);
+  double inv_total = 1.0f / total;
+  for (uint i = 0; i < m_hist.size(); i++) {
+    if (m_hist[i]) {
+      double bits = log(m_hist[i] * inv_total) * neg_inv_log2;
+      entropy += bits * m_hist[i];
+    }
+  }
+
+  return entropy;
+}
+
+uint64 symbol_histogram::get_total() const {
+  uint64 total = 0;
+  for (uint i = 0; i < m_hist.size(); i++)
+    total += m_hist[i];
+  return total;
+}
+
+adaptive_huffman_data_model::adaptive_huffman_data_model(bool encoding, uint total_syms)
+    : m_total_syms(0),
+      m_update_cycle(0),
+      m_symbols_until_update(0),
+      m_total_count(0),
+      m_pDecode_tables(NULL),
+      m_decoder_table_bits(0),
+      m_encoding(encoding) {
+  if (total_syms)
+    init(encoding, total_syms);
+}
+
+adaptive_huffman_data_model::adaptive_huffman_data_model(const adaptive_huffman_data_model& other)
+    : m_total_syms(0),
+      m_update_cycle(0),
+      m_symbols_until_update(0),
+      m_total_count(0),
+      m_pDecode_tables(NULL),
+      m_decoder_table_bits(0),
+      m_encoding(false) {
+  *this = other;
+}
+
+adaptive_huffman_data_model::~adaptive_huffman_data_model() {
+  if (m_pDecode_tables)
+    crnlib_delete(m_pDecode_tables);
+}
+
+adaptive_huffman_data_model& adaptive_huffman_data_model::operator=(const adaptive_huffman_data_model& rhs) {
+  if (this == &rhs)
+    return *this;
+
+  m_total_syms = rhs.m_total_syms;
+
+  m_update_cycle = rhs.m_update_cycle;
+  m_symbols_until_update = rhs.m_symbols_until_update;
+
+  m_total_count = rhs.m_total_count;
+
+  m_sym_freq = rhs.m_sym_freq;
+
+  m_codes = rhs.m_codes;
+  m_code_sizes = rhs.m_code_sizes;
+
+  if (rhs.m_pDecode_tables) {
+    if (m_pDecode_tables)
+      *m_pDecode_tables = *rhs.m_pDecode_tables;
+    else
+      m_pDecode_tables = crnlib_new<prefix_coding::decoder_tables>(*rhs.m_pDecode_tables);
+  } else {
+    crnlib_delete(m_pDecode_tables);
+    m_pDecode_tables = NULL;
+  }
+
+  m_decoder_table_bits = rhs.m_decoder_table_bits;
+  m_encoding = rhs.m_encoding;
+
+  return *this;
+}
+
+void adaptive_huffman_data_model::clear() {
+  m_sym_freq.clear();
+  m_codes.clear();
+  m_code_sizes.clear();
+
+  m_total_syms = 0;
+  m_update_cycle = 0;
+  m_symbols_until_update = 0;
+  m_decoder_table_bits = 0;
+  m_total_count = 0;
+
+  if (m_pDecode_tables) {
+    crnlib_delete(m_pDecode_tables);
+    m_pDecode_tables = NULL;
+  }
+}
+
+void adaptive_huffman_data_model::init(bool encoding, uint total_syms) {
+  clear();
+
+  m_encoding = encoding;
+
+  m_sym_freq.resize(total_syms);
+  m_code_sizes.resize(total_syms);
+
+  m_total_syms = total_syms;
+
+  if (m_total_syms <= 16)
+    m_decoder_table_bits = 0;
+  else
+    m_decoder_table_bits = static_cast<uint8>(math::minimum(1 + math::ceil_log2i(m_total_syms), pr

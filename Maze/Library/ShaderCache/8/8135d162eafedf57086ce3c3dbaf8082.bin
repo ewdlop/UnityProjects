@@ -1,0 +1,68 @@
+^^^^^^^^^^^^^^^
+
+Certain methods are candidates to have :arc-term:`related result types`:
+
+* class methods in the ``alloc`` and ``new`` method families
+* instance methods in the ``init`` family
+* the instance method ``self``
+* outside of ARC, the instance methods ``retain`` and ``autorelease``
+
+If the formal result type of such a method is ``id`` or protocol-qualified
+``id``, or a type equal to the declaring class or a superclass, then it is said
+to have a related result type.  In this case, when invoked in an explicit
+message send, it is assumed to return a type related to the type of the
+receiver:
+
+* if it is a class method, and the receiver is a class name ``T``, the message
+  send expression has type ``T*``; otherwise
+* if it is an instance method, and the receiver has type ``T``, the message
+  send expression has type ``T``; otherwise
+* the message send expression has the normal result type of the method.
+
+This is a new rule of the Objective-C language and applies outside of ARC.
+
+.. admonition:: Rationale
+
+  ARC's automatic code emission is more prone than most code to signature
+  errors, i.e. errors where a call was emitted against one method signature,
+  but the implementing method has an incompatible signature.  Having more
+  precise type information helps drastically lower this risk, as well as
+  catching a number of latent bugs.
+
+.. _arc.optimization:
+
+Optimization
+============
+
+Within this section, the word :arc-term:`function` will be used to
+refer to any structured unit of code, be it a C function, an
+Objective-C method, or a block.
+
+This specification describes ARC as performing specific ``retain`` and
+``release`` operations on retainable object pointers at specific
+points during the execution of a program.  These operations make up a
+non-contiguous subsequence of the computation history of the program.
+The portion of this sequence for a particular retainable object
+pointer for which a specific function execution is directly
+responsible is the :arc-term:`formal local retain history` of the
+object pointer.  The corresponding actual sequence executed is the
+`dynamic local retain history`.
+
+However, under certain circumstances, ARC is permitted to re-order and
+eliminate operations in a manner which may alter the overall
+computation history beyond what is permitted by the general "as if"
+rule of C/C++ and the :ref:`restrictions <arc.objects.retains>` on
+the implementation of ``retain`` and ``release``.
+
+.. admonition:: Rationale
+
+  Specifically, ARC is sometimes permitted to optimize ``release``
+  operations in ways which might cause an object to be deallocated
+  before it would otherwise be.  Without this, it would be almost
+  impossible to eliminate any ``retain``/``release`` pairs.  For
+  example, consider the following code:
+
+  .. code-block:: objc
+
+    id x = _ivar;
+    [x foo];

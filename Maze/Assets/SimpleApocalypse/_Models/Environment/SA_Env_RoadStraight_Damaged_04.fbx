@@ -1,0 +1,969 @@
+(%s)
+        """
+        def run_command(code):
+            p = subprocess.Popen([sys.executable, "-Wd", "-c", code],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE)
+            stdout, stderr = p.communicate()
+            p.stdout.close()
+            p.stderr.close()
+            self.assertEqual(p.returncode, 0)
+            self.assertEqual(stdout.strip(), b"")
+            return strip_python_stderr(stderr)
+
+        stderr = run_command(code % "0")
+        self.assertIn(b"ResourceWarning: gc: 2 uncollectable objects at "
+                      b"shutdown; use", stderr)
+        self.assertNotIn(b"<X 'first'>", stderr)
+        # With DEBUG_UNCOLLECTABLE, the garbage list gets printed
+        stderr = run_command(code % "gc.DEBUG_UNCOLLECTABLE")
+        self.assertIn(b"ResourceWarning: gc: 2 uncollectable objects at "
+                      b"shutdown", stderr)
+        self.assertTrue(
+            (b"[<X 'first'>, <X 'second'>]" in stderr) or
+            (b"[<X 'second'>, <X 'first'>]" in stderr), stderr)
+        # With DEBUG_SAVEALL, no additional message should get printed
+        # (because gc.garbage also contains normally reclaimable cyclic
+        # references, and its elements get printed at runtime anyway).
+        stderr = run_command(code % "gc.DEBUG_SAVEALL")
+        self.assertNotIn(b"uncollectable objects at shutdown", stderr)
+
+    @requires_type_collecting
+    def test_gc_main_module_at_shutdown(self):
+        # Create a reference cycle through the __main__ module and check
+        # it gets collected at interpreter shutdown.
+        code = """if 1:
+            class C:
+                def __del__(self):
+                    print('__del__ called')
+            l = [C()]
+            l.append(l)
+            """
+        rc, out, err = assert_python_ok('-c', code)
+        self.assertEqual(out.strip(), b'__del__ called')
+
+    @requires_type_collecting
+    def test_gc_ordinary_module_at_shutdown(self):
+        # Same as above, but with a non-__main__ module.
+        with temp_dir() as script_dir:
+            module = """if 1:
+                class C:
+                    def __del__(self):
+                        print('__del__ called')
+                l = [C()]
+                l.append(l)
+                """
+            code = """if 1:
+                import sys
+                sys.path.insert(0, %r)
+                import gctest
+                """ % (script_dir,)
+            make_script(script_dir, 'gctest', module)
+            rc, out, err = assert_python_ok('-c', code)
+            self.assertEqual(out.strip(), b'__del__ called')
+
+    @requires_type_collecting
+    def test_global_del_SystemExit(self):
+        code = """if 1:
+            class ClassWithDel:
+                def __del__(self):
+                    print('__del__ called')
+            a = ClassWithDel()
+            a.link = a
+            raise SystemExit(0)"""
+        self.addCleanup(unlink, TESTFN)
+        with open(TESTFN, 'w') as script:
+            script.write(code)
+        rc, out, err = assert_python_ok(TESTFN)
+        self.assertEqual(out.strip(), b'__del__ called')
+
+    def test_get_stats(self):
+        stats = gc.get_stats()
+        self.assertEqual(len(stats), 3)
+        for st in stats:
+            self.assertIsInstance(st, dict)
+            self.assertEqual(set(st),
+                             {"collected", "collections", "uncollectable"})
+            self.assertGreaterEqual(st["collected"], 0)
+            self.assertGreaterEqual(st["collections"], 0)
+            self.assertGreaterEqual(st["uncollectable"], 0)
+        # Check that collection counts are incremented correctly
+        if gc.isenabled():
+            self.addCleanup(gc.enable)
+            gc.disable()
+        old = gc.get_stats()
+        gc.collect(0)
+        new = gc.get_stats()
+        self.assertEqual(new[0]["collections"], old[0]["collections"] + 1)
+        self.assertEqual(new[1]["collections"], old[1]["collections"])
+        self.assertEqual(new[2]["collections"], old[2]["collections"])
+        gc.collect(2)
+        new = gc.get_stats()
+        self.assertEqual(new[0]["collections"], old[0]["collections"] + 1)
+        self.assertEqual(new[1]["collections"], old[1]["collections"])
+        self.assertEqual(new[2]["collections"], old[2]["collections"] + 1)
+
+    def test_freeze(self):
+        gc.freeze()
+        self.assertGreater(gc.get_freeze_count(), 0)
+        gc.unfreeze()
+        self.assertEqual(gc.get_freeze_count(), 0)
+
+    def test_38379(self):
+        # When a finalizer resurrects objects, stats were reporting them as
+        # having been collected.  This affected both collect()'s return
+        # value and the dicts returned by get_stats().
+        N = 100
+
+        class A:  # simple self-loop
+            def __init__(self):
+                self.me = self
+
+        class Z(A):  # resurrecting __del__
+            def __del__(self):
+                zs.append(self)
+
+        zs = []
+
+        def getstats():
+            d = gc.get_stats()[-1]
+            return d['collected'], d['uncollectable']
+
+        gc.collect()
+        gc.disable()
+
+        # No problems if just collecting A() instances.
+        oldc, oldnc = getstats()
+        for i in range(N):
+            A()
+        t = gc.collect()
+        c, nc = getstats()
+        self.assertEqual(t, 2*N) # instance object & its dict
+        self.assertEqual(c - oldc, 2*N)
+        self.assertEqual(nc - oldnc, 0)
+
+        # But Z() is not actually collected.
+        oldc, oldnc = c, nc
+        Z()
+        # Nothing is collected - Z() is merely resurrected.
+        t = gc.collect()
+        c, nc = getstats()
+        #self.assertEqual(t, 2)  # before
+        self.assertEqual(t, 0)  # after
+        #self.assertEqual(c - oldc, 2)   # before
+        self.assertEqual(c - oldc, 0)   # after
+        self.assertEqual(nc - oldnc, 0)
+
+        # Unfortunately, a Z() prevents _anything_ from being collected.
+        # It should be possible to collect the A instances anyway, but
+        # that will require non-trivial code changes.
+        oldc, oldnc = c, nc
+        for i in range(N):
+            A()
+        Z()
+        # Z() prevents anything from being collected.
+        t = gc.collect()
+        c, nc = getstats()
+        #self.assertEqual(t, 2*N + 2)  # before
+        self.assertEqual(t, 0)  # after
+        #self.assertEqual(c - oldc, 2*N + 2)   # before
+        self.assertEqual(c - oldc, 0)   # after
+        self.assertEqual(nc - oldnc, 0)
+
+        # But the A() trash is reclaimed on the next run.
+        oldc, oldnc = c, nc
+        t = gc.collect()
+        c, nc = getstats()
+        self.assertEqual(t, 2*N)
+        self.assertEqual(c - oldc, 2*N)
+        self.assertEqual(nc - oldnc, 0)
+
+        gc.enable()
+
+
+class GCCallbackTests(unittest.TestCase):
+    def setUp(self):
+        # Save gc state and disable it.
+        self.enabled = gc.isenabled()
+        gc.disable()
+        self.debug = gc.get_debug()
+        gc.set_debug(0)
+        gc.callbacks.append(self.cb1)
+        gc.callbacks.append(self.cb2)
+        self.othergarbage = []
+
+    def tearDown(self):
+        # Restore gc state
+        del self.visit
+        gc.callbacks.remove(self.cb1)
+        gc.callbacks.remove(self.cb2)
+        gc.set_debug(self.debug)
+        if self.enabled:
+            gc.enable()
+        # destroy any uncollectables
+        gc.collect()
+        for obj in gc.garbage:
+            if isinstance(obj, Uncollectable):
+                obj.partner = None
+        del gc.garbage[:]
+        del self.othergarbage
+        gc.collect()
+
+    def preclean(self):
+        # Remove all fluff from the system.  Invoke this function
+        # manually rather than through self.setUp() for maximum
+        # safety.
+        self.visit = []
+        gc.collect()
+        garbage, gc.garbage[:] = gc.garbage[:], []
+        self.othergarbage.append(garbage)
+        self.visit = []
+
+    def cb1(self, phase, info):
+        self.visit.append((1, phase, dict(info)))
+
+    def cb2(self, phase, info):
+        self.visit.append((2, phase, dict(info)))
+        if phase == "stop" and hasattr(self, "cleanup"):
+            # Clean Uncollectable from garbage
+            uc = [e for e in gc.garbage if isinstance(e, Uncollectable)]
+            gc.garbage[:] = [e for e in gc.garbage
+                             if not isinstance(e, Uncollectable)]
+            for e in uc:
+                e.partner = None
+
+    def test_collect(self):
+        self.preclean()
+        gc.collect()
+        # Algorithmically verify the contents of self.visit
+        # because it is long and tortuous.
+
+        # Count the number of visits to each callback
+        n = [v[0] for v in self.visit]
+        n1 = [i for i in n if i == 1]
+        n2 = [i for i in n if i == 2]
+        self.assertEqual(n1, [1]*2)
+        self.assertEqual(n2, [2]*2)
+
+        # Count that we got the right number of start and stop callbacks.
+        n = [v[1] for v in self.visit]
+        n1 = [i for i in n if i == "start"]
+        n2 = [i for i in n if i == "stop"]
+        self.assertEqual(n1, ["start"]*2)
+        self.assertEqual(n2, ["stop"]*2)
+
+        # Check that we got the right info dict for all callbacks
+        for v in self.visit:
+            info = v[2]
+            self.assertTrue("generation" in info)
+            self.assertTrue("collected" in info)
+            self.assertTrue("uncollectable" in info)
+
+    def test_collect_generation(self):
+        self.preclean()
+        gc.collect(2)
+        for v in self.visit:
+            info = v[2]
+            self.assertEqual(info["generation"], 2)
+
+    @cpython_only
+    def test_collect_garbage(self):
+        self.preclean()
+        # Each of these cause four objects to be garbage: Two
+        # Uncolectables and their instance dicts.
+        Uncollectable()
+        Uncollectable()
+        C1055820(666)
+        gc.collect()
+        for v in self.visit:
+            if v[1] != "stop":
+                continue
+            info = v[2]
+            self.assertEqual(info["collected"], 2)
+            self.assertEqual(info["uncollectable"], 8)
+
+        # We should now have the Uncollectables in gc.garbage
+        self.assertEqual(len(gc.garbage), 4)
+        for e in gc.garbage:
+            self.assertIsInstance(e, Uncollectable)
+
+        # Now, let our callback handle the Uncollectable instances
+        self.cleanup=True
+        self.visit = []
+        gc.garbage[:] = []
+        gc.collect()
+        for v in self.visit:
+            if v[1] != "stop":
+                continue
+            info = v[2]
+            self.assertEqual(info["collected"], 0)
+            self.assertEqual(info["uncollectable"], 4)
+
+        # Uncollectables should be gone
+        self.assertEqual(len(gc.garbage), 0)
+
+
+class GCTogglingTests(unittest.TestCase):
+    def setUp(self):
+        gc.enable()
+
+    def tearDown(self):
+        gc.disable()
+
+    def test_bug1055820c(self):
+        # Corresponds to temp2c.py in the bug report.  This is pretty
+        # elaborate.
+
+        c0 = C1055820(0)
+        # Move c0 into generation 2.
+        gc.collect()
+
+        c1 = C1055820(1)
+        c1.keep_c0_alive = c0
+        del c0.loop # now only c1 keeps c0 alive
+
+        c2 = C1055820(2)
+        c2wr = weakref.ref(c2) # no callback!
+
+        ouch = []
+        def callback(ignored):
+            ouch[:] = [c2wr()]
+
+        # The callback gets associated with a wr on an object in generation 2.
+        c0wr = weakref.ref(c0, callback)
+
+        c0 = c1 = c2 = None
+
+        # What we've set up:  c0, c1, and c2 are all trash now.  c0 is in
+        # generation 2.  The only thing keeping it alive is that c1 points to
+        # it. c1 and c2 are in generation 0, and are in self-loops.  There's a
+        # global weakref to c2 (c2wr), but that weakref has no callback.
+        # There's also a global weakref to c0 (c0wr), and that does have a
+        # callback, and that callback references c2 via c2wr().
+        #
+        #               c0 has a wr with callback, which references c2wr
+        #               ^
+        #               |
+        #               |     Generation 2 above dots
+        #. . . . . . . .|. . . . . . . . . . . . . . . . . . . . . . . .
+        #               |     Generation 0 below dots
+        #               |
+        #               |
+        #            ^->c1   ^->c2 has a wr but no callback
+        #            |  |    |  |
+        #            <--v    <--v
+        #
+        # So this is the nightmare:  when generation 0 gets collected, we see
+        # that c2 has a callback-free weakref, and c1 doesn't even have a
+        # weakref.  Collecting generation 0 doesn't see c0 at all, and c0 is
+        # the only object that has a weakref with a callback.  gc clears c1
+        # and c2.  Clearing c1 has the side effect of dropping the refcount on
+        # c0 to 0, so c0 goes away (despite that it's in an older generation)
+        # and c0's wr callback triggers.  That in turn materializes a reference
+        # to c2 via c2wr(), but c2 gets cleared anyway by gc.
+
+        # We want to let gc happen "naturally", to preserve the distinction
+        # between generations.
+        junk = []
+        i = 0
+        detector = GC_Detector()
+        while not detector.gc_happened:
+            i += 1
+            if i > 10000:
+                self.fail("gc didn't happen after 10000 iterations")
+            self.assertEqual(len(ouch), 0)
+            junk.append([])  # this will eventually trigger gc
+
+        self.assertEqual(len(ouch), 1)  # else the callback wasn't invoked
+        for x in ouch:
+            # If the callback resurrected c2, the instance would be damaged,
+            # with an empty __dict__.
+            self.assertEqual(x, None)
+
+    def test_bug1055820d(self):
+        # Corresponds to temp2d.py in the bug report.  This is very much like
+        # test_bug1055820c, but uses a __del__ method instead of a weakref
+        # callback to sneak in a resurrection of cyclic trash.
+
+        ouch = []
+        class D(C1055820):
+            def __del__(self):
+                ouch[:] = [c2wr()]
+
+        d0 = D(0)
+        # Move all the above into generation 2.
+        gc.collect()
+
+        c1 = C1055820(1)
+        c1.keep_d0_alive = d0
+        del d0.loop # now only c1 keeps d0 alive
+
+        c2 = C1055820(2)
+        c2wr = weakref.ref(c2) # no callback!
+
+        d0 = c1 = c2 = None
+
+        # What we've set up:  d0, c1, and c2 are all trash now.  d0 is in
+        # generation 2.  The only thing keeping it alive is that c1 points to
+        # it.  c1 and c2 are in generation 0, and are in self-loops.  There's
+        # a global weakref to c2 (c2wr), but that weakref has no callback.
+        # There are no other weakrefs.
+        #
+        #               d0 has a __del__ method that references c2wr
+        #               ^
+        #               |
+        #               |     Generation 2 above dots
+        #. . . . . . . .|. . . . . . . . . . . . . . . . . . . . . . . .
+        #               |     Generation 0 below dots
+        #               |
+        #               |
+        #            ^->c1   ^->c2 has a wr but no callback
+        #            |  |    |  |
+        #            <--v    <--v
+        #
+        # So this is the nightmare:  when generation 0 gets collected, we see
+        # that c2 has a callback-free weakref, and c1 doesn't even have a
+        # weakref.  Collecting generation 0 doesn't see d0 at all.  gc clears
+        # c1 and c2.  Clearing c1 has the side effect of dropping the refcount
+        # on d0 to 0, so d0 goes away (despite that it's in an older
+        # generation) and d0's __del__ triggers.  That in turn materializes
+        # a reference to c2 via c2wr(), but c2 gets cleared anyway by gc.
+
+        # We want to let gc happen "naturally", to preserve the distinction
+        # between generations.
+        detector = GC_Detector()
+        junk = []
+        i = 0
+        while not detector.gc_happened:
+            i += 1
+            if i > 10000:
+                self.fail("gc didn't happen after 10000 iterations")
+            self.assertEqual(len(ouch), 0)
+            junk.append([])  # this will eventually trigger gc
+
+        self.assertEqual(len(ouch), 1)  # else __del__ wasn't invoked
+        for x in ouch:
+            # If __del__ resurrected c2, the instance would be damaged, with an
+            # empty __dict__.
+            self.assertEqual(x, None)
+
+def test_main():
+    enabled = gc.isenabled()
+    gc.disable()
+    assert not gc.isenabled()
+    debug = gc.get_debug()
+    gc.set_debug(debug & ~gc.DEBUG_LEAK) # this test is supposed to leak
+
+    try:
+        gc.collect() # Delete 2nd generation garbage
+        run_unittest(GCTests, GCTogglingTests, GCCallbackTests)
+    finally:
+        gc.set_debug(debug)
+        # test gc.enable() even if GC is disabled by default
+        if verbose:
+            print("restoring automatic collection")
+        # make sure to always test gc.enable()
+        gc.enable()
+        assert gc.isenabled()
+        if not enabled:
+            gc.disable()
+
+if __name__ == "__main__":
+    test_main()
+                                                                                                                                                                                                                                                                                                                                              R µt…•­ 8ƒY£Î>O­8LÅ„+Áû¬6Õáõ;IâQ‡g¡£« S]÷LôR±…° ĞËdÛCÕà\<ŞÎöBç:‹±‹“°İUz«­z¿)mT6õ¥_U¬c:E‰’#?i/ÏÛsÎ7SPq]””Ã!xÀûBqƒ|æ!ÚŞ†x°@¹·X¯ D@*#1òî›ÖãøÂNI;°ºŠØ›"XP¼f€JÕ\b‡ù.l‘È[’œü•E2q±d·ï&(›P9Ph…÷¢{‡Ö`ó b«ô×KYĞÉxMy¿ß4+©_5Ç˜/;U=Ã¨~»{UÌ-1@¬û¹™èRÕ}šß¼DqgÆ"B†»¶„R44É
+¶÷Œ0ŸPc:óÅ_ıDn Äñåæj…E@È×j¾û^ÚÁ2oÖâ÷Q<«è7Ô_Ø‡z… |Md“è”Ü//B‹à¿Öäº˜©‡a8ÊıÀF6o:1Ó®_¾öT
+C·7hK“N˜“åŠ°ÙwHJzjGğ^VüiYBRÏs‚^6?9
+ÉüZp³?¯wí-<;m ]°êKÖól›ƒ{‰„Ö:F+|´—<,:¡ó™0MN¤óx5r^×ÃsÿŠy{ó2×èŸÇõâÅk@MHï­í3²PUÿM¤ü¬ï'z¦ÑùKSŠ³U­æÔÀ×Æ­·©ºFåP÷uş…NH>nQÈ( „¤¿>zÑ-Áùa‡Š4Ï°So-¹{Muë/F$	ñUepW{S¼Í§ÙGp&†¤{"®!Àií Å&E->c·
+ó*>mÂ«(åÕÚ RÖ1¦_³¸”$U›Î‹bŞ·wfÇ7ßŒ8&êÜój	³…+äxYráSÀ‹°¤hã4ì»,J¼¡\C÷œ”«—3@·
+ò– KÏ=ûeÉÆÙ^Ç£;ŸÿœdM¯îsß•l†­•
+¢î&¯9á4bû?¢MÊH|Š	M
+ªVÏÄç.­mÖ‹yÇ'œ©:³şéÌQ#N£Ÿu\²W²°­TtĞhT}í²ëå<S.À ásJW>iÜŞ›İ>
+ÜÑ¤& EgŞ@0¬øÆÂÛ³‹MŒ›tšÓ6)<.a¯˜ê|-=‘XÄ-)Âñp	^Fş ¯;Iİ²¡q¨ïÎ‚€X/˜åÇñ#ÿ‘3Âu[#)/3º?ÛÓ™ø÷Ã»PÀÍ7µ /Á•ø-pZÑ>3b#™‰—,cy/å¶û0PÃkŒñˆ¶SÛ`åŸîHBi˜~WW—^¶9ï˜Àxt3wlX¬	V¹9Û–6ÅQ+ÎïœÑ6pùÃt´áù¨H‡Ú® f·±Cc­ŞÌg&Áıå#¨[½ˆVÏÊk›˜v ái$ÍùŒJè£íl§³ÂÈSåD,©ƒ¸™»FîCNy.†Üè®Ê,*òè0ÕÓÚÕ[©ôbAƒ6Gnaà:@4&µû t¿¿n
+< Ògxçå-{±
+Uş».óÂ]qğmLÚî²XE7¦m¸0hnK}°¨¹Ä¤|ğ…vîå¿y{¢şCY@öÅwı¼{_º\ï^X‡ipÖiá©qQT&W{ÀÉ²c+ï1XFÔ!;6M<İÖ³eš‰ÛşíÉy(m­{3¥1XØ×‹ã}ƒMú|Ãâ5¨$|È‡|Z§¤ÛµSËDv¼êw;*µÿ‡¦zVÙ¼Wº‘©Kjªªø©ˆÎu2r®È¯è!	çhÅá¦rqâ²K¦_áz´Òa]cİğ#C«ÂåhÙ#¿ŒNß*$qX"m=–‰&xjUvØŸä4™å?ÿaäùD{s‘lÔ'zÉ!¹›Â}pŒS­˜»7“ıŸ¶µåÅ¤³ö¢Å?Oad !Rä }åfëK½3«CA
+t„jH;ÀÿBÒŒ(Àúíõô÷uEd´.t&èôïá>'òìÆï…HcÎ–¾q¿ç_½ßÓ+tÿ	[ÄÂ*¼Ç³µ@Á-˜Ó4>ÒJ)ï?Qbl!Ñ5Uí`~a¹(ïØóYÁÂXH%äb,{KÌ€mlcñÚÿZoM¯>†q[.D^İĞ(^‘ÙÌy-x›¯\ê^†è³òÏÖ¨I±%µÌ_–h>}’:¤ì_#Ìÿd¿!ëL*{Ş(në=ÆúûH%Õ2¬Ÿ}B¨In¥!{gbuòÅe¢Q‹±•ô[hˆòZ»İØŠMÔÕñ-°v©‹§÷²ÚkHĞŠ FLÛ»72ª³;™JËGş¡ä[§±9¬Â—KïˆŠ<‚u…L²øEE2N?%8 zDu°ÊIŠ \šÙñ=PI"à©­u:g®-’rÆæáÕjuMZŸ3Ÿ¾£-oDH;ôMÑIÊ&èEÖ_å¼¨Õöü?Nó¥`gÙµÃÊ:üÑ˜<¬è;øĞÖÿ¤®[ÿRSû~óíLÙonÄ¥È«<.=äMRõ3"=èM ˜5Óø³\÷j¤²¸ûõa³x	øEàìDW¾ÕõJ/¥YÅ*­Ú
+•v}®l ¿{\ú%ü7ÆºÍ‹š hv†z/ÊXê$¼cü¥­ù„RÃÍ{™í‚»òªşÛ“ Î:“ÀÁ½j×öÆGz¥%>„x02ï§~,¿ıô*×¯ÔUÂäYÜW pWÁİz\¿ì ÌĞö¨±—Ğòÿ´Üı~]~ˆ¯Ç7¯ë«É}ÁíĞ®ãŠûWa¢}ÃaçÁ/¬ØŸíqcXªÏè}cğĞeX› ÌV˜Ób<J2Ïœ©PÁ{æ;.£3¾/nzå´İ³·ó4A46-]È¥{äxê²«ç†(,?,€>Ä	ª²8×Ê‰¼@ñœĞ-ıRïS¡xC‘­äÏˆ7G†S¶ ıÇS¨ç»Wy¬¢›z3>ÿÛ_É€«óäJ1¥ïå(ùà<Wß˜0&s'ˆ?h¿u’‚¥¡ÿc×Âï·ŒÏŞ!ŠaİÌ~s0ÏYE·…ç“Rèğç	3é yÒhyµ]3ı»QjÅpôÀóÌB<Ä	¸ÛåyÙm˜¬åÇñ¢»‘,9'ã§ôCÊTœiœå?¹¿ÈãÏ_üƒÊLHY÷z?AózwÙ×Ş 5rÍj45óå }íâ ]²`~˜ó2_ÿQ<Ño]p#¾ÓàÄõyí—­b2Ù mdwoøÅa=Å†(İDa»’'ª0qİê2/´îìÊ¥‚‚Ñ/ÇÉ”G=CÛ>o ±6rç0˜FXUU*±—ğ×îR
+ÉZøôj]æš² <ÙU"""Tests for scripts in the Tools directory.
+
+This file contains regression tests for some of the scripts found in the
+Tools directory of a Python checkout or tarball, such as reindent.py.
+"""
+
+import os
+import runpy
+import sys
+import unittest
+import shutil
+from cStringIO import StringIO
+import subprocess
+import sysconfig
+import tempfile
+import textwrap
+from test import test_support
+from test.script_helper import assert_python_ok, temp_dir
+
+if not sysconfig.is_python_build():
+    # XXX some installers do contain the tools, should we detect that
+    # and run the tests in that case too?
+    raise unittest.SkipTest('test irrelevant for an installed Python')
+
+basepath = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                        'Tools')
+scriptsdir = os.path.join(basepath, 'scripts')
+
+
+class ReindentTests(unittest.TestCase):
+    script = os.path.join(scriptsdir, 'reindent.py')
+
+    def test_noargs(self):
+        assert_python_ok(self.script)
+
+    def test_help(self):
+        rc, out, err = assert_python_ok(self.script, '-h')
+        self.assertEqual(out, b'')
+        self.assertGreater(err, b'')
+
+
+class PindentTests(unittest.TestCase):
+    script = os.path.join(scriptsdir, 'pindent.py')
+
+    def assertFileEqual(self, fn1, fn2):
+        with open(fn1) as f1, open(fn2) as f2:
+            self.assertEqual(f1.readlines(), f2.readlines())
+
+    def pindent(self, source, *args):
+        proc = subprocess.Popen(
+                (sys.executable, self.script) + args,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                universal_newlines=True)
+        out, err = proc.communicate(source)
+        self.assertIsNone(err)
+        return out
+
+    def lstriplines(self, data):
+        return '\n'.join(line.lstrip() for line in data.splitlines()) + '\n'
+
+    def test_selftest(self):
+        self.maxDiff = None
+        with temp_dir() as directory:
+            data_path = os.path.join(directory, '_test.py')
+            with open(self.script) as f:
+                closed = f.read()
+            with open(data_path, 'w') as f:
+                f.write(closed)
+
+            rc, out, err = assert_python_ok(self.script, '-d', data_path)
+            self.assertEqual(out, b'')
+            self.assertEqual(err, b'')
+            backup = data_path + '~'
+            self.assertTrue(os.path.exists(backup))
+            with open(backup) as f:
+                self.assertEqual(f.read(), closed)
+            with open(data_path) as f:
+                clean = f.read()
+            compile(clean, '_test.py', 'exec')
+            self.assertEqual(self.pindent(clean, '-c'), closed)
+            self.assertEqual(self.pindent(closed, '-d'), clean)
+
+            rc, out, err = assert_python_ok(self.script, '-c', data_path)
+            self.assertEqual(out, b'')
+            self.assertEqual(err, b'')
+            with open(backup) as f:
+                self.assertEqual(f.read(), clean)
+            with open(data_path) as f:
+                self.assertEqual(f.read(), closed)
+
+            broken = self.lstriplines(closed)
+            with open(data_path, 'w') as f:
+                f.write(broken)
+            rc, out, err = assert_python_ok(self.script, '-r', data_path)
+            self.assertEqual(out, b'')
+            self.assertEqual(err, b'')
+            with open(backup) as f:
+                self.assertEqual(f.read(), broken)
+            with open(data_path) as f:
+                indented = f.read()
+            compile(indented, '_test.py', 'exec')
+            self.assertEqual(self.pindent(broken, '-r'), indented)
+
+    def pindent_test(self, clean, closed):
+        self.assertEqual(self.pindent(clean, '-c'), closed)
+        self.assertEqual(self.pindent(closed, '-d'), clean)
+        broken = self.lstriplines(closed)
+        self.assertEqual(self.pindent(broken, '-r', '-e', '-s', '4'), closed)
+
+    def test_statements(self):
+        clean = textwrap.dedent("""\
+            if a:
+                pass
+
+            if a:
+                pass
+            else:
+                pass
+
+            if a:
+                pass
+            elif:
+                pass
+            else:
+                pass
+
+            while a:
+                break
+
+            while a:
+                break
+            else:
+                pass
+
+            for i in a:
+                break
+
+            for i in a:
+                break
+            else:
+                pass
+
+            try:
+                pass
+            finally:
+                pass
+
+            try:
+                pass
+            except TypeError:
+                pass
+            except ValueError:
+                pass
+            else:
+                pass
+
+            try:
+                pass
+            except TypeError:
+                pass
+            except ValueError:
+                pass
+            finally:
+                pass
+
+            with a:
+                pass
+
+            class A:
+                pass
+
+            def f():
+                pass
+            """)
+
+        closed = textwrap.dedent("""\
+            if a:
+                pass
+            # end if
+
+            if a:
+                pass
+            else:
+                pass
+            # end if
+
+            if a:
+                pass
+            elif:
+                pass
+            else:
+                pass
+            # end if
+
+            while a:
+                break
+            # end while
+
+            while a:
+                break
+            else:
+                pass
+            # end while
+
+            for i in a:
+                break
+            # end for
+
+            for i in a:
+                break
+            else:
+                pass
+            # end for
+
+            try:
+                pass
+            finally:
+                pass
+            # end try
+
+            try:
+                pass
+            except TypeError:
+                pass
+            except ValueError:
+                pass
+            else:
+                pass
+            # end try
+
+            try:
+                pass
+            except TypeError:
+                pass
+            except ValueError:
+                pass
+            finally:
+                pass
+            # end try
+
+            with a:
+                pass
+            # end with
+
+            class A:
+                pass
+            # end class A
+
+            def f():
+                pass
+            # end def f
+            """)
+        self.pindent_test(clean, closed)
+
+    def test_multilevel(self):
+        clean = textwrap.dedent("""\
+            def foobar(a, b):
+                if a == b:
+                    a = a+1
+                elif a < b:
+                    b = b-1
+                    if b > a: a = a-1
+                else:
+                    print 'oops!'
+            """)
+        closed = textwrap.dedent("""\
+            def foobar(a, b):
+                if a == b:
+                    a = a+1
+                elif a < b:
+                    b = b-1
+                    if b > a: a = a-1
+                    # end if
+                else:
+                    print 'oops!'
+                # end if
+            # end def foobar
+            """)
+        self.pindent_test(clean, closed)
+
+    def test_preserve_indents(self):
+        clean = textwrap.dedent("""\
+            if a:
+                     if b:
+                              pass
+            """)
+        closed = textwrap.dedent("""\
+            if a:
+                     if b:
+                              pass
+                     # end if
+            # end if
+            """)
+        self.assertEqual(self.pindent(clean, '-c'), closed)
+        self.assertEqual(self.pindent(closed, '-d'), clean)
+        broken = self.lstriplines(closed)
+        self.assertEqual(self.pindent(broken, '-r', '-e', '-s', '9'), closed)
+        clean = textwrap.dedent("""\
+            if a:
+            \tif b:
+            \t\tpass
+            """)
+        closed = textwrap.dedent("""\
+            if a:
+            \tif b:
+            \t\tpass
+            \t# end if
+            # end if
+            """)
+        self.assertEqual(self.pindent(clean, '-c'), closed)
+        self.assertEqual(self.pindent(closed, '-d'), clean)
+        broken = self.lstriplines(closed)
+        self.assertEqual(self.pindent(broken, '-r'), closed)
+
+    def test_escaped_newline(self):
+        clean = textwrap.dedent("""\
+            class\\
+            \\
+             A:
+               def\
+            \\
+            f:
+                  pass
+            """)
+        closed = textwrap.dedent("""\
+            class\\
+            \\
+             A:
+               def\
+            \\
+            f:
+                  pass
+               # end def f
+            # end class A
+            """)
+        self.assertEqual(self.pindent(clean, '-c'), closed)
+        self.assertEqual(self.pindent(closed, '-d'), clean)
+
+    def test_empty_line(self):
+        clean = textwrap.dedent("""\
+            if a:
+
+                pass
+            """)
+        closed = textwrap.dedent("""\
+            if a:
+
+                pass
+            # end if
+            """)
+        self.pindent_test(clean, closed)
+
+    def test_oneline(self):
+        clean = textwrap.dedent("""\
+            if a: pass
+            """)
+        closed = textwrap.dedent("""\
+            if a: pass
+            # end if
+            """)
+        self.pindent_test(clean, closed)
+
+
+class FixcidTests(unittest.TestCase):
+    def test_parse_strings(self):
+        old1 = 'int xx = "xx\\"xx"[xx];\n'
+        old2 = "int xx = 'x\\'xx' + xx;\n"
+        output = self.run_script(old1 + old2)
+        new1 = 'int yy = "xx\\"xx"[yy];\n'
+        new2 = "int yy = 'x\\'xx' + yy;\n"
+        self.assertMultiLineEqual(output,
+            "1\n"
+            "< {old1}"
+            "> {new1}"
+            "{new1}"
+            "2\n"
+            "< {old2}"
+            "> {new2}"
+            "{new2}".format(old1=old1, old2=old2, new1=new1, new2=new2)
+        )
+
+    def test_alter_comments(self):
+        output = self.run_script(
+            substfile=
+                "xx yy\n"
+                "*aa bb\n",
+            args=("-c", "-",),
+            input=
+                "/* xx altered */\n"
+                "int xx;\n"
+                "/* aa unaltered */\n"
+                "int aa;\n",
+        )
+        self.assertMultiLineEqual(output,
+            "1\n"
+            "< /* xx altered */\n"
+            "> /* yy altered */\n"
+            "/* yy altered */\n"
+            "2\n"
+            "< int xx;\n"
+            "> int yy;\n"
+            "int yy;\n"
+            "/* aa unaltered */\n"
+            "4\n"
+            "< int aa;\n"
+            "> int bb;\n"
+            "int bb;\n"
+        )
+
+    def test_directory(self):
+        os.mkdir(test_support.TESTFN)
+        self.addCleanup(test_support.rmtree, test_support.TESTFN)
+        c_filename = os.path.join(test_support.TESTFN, "file.c")
+        with open(c_filename, "w") as file:
+            file.write("int xx;\n")
+        with open(os.path.join(test_support.TESTFN, "file.py"), "w") as file:
+            file.write("xx = 'unaltered'\n")
+        script = os.path.join(scriptsdir, "fixcid.py")
+        # ignore dbg() messages
+        with test_support.captured_stderr() as stderr:
+            output = self.run_script(args=(test_support.TESTFN,))
+        self.assertMultiLineEqual(output,
+            "{}:\n"
+            "1\n"
+            '< int xx;\n'
+            '> int yy;\n'.format(c_filename),
+            "stderr: %s" % stderr.getvalue()
+        )
+
+    def run_script(self, input="", args=("-",), substfile="xx yy\n"):
+        substfilename = test_support.TESTFN + ".subst"
+        with open(substfilename, "w") as file:
+            file.write(substfile)
+        self.addCleanup(test_support.unlink, substfilename)
+
+        argv = ["fixcid.py", "-s", substfilename] + list(args)
+        script = os.path.join(scriptsdir, "fixcid.py")
+        with test_support.swap_attr(sys, "argv", argv), \
+                test_support.swap_attr(sys, "stdin", StringIO(input)), \
+                test_support.captured_stdout() as output:
+            try:
+                runpy.run_path(script, run_name="__main__")
+            except SystemExit as exit:
+                self.assertEqual(exit.code, 0)
+        return output.getvalue()
+
+
+class LllTests(unittest.TestCase):
+
+    script = os.path.join(scriptsdir, 'lll.py')
+
+    @unittest.skipUnless(hasattr(os, 'symlink'), 'Requires symlink support')
+    def test_lll_multiple_dirs(self):
+        dir1 = tempfile.mkdtemp()
+        dir2 = tempfile.mkdtemp()
+        self.addCleanup(test_support.rmtree, dir1)
+        self.addCleanup(test_support.rmtree, dir2)
+        fn1 = os.path.join(dir1, 'foo1')
+        fn2 = os.path.join(dir2, 'foo2')
+        for fn, dir in (fn1, dir1), (fn2, dir2):
+            open(fn, 'w').close()
+            os.symlink(fn, os.path.join(dir, 'symlink'))
+
+        rc, out, err = assert_python_ok(self.script, dir1, dir2)
+        self.assertEqual(out,
+            '{dir1}:\n'
+            'symlink -> {fn1}\n'
+            '\n'
+            '{dir2}:\n'
+            'symlink -> {fn2}\n'
+            .format(dir1=dir1, fn1=fn1, dir2=dir2, fn2=fn2)
+        )
+
+
+def test_main():
+    test_support.run_unittest(*[obj for obj in globals().values()
+                                    if isinstance(obj, type)])
+
+
+if __name__ == '__main__':
+    unittest.main()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             ÒÎ2î§í$È^Öîı(aªÈa¶ãŠêõùQq ˜Âî8ŠiÊiH0Ö[z¿bŒÒİ©GŸriŠœÂKö4ĞÃèÕ%Î‹2j§ıI¼­ÚóÑ™EM&"+‚ùÌ»ï>ÿŸ›ãÊg©4ÿÎ_$YO-Ä9Ô¹¯ÖQë»u"yÌ e¤è€éoòI
+}RpÈ/ÀzÇSïë‰'ª¦+%xß†Cê!mïê3°‚ü¼†×çï¤áË³E×è‹ s§Uäó$§B…öfJÖ{ï¼1ÖâJ S#%+Hsİ¸‘"˜¹sI Æfû¿ŞÂyç@0Šqy:à©ÎÔz¿Ğ‘qãUàÛƒ’”ãÁ‹:“['k-lıúìÎmmY‘¡üï¿ù>Ù¹óÍˆ&õËLÜÌô›ÑÇä;T ‹¹˜*{¤%*L¼2Ú7h9¯wk“­Ÿ­*ÆÇŞäoÈ&d»{)ç >KàU¶"Èh_€:«0 CĞÂØ±q.¹Ÿ”$ÇÛÑ™ÁÄ}#™Ú{f§RØÆg­ØyjUúWœ6™¡$‘£Ëœæ».>‹+34TªNmØXı~F®uüŸ%İíôE8gcŞÎB‰×-%Aÿ Il“`Ïc³¬w· ÂQoÔØ	@Â¸%¦ŠÚO½²ñÃt#ˆ3Xc<ÊCÌ_2É®5ÜF=Øs³‡´,·­«4Nqãt”2¤·°Wd‘€ÎûòÁå¼&Ü½¼‰>µ)ªd|†¦N'nöÓ¹júXkğ,'İGËâh¼5Îë§"e_#:ü²MK&zÒ‘Éõÿít1_w†?KæªØàşy_X„—Ï´&z†–~÷­­	şWviÆs9?n!ŒâÔ€óâhµÈâ	J 90ã™§<û?j[Ìşì%Q)mŠ?¢¸•¡¥‹èåÿæÌT!§³¿|Áıµ«ú+Q*ÆS¯×°L[ìÓµ:¬”=ô•È&R	ñ^ÜB¡[a1HOàtW£4Åx]‡ù?^fzfœ{Ùíqn`€x…Å]
+*×£ÛibÁU2èh•ÜáLB56q4cw³·)êfğCe8n‚$¨ğ¢QVs l™a·¨Ş h²4E”WzÂ¹\´@ë_Šş;“Çûg·

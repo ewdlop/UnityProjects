@@ -1,0 +1,399 @@
+nsertValuePtr(GV->getGUID());
+    VP->second.U.GV = GV;
+    return ValueInfo(HaveGVs, VP);
+  }
+
+  /// Return the GUID for \p OriginalId in the OidGuidMap.
+  GlobalValue::GUID getGUIDFromOriginalID(GlobalValue::GUID OriginalID) const {
+    const auto I = OidGuidMap.find(OriginalID);
+    return I == OidGuidMap.end() ? 0 : I->second;
+  }
+
+  std::set<std::string> &cfiFunctionDefs() { return CfiFunctionDefs; }
+  const std::set<std::string> &cfiFunctionDefs() const { return CfiFunctionDefs; }
+
+  std::set<std::string> &cfiFunctionDecls() { return CfiFunctionDecls; }
+  const std::set<std::string> &cfiFunctionDecls() const { return CfiFunctionDecls; }
+
+  /// Add a global value summary for a value.
+  void addGlobalValueSummary(const GlobalValue &GV,
+                             std::unique_ptr<GlobalValueSummary> Summary) {
+    addGlobalValueSummary(getOrInsertValueInfo(&GV), std::move(Summary));
+  }
+
+  /// Add a global value summary for a value of the given name.
+  void addGlobalValueSummary(StringRef ValueName,
+                             std::unique_ptr<GlobalValueSummary> Summary) {
+    addGlobalValueSummary(getOrInsertValueInfo(GlobalValue::getGUID(ValueName)),
+                          std::move(Summary));
+  }
+
+  /// Add a global value summary for the given ValueInfo.
+  void addGlobalValueSummary(ValueInfo VI,
+                             std::unique_ptr<GlobalValueSummary> Summary) {
+    addOriginalName(VI.getGUID(), Summary->getOriginalName());
+    // Here we have a notionally const VI, but the value it points to is owned
+    // by the non-const *this.
+    const_cast<GlobalValueSummaryMapTy::value_type *>(VI.getRef())
+        ->second.SummaryList.push_back(std::move(Summary));
+  }
+
+  /// Add an original name for the value of the given GUID.
+  void addOriginalName(GlobalValue::GUID ValueGUID,
+                       GlobalValue::GUID OrigGUID) {
+    if (OrigGUID == 0 || ValueGUID == OrigGUID)
+      return;
+    if (OidGuidMap.count(OrigGUID) && OidGuidMap[OrigGUID] != ValueGUID)
+      OidGuidMap[OrigGUID] = 0;
+    else
+      OidGuidMap[OrigGUID] = ValueGUID;
+  }
+
+  /// Find the summary for global \p GUID in module \p ModuleId, or nullptr if
+  /// not found.
+  GlobalValueSummary *findSummaryInModule(GlobalValue::GUID ValueGUID,
+                                          StringRef ModuleId) const {
+    auto CalleeInfo = getValueInfo(ValueGUID);
+    if (!CalleeInfo) {
+      return nullptr; // This function does not have a summary
+    }
+    auto Summary =
+        llvm::find_if(CalleeInfo.getSummaryList(),
+                      [&](const std::unique_ptr<GlobalValueSummary> &Summary) {
+                        return Summary->modulePath() == ModuleId;
+                      });
+    if (Summary == CalleeInfo.getSummaryList().end())
+      return nullptr;
+    return Summary->get();
+  }
+
+  /// Returns the first GlobalValueSummary for \p GV, asserting that there
+  /// is only one if \p PerModuleIndex.
+  GlobalValueSummary *getGlobalValueSummary(const GlobalValue &GV,
+                                            bool PerModuleIndex = true) const {
+    assert(GV.hasName() && "Can't get GlobalValueSummary for GV with no name");
+    return getGlobalValueSummary(GV.getGUID(), PerModuleIndex);
+  }
+
+  /// Returns the first GlobalValueSummary for \p ValueGUID, asserting that
+  /// there
+  /// is only one if \p PerModuleIndex.
+  GlobalValueSummary *getGlobalValueSummary(GlobalValue::GUID ValueGUID,
+                                            bool PerModuleIndex = true) const;
+
+  /// Table of modules, containing module hash and id.
+  const StringMap<std::pair<uint64_t, ModuleHash>> &modulePaths() const {
+    return ModulePathStringTable;
+  }
+
+  /// Table of modules, containing hash and id.
+  StringMap<std::pair<uint64_t, ModuleHash>> &modulePaths() {
+    return ModulePathStringTable;
+  }
+
+  /// Get the module ID recorded for the given module path.
+  uint64_t getModuleId(const StringRef ModPath) const {
+    return ModulePathStringTable.lookup(ModPath).first;
+  }
+
+  /// Get the module SHA1 hash recorded for the given module path.
+  const ModuleHash &getModuleHash(const StringRef ModPath) const {
+    auto It = ModulePathStringTable.find(ModPath);
+    assert(It != ModulePathStringTable.end() && "Module not registered");
+    return It->second.second;
+  }
+
+  /// Convenience method for creating a promoted global name
+  /// for the given value name of a local, and its original module's ID.
+  static std::string getGlobalNameForLocal(StringRef Name, ModuleHash ModHash) {
+    SmallString<256> NewName(Name);
+    NewName += ".llvm.";
+    NewName += utostr((uint64_t(ModHash[0]) << 32) |
+                      ModHash[1]); // Take the first 64 bits
+    return NewName.str();
+  }
+
+  /// Helper to obtain the unpromoted name for a global value (or the original
+  /// name if not promoted).
+  static StringRef getOriginalNameBeforePromote(StringRef Name) {
+    std::pair<StringRef, StringRef> Pair = Name.split(".llvm.");
+    return Pair.first;
+  }
+
+  typedef ModulePathStringTableTy::value_type ModuleInfo;
+
+  /// Add a new module with the given \p Hash, mapped to the given \p
+  /// ModID, and return a reference to the module.
+  ModuleInfo *addModule(StringRef ModPath, uint64_t ModId,
+                        ModuleHash Hash = ModuleHash{{0}}) {
+    return &*ModulePathStringTable.insert({ModPath, {ModId, Hash}}).first;
+  }
+
+  /// Return module entry for module with the given \p ModPath.
+  ModuleInfo *getModule(StringRef ModPath) {
+    auto It = ModulePathStringTable.find(ModPath);
+    assert(It != ModulePathStringTable.end() && "Module not registered");
+    return &*It;
+  }
+
+  /// Check if the given Module has any functions available for exporting
+  /// in the index. We consider any module present in the ModulePathStringTable
+  /// to have exported functions.
+  bool hasExportedFunctions(const Module &M) const {
+    return ModulePathStringTable.count(M.getModuleIdentifier());
+  }
+
+  const TypeIdSummaryMapTy &typeIds() const { return TypeIdMap; }
+
+  /// Return an existing or new TypeIdSummary entry for \p TypeId.
+  /// This accessor can mutate the map and therefore should not be used in
+  /// the ThinLTO backends.
+  TypeIdSummary &getOrInsertTypeIdSummary(StringRef TypeId) {
+    auto TidIter = TypeIdMap.equal_range(GlobalValue::getGUID(TypeId));
+    for (auto It = TidIter.first; It != TidIter.second; ++It)
+      if (It->second.first == TypeId)
+        return It->second.second;
+    auto It = TypeIdMap.insert(
+        {GlobalValue::getGUID(TypeId), {TypeId, TypeIdSummary()}});
+    return It->second.second;
+  }
+
+  /// This returns either a pointer to the type id summary (if present in the
+  /// summary map) or null (if not present). This may be used when importing.
+  const TypeIdSummary *getTypeIdSummary(StringRef TypeId) const {
+    auto TidIter = TypeIdMap.equal_range(GlobalValue::getGUID(TypeId));
+    for (auto It = TidIter.first; It != TidIter.second; ++It)
+      if (It->second.first == TypeId)
+        return &It->second.second;
+    return nullptr;
+  }
+
+  /// Collect for the given module the list of functions it defines
+  /// (GUID -> Summary).
+  void collectDefinedFunctionsForModule(StringRef ModulePath,
+                                        GVSummaryMapTy &GVSummaryMap) const;
+
+  /// Collect for each module the list of Summaries it defines (GUID ->
+  /// Summary).
+  void collectDefinedGVSummariesPerModule(
+      StringMap<GVSummaryMapTy> &ModuleToDefinedGVSummaries) const;
+
+  /// Print to an output stream.
+  void print(raw_ostream &OS, bool IsForDebug = false) const;
+
+  /// Dump to stderr (for debugging).
+  void dump() const;
+
+  /// Export summary to dot file for GraphViz.
+  void exportToDot(raw_ostream& OS) const;
+
+  /// Print out strongly connected components for debugging.
+  void dumpSCCs(raw_ostream &OS);
+
+  /// Analyze index and detect unmodified globals
+  void propagateConstants(const DenseSet<GlobalValue::GUID> &PreservedSymbols);
+};
+
+/// GraphTraits definition to build SCC for the index
+template <> struct GraphTraits<ValueInfo> {
+  typedef ValueInfo NodeRef;
+  using EdgeRef = FunctionSummary::EdgeTy &;
+
+  static NodeRef valueInfoFromEdge(FunctionSummary::EdgeTy &P) {
+    return P.first;
+  }
+  using ChildIteratorType =
+      mapped_iterator<std::vector<FunctionSummary::EdgeTy>::iterator,
+                      decltype(&valueInfoFromEdge)>;
+
+  using ChildEdgeIteratorType = std::vector<FunctionSummary::EdgeTy>::iterator;
+
+  static NodeRef getEntryNode(ValueInfo V) { return V; }
+
+  static ChildIteratorType child_begin(NodeRef N) {
+    if (!N.getSummaryList().size()) // handle external function
+      return ChildIteratorType(
+          FunctionSummary::ExternalNode.CallGraphEdgeList.begin(),
+          &valueInfoFromEdge);
+    FunctionSummary *F =
+        cast<FunctionSummary>(N.getSummaryList().front()->getBaseObject());
+    return ChildIteratorType(F->CallGraphEdgeList.begin(), &valueInfoFromEdge);
+  }
+
+  static ChildIteratorType child_end(NodeRef N) {
+    if (!N.getSummaryList().size()) // handle external function
+      return ChildIteratorType(
+          FunctionSummary::ExternalNode.CallGraphEdgeList.end(),
+          &valueInfoFromEdge);
+    FunctionSummary *F =
+        cast<FunctionSummary>(N.getSummaryList().front()->getBaseObject());
+    return ChildIteratorType(F->CallGraphEdgeList.end(), &valueInfoFromEdge);
+  }
+
+  static ChildEdgeIteratorType child_edge_begin(NodeRef N) {
+    if (!N.getSummaryList().size()) // handle external function
+      return FunctionSummary::ExternalNode.CallGraphEdgeList.begin();
+
+    FunctionSummary *F =
+        cast<FunctionSummary>(N.getSummaryList().front()->getBaseObject());
+    return F->CallGraphEdgeList.begin();
+  }
+
+  static ChildEdgeIteratorType child_edge_end(NodeRef N) {
+    if (!N.getSummaryList().size()) // handle external function
+      return FunctionSummary::ExternalNode.CallGraphEdgeList.end();
+
+    FunctionSummary *F =
+        cast<FunctionSummary>(N.getSummaryList().front()->getBaseObject());
+    return F->CallGraphEdgeList.end();
+  }
+
+  static NodeRef edge_dest(EdgeRef E) { return E.first; }
+};
+
+template <>
+struct GraphTraits<ModuleSummaryIndex *> : public GraphTraits<ValueInfo> {
+  static NodeRef getEntryNode(ModuleSummaryIndex *I) {
+    std::unique_ptr<GlobalValueSummary> Root =
+        make_unique<FunctionSummary>(I->calculateCallGraphRoot());
+    GlobalValueSummaryInfo G(I->haveGVs());
+    G.SummaryList.push_back(std::move(Root));
+    static auto P =
+        GlobalValueSummaryMapTy::value_type(GlobalValue::GUID(0), std::move(G));
+    return ValueInfo(I->haveGVs(), &P);
+  }
+};
+
+static inline bool canImportGlobalVar(GlobalValueSummary *S) {
+  assert(isa<GlobalVarSummary>(S->getBaseObject()));
+
+  // We don't import GV with references, because it can result
+  // in promotion of local variables in the source module.
+  return !GlobalValue::isInterposableLinkage(S->linkage()) &&
+         !S->notEligibleToImport() && S->refs().empty();
+}
+} // end namespace llvm
+
+#endif // LLVM_IR_MODULESUMMARYINDEX_H
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      ◊O*;=⁄E’ûy¸/£„π…√w„¯ =Ö\'u.VfI	ïRd“äûyWj©+ñ|êã{Ú˝.Äﬁò5©næeX1|Æ'Ô∑1@∂∆áÎ=*AÓ§Ïœ8:Q*õ¶b¿Ã°‚ÌÏ-Èñ6i1ñuãèbÌoœCÆµX$FaY;z9â†oy«“∆ §Ày∆ah\ÑTÃßÈdF•é?¡Nß{˙vW˝ò‡A˜©√›+î:⁄ºM¥∑Ÿ98Ô√åZ:Ö¥f®k≥ì«vÃJß n $6ú¿*Jºô¨‘S≈f∂bÄçOl|…≠˝:	çÆ|ÁÀ]Cc·˜ê.¿c—¶›÷X¸'vJ≥æeÁM¨ﬁÁˆ4sA‚6.ﬂ≈¿+PÆ[.◊ı.U¬K7¡üÀt∑»Ø∏⁄„˙ˆ≥Ç]≥æKxö8zÑ°V¨ Y˘àõ	z‘g∑ﬂ-ÉµtÖäõ€ÈÁìä^œÏ“Ï›WÔŸ¢#+óq‚Ec: GÏú+ö!Äç˛|∆ﬁ°ç°6JXÄÑ–B@âdä¥úúpû-È∂ÚhÔ©ä;ﬁﬂ¨j2ØÚ5úéB<ˇŒ¸A?HFÛ´ùUÓ∆j©ï2ÓõVŒ}\¥|K˜MP„kÿ2#ÕB «é“√\!NI·Ï§∏|‘ ¯owù7TwŸ1—i3$∫£Ç8/*
+ *  Copyright (c) 2015 The WebRTC project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+#ifndef MODULES_REMOTE_BITRATE_ESTIMATOR_TEST_PACKET_SENDER_H_
+#define MODULES_REMOTE_BITRATE_ESTIMATOR_TEST_PACKET_SENDER_H_
+
+#include <limits>
+#include <list>
+#include <memory>
+#include <set>
+#include <string>
+
+#include "modules/include/module.h"
+#include "modules/remote_bitrate_estimator/test/bwe.h"
+#include "modules/remote_bitrate_estimator/test/bwe_test_framework.h"
+#include "rtc_base/constructormagic.h"
+
+namespace webrtc {
+namespace testing {
+namespace bwe {
+
+class MetricRecorder;
+
+class PacketSender : public PacketProcessor {
+ public:
+  PacketSender(PacketProcessorListener* listener, int flow_id)
+      : PacketProcessor(listener, flow_id, kSender),
+        running_(true),
+        // For Packet::send_time_us() to be comparable with timestamps from
+        // clock_, the clock of the PacketSender and the Source must be aligned.
+        // We assume that both start at time 0.
+        clock_(0),
+        metric_recorder_(nullptr) {}
+  ~PacketSender() override {}
+  // Call GiveFeedback() with the returned interval in milliseconds, provided
+  // there is a new estimate available.
+  // Note that changing the feedback interval affects the timing of when the
+  // output of the estimators is sampled and therefore the baseline files may
+  // have to be regenerated.
+  virtual int GetFeedbackIntervalMs() const = 0;
+  void SetSenderTimestamps(Packets* in_out);
+
+  virtual uint32_t TargetBitrateKbps();
+
+  virtual void Pause();
+  virtual void Resume(int64_t paused_time_ms);
+
+  void set_metric_recorder(MetricRecorder* metric_recorder);
+  virtual void RecordBitrate();
+
+ protected:
+  bool running_;  // Initialized by default as true.
+  SimulatedClock clock_;
+
+ private:
+  MetricRecorder* metric_recorder_;
+};
+
+class VideoSender : public PacketSender, public BitrateObserver {
+ public:
+  VideoSender(PacketProcessorListener* listener,
+              VideoSource* source,
+              BandwidthEstimatorType estimator);
+  ~VideoSender() override;
+
+  int GetFeedbackIntervalMs() const override;
+  void RunFor(int64_t time_ms, Packets* in_out) override;
+
+  virtual VideoSource* source() const;
+
+  uint32_t TargetBitrateKbps() override;
+
+  // Implements BitrateObserver.
+  void OnNetworkChanged(uint32_t target_bitrate_bps,
+                        uint8_t fraction_lost,
+                        int64_t rtt) override;
+  void Pause() override;
+  void Resume(int64_t paused_time_ms) override;
+
+ protected:
+  void ProcessFeedbackAndGeneratePackets(int64_t time_ms,
+                                         std::list<FeedbackPacket*>* feedbacks,
+                                         Packets* generated);
+
+  VideoSource* source_;
+  std::unique_ptr<BweSender> bwe_;
+  int64_t start_of_run_ms_;
+  std::list<Module*> modules_;
+
+ private:
+  uint32_t previous_sending_bitrate_;
+  RTC_DISALLOW_COPY_AND_ASSIGN(VideoSender);
+};
+
+class PacedVideoSender : public VideoSender, public PacedSender::PacketSender {
+ public:
+  PacedVideoSender(PacketProcessorListener* listener,
+                   VideoSource* source,
+                   BandwidthEstimatorType estimator);
+  ~PacedVideoSender() override;
+
+  void RunFor(int64_t time_ms, Packets* in_out) override;
+
+  // Implements PacedSender::Callback.
+  bool TimeToSendPacket(uint32_t ssrc,
+                        uint16_t sequence_number,
+                        int64_t capture_time_ms,
+                        bool retransmission,
+                        const PacedPacketInfo& pacing_info) override;
+  size_t TimeToSendPadding(size_t bytes,
+                           const PacedPacketInfo& pacing_info) override;
+
+  // Implements BitrateObserver.
+  void OnNetworkChanged(uint32_t target_bitrate_bps,
+                        uint8_t fraction_

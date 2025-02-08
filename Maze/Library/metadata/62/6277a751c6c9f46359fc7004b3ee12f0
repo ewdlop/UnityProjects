@@ -1,0 +1,337 @@
+torBrowsableState.Advanced)]
+		public bool Focus() {
+			return FocusInternal (false);
+		}
+
+		internal virtual bool FocusInternal (bool skip_check) {
+			if (skip_check || (CanFocus && IsHandleCreated && !has_focus && !is_focusing)) {
+				is_focusing = true;
+				Select(this);
+				is_focusing = false;
+			}
+			return has_focus;
+		}
+
+		internal Control GetRealChildAtPoint (Point pt) {
+			if (!IsHandleCreated)
+				CreateHandle ();
+
+			foreach (Control control in child_controls.GetAllControls ()) {
+				if (control.Bounds.Contains (PointToClient (pt))) {
+					Control child = control.GetRealChildAtPoint (pt);
+					if (child == null)
+						return control;
+					else
+						return child;
+				}
+			}
+
+			return null;
+		}
+
+		public Control GetChildAtPoint(Point pt)
+		{
+			return GetChildAtPoint (pt, GetChildAtPointSkip.None);
+		}
+
+		public Control GetChildAtPoint (Point pt, GetChildAtPointSkip skipValue)
+		{
+			// MS's version causes the handle to be created.  The stack trace shows that get_Handle is called here, but
+			// we'll just call CreateHandle instead.
+			if (!IsHandleCreated)
+				CreateHandle ();
+
+			// Microsoft's version of this function doesn't seem to work, so I can't check
+			// if we only consider children or also grandchildren, etc.
+			// I'm gonna say 'children only'
+			foreach (Control child in Controls) {
+				if ((skipValue & GetChildAtPointSkip.Disabled) == GetChildAtPointSkip.Disabled && !child.Enabled)
+					continue;
+				else if ((skipValue & GetChildAtPointSkip.Invisible) == GetChildAtPointSkip.Invisible && !child.Visible)
+					continue;
+				else if ((skipValue & GetChildAtPointSkip.Transparent) == GetChildAtPointSkip.Transparent && child.BackColor.A == 0x0)
+					continue;
+				else if (child.Bounds.Contains (pt))
+					return child;
+			}
+
+			return null;
+		}
+
+		public IContainerControl GetContainerControl() {
+			Control	current = this;
+
+			while (current!=null) {
+				if ((current is IContainerControl) && ((current.control_style & ControlStyles.ContainerControl)!=0)) {
+					return (IContainerControl)current;
+				}
+				current = current.parent;
+			}
+			return null;
+		}
+
+		internal ContainerControl InternalGetContainerControl() {
+			Control	current = this;
+
+			while (current!=null) {
+				if ((current is ContainerControl) && ((current.control_style & ControlStyles.ContainerControl)!=0)) {
+					return current as ContainerControl;
+				}
+				current = current.parent;
+			}
+			return null;
+		}
+
+		public Control GetNextControl(Control ctl, bool forward)
+		{
+			if (!this.Contains(ctl))
+				ctl = this;
+
+			if (forward)
+				ctl = FindControlForward(this, ctl);
+			else
+				ctl = FindControlBackward(this, ctl);
+
+			if (ctl != this)
+				return ctl;
+
+			return null;
+		}
+
+		private Size ApplySizeConstraints (Size proposedSize) {
+			// If we're bigger than the MaximumSize, fix that
+			if (this.maximum_size.Width != 0 && proposedSize.Width > this.maximum_size.Width)
+				proposedSize.Width = this.maximum_size.Width;
+			if (this.maximum_size.Height != 0 && proposedSize.Height > this.maximum_size.Height)
+				proposedSize.Height = this.maximum_size.Height;
+
+			// If we're smaller than the MinimumSize, fix that
+			if (proposedSize.Width < this.minimum_size.Width)
+				proposedSize.Width = this.minimum_size.Width;
+			if (proposedSize.Height < this.minimum_size.Height)
+				proposedSize.Height = this.minimum_size.Height;
+
+			return proposedSize;
+		}
+
+		[EditorBrowsable (EditorBrowsableState.Advanced)]
+		public virtual Size GetPreferredSize (Size proposedSize) {
+#if !DebugPreferredSizeCache
+			if (can_cache_preferred_size && proposedSize == Size.Empty && !cached_preferred_size.IsEmpty)
+				return cached_preferred_size;
+#endif
+
+			proposedSize = ApplySizeConstraints (proposedSize);
+			Size size = ApplySizeConstraints (GetPreferredSizeCore (proposedSize));
+
+			if (can_cache_preferred_size && proposedSize == Size.Empty) {
+#if DebugPreferredSizeCache				
+				Debug.Assert(cached_preferred_size.IsEmpty || cached_preferred_size == size, "Invalid preferred size cache");
+#endif
+				cached_preferred_size = size;
+			}
+
+			return size;
+		}
+
+		public void Hide() {
+			this.Visible = false;
+		}
+
+		public void Invalidate ()
+		{
+			Invalidate (ClientRectangle, false);
+		}
+
+		public void Invalidate (bool invalidateChildren)
+		{
+			Invalidate (ClientRectangle, invalidateChildren);
+		}
+
+		public void Invalidate (Rectangle rc)
+		{
+			Invalidate (rc, false);
+		}
+
+		public void Invalidate (Rectangle rc, bool invalidateChildren)
+		{
+			// Win32 invalidates control including when Width and Height is equal 0
+			// or is not visible, only Paint event must be care about this.
+			if (!IsHandleCreated)
+				return;
+
+			if (rc.IsEmpty)
+				rc = ClientRectangle;
+				
+			if  (rc.Width > 0 && rc.Height > 0) {
+
+				NotifyInvalidate(rc);
+
+				XplatUI.Invalidate(Handle, rc, false);
+
+				if (invalidateChildren) {
+					Control [] controls = child_controls.GetAllControls ();
+					for (int i=0; i<controls.Length; i++)
+						controls [i].Invalidate ();
+				} else {
+					// If any of our children are transparent, we
+					// have to invalidate them anyways
+					foreach (Control c in Controls)
+						if (c.BackColor.A != 255)
+							c.Invalidate ();
+				}
+			}
+			OnInvalidated(new InvalidateEventArgs(rc));
+		}
+
+		public void Invalidate (Region region)
+		{
+			Invalidate (region, false);
+		}
+
+		public void Invalidate (Region region, bool invalidateChildren)
+		{
+			using (Graphics g = CreateGraphics ()){
+				RectangleF bounds = region.GetBounds (g);
+				Invalidate (new Rectangle ((int) bounds.X, (int) bounds.Y, (int) bounds.Width, (int) bounds.Height), invalidateChildren);
+			}
+		}
+
+		public object Invoke (Delegate method) {
+			object [] prms = null;
+			if (method is EventHandler)
+				prms = new object [] { this, EventArgs.Empty };
+
+			return Invoke(method, prms);
+		}
+		public object Invoke (Delegate method, params object [] args) {
+			Control control = FindControlToInvokeOn ();
+			
+			if (!this.InvokeRequired) {
+				return method.DynamicInvoke(args);
+			}
+
+			IAsyncResult result = BeginInvokeInternal (method, args, control);
+			return EndInvoke(result);
+		}
+
+		[EditorBrowsable(EditorBrowsableState.Advanced)]
+		public void PerformLayout () {
+			PerformLayout (null, null);
+		}
+
+		[EditorBrowsable(EditorBrowsableState.Advanced)]
+		public void PerformLayout (Control affectedControl, string affectedProperty) {
+			cached_preferred_size = Size.Empty;
+			if (affectedControl != null)
+				affectedControl.cached_preferred_size = Size.Empty;
+			PerformLayout ((IComponent) affectedControl, affectedProperty);
+		}
+
+		internal void PerformLayout (IComponent affectedComponent, string affectedProperty)
+		{
+			LayoutEventArgs levent = new LayoutEventArgs (affectedComponent, affectedProperty);
+
+			if (layout_suspended > 0) {
+				if (layout_pending_event_args == null || layout_pending_after_resume)
+					layout_pending_event_args = levent;
+				layout_pending = true;
+				layout_pending_after_resume = false;					
+				return;
+			}
+					
+			layout_pending = false;
+
+			// Prevent us from getting messed up
+			layout_suspended++;
+
+			// Perform all Dock and Anchor calculations
+			try {
+				OnLayout(levent);
+			}
+			// Need to make sure we decremend layout_suspended
+			finally {
+				layout_suspended--;
+				layout_dirty = false;
+
+				if (parent != null && parent.layout_dirty)
+					parent.PerformLayout(this, "PreferredSize");
+			}
+		}
+
+		void IArrangedContainer.PerformLayout (IArrangedElement affectedElement, string affectedProperty)
+		{
+			PerformLayout (affectedElement, affectedProperty);
+		}
+
+		public Point PointToClient (Point p) {
+			int x = p.X;
+			int y = p.Y;
+
+			XplatUI.ScreenToClient (Handle, ref x, ref y);
+
+			return new Point (x, y);
+		}
+
+		public Point PointToScreen(Point p) {
+			int x = p.X;
+			int y = p.Y;
+
+			XplatUI.ClientToScreen(Handle, ref x, ref y);
+
+			return new Point(x, y);
+		}
+
+		[EditorBrowsable(EditorBrowsableState.Advanced)]
+		public PreProcessControlState PreProcessControlMessage (ref Message msg)
+		{
+			return PreProcessControlMessageInternal (ref msg);
+		}
+
+		internal PreProcessControlState PreProcessControlMessageInternal (ref Message msg)
+		{
+			switch ((Msg)msg.Msg) {
+				case Msg.WM_KEYDOWN:
+				case Msg.WM_SYSKEYDOWN:
+					PreviewKeyDownEventArgs e = new PreviewKeyDownEventArgs ((Keys)msg.WParam.ToInt32 () | XplatUI.State.ModifierKeys);
+					OnPreviewKeyDown (e);
+				
+					if (e.IsInputKey)
+						return PreProcessControlState.MessageNeeded;
+				
+					if (PreProcessMessage (ref msg))
+						return PreProcessControlState.MessageProcessed;
+
+					if (IsInputKey ((Keys)msg.WParam.ToInt32 () | XplatUI.State.ModifierKeys))
+						return PreProcessControlState.MessageNeeded;	
+					
+					break;
+				case Msg.WM_CHAR:
+				case Msg.WM_SYSCHAR:
+					if (PreProcessMessage (ref msg))
+						return PreProcessControlState.MessageProcessed;
+						
+					if (IsInputChar ((char)msg.WParam))
+						return PreProcessControlState.MessageNeeded;
+						
+					break;
+				default:
+					break;
+			}
+				
+			return PreProcessControlState.MessageNotNeeded;
+		}
+		
+		public virtual bool PreProcessMessage (ref Message msg)
+		{
+			return InternalPreProcessMessage (ref msg);
+		}
+
+		internal virtual bool InternalPreProcessMessage (ref Message msg) {
+			Keys key_data;
+
+			if ((msg.Msg == (int)Msg.WM_KEYDOWN) || (msg.Msg == (int)Msg.WM_SYSKEYDOWN)) {
+				key_data = (Keys)msg.WParam.ToInt32() | XplatUI.State.ModifierKeys;
+
+				if (!ProcessCmdKey(ref msg, key_data)) {
+					if (IsInputKey(k

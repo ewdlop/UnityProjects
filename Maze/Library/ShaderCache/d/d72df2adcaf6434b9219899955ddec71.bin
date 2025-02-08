@@ -1,0 +1,45 @@
+on[0]==6 && info.formatVersion[1]>=1)) {
+            /* mask off possible future extensions to be safe */
+            mbcsTable->unicodeMask=(uint8_t)(sharedData->staticData->unicodeMask&3);
+        } else {
+            /* for older versions, assume worst case: contains anything possible (prevent over-optimizations) */
+            mbcsTable->unicodeMask=UCNV_HAS_SUPPLEMENTARY|UCNV_HAS_SURROGATES;
+        }
+
+        /*
+         * _MBCSHeader.version 4.3 adds utf8Friendly data structures.
+         * Check for the header version, SBCS vs. MBCS, and for whether the
+         * data structures are optimized for code points as high as what the
+         * runtime code is designed for.
+         * The implementation does not handle mapping tables with entries for
+         * unpaired surrogates.
+         */
+        if( header->version[1]>=3 &&
+            (mbcsTable->unicodeMask&UCNV_HAS_SURROGATES)==0 &&
+            (mbcsTable->countStates==1 ?
+                (header->version[2]>=(SBCS_FAST_MAX>>8)) :
+                (header->version[2]>=(MBCS_FAST_MAX>>8))
+            )
+        ) {
+            mbcsTable->utf8Friendly=TRUE;
+
+            if(mbcsTable->countStates==1) {
+                /*
+                 * SBCS: Stage 3 is allocated in 64-entry blocks for U+0000..SBCS_FAST_MAX or higher.
+                 * Build a table with indexes to each block, to be used instead of
+                 * the regular stage 1/2 table.
+                 */
+                int32_t i;
+                for(i=0; i<(SBCS_FAST_LIMIT>>6); ++i) {
+                    mbcsTable->sbcsIndex[i]=mbcsTable->fromUnicodeTable[mbcsTable->fromUnicodeTable[i>>4]+((i<<2)&0x3c)];
+                }
+                /* set SBCS_FAST_MAX to reflect the reach of sbcsIndex[] even if header->version[2]>(SBCS_FAST_MAX>>8) */
+                mbcsTable->maxFastUChar=SBCS_FAST_MAX;
+            } else {
+                /*
+                 * MBCS: Stage 3 is allocated in 64-entry blocks for U+0000..MBCS_FAST_MAX or higher.
+                 * The .cnv file is prebuilt with an additional stage table with indexes
+                 * to each block.
+                 */
+                mbcsTable->mbcsIndex=(const uint16_t *)
+         

@@ -1,0 +1,264 @@
+/*
+ * Copyright 2013-2014 Ecole Normale Superieure
+ * Copyright 2014      INRIA Rocquencourt
+ * Copyright 2016      Sven Verdoolaege
+ *
+ * Use of this software is governed by the MIT license
+ *
+ * Written by Sven Verdoolaege,
+ * Ecole Normale Superieure, 45 rue d'Ulm, 75230 Paris, France
+ * and Inria Paris - Rocquencourt, Domaine de Voluceau - Rocquencourt,
+ * B.P. 105 - 78153 Le Chesnay, France
+ */
+
+#include <isl/set.h>
+#include <isl_schedule_band.h>
+#include <isl_schedule_private.h>
+#include <isl_schedule_node_private.h>
+
+/* Create a new schedule node in the given schedule, point at the given
+ * tree with given ancestors and child positions.
+ * "child_pos" may be NULL if there are no ancestors.
+ */
+__isl_give isl_schedule_node *isl_schedule_node_alloc(
+	__isl_take isl_schedule *schedule, __isl_take isl_schedule_tree *tree,
+	__isl_take isl_schedule_tree_list *ancestors, int *child_pos)
+{
+	isl_ctx *ctx;
+	isl_schedule_node *node;
+	int i, n;
+
+	if (!schedule || !tree || !ancestors)
+		goto error;
+	n = isl_schedule_tree_list_n_schedule_tree(ancestors);
+	if (n > 0 && !child_pos)
+		goto error;
+	ctx = isl_schedule_get_ctx(schedule);
+	node = isl_calloc_type(ctx, isl_schedule_node);
+	if (!node)
+		goto error;
+	node->ref = 1;
+	node->schedule = schedule;
+	node->tree = tree;
+	node->ancestors = ancestors;
+	node->child_pos = isl_alloc_array(ctx, int, n);
+	if (n && !node->child_pos)
+		return isl_schedule_node_free(node);
+	for (i = 0; i < n; ++i)
+		node->child_pos[i] = child_pos[i];
+
+	return node;
+error:
+	isl_schedule_free(schedule);
+	isl_schedule_tree_free(tree);
+	isl_schedule_tree_list_free(ancestors);
+	return NULL;
+}
+
+/* Return a pointer to the root of a schedule tree with as single
+ * node a domain node with the given domain.
+ */
+__isl_give isl_schedule_node *isl_schedule_node_from_domain(
+	__isl_take isl_union_set *domain)
+{
+	isl_schedule *schedule;
+	isl_schedule_node *node;
+
+	schedule = isl_schedule_from_domain(domain);
+	node = isl_schedule_get_root(schedule);
+	isl_schedule_free(schedule);
+
+	return node;
+}
+
+/* Return a pointer to the root of a schedule tree with as single
+ * node a extension node with the given extension.
+ */
+__isl_give isl_schedule_node *isl_schedule_node_from_extension(
+	__isl_take isl_union_map *extension)
+{
+	isl_ctx *ctx;
+	isl_schedule *schedule;
+	isl_schedule_tree *tree;
+	isl_schedule_node *node;
+
+	if (!extension)
+		return NULL;
+
+	ctx = isl_union_map_get_ctx(extension);
+	tree = isl_schedule_tree_from_extension(extension);
+	schedule = isl_schedule_from_schedule_tree(ctx, tree);
+	node = isl_schedule_get_root(schedule);
+	isl_schedule_free(schedule);
+
+	return node;
+}
+
+/* Return the isl_ctx to which "node" belongs.
+ */
+isl_ctx *isl_schedule_node_get_ctx(__isl_keep isl_schedule_node *node)
+{
+	return node ? isl_schedule_get_ctx(node->schedule) : NULL;
+}
+
+/* Return a pointer to the leaf of the schedule into which "node" points.
+ */
+__isl_keep isl_schedule_tree *isl_schedule_node_peek_leaf(
+	__isl_keep isl_schedule_node *node)
+{
+	return node ? isl_schedule_peek_leaf(node->schedule) : NULL;
+}
+
+/* Return a copy of the leaf of the schedule into which "node" points.
+ */
+__isl_give isl_schedule_tree *isl_schedule_node_get_leaf(
+	__isl_keep isl_schedule_node *node)
+{
+	return isl_schedule_tree_copy(isl_schedule_node_peek_leaf(node));
+}
+
+/* Return the type of the node or isl_schedule_node_error on error.
+ */
+enum isl_schedule_node_type isl_schedule_node_get_type(
+	__isl_keep isl_schedule_node *node)
+{
+	return node ? isl_schedule_tree_get_type(node->tree)
+		    : isl_schedule_node_error;
+}
+
+/* Return the type of the parent of "node" or isl_schedule_node_error on error.
+ */
+enum isl_schedule_node_type isl_schedule_node_get_parent_type(
+	__isl_keep isl_schedule_node *node)
+{
+	int pos;
+	int has_parent;
+	isl_schedule_tree *parent;
+	enum isl_schedule_node_type type;
+
+	if (!node)
+		return isl_schedule_node_error;
+	has_parent = isl_schedule_node_has_parent(node);
+	if (has_parent < 0)
+		return isl_schedule_node_error;
+	if (!has_parent)
+		isl_die(isl_schedule_node_get_ctx(node), isl_error_invalid,
+			"node has no parent", return isl_schedule_node_error);
+
+	pos = isl_schedule_tree_list_n_schedule_tree(node->ancestors) - 1;
+	parent = isl_schedule_tree_list_get_schedule_tree(node->ancestors, pos);
+	type = isl_schedule_tree_get_type(parent);
+	isl_schedule_tree_free(parent);
+
+	return type;
+}
+
+/* Return a copy of the subtree that this node points to.
+ */
+__isl_give isl_schedule_tree *isl_schedule_node_get_tree(
+	__isl_keep isl_schedule_node *node)
+{
+	if (!node)
+		return NULL;
+
+	return isl_schedule_tree_copy(node->tree);
+}
+
+/* Return a copy of the schedule into which "node" points.
+ */
+__isl_give isl_schedule *isl_schedule_node_get_schedule(
+	__isl_keep isl_schedule_node *node)
+{
+	if (!node)
+		return NULL;
+	return isl_schedule_copy(node->schedule);
+}
+
+/* Return a fresh copy of "node".
+ */
+__isl_take isl_schedule_node *isl_schedule_node_dup(
+	__isl_keep isl_schedule_node *node)
+{
+	if (!node)
+		return NULL;
+
+	return isl_schedule_node_alloc(isl_schedule_copy(node->schedule),
+				isl_schedule_tree_copy(node->tree),
+				isl_schedule_tree_list_copy(node->ancestors),
+				node->child_pos);
+}
+
+/* Return an isl_schedule_node that is equal to "node" and that has only
+ * a single reference.
+ */
+__isl_give isl_schedule_node *isl_schedule_node_cow(
+	__isl_take isl_schedule_node *node)
+{
+	if (!node)
+		return NULL;
+
+	if (node->ref == 1)
+		return node;
+	node->ref--;
+	return isl_schedule_node_dup(node);
+}
+
+/* Return a new reference to "node".
+ */
+__isl_give isl_schedule_node *isl_schedule_node_copy(
+	__isl_keep isl_schedule_node *node)
+{
+	if (!node)
+		return NULL;
+
+	node->ref++;
+	return node;
+}
+
+/* Free "node" and return NULL.
+ */
+__isl_null isl_schedule_node *isl_schedule_node_free(
+	__isl_take isl_schedule_node *node)
+{
+	if (!node)
+		return NULL;
+	if (--node->ref > 0)
+		return NULL;
+
+	isl_schedule_tree_list_free(node->ancestors);
+	free(node->child_pos);
+	isl_schedule_tree_free(node->tree);
+	isl_schedule_free(node->schedule);
+	free(node);
+
+	return NULL;
+}
+
+/* Do "node1" and "node2" point to the same position in the same
+ * schedule?
+ */
+isl_bool isl_schedule_node_is_equal(__isl_keep isl_schedule_node *node1,
+	__isl_keep isl_schedule_node *node2)
+{
+	int i, n1, n2;
+
+	if (!node1 || !node2)
+		return isl_bool_error;
+	if (node1 == node2)
+		return isl_bool_true;
+	if (node1->schedule != node2->schedule)
+		return isl_bool_false;
+
+	n1 = isl_schedule_node_get_tree_depth(node1);
+	n2 = isl_schedule_node_get_tree_depth(node2);
+	if (n1 != n2)
+		return isl_bool_false;
+	for (i = 0; i < n1; ++i)
+		if (node1->child_pos[i] != node2->child_pos[i])
+			return isl_bool_false;
+
+	return isl_bool_true;
+}
+
+/* Return the number of outer schedule dimensions of "node"
+ * in its sched

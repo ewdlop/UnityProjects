@@ -1,0 +1,44 @@
+//------------------------------------------------------------
+// Copyright (c) Microsoft Corporation.  All rights reserved.
+//------------------------------------------------------------
+
+namespace System.Runtime
+{
+    using System.Threading;
+    using System.Security;
+
+    // IOThreadScheduler takes no locks due to contention problems on multiproc.
+    [Fx.Tag.SynchronizationPrimitive(Fx.Tag.BlocksUsing.NonBlocking)]
+    class IOThreadScheduler
+    {
+        // Do not increase the maximum capacity above 32k!  It must be a power of two, 0x8000 or less, in order to
+        // work with the strategy for 'headTail'.
+        const int MaximumCapacity = 0x8000;
+
+        [Fx.Tag.SecurityNote(Miscellaneous = "can be called outside user context")]
+        static class Bits
+        {
+            public const int HiShift     = 32 / 2;
+
+            public const int HiOne       = 1 << HiShift;
+            public const int LoHiBit     = HiOne >> 1;
+            public const int HiHiBit     = LoHiBit << HiShift;
+            public const int LoCountMask = LoHiBit - 1;
+            public const int HiCountMask = LoCountMask << HiShift;
+            public const int LoMask      = LoCountMask | LoHiBit;
+            public const int HiMask      = HiCountMask | HiHiBit;
+            public const int HiBits      = LoHiBit | HiHiBit;
+
+            public static int Count(int slot)
+            {
+                return ((slot >> HiShift) - slot + 2 & LoMask) - 1;
+            }
+
+            public static int CountNoIdle(int slot)
+            {
+                return (slot >> HiShift) - slot + 1 & LoMask;
+            }
+
+            public static int IncrementLo(int slot)
+            {
+  

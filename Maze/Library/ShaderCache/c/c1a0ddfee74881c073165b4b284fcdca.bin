@@ -1,0 +1,83 @@
+ay only call this method on themselves.  It is entended to
+    // support the ICloneable interface.
+    // 
+    [System.Security.SecuritySafeCritical]  // auto-generated
+    [ResourceExposure(ResourceScope.None)]
+    [MethodImplAttribute(MethodImplOptions.InternalCall)]
+    protected extern Object MemberwiseClone();
+    
+   
+    // Sets the value specified in the variant on the field
+    // 
+    [System.Security.SecurityCritical]  // auto-generated
+    private void FieldSetter(String typeName, String fieldName, Object val)
+    {
+        Contract.Requires(typeName != null);
+        Contract.Requires(fieldName != null);
+
+        // Extract the field info object
+        FieldInfo fldInfo = GetFieldInfo(typeName, fieldName);
+
+        if (fldInfo.IsInitOnly)
+            throw new FieldAccessException(Environment.GetResourceString("FieldAccess_InitOnly"));
+
+        // Make sure that the value is compatible with the type
+        // of field
+#if FEATURE_REMOTING        
+        System.Runtime.Remoting.Messaging.Message.CoerceArg(val, fldInfo.FieldType);    
+#else
+        Type pt=fldInfo.FieldType;
+        if (pt.IsByRef) 
+        {
+            pt = pt.GetElementType();
+        }
+    
+        if (!pt.IsInstanceOfType(val))
+        {
+            val = Convert.ChangeType(val, pt, CultureInfo.InvariantCulture);
+        }
+
+#endif
+
+        // Set the value            
+        fldInfo.SetValue(this, val);
+    }
+    
+    // Gets the value specified in the variant on the field
+    // 
+    private void FieldGetter(String typeName, String fieldName, ref Object val)
+    {
+        Contract.Requires(typeName != null);
+        Contract.Requires(fieldName != null);
+
+        // Extract the field info object
+        FieldInfo fldInfo = GetFieldInfo(typeName, fieldName);
+
+        // Get the value
+        val = fldInfo.GetValue(this);            
+    }
+
+    // Gets the field info object given the type name and field name.
+    // 
+    private FieldInfo GetFieldInfo(String typeName, String fieldName)
+    {
+        Contract.Requires(typeName != null);
+        Contract.Requires(fieldName != null);
+        Contract.Ensures(Contract.Result<FieldInfo>() != null);
+
+        Type t = GetType();
+        while(null != t)
+        {
+            if(t.FullName.Equals(typeName))
+            {
+                break;
+            }
+
+            t = t.BaseType;
+        }
+        
+        if (null == t)
+        {
+#if FEATURE_REMOTING         
+            throw new RemotingException(String.Format(
+                CultureInfo.CurrentCulture, Environment.GetResourceString("Remot

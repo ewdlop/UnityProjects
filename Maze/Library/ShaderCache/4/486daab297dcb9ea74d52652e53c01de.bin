@@ -1,0 +1,74 @@
+t* Object : InContext.Objects)
+	{
+		if(FDataprepCoreUtils::IsAsset(Object) && !UsedAssets.Contains(Object))
+		{
+			ObjectsToDelete.Add(Object);
+		}
+	}
+
+	DeleteObjects( ObjectsToDelete );
+}
+
+void UDataprepCompactSceneGraphOperation::OnExecution_Implementation(const FDataprepContext& InContext)
+{
+#ifdef LOG_TIME
+	DataprepEditingOperationTime::FTimeLogger TimeLogger(TEXT("CompactSceneGraph"), [&](FText Text) { this->LogInfo(Text); });
+#endif
+
+	TMap<AActor*, bool> VisibilityMap;
+	for (UObject* Object : InContext.Objects)
+	{
+		if (!ensure(Object) || Object->IsPendingKill())
+		{
+			continue;
+		}
+
+		if (AActor* Actor = Cast<AActor>(Object))
+		{
+			IsActorVisible(Actor, VisibilityMap);
+		}
+	}
+
+	TArray<UObject*> ObjectsToDelete;
+	ObjectsToDelete.Reserve(InContext.Objects.Num());
+
+	for (const TPair<AActor*, bool>& ActorVisiblity : VisibilityMap)
+	{
+		if (!ActorVisiblity.Value)
+		{
+			ObjectsToDelete.Add(ActorVisiblity.Key);
+		}
+	}
+
+	DeleteObjects(ObjectsToDelete);
+}
+
+void UDataprepSpawnActorsAtLocation::OnExecution_Implementation(const FDataprepContext& InContext)
+{
+#ifdef LOG_TIME
+	DataprepEditingOperationTime::FTimeLogger TimeLogger(TEXT("SpawnActorsAtLocation"), [&](FText Text) { this->LogInfo(Text); });
+#endif
+
+	if (!SelectedAsset)
+	{
+		UE_LOG(LogDataprep, Log, TEXT("No asset was selected"));
+		return;
+	}
+
+	for (UObject* Object : InContext.Objects)
+	{
+		if (!ensure(Object) || Object->IsPendingKill())
+		{
+			continue;
+		}
+
+		if (AActor* Actor = Cast<AActor>(Object))
+		{
+			const FAssetData AssetData(SelectedAsset);
+
+			if (!AssetData.IsValid())
+			{
+				continue;
+			}
+
+			UClass* AssetClass = Cast<UClass>(S

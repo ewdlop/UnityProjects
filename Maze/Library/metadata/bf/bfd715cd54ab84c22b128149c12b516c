@@ -1,0 +1,104 @@
+//
+// WsdlImporter.cs
+//
+// Authors:
+//	Atsushi Enomoto <atsushi@ximian.com>
+//	Ankit Jain <jankit@novell.com>	
+//	Martin Baulig <martin.baulig@xamarin.com>
+//
+// Copyright (C) 2005 Novell, Inc.  http://www.novell.com
+// Copyright (c) 2012 Xamarin Inc. (http://www.xamarin.com)
+//
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+// 
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+//
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.ServiceModel;
+using System.ServiceModel.Channels;
+using System.Web.Services.Description;
+using System.Xml;
+using System.Xml.Schema;
+
+using SMBinding = System.ServiceModel.Channels.Binding;
+using WS = System.Web.Services.Description;
+using WSServiceDescription = System.Web.Services.Description.ServiceDescription;
+using WSBinding = System.Web.Services.Description.Binding;
+using WSMessage = System.Web.Services.Description.Message;
+using QName = System.Xml.XmlQualifiedName;
+
+namespace System.ServiceModel.Description
+{
+	[MonoTODO]
+	public class WsdlImporter : MetadataImporter
+	{
+		ServiceDescriptionCollection wsdl_documents;
+		XmlSchemaSet xmlschemas;
+		List<XmlElement> policies; /* ?? */
+		MetadataSet metadata;
+		bool beforeImportCalled;
+
+		KeyedByTypeCollection<IWsdlImportExtension> wsdl_extensions;
+			
+		//Imported
+		Collection<ContractDescription> contracts = null;
+		ServiceEndpointCollection endpoint_colln = null;
+
+		// Contract by PortType
+		Dictionary<PortType, ContractDescription> contractHash = null;
+		// ServiceEndpoint by WSBinding
+		Dictionary<WSBinding, ServiceEndpoint> bindingHash = null;
+		// ServiceEndpoint by Port
+		Dictionary<Port, ServiceEndpoint> endpointHash = null;
+
+		public WsdlImporter (
+			MetadataSet metadata,
+			IEnumerable<IPolicyImportExtension> policyImportExtensions,
+			IEnumerable<IWsdlImportExtension> wsdlImportExtensions)
+			: base (policyImportExtensions)
+		{
+			if (metadata == null)
+				throw new ArgumentNullException ("metadata");
+			
+			if (wsdlImportExtensions == null) {
+				wsdl_extensions = new KeyedByTypeCollection<IWsdlImportExtension> ();
+
+				wsdl_extensions.Add (new DataContractSerializerMessageContractImporter ());
+				wsdl_extensions.Add (new XmlSerializerMessageContractImporter ());
+				wsdl_extensions.Add (new MessageEncodingBindingElementImporter ());
+				wsdl_extensions.Add (new TransportBindingElementImporter ());
+				wsdl_extensions.Add (new StandardBindingImporter ());
+			} else {
+				wsdl_extensions = new KeyedByTypeCollection<IWsdlImportExtension> (wsdlImportExtensions);
+			}
+
+			// It is okay to fill these members immediately when WsdlImporter.ctor() is invoked
+			// i.e. after this .ctor(), those metadata docs are not considered anymore.
+			this.metadata = metadata;
+			this.wsdl_documents = new ServiceDescriptionCollection ();
+			this.xmlschemas = new XmlSchemaSet ();
+			this.policies = new List<XmlElement> ();
+			this.contractHash = new Dictionary<PortType, ContractDescription> ();
+			this.bindingHash = new Dictionary<WSBinding, ServiceEndpoint> ();
+			this.endpointHash = new Dictionary<Port, ServiceEndpoint> ();
+
+			foreach (MetadataSection ms in metadata.MetadataSections) {
+				if (ms.Dialect == MetadataSection.ServiceDescriptionDialect &&
+					ms.Metadata.GetType 

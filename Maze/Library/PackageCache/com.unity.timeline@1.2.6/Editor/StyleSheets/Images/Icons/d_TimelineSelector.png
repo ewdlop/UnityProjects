@@ -1,0 +1,439 @@
+y2D<float*> deepFData;
+    Array2D<half*> deepHData;
+
+    Array2D<unsigned int> sampleCount;
+
+    cout << "Reading partial files " << flush;
+    MultiPartInputFile file (fn.c_str());
+
+    for (int i = 0; i < randomReadCount; i++)
+    {
+        int partNumber = rand() % file.parts();
+        int partType = partTypes[partNumber];
+        int pixelType = pixelTypes[partNumber];
+        int levelMode = levelModes[partNumber];
+
+        switch (partType)
+        {
+            case 0:
+            {
+                int l1, l2;
+                l1 = rand() % height;
+                l2 = rand() % height;
+                if (l1 > l2) swap(l1, l2);
+
+                InputPart part(file, partNumber);
+
+                FrameBuffer frameBuffer;
+                setInputFrameBuffer(frameBuffer, pixelType,
+                                    uData, fData, hData, width, height);
+
+                part.setFrameBuffer(frameBuffer);
+                part.readPixels(l1, l2);
+
+                switch (pixelType)
+                {
+                    case 0:
+                        assert(checkPixels<unsigned int>(uData, 0, width - 1, l1, l2, width));
+                        break;
+                    case 1:
+                        assert(checkPixels<float>(fData, 0, width - 1, l1, l2, width));
+                        break;
+                    case 2:
+                        assert(checkPixels<half>(hData, 0, width - 1, l1, l2, width));
+                        break;
+                }
+
+                break;
+            }
+            case 1:
+            {
+                int tx1, tx2, ty1, ty2;
+                int lx, ly;
+
+                TiledInputPart part(file, partNumber);
+
+                int numXLevels = part.numXLevels();
+                int numYLevels = part.numYLevels();
+
+                lx = rand() % numXLevels;
+                ly = rand() % numYLevels;
+                if (levelMode == 1) ly = lx;
+
+                int w = part.levelWidth(lx);
+                int h = part.levelHeight(ly);
+
+                int numXTiles = part.numXTiles(lx);
+                int numYTiles = part.numYTiles(ly);
+                tx1 = rand() % numXTiles;
+                tx2 = rand() % numXTiles;
+                ty1 = rand() % numYTiles;
+                ty2 = rand() % numYTiles;
+                if (tx1 > tx2) swap(tx1, tx2);
+                if (ty1 > ty2) swap(ty1, ty2);
+
+                FrameBuffer frameBuffer;
+                setInputFrameBuffer(frameBuffer, pixelType,
+                                    uData, fData, hData, w, h);
+
+                part.setFrameBuffer(frameBuffer);
+                part.readTiles(tx1, tx2, ty1, ty2, lx, ly);
+
+                Box2i b1 = part.dataWindowForTile(tx1, ty1, lx, ly);
+                Box2i b2 = part.dataWindowForTile(tx2, ty2, lx, ly);
+
+                switch (pixelType)
+                {
+                    case 0:
+                        assert(checkPixels<unsigned int>(uData, b1.min.x, b2.max.x, b1.min.y, b2.max.y,
+                                                         w));
+                        break;
+                    case 1:
+                        assert(checkPixels<float>(fData, b1.min.x, b2.max.x, b1.min.y, b2.max.y,
+                                                  w));
+                        break;
+                    case 2:
+                        assert(checkPixels<half>(hData, b1.min.x, b2.max.x, b1.min.y, b2.max.y,
+                                                 w));
+                        break;
+                }
+
+                break;
+            }
+            case 2:
+            {
+                DeepScanLineInputPart part(file, partNumber);
+
+                DeepFrameBuffer frameBuffer;
+
+                sampleCount.resizeErase(height, width);
+                frameBuffer.insertSampleCountSlice (Slice (IMF::UINT,
+                                                    (char *) (&sampleCount[0][0]),
+                                                    sizeof (unsigned int) * 1,
+                                                    sizeof (unsigned int) * width));
+
+                setInputDeepFrameBuffer(frameBuffer, pixelType,
+                                        deepUData, deepFData, deepHData, width, height);
+
+                part.setFrameBuffer(frameBuffer);
+
+                int l1, l2;
+                l1 = rand() % height;
+                l2 = rand() % height;
+                if (l1 > l2) swap(l1, l2);
+
+                part.readPixelSampleCounts(l1, l2);
+                assert(checkSampleCount(sampleCount, 0, width - 1, l1, l2, width));
+
+                allocatePixels(pixelType, sampleCount,
+                               deepUData, deepFData, deepHData, 0, width - 1, l1, l2);
+
+                part.readPixels(l1, l2);
+
+                switch (pixelType)
+                {
+                    case 0:
+                        assert(checkPixels<unsigned int>(sampleCount, deepUData, 0, width - 1, l1, l2, width));
+                        break;
+                    case 1:
+                        assert(checkPixels<float>(sampleCount, deepFData, 0, width - 1, l1, l2, width));
+                        break;
+                    case 2:
+                        assert(checkPixels<half>(sampleCount, deepHData, 0, width - 1, l1, l2, width));
+                        break;
+                }
+
+                releasePixels(pixelType, deepUData, deepFData, deepHData, 0, width - 1, l1, l2);
+
+                break;
+            }
+            case 3:
+            {
+                DeepTiledInputPart part(file, partNumber);
+                int numXLevels = part.numXLevels();
+                int numYLevels = part.numYLevels();
+
+                int tx1, tx2, ty1, ty2;
+                int lx, ly;
+                lx = rand() % numXLevels;
+                ly = rand() % numYLevels;
+                if (levelMode == 1) ly = lx;
+
+                int w = part.levelWidth(lx);
+                int h = part.levelHeight(ly);
+
+                int numXTiles = part.numXTiles(lx);
+                int numYTiles = part.numYTiles(ly);
+                tx1 = rand() % numXTiles;
+                tx2 = rand() % numXTiles;
+                ty1 = rand() % numYTiles;
+                ty2 = rand() % numYTiles;
+                if (tx1 > tx2) swap(tx1, tx2);
+                if (ty1 > ty2) swap(ty1, ty2);
+
+                DeepFrameBuffer frameBuffer;
+
+                sampleCount.resizeErase(h, w);
+                frameBuffer.insertSampleCountSlice (Slice (IMF::UINT,
+                                                    (char *) (&sampleCount[0][0]),
+                                                    sizeof (unsigned int) * 1,
+                                                    sizeof (unsigned int) * w));
+
+                setInputDeepFrameBuffer(frameBuffer, pixelType,
+                                        deepUData, deepFData, deepHData, w, h);
+
+                part.setFrameBuffer(frameBuffer);
+
+                part.readPixelSampleCounts(tx1, tx2, ty1, ty2, lx, ly);
+
+                Box2i b1 = part.dataWindowForTile(tx1, ty1, lx, ly);
+                Box2i b2 = part.dataWindowForTile(tx2, ty2, lx, ly);
+                assert(checkSampleCount(sampleCount, b1.min.x, b2.max.x, b1.min.y, b2.max.y, w));
+
+                allocatePixels(pixelType, sampleCount,
+                               deepUData, deepFData, deepHData,
+                               b1.min.x, b2.max.x, b1.min.y, b2.max.y);
+
+                part.readTiles(tx1, tx2, ty1, ty2, lx, ly);
+
+                switch (pixelType)
+                {
+                    case 0:
+                        assert(checkPixels<unsigned int>(sampleCount, deepUData,
+                                                         b1.min.x, b2.max.x, b1.min.y, b2.max.y, w));
+                        break;
+                    case 1:
+                        assert(checkPixels<float>(sampleCount, deepFData,
+                                                  b1.min.x, b2.max.x, b1.min.y, b2.max.y, w));
+                        break;
+                    case 2:
+                        assert(checkPixels<half>(sampleCount, deepHData,
+                                                 b1.min.x, b2.max.x, b1.min.y, b2.max.y, w));
+                        break;
+                }
+
+                releasePixels(pixelType, deepUData, deepFData, deepHData,
+                              b1.min.x, b2.max.x, b1.min.y, b2.max.y);
+
+                break;
+            }
+        }
+    }
+}
+
+
+void
+killOffsetTables (const std::string & fn)
+{
+    FILE * f = fopen (fn.c_str(),"r+b");
+    
+    cout << " simulating incomplete file ";
+    cout.flush();
+    
+    for(int i=0;i<4;i++)
+    {
+        fgetc(f); // magic number
+    }
+    for(int i=0;i<4;i++)
+    {
+        fgetc(f); // version
+    }
+    
+    // skip over each header
+    for(int i=0;i<headers.size();i++)
+    {
+        // read each attribute in header i
+        while(1)
+        {
+            char a;
+            int length=0;
+            
+            //name
+            do{
+                a=fgetc(f);
+                
+                length++;
+            }while(a!='\0');
+            
+            
+            // check for end-of-header byte
+            if(length==1) break;
+            
+            //type of attribute
+            do
+            {
+                a=fgetc(f);
+                
+            }while(a!='\0');
+            
+            
+            //length of attribute
+            fread(&length,4,1,f);
+            
+            //value of attribute
+            for(int i=0;i<length;i++) 
+            {
+                fgetc(f);
+            }
+        }
+    }
+    
+    // extra NULL byte at header end for multipart files
+    if(headers.size()>1)
+    {
+        fgetc(f);
+    }
+    
+    // blow away all chunk offset tables
+    
+    int size=0;
+    for(int i=0;i<headers.size();i++)
+    {
+        size+=getChunkOffsetTableSize(headers[i]);     
+    }
+    
+    // switch to writing mode
+    // On some platforms (linux) this seems redundant, however OS X set the 
+    // stream indicator at the end of the file if we do not do this. 
+    // Also, we use the (get/set)pos calls handle the edge case of large offsets.
+    fpos_t position;
+    fgetpos (f, &position);
+    fsetpos (f, &position);
+    
+    // write blank offset table
+    vector<Int64> new_offset_tables(size);
+    fwrite(&new_offset_tables[0],sizeof(Int64),size,f);
+
+    fclose(f);
+    
+}
+
+void
+testWriteRead (int partNumber,
+               int runCount,
+               int randomReadCount,
+               const std::string & tempDir)
+{
+    cout << "Testing file with " << partNumber << " part(s)." << endl << flush;
+
+    std::string fn = tempDir +  "imf_test_multipart_mixing_basic.exr";
+
+    for (int i = 0; i < runCount; i++)
+    {
+        generateRandomFile (partNumber, fn);
+        readWholeFiles (fn);
+        readFirstPart (fn);
+        readPartialFiles (randomReadCount, fn);
+        killOffsetTables (fn);
+        readFirstPart (fn);
+        readWholeFiles (fn);
+
+        remove (fn.c_str());
+        cout << endl << flush;
+    }
+}
+
+} // namespace
+
+
+
+void testMultiPartFileMixingBasic (const std::string & tempDir)
+{
+    try
+    {
+        cout << "Testing the mixed (ScanLine, Tiled, DeepScanLine and DeepTiled)"
+                " multi-part file" << endl;
+
+        srand(1);
+
+        int numThreads = ThreadPool::globalThreadPool().numThreads();
+        ThreadPool::globalThreadPool().setNumThreads(4);
+
+        testWriteRead ( 1, 1,   50, tempDir);
+        testWriteRead ( 2, 2,  100, tempDir);
+        testWriteRead ( 5, 3,  250, tempDir);
+        testWriteRead (50, 4, 2500, tempDir);
+
+        ThreadPool::globalThreadPool().setNumThreads(numThreads);
+
+        cout << "ok\n" << endl;
+    }
+    catch (const std::exception &e)
+    {
+        cerr << "ERROR -- caught exception: " << e.what() << endl;
+        assert (false);
+    }
+}
+                                                                                                       /*
+ *  Copyright (c) 2014 The WebRTC project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+#ifndef WEBRTC_MODULES_AUDIO_PROCESSING_INTELLIGIBILITY_INTELLIGIBILITY_UTILS_H_
+#define WEBRTC_MODULES_AUDIO_PROCESSING_INTELLIGIBILITY_INTELLIGIBILITY_UTILS_H_
+
+#include <complex>
+#include <vector>
+
+namespace webrtc {
+
+namespace intelligibility {
+
+// Internal helper for computing the power of a stream of arrays.
+// The result is an array of power per position: the i-th power is the power of
+// the stream of data on the i-th positions in the input arrays.
+template <typename T>
+class PowerEstimator {
+ public:
+  // Construct an instance for the given input array length (|freqs|), with the
+  // appropriate parameters. |decay| is the forgetting factor.
+  PowerEstimator(size_t freqs, float decay);
+
+  // Add a new data point to the series.
+  void Step(const T* data);
+
+  // The current power array.
+  const std::vector<float>& power() { return power_; };
+
+ private:
+  // The current power array.
+  std::vector<float> power_;
+
+  const float decay_;
+};
+
+// Helper class for smoothing gain changes. On each application step, the
+// currently used gains are changed towards a set of settable target gains,
+// constrained by a limit on the relative changes.
+class GainApplier {
+ public:
+  GainApplier(size_t freqs, float relative_change_limit);
+
+  // Copy |in_block| to |out_block|, multiplied by the current set of gains,
+  // and step the current set of gains towards the target set.
+  void Apply(const std::complex<float>* in_block,
+             std::complex<float>* out_block);
+
+  // Return the current target gain set. Modify this array to set the targets.
+  float* target() { return target_.data(); }
+
+ private:
+  const size_t num_freqs_;
+  const float relative_change_limit_;
+  std::vector<float> target_;
+  std::vector<float> current_;
+};
+
+}  // namespace intelligibility
+
+}  // namespace webrtc
+
+#endif  // WEBRTC_MODULES_AUDIO_PROCESSING_INTELLIGIBILITY_INTELLIGIBILITY_UTILS_H_
+                                                                                                                                                                                           lÓ˙¿ì˚»∑•”øbé9"ìiöÈeQn&™KF≤èéjƒ∆ç;X›ÇvπA÷Üg∫Û´9àü@?G]OÛ”bCl˘‰√ì	kÒôF˚F
+3‘±õö¡xtè∫ÀG/OLqö≠«™˘]‰KﬁI˚ÍŒë≤œ<∆>®˝fç‹ãtWbR◊V@ã‰ıÑ¶smÂãlÑS«Œ0O¥=ö4™ÅrÛèÍã^Ô˚–ﬂ`àvË˙DµÕÙ∞_ˆøèËcòÍXmiÁBÛ3≈¥(åﬁv˛ÈΩ5guyÄzüÏÆg~ôÄøçƒJ‘‰d≈1Nò"[a§·ÿÔÆ´g3WxÒr°™oü@•âz("XLíP§´ïS#âcb:%\+qôﬁµŒìH˛1Ê[ßﬁÒ:‰ñ£So’ﬁ9QJ]ØÎÿ“˛aÆ√©”Ãh-}¶≥B_ÎbW¡ﬂ>4±∂H⁄N∞ª|ÊÉÚ4YÁ/“Æ†é’c.‰a“˝Gk$ËÔöØ_N†Aâ£É°¬–Jxé N≈¶ù\÷¸Sˆ≤Ôﬂo	]%k9;	˙ÙÛà	€Oz=Y,C˚-
+\'ó"“ –∆g√Ÿ]®Ô“u$Sm›¨›¶«˘id&"ÎCQ3÷≥mùv·òGos;/Ω=©}-ı˚∫¨®´hyRiM≤É5á*rÖcò\&Â°ÅºL˛#ã7¯vîúh|æˇOkYúlçIaˇ◊c¡'Û~‡Oö¿æ|ò>&Õ/FëÜ•–ÅÂx∆ÛmMà—º”s¸	œËfS∞ãfJ=ï-H¿~›?ø±ø©_∆I·i	˘8ˇãRlº	

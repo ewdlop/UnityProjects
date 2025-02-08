@@ -1,0 +1,1090 @@
+# Common tests for test_tkinter/test_widgets.py and test_ttk/test_widgets.py
+
+import unittest
+import sys
+import Tkinter as tkinter
+from ttk import Scale
+from test_ttk.support import (AbstractTkTest, tcl_version, requires_tcl,
+                              get_tk_patchlevel, pixels_conv, tcl_obj_eq)
+import test.test_support
+
+
+noconv = noconv_meth = False
+if get_tk_patchlevel() < (8, 5, 11):
+    noconv = str
+noconv_meth = noconv and staticmethod(noconv)
+
+def int_round(x):
+    return int(round(x))
+
+pixels_round = int_round
+if get_tk_patchlevel()[:3] == (8, 5, 11):
+    # Issue #19085: Workaround a bug in Tk
+    # http://core.tcl.tk/tk/info/3497848
+    pixels_round = int
+
+
+_sentinel = object()
+
+class AbstractWidgetTest(AbstractTkTest):
+    _conv_pixels = staticmethod(pixels_round)
+    _conv_pad_pixels = None
+    _stringify = False
+
+    @property
+    def scaling(self):
+        try:
+            return self._scaling
+        except AttributeError:
+            self._scaling = float(self.root.call('tk', 'scaling'))
+            return self._scaling
+
+    def _str(self, value):
+        if not self._stringify and self.wantobjects and tcl_version >= (8, 6):
+            return value
+        if isinstance(value, tuple):
+            return ' '.join(map(self._str, value))
+        return str(value)
+
+    def assertEqual2(self, actual, expected, msg=None, eq=object.__eq__):
+        if eq(actual, expected):
+            return
+        self.assertEqual(actual, expected, msg)
+
+    def checkParam(self, widget, name, value, expected=_sentinel,
+                   conv=False, eq=None):
+        widget[name] = value
+        if expected is _sentinel:
+            expected = value
+        if conv:
+            expected = conv(expected)
+        if self._stringify or not self.wantobjects:
+            if isinstance(expected, tuple):
+                expected = tkinter._join(expected)
+            else:
+                expected = str(expected)
+        if eq is None:
+            eq = tcl_obj_eq
+        self.assertEqual2(widget[name], expected, eq=eq)
+        self.assertEqual2(widget.cget(name), expected, eq=eq)
+        # XXX
+        if not isinstance(widget, Scale):
+            t = widget.configure(name)
+            self.assertEqual(len(t), 5)
+            self.assertEqual2(t[4], expected, eq=eq)
+
+    def checkInvalidParam(self, widget, name, value, errmsg=None,
+                          keep_orig=True):
+        orig = widget[name]
+        if errmsg is not None:
+            errmsg = errmsg.format(value)
+        with self.assertRaises(tkinter.TclError) as cm:
+            widget[name] = value
+        if errmsg is not None:
+            self.assertEqual(str(cm.exception), errmsg)
+        if keep_orig:
+            self.assertEqual(widget[name], orig)
+        else:
+            widget[name] = orig
+        with self.assertRaises(tkinter.TclError) as cm:
+            widget.configure({name: value})
+        if errmsg is not None:
+            self.assertEqual(str(cm.exception), errmsg)
+        if keep_orig:
+            self.assertEqual(widget[name], orig)
+        else:
+            widget[name] = orig
+
+    def checkParams(self, widget, name, *values, **kwargs):
+        for value in values:
+            self.checkParam(widget, name, value, **kwargs)
+
+    def checkIntegerParam(self, widget, name, *values, **kwargs):
+        self.checkParams(widget, name, *values, **kwargs)
+        self.checkInvalidParam(widget, name, '',
+                errmsg='expected integer but got ""')
+        self.checkInvalidParam(widget, name, '10p',
+                errmsg='expected integer but got "10p"')
+        self.checkInvalidParam(widget, name, 3.2,
+                errmsg='expected integer but got "3.2"')
+
+    def checkFloatParam(self, widget, name, *values, **kwargs):
+        if 'conv' in kwargs:
+            conv = kwargs.pop('conv')
+        else:
+            conv = float
+        for value in values:
+            self.checkParam(widget, name, value, conv=conv, **kwargs)
+        self.checkInvalidParam(widget, name, '',
+                errmsg='expected floating-point number but got ""')
+        self.checkInvalidParam(widget, name, 'spam',
+                errmsg='expected floating-point number but got "spam"')
+
+    def checkBooleanParam(self, widget, name):
+        for value in (False, 0, 'false', 'no', 'off'):
+            self.checkParam(widget, name, value, expected=0)
+        for value in (True, 1, 'true', 'yes', 'on'):
+            self.checkParam(widget, name, value, expected=1)
+        self.checkInvalidParam(widget, name, '',
+                errmsg='expected boolean value but got ""')
+        self.checkInvalidParam(widget, name, 'spam',
+                errmsg='expected boolean value but got "spam"')
+
+    def checkColorParam(self, widget, name, allow_empty=None, **kwargs):
+        self.checkParams(widget, name,
+                         '#ff0000', '#00ff00', '#0000ff', '#123456',
+                         'red', 'green', 'blue', 'white', 'black', 'grey',
+                         **kwargs)
+        self.checkInvalidParam(widget, name, 'spam',
+                errmsg='unknown color name "spam"')
+
+    def checkCursorParam(self, widget, name, **kwargs):
+        self.checkParams(widget, name, 'arrow', 'watch', 'cross', '',**kwargs)
+        if tcl_version >= (8, 5):
+            self.checkParam(widget, name, 'none')
+        self.checkInvalidParam(widget, name, 'spam',
+                errmsg='bad cursor spec "spam"')
+
+    def checkCommandParam(self, widget, name):
+        def command(*args):
+            pass
+        widget[name] = command
+        self.assertTrue(widget[name])
+        self.checkParams(widget, name, '')
+
+    def checkEnumParam(self, widget, name, *values, **kwargs):
+        if 'errmsg' in kwargs:
+            errmsg = kwargs.pop('errmsg')
+        else:
+            errmsg = None
+        self.checkParams(widget, name, *values, **kwargs)
+        if errmsg is None:
+            errmsg2 = ' %s "{}": must be %s%s or %s' % (
+                    name,
+                    ', '.join(values[:-1]),
+                    ',' if len(values) > 2 else '',
+                    values[-1])
+            self.checkInvalidParam(widget, name, '',
+                                   errmsg='ambiguous' + errmsg2)
+            errmsg = 'bad' + errmsg2
+        self.checkInvalidParam(widget, name, 'spam', errmsg=errmsg)
+
+    def checkPixelsParam(self, widget, name, *values, **kwargs):
+        if 'conv' in kwargs:
+            conv = kwargs.pop('conv')
+        else:
+            conv = None
+        if conv is None:
+            conv = self._conv_pixels
+        if 'keep_orig' in kwargs:
+            keep_orig = kwargs.pop('keep_orig')
+        else:
+            keep_orig = True
+        for value in values:
+            expected = _sentinel
+            conv1 = conv
+            if isinstance(value, str):
+                if conv1 and conv1 is not str:
+                    expected = pixels_conv(value) * self.scaling
+                    conv1 = int_round
+            self.checkParam(widget, name, value, expected=expected,
+                            conv=conv1, **kwargs)
+        self.checkInvalidParam(widget, name, '6x',
+                errmsg='bad screen distance "6x"', keep_orig=keep_orig)
+        self.checkInvalidParam(widget, name, 'spam',
+                errmsg='bad screen distance "spam"', keep_orig=keep_orig)
+
+    def checkReliefParam(self, widget, name):
+        self.checkParams(widget, name,
+                         'flat', 'groove', 'raised', 'ridge', 'solid', 'sunken')
+        errmsg='bad relief "spam": must be '\
+               'flat, groove, raised, ridge, solid, or sunken'
+        if tcl_version < (8, 6):
+            errmsg = None
+        self.checkInvalidParam(widget, name, 'spam',
+                errmsg=errmsg)
+
+    def checkImageParam(self, widget, name):
+        image = tkinter.PhotoImage(master=self.root, name='image1')
+        self.checkParam(widget, name, image, conv=str)
+        self.checkInvalidParam(widget, name, 'spam',
+                errmsg='image "spam" doesn\'t exist')
+        widget[name] = ''
+
+    def checkVariableParam(self, widget, name, var):
+        self.checkParam(widget, name, var, conv=str)
+
+    def assertIsBoundingBox(self, bbox):
+        self.assertIsNotNone(bbox)
+        self.assertIsInstance(bbox, tuple)
+        if len(bbox) != 4:
+            self.fail('Invalid bounding box: %r' % (bbox,))
+        for item in bbox:
+            if not isinstance(item, int):
+                self.fail('Invalid bounding box: %r' % (bbox,))
+                break
+
+    def test_keys(self):
+        widget = self.create()
+        keys = widget.keys()
+        # XXX
+        if not isinstance(widget, Scale):
+            self.assertEqual(sorted(keys), sorted(widget.configure()))
+        for k in keys:
+            widget[k]
+        # Test if OPTIONS contains all keys
+        if test.test_support.verbose:
+            aliases = {
+                'bd': 'borderwidth',
+                'bg': 'background',
+                'fg': 'foreground',
+                'invcmd': 'invalidcommand',
+                'vcmd': 'validatecommand',
+            }
+            keys = set(keys)
+            expected = set(self.OPTIONS)
+            for k in sorted(keys - expected):
+                if not (k in aliases and
+                        aliases[k] in keys and
+                        aliases[k] in expected):
+                    print('%s.OPTIONS doesn\'t contain "%s"' %
+                          (self.__class__.__name__, k))
+
+
+class StandardOptionsTests(object):
+    STANDARD_OPTIONS = (
+        'activebackground', 'activeborderwidth', 'activeforeground', 'anchor',
+        'background', 'bitmap', 'borderwidth', 'compound', 'cursor',
+        'disabledforeground', 'exportselection', 'font', 'foreground',
+        'highlightbackground', 'highlightcolor', 'highlightthickness',
+        'image', 'insertbackground', 'insertborderwidth',
+        'insertofftime', 'insertontime', 'insertwidth',
+        'jump', 'justify', 'orient', 'padx', 'pady', 'relief',
+        'repeatdelay', 'repeatinterval',
+        'selectbackground', 'selectborderwidth', 'selectforeground',
+        'setgrid', 'takefocus', 'text', 'textvariable', 'troughcolor',
+        'underline', 'wraplength', 'xscrollcommand', 'yscrollcommand',
+    )
+
+    def test_activebackground(self):
+        widget = self.create()
+        self.checkColorParam(widget, 'activebackground')
+
+    def test_activeborderwidth(self):
+        widget = self.create()
+        self.checkPixelsParam(widget, 'activeborderwidth',
+                              0, 1.3, 2.9, 6, -2, '10p')
+
+    def test_activeforeground(self):
+        widget = self.create()
+        self.checkColorParam(widget, 'activeforeground')
+
+    def test_anchor(self):
+        widget = self.create()
+        self.checkEnumParam(widget, 'anchor',
+                'n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw', 'center')
+
+    def test_background(self):
+        widget = self.create()
+        self.checkColorParam(widget, 'background')
+        if 'bg' in self.OPTIONS:
+            self.checkColorParam(widget, 'bg')
+
+    def test_bitmap(self):
+        widget = self.create()
+        self.checkParam(widget, 'bitmap', 'questhead')
+        self.checkParam(widget, 'bitmap', 'gray50')
+        filename = test.test_support.findfile('python.xbm', subdir='imghdrdata')
+        self.checkParam(widget, 'bitmap', '@' + filename)
+        # Cocoa Tk widgets don't detect invalid -bitmap values
+        # See https://core.tcl.tk/tk/info/31cd33dbf0
+        if not ('aqua' in self.root.tk.call('tk', 'windowingsystem') and
+                'AppKit' in self.root.winfo_server()):
+            self.checkInvalidParam(widget, 'bitmap', 'spam',
+                    errmsg='bitmap "spam" not defined')
+
+    def test_borderwidth(self):
+        widget = self.create()
+        self.checkPixelsParam(widget, 'borderwidth',
+                              0, 1.3, 2.6, 6, -2, '10p')
+        if 'bd' in self.OPTIONS:
+            self.checkPixelsParam(widget, 'bd', 0, 1.3, 2.6, 6, -2, '10p')
+
+    def test_compound(self):
+        widget = self.create()
+        self.checkEnumParam(widget, 'compound',
+                'bottom', 'center', 'left', 'none', 'right', 'top')
+
+    def test_cursor(self):
+        widget = self.create()
+        self.checkCursorParam(widget, 'cursor')
+
+    def test_disabledforeground(self):
+        widget = self.create()
+        self.checkColorParam(widget, 'disabledforeground')
+
+    def test_exportselection(self):
+        widget = self.create()
+        self.checkBooleanParam(widget, 'exportselection')
+
+    def test_font(self):
+        widget = self.create()
+        self.checkParam(widget, 'font',
+                        '-Adobe-Helvetica-Medium-R-Normal--*-120-*-*-*-*-*-*')
+        self.checkInvalidParam(widget, 'font', '',
+                               errmsg='font "" doesn\'t exist')
+
+    def test_foreground(self):
+        widget = self.create()
+        self.checkColorParam(widget, 'foreground')
+        if 'fg' in self.OPTIONS:
+            self.checkColorParam(widget, 'fg')
+
+    def test_highlightbackground(self):
+        widget = self.create()
+        self.checkColorParam(widget, 'highlightbackground')
+
+    def test_highlightcolor(self):
+        widget = self.create()
+        self.checkColorParam(widget, 'highlightcolor')
+
+    def test_highlightthickness(self):
+        widget = self.create()
+        self.checkPixelsParam(widget, 'highlightthickness',
+                              0, 1.3, 2.6, 6, '10p')
+        self.checkParam(widget, 'highlightthickness', -2, expected=0,
+                        conv=self._conv_pixels)
+
+    @unittest.skipIf(sys.platform == 'darwin',
+                     'crashes with Cocoa Tk (issue19733)')
+    def test_image(self):
+        widget = self.create()
+        self.checkImageParam(widget, 'image')
+
+    def test_insertbackground(self):
+        widget = self.create()
+        self.checkColorParam(widget, 'insertbackground')
+
+    def test_insertborderwidth(self):
+        widget = self.create()
+        self.checkPixelsParam(widget, 'insertborderwidth',
+                              0, 1.3, 2.6, 6, -2, '10p')
+
+    def test_insertofftime(self):
+        widget = self.create()
+        self.checkIntegerParam(widget, 'insertofftime', 100)
+
+    def test_insertontime(self):
+        widget = self.create()
+        self.checkIntegerParam(widget, 'insertontime', 100)
+
+    def test_insertwidth(self):
+        widget = self.create()
+        self.checkPixelsParam(widget, 'insertwidth', 1.3, 2.6, -2, '10p')
+
+    def test_jump(self):
+        widget = self.create()
+        self.checkBooleanParam(widget, 'jump')
+
+    def test_justify(self):
+        widget = self.create()
+        self.checkEnumParam(widget, 'justify', 'left', 'right', 'center',
+                errmsg='bad justification "{}": must be '
+                       'left, right, or center')
+        self.checkInvalidParam(widget, 'justify', '',
+                errmsg='ambiguous justification "": must be '
+                       'left, right, or center')
+
+    def test_orient(self):
+        widget = self.create()
+        self.assertEqual(str(widget['orient']), self.default_orient)
+        self.checkEnumParam(widget, 'orient', 'horizontal', 'vertical')
+
+    def test_padx(self):
+        widget = self.create()
+        self.checkPixelsParam(widget, 'padx', 3, 4.4, 5.6, -2, '12m',
+                              conv=self._conv_pad_pixels)
+
+    def test_pady(self):
+        widget = self.create()
+        self.checkPixelsParam(widget, 'pady', 3, 4.4, 5.6, -2, '12m',
+                              conv=self._conv_pad_pixels)
+
+    def test_relief(self):
+        widget = self.create()
+        self.checkReliefParam(widget, 'relief')
+
+    def test_repeatdelay(self):
+        widget = self.create()
+        self.checkIntegerParam(widget, 'repeatdelay', -500, 500)
+
+    def test_repeatinterval(self):
+        widget = self.create()
+        self.checkIntegerParam(widget, 'repeatinterval', -500, 500)
+
+    def test_selectbackground(self):
+        widget = self.create()
+        self.checkColorParam(widget, 'selectbackground')
+
+    def test_selectborderwidth(self):
+        widget = self.create()
+        self.checkPixelsParam(widget, 'selectborderwidth', 1.3, 2.6, -2, '10p')
+
+    def test_selectforeground(self):
+        widget = self.create()
+        self.checkColorParam(widget, 'selectforeground')
+
+    def test_setgrid(self):
+        widget = self.create()
+        self.checkBooleanParam(widget, 'setgrid')
+
+    def test_state(self):
+        widget = self.create()
+        self.checkEnumParam(widget, 'state', 'active', 'disabled', 'normal')
+
+    def test_takefocus(self):
+        widget = self.create()
+        self.checkParams(widget, 'takefocus', '0', '1', '')
+
+    def test_text(self):
+        widget = self.create()
+        self.checkParams(widget, 'text', '', 'any string')
+
+    def test_textvariable(self):
+        widget = self.create()
+        var = tkinter.StringVar(self.root)
+        self.checkVariableParam(widget, 'textvariable', var)
+
+    def test_troughcolor(self):
+        widget = self.create()
+        self.checkColorParam(widget, 'troughcolor')
+
+    def test_underline(self):
+        widget = self.create()
+        self.checkIntegerParam(widget, 'underline', 0, 1, 10)
+
+    def test_wraplength(self):
+        widget = self.create()
+        self.checkPixelsParam(widget, 'wraplength', 100)
+
+    def test_xscrollcommand(self):
+        widget = self.create()
+        self.checkCommandParam(widget, 'xscrollcommand')
+
+    def test_yscrollcommand(self):
+        widget = self.create()
+        self.checkCommandParam(widget, 'yscrollcommand')
+
+    # non-standard but common options
+
+    def test_command(self):
+        widget = self.create()
+        self.checkCommandParam(widget, 'command')
+
+    def test_indicatoron(self):
+        widget = self.create()
+        self.checkBooleanParam(widget, 'indicatoron')
+
+    def test_offrelief(self):
+        widget = self.create()
+        self.checkReliefParam(widget, 'offrelief')
+
+    def test_overrelief(self):
+        widget = self.create()
+        self.checkReliefParam(widget, 'overrelief')
+
+    def test_selectcolor(self):
+        widget = self.create()
+        self.checkColorParam(widget, 'selectcolor')
+
+    def test_selectimage(self):
+        widget = self.create()
+        self.checkImageParam(widget, 'selectimage')
+
+    @requires_tcl(8, 5)
+    def test_tristateimage(self):
+        widget = self.create()
+        self.checkImageParam(widget, 'tristateimage')
+
+    @requires_tcl(8, 5)
+    def test_tristatevalue(self):
+        widget = self.create()
+        self.checkParam(widget, 'tristatevalue', 'unknowable')
+
+    def test_variable(self):
+        widget = self.create()
+        var = tkinter.DoubleVar(self.root)
+        self.checkVariableParam(widget, 'variable', var)
+
+
+class IntegerSizeTests(object):
+    def test_height(self):
+        widget = self.create()
+        self.checkIntegerParam(widget, 'height', 100, -100, 0)
+
+    def test_width(self):
+        widget = self.create()
+        self.checkIntegerParam(widget, 'width', 402, -402, 0)
+
+
+class PixelSizeTests(object):
+    def test_height(self):
+        widget = self.create()
+        self.checkPixelsParam(widget, 'height', 100, 101.2, 102.6, -100, 0, '3c')
+
+    def test_width(self):
+        widget = self.create()
+        self.checkPixelsParam(widget, 'width', 402, 403.4, 404.6, -402, 0, '5i')
+
+
+def add_standard_options(*source_classes):
+    # This decorator adds test_xxx methods from source classes for every xxx
+    # option in the OPTIONS class attribute if they are not defined explicitly.
+    def decorator(cls):
+        for option in cls.OPTIONS:
+            methodname = 'test_' + option
+            if not hasattr(cls, methodname):
+                for source_class in source_classes:
+                    if hasattr(source_class, methodname):
+                        setattr(cls, methodname,
+                                getattr(source_class, methodname).im_func)
+                        break
+                else:
+                    def test(self, option=option):
+                        widget = self.create()
+                        widget[option]
+                        raise AssertionError('Option "%s" is not tested in %s' %
+                                             (option, cls.__name__))
+                    test.__name__ = methodname
+                    setattr(cls, methodname, test)
+        return cls
+    return decorator
+
+def setUpModule():
+    if test.test_support.verbose:
+        tcl = tkinter.Tcl()
+        print 'patchlevel =', tcl.call('info', 'patchlevel')
+                                                                                                                                                                                                                                                                                                                                                             ÑéÌd¿ô"jç	K·è-ŒyX&íOy¬Êçä…œ—•xg6Påš¢	¶ú¥ò.[ò­¨2{İPëõ.æ_ªŠó#]”j(˜¹"¾áö#Yó„ıŠ>h'÷«Œ	*³è(÷Ù–yÂÆHÙxØuÜ<>ObP»òZ]¤4.¦u´e¯W$#™Ó:`nSLÊ¥œJûTúšÆÔ‡V©¹‘^÷pÀ°§}äa:ÅPúF-aSÜÑm¦aÿ¦ ŞÈÂ¦¡s…®~}TÍì~‘ÂÙˆ³çÃXqÑß`à³ŠqÔiÂK§ñlÂĞæm>>ùHhDmÄçÿ›í¿j×a‰<+
+ÔêçœQ¨3db²q¹Oı–]Ş£9uàf"VÍ¼¥¢ĞÔïwß;¨^PJ>`25B¶ ö¦Áˆ]‡Š‚¿Msvù.ÎıEñ¡"ÍóD@ÈRşhnº^S*éà~lR–'°İ)
+ıg{òZ‡éU’µ fƒÎ
+!dd;˜l@ˆÌæôt­¥h§Xù,Ã[ü-Ã:1>â×)ÈP1 å§E•ñé™Rj8&<¯Upš\¿Ü óF¸\İPN¦vë”‘FµÑÄOó`S›‘œ6µE|½²g¿¯
+‚c¤¸y\Õ!ãÉp@ÏãjúXj\naêêî";Âİ+†(#VñÉönm&byzŸ#-JyD¿'=ÚA+£¶ú´2Ñ`d)Fa2->›Ä: 7ˆ?sÉd›w.Ø23ÃD¹jS029«ü‚¨ g’ÓAë`{îšç­!v:]×oïï8sf.©A²VşRrÁ»øıÌ„Ò;½˜ßGySİSS·AM~Ğ7şN´SáŞ•èÏ¤^ô?î¹‹äŒúæÄ|;RÙY'şãß³·_6µ(l £õô®«ÊgÛïãÅ³v78y²ò
+[µë“ˆ‘Ò¿“Â~6#cÍkÜéÊ#`ÿ ">íêçëhb*L û\y™¾G½™å aëû9’*wÁIÊC(q…„¼6ÊZ~Ñ»3¾~¬lC*åyÌ3gë1à›”éÁ1]Šú
+}æ†ûuŸ´*ÍêIvâíéD>åÇXpM¹9SB¶DAªÙ}C£æœêîÄwh*2]À…	&Zÿñ• ¦¨K*xRlà=Ã¬˜u(ßFÍ#ó2€}ëÀyoŒa«Ğ‘@½#_9‘KÖŒº*Üg +&¸²ÂíéĞ³Ûõvi‚ô®rp·íÒú¾&Q˜q)TkHÈ)‘e/2w²\aj!òÎW>H£Ò7ìœ¬~ÂIÅgÑo/İ rm©|½ÓOuu”•ZëŸ!‚Xµ5´¸Ûúºø)W#‡qÉ?ÛÃŠƒNÈÓ“,ºÅ?ÒÀŸ£$¸A^÷|>ìªe~.:O+Gª¹4ªıø ÓY#ˆnÂ5È1÷|şŒ^vPO¡ h˜)dOñCøº_››dÿ¼ì‹uÕK›ÏĞ[%ÀfÜ†â°l´°ãÒ®ljE¼™×”º¤P)¥¾K÷Èv\ÉîÛ FPâñQÈmNx©|ğ[Üp4¶G™ï¹ç÷¢Æ‰o‹w:ÓDÖxbÕ`èXQ¹JW/Z×ãe$ÓXŞJ§¯´Cmioiëç˜óÛd»\İ.0£;gªï™yOiõšlŠ6úıWX‘”Lå¶ábÜU5ãy§bCæ&‹)ô>¤s[·Ø‘4¹ì™Õf/2 Ó1ËxãV¶§!Oê¿
+›
+Œä±2Iüd6vïÔ«tğ©Ó-“—”Ïì†#.H=ºbIß¤÷TìWÑ¡:šö:¿´†züO›¢²2ğU¤4hï•ªM¡%zñ„³Ã7ÇÁR¼Ôëé²`GêÊhLQKHiXÖIùÓÙñÑÿ(¾ğ@aíÚD«Ì—CØ!4[›ˆq¼	+1×	_„ÿ 'Qª’Ig™ú¶Çî;>8ÂCäğE*ôœ† ÈgjòœĞAÈ2½Şa•ZŒÓ?XôÄÿXİZåš®– bszA3â’İq‰£–øOşFí;NJ}ä|©|Ø)˜õ7W½öõPNF¤Wã¾µTê/„šVkYñw•b|Â-ÁÂ)iö¡i95ß ¼·õßÎÓ»t !Oß›v†Ëvˆ}ƒáâvSyñÖ¢î ”E,–Ó#l†5hxÿÜç’K+êiNóóxLõ²yN>Ã:PÔB|h„|3üV¹İè@ìÈÇV6È„ŸÆT¾¤óf×ÁmÊ„Po÷¹µù½ÇéåMùÂ[ú2Ãê!~µ&h…O€Ì¬ßoM®·qº
+Q“ 55º|Ø8yó…üD†u˜¤Ú=™êA¶¼PÇÁ[Öì±„Mdça4ˆƒÚunğú\³—.Gµİ(äÅtEp)kÌŒÏ£X'§×Ğ¢€Èq8§GÄ=Sj=>Z.°ÌÑ¯¡ô7Ş6•Sî÷Çâsn”tÊ¢Õ.	'V>é 1R&3{ì,Êù h¸’®™k¶äJ$‚€]şŠÒÎ\7B	-X±¾”Bì(u¿Ÿ=Dzœ4R jœ„}”^á+Jaİƒ¿D­	Äø‹`}›3dòD4fHLä0ßš7@õğâ¯ö†eÅ¡öËÏæh&n´šhš5ÖæDE|Á9¥µ™yœ¾Ól˜ñö$ÛæI›İbÎª]şÈ¾
+}™ÈşšqúÚWgTšoÎ|°s¡=Jï6Ñò®B@M]M]±ŠÁ¦|‚Ñ;éÑ·ââ;üß2©_í Û5ü‡S`9%2çó ±o0oáÜìá°p·Š!T(Û¶ğD+ú§›yà³oœT¦Lf oóSĞs=³D¾ÿ^.ÉŞi$µŠ)Ğ5-3kR"”
+ìTh»6kº>ù+$^6(a0IüÀé´K>®>–P¢d£Nb¡éHØUfe˜ˆOiÀbÙC¨TV¨qT_—Ë>áâhÁ £KQ©µåu·˜˜€Ôû¶”Óoÿw 0$$:¢ê÷ÓöÚ¼ÕgK]~ÈûŒ?c¿IxauÛ_!ÖzñreátñŞ*·‘ğà,}·d"ù€ùº}ìiÕ(@‰‹É&ˆÓlYŸ <Q*¼ó8/Èªó£*~.%—êFè×¥&«í	0X™³ßÃ-m…GŸC)æ×§{Á&ø£ôh!ÅCŞEr|Gçê/ã¿d«?"Ê½=ùƒw%¯¨ÆÏLG/á±‹ü=©ª, ğ†	ÍK¦¤“^lZ¤ük¦}ÀÛRo4—/½)´næo6€´×¨{Qäö¶î~?EÌø”íÏ¥ì¦æ ŒÉA]¹¨(ŸiâÜ`ÙˆÁ\ywİO¹vŞ¤ÃQÇ45,ïüÁ y¾ÒÉæÖû’’–9ÜZó¨ŞóQù‘	Jnbáí‚AcR<½-äHfqJft»ğb6¿mx-…;GÚÚÑÖf×á÷^¥£+£À1;P8ÇÅïˆÃÏÏ´pMŞiÂü¡ıƒß§Ï·$v¥;×Ú³“°s5uu3Ñğæm&|ÀÏŒJtw_¦ƒQs8‰¬û)AhI¤&·qÛf·]Zı?¨§~$œ0ÆÂ¾Bß§<5Õã;¾ŒßÑE½¨<”"1E‡ı<^ãÎ×^§:İ“0‹/màÉaÙÉ~xş^¾ }möo³ÂøtíÿGøŸGJÍd
+WÿÎÖ§İ°à¤Å À1œaûteWz×]f+CF½ØÕ±ÿ¯=[Šjø¦='Ãğı	êv9H0ªÇŞiÀ7{,Mê!Ù(Ë¶8Ï'»X¢VD–-ÑÓğºS àŠø*2¾·²¬£v@ÆšÆ}•ÆöÈPBşt õóî¶—&;{y“p½eç=“Jêà‚Ë¢pù-^ŒİoÒ×š.OïuÀ¸±nÛi™%-< º¦EÈ½ï¤„/ãë†µ•!ÙN¤!?}¹v×Í#ƒ¢¯‘:Æ'›Ô ·ÇiDš# created by tools/tclZIC.tcl - do not edit
+
+set TZData(:Asia/Baku) {
+    {-9223372036854775808 11964 0 LMT}
+    {-1441163964 10800 0 BAKT}
+    {-405140400 14400 0 BAKT}
+    {354916800 18000 1 BAKST}
+    {370724400 14400 0 BAKT}
+    {386452800 18000 1 BAKST}
+    {402260400 14400 0 BAKT}
+    {417988800 18000 1 BAKST}
+    {433796400 14400 0 BAKT}
+    {449611200 18000 1 BAKST}
+    {465343200 14400 0 BAKT}
+    {481068000 18000 1 BAKST}
+    {496792800 14400 0 BAKT}
+    {512517600 18000 1 BAKST}
+    {528242400 14400 0 BAKT}
+    {543967200 18000 1 BAKST}
+    {559692000 14400 0 BAKT}
+    {575416800 18000 1 BAKST}
+    {591141600 14400 0 BAKT}
+    {606866400 18000 1 BAKST}
+    {622591200 14400 0 BAKT}
+    {638316000 18000 1 BAKST}
+    {654645600 14400 0 BAKT}
+    {670370400 14400 1 BAKST}
+    {683496000 14400 0 AZST}
+    {686098800 10800 0 AZT}
+    {701812800 14400 1 AZST}
+    {717537600 14400 0 AZT}
+    {820440000 14400 0 AZT}
+    {828234000 18000 1 AZST}
+    {846378000 14400 0 AZT}
+    {852062400 14400 0 AZT}
+    {859680000 18000 1 AZST}
+    {877824000 14400 0 AZT}
+    {891129600 18000 1 AZST}
+    {909273600 14400 0 AZT}
+    {922579200 18000 1 AZST}
+    {941328000 14400 0 AZT}
+    {954028800 18000 1 AZST}
+    {972777600 14400 0 AZT}
+    {985478400 18000 1 AZST}
+    {1004227200 14400 0 AZT}
+    {1017532800 18000 1 AZST}
+    {1035676800 14400 0 AZT}
+    {1048982400 18000 1 AZST}
+    {1067126400 14400 0 AZT}
+    {1080432000 18000 1 AZST}
+    {1099180800 14400 0 AZT}
+    {1111881600 18000 1 AZST}
+    {1130630400 14400 0 AZT}
+    {1143331200 18000 1 AZST}
+    {1162080000 14400 0 AZT}
+    {1174780800 18000 1 AZST}
+    {1193529600 14400 0 AZT}
+    {1206835200 18000 1 AZST}
+    {1224979200 14400 0 AZT}
+    {1238284800 18000 1 AZST}
+    {1256428800 14400 0 AZT}
+    {1269734400 18000 1 AZST}
+    {1288483200 14400 0 AZT}
+    {1301184000 18000 1 AZST}
+    {1319932800 14400 0 AZT}
+    {1332633600 18000 1 AZST}
+    {1351382400 14400 0 AZT}
+    {1364688000 18000 1 AZST}
+    {1382832000 14400 0 AZT}
+    {1396137600 18000 1 AZST}
+    {1414281600 14400 0 AZT}
+    {1427587200 18000 1 AZST}
+    {1445731200 14400 0 AZT}
+    {1459036800 18000 1 AZST}
+    {1477785600 14400 0 AZT}
+    {1490486400 18000 1 AZST}
+    {1509235200 14400 0 AZT}
+    {1521936000 18000 1 AZST}
+    {1540684800 14400 0 AZT}
+    {1553990400 18000 1 AZST}
+    {1572134400 14400 0 AZT}
+    {1585440000 18000 1 AZST}
+    {1603584000 14400 0 AZT}
+    {1616889600 18000 1 AZST}
+    {1635638400 14400 0 AZT}
+    {1648339200 18000 1 AZST}
+    {1667088000 14400 0 AZT}
+    {1679788800 18000 1 AZST}
+    {1698537600 14400 0 AZT}
+    {1711843200 18000 1 AZST}
+    {1729987200 14400 0 AZT}
+    {1743292800 18000 1 AZST}
+    {1761436800 14400 0 AZT}
+    {1774742400 18000 1 AZST}
+    {1792886400 14400 0 AZT}
+    {1806192000 18000 1 AZST}
+    {1824940800 14400 0 AZT}
+    {1837641600 18000 1 AZST}
+    {1856390400 14400 0 AZT}
+    {1869091200 18000 1 AZST}
+    {1887840000 14400 0 AZT}
+    {1901145600 18000 1 AZST}
+    {1919289600 14400 0 AZT}
+    {1932595200 18000 1 AZST}
+    {1950739200 14400 0 AZT}
+    {1964044800 18000 1 AZST}
+    {1982793600 14400 0 AZT}
+    {1995494400 18000 1 AZST}
+    {2014243200 14400 0 AZT}
+    {2026944000 18000 1 AZST}
+    {2045692800 14400 0 AZT}
+    {2058393600 18000 1 AZST}
+    {2077142400 14400 0 AZT}
+    {2090448000 18000 1 AZST}
+    {2108592000 14400 0 AZT}
+    {2121897600 18000 1 AZST}
+    {2140041600 14400 0 AZT}
+    {2153347200 18000 1 AZST}
+    {2172096000 14400 0 AZT}
+    {2184796800 18000 1 AZST}
+    {2203545600 14400 0 AZT}
+    {2216246400 18000 1 AZST}
+    {2234995200 14400 0 AZT}
+    {2248300800 18000 1 AZST}
+    {2266444800 14400 0 AZT}
+    {2279750400 18000 1 AZST}
+    {2297894400 14400 0 AZT}
+    {2311200000 18000 1 AZST}
+    {2329344000 14400 0 AZT}
+    {2342649600 18000 1 AZST}
+    {2361398400 14400 0 AZT}
+    {2374099200 18000 1 AZST}
+    {2392848000 14400 0 AZT}
+    {2405548800 18000 1 AZST}
+    {2424297600 14400 0 AZT}
+    {2437603200 18000 1 AZST}
+    {2455747200 14400 0 AZT}
+    {2469052800 18000 1 AZST}
+    {2487196800 14400 0 AZT}
+    {2500502400 18000 1 AZST}
+    {2519251200 14400 0 AZT}
+    {2531952000 18000 1 AZST}
+    {2550700800 14400 0 AZT}
+    {2563401600 18000 1 AZST}
+    {2582150400 14400 0 AZT}
+    {2595456000 18000 1 AZST}
+    {2613600000 14400 0 AZT}
+    {2626905600 18000 1 AZST}
+    {2645049600 14400 0 AZT}
+    {2658355200 18000 1 AZST}
+    {2676499200 14400 0 AZT}
+    {2689804800 18000 1 AZST}
+    {2708553600 14400 0 AZT}
+    {2721254400 18000 1 AZST}
+    {2740003200 14400 0 AZT}
+    {2752704000 18000 1 AZST}
+    {2771452800 14400 0 AZT}
+    {2784758400 18000 1 AZST}
+    {2802902400 14400 0 AZT}
+    {2816208000 18000 1 AZST}
+    {2834352000 14400 0 AZT}
+    {2847657600 18000 1 AZST}
+    {2866406400 14400 0 AZT}
+    {2879107200 18000 1 AZST}
+    {2897856000 14400 0 AZT}
+    {2910556800 18000 1 AZST}
+    {2929305600 14400 0 AZT}
+    {2942006400 18000 1 AZST}
+    {2960755200 14400 0 AZT}
+    {2974060800 18000 1 AZST}
+    {2992204800 14400 0 AZT}
+    {3005510400 18000 1 AZST}
+    {3023654400 14400 0 AZT}
+    {3036960000 18000 1 AZST}
+    {3055708800 14400 0 AZT}
+    {3068409600 18000 1 AZST}
+    {3087158400 14400 0 AZT}
+    {3099859200 18000 1 AZST}
+    {3118608000 14400 0 AZT}
+    {3131913600 18000 1 AZST}
+    {3150057600 14400 0 AZT}
+    {3163363200 18000 1 AZST}
+    {3181507200 14400 0 AZT}
+    {3194812800 18000 1 AZST}
+    {3212956800 14400 0 AZT}
+    {3226262400 18000 1 AZST}
+    {3245011200 14400 0 AZT}
+    {3257712000 18000 1 AZST}
+    {3276460800 14400 0 AZT}
+    {3289161600 18000 1 AZST}
+    {3307910400 14400 0 AZT}
+    {3321216000 18000 1 AZST}
+    {3339360000 14400 0 AZT}
+    {3352665600 18000 1 AZST}
+    {3370809600 14400 0 AZT}
+    {3384115200 18000 1 AZST}
+    {3402864000 14400 0 AZT}
+    {3415564800 18000 1 AZST}
+    {3434313600 14400 0 AZT}
+    {3447014400 18000 1 AZST}
+    {3465763200 14400 0 AZT}
+    {3479068800 18000 1 AZST}
+    {3497212800 14400 0 AZT}
+    {3510518400 18000 1 AZST}
+    {3528662400 14400 0 AZT}
+    {3541968000 18000 1 AZST}
+    {3560112000 14400 0 AZT}
+    {3573417600 18000 1 AZST}
+    {3592166400 14400 0 AZT}
+    {3604867200 18000 1 AZST}
+    {3623616000 14400 0 AZT}
+    {3636316800 18000 1 AZST}
+    {3655065600 14400 0 AZT}
+    {3668371200 18000 1 AZST}
+    {3686515200 14400 0 AZT}
+    {3699820800 18000 1 AZST}
+    {3717964800 14400 0 AZT}
+    {3731270400 18000 1 AZST}
+    {3750019200 14400 0 AZT}
+    {3762720000 18000 1 AZST}
+    {3781468800 14400 0 AZT}
+    {3794169600 18000 1 AZST}
+    {3812918400 14400 0 AZT}
+    {3825619200 18000 1 AZST}
+    {3844368000 14400 0 AZT}
+    {3857673600 18000 1 AZST}
+    {3875817600 14400 0 AZT}
+    {3889123200 18000 1 AZST}
+    {3907267200 14400 0 AZT}
+    {3920572800 18000 1 AZST}
+    {3939321600 14400 0 AZT}
+    {3952022400 18000 1 AZST}
+    {3970771200 14400 0 AZT}
+    {3983472000 18000 1 AZST}
+    {4002220800 14400 0 AZT}
+    {4015526400 18000 1 AZST}
+    {4033670400 14400 0 AZT}
+    {4046976000 18000 1 AZST}
+    {4065120000 14400 0 AZT}
+    {4078425600 18000 1 AZST}
+    {4096569600 14400 0 AZT}
+}
+                                                                                                                                                                                                                                                                                                                                                               ÛüËGU&&‘uçÀÊ‰r‘ûş+$]!xÉ!ïÃ.¼n2è¥EÔTI1«¿%ÖøÇO‚$ªWÒ!.¬¥£ğ$÷	ìÚ'W¿ìe)N¦ë
+é[Õœ/Ô~î·?ìHìÂ¸ì¯6kB×]¼•YOà’Ÿ£KN¬65 ¿½Ä¹)ÉÃù+l¬ŒhÁ”*¨z†|Cpıóú%§=ó‰PtáÏ¤ÏqtB®ƒÙÓûü¦{KiPMˆ´ŸúÂ&6%ÈØáQ¡Ç%D¦ëD7–Œ3£·&²'AY:E©Ô]^XµqÃ•‹Qüá²æ÷–Íã´b„ˆu.=lß0¼šğ¦9UÎëµ€óNÇ}™.@™ «òÙ=ƒ£œ3PòôñÄœÈ¬v5èÔı–&Ä—î“ RQ‰—¼§©›qôãà.ÏÂ8)º†tºh^ï¡.å‚fÁJC‰}$ÑâZ¿¿xC/F–Êñ%®É5Î€Ë]¬1“ô	Nˆ²hR‚åûUgì{tzÀ(€—¼¶‚c>ı¤²“èø­ÈÒ~EŒw¡+
+J%Åbòÿ¸……g0ÄÃÄ~:ôô¯ŸòËbo²ºj3ÁK˜‹ÜÅÛ]®A<¾Lõı$Æ»¶×»0•G¦ıXˆÅ¿±®İ/*
+ *  Copyright (c) 2014 The WebRTC project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+// Borrowed from Chromium's src/base/stl_util.h.
+
+#ifndef WEBRTC_SYSTEM_WRAPPERS_INCLUDE_STL_UTIL_H_
+#define WEBRTC_SYSTEM_WRAPPERS_INCLUDE_STL_UTIL_H_
+
+#include <assert.h>
+#include <algorithm>
+#include <functional>
+#include <iterator>
+#include <string>
+#include <vector>
+
+namespace webrtc {
+
+// Clears internal memory of an STL object.
+// STL clear()/reserve(0) does not always free internal memory allocated
+// This function uses swap/destructor to ensure the internal memory is freed.
+template<class T>
+void STLClearObject(T* obj) {
+  T tmp;
+  tmp.swap(*obj);
+  // Sometimes "T tmp" allocates objects with memory (arena implementation?).
+  // Hence using additional reserve(0) even if it doesn't always work.
+  obj->reserve(0);
+}
+
+// For a range within a container of pointers, calls delete (non-array version)
+// on these pointers.
+// NOTE: for these three functions, we could just implement a DeleteObject
+// functor and then call for_each() on the range and functor, but this
+// requires us to pull in all of algorithm.h, which seems expensive.
+// For hash_[multi]set, it is important that this deletes behind the iterator
+// because the hash_set may call the hash function on the iterator when it is
+// advanced, which could result in the hash function trying to deference a
+// stale pointer.
+template <class ForwardIterator>
+void STLDeleteContainerPointers(ForwardIterator begin, ForwardIterator end) {
+  while (begin != end) {
+    ForwardIterator temp = begin;
+    ++begin;
+    delete *temp;
+  }
+}
+
+// For a range within a container of pairs, calls delete (non-array version) on
+// BOTH items in the pairs.
+// NOTE: Like STLDeleteContainerPointers, it is important that this deletes
+// behind the iterator because if both the key and value are deleted, the
+// container may call the hash function on the iterator when it is advanced,
+// which could result in the hash function trying to dereference a stale
+// pointer.
+template <class ForwardIterator>
+void STLDeleteContainerPairPointers(ForwardIterator begin,
+                                    ForwardIterator end) {
+  while (begin != end) {
+    ForwardIterator temp = begin;
+    ++begin;
+    delete temp->first;
+    delete temp->second;
+  }
+}
+
+// For a range within a container of pairs, calls delete (non-array version) on
+// the FIRST item in the pairs.
+// NOTE: Like STLDeleteContainerPointers, deleting behind the iterator.
+template <class ForwardIterator>
+void STLDeleteContainerPairFirstPointers(ForwardIterator begin,
+                                         ForwardIterator end) {
+  while (begin != end) {
+    ForwardIterator temp = begin;
+    ++begin;
+    delete temp->first;
+  }
+}
+
+// For a range within a container of pairs, calls delete.
+// NOTE: Like STLDeleteContainerPointers, deleting behind the iterator.
+// Deleting the value does not always invalidate the iterator, but it may
+// do so if the key is a pointer into the value object.
+template <class ForwardIterator>
+void STLDeleteContainerPairSecondPointers(ForwardIterator begin,
+                                          ForwardIterator end) {
+  while (begin != end) {
+    ForwardIterator temp = begin;
+    ++begin;
+    delete temp->second;
+  }
+}
+
+// To treat a possibly-empty vector as an array, use these functions.
+// If you know the array will never be empty, you can use &*v.begin()
+// directly, but that is undefined behaviour if |v| is empty.
+template<typename T>
+inline T* vector_as_array(std::vector<T>* v) {
+  return v->empty() ? NULL : &*v->begin();
+}
+
+template<typename T>
+inline const T* vector_as_array(const std::vector<T>* v) {
+  return v->empty() ? NULL : &*v->begin();
+}
+
+// Return a mutable char* pointing to a string's internal buffer,
+// which may not be null-terminated. Writing through this pointer will
+// modify the string.
+//
+// string_as_array(&str)[i] is valid for 0 <= i < str.size() until the
+// next call to a string method that invalidates iterators.
+//
+// As of 2006-04, there is no standard-blessed way of getting a
+// mutable reference to a string's internal buffer. However, issue 530
+// (http://www.open-std.org/JTC1/SC22/WG21/docs/lwg-active.html#530)
+// proposes this as the method. According to Matt Austern, this should
+// already work on all current implementations.
+inline char* string_as_array(std::string* str) {
+  // DO NOT USE const_cast<char*>(str->data())
+  return str->empty() ? NULL : &*str->begin();
+}
+
+// The following functions are useful for cleaning up STL containers whose
+// elements point to allocated memory.
+
+// STLDeleteElements() deletes all the elements in an STL container and clears
+// the container.  This function is suitable for use with a vector, set,
+// hash_set, or any other STL container which defines sensible begin(), end(),
+// and clear() methods.
+//
+// If container is NULL, this function is a no-op.
+//
+// As an alternative to calling STLDeleteElements() directly, consider
+// STLElementDeleter (defined below), which ensures that your container's
+// elements are deleted when the STLElementDeleter goes out of scope.
+template <class T>
+void STLDeleteElements(T* container) {
+  if (!container)
+    return;
+  STLDeleteContainerPointers(container->begin(), container->end());
+  container->clear();
+}
+
+// Given an STL container consisting of (key, value) pairs, STLDeleteValues
+// deletes all the "value" components and clears the container.  Does nothing
+// in the case it's given a NULL pointer.
+template <class T>
+void STLDeleteValues(T* container) {
+  if (!container)
+    return;
+  for (typename T::iterator i(container->begin()); i != container->end(); ++i)
+    delete i->second;
+  container->clear();
+}
+
+
+// The following classes provide a convenient way to delete all elements or
+// values from STL containers when they goes out of scope.  This greatly
+// simplifies code that creates temporary objects and has multiple return
+// statements.  Example:
+//
+// vector<MyProto *> tmp_proto;
+// STLElementDeleter<vector<MyProto *> > d(&tmp_proto);
+// if (...) return false;
+// ...
+// return success;
+
+// Given a pointer to an STL container this class will delete all the element
+// pointers when it goes out of scope.
+template<class T>
+class STLElementDeleter {
+ public:
+  STLElementDeleter<T>(T* container) : container_(container) {}
+  ~STLElementDeleter<T>() { STLDeleteElements(container_); }
+
+ private:
+  T* container_;
+};
+
+// Given a pointer to an STL container this class will delete all the value
+// pointers when it goes out of scope.
+template<class T>
+class STLValueDeleter {
+ public:
+  STLValueDeleter<T>(T* container) : container_(container) {}
+  ~STLValueDeleter<T>() { STLDeleteValues(container_); }
+
+ private:
+  T* container_;
+};
+
+// Test to see if a set, map, hash_set or hash_map contains a particular key.
+// Returns true if the key is in the collection.
+template <typename Collection, typename Key>
+bool ContainsKey(const Collection& collection, const Key& key) {
+  return collection.find(key) != collection.end();
+}
+
+// Returns true if the container is sorted.
+template <typename Container>
+bool STLIsSorted(const Container& cont) {
+  // Note: Use reverse iterator on container to ensure we only require
+  // value_type to implement operator<.
+  return std::adjacent_find(cont.rbegin(), cont.rend(),
+                            std::less<typename Container::value_type>())
+      == cont.rend();
+}
+
+// Returns a new ResultType containing the difference of two sorted containers.
+template <typename ResultType, typename Arg1, typename Arg2>
+ResultType STLSetDifference(const Arg1& a1, const Arg2& a2) {
+  assert(STLIsSorted(a1));
+  assert(STLIsSorted(a2));
+  ResultType difference;
+  std::set_difference(a1.begin(), a1.end(),
+                      a2.begin(), a2.end(),
+                      std::inserter(difference, difference.end()));
+  return difference;
+}
+
+// Returns a new ResultType containing the union of two sorted containers.
+template <typename ResultType, typename Arg1, typename Arg2>
+ResultType STLSetUnion(const Arg1& a1, const Arg2& a2) {
+  assert(STLIsSorted(a1));
+  assert(STLIsSorted(a2));
+  ResultType result;
+  std::set_union(a1.begin(), a1.end(),
+                 a2.begin(), a2.end(),
+                 std::inserter(result, result.end()));
+  return result;
+}
+
+// Returns a new ResultType containing the intersection of two sorted
+// containers.
+template <typename ResultType, typename Arg1, typename Arg2>
+ResultType STLSetIntersection(const Arg1& a1, const Arg2& a2) {
+  assert(STLIsSorted(a1));
+  assert(STLIsSorted(a2));
+  ResultType result;
+  std::set_intersection(a1.begin(), a1.end(),
+                        a2.begin(), a2.end(),
+                        std::inserter(result, result.end()));
+  return result;
+}
+
+// Returns true if the sorted container |a1| contains all elements of the sorted
+// container |a2|.
+template <typename Arg1, typename Arg2>
+bool STLIncludes(const Arg1& a1, const Arg2& a2) {
+  assert(STLIsSorted(a1));
+  assert(STLIsSorted(a2));
+  return std::includes(a1.begin(), a1.end(),
+                       a2.begin(), a2.end());
+}
+
+}  // namespace webrtc
+
+#endif  // WEBRTC_SYSTEM_WRAPPERS_INCLUDE_STL_UTIL_H_
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         ‹'yş$é
+c´$®;LÚv,?\UöÿÕe{TGšhR{ƒÇ/Wy9”¶jö}œÆT£RV¸û°qÿ„–ìÅ'ùpƒ¦šeVª]]9iÏØÿ%ğ¬ãÑ¾3€ÌÁ¶“˜ÆzºAİ¤ÚuúãÓŒŒš\ ß ´’!e++¥6ÏİŸVİá…ˆPv0L±çF7XhNò’¡úìÀ«|[Éé@7ö)àeÙD'˜†E‡a©.‘~#Â–(Ph'tëJb ºêye3AU¾M”4ÍÉ•!“Ğ¢4.¡ß¼¡cv™qƒN6©Î¡‚­‰!6éR¨tÒğKÍzîÈİîÌøÍRhÙË]¨¥PhR¼İiæ r(šõ½æ4&³Ñ÷âcş2¡Å$ âêåQ¦áWÁ2Î]QéÔ<š9eòãr€­½^†™ËC›B”¿=,œı.•B
+NQ„ñ‹l¬´¡[È°šôO¯Òj$é˜—xÓì=•9?”e¢,Â%23UíY^Ùÿ«%7ôÓÔ{¶ZYÑë…ÖéKá£*ÑXüL OİzhYDæÓ´Éó•æ5ol+!,ÆãÖßú«=õ

@@ -1,0 +1,67 @@
+;
+			}
+		}
+
+		int32 ChildrenCount = InActor->GetChildrenCount();
+		for (int32 i = 0; i < ChildrenCount; ++i)
+		{
+			FixIesTextures(Scene, InActor->GetChild(i));
+		}
+	}
+
+	EDatasmithTextureMode GetTextureModeFromPropertyName(const FString& PropertyName)
+	{
+		if (PropertyName.Find(TEXT("BUMP")) != INDEX_NONE)
+		{
+			return EDatasmithTextureMode::Bump;
+		}
+		else if (PropertyName.Find(TEXT("SPECULAR")) != INDEX_NONE)
+		{
+			return EDatasmithTextureMode::Specular;
+		}
+		else if (PropertyName.Find(TEXT("NORMAL")) != INDEX_NONE)
+		{
+			return EDatasmithTextureMode::Normal;
+		}
+
+		return EDatasmithTextureMode::Diffuse;
+	};
+
+	void CheckMasterMaterialTextures( IDatasmithScene& Scene )
+	{
+		TSet<FString> ProcessedTextures;
+
+		IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+
+
+		for( int32 MaterialIndex = 0; MaterialIndex < Scene.GetMaterialsCount(); ++MaterialIndex )
+		{
+			const TSharedPtr< IDatasmithBaseMaterialElement >& BaseMaterial = Scene.GetMaterial( MaterialIndex );
+
+			if ( BaseMaterial->IsA( EDatasmithElementType::MasterMaterial ) )
+			{
+				const TSharedPtr< IDatasmithMasterMaterialElement >& Material = StaticCastSharedPtr< IDatasmithMasterMaterialElement >( BaseMaterial );
+
+				for ( int32 i = 0; i < Material->GetPropertiesCount(); ++i )
+				{
+					TSharedPtr< IDatasmithKeyValueProperty > Property = Material->GetProperty(i);
+
+					if (Property->GetPropertyType() == EDatasmithKeyValuePropertyType::Texture && FCString::Strlen(Property->GetValue()) > 0)
+					{
+						FString TexturePathName = Property->GetValue();
+
+						// If TexturePathName is a path to a file on disk
+						if (TexturePathName[0] != '/' && PlatformFile.FileExists( *TexturePathName ))
+						{
+							// Add TextureElement associated to TexturePathName if it has not been yet
+							if (ProcessedTextures.Find(TexturePathName) == nullptr)
+							{
+
+								TSharedPtr< IDatasmithTextureElement > TextureElement = FDatasmithSceneFactory::CreateTexture(*FPaths::GetBaseFilename(TexturePathName));
+
+								TextureElement->SetTextureMode( GetTextureModeFromPropertyName(Property->GetName()) );
+								TextureElement->SetFile( *TexturePathName );
+
+								Scene.AddTexture( TextureElement );
+
+								ProcessedT

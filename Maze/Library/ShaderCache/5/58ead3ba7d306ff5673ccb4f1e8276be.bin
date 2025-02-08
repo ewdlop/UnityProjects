@@ -1,0 +1,246 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "RigVMCore/RigVM.h"
+#include "UObject/Package.h"
+#include "UObject/AnimObjectVersion.h"
+#include "HAL/PlatformTLS.h"
+
+bool FRigVMParameter::Serialize(FArchive& Ar)
+{
+	Ar.UsingCustomVersion(FAnimObjectVersion::GUID);
+
+	if (Ar.CustomVer(FAnimObjectVersion::GUID) < FAnimObjectVersion::StoreMarkerNamesOnSkeleton)
+	{
+		return false;
+	}
+
+	Ar << Type;
+	Ar << Name;
+	Ar << RegisterIndex;
+	Ar << CPPType;
+	Ar << ScriptStructPath;
+
+	if (Ar.IsLoading())
+	{
+		ScriptStruct = nullptr;
+	}
+
+	return true;
+}
+
+UScriptStruct* FRigVMParameter::GetScriptStruct() const
+{
+	if (ScriptStruct == nullptr)
+	{
+		if (ScriptStructPath != NAME_None)
+		{
+			FRigVMParameter* MutableThis = (FRigVMParameter*)this;
+			MutableThis->ScriptStruct = FindObject<UScriptStruct>(ANY_PACKAGE, *ScriptStructPath.ToString());
+		}
+	}
+	return ScriptStruct;
+}
+
+URigVM::URigVM()
+    : WorkMemoryPtr(&WorkMemoryStorage)
+    , LiteralMemoryPtr(&LiteralMemoryStorage)
+    , ByteCodePtr(&ByteCodeStorage)
+    , FunctionNamesPtr(&FunctionNamesStorage)
+    , FunctionsPtr(&FunctionsStorage)
+	, ExecutingThreadId(INDEX_NONE)
+	, DeferredVMToCopy(nullptr)
+{
+	GetWorkMemory().SetMemoryType(ERigVMMemoryType::Work);
+	GetLiteralMemory().SetMemoryType(ERigVMMemoryType::Literal);
+}
+
+URigVM::~URigVM()
+{
+	Reset();
+}
+
+void URigVM::Serialize(FArchive& Ar)
+{
+	Ar.UsingCustomVersion(FAnimObjectVersion::GUID);
+
+	if (Ar.CustomVer(FAnimObjectVersion::GUID) < FAnimObjectVersion::StoreMarkerNamesOnSkeleton)
+	{
+		return;
+	}
+
+	ensure(ExecutingThreadId == INDEX_NONE);
+
+	if (Ar.IsLoading())
+	{
+		Reset();
+	}
+
+	Ar << WorkMemoryStorage;
+	Ar << LiteralMemoryStorage;
+	Ar << FunctionNamesStorage;
+	Ar << ByteCodeStorage;
+	Ar << Parameters;
+
+	if (Ar.IsLoading())
+	{
+		if (WorkMemoryStorage.bEncounteredErrorDuringLoad ||
+			LiteralMemoryStorage.bEncounteredErrorDuringLoad)
+		{
+			Reset();
+		}
+		else
+		{
+			Instructions.Reset();
+			FunctionsStorage.Reset();
+			ParametersNameMap.Reset();
+
+			for (int32 Index = 0; Index < Parameters.Num(); Index++)
+			{
+				ParametersNameMap.Add(Parameters[Index].Name, Index);
+			}
+
+			InvalidateCachedMemory();
+		}
+	}
+}
+
+void URigVM::Reset()
+{
+	WorkMemoryStorage.Reset();
+	LiteralMemoryStorage.Reset();
+	FunctionNamesStorage.Reset();
+	FunctionsStorage.Reset();
+	ByteCodeStorage.Reset();
+	Instructions.Reset();
+	Parameters.Reset();
+	ParametersNameMap.Reset();
+	DeferredVMToCopy = nullptr;
+
+	WorkMemoryPtr = &WorkMemoryStorage;
+	LiteralMemoryPtr = &LiteralMemoryStorage;
+	FunctionNamesPtr = &FunctionNamesStorage;
+	FunctionsPtr = &FunctionsStorage;
+	ByteCodePtr = &ByteCodeStorage;
+
+	InvalidateCachedMemory();
+}
+
+void URigVM::Empty()
+{
+	WorkMemoryStorage.Empty();
+	LiteralMemoryStorage.Empty();
+	FunctionNamesStorage.Empty();
+	FunctionsStorage.Empty();
+	ByteCodeStorage.Empty();
+	Instructions.Empty();
+	Parameters.Empty();
+	ParametersNameMap.Empty();
+	DeferredVMToCopy = nullptr;
+	ExternalVariables.Empty();
+
+	InvalidateCachedMemory();
+
+	CachedMemory.Empty();
+	FirstHandleForInstruction.Empty();
+	CachedMemoryHandles.Empty();
+}
+
+void URigVM::CopyFrom(URigVM* InVM, bool bDeferCopy, bool bReferenceLiteralMemory, bool bReferenceByteCode)
+{
+	check(InVM);
+
+	// if this vm is currently executing on a worker thread
+	// we defer the copy until the next execute
+	if (ExecutingThreadId != INDEX_NONE || bDeferCopy)
+	{
+		DeferredVMToCopy = InVM;
+		return;
+	}
+	
+	Reset();
+
+	if(InVM->WorkMemoryPtr == &InVM->WorkMemoryStorage)
+	{
+		WorkMemoryStorage = InVM->WorkMemoryStorage;
+		WorkMemoryPtr = &WorkMemoryStorage;
+	}
+	else
+	{
+		WorkMemoryPtr = InVM->WorkMemoryPtr;
+	}
+
+	if(InVM->LiteralMemoryPtr == &InVM->LiteralMemoryStorage && !bReferenceLiteralMemory)
+	{
+		LiteralMemoryStorage = InVM->LiteralMemoryStorage;
+		LiteralMemoryPtr = &LiteralMemoryStorage;
+	}
+	else
+	{
+		LiteralMemoryPtr = InVM->LiteralMemoryPtr;
+	}
+
+	if(InVM->FunctionNamesPtr == &InVM->FunctionNamesStorage && !bReferenceByteCode)
+	{
+		FunctionNamesStorage = InVM->FunctionNamesStorage;
+		FunctionNamesPtr = &FunctionNamesStorage;
+	}
+	else
+	{
+		FunctionNamesPtr = InVM->FunctionNamesPtr;
+	}
+	
+	if(InVM->FunctionsPtr == &InVM->FunctionsStorage && !bReferenceByteCode)
+	{
+		FunctionsStorage = InVM->FunctionsStorage;
+		FunctionsPtr = &FunctionsStorage;
+	}
+	else
+	{
+		FunctionsPtr = InVM->FunctionsPtr;
+	}
+	
+	if(InVM->ByteCodePtr == &InVM->ByteCodeStorage && !bReferenceByteCode)
+	{
+		ByteCodeStorage = InVM->ByteCodeStorage;
+		ByteCodePtr = &ByteCodeStorage;
+		ByteCodePtr->bByteCodeIsAligned = InVM->ByteCodeStorage.bByteCodeIsAligned;
+	}
+	else
+	{
+		ByteCodePtr = InVM->ByteCodePtr;
+	}
+	
+	Instructions = InVM->Instructions;
+	Parameters = InVM->Parameters;
+	ParametersNameMap = InVM->ParametersNameMap;
+}
+
+int32 URigVM::AddRigVMFunction(UScriptStruct* InRigVMStruct, const FName& InMethodName)
+{
+	check(InRigVMStruct);
+	FString FunctionKey = FString::Printf(TEXT("F%s::%s"), *InRigVMStruct->GetName(), *InMethodName.ToString());
+	int32 FunctionIndex = GetFunctionNames().Find(*FunctionKey);
+	if (FunctionIndex != INDEX_NONE)
+	{
+		return FunctionIndex;
+	}
+
+	FRigVMFunctionPtr Function = FRigVMRegistry::Get().FindFunction(*FunctionKey);
+	if (Function == nullptr)
+	{
+		return INDEX_NONE;
+	}
+
+	GetFunctionNames().Add(*FunctionKey);
+	return GetFunctions().Add(Function);
+}
+
+FString URigVM::GetRigVMFunctionName(int32 InFunctionIndex) const
+{
+	return GetFunctionNames()[InFunctionIndex].ToString();
+}
+
+const FRigVMInstructionArray& URigVM::GetInstructions()
+{
+	RefreshInstructionsIfRequired();
+	return Instr

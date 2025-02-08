@@ -1,0 +1,41 @@
+fy the range of the value using metadata 
+<range-metadata>` and LLVM can do the sext to zext conversion for you.
+
+Zext GEP indices to machine register width
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Internally, LLVM often promotes the width of GEP indices to machine register
+width.  When it does so, it will default to using sign extension (sext) 
+operations for safety.  If your source language provides information about 
+the range of the index, you may wish to manually extend indices to machine 
+register width using a zext instruction.
+
+When to specify alignment
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+LLVM will always generate correct code if you don’t specify alignment, but may
+generate inefficient code.  For example, if you are targeting MIPS (or older 
+ARM ISAs) then the hardware does not handle unaligned loads and stores, and 
+so you will enter a trap-and-emulate path if you do a load or store with 
+lower-than-natural alignment.  To avoid this, LLVM will emit a slower 
+sequence of loads, shifts and masks (or load-right + load-left on MIPS) for 
+all cases where the load / store does not have a sufficiently high alignment 
+in the IR.
+
+The alignment is used to guarantee the alignment on allocas and globals, 
+though in most cases this is unnecessary (most targets have a sufficiently 
+high default alignment that they’ll be fine).  It is also used to provide a 
+contract to the back end saying ‘either this load/store has this alignment, or
+it is undefined behavior’.  This means that the back end is free to emit 
+instructions that rely on that alignment (and mid-level optimizers are free to 
+perform transforms that require that alignment).  For x86, it doesn’t make 
+much difference, as almost all instructions are alignment-independent.  For 
+MIPS, it can make a big difference.
+
+Note that if your loads and stores are atomic, the backend will be unable to 
+lower an under aligned access into a sequence of natively aligned accesses.  
+As a result, alignment is mandatory for atomic loads and stores.
+
+Other Things to Consider
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+#. Use ptrtoint/inttoptr sparingly (they interfere with p

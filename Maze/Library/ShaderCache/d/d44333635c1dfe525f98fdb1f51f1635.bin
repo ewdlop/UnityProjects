@@ -1,0 +1,63 @@
+                utf8->toUBytes[oldToULength++]=*source++;
+                        }
+                        utf8->toULength=toULength;
+                        pToUArgs->source=(char *)source;
+                        pFromUArgs->target=(char *)target;
+                        *pErrorCode=U_ILLEGAL_CHAR_FOUND;
+                        return;
+                    }
+                }
+            }
+
+            if(value>=minValue) {
+                /* output the mapping for c */
+                *target++=(uint8_t)value;
+                --targetCapacity;
+            } else {
+                /* value<minValue means c is unassigned (unmappable) */
+                /*
+                 * Try an extension mapping.
+                 * Pass in no source because we don't have UTF-16 input.
+                 * If we have a partial match on c, we will return and revert
+                 * to UTF-8->UTF-16->charset conversion.
+                 */
+                static const UChar nul=0;
+                const UChar *noSource=&nul;
+                c=_extFromU(cnv, cnv->sharedData,
+                            c, &noSource, noSource,
+                            &target, target+targetCapacity,
+                            NULL, -1,
+                            pFromUArgs->flush,
+                            pErrorCode);
+
+                if(U_FAILURE(*pErrorCode)) {
+                    /* not mappable or buffer overflow */
+                    cnv->fromUChar32=c;
+                    break;
+                } else if(cnv->preFromUFirstCP>=0) {
+                    /*
+                     * Partial match, return and revert to pivoting.
+                     * In normal from-UTF-16 conversion, we would just continue
+                     * but then exit the loop because the extension match would
+                     * have consumed the source.
+                     */
+                    *pErrorCode=U_USING_DEFAULT_WARNING;
+                    break;
+                } else {
+                    /* a mapping was written to the target, continue */
+
+                    /* recalculate the targetCapacity after an extension mapping */
+                    targetCapacity=(int32_t)(pFromUArgs->targetLimit-(char *)target);
+                }
+            }
+        } else {
+            /* target is full */
+            *pErrorCode=U_BUFFER_OVERFLOW_ERROR;
+            break;
+        }
+    }
+
+    /*
+     * The sourceLimit may have been adjusted before the conversion loop
+     * to stop before a truncated sequence.
+     * If so, then collect the truncated sequence 

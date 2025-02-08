@@ -1,0 +1,385 @@
+/**
+ * \file
+ *
+ * interp.c: Interpreter for CIL byte codes
+ *
+ * Authors:
+ *   Paolo Molaro (lupus@ximian.com)
+ *   Miguel de Icaza (miguel@ximian.com)
+ *   Dietmar Maurer (dietmar@ximian.com)
+ *
+ * (C) 2001, 2002 Ximian, Inc.
+ */
+#ifndef __USE_ISOC99
+#define __USE_ISOC99
+#endif
+#include "config.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <glib.h>
+#include <math.h>
+#include <locale.h>
+
+#include <mono/utils/gc_wrapper.h>
+#include <mono/utils/mono-math.h>
+#include <mono/utils/mono-counters.h>
+#include <mono/utils/mono-tls-inline.h>
+#include <mono/utils/mono-membar.h>
+
+#ifdef HAVE_ALLOCA_H
+#   include <alloca.h>
+#else
+#   ifdef __CYGWIN__
+#      define alloca __builtin_alloca
+#   endif
+#endif
+
+/* trim excessive headers */
+#include <mono/metadata/image.h>
+#include <mono/metadata/assembly-internals.h>
+#include <mono/metadata/cil-coff.h>
+#include <mono/metadata/mono-endian.h>
+#include <mono/metadata/tabledefs.h>
+#include <mono/metadata/tokentype.h>
+#include <mono/metadata/loader.h>
+#include <mono/metadata/threads.h>
+#include <mono/metadata/threadpool.h>
+#include <mono/metadata/profiler-private.h>
+#include <mono/metadata/appdomain.h>
+#include <mono/metadata/reflection.h>
+#include <mono/metadata/exception.h>
+#include <mono/metadata/verify.h>
+#include <mono/metadata/opcodes.h>
+#include <mono/metadata/debug-helpers.h>
+#include <mono/metadata/mono-config.h>
+#include <mono/metadata/marshal.h>
+#include <mono/metadata/environment.h>
+#include <mono/metadata/mono-debug.h>
+#include <mono/metadata/gc-internals.h>
+#include <mono/utils/atomic.h>
+
+#include "interp.h"
+#include "interp-internals.h"
+#include "mintops.h"
+
+#include <mono/mini/mini.h>
+#include <mono/mini/mini-runtime.h>
+#include <mono/mini/aot-runtime.h>
+#include <mono/mini/llvm-runtime.h>
+#include <mono/mini/llvmonly-runtime.h>
+#include <mono/mini/jit-icalls.h>
+#include <mono/mini/debugger-agent.h>
+#include <mono/mini/ee.h>
+#include <mono/mini/trace.h>
+
+#ifdef TARGET_ARM
+#include <mono/mini/mini-arm.h>
+#endif
+#include <mono/metadata/icall-decl.h>
+
+#ifdef _MSC_VER
+#pragma warning(disable:4102) // label' : unreferenced label
+#endif
+
+/* Arguments that are passed when invoking only a finally/filter clause from the frame */
+struct FrameClauseArgs {
+	/* Where we start the frame execution from */
+	const guint16 *start_with_ip;
+	/*
+	 * End ip of the exit_clause. We need it so we know whether the resume
+	 * state is for this frame (which is called from EH) or for the original
+	 * frame further down the stack.
+	 */
+	const guint16 *end_at_ip;
+	/* When exiting this clause we also exit the frame */
+	int exit_clause;
+	/* Exception that we are filtering */
+	MonoException *filter_exception;
+	InterpFrame *base_frame;
+};
+
+/*
+ * This code synchronizes with interp_mark_stack () using compiler memory barriers.
+ */
+
+static StackFragment*
+stack_frag_new (int size)
+{
+	StackFragment *frag = (StackFragment*)g_malloc (size);
+
+	frag->pos = (guint8*)&frag->data;
+	frag->end = (guint8*)frag + size;
+	frag->next = NULL;
+	return frag;
+}
+
+static void
+frame_stack_init (FrameStack *stack, int size)
+{
+	StackFragment *frag;
+
+	frag = stack_frag_new (size);
+	stack->first = stack->last = stack->current = frag;
+	mono_compiler_barrier ();
+	stack->inited = 1;
+}
+
+static StackFragment*
+add_frag (FrameStack *stack, int size)
+{
+	StackFragment *new_frag;
+
+	// FIXME:
+	int frag_size = 4096;
+	if (size + sizeof (StackFragment) > frag_size)
+		frag_size = size + sizeof (StackFragment);
+	new_frag = stack_frag_new (frag_size);
+	mono_compiler_barrier ();
+	stack->last->next = new_frag;
+	stack->last = new_frag;
+	stack->current = new_frag;
+	return new_frag;
+}
+
+static MONO_ALWAYS_INLINE gpointer
+frame_stack_alloc_ovf (FrameStack *stack, int size, StackFragment **out_frag)
+{
+	StackFragment *current = stack->current;
+	gpointer res;
+
+	if (current->next && current->next->pos + size <= current->next->end) {
+		current = stack->current = current->next;
+		current->pos = (guint8*)&current->data;
+	} else {
+		current = add_frag (stack, size);
+	}
+	g_assert (current->pos + size <= current->end);
+	res = (gpointer)current->pos;
+	current->pos += size;
+
+	mono_compiler_barrier ();
+
+	if (out_frag)
+		*out_frag = current;
+	return res;
+}
+
+static MONO_ALWAYS_INLINE gpointer
+frame_stack_alloc (FrameStack *stack, int size, StackFragment **out_frag)
+{
+	StackFragment *current = stack->current;
+	gpointer res;
+
+	if (G_LIKELY (current->pos + size <= current->end)) {
+		res = current->pos;
+		current->pos += size;
+		mono_compiler_barrier ();
+
+		if (out_frag)
+			*out_frag = current;
+		return res;
+	} else {
+		return frame_stack_alloc_ovf (stack, size, out_frag);
+	}
+}
+
+static MONO_ALWAYS_INLINE void
+frame_stack_pop (FrameStack *stack, StackFragment *frag, gpointer pos)
+{
+	g_assert ((guint8*)pos >= (guint8*)&frag->data && (guint8*)pos <= (guint8*)frag->end);
+	stack->current = frag;
+	mono_compiler_barrier ();
+	stack->current->pos = (guint8*)pos;
+	mono_compiler_barrier ();
+	//memset (stack->current->pos, 0, stack->current->end - stack->current->pos);
+}
+
+static void
+frame_stack_free (FrameStack *stack)
+{
+	stack->inited = 0;
+	mono_compiler_barrier ();
+	StackFragment *frag = stack->first;
+	while (frag) {
+		StackFragment *next = frag->next;
+		g_free (frag);
+		frag = next;
+	}
+}
+
+/*
+ * alloc_frame:
+ *
+ *   Allocate a new frame from the frame stack.
+ */
+static MONO_ALWAYS_INLINE InterpFrame*
+alloc_frame (ThreadContext *ctx, gpointer native_stack_addr, InterpFrame *parent, InterpMethod *imethod, stackval *args, stackval *retval)
+{
+	StackFragment *frag;
+	InterpFrame *frame;
+
+	// FIXME: Add stack overflow checks
+	frame = (InterpFrame*)frame_stack_alloc (&ctx->iframe_stack, sizeof (InterpFrame), &frag);
+
+	frame->iframe_frag = frag;
+	frame->parent = parent;
+	frame->native_stack_addr = native_stack_addr;
+	frame->imethod = imethod;
+	frame->stack_args = args;
+	frame->retval = retval;
+	frame->stack = NULL;
+	frame->ip = NULL;
+	frame->state.ip = NULL;
+
+	return frame;
+}
+
+/*
+ * alloc_data_stack:
+ *
+ *   Allocate stack space for a frame.
+ */
+static MONO_ALWAYS_INLINE void
+alloc_stack_data (ThreadContext *ctx, InterpFrame *frame, int size)
+{
+	StackFragment *frag;
+	gpointer res;
+
+	res = frame_stack_alloc (&ctx->data_stack, size, &frag);
+
+	frame->stack = (stackval*)res;
+	frame->data_frag = frag;
+}
+
+static gpointer
+alloc_extra_stack_data (ThreadContext *ctx, int size)
+{
+	StackFragment *frag;
+
+	return frame_stack_alloc (&ctx->data_stack, size, &frag);
+}
+
+/*
+ * pop_frame:
+ *
+ *   Pop FRAME and its child frames from the frame stack.
+ * FRAME stays valid until the next alloc_frame () call.
+ */
+static void
+pop_frame (ThreadContext *context, InterpFrame *frame)
+{
+	if (frame->stack)
+		frame_stack_pop (&context->data_stack, frame->data_frag, frame->stack);
+	frame_stack_pop (&context->iframe_stack, frame->iframe_frag, frame);
+}
+
+#define interp_exec_method(frame, context, error) interp_exec_method_full ((frame), (context), NULL, error)
+
+/*
+ * List of classes whose methods will be executed by transitioning to JITted code.
+ * Used for testing.
+ */
+GSList *mono_interp_jit_classes;
+/* Optimizations enabled with interpreter */
+int mono_interp_opt = INTERP_OPT_DEFAULT;
+/* If TRUE, interpreted code will be interrupted at function entry/backward branches */
+static gboolean ss_enabled;
+
+static gboolean interp_init_done = FALSE;
+
+static void interp_exec_method_full (InterpFrame *frame, ThreadContext *context, FrameClauseArgs *clause_args, MonoError *error);
+
+static MONO_NEVER_INLINE void
+interp_exec_method_call_vararg (InterpFrame *frame, ThreadContext *context, MonoError *error)
+// This function makes WebAsssembly stacks clearer, so you can see which recursion
+// is occuring, in the absence of line numbers in the debugger.
+{
+	interp_exec_method_full (frame, context, NULL, error);
+}
+
+static MONO_NEVER_INLINE void
+interp_exec_method_newobj_fast (InterpFrame *frame, ThreadContext *context, MonoError *error)
+// This function makes WebAsssembly stacks clearer, so you can see which recursion
+// is occuring, in the absence of line numbers in the debugger.
+{
+	interp_exec_method_full (frame, context, NULL, error);
+}
+
+static MONO_NEVER_INLINE void
+interp_exec_method_newobj_vtst_fast (InterpFrame *frame, ThreadContext *context, MonoError *error)
+// This function makes WebAsssembly stacks clearer, so you can see which recursion
+// is occuring, in the absence of line numbers in the debugger.
+{
+	interp_exec_method_full (frame, context, NULL, error);
+}
+
+static InterpMethod* lookup_method_pointer (gpointer addr);
+
+typedef void (*ICallMethod) (InterpFrame *frame);
+
+static MonoNativeTlsKey thread_context_id;
+
+#define DEBUG_INTERP 0
+#define COUNT_OPS 0
+
+#if DEBUG_INTERP
+int mono_interp_traceopt = 2;
+/* If true, then we output the opcodes as we interpret them */
+static int global_tracing = 2;
+
+static int debug_indent_level = 0;
+
+static int break_on_method = 0;
+static int nested_trace = 0;
+static GList *db_methods = NULL;
+static char* dump_args (InterpFrame *inv);
+
+static void
+output_indent (void)
+{
+	int h;
+
+	for (h = 0; h < debug_indent_level; h++)
+		g_print ("  ");
+}
+
+static void
+db_match_method (gpointer data, gpointer user_data)
+{
+	MonoMethod *m = (MonoMethod*)user_data;
+	MonoMethodDesc *desc = (MonoMethodDesc*)data;
+
+	if (mono_method_desc_full_match (desc, m))
+		break_on_method = 1;
+}
+
+static void
+debug_enter (InterpFrame *frame, int *tracing)
+{
+	if (db_methods) {
+		g_list_foreach (db_methods, db_match_method, (gpointer)frame->imethod->method);
+		if (break_on_method)
+			*tracing = nested_trace ? (global_tracing = 2, 3) : 2;
+		break_on_method = 0;
+	}
+	if (*tracing) {
+		MonoMethod *method = frame->imethod->method;
+		char *mn, *args = dump_args (frame);
+		debug_indent_level++;
+		output_indent ();
+		mn = mono_method_full_name (method, FALSE);
+		g_print ("(%p) Entering %s (", mono_thread_internal_current (), mn);
+		g_free (mn);
+		g_print  ("%s)\n", args);
+		g_free (args);
+	}
+}
+
+#define DEBUG_LEAVE()	\
+	if (tracing) {	\
+		char *mn, *args;	\
+		args = dump_retval (frame);	\
+		output_indent ();	\
+		mn = m

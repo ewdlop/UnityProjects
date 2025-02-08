@@ -1,0 +1,61 @@
+bjectAnnotation>& OutFinalizedObjectAnnotation )
+{
+	OutFinalizedObjectAnnotation.Reset();
+
+	if (Array)
+	{
+		// Can only diff objects
+		return;
+	}
+
+	if (!bFinalized)
+	{
+		bFinalized = true;
+
+		UObject* CurrentObject = Object.Get();
+		if (CurrentObject)
+		{
+			// Serialize the object so we can diff it
+			FSerializedObject CurrentSerializedObject;
+			{
+				CurrentSerializedObject.SetObject(CurrentObject);
+				OutFinalizedObjectAnnotation = CurrentSerializedObject.ObjectAnnotation;
+				FWriter Writer(CurrentSerializedObject, bWantsBinarySerialization);
+				SerializeObject(Writer);
+			}
+			
+			// Diff against the object state when the transaction started
+			Diff(Owner, SerializedObject, CurrentSerializedObject, DeltaChange);
+
+			// If we have a previous snapshot then we need to consider that part of the diff for the finalized object, as systems may 
+			// have been tracking delta-changes between snapshots and this finalization will need to account for those changes too
+			if (bSnapshot)
+			{
+				Diff(Owner, SerializedObjectSnapshot, CurrentSerializedObject, DeltaChange, /*bFullDiff*/false);
+			}
+
+			SerializedObjectFlip.Swap(CurrentSerializedObject);
+		}
+
+		// Clear out any snapshot data now as we won't be getting any more snapshot requests once finalized
+		bSnapshot = false;
+		SerializedObjectSnapshot.Reset();
+	}
+}
+
+void FTransaction::FObjectRecord::Snapshot( FTransaction* Owner, TArrayView<const FProperty*> Properties )
+{
+	if (Array)
+	{
+		// Can only diff objects
+		return;
+	}
+
+	if (bFinalized)
+	{
+		// Cannot snapshot once finalized
+		return;
+	}
+
+	UObject* CurrentObject = Object.Get();
+	i

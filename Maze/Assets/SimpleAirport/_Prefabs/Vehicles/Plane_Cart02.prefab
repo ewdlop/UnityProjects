@@ -1,0 +1,316 @@
+::operator()(const MachineInstr *InstA,
+                                       const MachineInstr *InstB) const {
+  // This is a comparison function for a priority queue: give higher priority
+  // to earlier instructions.
+  // This operator is used as "less", so returning "true" gives InstB higher
+  // priority (because then InstA < InstB).
+  if (InstA == InstB)
+    return false;
+  const MachineBasicBlock *BA = InstA->getParent();
+  const MachineBasicBlock *BB = InstB->getParent();
+  if (BA != BB) {
+    // If the blocks are different, ideally the dominating block would
+    // have a higher priority, but it may be too expensive to check.
+    return BA->getNumber() > BB->getNumber();
+  }
+
+  MachineBasicBlock::const_iterator ItA = InstA->getIterator();
+  MachineBasicBlock::const_iterator ItB = InstB->getIterator();
+  MachineBasicBlock::const_iterator End = BA->end();
+  while (ItA != End) {
+    if (ItA == ItB)
+      return false;   // ItA was before ItB.
+    ++ItA;
+  }
+  return true;
+}
+
+// Main W-Z implementation.
+
+void BT::visitPHI(const MachineInstr &PI) {
+  int ThisN = PI.getParent()->getNumber();
+  if (Trace)
+    dbgs() << "Visit FI(" << printMBBReference(*PI.getParent()) << "): " << PI;
+
+  const MachineOperand &MD = PI.getOperand(0);
+  assert(MD.getSubReg() == 0 && "Unexpected sub-register in definition");
+  RegisterRef DefRR(MD);
+  uint16_t DefBW = ME.getRegBitWidth(DefRR);
+
+  RegisterCell DefC = ME.getCell(DefRR, Map);
+  if (DefC == RegisterCell::self(DefRR.Reg, DefBW))    // XXX slow
+    return;
+
+  bool Changed = false;
+
+  for (unsigned i = 1, n = PI.getNumOperands(); i < n; i += 2) {
+    const MachineBasicBlock *PB = PI.getOperand(i + 1).getMBB();
+    int PredN = PB->getNumber();
+    if (Trace)
+      dbgs() << "  edge " << printMBBReference(*PB) << "->"
+             << printMBBReference(*PI.getParent());
+    if (!EdgeExec.count(CFGEdge(PredN, ThisN))) {
+      if (Trace)
+        dbgs() << " not executable\n";
+      continue;
+    }
+
+    RegisterRef RU = PI.getOperand(i);
+    RegisterCell ResC = ME.getCell(RU, Map);
+    if (Trace)
+      dbgs() << " input reg: " << printReg(RU.Reg, &ME.TRI, RU.Sub)
+             << " cell: " << ResC << "\n";
+    Changed |= DefC.meet(ResC, DefRR.Reg);
+  }
+
+  if (Changed) {
+    if (Trace)
+      dbgs() << "Output: " << printReg(DefRR.Reg, &ME.TRI, DefRR.Sub)
+             << " cell: " << DefC << "\n";
+    ME.putCell(DefRR, DefC, Map);
+    visitUsesOf(DefRR.Reg);
+  }
+}
+
+void BT::visitNonBranch(const MachineInstr &MI) {
+  if (Trace)
+    dbgs() << "Visit MI(" << printMBBReference(*MI.getParent()) << "): " << MI;
+  if (MI.isDebugValue())
+    return;
+  assert(!MI.isBranch() && "Unexpected branch instruction");
+
+  CellMapType ResMap;
+  bool Eval = ME.evaluate(MI, Map, ResMap);
+
+  if (Trace && Eval) {
+    for (unsigned i = 0, n = MI.getNumOperands(); i < n; ++i) {
+      const MachineOperand &MO = MI.getOperand(i);
+      if (!MO.isReg() || !MO.isUse())
+        continue;
+      RegisterRef RU(MO);
+      dbgs() << "  input reg: " << printReg(RU.Reg, &ME.TRI, RU.Sub)
+             << " cell: " << ME.getCell(RU, Map) << "\n";
+    }
+    dbgs() << "Outputs:\n";
+    for (const std::pair<unsigned, RegisterCell> &P : ResMap) {
+      RegisterRef RD(P.first);
+      dbgs() << "  " << printReg(P.first, &ME.TRI) << " cell: "
+             << ME.getCell(RD, ResMap) << "\n";
+    }
+  }
+
+  // Iterate over all definitions of the instruction, and update the
+  // cells accordingly.
+  for (const MachineOperand &MO : MI.operands()) {
+    // Visit register defs only.
+    if (!MO.isReg() || !MO.isDef())
+      continue;
+    RegisterRef RD(MO);
+    assert(RD.Sub == 0 && "Unexpected sub-register in definition");
+    if (!TargetRegisterInfo::isVirtualRegister(RD.Reg))
+      continue;
+
+    bool Changed = false;
+    if (!Eval || ResMap.count(RD.Reg) == 0) {
+      // Set to "ref" (aka "bottom").
+      uint16_t DefBW = ME.getRegBitWidth(RD);
+      RegisterCell RefC = RegisterCell::self(RD.Reg, DefBW);
+      if (RefC != ME.getCell(RD, Map)) {
+        ME.putCell(RD, RefC, Map);
+        Changed = true;
+      }
+    } else {
+      RegisterCell DefC = ME.getCell(RD, Map);
+      RegisterCell ResC = ME.getCell(RD, ResMap);
+      // This is a non-phi instruction, so the values of the inputs come
+      // from the same registers each time this instruction is evaluated.
+      // During the propagation, the values of the inputs can become lowered
+      // in the sense of the lattice operation, which may cause different
+      // results to be calculated in subsequent evaluations. This should
+      // not cause the bottoming of the result in the map, since the new
+      // result is already reflecting the lowered inputs.
+      for (uint16_t i = 0, w = DefC.width(); i < w; ++i) {
+        BitValue &V = DefC[i];
+        // Bits that are already "bottom" should not be updated.
+        if (V.Type == BitValue::Ref && V.RefI.Reg == RD.Reg)
+          continue;
+        // Same for those that are identical in DefC and ResC.
+        if (V == ResC[i])
+          continue;
+        V = ResC[i];
+        Changed = true;
+      }
+      if (Changed)
+        ME.putCell(RD, DefC, Map);
+    }
+    if (Changed)
+      visitUsesOf(RD.Reg);
+  }
+}
+
+void BT::visitBranchesFrom(const MachineInstr &BI) {
+  const MachineBasicBlock &B = *BI.getParent();
+  MachineBasicBlock::const_iterator It = BI, End = B.end();
+  BranchTargetList Targets, BTs;
+  bool FallsThrough = true, DefaultToAll = false;
+  int ThisN = B.getNumber();
+
+  do {
+    BTs.clear();
+    const MachineInstr &MI = *It;
+    if (Trace)
+      dbgs() << "Visit BR(" << printMBBReference(B) << "): " << MI;
+    assert(MI.isBranch() && "Expecting branch instruction");
+    InstrExec.insert(&MI);
+    bool Eval = ME.evaluate(MI, Map, BTs, FallsThrough);
+    if (!Eval) {
+      // If the evaluation failed, we will add all targets. Keep going in
+      // the loop to mark all executable branches as such.
+      DefaultToAll = true;
+      FallsThrough = true;
+      if (Trace)
+        dbgs() << "  failed to evaluate: will add all CFG successors\n";
+    } else if (!DefaultToAll) {
+      // If evaluated successfully add the targets to the cumulative list.
+      if (Trace) {
+        dbgs() << "  adding targets:";
+        for (unsigned i = 0, n = BTs.size(); i < n; ++i)
+          dbgs() << " " << printMBBReference(*BTs[i]);
+        if (FallsThrough)
+          dbgs() << "\n  falls through\n";
+        else
+          dbgs() << "\n  does not fall through\n";
+      }
+      Targets.insert(BTs.begin(), BTs.end());
+    }
+    ++It;
+  } while (FallsThrough && It != End);
+
+  if (!DefaultToAll) {
+    // Need to add all CFG successors that lead to EH landing pads.
+    // There won't be explicit branches to these blocks, but they must
+    // be processed.
+    for (const MachineBasicBlock *SB : B.successors()) {
+      if (SB->isEHPad())
+        Targets.insert(SB);
+    }
+    if (FallsThrough) {
+      MachineFunction::const_iterator BIt = B.getIterator();
+      MachineFunction::const_iterator Next = std::next(BIt);
+      if (Next != MF.end())
+        Targets.insert(&*Next);
+    }
+  } else {
+    for (const MachineBasicBlock *SB : B.successors())
+      Targets.insert(SB);
+  }
+
+  for (const MachineBasicBlock *TB : Targets)
+    FlowQ.push(CFGEdge(ThisN, TB->getNumber()));
+}
+
+void BT::visitUsesOf(unsigned Reg) {
+  if (Trace)
+    dbgs() << "queuing uses of modified reg " << printReg(Reg, &ME.TRI)
+           << " cell: " << ME.getCell(Reg, Map) << '\n';
+
+  for (MachineInstr &UseI : MRI.use_nodbg_instructions(Reg))
+    UseQ.push(&UseI);
+}
+
+BT::RegisterCell BT::get(RegisterRef RR) const {
+  return ME.getCell(RR, Map);
+}
+
+void BT::put(RegisterRef RR, const RegisterCell &RC) {
+  ME.putCell(RR, RC, Map);
+}
+
+// Replace all references to bits from OldRR with the corresponding bits
+// in NewRR.
+void BT::subst(RegisterRef OldRR, RegisterRef NewRR) {
+  assert(Map.count(OldRR.Reg) > 0 && "OldRR not present in map");
+  BitMask OM = ME.mask(OldRR.Reg, OldRR.Sub);
+  BitMask NM = ME.mask(NewRR.Reg, NewRR.Sub);
+  uint16_t OMB = OM.first(), OME = OM.last();
+  uint16_t NMB = NM.first(), NME = NM.last();
+  (void)NME;
+  assert((OME-OMB == NME-NMB) &&
+         "Substituting registers of different lengths");
+  for (std::pair<const unsigned, RegisterCell> &P : Map) {
+    RegisterCell &RC = P.second;
+    for (uint16_t i = 0, w = RC.width(); i < w; ++i) {
+      BitValue &V = RC[i];
+      if (V.Type != BitValue::Ref || V.RefI.Reg != OldRR.Reg)
+        continue;
+      if (V.RefI.Pos < OMB || V.RefI.Pos > OME)
+        continue;
+      V.RefI.Reg = NewRR.Reg;
+      V.RefI.Pos += NMB-OMB;
+    }
+  }
+}
+
+// Check if the block has been "executed" during propagation. (If not, the
+// block is dead, but it may still appear to be reachable.)
+bool BT::reached(const MachineBasicBlock *B) const {
+  int BN = B->getNumber();
+  assert(BN >= 0);
+  return ReachedBB.count(BN);
+}
+
+// Visit an individual instruction. This could be a newly added instruction,
+// or one that has been modified by an optimization.
+void BT::visit(const MachineInstr &MI) {
+  assert(!MI.isBranch() && "Only non-branches are allowed");
+  InstrExec.insert(&MI);
+  visitNonBranch(MI);
+  // Make sure to flush all the pending use updates.
+  runUseQueue();
+  // The call to visitNonBranch could propagate the changes until a branch
+  // is actually visited. This could result in adding CFG edges to the flow
+  // queue. Since the queue won't be processed, clear it.
+  while (!FlowQ.empty())
+    FlowQ.pop();
+}
+
+void BT::reset() {
+  EdgeExec.clear();
+  InstrExec.clear();
+  Map.clear();
+  ReachedBB.clear();
+  ReachedBB.reserve(MF.size());
+}
+
+void BT::runEdgeQueue(BitVector &BlockScanned) {
+  while (!FlowQ.empty()) {
+    CFGEdge Edge = FlowQ.front();
+    FlowQ.pop();
+
+    if (EdgeExec.count(Edge))
+      return;
+    EdgeExec.insert(Edge);
+    ReachedBB.insert(Edge.second);
+
+    const MachineBasicBlock &B = *MF.getBlockNumbered(Edge.second);
+    MachineBasicBlock::const_iterator It = B.begin(), End = B.end();
+    // Visit PHI nodes first.
+    while (It != End && It->isPHI()) {
+      const MachineInstr &PI = *It++;
+      InstrExec.insert(&PI);
+      visitPHI(PI);
+    }
+
+    // If this block has already been visited through a flow graph edge,
+    // then the instructions have already been processed. Any updates to
+    // the cells would now only happen through visitUsesOf...
+    if (BlockScanned[Edge.second])
+      return;
+    BlockScanned[Edge.second] = true;
+
+    // Visit non-branch instructions.
+    while (It != End && !It->isBranch()) {
+      const MachineInstr &MI = *It++;
+      InstrExec.insert(&MI);
+      visitNonBranch(MI);
+    

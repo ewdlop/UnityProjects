@@ -1,0 +1,67 @@
+    int32_t targetCapacity, length;
+    int32_t *offsets;
+
+    const uint16_t *table;
+    const uint16_t *results;
+
+    UChar32 c;
+
+    int32_t sourceIndex;
+
+    uint32_t asciiRoundtrips;
+    uint16_t value, minValue;
+
+    /* set up the local pointers */
+    cnv=pArgs->converter;
+    source=pArgs->source;
+    sourceLimit=pArgs->sourceLimit;
+    target=(uint8_t *)pArgs->target;
+    targetCapacity=(int32_t)(pArgs->targetLimit-pArgs->target);
+    offsets=pArgs->offsets;
+
+    table=cnv->sharedData->mbcs.fromUnicodeTable;
+    if((cnv->options&UCNV_OPTION_SWAP_LFNL)!=0) {
+        results=(uint16_t *)cnv->sharedData->mbcs.swapLFNLFromUnicodeBytes;
+    } else {
+        results=(uint16_t *)cnv->sharedData->mbcs.fromUnicodeBytes;
+    }
+    asciiRoundtrips=cnv->sharedData->mbcs.asciiRoundtrips;
+
+    if(cnv->useFallback) {
+        /* use all roundtrip and fallback results */
+        minValue=0x800;
+    } else {
+        /* use only roundtrips and fallbacks from private-use characters */
+        minValue=0xc00;
+    }
+
+    /* get the converter state from UConverter */
+    c=cnv->fromUChar32;
+
+    /* sourceIndex=-1 if the current character began in the previous buffer */
+    sourceIndex= c==0 ? 0 : -1;
+    lastSource=source;
+
+    /*
+     * since the conversion here is 1:1 UChar:uint8_t, we need only one counter
+     * for the minimum of the sourceLength and targetCapacity
+     */
+    length=(int32_t)(sourceLimit-source);
+    if(length<targetCapacity) {
+        targetCapacity=length;
+    }
+
+    /* conversion loop */
+    if(c!=0 && targetCapacity>0) {
+        goto getTrail;
+    }
+
+#if MBCS_UNROLL_SINGLE_FROM_BMP
+    /* unrolling makes it slower on Pentium III/Windows 2000?! */
+    /* unroll the loop with the most common case */
+unrolled:
+    if(targetCapacity>=4) {
+        int32_t count, loops;
+        uint16_t andedValues;
+
+        loops=count=tar

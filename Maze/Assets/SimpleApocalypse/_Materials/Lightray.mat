@@ -1,0 +1,51 @@
+
+  assert(Aspect.Type.isVector());
+  return findVectorLegalAction(Aspect);
+}
+
+/// Helper function to get LLT for the given type index.
+static LLT getTypeFromTypeIdx(const MachineInstr &MI,
+                              const MachineRegisterInfo &MRI, unsigned OpIdx,
+                              unsigned TypeIdx) {
+  assert(TypeIdx < MI.getNumOperands() && "Unexpected TypeIdx");
+  // G_UNMERGE_VALUES has variable number of operands, but there is only
+  // one source type and one destination type as all destinations must be the
+  // same type. So, get the last operand if TypeIdx == 1.
+  if (MI.getOpcode() == TargetOpcode::G_UNMERGE_VALUES && TypeIdx == 1)
+    return MRI.getType(MI.getOperand(MI.getNumOperands() - 1).getReg());
+  return MRI.getType(MI.getOperand(OpIdx).getReg());
+}
+
+std::tuple<LegalizerInfo::LegalizeAction, unsigned, LLT>
+LegalizerInfo::getAction(const MachineInstr &MI,
+                         const MachineRegisterInfo &MRI) const {
+  SmallBitVector SeenTypes(8);
+  const MCOperandInfo *OpInfo = MI.getDesc().OpInfo;
+  // FIXME: probably we'll need to cache the results here somehow?
+  for (unsigned i = 0; i < MI.getDesc().getNumOperands(); ++i) {
+    if (!OpInfo[i].isGenericType())
+      continue;
+
+    // We must only record actions once for each TypeIdx; otherwise we'd
+    // try to legalize operands multiple times down the line.
+    unsigned TypeIdx = OpInfo[i].getGenericTypeIndex();
+    if (SeenTypes[TypeIdx])
+      continue;
+
+    SeenTypes.set(TypeIdx);
+
+    LLT Ty = getTypeFromTypeIdx(MI, MRI, i, TypeIdx);
+    auto Action = getAction({MI.getOpcode(), TypeIdx, Ty});
+    if (Action.first != Legal)
+      return std::make_tuple(Action.first, TypeIdx, Action.second);
+  }
+  return std::make_tuple(Legal, 0, LLT{});
+}
+
+bool LegalizerInfo::isLegal(const MachineInstr &MI,
+                            const MachineRegisterInfo &MRI) const {
+  return std::get<0>(getAction(MI, MRI)) == Legal;
+}
+
+bool LegalizerInfo::legalizeCustom(MachineInstr &MI, MachineRegisterInfo &MRI,
+                                   MachineIRBuilder &MIRBui

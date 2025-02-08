@@ -1,0 +1,61 @@
+usr/gnu/bin/grep;
+	fi
+	if [[ (-e "/usr/gnu/bin/egrep") ]]; then
+		EGREP=/usr/gnu/bin/egrep;
+	fi
+	if [[ (-e "/usr/gnu/bin/sed") ]]; then
+		SED=/usr/gnu/bin/sed;
+	fi
+	if [[ (-e "/usr/gnu/bin/awk") ]]; then
+		AWK=/usr/gnu/bin/awk;
+	else
+		AWK=nawk;
+	fi
+
+	DISASS=dis
+	DISASSARGS=()
+fi
+
+# Fixup
+if [[ "$IS_DARWIN" -ne 0 ]]; then
+	DISASS=otool
+	DISASSARGS=("-tV")
+fi
+
+# Fixup
+if [[ ("$IS_FREEBSD" -ne "0" || "$IS_OPENBSD" -ne "0" || "$IS_NETBSD" -ne "0") ]]; then
+	MAKE=gmake
+elif [[ ("$IS_SOLARIS" -ne "0") ]]; then
+	MAKE=$(which gmake 2>/dev/null | "$GREP" -v "no gmake" | head -1)
+	if [[ (-z "$MAKE") && (-e "/usr/sfw/bin/gmake") ]]; then
+		MAKE=/usr/sfw/bin/gmake
+	fi
+else
+	MAKE=make
+fi
+
+# CPU features and flags
+if [[ ("$IS_X86" -ne "0" || "$IS_X64" -ne "0") ]]; then
+	if [[ ("$IS_DARWIN" -ne "0") ]]; then
+		X86_CPU_FLAGS=$(sysctl machdep.cpu.features 2>&1 | cut -f 2 -d ':')
+	elif [[ ("$IS_SOLARIS" -ne "0") ]]; then
+		X86_CPU_FLAGS=$(isainfo -v 2>/dev/null)
+	elif [[ ("$IS_FREEBSD" -ne "0") ]]; then
+		X86_CPU_FLAGS=$(grep Features /var/run/dmesg.boot)
+	else
+		X86_CPU_FLAGS=$(cat /proc/cpuinfo 2>&1 | "$AWK" '{IGNORECASE=1}{if ($1 == "flags"){print;exit}}' | cut -f 2 -d ':')
+	fi
+elif [[ ("$IS_ARM32" -ne "0" || "$IS_ARM64" -ne "0") ]]; then
+	if [[ ("$IS_DARWIN" -ne "0") ]]; then
+		ARM_CPU_FLAGS=$(sysctl machdep.cpu.features 2>&1 | cut -f 2 -d ':')
+	else
+		ARM_CPU_FLAGS=$(cat /proc/cpuinfo 2>&1 | "$AWK" '{IGNORECASE=1}{if ($1 == "Features"){print;exit}}' | cut -f 2 -d ':')
+	fi
+fi
+
+for ARG in "$@"
+do
+	# Recognize "fast" and "quick", which does not perform tests that take more time to execute
+    if [[ ($("$EGREP" -ix "fast" <<< "$ARG") || $("$EGREP" -ix "quick" <<< "$ARG")) ]]; then
+		HAVE_VALGRIND=0
+		WANT_BENCH

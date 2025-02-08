@@ -1,0 +1,44 @@
+Vector<char, 128> Buf;
+  raw_svector_ostream VecOS(Buf);
+  raw_pwrite_stream &OldStream = getStream();
+
+  // Redirect the output stream to our buffer and fill our buffer with
+  // the section data.
+  setStream(VecOS);
+  Asm.writeSectionData(&MCSec, Layout);
+
+  // Reset the stream back to what it was before.
+  setStream(OldStream);
+
+  // Write the section contents to the object file.
+  getStream() << Buf;
+
+  // Calculate our CRC with an initial value of '0', this is not how
+  // JamCRC is specified but it aligns with the expected output.
+  JamCRC JC(/*Init=*/0);
+  JC.update(Buf);
+  return JC.getCRC();
+}
+
+void WinCOFFObjectWriter::writeSection(MCAssembler &Asm,
+                                       const MCAsmLayout &Layout,
+                                       const COFFSection &Sec,
+                                       const MCSection &MCSec) {
+  if (Sec.Number == -1)
+    return;
+
+  // Write the section contents.
+  if (Sec.Header.PointerToRawData != 0) {
+    assert(getStream().tell() <= Sec.Header.PointerToRawData &&
+           "Section::PointerToRawData is insane!");
+
+    unsigned PaddingSize = Sec.Header.PointerToRawData - getStream().tell();
+    assert(PaddingSize < 4 &&
+           "Should only need at most three bytes of padding!");
+    WriteZeros(PaddingSize);
+
+    uint32_t CRC = writeSectionContents(Asm, Layout, MCSec);
+
+    // Update the section definition auxiliary symbol to record the CRC.
+    COFFSection *Sec = SectionMap[&MCSec];
+    COFFSymbol::AuxiliarySymbols &Au

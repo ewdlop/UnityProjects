@@ -1,0 +1,219 @@
+//----------------------------------------------------------------
+// Copyright (c) Microsoft Corporation.  All rights reserved.
+//----------------------------------------------------------------
+
+namespace System.ServiceModel.Discovery.VersionCD1
+{
+    using System.Runtime.Serialization;
+    using System.ServiceModel.Channels;
+    using System.Runtime;
+    using System.ServiceModel.Description;
+    using System.Globalization;
+
+    class DiscoveryVersionCD1Implementation : IDiscoveryVersionImplementation
+    {
+        static readonly Uri ScopeMatchByExact = new Uri(ProtocolStrings.VersionCD1.ScopeMatchByExact);
+        static readonly Uri ScopeMatchByLdap = new Uri(ProtocolStrings.VersionCD1.ScopeMatchByLdap);
+        static readonly Uri ScopeMatchByPrefix = new Uri(ProtocolStrings.VersionCD1.ScopeMatchByPrefix);
+        static readonly Uri ScopeMatchByUuid = new Uri(ProtocolStrings.VersionCD1.ScopeMatchByUuid);
+        static readonly Uri ScopeMatchByNone = new Uri(ProtocolStrings.VersionCD1.ScopeMatchByNone);
+
+        Uri discoveryAddress;
+        DataContractSerializer eprSerializer;
+        DiscoveryVersion.SchemaQualifiedNames qualifiedNames;
+
+        ContractDescription adhocDiscoveryContract;
+        ContractDescription managedDiscoveryContract;
+        ContractDescription announcementContract;
+
+        [Fx.Tag.SynchronizationObject()]
+        object contractLock;
+
+        public DiscoveryVersionCD1Implementation()
+        {
+            this.contractLock = new object();
+        }
+
+        public string WsaNamespace
+        {
+            get
+            {
+                return ProtocolStrings.WsaNamespaceAugust2004;
+            }
+        }
+
+        public Uri DiscoveryAddress
+        {
+            get
+            {
+                if (this.discoveryAddress == null)
+                {
+                    this.discoveryAddress = new Uri(ProtocolStrings.VersionCD1.AdhocAddress);
+                }
+                return this.discoveryAddress;
+            }
+        }                
+
+        public MessageVersion MessageVersion
+        {
+            get
+            {                    
+                return MessageVersion.Soap12WSAddressingAugust2004;
+            }
+        }
+
+        public DiscoveryVersion.SchemaQualifiedNames QualifiedNames
+        {
+            get
+            {
+                if (this.qualifiedNames == null)
+                {
+                    this.qualifiedNames = new DiscoveryVersion.SchemaQualifiedNames(ProtocolStrings.VersionCD1.Namespace, this.WsaNamespace);
+                }
+                return this.qualifiedNames;
+            }
+        }
+
+        public DataContractSerializer EprSerializer
+        {
+            get
+            {
+                if (this.eprSerializer == null)
+                {
+                    this.eprSerializer = new DataContractSerializer(typeof(EndpointAddressAugust2004));
+                }
+                return this.eprSerializer;
+            }
+        }
+
+        public ContractDescription GetDiscoveryContract(ServiceDiscoveryMode discoveryMode)
+        {
+            if (discoveryMode == ServiceDiscoveryMode.Adhoc)
+            {
+                if (this.adhocDiscoveryContract == null)
+                {
+                    lock (this.contractLock)
+                    {
+                        if (this.adhocDiscoveryContract == null)
+                        {
+                            this.adhocDiscoveryContract = DiscoveryUtility.GetContract(typeof(IDiscoveryContractAdhocCD1));
+                        }
+                    }
+                }
+                return this.adhocDiscoveryContract;
+            }
+            else if (discoveryMode == ServiceDiscoveryMode.Managed)
+            {
+                if (this.managedDiscoveryContract == null)
+                {
+                    lock (this.contractLock)
+                    {
+                        if (this.managedDiscoveryContract == null)
+                        {
+                            this.managedDiscoveryContract = DiscoveryUtility.GetContract(typeof(IDiscoveryContractManagedCD1));
+                        }
+                    }
+                }
+                return this.managedDiscoveryContract;
+            }
+            else
+            {
+                throw FxTrace.Exception.AsError(new ArgumentException(SR.DiscoveryIncorrectMode(discoveryMode)));
+            }
+        }
+
+        public ContractDescription GetAnnouncementContract()
+        {
+            if (this.announcementContract == null)
+            {
+                lock (this.contractLock)
+                {
+                    if (this.announcementContract == null)
+                    {
+                        this.announcementContract = DiscoveryUtility.GetContract(typeof(IAnnouncementContractCD1));
+                    }
+                }
+            }
+            return this.announcementContract;
+        }
+
+        public IDiscoveryInnerClient CreateDiscoveryInnerClient(DiscoveryEndpoint discoveryEndpoint, IDiscoveryInnerClientResponse responseReceiver)
+        {
+            if (discoveryEndpoint.DiscoveryMode == ServiceDiscoveryMode.Adhoc)
+            {
+                return new DiscoveryInnerClientAdhocCD1(discoveryEndpoint, responseReceiver);
+            }
+            else if (discoveryEndpoint.DiscoveryMode == ServiceDiscoveryMode.Managed)
+            {
+                return new DiscoveryInnerClientManagedCD1(discoveryEndpoint, responseReceiver);
+            }
+            else
+            {
+                throw FxTrace.Exception.AsError(new ArgumentException(SR.DiscoveryIncorrectMode(discoveryEndpoint.DiscoveryMode)));
+            }
+        }
+
+        public IAnnouncementInnerClient CreateAnnouncementInnerClient(AnnouncementEndpoint announcementEndpoint)
+        {
+            return new AnnouncementInnerClientCD1(announcementEndpoint);
+        }
+
+        public Uri ToVersionIndependentScopeMatchBy(Uri versionDependentScopeMatchBy)
+        {
+            Uri scopeMatchBy = versionDependentScopeMatchBy;
+
+            if (versionDependentScopeMatchBy == DiscoveryVersionCD1Implementation.ScopeMatchByExact)
+            {
+                scopeMatchBy = FindCriteria.ScopeMatchByExact;
+            }
+            else if (versionDependentScopeMatchBy == DiscoveryVersionCD1Implementation.ScopeMatchByPrefix)
+            {
+                scopeMatchBy = FindCriteria.ScopeMatchByPrefix;
+            }
+            else if (versionDependentScopeMatchBy == DiscoveryVersionCD1Implementation.ScopeMatchByLdap)
+            {
+                scopeMatchBy = FindCriteria.ScopeMatchByLdap;
+            }
+            else if (versionDependentScopeMatchBy == DiscoveryVersionCD1Implementation.ScopeMatchByUuid)
+            {
+                scopeMatchBy = FindCriteria.ScopeMatchByUuid;
+            }
+            else if (versionDependentScopeMatchBy == DiscoveryVersionCD1Implementation.ScopeMatchByNone)
+            {
+                scopeMatchBy = FindCriteria.ScopeMatchByNone;
+            }
+
+            return scopeMatchBy;
+        }
+
+        public Uri ToVersionDependentScopeMatchBy(Uri versionIndependentScopeMatchBy)
+        {
+            Uri scopeMatchBy = versionIndependentScopeMatchBy;
+
+            if (versionIndependentScopeMatchBy == FindCriteria.ScopeMatchByExact)
+            {
+                scopeMatchBy = DiscoveryVersionCD1Implementation.ScopeMatchByExact;
+            }
+            else if (versionIndependentScopeMatchBy == FindCriteria.ScopeMatchByPrefix)
+            {
+                scopeMatchBy = DiscoveryVersionCD1Implementation.ScopeMatchByPrefix;
+            }
+            else if (versionIndependentScopeMatchBy == FindCriteria.ScopeMatchByLdap)
+            {
+                scopeMatchBy = DiscoveryVersionCD1Implementation.ScopeMatchByLdap;
+            }
+            else if (versionIndependentScopeMatchBy == FindCriteria.ScopeMatchByUuid)
+            {
+                scopeMatchBy = DiscoveryVersionCD1Implementation.ScopeMatchByUuid;
+            }
+            else if (versionIndependentScopeMatchBy == FindCriteria.ScopeMatchByNone)
+            {
+                scopeMatchBy = DiscoveryVersionCD1Implementation.ScopeMatchByNone;
+            }
+
+            return scopeMatchBy;
+        }
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         IÅ˛ˇ  Üæ  MâIÅ‡ ˇˇL9¡ÖÁ  Dâ¡ËHãT$HãH£¬ÉÜ   É‡?IãD≈L£sxHç=    Hç    æß   1…E1¿Ë    Dâ˝Lã<$LâˇHâﬁË    Iâ∆HâIãAâÔI9ç  ÑgˇˇˇI«E    Iâç  I«Ö      I«Ö       Ä|$ ÖBˇˇˇÄ|$ tCHâ»H9¡Öè   ÈØ   HÖ¿Ñ˛ˇˇHâÒHÅ· ˇˇH9»Ö˛ˇˇÅÊˇ  Hâ¬Dâ˘Ë    È¥   Dâ¯Dâ˚EÖˇuHã|$HãˇAâ«Hã|$HãˇPHã,$HâÔHãt$LâÚDâ˘Aâ¿Ë    HãD$ Lã0HãE Iãç  AâﬂH9¡t%I«E    IâÖ  I«Ö      I«Ö       IÅ˛ˇ  v=MâIÅ‡ ˇˇL9¿uOAÅÊˇ  Hã|$LâˆHâ¬Dâ˘Ë    A∆$ HÉƒ([A\A]A^A_]√Hç=    Hç    æt  A∏   LâÒË    Hç=    Hç    æu  Hâ¡Ë    Hç=    Hç    æu  Ë          Hã~Hã2HâH% ˇˇH9á  uHÉ«ÅÊˇ  È    √       HÉ: tRAWAVSIâ◊Hâ˚Lçw∞ÜGÑ¿tLâ˜Ë    Iã7HÖˆtHÉ√HâH% ˇˇH;uHâﬂË    I«    A∆ [A^A_√       PIâÒHÅ˛ˇ  Ü…   HãMâ»IÅ‡ ˇˇL9¡Ö‘   Dâ»¡Ëâ¬É‚?æ   â—H”ÊLãGDâ…É·?I£¿sHãD◊H£»Ç∏   Hãá  HÖt9HãÑ◊  Hâ∆H´ŒHâ¥◊  H9∆u7Hç=    Hç    æ√   1…E1¿Ë    H	Hâá  ∏   H”‡HâÑ◊  AÅ·ˇ  Lâ»H¡‡	Jç»H«Ñ       X√Hç=    Hç    æt  A∏   Lâ…Ë    Hç=    Hç    æu  Ë    Hç=    Hç    æ¬   1…E1¿Ë    HãFÄ∏∞   t∆Ä∞   H(  √1¿√  USPHâ˚1ÌÉ˝	w3Î	êÉ≈É˝	w(ÛêÛêÛêÛêÛêÛêÛêÛêÛêÛêÄ; uﬂ∞ÜÑ¿u◊ÎD  Ë    Ä; u∆ÎÂHÉƒ[]√             AVSPIâÒH«á Ä      HâH¡‡	LçJã4HÖˆtj1¿I¯D  Hâ√HºŒH≥ŒH´»Hâá Ä  H9ÿu%HãúœÄ  I\»HâúœÄ  HÖˆuÀÎ)fÑ     H«ÑœÄ      1€I\»HâúœÄ  HÖˆu†H«áÇ      IÅ˘  É+  Lâ»H¡ËDâÀ¡ÎâŸÉ·?AÉ·?LãÑ«Ç  æ   H”ÊI£ÿsH¡‡	H¯Hç4»HÅ∆Ç  HãÑ»Ç  Î+I	LâÑ«Ç  H¡‡	H¯Hç4»HÅ∆Ç  H«Ñ»Ç      1¿L´»HâLãá Ä  MÖ¿Ñ:  Mâ∆ÎYfÑ     JçHt√Hâ¥«Ä  HÖ…Ñ  LâˆHº¡H≥¡I´∆Lâ∑ Ä  I9ˆuHã¥«Ä  Î¡êH«Ñ«Ä      1ˆÎ∞Mº»∏   Dâ…H”‡M≥ŒLâ∑ Ä  NãúœÄ  MÖ€Ñ˚   IºÀA∫   I”‚H«∆˛ˇˇˇH”∆L!ﬁJâ¥œÄ  tI	¿Lâá Ä  Mâ∆Hã∑Ç  HÖ∆t(JãÑœÇ  I	¬NâîœÇ  I9¬u"ÎNf.Ñ     @ H	∆Hâ∑Ç  NâîœÇ  I¡·L	…Hâ»H¡‡	Lç»JãHÖ…Ö	ˇˇˇf.Ñ     D  MâMÖˆÖ$ˇˇˇHãáÇ  Hã
+H!¡t'D  HºÒH£sHã\ÚHÖú˜Ç  uH≥ÒHÖ…uﬁ1¿HÉƒ[A^√∞HÉƒ[A^√Hç=    Hç    æ2   1…E1¿Ë    Hç=    Hç    æE  A∏   Lâ…Ë                AWAVAUATSH«á Ä      HãHÖ¿Ñî  Iâ…Iâ“E1‰Ä    Lâ‚Hº»H≥»I´ÃLâß Ä  I9‘u%H

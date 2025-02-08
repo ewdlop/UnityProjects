@@ -1,0 +1,118 @@
+==================
+  InscribeBundle
+
+    To be called after signing the bundle engine to reattach the attached container.
+
+    [IN]
+    @(Inscribe) - The bundle to inscribe.
+
+    [OUT]
+    @(SignBundle) - The bundle engine file to be signed.
+  ================================================================================================
+  -->
+  <PropertyGroup>
+    <InscribeBundleDependsOn>
+      PrepareForBuild;
+      ResolveWixExtensionReferences;
+      CompileAndLink;
+      InternalSignBundleEngine
+    </InscribeBundleDependsOn>
+  </PropertyGroup>
+  <Target
+      Name="InscribeBundle"
+      DependsOnTargets="$(InscribeBundleDependsOn)"
+      Inputs="@(SignTargetPath)"
+      Outputs="$(IntermediateOutputPath)$(SignedFile)">
+
+    <Insignia
+        BundleFile="@(SignBundleEngine)"
+        OriginalBundleFile="@(SignTargetPath)"
+        OutputFile="@(SignTargetPath)"
+        ToolPath="$(WixToolPath)"
+        NoLogo="$(InscribeNoLogo)"
+        RunAsSeparateProcess="$(RunWixToolsOutOfProc)"
+        SuppressAllWarnings="$(InscribeSuppressAllWarnings)"
+        SuppressSpecificWarnings="$(InscribeSuppressSpecificWarnings)"
+        TreatWarningsAsErrors="$(InscribeTreatWarningsAsErrors)"
+        TreatSpecificWarningsAsErrors="$(InscribeTreatSpecificWarningsAsErrors)"
+        VerboseOutput="$(InscribeVerboseOutput)"
+        AdditionalOptions="$(InscribeAdditionalOptions)">
+      <Output TaskParameter="Output" ItemName="SignBundle" />
+      <Output TaskParameter="Output" ItemName="FileWrites" />
+    </Insignia>
+  </Target>
+
+  <!--
+  ================================================================================================
+  Lib
+
+    Links the .wixobj, .wxl, .wixlib, wix extensions into a .wixlib file using lit.exe.
+
+    [IN]
+    @(CompileObjOutput) - The compiled .wixobj file.
+    @(EmbeddedResource) - The list of wxl files to use for localization.
+    @(WixObject) - The list of .wixobj files.
+    @(WixLibrary) - The list of .wixlib files.
+    @(WixExtension) - The list of wix dll extension files.
+
+    [OUT]
+    $(TargetPath) - The compiled .wixlib file.
+  ================================================================================================
+  -->
+  <PropertyGroup>
+    <LibDependsOn>
+      PrepareForBuild;
+      ResolveWixExtensionReferences
+    </LibDependsOn>
+  </PropertyGroup>
+  <Target
+    Name="Lib"
+    Inputs="@(CompileObjOutput);
+            @(EmbeddedResource);
+            @(WixObject);
+            @(WixLibrary);
+            @(_ResolvedWixExtensionPaths);
+            $(MSBuildAllProjects)"
+    Outputs="$(TargetPath)"
+    DependsOnTargets="$(LibDependsOn)"
+    Condition=" '$(OutputType)' == 'Library' ">
+
+    <Lit
+      ObjectFiles="@(CompileObjOutput);@(WixObject);@(WixLibProjects);@(WixLibrary)"
+      AdditionalOptions="$(LibAdditionalOptions)" 
+      BindInputPaths="@(LinkerBindInputPaths)"
+      BindFiles="$(LibBindFiles)"
+      ExtensionDirectory="$(WixExtDir)"
+      Extensions="@(_ResolvedWixExtensionPaths)"
+      LocalizationFiles="@(EmbeddedResource)"
+      NoLogo="$(LibNoLogo)"
+      OutputFile="$(TargetPath)"
+      Pedantic="$(LibPedantic)"
+      ReferencePaths="$(ReferencePaths)"
+      RunAsSeparateProcess="$(RunWixToolsOutOfProc)"
+      SuppressAllWarnings="$(LibSuppressAllWarnings)"
+      SuppressIntermediateFileVersionMatching="$(LibSuppressIntermediateFileVersionMatching)"
+      SuppressSchemaValidation="$(LibSuppressSchemaValidation)"
+      SuppressSpecificWarnings="$(LibSuppressSpecificWarnings)"
+      ToolPath="$(WixToolPath)"
+      TreatWarningsAsErrors="$(LibTreatWarningsAsErrors)"
+      VerboseOutput="$(LibVerboseOutput)" />
+  </Target>
+
+  <!--
+  ================================================================================================
+  AssignCultures
+
+    Determines the final list of culture groups to build based on either the Cultures property or
+    those specified in .wxl files. 
+    
+      Culture groups specified in the Cultures property must be specified as a semi-colon 
+      delimited  list of groups, with comma-delimited cultures within a group.  
+      For example:
+        <Cultures>en-US,en;en-GB,en</Cultures>
+      This will build 2 targets, outputing to en-US and en-GB sub-folders.  Light will first look
+      for strings in the first culture (en-US or en-GB) then the second (en).
+    
+      Cultures of .wxl files will be used when the Culture property is not set.  The culture of a 
+      .wxl file is determined by the Culture attribute in the WixLocalization element in the file
+

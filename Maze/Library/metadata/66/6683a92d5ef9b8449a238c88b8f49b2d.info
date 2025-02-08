@@ -1,0 +1,150 @@
+// ==++==
+// 
+//   Copyright (c) Microsoft Corporation.  All rights reserved.
+// 
+// ==--==
+// <OWNER>Microsoft</OWNER>
+// 
+
+//
+// CryptoConfig.cs
+//
+
+namespace System.Security.Cryptography {
+    using System;
+    using System.Collections;
+    using System.Collections.Generic;
+    using System.IO;
+    using System.Reflection;
+    using System.Security.Cryptography.X509Certificates;
+    using System.Security.Permissions;
+    using System.Threading;
+    using System.Globalization;
+    using System.Runtime.Versioning;
+    using Microsoft.Win32;
+    using System.Diagnostics.Contracts;
+
+    [System.Runtime.InteropServices.ComVisible(true)]
+    public class CryptoConfig {
+        private static volatile Dictionary<string, string> defaultOidHT = null;
+        private static volatile Dictionary<string, object> defaultNameHT = null;
+        private static volatile Dictionary<string, string> machineOidHT = null;
+        private static volatile Dictionary<string, string> machineNameHT = null;
+        private static volatile Dictionary<string, Type> appNameHT = new Dictionary<string, Type>(StringComparer.OrdinalIgnoreCase);
+        private static volatile Dictionary<string, string> appOidHT = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        private const string MachineConfigFilename = "machine.config";
+
+        private static volatile string version = null;
+
+#if FEATURE_CRYPTO
+        private static volatile bool s_fipsAlgorithmPolicy;
+        private static volatile bool s_haveFipsAlgorithmPolicy;
+
+        /// <summary>
+        ///     Determine if the runtime should enforce that only FIPS certified algorithms are created. This
+        ///     property returns true if this policy should be enforced, false if any algorithm may be created.
+        /// </summary>
+        public static bool AllowOnlyFipsAlgorithms {
+            [System.Security.SecuritySafeCritical]  // auto-generated
+            [ResourceExposure(ResourceScope.None)]
+            [ResourceConsumption(ResourceScope.Machine, ResourceScope.Machine)]
+            get {
+                if (!s_haveFipsAlgorithmPolicy)
+                {
+                    //
+                    // If the user has not disabled FIPS enforcement in a config file, check the CNG settings
+                    // on Vista and the FIPS registry key downlevel.
+                    //
+
+#if !FEATURE_CORECLR
+                    if (Utils._GetEnforceFipsPolicySetting()) {
+                        if (Environment.OSVersion.Version.Major >= 6) {
+                            bool fipsEnabled;
+                            uint policyReadStatus = Win32Native.BCryptGetFipsAlgorithmMode(out fipsEnabled);
+
+                            bool readPolicy = policyReadStatus == Win32Native.STATUS_SUCCESS ||
+                                              policyReadStatus == Win32Native.STATUS_OBJECT_NAME_NOT_FOUND;
+
+                            s_fipsAlgorithmPolicy = !readPolicy || fipsEnabled;
+                            s_haveFipsAlgorithmPolicy = true;
+                        }
+                        else {
+                            s_fipsAlgorithmPolicy = Utils.ReadLegacyFipsPolicy();
+                            s_haveFipsAlgorithmPolicy = true;
+                        }
+                    }
+                    else
+#endif // !FEATURE_CORECLR
+                    {
+                        s_fipsAlgorithmPolicy = false;
+                        s_haveFipsAlgorithmPolicy = true;
+                    }
+                }
+
+                return s_fipsAlgorithmPolicy;
+            }
+        }
+#endif // FEATURE_CRYPTO
+
+        private static string Version
+        {
+            [System.Security.SecurityCritical]  // auto-generated
+            get
+            {
+                if(version == null)
+                    version = ((RuntimeType)typeof(CryptoConfig)).GetRuntimeAssembly().GetVersion().ToString();
+
+                return version;
+            }
+        }
+
+        // Private object for locking instead of locking on a public type for SQL reliability work.
+        private static Object s_InternalSyncObject;
+        private static Object InternalSyncObject {
+            get {
+                if (s_InternalSyncObject == null) {
+                    Object o = new Object();
+                    Interlocked.CompareExchange(ref s_InternalSyncObject, o, null);
+                }
+                return s_InternalSyncObject;
+            }
+        }
+
+        private static Dictionary<string, string> DefaultOidHT {
+            get {
+                if (defaultOidHT == null) {
+                    Dictionary<string, string> ht = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+#if FEATURE_CRYPTO || FEATURE_LEGACYNETCFCRYPTO
+                    ht.Add("SHA", Constants.OID_OIWSEC_SHA1);
+                    ht.Add("SHA1", Constants.OID_OIWSEC_SHA1);
+                    ht.Add("System.Security.Cryptography.SHA1", Constants.OID_OIWSEC_SHA1);
+#endif //FEATURE_CRYPTO || FEATURE_LEGACYNETCFCRYPTO
+#if FEATURE_CRYPTO
+                    ht.Add("System.Security.Cryptography.SHA1CryptoServiceProvider", Constants.OID_OIWSEC_SHA1);
+                    ht.Add("System.Security.Cryptography.SHA1Cng", Constants.OID_OIWSEC_SHA1);
+#endif //FEATURE_CRYPTO
+#if FEATURE_CRYPTO || FEATURE_LEGACYNETCFCRYPTO
+                    ht.Add("System.Security.Cryptography.SHA1Managed", Constants.OID_OIWSEC_SHA1);
+                    ht.Add("SHA256", Constants.OID_OIWSEC_SHA256);
+                    ht.Add("System.Security.Cryptography.SHA256", Constants.OID_OIWSEC_SHA256);
+#endif //FEATURE_CRYPTO || FEATURE_LEGACYNETCFCRYPTO
+#if FEATURE_CRYPTO 
+                    ht.Add("System.Security.Cryptography.SHA256CryptoServiceProvider", Constants.OID_OIWSEC_SHA256);
+                    ht.Add("System.Security.Cryptography.SHA256Cng", Constants.OID_OIWSEC_SHA256);
+#endif //FEATURE_CRYPTO
+#if FEATURE_CRYPTO || FEATURE_LEGACYNETCFCRYPTO
+                    ht.Add("System.Security.Cryptography.SHA256Managed", Constants.OID_OIWSEC_SHA256);
+#endif //FEATURE_CRYPTO || FEATURE_LEGACYNETCFCRYPTO
+#if FEATURE_CRYPTO
+                    ht.Add("SHA384", Constants.OID_OIWSEC_SHA384);
+                    ht.Add("System.Security.Cryptography.SHA384", Constants.OID_OIWSEC_SHA384);
+                    ht.Add("System.Security.Cryptography.SHA384CryptoServiceProvider", Constants.OID_OIWSEC_SHA384);
+                    ht.Add("System.Security.Cryptography.SHA384Cng", Constants.OID_OIWSEC_SHA384);
+                    ht.Add("System.Security.Cryptography.SHA384Managed", Constants.OID_OIWSEC_SHA384);
+                    ht.Add("SHA512", Constants.OID_OIWSEC_SHA512);
+                    ht.Add("System.Security.Cryptography.SHA512", Constants.OID_OIWSEC_SHA512);
+                    ht.Add("System.Security.Cryptography.SHA512CryptoServiceProvider", Constants.OID_OIWSEC_SHA512);
+                    ht.Add("System.Security.Cryptography.SHA512Cng", Constants.OID_OIWSEC_SHA512);
+                    ht.Add("System.Security.Cryptography.SHA512Managed", Constants.OID_OIWSEC_SHA512);
+                    ht.Add("RIPEMD160", Constants.O

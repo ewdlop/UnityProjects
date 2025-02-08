@@ -1,0 +1,89 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	MTLTTrace.cpp: Metal device RHI implementation.
+ =============================================================================*/
+
+#include "MTITrace.hpp"
+#import <Foundation/Foundation.h>
+
+MTLPP_BEGIN
+
+std::fstream& operator>>(std::fstream& fs, MTIString& dt)
+{
+	size_t size;
+	fs >> size;
+	char c;
+	for(unsigned i = 0; i < size; i++)
+	{
+		fs >> c;
+		dt.push_back(c);
+	}
+	return fs;
+}
+
+std::fstream& operator<<(std::fstream& fs, const MTIString& dt)
+{
+	size_t size = dt.length();
+	fs << size;
+	for(unsigned i = 0; i < dt.length(); i++)
+	{
+		fs << dt[i];
+	}
+	return fs;
+}
+
+std::fstream& operator>>(std::fstream& fs, MTITraceCommand& dt)
+{
+	fs >> dt.Class;
+	fs >> dt.Thread;
+	fs >> dt.Receiver;
+	fs >> dt.Cmd;
+	return fs;
+}
+
+std::fstream& operator<<(std::fstream& fs, const MTITraceCommand& dt)
+{
+	fs << dt.Class;
+	fs << dt.Thread;
+	fs << dt.Receiver;
+	fs << dt.Cmd;
+	return fs;
+}
+
+MTITraceCommandHandler::MTITraceCommandHandler(std::string InClass, std::string InCmd)
+: Class(InClass)
+, Cmd(InCmd)
+{
+	Id = Class + Cmd;
+	MTITrace::Get().RegisterCommandHandler(this);
+}
+
+void MTITraceCommandHandler::Trace(std::fstream& fs, uintptr_t Receiver)
+{
+	fs << Class;
+	fs << (uint32)pthread_mach_thread_np(pthread_self());
+	fs << Receiver;
+	fs << Cmd;
+}
+
+MTITrace::MTITrace()
+{
+}
+
+MTITrace::~MTITrace()
+{
+	if(File.is_open())
+	{
+		File.flush();
+		File.close();
+	}
+}
+
+MTITrace& MTITrace::Get()
+{
+	static MTITrace sSelf;
+	return sSelf;
+}
+
+std::fstream& MTITrace::Beg

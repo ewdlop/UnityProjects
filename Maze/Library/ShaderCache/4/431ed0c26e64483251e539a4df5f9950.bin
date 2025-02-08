@@ -1,0 +1,54 @@
+hin registry if it exists for this application and is accessible; else the defaultValue.
+        /// </returns>
+        [RegistryPermission(SecurityAction.Assert, Read = netFrameworkFullPath)]
+        public static string AppConfigReadString(string configVariable, string defaultValue)
+        {
+            object value = ReadConfig(GetAppConfigPath(configVariable), GetAppConfigValueName(), RegistryValueKind.String);
+            if (value != null)
+            {
+                return (string)value;
+            }
+
+            return defaultValue;
+        }
+
+        private static object ReadConfig(string path, string valueName, RegistryValueKind kind)
+        {
+            object ret = null;
+
+            Debug.Assert(!String.IsNullOrEmpty(path), "Registry path should not be null.");
+            Debug.Assert(!String.IsNullOrEmpty(valueName), "valueName should not be null.");
+
+            try
+            {
+                // We read reflected keys on WOW64.
+                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(path))
+                {
+                    if (key == null)
+                    {
+                        return ret;
+                    }
+
+                    try
+                    {
+                        object value = key.GetValue(valueName, null);
+
+                        if ((value != null) && (key.GetValueKind(valueName) == kind))
+                        {
+                            ret = value;
+                        }
+                    }
+                    catch (UnauthorizedAccessException) { }
+                    catch (IOException) { }
+                }
+            }
+            catch (SecurityException) { }
+            catch (ObjectDisposedException) { }
+
+            return ret;
+        }
+        
+        private static string GetNetFrameworkVersionedPath()
+        {
+            string versionedKeyPath = String.Format(
+                CultureInfo.InvariantCultur

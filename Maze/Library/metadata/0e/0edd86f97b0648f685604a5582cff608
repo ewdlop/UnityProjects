@@ -1,0 +1,192 @@
+TER_GC_UNSAFE;
+		mono_arch_get_native_call_context_ret (&ccontext, frame, sig);
+		MONO_EXIT_GC_UNSAFE;
+	}
+
+	if (ccontext.stack != NULL)
+		g_free (ccontext.stack);
+#else
+	if (!context->has_resume_state && !MONO_TYPE_ISSTRUCT (sig->ret))
+		stackval_from_data (sig->ret, frame->retval, (char*)&frame->retval->data.p, sig->pinvoke);
+
+	g_free (margs->iargs);
+	g_free (margs->fargs);
+	g_free (margs);
+#endif
+	goto exit_pinvoke; // prevent unused label warning in some configurations
+exit_pinvoke:
+	return;
+}
+#ifdef _MSC_VER
+#pragma optimize ("", on)
+#endif
+
+/*
+ * interp_init_delegate:
+ *
+ *   Initialize del->interp_method.
+ */
+static void
+interp_init_delegate (MonoDelegate *del, MonoError *error)
+{
+	MonoMethod *method;
+
+	if (del->interp_method) {
+		/* Delegate created by a call to ves_icall_mono_delegate_ctor_interp () */
+		del->method = ((InterpMethod *)del->interp_method)->method;
+	} if (del->method_ptr && !del->method) {
+		/* Delegate created from methodInfo.MethodHandle.GetFunctionPointer() */
+		del->interp_method = (InterpMethod *)del->method_ptr;
+	} else if (del->method) {
+		/* Delegate created dynamically */
+		del->interp_method = mono_interp_get_imethod (del->object.vtable->domain, del->method, error);
+	} else {
+		/* Created from JITted code */
+		g_assert_not_reached ();
+	}
+
+	method = ((InterpMethod*)del->interp_method)->method;
+	if (del->target &&
+			method &&
+			method->flags & METHOD_ATTRIBUTE_VIRTUAL &&
+			method->flags & METHOD_ATTRIBUTE_ABSTRACT &&
+			mono_class_is_abstract (method->klass))
+		del->interp_method = get_virtual_method ((InterpMethod*)del->interp_method, del->target->vtable);
+
+	method = ((InterpMethod*)del->interp_method)->method;
+	if (method && m_class_get_parent (method->klass) == mono_defaults.multicastdelegate_class) {
+		const char *name = method->name;
+		if (*name == 'I' && (strcmp (name, "Invoke") == 0)) {
+			/*
+			 * When invoking the delegate interp_method is executed directly. If it's an
+			 * invoke make sure we replace it with the appropriate delegate invoke wrapper.
+			 *
+			 * FIXME We should do this later, when we also know the delegate on which the
+			 * target method is called.
+			 */
+			del->interp_method = mono_interp_get_imethod (del->object.vtable->domain, mono_marshal_get_delegate_invoke (method, NULL), error);
+			mono_error_assert_ok (error);
+		}
+	}
+
+	if (!((InterpMethod *) del->interp_method)->transformed && method_is_dynamic (method)) {
+		/* Return any errors from method compilation */
+		mono_interp_transform_method ((InterpMethod *) del->interp_method, get_context (), error);
+		return_if_nok (error);
+	}
+}
+
+static void
+interp_delegate_ctor (MonoObjectHandle this_obj, MonoObjectHandle target, gpointer addr, MonoError *error)
+{
+	/*
+	 * addr is the result of an LDFTN opcode, i.e. an InterpMethod
+	 */
+	InterpMethod *imethod = (InterpMethod*)addr;
+
+	if (!(imethod->method->flags & METHOD_ATTRIBUTE_STATIC)) {
+		MonoMethod *invoke = mono_get_delegate_invoke_internal (mono_handle_class (this_obj));
+		/* virtual invoke delegates must not have null check */
+		if (mono_method_signature_internal (imethod->method)->param_count == mono_method_signature_internal (invoke)->param_count
+				&& MONO_HANDLE_IS_NULL (target)) {
+			mono_error_set_argument (error, "this", "Delegate to an instance method cannot have null 'this'");
+			return;
+		}
+	}
+
+	g_assert (imethod->method);
+	gpointer entry = mini_get_interp_callbacks ()->create_method_pointer (imethod->method, FALSE, error);
+	return_if_nok (error);
+
+	MONO_HANDLE_SETVAL (MONO_HANDLE_CAST (MonoDelegate, this_obj), interp_method, gpointer, imethod);
+
+	mono_delegate_ctor (this_obj, target, entry, error);
+}
+
+/*
+ * From the spec:
+ * runtime specifies that the implementation of the method is automatically
+ * provided by the runtime and is primarily used for the methods of delegates.
+ */
+#ifndef ENABLE_NETCORE
+static MONO_NEVER_INLINE MonoException*
+ves_imethod (InterpFrame *frame, MonoMethod *method, MonoMethodSignature *sig, stackval *sp, stackval *retval)
+{
+	const char *name = method->name;
+	mono_class_init_internal (method->klass);
+
+	if (method->klass == mono_defaults.array_class) {
+		if (!strcmp (name, "UnsafeMov")) {
+			/* TODO: layout checks */
+			stackval_from_data (sig->ret, retval, (char*) sp, FALSE);
+			return NULL;
+		}
+		if (!strcmp (name, "UnsafeLoad"))
+			return ves_array_get (frame, sp, retval, sig, FALSE);
+	}
+	
+	g_error ("Don't know how to exec runtime method %s.%s::%s", 
+			m_class_get_name_space (method->klass), m_class_get_name (method->klass),
+			method->name);
+}
+#endif
+
+#if DEBUG_INTERP
+static char*
+dump_stack (stackval *stack, stackval *sp)
+{
+	stackval *s = stack;
+	GString *str = g_string_new ("");
+	
+	if (sp == stack)
+		return g_string_free (str, FALSE);
+	
+	while (s < sp) {
+		g_string_append_printf (str, "[%p (%" PRId64 ")] ", s->data.l, (gint64)s->data.l);
+		++s;
+	}
+	return g_string_free (str, FALSE);
+}
+
+static void
+dump_stackval (GString *str, stackval *s, MonoType *type)
+{
+	switch (type->type) {
+	case MONO_TYPE_I1:
+	case MONO_TYPE_U1:
+	case MONO_TYPE_I2:
+	case MONO_TYPE_U2:
+	case MONO_TYPE_I4:
+	case MONO_TYPE_U4:
+	case MONO_TYPE_CHAR:
+	case MONO_TYPE_BOOLEAN:
+		g_string_append_printf (str, "[%d] ", s->data.i);
+		break;
+	case MONO_TYPE_STRING:
+	case MONO_TYPE_SZARRAY:
+	case MONO_TYPE_CLASS:
+	case MONO_TYPE_OBJECT:
+	case MONO_TYPE_ARRAY:
+	case MONO_TYPE_PTR:
+	case MONO_TYPE_I:
+	case MONO_TYPE_U:
+		g_string_append_printf (str, "[%p] ", s->data.p);
+		break;
+	case MONO_TYPE_VALUETYPE:
+		if (m_class_is_enumtype (type->data.klass))
+			g_string_append_printf (str, "[%d] ", s->data.i);
+		else
+			g_string_append_printf (str, "[vt:%p] ", s->data.p);
+		break;
+	case MONO_TYPE_R4:
+		g_string_append_printf (str, "[%g] ", s->data.f_r4);
+		break;
+	case MONO_TYPE_R8:
+		g_string_append_printf (str, "[%g] ", s->data.f);
+		break;
+	case MONO_TYPE_I8:
+	case MONO_TYPE_U8:
+	default: {
+		GString *res = g_string_new ("");
+		mono_type_get_desc (res, type, TRUE);
+		g_string_ap

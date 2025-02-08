@@ -1,0 +1,59 @@
+﻿//-----------------------------------------------------------------------------
+// Copyright (c) Microsoft Corporation.  All rights reserved.
+//-----------------------------------------------------------------------------
+
+namespace Microsoft.VisualBasic.Activities.XamlIntegration
+{
+    using System;
+    using System.Activities.Expressions;
+    using System.Collections.Generic;
+    using System.Linq;
+    using System.Text;
+    using System.Text.RegularExpressions;
+    using System.Reflection;
+    using System.Xml.Linq;
+    using System.ComponentModel;
+    using System.Xaml;
+    using System.Windows.Markup;
+    using System.Security;
+    using System.Security.Permissions;
+    using System.Runtime;
+    using System.Threading;
+
+    static class VisualBasicExpressionConverter
+    {
+        static readonly Regex assemblyQualifiedNamespaceRegex = new Regex(
+            "clr-namespace:(?<namespace>[^;]*);assembly=(?<assembly>.*)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        public static VisualBasicSettings CollectXmlNamespacesAndAssemblies(ITypeDescriptorContext context)
+        {
+            // access XamlSchemaContext.ReferenceAssemblies 
+            // for the Compiled Xaml scenario
+            IList<Assembly> xsCtxReferenceAssemblies = null;
+            IXamlSchemaContextProvider xamlSchemaContextProvider = context.GetService(typeof(IXamlSchemaContextProvider)) as IXamlSchemaContextProvider;
+            if (xamlSchemaContextProvider != null && xamlSchemaContextProvider.SchemaContext != null)
+            {
+                xsCtxReferenceAssemblies = xamlSchemaContextProvider.SchemaContext.ReferenceAssemblies;
+                if (xsCtxReferenceAssemblies != null && xsCtxReferenceAssemblies.Count == 0)
+                {
+                    xsCtxReferenceAssemblies = null;
+                }
+            } 
+
+            VisualBasicSettings settings = null;
+            IXamlNamespaceResolver namespaceResolver = (IXamlNamespaceResolver)context.GetService(typeof(IXamlNamespaceResolver));
+
+            if (namespaceResolver == null)
+            {
+                return null;
+            }
+
+            lock (AssemblyCache.XmlnsMappingsLockObject)
+            {
+                // Fetch xmlnsMappings for the prefixes returned by the namespaceResolver service
+
+                foreach (NamespaceDeclaration prefix in namespaceResolver.GetNamespacePrefixes())
+                {
+                    ReadOnlyXmlnsMapping mapping;
+                    WrapCachedMapping(prefix, out mapping);
+                    if (!mapping.IsEmpty)

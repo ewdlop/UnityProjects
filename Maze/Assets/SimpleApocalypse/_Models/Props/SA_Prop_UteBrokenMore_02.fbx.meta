@@ -1,0 +1,50 @@
+//===- ELFAsmParser.cpp - ELF Assembly Parser -----------------------------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+
+#include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSwitch.h"
+#include "llvm/BinaryFormat/ELF.h"
+#include "llvm/MC/MCAsmInfo.h"
+#include "llvm/MC/MCContext.h"
+#include "llvm/MC/MCDirectives.h"
+#include "llvm/MC/MCExpr.h"
+#include "llvm/MC/MCParser/MCAsmLexer.h"
+#include "llvm/MC/MCParser/MCAsmParser.h"
+#include "llvm/MC/MCParser/MCAsmParserExtension.h"
+#include "llvm/MC/MCSection.h"
+#include "llvm/MC/MCSectionELF.h"
+#include "llvm/MC/MCStreamer.h"
+#include "llvm/MC/MCSymbol.h"
+#include "llvm/MC/MCSymbolELF.h"
+#include "llvm/MC/SectionKind.h"
+#include "llvm/Support/Casting.h"
+#include "llvm/Support/MathExtras.h"
+#include "llvm/Support/SMLoc.h"
+#include <cassert>
+#include <cstdint>
+#include <utility>
+
+using namespace llvm;
+
+namespace {
+
+class ELFAsmParser : public MCAsmParserExtension {
+  template<bool (ELFAsmParser::*HandlerMethod)(StringRef, SMLoc)>
+  void addDirectiveHandler(StringRef Directive) {
+    MCAsmParser::ExtensionDirectiveHandler Handler = std::make_pair(
+        this, HandleDirective<ELFAsmParser, HandlerMethod>);
+
+    getParser().addDirectiveHandler(Directive, Handler);
+  }
+
+  bool ParseSectionSwitch(StringRef Section, unsigned Type, unsigned Flags,
+                          SectionKind Kind);
+
+public:
+  ELFAsmParser() { BracketExpressionsSupported =

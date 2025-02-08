@@ -1,0 +1,57 @@
+ llvm::StringRef::npos;
+}
+
+size_t ParentPathEnd(llvm::StringRef path, FileSpec::PathSyntax syntax) {
+  size_t end_pos = FilenamePos(path, syntax);
+
+  bool filename_was_sep =
+      path.size() > 0 && IsPathSeparator(path[end_pos], syntax);
+
+  // Skip separators except for root dir.
+  size_t root_dir_pos = RootDirStart(path.substr(0, end_pos), syntax);
+
+  while (end_pos > 0 && (end_pos - 1) != root_dir_pos &&
+         IsPathSeparator(path[end_pos - 1], syntax))
+    --end_pos;
+
+  if (end_pos == 1 && root_dir_pos == 0 && filename_was_sep)
+    return llvm::StringRef::npos;
+
+  return end_pos;
+}
+
+} // end anonymous namespace
+
+void FileSpec::Resolve(llvm::SmallVectorImpl<char> &path) {
+  if (path.empty())
+    return;
+
+  llvm::SmallString<32> Source(path.begin(), path.end());
+  StandardTildeExpressionResolver Resolver;
+  Resolver.ResolveFullPath(Source, path);
+
+  // Save a copy of the original path that's passed in
+  llvm::SmallString<128> original_path(path.begin(), path.end());
+
+  llvm::sys::fs::make_absolute(path);
+  if (!llvm::sys::fs::exists(path)) {
+    path.clear();
+    path.append(original_path.begin(), original_path.end());
+  }
+}
+
+FileSpec::FileSpec() : m_syntax(GetNativeSyntax()) {}
+
+//------------------------------------------------------------------
+// Default constructor that can take an optional full path to a
+// file on disk.
+//------------------------------------------------------------------
+FileSpec::FileSpec(llvm::StringRef path, bool resolve_path, PathSyntax syntax)
+    : m_syntax(syntax) {
+  SetFile(path, resolve_path, syntax);
+}
+
+FileSpec::FileSpec(llvm::StringRef path, bool resolve_path,
+                   const llvm::Triple &Triple)
+    : FileSpec{path, resolve_path,
+               Triple.isOSWindows() ? ePathSyntaxWindows : ePathSyntaxPosix} {}

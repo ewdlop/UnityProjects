@@ -1,0 +1,210 @@
+                   part.readTiles(0, numXTiles - 1, 0, numYTiles - 1, xLevel, yLevel);
+                            switch (pixelTypes[partNumber])
+                            {
+                                case 0:
+                                    assert(checkPixels<unsigned int>(uData, w, h));
+                                    break;
+                                case 1:
+                                    assert(checkPixels<float>(fData, w, h));
+                                    break;
+                                case 2:
+                                    assert(checkPixels<half>(hData, w, h));
+                                    break;
+                            }
+                        }
+                    break;
+                }
+                case 2:
+                {
+                    DeepScanLineInputPart part(file, partNumber);
+
+                    DeepFrameBuffer frameBuffer;
+
+                    sampleCount.resizeErase(height, width);
+                    frameBuffer.insertSampleCountSlice (Slice (IMF::UINT,
+                                                        (char *) (&sampleCount[0][0]),
+                                                        sizeof (unsigned int) * 1,
+                                                        sizeof (unsigned int) * width));
+
+                    setInputDeepFrameBuffer(frameBuffer, pixelTypes[partNumber],
+                                            deepUData, deepFData, deepHData, width, height);
+
+                    part.setFrameBuffer(frameBuffer);
+
+                    part.readPixelSampleCounts(0, height - 1);
+
+                    allocatePixels(pixelTypes[partNumber], sampleCount,
+                                   deepUData, deepFData, deepHData, width, height);
+
+                    part.readPixels(0, height - 1);
+                    switch (pixelTypes[partNumber])
+                    {
+                        case 0:
+                            assert(checkPixels<unsigned int>(sampleCount, deepUData, width, height));
+                            break;
+                        case 1:
+                            assert(checkPixels<float>(sampleCount, deepFData, width, height));
+                            break;
+                        case 2:
+                            assert(checkPixels<half>(sampleCount, deepHData, width, height));
+                            break;
+                    }
+
+                    releasePixels(pixelTypes[partNumber],
+                                  deepUData, deepFData, deepHData, width, height);
+
+                    break;
+                }
+                case 3:
+                {
+                    DeepTiledInputPart part(file, partNumber);
+                    int numXLevels = part.numXLevels();
+                    int numYLevels = part.numYLevels();
+                    for (int xLevel = 0; xLevel < numXLevels; xLevel++)
+                        for (int yLevel = 0; yLevel < numYLevels; yLevel++)
+                        {
+                            if (!part.isValidLevel(xLevel, yLevel))
+                                continue;
+
+                            int w = part.levelWidth(xLevel);
+                            int h = part.levelHeight(yLevel);
+
+                            DeepFrameBuffer frameBuffer;
+
+                            sampleCount.resizeErase(h, w);
+                            frameBuffer.insertSampleCountSlice (Slice (IMF::UINT,
+                                                                (char *) (&sampleCount[0][0]),
+                                                                sizeof (unsigned int) * 1,
+                                                                sizeof (unsigned int) * w));
+
+                            setInputDeepFrameBuffer(frameBuffer, pixelTypes[partNumber],
+                                                    deepUData, deepFData, deepHData, w, h);
+
+                            part.setFrameBuffer(frameBuffer);
+
+                            int numXTiles = part.numXTiles(xLevel);
+                            int numYTiles = part.numYTiles(yLevel);
+
+                            part.readPixelSampleCounts(0, numXTiles - 1, 0, numYTiles - 1,
+                                                       xLevel, yLevel);
+
+                            allocatePixels(pixelTypes[partNumber], sampleCount,
+                                           deepUData, deepFData, deepHData, w, h);
+
+                            part.readTiles(0, numXTiles - 1, 0, numYTiles - 1, xLevel, yLevel);
+                            switch (pixelTypes[partNumber])
+                            {
+                                case 0:
+                                    assert(checkPixels<unsigned int>(sampleCount, deepUData, w, h));
+                                    break;
+                                case 1:
+                                    assert(checkPixels<float>(sampleCount, deepFData, w, h));
+                                    break;
+                                case 2:
+                                    assert(checkPixels<half>(sampleCount, deepHData, w, h));
+                                    break;
+                            }
+
+                            releasePixels(pixelTypes[partNumber],
+                                          deepUData, deepFData, deepHData, w, h);
+                        }
+
+                    break;
+                }
+            }
+            cerr << "part " << partNumber << " ok ";
+            
+        }
+    }
+    catch (...)
+    {
+        cout << "Error while reading part " << partNumber << endl << flush;
+        throw;
+    }
+}
+
+void
+readFirstPart()
+{
+    Array2D<unsigned int> uData;
+    Array2D<float> fData;
+    Array2D<half> hData;
+    
+    Array2D<unsigned int*> deepUData;
+    Array2D<float*> deepFData;
+    Array2D<half*> deepHData;
+    
+    Array2D<unsigned int> sampleCount;
+    
+    cout << "Reading first part " << flush;
+    int pixelType = pixelTypes[0];
+    int partType = partTypes[0];
+    int levelMode = levelModes[0];
+    switch (partType)
+    {
+        case 0:
+        {
+        int l1, l2;
+        l1 = rand() % height;
+        l2 = rand() % height;
+        if (l1 > l2) swap(l1, l2);
+
+        InputFile part(filename.c_str());
+
+        FrameBuffer frameBuffer;
+        setInputFrameBuffer(frameBuffer, pixelType,
+                            uData, fData, hData, width, height);
+
+        part.setFrameBuffer(frameBuffer);
+        part.readPixels(l1, l2);
+
+        switch (pixelType)
+        {
+        case 0:
+            assert(checkPixels<unsigned int>(uData, 0, width - 1, l1, l2, width));
+            break;
+        case 1:
+            assert(checkPixels<float>(fData, 0, width - 1, l1, l2, width));
+            break;
+        case 2:
+            assert(checkPixels<half>(hData, 0, width - 1, l1, l2, width));
+            break;
+        }
+
+        break;
+    }
+    case 1:
+    {
+        int tx1, tx2, ty1, ty2;
+        int lx, ly;
+
+        TiledInputFile part(filename.c_str());
+
+        int numXLevels = part.numXLevels();
+        int numYLevels = part.numYLevels();
+
+        lx = rand() % numXLevels;
+        ly = rand() % numYLevels;
+        if (levelMode == 1) ly = lx;
+
+        int w = part.levelWidth(lx);
+        int h = part.levelHeight(ly);
+
+        int numXTiles = part.numXTiles(lx);
+        int numYTiles = part.numYTiles(ly);
+        tx1 = rand() % numXTiles;
+        tx2 = rand() % numXTiles;
+        ty1 = rand() % numYTiles;
+        ty2 = rand() % numYTiles;
+        if (tx1 > tx2) swap(tx1, tx2);
+        if (ty1 > ty2) swap(ty1, ty2);
+
+        FrameBuffer frameBuffer;
+        setInputFrameBuffer(frameBuffer, pixelType,
+                            uData, fData, hData, w, h);
+
+        part.setFrameBuffer(frameBuffer);
+        part.readTiles(tx1, tx2, ty1, ty2, lx, ly);
+
+        Box2i b1 = part.dataWindowForTile(tx1, ty1, lx, ly);
+        Box2i b2 = part.dataWindowForT

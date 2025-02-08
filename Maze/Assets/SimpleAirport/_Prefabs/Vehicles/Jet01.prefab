@@ -1,0 +1,225 @@
+_0)
+    .addReg(Reg2)
+    .addImm(ARM::dsub_1);
+  return Out;
+}
+
+// Takes two DPR registers that have previously been VDUPed (Ssub0 and Ssub1)
+// and merges them into one DPR register.
+unsigned A15SDOptimizer::createVExt(MachineBasicBlock &MBB,
+                                    MachineBasicBlock::iterator InsertBefore,
+                                    const DebugLoc &DL, unsigned Ssub0,
+                                    unsigned Ssub1) {
+  unsigned Out = MRI->createVirtualRegister(&ARM::DPRRegClass);
+  BuildMI(MBB, InsertBefore, DL, TII->get(ARM::VEXTd32), Out)
+      .addReg(Ssub0)
+      .addReg(Ssub1)
+      .addImm(1)
+      .add(predOps(ARMCC::AL));
+  return Out;
+}
+
+unsigned A15SDOptimizer::createInsertSubreg(
+    MachineBasicBlock &MBB, MachineBasicBlock::iterator InsertBefore,
+    const DebugLoc &DL, unsigned DReg, unsigned Lane, unsigned ToInsert) {
+  unsigned Out = MRI->createVirtualRegister(&ARM::DPR_VFP2RegClass);
+  BuildMI(MBB,
+          InsertBefore,
+          DL,
+          TII->get(TargetOpcode::INSERT_SUBREG), Out)
+    .addReg(DReg)
+    .addReg(ToInsert)
+    .addImm(Lane);
+
+  return Out;
+}
+
+unsigned
+A15SDOptimizer::createImplicitDef(MachineBasicBlock &MBB,
+                                  MachineBasicBlock::iterator InsertBefore,
+                                  const DebugLoc &DL) {
+  unsigned Out = MRI->createVirtualRegister(&ARM::DPRRegClass);
+  BuildMI(MBB,
+          InsertBefore,
+          DL,
+          TII->get(TargetOpcode::IMPLICIT_DEF), Out);
+  return Out;
+}
+
+// This function inserts instructions in order to optimize interactions between
+// SPR registers and DPR/QPR registers. It does so by performing VDUPs on all
+// lanes, and the using VEXT instructions to recompose the result.
+unsigned
+A15SDOptimizer::optimizeAllLanesPattern(MachineInstr *MI, unsigned Reg) {
+  MachineBasicBlock::iterator InsertPt(MI);
+  DebugLoc DL = MI->getDebugLoc();
+  MachineBasicBlock &MBB = *MI->getParent();
+  InsertPt++;
+  unsigned Out;
+
+  // DPair has the same length as QPR and also has two DPRs as subreg.
+  // Treat DPair as QPR.
+  if (MRI->getRegClass(Reg)->hasSuperClassEq(&ARM::QPRRegClass) ||
+      MRI->getRegClass(Reg)->hasSuperClassEq(&ARM::DPairRegClass)) {
+    unsigned DSub0 = createExtractSubreg(MBB, InsertPt, DL, Reg,
+                                         ARM::dsub_0, &ARM::DPRRegClass);
+    unsigned DSub1 = createExtractSubreg(MBB, InsertPt, DL, Reg,
+                                         ARM::dsub_1, &ARM::DPRRegClass);
+
+    unsigned Out1 = createDupLane(MBB, InsertPt, DL, DSub0, 0);
+    unsigned Out2 = createDupLane(MBB, InsertPt, DL, DSub0, 1);
+    Out = createVExt(MBB, InsertPt, DL, Out1, Out2);
+
+    unsigned Out3 = createDupLane(MBB, InsertPt, DL, DSub1, 0);
+    unsigned Out4 = createDupLane(MBB, InsertPt, DL, DSub1, 1);
+    Out2 = createVExt(MBB, InsertPt, DL, Out3, Out4);
+
+    Out = createRegSequence(MBB, InsertPt, DL, Out, Out2);
+
+  } else if (MRI->getRegClass(Reg)->hasSuperClassEq(&ARM::DPRRegClass)) {
+    unsigned Out1 = createDupLane(MBB, InsertPt, DL, Reg, 0);
+    unsigned Out2 = createDupLane(MBB, InsertPt, DL, Reg, 1);
+    Out = createVExt(MBB, InsertPt, DL, Out1, Out2);
+
+  } else {
+    assert(MRI->getRegClass(Reg)->hasSuperClassEq(&ARM::SPRRegClass) &&
+           "Found unexpected regclass!");
+
+    unsigned PrefLane = getPrefSPRLane(Reg);
+    unsigned Lane;
+    switch (PrefLane) {
+      case ARM::ssub_0: Lane = 0; break;
+      case ARM::ssub_1: Lane = 1; break;
+      default: llvm_unreachable("Unknown preferred lane!");
+    }
+
+    // Treat DPair as QPR
+    bool UsesQPR = usesRegClass(MI->getOperand(0), &ARM::QPRRegClass) ||
+                   usesRegClass(MI->getOperand(0), &ARM::DPairRegClass);
+
+    Out = createImplicitDef(MBB, InsertPt, DL);
+    Out = createInsertSubreg(MBB, InsertPt, DL, Out, PrefLane, Reg);
+    Out = createDupLane(MBB, InsertPt, DL, Out, Lane, UsesQPR);
+    eraseInstrWithNoUses(MI);
+  }
+  return Out;
+}
+
+bool A15SDOptimizer::runOnInstruction(MachineInstr *MI) {
+  // We look for instructions that write S registers that are then read as
+  // D/Q registers. These can only be caused by COPY, INSERT_SUBREG and
+  // REG_SEQUENCE pseudos that insert an SPR value into a DPR register or
+  // merge two SPR values to form a DPR register.  In order avoid false
+  // positives we make sure that there is an SPR producer so we look past
+  // COPY and PHI nodes to find it.
+  //
+  // The best code pattern for when an SPR producer is going to be used by a
+  // DPR or QPR consumer depends on whether the other lanes of the
+  // corresponding DPR/QPR are currently defined.
+  //
+  // We can handle these efficiently, depending on the type of
+  // pseudo-instruction that is producing the pattern
+  //
+  //   * COPY:          * VDUP all lanes and merge the results together
+  //                      using VEXTs.
+  //
+  //   * INSERT_SUBREG: * If the SPR value was originally in another DPR/QPR
+  //                      lane, and the other lane(s) of the DPR/QPR register
+  //                      that we are inserting in are undefined, use the
+  //                      original DPR/QPR value.
+  //                    * Otherwise, fall back on the same stategy as COPY.
+  //
+  //   * REG_SEQUENCE:  * If all except one of the input operands are
+  //                      IMPLICIT_DEFs, insert the VDUP pattern for just the
+  //                      defined input operand
+  //                    * Otherwise, fall back on the same stategy as COPY.
+  //
+
+  // First, get all the reads of D-registers done by this instruction.
+  SmallVector<unsigned, 8> Defs = getReadDPRs(MI);
+  bool Modified = false;
+
+  for (SmallVectorImpl<unsigned>::iterator I = Defs.begin(), E = Defs.end();
+     I != E; ++I) {
+    // Follow the def-use chain for this DPR through COPYs, and also through
+    // PHIs (which are essentially multi-way COPYs). It is because of PHIs that
+    // we can end up with multiple defs of this DPR.
+
+    SmallVector<MachineInstr *, 8> DefSrcs;
+    if (!TRI->isVirtualRegister(*I))
+      continue;
+    MachineInstr *Def = MRI->getVRegDef(*I);
+    if (!Def)
+      continue;
+
+    elideCopiesAndPHIs(Def, DefSrcs);
+
+    for (MachineInstr *MI : DefSrcs) {
+      // If we've already analyzed and replaced this operand, don't do
+      // anything.
+      if (Replacements.find(MI) != Replacements.end())
+        continue;
+
+      // Now, work out if the instruction causes a SPR->DPR dependency.
+      if (!hasPartialWrite(MI))
+        continue;
+
+      // Collect all the uses of this MI's DPR def for updating later.
+      SmallVector<MachineOperand*, 8> Uses;
+      unsigned DPRDefReg = MI->getOperand(0).getReg();
+      for (MachineRegisterInfo::use_iterator I = MRI->use_begin(DPRDefReg),
+             E = MRI->use_end(); I != E; ++I)
+        Uses.push_back(&*I);
+
+      // We can optimize this.
+      unsigned NewReg = optimizeSDPattern(MI);
+
+      if (NewReg != 0) {
+        Modified = true;
+        for (SmallVectorImpl<MachineOperand *>::const_iterator I = Uses.begin(),
+               E = Uses.end(); I != E; ++I) {
+          // Make sure to constrain the register class of the new register to
+          // match what we're replacing. Otherwise we can optimize a DPR_VFP2
+          // reference into a plain DPR, and that will end poorly. NewReg is
+          // always virtual here, so there will always be a matching subclass
+          // to find.
+          MRI->constrainRegClass(NewReg, MRI->getRegClass((*I)->getReg()));
+
+          DEBUG(dbgs() << "Replacing operand "
+                       << **I << " with "
+                       << printReg(NewReg) << "\n");
+          (*I)->substVirtReg(NewReg, 0, *TRI);
+        }
+      }
+      Replacements[MI] = NewReg;
+    }
+  }
+  return Modified;
+}
+
+bool A15SDOptimizer::runOnMachineFunction(MachineFunction &Fn) {
+  if (skipFunction(Fn.getFunction()))
+    return false;
+
+  const ARMSubtarget &STI = Fn.getSubtarget<ARMSubtarget>();
+  // Since the A15SDOptimizer pass can insert VDUP instructions, it can only be
+  // enabled when NEON is available.
+  if (!(STI.isCortexA15() && STI.hasNEON()))
+    return false;
+  TII = STI.getInstrInfo();
+  TRI = STI.getRegisterInfo();
+  MRI = &Fn.getRegInfo();
+  bool Modified = false;
+
+  DEBUG(dbgs() << "Running on function " << Fn.getName()<< "\n");
+
+  DeadInstr.clear();
+  Replacements.clear();
+
+  for (MachineBasicBlock &MBB : Fn) {
+    for (MachineInstr &MI : MBB) {
+      Modified |= runOnInstruction(&MI);
+    }
+  }
+
+  for (MachineInst

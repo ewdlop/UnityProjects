@@ -1,0 +1,64 @@
+write back the updated pointers */
+    pArgs->source=source;
+    pArgs->target=(char *)target;
+    pArgs->offsets=offsets;
+}
+
+U_CFUNC void
+ucnv_MBCSFromUnicodeWithOffsets(UConverterFromUnicodeArgs *pArgs,
+                            UErrorCode *pErrorCode) {
+    UConverter *cnv;
+    const UChar *source, *sourceLimit;
+    uint8_t *target;
+    int32_t targetCapacity;
+    int32_t *offsets;
+
+    const uint16_t *table;
+    const uint16_t *mbcsIndex;
+    const uint8_t *p, *bytes;
+    uint8_t outputType;
+
+    UChar32 c;
+
+    int32_t prevSourceIndex, sourceIndex, nextSourceIndex;
+
+    uint32_t stage2Entry;
+    uint32_t asciiRoundtrips;
+    uint32_t value;
+    /* Shift-In and Shift-Out byte sequences differ by encoding scheme. */
+    uint8_t siBytes[2] = {0, 0};
+    uint8_t soBytes[2] = {0, 0};
+    uint8_t siLength, soLength;
+    int32_t length = 0, prevLength;
+    uint8_t unicodeMask;
+
+    cnv=pArgs->converter;
+
+    if(cnv->preFromUFirstCP>=0) {
+        /*
+         * pass sourceIndex=-1 because we continue from an earlier buffer
+         * in the future, this may change with continuous offsets
+         */
+        ucnv_extContinueMatchFromU(cnv, pArgs, -1, pErrorCode);
+
+        if(U_FAILURE(*pErrorCode) || cnv->preFromULength<0) {
+            return;
+        }
+    }
+
+    /* use optimized function if possible */
+    outputType=cnv->sharedData->mbcs.outputType;
+    unicodeMask=cnv->sharedData->mbcs.unicodeMask;
+    if(outputType==MBCS_OUTPUT_1 && !(unicodeMask&UCNV_HAS_SURROGATES)) {
+        if(!(unicodeMask&UCNV_HAS_SUPPLEMENTARY)) {
+            ucnv_MBCSSingleFromBMPWithOffsets(pArgs, pErrorCode);
+        } else {
+            ucnv_MBCSSingleFromUnicodeWithOffsets(pArgs, pErrorCode);
+        }
+        return;
+    } else if(outputType==MBCS_OUTPUT_2 && cnv->sharedData->mbcs.utf8Friendly) {
+        ucnv_MBCSDoubleFromUnicodeWithOffsets(pArgs, pErrorCode);
+        return;
+    }
+
+    /* set up the local pointers *

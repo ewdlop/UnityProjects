@@ -1,0 +1,293 @@
+d compute
+
+
+template<typename MatrixType>
+template<typename HouseholderU, typename HouseholderV, typename NaiveU, typename NaiveV>
+void BDCSVD<MatrixType>::copyUV(const HouseholderU &householderU, const HouseholderV &householderV, const NaiveU &naiveU, const NaiveV &naiveV)
+{
+  // Note exchange of U and V: m_matrixU is set from m_naiveV and vice versa
+  if (computeU())
+  {
+    Index Ucols = m_computeThinU ? m_diagSize : householderU.cols();
+    m_matrixU = MatrixX::Identity(householderU.cols(), Ucols);
+    m_matrixU.topLeftCorner(m_diagSize, m_diagSize) = naiveV.template cast<Scalar>().topLeftCorner(m_diagSize, m_diagSize);
+    householderU.applyThisOnTheLeft(m_matrixU); // FIXME this line involves a temporary buffer
+  }
+  if (computeV())
+  {
+    Index Vcols = m_computeThinV ? m_diagSize : householderV.cols();
+    m_matrixV = MatrixX::Identity(householderV.cols(), Vcols);
+    m_matrixV.topLeftCorner(m_diagSize, m_diagSize) = naiveU.template cast<Scalar>().topLeftCorner(m_diagSize, m_diagSize);
+    householderV.applyThisOnTheLeft(m_matrixV); // FIXME this line involves a temporary buffer
+  }
+}
+
+/** \internal
+  * Performs A = A * B exploiting the special structure of the matrix A. Splitting A as:
+  *  A = [A1]
+  *      [A2]
+  * such that A1.rows()==n1, then we assume that at least half of the columns of A1 and A2 are zeros.
+  * We can thus pack them prior to the the matrix product. However, this is only worth the effort if the matrix is large
+  * enough.
+  */
+template<typename MatrixType>
+void BDCSVD<MatrixType>::structured_update(Block<MatrixXr,Dynamic,Dynamic> A, const MatrixXr &B, Index n1)
+{
+  Index n = A.rows();
+  if(n>100)
+  {
+    // If the matrices are large enough, let's exploit the sparse structure of A by
+    // splitting it in half (wrt n1), and packing the non-zero columns.
+    Index n2 = n - n1;
+    Map<MatrixXr> A1(m_workspace.data()      , n1, n);
+    Map<MatrixXr> A2(m_workspace.data()+ n1*n, n2, n);
+    Map<MatrixXr> B1(m_workspace.data()+  n*n, n,  n);
+    Map<MatrixXr> B2(m_workspace.data()+2*n*n, n,  n);
+    Index k1=0, k2=0;
+    for(Index j=0; j<n; ++j)
+    {
+      if( (A.col(j).head(n1).array()!=Literal(0)).any() )
+      {
+        A1.col(k1) = A.col(j).head(n1);
+        B1.row(k1) = B.row(j);
+        ++k1;
+      }
+      if( (A.col(j).tail(n2).array()!=Literal(0)).any() )
+      {
+        A2.col(k2) = A.col(j).tail(n2);
+        B2.row(k2) = B.row(j);
+        ++k2;
+      }
+    }
+  
+    A.topRows(n1).noalias()    = A1.leftCols(k1) * B1.topRows(k1);
+    A.bottomRows(n2).noalias() = A2.leftCols(k2) * B2.topRows(k2);
+  }
+  else
+  {
+    Map<MatrixXr,Aligned> tmp(m_workspace.data(),n,n);
+    tmp.noalias() = A*B;
+    A = tmp;
+  }
+}
+
+// The divide algorithm is done "in place", we are always working on subsets of the same matrix. The divide methods takes as argument the 
+// place of the submatrix we are currently working on.
+
+//@param firstCol : The Index of the first column of the submatrix of m_computed and for m_naiveU;
+//@param lastCol : The Index of the last column of the submatrix of m_computed and for m_naiveU; 
+// lastCol + 1 - firstCol is the size of the submatrix.
+//@param firstRowW : The Index of the first row of the matrix W that we are to change. (see the reference paper section 1 for more information on W)
+//@param firstRowW : Same as firstRowW with the column.
+//@param shift : Each time one takes the left submatrix, one must add 1 to the shift. Why? Because! We actually want the last column of the U submatrix 
+// to become the first column (*coeff) and to shift all the other columns to the right. There are more details on the reference paper.
+template<typename MatrixType>
+void BDCSVD<MatrixType>::divide (Index firstCol, Index lastCol, Index firstRowW, Index firstColW, Index shift)
+{
+  // requires rows = cols + 1;
+  using std::pow;
+  using std::sqrt;
+  using std::abs;
+  const Index n = lastCol - firstCol + 1;
+  const Index k = n/2;
+  const RealScalar considerZero = (std::numeric_limits<RealScalar>::min)();
+  RealScalar alphaK;
+  RealScalar betaK; 
+  RealScalar r0; 
+  RealScalar lambda, phi, c0, s0;
+  VectorType l, f;
+  // We use the other algorithm which is more efficient for small 
+  // matrices.
+  if (n < m_algoswap)
+  {
+    // FIXME this line involves temporaries
+    JacobiSVD<MatrixXr> b(m_computed.block(firstCol, firstCol, n + 1, n), ComputeFullU | (m_compV ? ComputeFullV : 0));
+    if (m_compU)
+      m_naiveU.block(firstCol, firstCol, n + 1, n + 1).real() = b.matrixU();
+    else 
+    {
+      m_naiveU.row(0).segment(firstCol, n + 1).real() = b.matrixU().row(0);
+      m_naiveU.row(1).segment(firstCol, n + 1).real() = b.matrixU().row(n);
+    }
+    if (m_compV) m_naiveV.block(firstRowW, firstColW, n, n).real() = b.matrixV();
+    m_computed.block(firstCol + shift, firstCol + shift, n + 1, n).setZero();
+    m_computed.diagonal().segment(firstCol + shift, n) = b.singularValues().head(n);
+    return;
+  }
+  // We use the divide and conquer algorithm
+  alphaK =  m_computed(firstCol + k, firstCol + k);
+  betaK = m_computed(firstCol + k + 1, firstCol + k);
+  // The divide must be done in that order in order to have good results. Divide change the data inside the submatrices
+  // and the divide of the right submatrice reads one column of the left submatrice. That's why we need to treat the 
+  // right submatrix before the left one. 
+  divide(k + 1 + firstCol, lastCol, k + 1 + firstRowW, k + 1 + firstColW, shift);
+  divide(firstCol, k - 1 + firstCol, firstRowW, firstColW + 1, shift + 1);
+
+  if (m_compU)
+  {
+    lambda = m_naiveU(firstCol + k, firstCol + k);
+    phi = m_naiveU(firstCol + k + 1, lastCol + 1);
+  } 
+  else 
+  {
+    lambda = m_naiveU(1, firstCol + k);
+    phi = m_naiveU(0, lastCol + 1);
+  }
+  r0 = sqrt((abs(alphaK * lambda) * abs(alphaK * lambda)) + abs(betaK * phi) * abs(betaK * phi));
+  if (m_compU)
+  {
+    l = m_naiveU.row(firstCol + k).segment(firstCol, k);
+    f = m_naiveU.row(firstCol + k + 1).segment(firstCol + k + 1, n - k - 1);
+  } 
+  else 
+  {
+    l = m_naiveU.row(1).segment(firstCol, k);
+    f = m_naiveU.row(0).segment(firstCol + k + 1, n - k - 1);
+  }
+  if (m_compV) m_naiveV(firstRowW+k, firstColW) = Literal(1);
+  if (r0<considerZero)
+  {
+    c0 = Literal(1);
+    s0 = Literal(0);
+  }
+  else
+  {
+    c0 = alphaK * lambda / r0;
+    s0 = betaK * phi / r0;
+  }
+  
+#ifdef EIGEN_BDCSVD_SANITY_CHECKS
+  assert(m_naiveU.allFinite());
+  assert(m_naiveV.allFinite());
+  assert(m_computed.allFinite());
+#endif
+  
+  if (m_compU)
+  {
+    MatrixXr q1 (m_naiveU.col(firstCol + k).segment(firstCol, k + 1));     
+    // we shiftW Q1 to the right
+    for (Index i = firstCol + k - 1; i >= firstCol; i--) 
+      m_naiveU.col(i + 1).segment(firstCol, k + 1) = m_naiveU.col(i).segment(firstCol, k + 1);
+    // we shift q1 at the left with a factor c0
+    m_naiveU.col(firstCol).segment( firstCol, k + 1) = (q1 * c0);
+    // last column = q1 * - s0
+    m_naiveU.col(lastCol + 1).segment(firstCol, k + 1) = (q1 * ( - s0));
+    // first column = q2 * s0
+    m_naiveU.col(firstCol).segment(firstCol + k + 1, n - k) = m_naiveU.col(lastCol + 1).segment(firstCol + k + 1, n - k) * s0; 
+    // q2 *= c0
+    m_naiveU.col(lastCol + 1).segment(firstCol + k + 1, n - k) *= c0;
+  } 
+  else 
+  {
+    RealScalar q1 = m_naiveU(0, firstCol + k);
+    // we shift Q1 to the right
+    for (Index i = firstCol + k - 1; i >= firstCol; i--) 
+      m_naiveU(0, i + 1) = m_naiveU(0, i);
+    // we shift q1 at the left with a factor c0
+    m_naiveU(0, firstCol) = (q1 * c0);
+    // last column = q1 * - s0
+    m_naiveU(0, lastCol + 1) = (q1 * ( - s0));
+    // first column = q2 * s0
+    m_naiveU(1, firstCol) = m_naiveU(1, lastCol + 1) *s0; 
+    // q2 *= c0
+    m_naiveU(1, lastCol + 1) *= c0;
+    m_naiveU.row(1).segment(firstCol + 1, k).setZero();
+    m_naiveU.row(0).segment(firstCol + k + 1, n - k - 1).setZero();
+  }
+  
+#ifdef EIGEN_BDCSVD_SANITY_CHECKS
+  assert(m_naiveU.allFinite());
+  assert(m_naiveV.allFinite());
+  assert(m_computed.allFinite());
+#endif
+  
+  m_computed(firstCol + shift, firstCol + shift) = r0;
+  m_computed.col(firstCol + shift).segment(firstCol + shift + 1, k) = alphaK * l.transpose().real();
+  m_computed.col(firstCol + shift).segment(firstCol + shift + k + 1, n - k - 1) = betaK * f.transpose().real();
+
+#ifdef EIGEN_BDCSVD_DEBUG_VERBOSE
+  ArrayXr tmp1 = (m_computed.block(firstCol+shift, firstCol+shift, n, n)).jacobiSvd().singularValues();
+#endif
+  // Second part: try to deflate singular values in combined matrix
+  deflation(firstCol, lastCol, k, firstRowW, firstColW, shift);
+#ifdef EIGEN_BDCSVD_DEBUG_VERBOSE
+  ArrayXr tmp2 = (m_computed.block(firstCol+shift, firstCol+shift, n, n)).jacobiSvd().singularValues();
+  std::cout << "\n\nj1 = " << tmp1.transpose().format(bdcsvdfmt) << "\n";
+  std::cout << "j2 = " << tmp2.transpose().format(bdcsvdfmt) << "\n\n";
+  std::cout << "err:      " << ((tmp1-tmp2).abs()>1e-12*tmp2.abs()).transpose() << "\n";
+  static int count = 0;
+  std::cout << "# " << ++count << "\n\n";
+  assert((tmp1-tmp2).matrix().norm() < 1e-14*tmp2.matrix().norm());
+//   assert(count<681);
+//   assert(((tmp1-tmp2).abs()<1e-13*tmp2.abs()).all());
+#endif
+  
+  // Third part: compute SVD of combined matrix
+  MatrixXr UofSVD, VofSVD;
+  VectorType singVals;
+  computeSVDofM(firstCol + shift, n, UofSVD, singVals, VofSVD);
+  
+#ifdef EIGEN_BDCSVD_SANITY_CHECKS
+  assert(UofSVD.allFinite());
+  assert(VofSVD.allFinite());
+#endif
+  
+  if (m_compU)
+    structured_update(m_naiveU.block(firstCol, firstCol, n + 1, n + 1), UofSVD, (n+2)/2);
+  else
+  {
+    Map<Matrix<RealScalar,2,Dynamic>,Aligned> tmp(m_workspace.data(),2,n+1);
+    tmp.noalias() = m_naiveU.middleCols(firstCol, n+1) * UofSVD;
+    m_naiveU.middleCols(firstCol, n + 1) = tmp;
+  }
+  
+  if (m_compV)  structured_update(m_naiveV.block(firstRowW, firstColW, n, n), VofSVD, (n+1)/2);
+  
+#ifdef EIGEN_BDCSVD_SANITY_CHECKS
+  assert(m_naiveU.allFinite());
+  assert(m_naiveV.allFinite());
+  assert(m_computed.allFinite());
+#endif
+  
+  m_computed.block(firstCol + shift, firstCol + shift, n, n).setZero();
+  m_computed.block(firstCol + shift, firstCol + shift, n, n).diagonal() = singVals;
+}// end divide
+
+// Compute SVD of m_computed.block(firstCol, firstCol, n + 1, n); this block only has non-zeros in
+// the first column and on the diagonal and has undergone deflation, so diagonal is in increasing
+// order except for possibly the (0,0) entry. The computed SVD is stored U, singVals and V, except
+// that if m_compV is false, then V is not computed. Singular values are sorted in decreasing order.
+//
+// TODO Opportunities for optimization: better root finding algo, better stopping criterion, better
+// handling of round-off errors, be consistent in ordering
+// For instance, to solve the secular equation using FMM, see http://www.stat.uchicago.edu/~lekheng/courses/302/classics/greengard-rokhlin.pdf
+template <typename MatrixType>
+void BDCSVD<MatrixType>::computeSVDofM(Index firstCol, Index n, MatrixXr& U, VectorType& singVals, MatrixXr& V)
+{
+  const RealScalar considerZero = (std::numeric_limits<RealScalar>::min)();
+  using std::abs;
+  ArrayRef col0 = m_computed.col(firstCol).segment(firstCol, n);
+  m_workspace.head(n) =  m_computed.block(firstCol, firstCol, n, n).diagonal();
+  ArrayRef diag = m_workspace.head(n);
+  diag(0) = Literal(0);
+
+  // Allocate space for singular values and vectors
+  singVals.resize(n);
+  U.resize(n+1, n+1);
+  if (m_compV) V.resize(n, n);
+
+#ifdef EIGEN_BDCSVD_DEBUG_VERBOSE
+  if (col0.hasNaN() || diag.hasNaN())
+    std::cout << "\n\nHAS NAN\n\n";
+#endif
+  
+  // Many singular values might have been deflated, the zero ones have been moved to the end,
+  // but others are interleaved and we must ignore them at this stage.
+  // To this end, let's compute a permutation skipping them:
+  Index actual_n = n;
+  while(actual_n>1 && diag(actual_n-1)==Literal(0)) --actual_n;
+  Index m = 0; // size of the deflated problem
+  for(Index k=0;k<actual_n;++k)
+    if(abs(col0(k))>considerZero)
+      m_workspaceI(m++) = k;
+  Map<ArrayXi> perm(m_workspace

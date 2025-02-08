@@ -1,0 +1,306 @@
+/*
+ * ins_once.c
+ *  Quick and dirty program to insert '#pragma once' into the header files.
+ *  1998/08     kmatsui
+ *  2002/08     kmatsui
+ *      Added -p, -o, -g option, removed -s option.
+ *      Compile with -DPATH_DELIM='x' option, if the path-delimiter is any
+ *          other than '/'.
+ *  2004/11     kmatsui
+ *      Changed '#pragma __once' to '#pragma once'.
+ *  2006/07     kmatsui
+ *      Removed -o option.
+ *      Changed non-prototype declarations to prototype ones.
+ */
+
+#include    "stdio.h"
+#include    "stdlib.h"
+#include    "string.h"
+#include    "ctype.h"
+#include    "errno.h"
+
+#ifndef PATH_DELIM
+#define PATH_DELIM  '/'
+#endif
+
+#define TRUE    1
+#define FALSE   0
+
+#define IFNDEF      0x100
+#define IF          0x101
+#define PRAGMA      0x102
+#define DEFINED     0x103
+#define _ONCE       0x111
+
+void    usage( void);
+void    test_a_file( char *);
+void    conv_a_file( char *);
+void    insert_once( FILE *, FILE *, char *);
+void    prepend_once( FILE *, FILE *);
+int     look_directive( FILE *);
+int     get_token( char **);
+void    ins_once( FILE *);
+
+int     test;
+    /* Only test files whether beginning with #ifndef or #if !defined.  */
+int     prepend;
+/*
+ * If TRUE, prepend '#pragma once' line to the file.
+ * If FALSE, insert the line after the first #ifndef line.
+ */
+int     gcc;
+/*
+ * If TRUE, do not insert '#pragma once' line to "stddef.h".
+ * This is the option for GCC family.
+ */
+
+int main( int argc, char **argv) {
+    extern int      getopt( int, char **, char *);
+    extern int      optind;
+    extern char     *optarg;
+    int     opt;
+    char    *except[] = { "assert.h", "cassert", "cassert.h", NULL};
+    char    *g_except[] = { "stddef.h", "stdio.h", "signal.h", "errno.h"
+                    , NULL};
+    char    *arg;
+    char    **ep;
+
+    if (argc < 2)
+        usage();
+    while (optind < argc
+            && (opt = getopt( argc, argv, "gopt")) != EOF) {
+        switch (opt) {
+        case 't':
+            test = TRUE;
+            break;
+        case 'p':
+            prepend = TRUE;
+            break;
+        case 'g':
+            gcc = TRUE;
+            break;
+        default:
+            usage();
+            break;
+        }
+    }
+    argv += (optind - 1);
+    while (*++argv) {
+        if ((arg = strrchr( *argv, PATH_DELIM)) != NULL)
+            arg++;
+        else
+            arg = *argv;
+        for (ep = except; *ep; ep++) {
+            if (strcmp( arg, *ep) == 0)
+                goto skip;
+        }
+        if (gcc) {
+            for (ep = g_except; *ep; ep++) {
+                if (strcmp( arg, *ep) == 0)
+                    goto skip;
+            }
+        }
+        if (test)
+            test_a_file( *argv);
+        else
+            conv_a_file( *argv);
+        continue;
+skip:   fprintf( stderr, "Skipped %s\n", *ep);
+    }
+    return 0;
+}
+
+void    usage( void)
+{
+    static char     *mes[] = {
+   "ins_once: Insert '#pragma once' to header files except \"assert.h\"\n",
+   "            and \"stddef.h\" and some others (for GCC).\n",
+   "Usage: ins_once [-DPATH_DELIM=\\] [-t|-p|-g] [header1.h [header2.h [...]]]\n",
+   "    -t : Only test files whether beginning with #ifndef or #if !defined.\n",
+   "    -p : Prepend the line to the file\n",
+   "        (default: insert after the first #ifndef line -- for GCC).\n",
+   "    -g : Do not convert stddef.h, stdio.h, signal.h, errno.h.\n",
+        NULL,
+    };
+    char    **mesp = mes;
+
+    while( *mesp)
+        fputs( *mesp++, stderr);
+    if (errno) {
+        fputs( strerror( errno), stderr);
+        fputc( '\n', stderr);
+    }
+    exit( errno);
+}
+
+void    test_a_file( char *fname) {
+/*
+ * Only test the file whether it begins with #ifndef or #if !defined.
+ */
+    char    buf[ BUFSIZ];
+    FILE    *fp_in;
+    int     token;
+    char    *cp;
+
+    fp_in = fopen( fname, "r");
+    if (fp_in == NULL)
+        usage();
+
+    while (fgets( buf, BUFSIZ, fp_in) != NULL) {
+        cp = buf;
+        if (get_token( &cp) == '#') {       /* The first directive  */
+            if (((token = get_token( &cp)) != IFNDEF)   /* #ifndef  */
+                    && (token != IF || get_token( &cp) != '!'
+                        || get_token( &cp) != DEFINED)) {   /* #if ! defined*/
+                fputs( fname, stderr);
+                fputs( ": doesn't begin with #ifndef nor #if !defined\n",
+                        stderr);
+            }
+            break;
+        }
+    }
+    fclose( fp_in);
+}
+
+void    conv_a_file( char *fname) {
+/*
+ * Insert '#pragma once' line to seemingly apropriate place according
+ * the command-line options.
+ */
+    char    *tmp = "tmp_once";
+    FILE    *fp_in, *fp_out;
+
+    if ((fp_in = fopen( fname, "r")) == NULL)
+        usage();
+    if ((fp_out = fopen( tmp, "w")) == NULL)
+        usage();
+    fprintf( stderr, "Converting %s\n", fname);
+
+    if (prepend)
+        prepend_once( fp_in, fp_out);
+    else
+        insert_once( fp_in, fp_out, fname);
+
+    fclose( fp_in);
+    fclose( fp_out);
+    if (remove( fname) != 0 || rename( tmp, fname) != 0)
+        usage();
+}
+
+void    insert_once( FILE *fp_in, FILE *fp_out, char *fname) {
+/*
+ * Insert '#pragma once' line after the first directive line, if the
+ * directive is #ifndef or #if !defined, else append the line at the end
+ * of the file.
+ */
+    char    buf[ BUFSIZ];
+    int     token;
+    int     no_ifndef = TRUE;
+    char    *cp;
+
+    while (fgets( buf, BUFSIZ, fp_in) != NULL) {
+        fputs( buf, fp_out);
+        cp = buf;
+        if (get_token( &cp) == '#') {       /* The first directive  */
+            if (((token = get_token( &cp)) == IFNDEF)   /* #ifndef  */
+                    || (token == IF && get_token( &cp) == '!'
+                        && get_token( &cp) == DEFINED)) {   /* #if ! defined*/
+                no_ifndef = FALSE;
+                if (! look_directive( fp_in))
+                    ins_once( fp_out);
+                /* Else already written in   */
+            } else {                            /* Other directive  */
+                fputs( fname, stderr);
+                fputs( ": doesn't begin with #ifndef nor #if !defined\n",
+                        stderr);
+            }
+            break;
+        }
+    }
+    while (fgets( buf, BUFSIZ, fp_in) != NULL)
+        fputs( buf, fp_out);
+    if (no_ifndef)
+        ins_once( fp_out);          /* Append the line to the file  */
+}
+
+void    prepend_once( FILE *fp_in, FILE *fp_out) {
+/*
+ * Prepend the '#pragma once' line at the top of the file.
+ */
+    char    buf[ BUFSIZ];
+
+    if (! look_directive( fp_in))
+        ins_once( fp_out);          /* Prepend the line to the file */
+
+    while (fgets( buf, BUFSIZ, fp_in) != NULL)
+        fputs( buf, fp_out);
+}
+
+int     look_directive( FILE *fp) {
+/*
+ * Look whether the next line is '#pragma once'.
+ */
+    char    buf[ BUFSIZ];
+    long    pos;
+    int     res = 0;
+    int     token;
+    char    *cp;
+
+    pos = ftell( fp);
+    cp = buf;
+    if (fgets( buf, BUFSIZ, fp) && buf[ 0] == '\n'
+            && fgets( buf, BUFSIZ, fp) && get_token( &cp) == '#'
+            && get_token( &cp) == PRAGMA && get_token( &cp) == _ONCE)
+        res = 1;
+    fseek( fp, pos, SEEK_SET);
+    return res;
+}
+
+int     get_token( char **cpp) {
+/* Get the next 'token', without parsing comments, literals, etc.   */
+    int     token;
+    char    *cp = *cpp;
+
+    while (*cp != '\n' && isspace( *cp))
+        cp++;
+    if (memcmp( cp, "ifndef", 6) == 0) {
+        token = IFNDEF;
+        cp += 6;
+    } else if (memcmp( cp, "if", 2) == 0) {
+        token = IF;
+        cp += 2;
+    } else if (memcmp( cp, "pragma", 6) == 0) {
+        token = PRAGMA;
+        cp += 6;
+    } else if (memcmp( cp, "defined", 7) == 0) {
+        token = DEFINED;
+        cp += 7;
+    } else if (memcmp( cp, "once", 6) == 0) {
+        token = _ONCE;
+        cp += 6;
+    } else {
+        token = *cp++;
+    }
+    *cpp = cp;
+    return token;
+}
+
+void    ins_once( FILE *fp) {
+    fputs( "\n#pragma once\n\n", fp);
+}
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          ø(sbä—}£”ìÉÓ/‹…°FTÔ.¼¶âd Ìdy´6Ä
+‡WÕ 8(göôd&‘¡p)8GY˜Ş:Ù8óØ[ÄH¼˜:zé{nDâN4!:k¯‡ëÑÒººıf³»Ìj+Óÿ›ı
+§#)¬ĞÓ‡Ó°}Ğåé¹óüj€ümäë&an~ŸnN`ûJºqÖ°üvU-Õuó­hˆ€
+_Z7£ N¥ó.Q±ï¿J¶«qªÛ€½øó¸·ıñy±&¤êÊédÑÁm¾ )¤uË¸˜ü—Ír€“cM€Xß4b$ŸŒ•Ígx6º@«âÆ§.¼€NvÄ=»»PN‡5ò:©¾k¹öÁƒçÒWxäıë½æSŠÑİf©Çe'!$ñT^÷¡½xËUödğ'ĞRX´E:tE<à-%b^(¢NHó}.ğ¬4‡–6<z˜ÙhR¤‰YïC#CšÇÇ¡›Gøú•ÍôÑXIå³·/°QlL¯Fs}{XöÕw·¬¼:ŸgÜ?Ac¡RêSÎşŞ»xKyÒKë.qemFÊ:(DìöO7 'DÇØA©ğè=úp
+;LWì`‚qš(k¤¼¬ù“äZ@i†~Æ_%;”“ áí*ØIP	Œhş¼|ş%´ıCÒÆÓ½pd<Î!«z;¤ñ/ÜœÓqç†Aƒ¾¬†œgDò‰Ä/ıçĞM»Ü)—9XaRº#ÓA-*òÏ*pbmÉæwV$nÄ×İÔş^ÈH¿9„h>8Ë²VWÒK ˜9KWü(DO“=øğ©9n<;Ê½=Œ@¶¯„Ów&á–µ–áÛúHVqÆ~Ó¬*,SÃna¨{qbpSøbûVqÓ~n†¢›òAœ±…‘ş¼ÍZ”
+ĞÁ¤CFPúÃá–Ï-_
+IêOJ(E•Àö.×…pbıüNhT¶.$ßfmôu”¹^^.\ÈgD~%X-ì£æH` ~î7MÁµ˜bí çY¾±ªX_åW¦ó%izñ™¬:ÿÃ6Z±Àaó°·™O„xA´ÿãœİª×ª¼{#Ì}dMÈÂ°ŞÖ»êaÁ³/eßÇ¤z5Ré¤P‚'0rv»}ëaüfXiqÈvl08Axİ¬
+ 3×4N<P:vk%¾µóKY¼ôõg,ĞWA 7+`9®ò-®ù…|íømşXOƒ?)}X7šU8Éã}÷‚ÚR‡ZÂ¥üÓÕ«ÍÆwvÃ”L4ß¶«üÈ´¤ß‘«Ïæı©1qÏ.^Ğ¬ç¾iyùõ'Û”ºX ê\6Ş
+>D_&–ôìh“ß´`4óad;¯ZOÚV¹™ÇÁ$;*YÚ (ì¤±#2¶w(´_ê$(fììÿ9¬’ÂÚÀ:¤>}k£ÊÓş3ë¥ƒ|Se*kuRˆ7Ú©üŒX„t¨qÑ|^3uc•@Õ×Ïüä‚vBMLö²ƒ}Táf€OÜ³MÂê§š}î~ëº{ÌúrË—â7Û¢o×Qˆ®?4mwÇXÛHovç°˜ÃÔÆ²}é/øÑN•¡:}z=ÿœB«Bü¶ÕÚÎÛæ›Ø¢Œ¬75KÕ[ºoÃ!)/²@8ÔY&ŞlVİ‰%÷¹.·XÙäˆ 9bÓwÖ­ı_C¬/ªi¡/„GÎ–7mÍ¸â²¨Ã7¨p‚•}ı1`Â€ª’„yç§j˜Í)ãç.J6œ¦hAìz‚J"h_?AE£Y†É¨›™™k2Ò8çe¬Nsò>-kS¯%•%>Ë¨sF£ÿzâÇRS²¼öÖX#v"Ø˜¼ZC£ÎëØUó–Dt~ëÕÒCAI‘{Á ëÆûoÏ•5 â¨İ0«ó³¡VÆ£)bø±M‡ÇËÌró’7ƒ¥¡aÇ:N4u5k„¢FÈÚìF%>°ì]éø[É»ãœ¨Ûv®¡'\Œ¯»]ê†ŞÜ“eb8¸îŒÕIR­ü¢=ôxÖwek»%H3f­_[É{/*²Å‘
+·=S*{Lvæ Òÿi‘/qzN.’® 5Oq%uU"bÃˆ3ŠB,[»—ßJI±0XÇşX¶1sºâ-¬†T¢änNlè‹ìçlÌµH?êƒ—P²ÿ}â?á‡È¤‡›òƒ–ƒ /Ş(µõ’«¾Ê[8·üW×¥™	m6×·*{QÅ¿õz‚hì¬£\¡Öí˜øÏ†ßN­Î]‹Äò#ıX^¢peğUF`
+MÓé@·LŒ<§¨$ºF†˜í“Î·2L#­ƒ´’ÁSı Ÿ´dğÁïPisıºÌ4Úëİ#ğ+Š@ğØ‚øíûÛÇ\„™â×:ş(¡Ê`[jğ¯¡š‰tä€×üzøfD¼¥¸Àà8µŞö0?ÙØ¶~%Z[]Ê”ÖŒ'5u·Ôl¢˜f{VGv¹blNßV‘i@*úÁÔë4¾Gó¢öÕ¾)/P,…C[dA{~euß]Iå=ñXjrÃ"y›Ú`›ĞtËşR_uOz ÅŒšJÏ­¯7ĞI¦µ`1¬ÛËªô”‰[™…k	«;ê`d×‚èÆó@‰Í|°9\@õ®VB	
+¿¶Rœ]Ÿ§º~´Î4<{-O,AĞœáßÓ
+åú,DEÌ“ÄÔÅVâO¶ªçõä Öñ¶³b†^a*J!•İáh•gjW%DôiD²»rŸUJAl_0äÅìŠN[B_Z§?Ó­ÚúÖ%CÖÃÒ»“u“´¼~×”û!,b¶txP9“\T®å“{±Áb‘dÔdèŸSÁj´ædòPæçÂ™$K Tª4Á×E‹7'±nÀivË˜à8•Ïé¤¥sì6ÆIÉÏÔqF ¾šà&èÙ¾ÏUâ0ösÛ¹îS…q%²ÖÉ(w2¦­PÙî»UJw[	¹ç¢³f*+9·`vz6…”]OôÎíç¦ïTõ—<(z”´È¨­„‹@+\XÊß"®1¥¸=áNô²€ù)‹‹%a­ÈÎ<î|Ò)ä á\šh{/æŞW9m0õ
+ZG ,à2‚-Ü9  #Ã²vRÉ3h^¬>gÃ)ŞÕÔæSşƒ„—ìÃÙ–rşKÒš|!ì`LË’cõëÜrœ˜O«’Tk‘Ãf‡›¬JyÄC+j:ZXl I?|ğKUeßœQÎß<¥Î0jĞt(9¶Éî¯wCıvä?ÑÜ³òh-J¦È{ ?Ú øÿå¡’à.s}ƒå¾ìIiËv ¢¾@ŒgşÀ$õ€¹a‚ŞqX'±ÊÎ™b€ %¤?s(Ä5Œ'€Al§Y¼.ŠpáùÏÛ9úêÜ 6ƒåVW]…us5»¼VòB¾üpn~Úÿ)„ |öÉ0‚ŠD¼ _¹gG®`]€IiMÏ1™›9u­-$ÑÃÙ…ªwè$F[ô„.Û¶ÛŒƒz¤Q¨B>¿_&uãQ1?=˜pvßqÄ2øí?q*¢õ•”T]˜97ÄÖí;D,l'§¹XË¥{×ÒŠ%¤ È²¤
+Å¦Â˜kò£!œ"6ŞáeÍP Ç4ôêÔså	$•˜ó˜FKıÑÎHÉ)Iş´İá\´¨²åøl½…%ÅÁš•ÂÛ†fÒÃƒ¤ÔYê ^Oò¿ÖÛcg0SÄ’ğÀbËµ÷W2úaå	çS#N2N¨VÏ&şş{H˜²i=Km'¿M—]_W´¨ØÈY+/Ó["m+Şz9{ZéĞ’Ê–èÄ6íxÙÀ¥¸ô÷/Ğ£X ¼hîœÆÓAÀ·-&ùå¦º“l²ÏÊ³.fRì×§~.êüD"œ8*.Bifg³×ƒÖ ı[2›èÄ£_)²qXı)mT°DÏDÈ¬ \=p2©EHÁ¦{Şé<8†ä]o¢UĞiMÇBr1ÿñ¹sU9Í A™"ûpÖt-¡¤

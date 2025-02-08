@@ -1,0 +1,187 @@
+ers = new XmlSerializer [types.Length];
+			for (int n=0; n<types.Length; n++)
+				sers[n] = new XmlSerializer (types[n]);
+			return sers;
+		}
+
+		protected virtual void Serialize (object o, XmlSerializationWriter writer)
+		{
+			if (customSerializer)
+				// Must be implemented in derived class
+				throw new NotImplementedException ();
+				
+			if (writer is XmlSerializationWriterInterpreter)
+				((XmlSerializationWriterInterpreter)writer).WriteRoot (o);
+			else {
+				try {
+					serializerData.WriterMethod.Invoke (writer, new object[] {o});
+				} catch (TargetInvocationException ex) {
+					throw ex.InnerException;
+				}
+			}
+		}
+
+		public void Serialize (Stream stream, object o)
+		{
+			Serialize (stream, o, null);
+		}
+
+		public void Serialize (TextWriter textWriter, object o)
+		{
+			XmlTextWriter xmlWriter = new XmlTextWriter (textWriter);
+			xmlWriter.Formatting = Formatting.Indented;
+			Serialize (xmlWriter, o, null);
+		}
+
+		public void Serialize (XmlWriter xmlWriter, object o)
+		{
+			Serialize (xmlWriter, o, null);
+		}
+
+		public void Serialize (Stream stream, object o, XmlSerializerNamespaces	namespaces)
+		{
+			XmlTextWriter xmlWriter	= new XmlTextWriter (stream, Encoding.UTF8);
+			xmlWriter.Formatting = Formatting.Indented;
+			Serialize (xmlWriter, o, namespaces);
+		}
+
+		public void Serialize (TextWriter textWriter, object o, XmlSerializerNamespaces	namespaces)
+		{
+			XmlTextWriter xmlWriter	= new XmlTextWriter (textWriter);
+			xmlWriter.Formatting = Formatting.Indented;
+			Serialize (xmlWriter, o, namespaces);
+			xmlWriter.Flush();
+		}
+
+		public void Serialize (XmlWriter xmlWriter, object o, XmlSerializerNamespaces namespaces)
+		{
+			XmlSerializationWriter xsWriter;
+
+			try {
+				if (customSerializer)
+					xsWriter = CreateWriter ();
+				else
+					xsWriter = CreateWriter (typeMapping);
+
+				if (namespaces == null || namespaces.Count == 0) {
+					namespaces = new XmlSerializerNamespaces ();
+					namespaces.Add ("xsi", XmlSchema.InstanceNamespace);
+					namespaces.Add ("xsd", XmlSchema.Namespace);
+				}
+
+				xsWriter.Initialize (xmlWriter, namespaces);
+				Serialize (o, xsWriter);
+				xmlWriter.Flush ();
+			} catch (Exception ex) {
+				if (ex is TargetInvocationException)
+					ex = ex.InnerException;
+
+				if (ex is InvalidOperationException || ex is InvalidCastException)
+					throw new InvalidOperationException ("There was an error generating" +
+						" the XML document.", ex);
+
+				throw;
+			}
+		}
+		
+		[MonoTODO]
+		public object Deserialize (XmlReader xmlReader, string encodingStyle, XmlDeserializationEvents events)
+		{
+			throw new NotImplementedException ();
+		}
+
+		[MonoTODO]
+		public object Deserialize (XmlReader xmlReader, string encodingStyle)
+		{
+			throw new NotImplementedException ();
+		}
+
+		[MonoTODO]
+		public object Deserialize (XmlReader xmlReader, XmlDeserializationEvents events)
+		{
+			throw new NotImplementedException ();
+		}
+		
+		[MonoTODO]
+		public static XmlSerializer[] FromMappings (XmlMapping[] mappings, Evidence evidence)
+		{
+			throw new NotImplementedException ();
+		}
+
+		[MonoTODO]
+		public static XmlSerializer[] FromMappings (XmlMapping[] mappings, Type type)
+		{
+			throw new NotImplementedException ();
+		}
+
+#if !MOBILE
+		public static Assembly GenerateSerializer (Type[] types, XmlMapping[] mappings)
+		{
+			return GenerateSerializer (types, mappings, null);
+		}
+		
+		[MonoTODO]
+		public static Assembly GenerateSerializer (Type[] types, XmlMapping[] mappings, CompilerParameters parameters)
+		{
+			GenerationBatch batch = new GenerationBatch ();
+			batch.Maps = mappings;
+			batch.Datas = new SerializerData [mappings.Length];
+			
+			for (int n=0; n<mappings.Length; n++) {
+				SerializerData data = new SerializerData ();
+				data.Batch = batch;
+				batch.Datas [n] = data;
+			}
+			
+			return GenerateSerializers (batch, parameters);
+		}
+#endif
+
+		public static string GetXmlSerializerAssemblyName (Type type)
+		{
+			return type.Assembly.GetName().Name + ".XmlSerializers";
+		}
+
+		public static string GetXmlSerializerAssemblyName (Type type, string defaultNamespace)
+		{
+			return GetXmlSerializerAssemblyName (type) + "." + defaultNamespace.GetHashCode ();
+		}
+		
+		[MonoTODO]
+		public void Serialize (XmlWriter xmlWriter, object o, XmlSerializerNamespaces namespaces, string encodingStyle)
+		{
+			throw new NotImplementedException ();
+		}
+
+		[MonoNotSupported("")]
+		public void Serialize (XmlWriter xmlWriter, Object o, XmlSerializerNamespaces namespaces, string encodingStyle, string id)
+		{
+			throw new NotImplementedException ();
+		}
+		
+		XmlSerializationWriter CreateWriter (XmlMapping typeMapping)
+		{
+			XmlSerializationWriter writer;
+			
+			lock (this) {
+				if (serializerData != null) {
+					lock (serializerData) {
+						writer = serializerData.CreateWriter ();
+					}
+					if (writer != null) return writer;
+				}
+			}
+			
+#if !MOBILE
+			if (!typeMapping.Source.CanBeGenerated || generationThreshold == -1)
+				return new XmlSerializationWriterInterpreter (typeMapping);
+
+			CheckGeneratedTypes (typeMapping);
+			
+			lock (this) {
+				lock (serializerData) {
+					writer = serializerData.CreateWriter ();
+				}
+				if (writer != null) return writer;
+				if (!generatorFallback)
+					throw new InvalidOperationException ("Error while generating serial

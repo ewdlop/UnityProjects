@@ -1,0 +1,38 @@
+ce, arg_num, args_base, args, arg_sizes,
+      arg_types);
+
+  if (rc != OFFLOAD_SUCCESS) {
+    DP("Call to target_data_begin failed, skipping target execution.\n");
+    // Call target_data_end to dealloc whatever target_data_begin allocated
+    // and return OFFLOAD_FAIL.
+    target_data_end(Device, arg_num, args_base, args, arg_sizes, arg_types);
+    return OFFLOAD_FAIL;
+  }
+
+  std::vector<void *> tgt_args;
+  std::vector<ptrdiff_t> tgt_offsets;
+
+  // List of (first-)private arrays allocated for this target region
+  std::vector<void *> fpArrays;
+
+  for (int32_t i = 0; i < arg_num; ++i) {
+    if (!(arg_types[i] & OMP_TGT_MAPTYPE_TARGET_PARAM)) {
+      // This is not a target parameter, do not push it into tgt_args.
+      continue;
+    }
+    void *HstPtrBegin = args[i];
+    void *HstPtrBase = args_base[i];
+    void *TgtPtrBegin;
+    ptrdiff_t TgtBaseOffset;
+    bool IsLast; // unused.
+    if (arg_types[i] & OMP_TGT_MAPTYPE_LITERAL) {
+      DP("Forwarding first-private value " DPxMOD " to the target construct\n",
+          DPxPTR(HstPtrBase));
+      TgtPtrBegin = HstPtrBase;
+      TgtBaseOffset = 0;
+    } else if (arg_types[i] & OMP_TGT_MAPTYPE_PRIVATE) {
+      // Allocate memory for (first-)private array
+      TgtPtrBegin = Device.RTL->data_alloc(Device.RTLDeviceID,
+          arg_sizes[i], HstPtrBegin);
+      if (!TgtPtrBegin) {
+        DP

@@ -1,0 +1,1135 @@
+#include <glib.h>
+#include <string.h>
+#include <stdio.h>
+#include "test.h"
+
+/* This test is just to be used with valgrind */
+static RESULT
+test_strfreev (void)
+{
+	gchar **array = g_new (gchar *, 4);
+	array [0] = g_strdup ("one");
+	array [1] = g_strdup ("two");
+	array [2] = g_strdup ("three");
+	array [3] = NULL;
+	
+	g_strfreev (array);
+	g_strfreev (NULL);
+
+	return OK;
+}
+
+static RESULT
+test_concat (void)
+{
+	gchar *x = g_strconcat ("Hello", ", ", "world", (const char*)NULL);
+	if (strcmp (x, "Hello, world") != 0)
+		return FAILED("concat failed, got: %s", x);
+	g_free (x);
+	return OK;
+}
+
+static RESULT
+test_split (void)
+{
+	const gchar *to_split = "Hello world, how are we doing today?";
+	gint i;
+	gchar **v;
+	
+	v= g_strsplit(to_split, " ", 0);
+	
+	if(v == NULL) {
+		return FAILED("split failed, got NULL vector (1)");
+	}
+	
+	for(i = 0; v[i] != NULL; i++);
+	if(i != 7) {
+		return FAILED("split failed, expected 7 tokens, got %d", i);
+	}
+	
+	g_strfreev(v);
+
+	v = g_strsplit(to_split, ":", -1);
+	if(v == NULL) {
+		return FAILED("split failed, got NULL vector (2)");
+	}
+
+	for(i = 0; v[i] != NULL; i++);
+	if(i != 1) {
+		return FAILED("split failed, expected 1 token, got %d", i);
+	}
+
+	if(strcmp(v[0], to_split) != 0) {
+		return FAILED("expected vector[0] to be '%s' but it was '%s'",
+			to_split, v[0]);
+	}
+	g_strfreev(v);
+
+	v = g_strsplit ("", ":", 0);
+	if (v == NULL)
+		return FAILED ("g_strsplit returned NULL");
+	g_strfreev (v);
+
+	v = g_strsplit ("/home/miguel/dingus", "/", 0);
+	if (v [0][0] != 0)
+		return FAILED ("Got a non-empty first element");
+	g_strfreev (v);
+
+	v = g_strsplit ("appdomain1, Version=0.0.0.0, Culture=neutral", ",", 4);
+	if (strcmp (v [0], "appdomain1") != 0)
+		return FAILED ("Invalid value");
+	
+	if (strcmp (v [1], " Version=0.0.0.0") != 0)
+		return FAILED ("Invalid value");
+	
+	if (strcmp (v [2], " Culture=neutral") != 0)
+		return FAILED ("Invalid value");
+
+	if (v [3] != NULL)
+		return FAILED ("Expected only 3 elements");
+	
+	g_strfreev (v);
+
+	v = g_strsplit ("abcXYdefXghiXYjklYmno", "XY", 4);
+	if (strcmp (v [0], "abc") != 0)
+		return FAILED ("Invalid value 0");
+	
+	if (strcmp (v [1], "defXghi") != 0)
+		return FAILED ("Invalid value 1");
+
+	if (strcmp (v [2], "jklYmno") != 0)
+		return FAILED ("Invalid value 2");
+
+	if (v [3] != NULL)
+		return FAILED ("Expected only 3 elements (1)");
+	
+	g_strfreev (v);
+
+	v = g_strsplit ("abcXYdefXghiXYjklYmno", "XY", 2);
+	if (strcmp (v [0], "abc") != 0)
+		return FAILED ("Invalid value 3");
+	
+	if (strcmp (v [1], "defXghiXYjklYmno") != 0)
+		return FAILED ("Invalid value 4");
+
+	if (v [2] != NULL)
+		return FAILED ("Expected only 2 elements (2)");
+	
+	g_strfreev (v);
+
+	v = g_strsplit ("abcXYdefXghiXYjklYmnoXY", "XY", 3);
+	if (strcmp (v [0], "abc") != 0)
+		return FAILED ("Invalid value 5");
+	
+	if (strcmp (v [1], "defXghi") != 0)
+		return FAILED ("Invalid value 6");
+
+	if (strcmp (v [2], "jklYmnoXY") != 0)
+		return FAILED ("Invalid value 7");
+
+	if (v [3] != NULL)
+		return FAILED ("Expected only 3 elements (3)");
+	
+	g_strfreev (v);
+
+	v = g_strsplit ("abcXYXYXYdefXY", "XY", -1);
+	if (strcmp (v [0], "abc") != 0)
+		return FAILED ("Invalid value 8");
+
+	if (strcmp (v [1], "") != 0)
+		return FAILED ("Invalid value 9");
+
+	if (strcmp (v [2], "") != 0)
+		return FAILED ("Invalid value 10");
+	
+	if (strcmp (v [3], "def") != 0)
+		return FAILED ("Invalid value 11");
+
+	if (strcmp (v [4], "") != 0)
+		return FAILED ("Invalid value 12");
+
+	if (v [5] != NULL)
+		return FAILED ("Expected only 5 elements (4)");
+	
+	g_strfreev (v);
+
+	v = g_strsplit ("XYXYXYabcXYdef", "XY", -1);
+	if (strcmp (v [0], "") != 0)
+		return FAILED ("Invalid value 13");
+	
+	if (strcmp (v [1], "") != 0)
+		return FAILED ("Invalid value 14");
+	
+	if (strcmp (v [2], "") != 0)
+		return FAILED ("Invalid value 15");
+	
+	if (strcmp (v [3], "abc") != 0)
+		return FAILED ("Invalid value 16");
+	
+	if (strcmp (v [4], "def") != 0)
+		return FAILED ("Invalid value 17");
+
+	if (v [5] != NULL)
+		return FAILED ("Expected only 5 elements (5)");
+	
+	g_strfreev (v);
+
+	v = g_strsplit ("value=", "=", 2);
+	if (strcmp (v [0], "value") != 0)
+		return FAILED ("Invalid value 18; expected 'value', got '%s'", v [0]);
+	if (strcmp (v [1], "") != 0)
+		return FAILED ("Invalid value 19; expected '', got '%s'", v [1]);
+	if (v [2] != NULL)
+		return FAILED ("Expected only 2 elements (6)");
+
+	g_strfreev (v);
+
+	return OK;
+}
+
+static RESULT
+test_split_set (void)
+{
+	gchar **v;
+	
+	v = g_strsplit_set ("abcXYdefXghiXYjklYmno", "XY", 6);
+	if (strcmp (v [0], "abc") != 0)
+		return FAILED ("Invalid value 0");
+
+	if (strcmp (v [1], "") != 0)
+		return FAILED ("Invalid value 1");
+	
+	if (strcmp (v [2], "def") != 0)
+		return FAILED ("Invalid value 2");
+
+	if (strcmp (v [3], "ghi") != 0)
+		return FAILED ("Invalid value 3");
+
+	if (strcmp (v [4], "") != 0)
+		return FAILED ("Invalid value 4");
+
+	if (strcmp (v [5], "jklYmno") != 0)
+		return FAILED ("Invalid value 5");
+
+	if (v [6] != NULL)
+		return FAILED ("Expected only 6 elements (1)");
+
+	g_strfreev (v);
+
+	v = g_strsplit_set ("abcXYdefXghiXYjklYmno", "XY", 3);
+	if (strcmp (v [0], "abc") != 0)
+		return FAILED ("Invalid value 6");
+
+	if (strcmp (v [1], "") != 0)
+		return FAILED ("Invalid value 7");
+	
+	if (strcmp (v [2], "defXghiXYjklYmno") != 0)
+		return FAILED ("Invalid value 8");
+
+	if (v [3] != NULL)
+		return FAILED ("Expected only 3 elements (2)");
+	
+	g_strfreev (v);
+
+	v = g_strsplit_set ("abcXdefYghiXjklYmnoX", "XY", 5);
+	if (strcmp (v [0], "abc") != 0)
+		return FAILED ("Invalid value 9");
+	
+	if (strcmp (v [1], "def") != 0)
+		return FAILED ("Invalid value 10");
+
+	if (strcmp (v [2], "ghi") != 0)
+		return FAILED ("Invalid value 11");
+
+	if (strcmp (v [3], "jkl") != 0)
+		return FAILED ("Invalid value 12");
+
+	if (strcmp (v [4], "mnoX") != 0)
+		return FAILED ("Invalid value 13");
+
+	if (v [5] != NULL)
+		return FAILED ("Expected only 5 elements (5)");
+	
+	g_strfreev (v);
+
+	v = g_strsplit_set ("abcXYXdefXY", "XY", -1);
+	if (strcmp (v [0], "abc") != 0)
+		return FAILED ("Invalid value 14");
+
+	if (strcmp (v [1], "") != 0)
+		return FAILED ("Invalid value 15");
+
+	if (strcmp (v [2], "") != 0)
+		return FAILED ("Invalid value 16");
+	
+	if (strcmp (v [3], "def") != 0)
+		return FAILED ("Invalid value 17");
+
+	if (strcmp (v [4], "") != 0)
+		return FAILED ("Invalid value 18");
+
+	if (strcmp (v [5], "") != 0)
+		return FAILED ("Invalid value 19");
+
+	if (v [6] != NULL)
+		return FAILED ("Expected only 6 elements (4)");
+	
+	g_strfreev (v);
+
+	v = g_strsplit_set ("XYXabcXYdef", "XY", -1);
+	if (strcmp (v [0], "") != 0)
+		return FAILED ("Invalid value 20");
+	
+	if (strcmp (v [1], "") != 0)
+		return FAILED ("Invalid value 21");
+	
+	if (strcmp (v [2], "") != 0)
+		return FAILED ("Invalid value 22");
+	
+	if (strcmp (v [3], "abc") != 0)
+		return FAILED ("Invalid value 23");
+
+	if (strcmp (v [4], "") != 0)
+		return FAILED ("Invalid value 24");
+	
+	if (strcmp (v [5], "def") != 0)
+		return FAILED ("Invalid value 25");
+
+	if (v [6] != NULL)
+		return FAILED ("Expected only 6 elements (5)");
+	
+	g_strfreev (v);
+
+	return OK;
+}
+
+static RESULT
+test_strreverse (void)
+{
+	RESULT res = OK;
+	gchar *a = g_strdup ("onetwothree");
+	gchar *a_target = (char*)"eerhtowteno";
+	gchar *b = g_strdup ("onetwothre");
+	gchar *b_target = (char*)"erhtowteno";
+	gchar *c = g_strdup ("");
+	gchar *c_target = (char*)"";
+
+	g_strreverse (a);
+	if (strcmp (a, a_target)) {
+		res = FAILED("strreverse failed. Expecting: '%s' and got '%s'\n", a, a_target);
+		goto cleanup;
+	}
+
+	g_strreverse (b);
+	if (strcmp (b, b_target)) {
+		res = FAILED("strreverse failed. Expecting: '%s' and got '%s'\n", b, b_target);
+		goto cleanup;
+	}
+
+	g_strreverse (c);
+	if (strcmp (c, c_target)) {
+		res = FAILED("strreverse failed. Expecting: '%s' and got '%s'\n", b, b_target);
+		goto cleanup;
+	}
+
+cleanup:
+	g_free (c);
+	g_free (b);
+	g_free (a);
+	return res;
+}
+
+static RESULT
+test_strjoin (void)
+{
+	char *s;
+	
+	s = g_strjoin (NULL, "a", "b", (const char*)NULL);
+	if (strcmp (s, "ab") != 0)
+		return FAILED ("Join of two strings with no separator fails");
+	g_free (s);
+
+	s = g_strjoin ("", "a", "b", (const char*)NULL);
+	if (strcmp (s, "ab") != 0)
+		return FAILED ("Join of two strings with empty separator fails");
+	g_free (s);
+
+	s = g_strjoin ("-", "a", "b", (const char*)NULL);
+	if (strcmp (s, "a-b") != 0)
+		return FAILED ("Join of two strings with separator fails");
+	g_free (s);
+
+	s = g_strjoin ("-", "aaaa", "bbbb", "cccc", "dddd", (const char*)NULL);
+	if (strcmp (s, "aaaa-bbbb-cccc-dddd") != 0)
+		return FAILED ("Join of multiple strings fails");
+	g_free (s);
+
+	s = g_strjoin ("-", (const char*)NULL);
+	if (s == NULL || (strcmp (s, "") != 0))
+		return FAILED ("Failed to join empty arguments");
+	g_free (s);
+
+	return OK;
+}
+
+static RESULT
+test_strchug (void)
+{
+	char *str = g_strdup (" \t\n hola");
+
+	g_strchug (str);
+	if (strcmp ("hola", str)) {
+		fprintf (stderr, "%s\n", str);
+		g_free (str);
+		return FAILED ("Failed.");
+	}
+	g_free (str);
+	return OK;
+}
+
+static RESULT
+test_strchomp (void)
+{
+	char *str = g_strdup ("hola  \t");
+
+	g_strchomp (str);
+	if (strcmp ("hola", str)) {
+		fprintf (stderr, "%s\n", str);
+		g_free (str);
+		return FAILED ("Failed.");
+	}
+	g_free (str);
+	return OK;
+}
+
+static RESULT
+test_strstrip (void)
+{
+	char *str = g_strdup (" \t hola   ");
+
+	g_strstrip (str);
+	if (strcmp ("hola", str)) {
+		fprintf (stderr, "%s\n", str);
+		g_free (str);
+		return FAILED ("Failed.");
+	}
+	g_free (str);
+	return OK;
+}
+
+#define urit(so,j) do { s = g_filename_to_uri (so, NULL, NULL); if (strcmp (s, j) != 0) return FAILED("Got %s expected %s", s, j); g_free (s); } while (0);
+
+#define errit(so) do { s = g_filename_to_uri (so, NULL, NULL); if (s != NULL) return FAILED ("got %s, expected NULL", s); } while (0);
+
+static RESULT
+test_filename_to_uri (void)
+{
+#ifdef G_OS_WIN32
+#else
+	char *s;
+
+	urit ("/a", "file:///a");
+	urit ("/home/miguel", "file:///home/miguel");
+	urit ("/home/mig uel", "file:///home/mig%20uel");
+	urit ("/\303\241", "file:///%C3%A1");
+	urit ("/\303\241/octal", "file:///%C3%A1/octal");
+	urit ("/%", "file:///%25");
+	urit ("/\001\002\003\004\005\006\007\010\011\012\013\014\015\016\017\020\021\022\023\024\025\026\027\030\031\032\033\034\035\036\037\040", "file:///%01%02%03%04%05%06%07%08%09%0A%0B%0C%0D%0E%0F%10%11%12%13%14%15%16%17%18%19%1A%1B%1C%1D%1E%1F%20");
+	urit ("/!$&'()*+,-./", "file:///!$&'()*+,-./");
+	urit ("/\042\043\045", "file:///%22%23%25");
+	urit ("/0123456789:=", "file:///0123456789:=");
+	urit ("/\073\074\076\077", "file:///%3B%3C%3E%3F");
+	urit ("/\133\134\135\136_\140\173\174\175", "file:///%5B%5C%5D%5E_%60%7B%7C%7D");
+	urit ("/\173\174\175\176\177\200", "file:///%7B%7C%7D~%7F%80");
+	urit ("/@ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz", "file:///@ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz");
+	errit ("a");
+	errit ("./hola");
+#endif
+	
+	return OK;
+}
+
+#define fileit(so,j) do { s = g_filename_from_uri (so, NULL, NULL); if (strcmp (s, j) != 0) return FAILED("Got %s expected %s", s, j); g_free (s); } while (0);
+
+#define ferrit(so) do { s = g_filename_from_uri (so, NULL, NULL); if (s != NULL) return FAILED ("got %s, expected NULL", s); } while (0);
+
+static RESULT
+test_filename_from_uri (void)
+{
+#ifndef G_OS_WIN32
+	char *s;
+
+	fileit ("file:///a", "/a");
+	fileit ("file:///%41", "/A");
+	fileit ("file:///home/miguel", "/home/miguel");
+	fileit ("file:///home/mig%20uel", "/home/mig uel");
+	fileit ("file:///home/c%2B%2B", "/home/c++");
+	fileit ("file:///home/c%2b%2b", "/home/c++");
+	ferrit ("/a");
+	ferrit ("a");
+	ferrit ("file://a");
+	ferrit ("file:a");
+	ferrit ("file:///%");
+	ferrit ("file:///%0");
+	ferrit ("file:///%jj");
+#endif
+	
+	return OK;
+}
+
+static RESULT
+test_ascii_xdigit_value (void)
+{
+	int i;
+	gchar j;
+
+	i = g_ascii_xdigit_value ('9' + 1);
+	if (i != -1)
+		return FAILED ("'9' + 1");
+	i = g_ascii_xdigit_value ('0' - 1);
+	if (i != -1)
+		return FAILED ("'0' - 1");
+	i = g_ascii_xdigit_value ('a' - 1);
+	if (i != -1)
+		return FAILED ("'a' - 1");
+	i = g_ascii_xdigit_value ('f' + 1);
+	if (i != -1)
+		return FAILED ("'f' + 1");
+	i = g_ascii_xdigit_value ('A' - 1);
+	if (i != -1)
+		return FAILED ("'A' - 1");
+	i = g_ascii_xdigit_value ('F' + 1);
+	if (i != -1)
+		return FAILED ("'F' + 1");
+
+	for (j = '0'; j < '9'; j++) {
+		int c = g_ascii_xdigit_value (j);
+		if (c  != (j - '0'))
+			return FAILED ("Digits %c -> %d", j, c);
+	}
+	for (j = 'a'; j < 'f'; j++) {
+		int c = g_ascii_xdigit_value (j);
+		if (c  != (j - 'a' + 10))
+			return FAILED ("Lower %c -> %d", j, c);
+	}
+	for (j = 'A'; j < 'F'; j++) {
+		int c = g_ascii_xdigit_value (j);
+		if (c  != (j - 'A' + 10))
+			return FAILED ("Upper %c -> %d", j, c);
+	}
+	return OK;
+}
+
+#define	G_STR_DELIMITERS "_-|> <."
+
+static void
+g_strdelimits (char *a, const char *old, char new)
+{
+	old = old ? old : G_STR_DELIMITERS;
+	while (*old)
+		g_strdelimit (a, *old++, new);
+}
+
+static RESULT
+test_strdelimit (void)
+{
+	gchar *str;
+
+	str = g_strdup (G_STR_DELIMITERS);
+	g_strdelimits (str, NULL, 'a');
+	if (0 != strcmp ("aaaaaaa", str))
+		return FAILED ("All delimiters: '%s'", str);
+	g_free (str);
+	str = g_strdup ("hola");
+	g_strdelimits (str, "ha", '+');
+	if (0 != strcmp ("+ol+", str))
+		return FAILED ("2 delimiters: '%s'", str);
+	g_free (str);
+	return OK;
+}
+
+#define NUMBERS "0123456789"
+
+static RESULT
+test_strlcpy (void)
+{
+	const gchar *src = "onetwothree";
+	gchar *dest;
+	gsize i;
+
+	dest = g_malloc (strlen (src) + 1);
+	memset (dest, 0, strlen (src) + 1);
+	i = g_strlcpy (dest, src, (gsize)-1);
+	if (i != strlen (src))
+		return FAILED ("Test1 got %d", i);
+
+	if (0 != strcmp (dest, src))
+		return FAILED ("Src and dest not equal");
+
+	i = g_strlcpy (dest, src, 3);
+	if (i != strlen (src))
+		return FAILED ("Test1 got %d", i);
+	if (0 != strcmp (dest, "on"))
+		return FAILED ("Test2");
+
+	i = g_strlcpy (dest, src, 1);
+	if (i != strlen (src))
+		return FAILED ("Test3 got %d", i);
+	if (*dest != '\0')
+		return FAILED ("Test4");
+
+	i = g_strlcpy (dest, src, 12345);
+	if (i != strlen (src))
+		return FAILED ("Test4 got %d", i);
+	if (0 != strcmp (dest, src))
+		return FAILED ("Src and dest not equal 2");
+	g_free (dest);
+
+	/* This is a test for g_filename_from_utf8, even if it does not look like it */
+	dest = g_filename_from_utf8 (NUMBERS, strlen (NUMBERS), NULL, NULL, NULL);
+	if (0 != strcmp (dest, NUMBERS))
+		return FAILED ("problem [%s] and [%s]", dest, NUMBERS);
+	g_free (dest);
+	
+	return OK;
+}
+
+static RESULT
+test_strescape (void)
+{
+	gchar *str;
+
+	str = g_strescape ("abc", NULL);
+	if (strcmp ("abc", str))
+		return FAILED ("#1");
+	str = g_strescape ("\t\b\f\n\r\\\"abc", NULL);
+	if (strcmp ("\\t\\b\\f\\n\\r\\\\\\\"abc", str))
+		return FAILED ("#2 %s", str);
+	str = g_strescape ("\001abc", NULL);
+	if (strcmp ("\\001abc", str))
+		return FAILED ("#3 %s", str);
+	str = g_strescape ("\001abc", "\001");
+	if (strcmp ("\001abc", str))
+		return FAILED ("#3 %s", str);
+	return OK;
+}
+
+static RESULT
+test_ascii_strncasecmp (void)
+{
+	int n;
+
+	n = g_ascii_strncasecmp ("123", "123", 1);
+	if (n != 0)
+		return FAILED ("Should have been 0");
+	
+	n = g_ascii_strncasecmp ("423", "123", 1);
+	if (n <= 0)
+		return FAILED ("Should have been > 0, got %d", n);
+
+	n = g_ascii_strncasecmp ("123", "423", 1);
+	if (n >= 0)
+		return FAILED ("Should have been < 0, got %d", n);
+
+	n = g_ascii_strncasecmp ("1", "1", 10);
+	if (n != 0)
+		return FAILED ("Should have been 0, got %d", n);
+	return OK;
+}
+
+static RESULT
+test_ascii_strdown (void)
+{
+	const gchar *a = "~09+AaBcDeFzZ$0909EmPAbCdEEEEEZZZZAAA";
+	const gchar *b = "~09+aabcdefzz$0909empabcdeeeeezzzzaaa";
+	gchar *c;
+	gint n, l;
+
+	l = (gint)strlen (b);
+	c = g_ascii_strdown (a, l);
+	n = g_ascii_strncasecmp (b, c, l);
+
+	if (n != 0) {
+		g_free (c);
+		return FAILED ("Should have been 0, got %d", n);
+	}
+
+	g_free (c);
+	return OK;
+}
+
+static RESULT
+test_strdupv (void)
+{
+	gchar **one;
+	gchar **two;
+	gint len;
+
+	one = g_strdupv (NULL);
+	if (one)
+		return FAILED ("Should have been NULL");
+
+	one = g_malloc (sizeof (gchar *));
+	*one = NULL;
+	two = g_strdupv (one);
+	if (!two)
+		FAILED ("Should have been not NULL");
+	len = g_strv_length (two);
+	if (len)
+		FAILED ("Should have been 0");
+	g_strfreev (two);
+	g_strfreev (one);
+	return NULL;
+}
+
+static Test strutil_tests [] = {
+	{"g_strfreev", test_strfreev},
+	{"g_strconcat", test_concat},
+	{"g_strsplit", test_split},
+	{"g_strsplit_set", test_split_set},
+	{"g_strreverse", test_strreverse},
+	{"g_strjoin", test_strjoin},
+	{"g_strchug", test_strchug},
+	{"g_strchomp", test_strchomp},
+	{"g_strstrip", test_strstrip},
+	{"g_filename_to_uri", test_filename_to_uri},
+	{"g_filename_from_uri", test_filename_from_uri},
+	{"g_ascii_xdigit_value", test_ascii_xdigit_value},
+	{"g_strdelimit", test_strdelimit},
+	{"g_strlcpy", test_strlcpy},
+	{"g_strescape", test_strescape},
+	{"g_ascii_strncasecmp", test_ascii_strncasecmp },
+	{"g_ascii_strdown", test_ascii_strdown },
+	{"g_strdupv", test_strdupv },
+	{NULL, NULL}
+};
+
+DEFINE_TEST_GROUP_INIT(strutil_tests_init, strutil_tests)
+                                                                                                                                                            t       M    ê      Y       c          1      p           †       }            8       é                    ö                    ¶    @
+      `      ∂    ê      J      Ã    †	      à       ÿ    0
+             Í    0
+      \          ‡      o                         $            Ë       2                   E                   T                   j           '       Ñ    3       .       ô    ¿      ‡       ß           ∏       π    @      ¿       √                  ”    †      P                                                        	                                                                                                                                                                                                                             !                 „    ¿      ‡       
+                                          /                     J                     d                     x            @      Ü    @      ¿       ®                     …                     ›                     È                   ¯                                                               %                     7                     B                   N                     g                                          ê                     °                     ≥                     ¿                     ”                  ˙                                          $                     4                     J                     S                     i                     t                     Ç                     è                     •                     Ø                     ¡                     ◊                     Á                     Ô                                          /                     C                     P                     h                     u                     è                     °                     π                     Œ                     ›                     ˙                     	                     ,	                     A	                     Z	                     l	                     s	                      __UNIQUE_ID_alias50 __UNIQUE_ID_alias49 __UNIQUE_ID_alias48 __UNIQUE_ID_alias47 __UNIQUE_ID_alias46 __UNIQUE_ID_alias45 __UNIQUE_ID_alias44 __UNIQUE_ID_alias43 __UNIQUE_ID_alias42 __UNIQUE_ID_alias41 __UNIQUE_ID_alias40 __UNIQUE_ID_alias39 __UNIQUE_ID_alias38 __UNIQUE_ID_alias37 __UNIQUE_ID_alias36 __UNIQUE_ID_alias35 __UNIQUE_ID_alias34 __UNIQUE_ID_alias33 __UNIQUE_ID_alias32 __UNIQUE_ID_alias31 __UNIQUE_ID_alias30 __UNIQUE_ID_alias29 __UNIQUE_ID_alias28 __UNIQUE_ID_alias27 __UNIQUE_ID_alias26 __UNIQUE_ID_alias25 __UNIQUE_ID_alias24 __module_depends ____versions __UNIQUE_ID_retpoline23 __UNIQUE_ID_intree22 __UNIQUE_ID_name21 __UNIQUE_ID_vermagic20 _note_6 ak8975_raw_to_gauss ak8963_09911_raw_to_gauss ak09912_raw_to_gauss ak8975_get_mount_matrix ak8975_set_mode ak8975_runtime_suspend ak8975_remove ak8975_irq_handler ak8975_power_on ak8975_runtime_resume ak8975_probe ak_def_array descriptor.38152 __key.37947 __key.38157 ak8975_channels ak8975_handle_trigger ak8975_info ak8975_scan_masks ak8975_start_read_axis ak8975_read_raw ak8975_driver_init ak8975_driver ak8975_driver_exit __func__.38153 __UNIQUE_ID_license52 __UNIQUE_ID_description51 __UNIQUE_ID_author50 ak_acpi_match ak8975_dev_pm_ops ak8975_id ak8975_of_match ak8975_ext_in// 
+// System.Web.Services.Protocols.SoapHttpClientProtocol.cs
+//
+// Author:
+//   Tim Coleman (tim@timcoleman.com)
+//   Miguel de Icaza (miguel@ximian.com)
+//   Lluis Sanchez Gual (lluis@ximian.com)
+//
+// Copyright (C) Tim Coleman, 2002
+// Copyright (C) Ximian, Inc, 2003
+//
+
+//
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+// 
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+//
+
+using System.ComponentModel;
+using System.Globalization;
+using System.IO;
+using System.Net;
+using System.Web;
+using System.Xml;
+using System.Text;
+using System.Reflection;
+using System.Web.Services;
+using System.Diagnostics;
+using System.Runtime.CompilerServices;
+using System.Web.Services.Description;
+using System.Web.Services.Discovery;
+using System.Xml.Serialization;
+using System.Xml.Schema;
+using System.Collections;
+using System.Threading;
+
+namespace System.Web.Services.Protocols 
+{
+	[System.Runtime.InteropServices.ComVisible (true)]
+	public class SoapHttpClientProtocol : HttpWebClientProtocol 
+	{
+		SoapTypeStubInfo type_info;
+		SoapProtocolVersion soapVersion;
+
+		#region SoapWebClientAsyncResult class
+
+		internal class SoapWebClientAsyncResult: WebClientAsyncResult
+		{
+			public SoapWebClientAsyncResult (WebRequest request, AsyncCallback callback, object asyncState)
+			: base (request, callback, asyncState)
+			{
+			}
+		
+			public SoapClientMessage Message;
+			public SoapExtension[] Extensions;
+		}
+		#endregion
+
+		#region Constructors
+
+		public SoapHttpClientProtocol () 
+		{
+			type_info = (SoapTypeStubInfo) TypeStubManager.GetTypeStub (this.GetType (), "Soap");
+		}
+
+		#endregion // Constructors
+
+		#region Methods
+
+		protected IAsyncResult BeginInvoke (string methodName, object[] parameters, AsyncCallback callback, object asyncState)
+		{
+			SoapMethodStubInfo msi = (SoapMethodStubInfo) type_info.GetMethod (methodName);
+
+			SoapWebClientAsyncResult ainfo = null;
+			try
+			{
+				SoapClientMessage message = new SoapClientMessage (this, msi, Url, parameters);
+				message.CollectHeaders (this, message.MethodStubInfo.Headers, SoapHeaderDirection.In);
+				
+				WebRequest request = GetRequestForMessage (uri, message);
+				
+				ainfo = new SoapWebClientAsyncResult (request, callback, asyncState);
+				ainfo.Message = message;
+				ainfo.Extensions = SoapExtension.CreateExtensionChain (type_info.SoapExtensions[0], msi.SoapExtensions, type_info.SoapExtensions[1]);
+
+				ainfo.Request.BeginGetRequestStream (new AsyncCallback (AsyncGetRequestStreamDone), ainfo);
+				RegisterMapping (asyncState, ainfo);
+			}
+			catch (Exception ex)
+			{
+				if (ainfo != null)
+					ainfo.SetCompleted (null, ex, false);
+			}
+
+			return ainfo;
+		}
+
+		void AsyncGetRequestStreamDone (IAsyncResult ar)
+		{
+			SoapWebClientAsyncResult ainfo = (SoapWebClientAsyncResult) ar.AsyncState;
+			try
+			{
+				SendRequest (ainfo.Request.EndGetRequestStream (ar), ainfo.Message, ainfo.Extensions);
+				ainfo.Request.BeginGetResponse (new AsyncCallback (AsyncGetResponseDone), ainfo);
+			}
+			catch (Exception ex)
+			{
+				ainfo.SetCompleted (null, ex, true);
+			}
+		}
+
+		void AsyncGetResponseDone (IAsyncResult ar)
+		{
+			SoapWebClientAsyncResult ainfo = (SoapWebClientAsyncResult) ar.AsyncState;
+			WebResponse response = null;
+
+			try {
+				response = GetWebResponse (ainfo.Request, ar);
+			}
+			catch (WebException ex) {
+				response = ex.Response;
+				HttpWebResponse http_response = response as HttpWebResponse;
+				if (http_response == null || http_response.StatusCode != HttpStatusCode.InternalServerError) {
+					ainfo.SetCompleted (null, ex, true);
+					return;
+				}
+			}
+			catch (Exception ex) {
+				ainfo.SetCompleted (null, ex, true);
+				return;
+			}
+
+			try {
+				object[] result = ReceiveResponse (response, ainfo.Message, ainfo.Extensions);
+				ainfo.SetCompleted (result, null, true);
+			}
+			catch (Exception ex) {
+				ainfo.SetCompleted (null, ex, true);
+			}
+			finally {
+				response.Close();
+			}
+		}
+
+		protected object[] EndInvoke (IAsyncResult asyncResult)
+		{
+			if (!(asyncResult is SoapWebClientAsyncResult)) throw new ArgumentException ("asyncResult is not the return value from BeginInvoke");
+
+			SoapWebClientAsyncResult ainfo = (SoapWebClientAsyncResult) asyncResult;
+			lock (ainfo)
+			{
+				if (!ainfo.IsCompleted)
+					ainfo.WaitForComplete ();
+
+				UnregisterMapping (ainfo.AsyncState);
+				
+				if (ainfo.Exception != null)
+					throw ainfo.Exception;
+				else
+					return (object[]) ainfo.Result;
+			}
+		}
+
+		public void Discover ()
+		{
+			BindingInfo bnd = (BindingInfo) type_info.Bindings [0];
+			
+			DiscoveryClientProtocol discoverer = new DiscoveryClientProtocol ();
+			discoverer.Discover (Url);
+			
+			foreach (object info in discoverer.AdditionalInformation)
+			{
+				System.Web.Services.Discovery.SoapBinding sb = info as System.Web.Services.Discovery.SoapBinding;
+				if (sb != null && sb.Binding.Name == bnd.Name && sb.Binding.Namespace == bnd.Namespace) {
+					Url = sb.Address;
+					return;
+				}
+			}
+			
+			string msg = string.Format (
+		        	"The binding named '{0}' from namespace '{1}' was not found in the discovery document at '{2}'",
+				bnd.Name, bnd.Namespace, Url);
+			throw new Exception (msg);
+		}
+
+		protected override WebRequest GetWebRequest (Uri uri)
+		{
+			return base.GetWebRequest (uri);
+		}
+
+		WebRequest GetRequestForMessage (Uri uri, SoapClientMessage message)
+		{
+			WebRequest request = GetWebRequest (uri);
+			request.Method = "POST";
+			WebHeaderCollection headers = request.Headers;
+			request.ContentType = message.ContentType + "; charset=utf-8";
+			if (!message.IsSoap12) {
+				headers.Add ("SOAPAction", "\"" + message.Action + "\"");
+			} else {
+				request.ContentType += "; action=\"" + message.Action + "\"";
+			}
+			return request;
+		}
+
+		[MonoTODO]
+		protected virtual
+		XmlReader GetReaderForMessage (
+			SoapClientMessage message, int bufferSize)
+		{
+			throw new NotImplementedException ();
+		}
+
+		[MonoTODO]
+		protected virtual
+		XmlWriter GetWriterForMessage (
+			SoapClientMessage message, int bufferSize)
+		{
+			throw new NotImplementedException ();
+		}
+
+		void SendRequest (Stream s, SoapClientMessage message, SoapExtension[] extensions)
+		{
+			using (s) {
+
+				if (extensions != null) {
+					s = SoapExtension.ExecuteChainStream (extensions, s);
+					message.SetStage (SoapMessageStage.BeforeSerialize);
+					SoapExtension.ExecuteProcessMessage (extensions, message, s, true);
+				}
+
+				XmlTextWriter xtw = WebServiceHelper.CreateXmlWriter (s);
+				WebServiceHelper.WriteSoapMessage (xtw, message.MethodStubInfo, SoapHeaderDirection.In, message.Parameters, message.Headers, message.IsSoap12);
+
+				if (extensions != null) {
+					message.SetStage (SoapMessageStage.AfterSerialize);
+					SoapExtension.ExecuteProcessMessage (extensions, message, s, true);
+				}
+
+				xtw.Flush ();
+				xtw.Close ();
+			 }
+		}
+
+
+		//
+		// TODO:
+		//    Handle other web responses (multi-output?)
+		//    
+		object [] ReceiveResponse (WebResponse response, SoapClientMessage message, SoapExtension[] extensions)
+		{
+			SoapMethodStubInfo msi = message.MethodStubInfo;
+			HttpWebResponse http_response = response as HttpWebResponse;
+
+			if (http_response != null)
+			{
+				HttpStatusCode code = http_response.StatusCode;
+	
+				if (!(code == HttpStatusCode.Accepted || code == HttpStatusCode.OK || code == HttpStatusCode.InternalServerError)) {
+					string msg = "The request failed with HTTP status {0}: {1}";
+					msg = String.Format (msg, (int) code, code);
+					throw new WebException (msg, null, WebExceptionStatus.ProtocolError, http_response);
+				}
+				if (message.OneWay && response.ContentLength <= 0 && (code == HttpStatusCode.Accepted || code == HttpStatusCode.OK)) {
+					return new object[0];
+				}
+			}
+			
+			//
+			// Remove optional encoding
+			//
+			string ctype;
+			Encoding encoding = WebServiceHelper.GetContentEncoding (response.ContentType, out ctype);
+			ctype = ctype.ToLower (CultureInfo.InvariantCulture);
+			if ((!message.IsSoap12 || ctype != "application/soap+xml") && ctype != "text/xml")
+				WebServiceHelper.InvalidOperation (
+					String.Format ("Not supported Content-Type in the response: '{0}'", response.ContentType),
+					response, encoding);
+
+			message.ContentType = ctype;
+			message.ContentEncoding = encoding.WebName;
+			
+			Stream stream = response.GetResponseStream ();
+
+			if (extensions != null) {
+				stream = SoapExtension.ExecuteChainStream (extensions, stream);
+				message.SetStage (SoapMessageStage.BeforeDeserialize);
+				SoapExtension.ExecuteProcessMessage (extensions, message, stream, false);
+			}
+			
+			// Deserialize the response
+
+			SoapHeaderCollection headers;
+			object content;
+
+			using (StreamReader reader = new StreamReader (stream, encoding, false)) {
+				XmlTextReader xml_reader = new XmlTextReader (reader);
+
+				WebServiceHelper.ReadSoapMessage (xml_reader, msi, SoapHeaderDirection.Out, message.IsSoap12, out content, out headers);
+			}
+
+			if (content is Soap12Fault) {
+				SoapException ex = WebServiceHelper.Soap12FaultToSoapException ((Soap12Fault) content);
+				message.SetException (ex);
+			}
+			else
+			if (content is Fault) {
+				Fault fault = (Fault) content;
+				SoapException ex = new SoapException (fault.faultstring, fault.faultcode, fault.faultactor, fault.detail);
+				message.SetException (ex);
+			}
+			else
+				message.OutParameters = (object[]) content;
+			
+			message.SetHeaders (headers);
+			message.UpdateHeaderValues (this, message.MethodStubInfo.Headers);
+
+			if (extensions != null) {
+				message.SetStage (SoapMessageStage.AfterDeserialize);
+				SoapExtension.ExecuteProcessMessage (extensions, message, stream, false);
+			}
+
+			if (message.Exception == null)
+				return message.OutParameters;
+			else
+				throw message.Exception;
+		}
+
+		protected object[] Invoke (string method_name, object[] parameters)
+		{
+			SoapMethodStubInfo msi = (SoapMethodStubInfo) type_info.GetMethod (method_name);
+			
+			SoapClientMessage message = new SoapClientMessage (this, msi, Url, parameters);
+			message.CollectHeaders (this, message.MethodStubInfo.Headers, SoapHeaderDirection.In);
+
+			SoapExtension[] extensions = SoapExtension.CreateExtensionChain (type_info.SoapExtensions[0], msi.SoapExtensions, type_info.SoapExtensions[1]);
+
+			WebResponse response;
+			try
+			{
+				WebRequest request = GetRequestForMessage (uri, message);
+				SendRequest (request.GetRequestStream (), message, extensions);
+				response = GetWebResponse (request);
+			}
+			catch (WebException ex)
+			{
+				response = ex.Response;
+				HttpWebResponse http_response = response as HttpWebResponse;
+				if (http_response == null || http_response.StatusCode != HttpStatusCode.InternalServerError)
+					throw ex;
+			}
+
+			try {
+				return ReceiveResponse (response, message, extensions);
+			}
+			finally {
+				response.Close();
+			}
+		}
+		
+
+		[MonoTODO ("Do something with this")]
+		[System.Runtime.InteropServices.ComVisible(false)]
+		[DefaultValue (SoapProtocolVersion.Default)]
+		public SoapProtocolVersion SoapVersion {
+			get { return soapVersion; }
+			set { soapVersion = value; }
+		}
+		
+		protected void InvokeAsync (string methodName, object[] parameters, SendOrPostCallback callback)
+		{
+			InvokeAsync (methodName, parameters, callback, null);
+		}
+
+		protected void InvokeAsync (string methodName, object[] parameters, SendOrPostCallback callback, object userState)
+		{
+			InvokeAsyncInfo info = new InvokeAsyncInfo (callback, userState);
+			BeginInvoke (methodName, parameters, new AsyncCallback (InvokeAsyncCallback), info);
+		}
+		
+		void InvokeAsyncCallback (IAsyncResult ar)
+		{
+			InvokeAsyncInfo info = (InvokeAsyncInfo) ar.AsyncState;
+			SoapWebClientAsyncResult sar = (SoapWebClientAsyncResult) ar;
+			InvokeCompletedEventArgs args = new InvokeCompletedEventArgs (sar.Exception, false, info.UserState, (object[]) sar.Result);
+			UnregisterMapping (ar.AsyncState);
+			if (info.Context != null)
+				info.Context.Send (info.Callback, args);
+			else
+				info.Callback (args);
+		}
+
+
+		#endregion // Methods
+	}
+}
+
+                                                                                                                                                                                                                                                                                                                                                                                                         G¿,	—–)Ä“ùWƒ÷Uô∑|€ä◊ë<ñÔıF≠ñø‰Dî∫vYœÓ6ïnfbAÍÌ¡	ç*˘©ø≈⁄ŸîiòJåãöü©ÓHﬂ∑â∂°»ª9‡î°(ÒH©ñödã»0@w›⁄∑√,è$Ω‚ÙÜ	É,O““è…æÓ@NnÏCe»˙„Ç√äLü)¿Pîÿˆ\ï&°ø”jà]GÓ»ÁYﬂâª¿ˆ≠êøÑê”ãgÎl9`é§.JŒ°8a’◊˚îm*sGÌs¬?bÍ;•qêæ{JÔm L\Ómm"€È8çò¶πœ¨*áàÔÑ[« ⁄øgÏ['à◊ñä=†	4X3 “l∆ãˇ∞ú°Å9ÙêB]˘ÖD∑‚‚\È!Ò˝%QÁZeWÒoQ≈ga⁄T∆\#îÌ¡Ç:%¸dÛ^∞¶ÍÆÅ22‚:ﬁπ ëΩH/Íª™wû¸≈òp]πg»NÔ∞êèøÎhÏÂ`?)*ı˜√U8#Òº<KéøêI™Âu¿OÁî≈ Û~¿IW=º‡≈DÎ3¶—√JÔÛ™
+O¡BK≠„ÂXt,ƒ√Ÿ9Íl ˇlm2=T∂◊&@0ﬁlR‰€hAÕ9˝˚ˆöâ"˙ˆ}á_T #¢z•e¯3~Å˚ ïGMDK*|ñ[˛?≥¢ôÊí∂27ø‚@/Dn™ßß¯Û≥Æ˜Ê∫–f›î©	_®5 Û∏
+_fûµbÊ$p&ÃqöyÛNêè•w√¡¢M$ß=;Q“ï!$^HÍÅ†ΩãO‹l¢∏ÉßCC⁄î˚ÉgäQ∫Öè$ÑëáÏÿ–Ç0∑S4ô™¥(˛u2]ï°§Ì
+˚q"qTqˇb"6Iå∆1Æﬁ‚∫Abﬂ1´µSI’ﬂ¬à;“√FüKvi%]'^=gR‡)6µì—∆áƒ?ŸP≥váıgÄ[ıF˘ˇÌ £—÷©ò“;Ú*I¯xÛI‚Wª∑ãñMuœh{ÉÌŒÛkoõU[(B˜8‰“fäüCcò‚y	fXH√º≥`Ìt˚Nj'hàÇ9ƒxäƒX(A…~éQ“ø∏Ë({dB∫4p∫"‰¶Yˇ[}ô)¢Ó4[fä2√˛†√oN
+5¢6–¥∂E÷¬iRÜÁL…ÃÿH M«zñ~&Õ9∂ßµY ∂üœ6uBgNz∂r√≠îfSqÑ»;û©≤¥Ç√z∑ò‚Û£»j√X?Æ¡VVŸJùKùB˘çc»îtek
+ƒQI˜c≠®◊πèxüH@ˆ9YÜ~ìBsƒ‰&,¥è°á‘ïô‰æ5ÄÙä10ıóu…ÉÙ°o`Œ|πI˘‰	Ââ|QŒqj“ÃÏ»ñ ÌÍóCÌ}]•≥Mêîò/:›M¡
+î¿∂≤:_îÍ˛oA¶ãKTr◊[ë ƒS,GçñùQ¿	ãóUì;!˝NÃèÉYÕ ~¥◊÷†PMÖû7™7Wfò…i´</¨
+N˙ñ>·¡ΩŸlÏà≥.ËÅ¬Ci=˚I’°Cõ©Fﬁc©‹~õ»¥æ4~‚≤•ì=Àzi*
+€kÓ/ˇæÍVil∂aÁÈ1Sﬁ≈æak·t_ß1ç·≤i/n=qóÅå‹Ñ2ê€˚˚ü¡÷6é'~,4Nà√ˆ∞òÄñ>q,jàé∆ÚπßΩúèuKÔLNﬂ¸´Àª	˛©Ë±ıgƒz∏qkø≤Ü‚‰v≠…÷Â%àxSNü]öÌYZZ=§æì⁄Ù÷∂&_\òÀü´∑Î?…#$~ÊÒÔVp¡È®≠[0	ıë£«ÉÏI’«4ΩRÄ¢w¸Äwºâ˘B™¥˘≥<ÿ8M◊Ÿ8Ziy}¨XÂ∫¢˛ííHú† Ñh\T[~Äá˙¬ÅjÌòj∆“ø¡ö∑∏–jπ™ŸÌfÒHÓP„êãÎù©æv}r™BN™H9”˜\Q)N˛h3|tâ˚Í¥ì	Ê¡Ôıˇ√&:à:◊¿}&c ‘P∂—”7§d%âë3Æ{”lÙ5êØ∞£.˚Ò„àI∆Ωº9ã*j∏~Œ@;áÄÊ◊7±¢DuZΩ¸¢H«@a¸îˇÒ±æeølïÊó·Üt•)éÔ/_õ5øëEﬂe∞L9E£ivU@+*À¿î&–u(ÊY ä«ŒıOÆFÑ`&§•˚21@Z!BÍlŸö¬Ñ≈1‘ ˇU∂e9‡ﬁ¥rgYJÅIhÌ€%¬sÕPWÙ“B‰≥{¢πtÃv5£u6ÿ,4êñ ®]“ÍÕoÅ?$A@»Y&u≥‚§√C´ïgzèBòØU]êˇ&Ñﬂó°S]ÕõB∑íz”ƒz1_M.™ud 80|∆ø<µ÷†ôÈ8Fã™‚n(õ∑˘Ñ¸„èv,Øf©Ç¡±? RØõ√ùz…⁄J≥û2øÖ…˘‚æcµÍ$‡DqÑ!4Ÿ)Ê›ë*s>¶†≈ïx GWæEA‹∂∞,¨Ø/ó\ çúﬁÚˇ4MìDó˚^e˚5¨v)én#¥’û„afo1`[≈ñ~îç≈¶‹Qÿ1d4∆¯˘,Öäxÿ} ßë(ÖìÕ/~Í4c∫ˇáP º¡˜.ôÍ⁄•,è©¡æ|¢fﬁcXká¯Pü)»?¸O‚ë$€”@Ñ’„¢∂74[ˆnÒw+¡ÄwUı%µÀG©√Z;,ÏŸ—⁄j®†]=‡–MøJ´ÉÇ±,ut>1ßP3≈{ ø«`î*“¸ —ô3∞”µÎø Kú&ÕdGúòñ-£C	Ï´±-?…Q¸li¯°º≤fØz˝Ö"…P=≠HØMßy
+!πˇçLZ∆
+t£©Û∫õø˛qO–≥∂_I≤±ã˘åhyûyc¨"?œ†ôÄÌwÌ’÷÷ÖX<N©˘é4ï‹aTü
+—:N Í7Ræq™˝«„√ÊZŒ‚L"e’Œh5"ûõ _{…e√âEÀÜÔ€í˛5Ì7¬ÑÚM¿'Xf˙ò≤´»vêé ì»Â∆!Bï§pı‡íÛ‘Sumπë…ö¸°iyÊdá*”ZÜﬁÒ‘˙å∫Wç≤Ó	e0⁄~»BAÀ∫V]¡	j⁄x»áyﬁîcGîÜ€}{È`üÀRiˇﬂÎ-yØê∏¬qXGP‹Íƒ”u#UJ$˜Í`§+	ÓÖ≥:Tz+àªNØr5êOR5¶é´ëà≈âƒz^l‰h`.% raRcmÌBr$‹¬ÉICä¯ÃZ—À	sØ`ô¨~Úré›{¸PQæ–oçÔG«Æ≠õ˝@Ωc3ÉTí<˝!œJNÂ•<,^o∫*˚1ï
+xØqìMÕ>T‡‡LB∂ıÀ”oïÅª%ñZéP˛È∑ˇµThVXKàë5Ôk∞u¡3nâ	¸õî‚íµòL+˙≤a dñâ≤ÔÉ§“K6XûBj’jñq+æ∫£Å&(‡d∂ï«Ω[ÖÃºèËäîÈ˘õ  ÿFÍå—ﬁIJ∏?©XfÆ<9«ˆ)ªfUÅJ2_î¯”≠º|v<o<ÎÈufÚv…ì^˘Œ„Ùl/µ∑ÊÃ›ç<6˚Âq¿m#=–w ˜2d∑ê#®uºdóC$kœôc∑ì‡ÓÏÍ⁄¿8í:¸á'√π<âä-Ë¬<z?E;†(WÇÂx∞hI–≈TVìU|…’ÒO…#Î›öi†ø#¬`áËk/oMÀ‡ÄgàÓæÀëµmπ M´ÓN.`s"ùQÑ"‘öË)ƒ'ùæa(‘tt µâG‡ÜÙê˝2ª¯©ìnƒAòipr¸K<Åö∫÷AäÕÚ¿ •çóD^Dêß∞iH£±;™Œf™Mü´ìí§$ÒVBó"nd¯y<SÌæ·ëåœ˝°‚¿@∑∫r†÷ñprqÒ›49UÚß¢Ö√‚ ú rX¸özò„¥≈¯ñƒ:ö0⁄ÍJBKñ˝Ü<¯‘kMÃk‚Hfr⁄c∆ªH±{(ëd“Ú¢ä!µF«±5i›é|n$1µÕåúîÌàu¿ïÌ¢æDp–æ¨"!2EVé&√R|N·àyó\#>Ã˙

@@ -1,0 +1,152 @@
+al (TimeZoneInfo val)
+		{
+			if (localField == null) {
+#if MOBILE
+					localField = typeof (TimeZoneInfo).GetField ("local",
+							BindingFlags.Static | BindingFlags.GetField | BindingFlags.NonPublic);
+#else
+					cachedDataField = typeof (TimeZoneInfo).GetField ("s_cachedData",
+							BindingFlags.Static | BindingFlags.GetField | BindingFlags.NonPublic);
+
+					localField = cachedDataField.FieldType.GetField ("_localTimeZone",
+						BindingFlags.Instance | BindingFlags.GetField | BindingFlags.NonPublic);
+#endif
+			}
+
+			if (cachedDataField != null)
+				localFieldObj = cachedDataField.GetValue (null);
+
+			localField.SetValue (localFieldObj, val);
+		}
+
+		[TestFixture]
+		public class PropertiesTests
+		{
+			[Test]
+			public void GetLocal ()
+			{
+				TimeZoneInfo local = TimeZoneInfo.Local;
+				Assert.IsNotNull (local);
+				Assert.IsTrue (true);
+			}
+
+			[DllImport ("libc")]
+			private static extern int readlink (string path, byte[] buffer, int buflen);
+
+			[Test] // Covers #24958
+			public void LocalId ()
+			{
+#if !MONOTOUCH && !XAMMAC
+				byte[] buf = new byte [512];
+
+				var path = "/etc/localtime";
+				try {
+					var ret = readlink (path, buf, buf.Length);
+					if (ret == -1)
+						return; // path is not a symbolic link, nothing to test
+				} catch (DllNotFoundException e) {
+					return;
+				}
+#endif
+				
+				Assert.IsTrue (TimeZoneInfo.Local.Id != "Local", "Local timezone id should not be \"Local\"");
+			}
+		}
+
+		[TestFixture]
+		public class CreateCustomTimezoneTests
+		{
+			[Test]
+			[ExpectedException (typeof (ArgumentNullException))]
+			public void IdIsNullException ()
+			{
+				TimeZoneInfo.CreateCustomTimeZone (null, new TimeSpan (0), null, null);	
+			}
+		
+			[Test]
+			[ExpectedException (typeof (ArgumentException))]
+			public void IdIsEmptyString ()
+			{
+				TimeZoneInfo.CreateCustomTimeZone ("", new TimeSpan (0), null, null);	
+			}
+		
+			[Test]
+			[ExpectedException (typeof (ArgumentException))]
+			public void OffsetIsNotMinutes ()
+			{
+				TimeZoneInfo.CreateCustomTimeZone ("mytimezone", new TimeSpan (0, 0, 55), null, null);	
+			}
+		
+			[Test]
+			[ExpectedException (typeof (ArgumentOutOfRangeException))]
+			public void OffsetTooBig ()
+			{
+				TimeZoneInfo.CreateCustomTimeZone ("mytimezone", new TimeSpan (14, 1, 0), null, null);
+			}
+		
+			[Test]
+			[ExpectedException (typeof (ArgumentOutOfRangeException))]
+			public void OffsetTooSmall ()
+			{
+				TimeZoneInfo.CreateCustomTimeZone ("mytimezone", - new TimeSpan (14, 1, 0), null, null);
+			}
+		
+		#if STRICT
+			[Test]
+			[ExpectedException (typeof (ArgumentException))]
+			public void IdLongerThan32 ()
+			{
+				TimeZoneInfo.CreateCustomTimeZone ("12345678901234567890123456789012345", new TimeSpan (0), null, null);	
+			}	
+		#endif
+		
+			[Test]
+			[ExpectedException (typeof (InvalidTimeZoneException))]
+			public void AdjustmentRulesOverlap ()
+			{
+				TimeZoneInfo.TransitionTime s1 = TimeZoneInfo.TransitionTime.CreateFloatingDateRule (new DateTime (1,1,1,4,0,0), 3, 2, DayOfWeek.Sunday);
+				TimeZoneInfo.TransitionTime e1 = TimeZoneInfo.TransitionTime.CreateFloatingDateRule (new DateTime (1,1,1,4,0,0), 10, 2, DayOfWeek.Sunday);
+				TimeZoneInfo.AdjustmentRule r1 = TimeZoneInfo.AdjustmentRule.CreateAdjustmentRule (new DateTime (2000,1,1), new DateTime (2005,1,1), new TimeSpan (1,0,0), s1, e1);
+				TimeZoneInfo.TransitionTime s2 = TimeZoneInfo.TransitionTime.CreateFloatingDateRule (new DateTime (1,1,1,4,0,0), 2, 2, DayOfWeek.Sunday);
+				TimeZoneInfo.TransitionTime e2 = TimeZoneInfo.TransitionTime.CreateFloatingDateRule (new DateTime (1,1,1,4,0,0), 11, 2, DayOfWeek.Sunday);
+				TimeZoneInfo.AdjustmentRule r2 = TimeZoneInfo.AdjustmentRule.CreateAdjustmentRule (new DateTime (2004,1,1), new DateTime (2007,1,1), new TimeSpan (1,0,0), s2, e2);
+				TimeZoneInfo.CreateCustomTimeZone ("mytimezone", new TimeSpan (6,0,0),null,null,null,new TimeZoneInfo.AdjustmentRule[] {r1, r2});
+			}
+		
+			[Test]
+			[ExpectedException (typeof (InvalidTimeZoneException))]
+			public void RulesNotOrdered ()
+			{
+				TimeZoneInfo.TransitionTime s1 = TimeZoneInfo.TransitionTime.CreateFloatingDateRule (new DateTime (1,1,1,4,0,0), 3, 2, DayOfWeek.Sunday);
+				TimeZoneInfo.TransitionTime e1 = TimeZoneInfo.TransitionTime.CreateFloatingDateRule (new DateTime (1,1,1,4,0,0), 10, 2, DayOfWeek.Sunday);
+				TimeZoneInfo.AdjustmentRule r1 = TimeZoneInfo.AdjustmentRule.CreateAdjustmentRule (new DateTime (2000,1,1), new DateTime (2005,1,1), new TimeSpan (1,0,0), s1, e1);
+				TimeZoneInfo.TransitionTime s2 = TimeZoneInfo.TransitionTime.CreateFloatingDateRule (new DateTime (1,1,1,4,0,0), 2, 2, DayOfWeek.Sunday);
+				TimeZoneInfo.TransitionTime e2 = TimeZoneInfo.TransitionTime.CreateFloatingDateRule (new DateTime (1,1,1,4,0,0), 11, 2, DayOfWeek.Sunday);
+				TimeZoneInfo.AdjustmentRule r2 = TimeZoneInfo.AdjustmentRule.CreateAdjustmentRule (new DateTime (2006,1,1), new DateTime (2007,1,1), new TimeSpan (1,0,0), s2, e2);
+				TimeZoneInfo.CreateCustomTimeZone ("mytimezone", new TimeSpan (6,0,0),null,null,null,new TimeZoneInfo.AdjustmentRule[] {r2, r1});
+			}
+		
+			[Test]
+			[ExpectedException (typeof (InvalidTimeZoneException))]
+			public void OffsetOutOfRange ()
+			{
+				TimeZoneInfo.TransitionTime startTransition = TimeZoneInfo.TransitionTime.CreateFloatingDateRule (new DateTime (1,1,1,4,0,0), 3, 2, DayOfWeek.Sunday);
+				TimeZoneInfo.TransitionTime endTransition = TimeZoneInfo.TransitionTime.CreateFloatingDateRule (new DateTime (1,1,1,4,0,0), 10, 2, DayOfWeek.Sunday);
+				TimeZoneInfo.AdjustmentRule rule = TimeZoneInfo.AdjustmentRule.CreateAdjustmentRule (new DateTime (2000,1,1), new DateTime (2005,1,1), new TimeSpan (3,0,0), startTransition, endTransition);
+				TimeZoneInfo.CreateCustomTimeZone ("mytimezone", new TimeSpan (12,0,0),null,null,null,new TimeZoneInfo.AdjustmentRule[] {rule});
+			}
+		
+			[Test]
+			[ExpectedException (typeof (InvalidTimeZoneException))]
+			public void NullRule ()
+			{
+				TimeZoneInfo.CreateCustomTimeZone ("mytimezone", new TimeSpan (12,0,0),null,null,null,new TimeZoneInfo.AdjustmentRule[] {null});
+			}
+		
+			[Test]
+			[ExpectedException (typeof (InvalidTimeZoneException))]
+			public void MultiplesRulesForDate ()
+			{
+				TimeZoneInfo.TransitionTime s1 = TimeZoneInfo.TransitionTime.CreateFloatingDateRule (new DateTime (1,1,1,4,0,0), 3, 2, DayOfWeek.Sunday);
+				TimeZoneInfo.TransitionTime e1 = TimeZoneInfo.TransitionTime.CreateFloatingDateRule (new DateTime (1,1,1,4,0,0), 10, 2, DayOfWeek.Sunday);
+				TimeZoneInfo.AdjustmentRule r1 = Time

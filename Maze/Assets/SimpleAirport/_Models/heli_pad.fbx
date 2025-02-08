@@ -1,0 +1,557 @@
+using System.Collections.Specialized;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Globalization;
+using System.Text;
+using System.Web.Compilation;
+using System.Web.Resources;
+using System.Web.UI;
+using System.Web.UI.WebControls;
+using System.Web.Routing;
+
+namespace System.Web.DynamicData {
+    /// <summary>
+    /// Base class for the filter user control
+    /// </summary>
+    public class FilterUserControlBase : UserControl, IControlParameterTarget {
+
+        private MetaColumn _column;
+        private FilterDelegateBase _filterDelegate;
+        private DataKey _selectedDataKey;
+
+        private bool? _isPostBackMock;
+        private RouteValueDictionary _routeValues;
+
+        /// <summary>
+        /// Name of the table that the filter applies to
+        /// </summary>
+        [Category("Data")]
+        [DefaultValue((string)null)]
+        public string TableName { get; set; }
+        
+        /// <summary>
+        /// Name of the column that the filter applies to
+        /// </summary>
+        [Category("Data")]
+        [DefaultValue((string)null)]
+        public string DataField { get; set; }
+
+        /// <summary>
+        /// The type of the context that the table/column is part of
+        /// </summary>
+        [Category("Data")]
+        [DefaultValue((string)null)]
+        public string ContextTypeName { get; set; }
+
+        /// <summary>
+        /// The value selcted in the drop down
+        /// </summary>
+        public virtual string SelectedValue {
+            get { return null; }
+        }
+
+        /// <summary>
+        /// The DataKey of the selected item
+        /// </summary>
+        public virtual DataKey SelectedDataKey {
+            get {
+                if (_selectedDataKey == null) {
+                    // Build a DataKey for the primary key of the selected item
+
+                    var fkColumn = Column as MetaForeignKeyColumn;
+                    if (fkColumn == null) {
+                        throw new InvalidOperationException(String.Format(CultureInfo.CurrentCulture,
+                            DynamicDataResources.FilterUserControlBase_SelectedDataKeyNotSupportedForThisField,
+                            ID,
+                            DataField));
+                    }
+
+                    if (String.IsNullOrEmpty(SelectedValue))
+                        return null;
+
+                    MetaTable parentTable = fkColumn.ParentTable;
+                    // 
+                    string[] keyNames = parentTable.PrimaryKeyNames;
+                    string[] keyStrings = Misc.ParseCommaSeparatedString(SelectedValue);
+                    Debug.Assert(keyStrings.Length == keyNames.Length);
+
+                    var keyTable = new OrderedDictionary(keyNames.Length);
+                    for (int i = 0; i < keyNames.Length; i++) {
+                        keyTable.Add(keyNames[i], keyStrings[i]);
+                    }
+                    _selectedDataKey = new DataKey(keyTable, keyNames);
+
+                }
+                return _selectedDataKey;
+            }
+        }
+
+        private FilterDelegateBase FilterDelegate {
+            get {
+                EnsureInit();
+                return _filterDelegate;
+            }
+        }
+
+        /// <summary>
+        /// The initial value of the filter when it gets populated (i.e. the current value)
+        /// </summary>
+        public string InitialValue {
+            get {
+                return FilterDelegate.InitialValue;
+            }
+        }
+
+        /// <summary>
+        /// Populate a ListControl with all the items in the foreign table (or true/false for boolean fields)
+        /// </summary>
+        /// <param name="listControl"></param>
+        public void PopulateListControl(ListControl listControl) {
+            FilterDelegate.PopulateListControl(listControl);
+        }
+
+        /// <summary>
+        /// The column this filter applies to
+        /// </summary>
+        public MetaColumn Column {
+            get {
+                EnsureInit();
+                return _column;
+            }
+        }
+
+        private void EnsureInit() {
+            if (_column != null)
+                return;
+
+            // make sure we have a DataField
+            if (String.IsNullOrEmpty(DataField)) {
+                throw new InvalidOperationException(String.Format(CultureInfo.CurrentCulture,
+                    DynamicDataResources.FilterUserControlBase_MissingDataField,
+                    ID));
+            }
+
+            MetaTable table = null;
+            
+            if (!String.IsNullOrEmpty(ContextTypeName) || !String.IsNullOrEmpty(TableName)) {
+                // make sure both ContextTypeName and TableName are specified together
+                if (String.IsNullOrEmpty(ContextTypeName)) {
+                    throw new InvalidOperationException(String.Format(CultureInfo.CurrentCulture,
+                        DynamicDataResources.FilterUserControlBase_MissingContextTypeName,
+                        ID));
+                }
+                if (String.IsNullOrEmpty(TableName)) {
+                    throw new InvalidOperationException(String.Format(CultureInfo.CurrentCulture,
+                        DynamicDataResources.FilterUserControlBase_MissingTableName,
+                        ID));
+                }
+
+                Type contextType = GetContextType(ContextTypeName);
+                MetaModel model = null;
+                try {
+                    model = MetaModel.GetModel(contextType);
+                } catch (InvalidOperationException e) {
+                    throw new InvalidOperationException(String.Format(CultureInfo.CurrentCulture,
+                        DynamicDataResources.FilterUserControlBase_UnknownContextType,
+                        ID,
+                        contextType.FullName), e);
+                }
+
+                string tableName = TableName;
+                try {
+                    table = model.GetTable(tableName);
+                } catch (ArgumentException e) {
+                    throw new InvalidOperationException(String.Format(CultureInfo.CurrentCulture,
+                        DynamicDataResources.FilterUserControlBase_InvalidTableName,
+                        ID,
+                        tableName), e);
+                }
+            } else {
+                // get context information from request context
+                table = DynamicDataRouteHandler.GetRequestMetaTable(HttpContext.Current);
+                if (table == null) {
+                    throw new InvalidOperationException(String.Format(CultureInfo.CurrentCulture,
+                        DynamicDataResources.FilterUserControlBase_CantInferInformationFromRequestUrl,
+                        ID));
+                }
+            }
+
+            try {
+                _column = table.GetColumn(DataField);
+            } catch (InvalidOperationException e) {
+                throw new InvalidOperationException(String.Format(CultureInfo.CurrentCulture,
+                    DynamicDataResources.FilterUserControlBase_InvalidDataField,
+                    ID,
+                    DataField), e);
+            }
+
+            // create appropriate filter implementation based on column type
+            if (_column is MetaForeignKeyColumn) {
+                _filterDelegate = new ForeignKeyFilterDelegate(this);
+            } else if (_column.ColumnType == typeof(bool) && !_column.IsCustomProperty) {
+                _filterDelegate = new BooleanPropertyFilterDelegate(this);
+            } else {
+                _filterDelegate = new DefaultPropertyFilterDelegate(this);
+            }
+        }
+
+        private Type GetContextType(string contextTypeName) {
+            Type contextType = null;
+            if (!String.IsNullOrEmpty(contextTypeName)) {
+                try {
+                    contextType = BuildManager.GetType(contextTypeName, /*throwOnError*/ true, /*ignoreCase*/ true);
+                } catch (Exception e) {
+                    throw new InvalidOperationException(String.Format(
+                        CultureInfo.CurrentCulture,
+                        DynamicDataResources.FilterUserControlBase_InvalidContextTypeName,
+                        ID, contextTypeName), e);
+                }
+            }
+            return contextType;
+        }
+
+        internal bool IsPostBackInternal {
+            get {
+                return _isPostBackMock ?? base.IsPostBack;
+            }
+            set {
+                _isPostBackMock = value;
+            }
+        }
+
+        internal RouteValueDictionary RouteValues {
+            get {
+                if (_routeValues == null) {
+                    RequestContext requestContext = DynamicDataRouteHandler.GetRequestContext(Context);
+                    _routeValues = requestContext.RouteData.Values;
+                }
+
+                return _routeValues;
+            }
+            set {
+                _routeValues = value;
+            }
+        }
+
+        #region IDynamicControlParameterProvider Members
+
+        MetaTable IControlParameterTarget.Table {
+            get {
+                EnsureInit();
+                ForeignKeyFilterDelegate foreignKeyDelegate = FilterDelegate as ForeignKeyFilterDelegate;
+                if (foreignKeyDelegate != null) {
+                    return foreignKeyDelegate.FilterTable;
+                } else {
+                    return null;
+                }
+            }
+        }
+
+        MetaColumn IControlParameterTarget.FilteredColumn {
+            get {
+                EnsureInit();
+                return _column;
+            }
+        }
+
+        string IControlParameterTarget.GetPropertyNameExpression(string columnName) {
+            return FilterDelegate.GetPropertyNameExpression(columnName);
+        }
+
+        #endregion
+
+        private abstract class FilterDelegateBase {
+            private string _initialValue;
+            private bool _initialValueObtained = false;
+
+            public FilterDelegateBase(FilterUserControlBase filterControl) {
+                FilterUserControl = filterControl;
+            }
+
+            public abstract void PopulateListControl(ListControl listControl);
+
+            public abstract string GetPropertyNameExpression(string columnName);
+
+            protected FilterUserControlBase FilterUserControl {
+                get;
+                private set;
+            }
+
+            public string InitialValue {
+                get {
+                    // Ignore the query string param on postbacks
+                    if (!_initialValueObtained && !FilterUserControl.IsPostBackInternal) {
+                        _initialValue = GetInitialValueFromQueryString();
+                        _initialValueObtained = true;
+                    }
+                    return _initialValue;
+                }
+            }
+
+            protected abstract string GetInitialValueFromQueryString();
+        }
+
+        private class DefaultPropertyFilterDelegate : FilterDelegateBase {
+            public DefaultPropertyFilterDelegate(FilterUserControlBase filterControl)
+                : base(filterControl) {
+            }
+
+            public override void PopulateListControl(ListControl listControl) {
+                throw new InvalidOperationException(String.Format(CultureInfo.CurrentCulture,
+                    DynamicDataResources.FilterUserControlBase_UnsupportedDataField,
+                    FilterUserControl.ID,
+                    FilterUserControl.DataField));
+            }
+
+            public override string GetPropertyNameExpression(string columnName) {
+                return "SelectedValue";
+            }
+
+            protected override string GetInitialValueFromQueryString() {
+                object value;
+                if (FilterUserControl.RouteValues.TryGetValue(FilterUserControl.Column.Name, out value)) {
+                    return value as string;
+                }
+
+                return null;
+            }
+        }
+
+        private class BooleanPropertyFilterDelegate : DefaultPropertyFilterDelegate {
+            public BooleanPropertyFilterDelegate(FilterUserControlBase filterControl)
+                : base(filterControl) {
+            }
+
+            public override void PopulateListControl(ListControl listControl) {
+                listControl.Items.Add(new ListItem(DynamicDataResources.FilterUserControlBase_BooleanFilter_TrueString, bool.TrueString));
+                listControl.Items.Add(new ListItem(DynamicDataResources.FilterUserControlBase_BooleanFilter_FalseString, bool.FalseString));
+            }
+        }
+
+        private class ForeignKeyFilterDelegate : FilterDelegateBase {
+
+            public ForeignKeyFilterDelegate(FilterUserControlBase filterControl)
+                : base(filterControl) {
+                FilterTable = ((MetaForeignKeyColumn)filterControl.Column).ParentTable;
+            }
+
+            internal MetaTable FilterTable { get; private set; }
+
+            public override void PopulateListControl(ListControl listControl) {
+                Misc.FillListItemCollection(FilterTable, listControl.Items);
+            }
+
+            public override string GetPropertyNameExpression(string columnName) {
+                return String.Format(CultureInfo.InvariantCulture, "SelectedDataKey['{0}']", columnName);
+            }
+
+            protected override string GetInitialValueFromQueryString() {
+                var fkColumn = (MetaForeignKeyColumn)FilterUserControl.Column;
+
+                var builder = new StringBuilder();
+
+                for (int i = 0; i < fkColumn.ForeignKeyNames.Count; i++) {
+                    // The query string parameter looks like CategoryID=5
+                    string queryStringParamName = fkColumn.ForeignKeyNames[i];
+
+                    object value;
+                    // If any of the fk components are missing, we don't have a value for the filter
+                    if (!FilterUserControl.RouteValues.TryGetValue(queryStringParamName, out value)) {
+                        return String.Empty;
+                    }
+
+                    string pkValue = (string)value;
+
+                    // For the ListControl value, we use a comma separated list of primary keys, instead of using
+                    // named keys.  This is simpler since the ListControl value must be a single string.
+
+                    if (i > 0) {
+                        builder.Append(",");
+                    }
+
+                    builder.Append(pkValue);
+                }
+
+                return builder.ToString();
+            }
+        }
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        i∫∏
+runi†™
+runiíd
+runiäß
+runiKû
+runi)
+runi)Â
+runi)∆
+runi
+runi
+runi˘√
+runi˘¿
+runi†
+runiü
+runhì.
+runhë—
+runhäM
+runhÄ
+runh¢
+runh6?
+runh4d
+runh3
+runh23
+runh2/
+runo	á§
+runo	"p
+runo	"W
+runo	"8
+runo	"
+runo|†
+runo.»
+runo.ï
+runoç6
+runoƒ‰
+runnÅ
+runn[ñ
+runn'Ó
+runn'Ë
+runn'Â
+runn—
+runnº
+runn¸O
+runn¥©
+runn§°
+runn__
+runn_-
+runn@I
+runnN
+runn6
+runn4
+runn˙⁄
+runnÊß
+runnÊ•
+runn‡ú
+runn≠}
+runnÎÍ
+runn{
+runn{
+runn~t
+runn˛z
+runn(g
+runn—î
+runn—ì
+runn°‹
+runn°º
+runn@4
+runn#
+runnÓ%
+runnÓ$
+runn‚€
+runnÀM
+runn }
+runn®˜
+runn†
+runnﬁ
+runn›4
+runnº-
+runn¥Ä
+runn¥V
+runn¥U
+runn¥,
+runn¥+
+runnà
+runnÇ
+runnc
+runn\
+runn
+runn
+runn˝
+runnˆ
+runn˘Ù
+runn≠°
+runn≠h
+runn<Type Name="MessageBase" FullName="Mono.Security.Protocol.Ntlm.MessageBase">
+  <TypeSignature Language="C#" Value="public abstract class MessageBase" Maintainer="auto" />
+  <AssemblyInfo>
+    <AssemblyName>Mono.Security</AssemblyName>
+    <AssemblyPublicKey>[00 24 00 00 04 80 00 00 94 00 00 00 06 02 00 00 00 24 00 00 52 53 41 31 00 04 00 00 01 00 01 00 79 15 99 77 D2 D0 3A 8E 6B EA 7A 2E 74 E8 D1 AF CC 93 E8 85 19 74 95 2B B4 80 A1 2C 91 34 47 4D 04 06 24 47 C3 7E 0E 68 C0 80 53 6F CF 3C 3F BE 2F F9 C9 79 CE 99 84 75 E5 06 E8 CE 82 DD 5B 0F 35 0D C1 0E 93 BF 2E EE CF 87 4B 24 77 0C 50 81 DB EA 74 47 FD DA FA 27 7B 22 DE 47 D6 FF EA 44 96 74 A4 F9 FC CF 84 D1 50 69 08 93 80 28 4D BD D3 5F 46 CD FF 12 A1 BD 78 E4 EF 00 65 D0 16 DF]</AssemblyPublicKey>
+    <AssemblyVersion>1.0.5000.0</AssemblyVersion>
+    <AssemblyVersion>2.0.0.0</AssemblyVersion>
+  </AssemblyInfo>
+  <ThreadSafetyStatement>Gtk# is thread aware, but not thread safe; See the <link location="node:gtk-sharp/programming/threads">Gtk# Thread Programming</link> for details.</ThreadSafetyStatement>
+  <Base>
+    <BaseTypeName>System.Object</BaseTypeName>
+  </Base>
+  <Interfaces />
+  <Docs>
+    <summary>The NTLM challenge response is a series of three messages exchanged between a client and a server. This class implements the basic and common functionalities for the three messages type.</summary>
+    <remarks>To be added</remarks>
+  </Docs>
+  <Members>
+    <Member MemberName=".ctor">
+      <MemberSignature Language="C#" Value="protected MessageBase (int messageType);" />
+      <MemberType>Constructor</MemberType>
+      <ReturnValue />
+      <Parameters>
+        <Parameter Name="messageType" Type="System.Int32" />
+      </Parameters>
+      <Docs>
+        <param name="messageType">a <see cref="T:System.Int32" /> representing the message sequence number (1, 2 or 3).</param>
+        <summary>Initialize the message structure using the specified message number.</summary>
+        <remarks>To be added</remarks>
+      </Docs>
+      <AssemblyInfo>
+        <AssemblyVersion>1.0.5000.0</AssemblyVersion>
+        <AssemblyVersion>2.0.0.0</AssemblyVersion>
+      </AssemblyInfo>
+    </Member>
+    <Member MemberName="CheckHeader">
+      <MemberSignature Language="C#" Value="protected bool CheckHeader (byte[] message);" />
+      <MemberType>Method</MemberType>
+      <ReturnValue>
+        <ReturnType>System.Boolean</ReturnType>
+      </ReturnValue>
+      <Parameters>
+        <Parameter Name="message" Type="System.Byte[]" />
+      </Parameters>
+      <Docs>
+        <param name="message">an array of bytes containing the message to verify.</param>
+        <summary>Verify that the message header is valid for the message type.</summary>
+        <returns>True if the header is valid for the message type, false otherwise.</returns>
+        <remarks>To be added</remarks>
+      </Docs>
+      <AssemblyInfo>
+        <AssemblyVersion>1.0.5000.0</AssemblyVersion>
+        <AssemblyVersion>2.0.0.0</AssemblyVersion>
+      </AssemblyInfo>
+    </Member>
+    <Member MemberName="Decode">
+      <MemberSignature Language="C#" Value="protected virtual void Decode (byte[] message);" />
+      <MemberType>Method</MemberType>
+      <ReturnValue>
+        <ReturnType>System.Void</ReturnType>
+      </ReturnValue>
+      <Parameters>
+        <Parameter Name="message" Type="System.Byte[]" />
+      </Parameters>
+      <Docs>
+        <param name="message">an array of bytes containing the message to decode. </param>
+        <summary>Decode the specified binrary message.</summary>
+        <remarks>To be added</remarks>
+      </Docs>
+      <AssemblyInfo>
+        <AssemblyVersion>1.0.5000.0</AssemblyVersion>
+        <AssemblyVersion>2.0.0.0</AssemblyVersion>
+      </AssemblyInfo>
+    </Member>
+    <Member MemberName="Flags">
+      <MemberSignature Language="C#" Value="public Mono.Security.Protocol.Ntlm.NtlmFlags Flags { set; get; }" />
+      <MemberType>Property</MemberType>
+      <ReturnValue>
+        <ReturnType>Mono.Security.Protocol.Ntlm.NtlmFlags</ReturnType>
+      </ReturnValue>
+      <Parameters />
+      <Docs>
+        <summary>Set or get the flags used by the message.</summary>
+        <value>a <see cref="T:Mono.Security.Protocol.Ntlm.NtlmFlags" /></value>
+  

@@ -1,0 +1,125 @@
+e generated.
+				//      (2) doesn't require any downward walking, and no enter events are generated.
+
+				// as we walk up the tree, we generate a list of all controls which cause
+				// validation.  After firing the leave events, we invoke (in order starting from
+				// the most deeply nested) their Validating event.  If one sets CancelEventArgs.Cancel
+				// to true, we ignore the control the user wanted to set ActiveControl to, and use
+				// the Validating control instead.
+
+				bool fire_enter = true;
+				Control root = common_ancestor;
+
+				active_control = value;
+
+				// Generate the leave messages
+				while (walk != common_ancestor && walk != null) {
+					if (walk == value) {
+						root = value;
+						fire_enter = false;
+						break;
+					}
+					walk.FireLeave ();
+					/* clear our idea of the active control as we go back up */
+					if (walk is ContainerControl)
+						((ContainerControl)walk).active_control = null;
+
+					if (walk.CausesValidation)
+						validation_chain.Add (walk);
+
+					walk = walk.Parent;
+				}
+
+				// Validation can be postponed due to all the controls
+				// in the enter chain not causing validation. If we don't have any
+				// enter chain, it means that the selected control is a child and then
+				// we need to validate the controls anyway
+				bool postpone_validation;
+				Control topmost_under_root = null; // topmost under root, in the *enter* chain
+				if (value == root)
+					postpone_validation = false;
+				else {
+					postpone_validation = true;
+					walk = value;
+					while (walk != root && walk != null) {
+						if (walk.CausesValidation)
+							postpone_validation = false;
+
+						topmost_under_root = walk;
+						walk = walk.Parent;
+					}
+				}
+
+				Control failed_validation_control = PerformValidation (form == null ? this : form, postpone_validation, 
+						validation_chain, topmost_under_root);
+				if (failed_validation_control != null) {
+					active_control = value = failed_validation_control;
+					fire_enter = true;
+				}
+
+				if (fire_enter) {
+					walk = value;
+					while (walk != root && walk != null) {
+						chain.Add (walk);
+						walk = walk.Parent;
+					}
+
+					if (root != null && walk == root && !(root is ContainerControl))
+						chain.Add (walk);
+
+					for (int i = chain.Count - 1; i >= 0; i--) {
+						walk = (Control) chain [i];
+						walk.FireEnter ();
+					}
+				}
+
+				walk = this;
+				Control ctl = this;
+				while (walk != null) {
+					if (walk.Parent is ContainerControl) {
+						((ContainerControl) walk.Parent).active_control = ctl;
+						ctl = walk.Parent;
+					}
+					walk = walk.Parent;
+				}
+
+				if (this is Form)
+					CheckAcceptButton();
+
+				// Scroll control into view
+				ScrollControlIntoView(active_control);
+				
+				
+				walk = this;
+				ctl = this;
+				while (walk != null) {
+					if (walk.Parent is ContainerControl) {
+						ctl = walk.Parent;
+					}
+					walk = walk.Parent;
+				}
+				
+				// Let the control know it's selected
+				if (ctl.InternalContainsFocus)
+					SendControlFocus (active_control);
+			}
+		}
+
+		// Return the control where validation failed, and null otherwise
+		// @topmost_under_root is the control under the root in the enter chain, if any
+		//
+		// The process of validation happens as described:
+		//
+		// 	1. Iterate over the nodes in the enter chain (walk down), looking for any node
+		// 	causing validation. If we can't find any, don't validate the current validation chain, but postpone it,
+		// 	saving it in the top_container.pending_validation_chain field, since we need to keep track of it later.
+		// 	If we have a previous pending_validation_chain, add the new nodes, making sure they are not repeated
+		// 	(this is computed in ActiveControl and we receive if as the postpone_validation parameter).
+		//
+		// 	2. If we found at least one node causing validation in the enter chain, try to validate the elements
+		// 	in pending_validation_chain, if any. Then continue with the ones receives as parameters.
+		//
+		// 	3. Return null if all the validation performed successfully, and return the control where the validation
+		// 	failed otherwise.
+		//
+		private Control PerformValidation (Conta

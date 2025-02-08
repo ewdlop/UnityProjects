@@ -1,0 +1,53 @@
+
+	if(bIsComplete)
+	{
+		if(SDataprepGraphTrackNode* TrackGraphNode = TrackGraphNodePtr.Pin().Get())
+		{
+			FModifierKeysState ModifierKeyState = FSlateApplication::Get().GetModifierKeys();
+			bool bControlKeyDown = ModifierKeyState.IsControlDown() || ModifierKeyState.IsCommandDown();
+			if(bControlKeyDown != bCachedControlKeyDown)
+			{
+				bCachedControlKeyDown = bControlKeyDown;
+				TrackGraphNode->OnControlKeyChanged(bCachedControlKeyDown);
+			}
+		}
+
+		FVector2D Location;
+		float ZoomAmount = 1.f;
+		GetViewLocation( Location, ZoomAmount );
+
+		UpdateLayout( AllottedGeometry.GetLocalSize(), Location, ZoomAmount );
+	}
+
+	SGraphEditor::Tick( AllottedGeometry, InCurrentTime, InDeltaTime);
+}
+
+void SDataprepGraphEditor::UpdateLayout( const FVector2D& LocalSize, const FVector2D& Location, float ZoomAmount )
+{
+	if(SDataprepGraphTrackNode* TrackGraphNode = TrackGraphNodePtr.Pin().Get())
+	{
+		WorkingArea = TrackGraphNode->Update();
+
+		if( !LocalSize.Equals(LastLocalSize) )
+		{
+			LastLocalSize = LocalSize;
+
+			// Force a re-compute of the view location
+			LastLocation = -Location;
+		}
+
+		if( !Location.Equals(LastLocation) )
+		{
+			FVector2D ComputedLocation(Location);
+
+			FVector2D PanelSize = LocalSize / ZoomAmount;
+			FVector2D WorkingSize = WorkingArea.GetSize();
+
+			if(Location.X != LastLocation.X)
+			{
+				const float Delta = WorkingSize.X - PanelSize.X;
+				const float MaxRight =  Delta > 0.f ? WorkingArea.Left + Delta : WorkingArea.Left;
+				ComputedLocation.X = ComputedLocation.X < WorkingArea.Left ? WorkingArea.Left : (ComputedLocation.X >= MaxRight ? MaxRight : ComputedLocation.X);
+			}
+
+			if(L

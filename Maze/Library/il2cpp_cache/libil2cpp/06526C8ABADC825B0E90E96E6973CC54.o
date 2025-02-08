@@ -1,0 +1,231 @@
+m_update_cycle = m_total_syms;
+
+  update();
+
+  m_symbols_until_update = m_update_cycle = 8;  //(m_total_syms + 6) >> 1;
+}
+
+void adaptive_huffman_data_model::rescale() {
+  uint total_freq = 0;
+
+  for (uint i = 0; i < m_total_syms; i++) {
+    uint freq = (m_sym_freq[i] + 1) >> 1;
+    total_freq += freq;
+    m_sym_freq[i] = static_cast<uint16>(freq);
+  }
+
+  m_total_count = total_freq;
+}
+
+void adaptive_huffman_data_model::update() {
+  m_total_count += m_update_cycle;
+
+  if (m_total_count >= 32768)
+    rescale();
+
+  void* pTables = create_generate_huffman_codes_tables();
+
+  uint max_code_size, total_freq;
+  bool status = generate_huffman_codes(pTables, m_total_syms, &m_sym_freq[0], &m_code_sizes[0], max_code_size, total_freq);
+  CRNLIB_ASSERT(status);
+  CRNLIB_ASSERT(total_freq == m_total_count);
+
+  if (max_code_size > prefix_coding::cMaxExpectedCodeSize)
+    prefix_coding::limit_max_code_size(m_total_syms, &m_code_sizes[0], prefix_coding::cMaxExpectedCodeSize);
+
+  free_generate_huffman_codes_tables(pTables);
+
+  if (m_encoding)
+    status = prefix_coding::generate_codes(m_total_syms, &m_code_sizes[0], &m_codes[0]);
+  else
+    status = prefix_coding::generate_decoder_tables(m_total_syms, &m_code_sizes[0], m_pDecode_tables, m_decoder_table_bits);
+
+  CRNLIB_ASSERT(status);
+  (void)status;
+
+  m_update_cycle = (5 * m_update_cycle) >> 2;
+  uint max_cycle = (m_total_syms + 6) << 3;  // this was << 2 - which is ~12% slower but compresses around .5% better
+
+  if (m_update_cycle > max_cycle)
+    m_update_cycle = max_cycle;
+
+  m_symbols_until_update = m_update_cycle;
+}
+
+static_huffman_data_model::static_huffman_data_model()
+    : m_total_syms(0),
+      m_pDecode_tables(NULL),
+      m_encoding(false) {
+}
+
+static_huffman_data_model::static_huffman_data_model(const static_huffman_data_model& other)
+    : m_total_syms(0),
+      m_pDecode_tables(NULL),
+      m_encoding(false) {
+  *this = other;
+}
+
+static_huffman_data_model::~static_huffman_data_model() {
+  if (m_pDecode_tables)
+    crnlib_delete(m_pDecode_tables);
+}
+
+static_huffman_data_model& static_huffman_data_model::operator=(const static_huffman_data_model& rhs) {
+  if (this == &rhs)
+    return *this;
+
+  m_total_syms = rhs.m_total_syms;
+  m_codes = rhs.m_codes;
+  m_code_sizes = rhs.m_code_sizes;
+
+  if (rhs.m_pDecode_tables) {
+    if (m_pDecode_tables)
+      *m_pDecode_tables = *rhs.m_pDecode_tables;
+    else
+      m_pDecode_tables = crnlib_new<prefix_coding::decoder_tables>(*rhs.m_pDecode_tables);
+  } else {
+    crnlib_delete(m_pDecode_tables);
+    m_pDecode_tables = NULL;
+  }
+
+  m_encoding = rhs.m_encoding;
+
+  return *this;
+}
+
+void static_huffman_data_model::clear() {
+  m_total_syms = 0;
+  m_codes.clear();
+  m_code_sizes.clear();
+  if (m_pDecode_tables) {
+    crnlib_delete(m_pDecode_tables);
+    m_pDecode_tables = NULL;
+  }
+  m_encoding = false;
+}
+
+bool static_huffman_data_model::init(bool encoding, uint total_syms, const uint16* pSym_freq, uint code_size_limit) {
+  CRNLIB_ASSERT((total_syms >= 1) && (total_syms <= prefix_coding::cMaxSupportedSyms) && (code_size_limit >= 1));
+
+  m_encoding = encoding;
+
+  m_total_syms = total_syms;
+
+  code_size_limit = math::minimum(code_size_limit, prefix_coding::cMaxExpectedCodeSize);
+
+  m_code_sizes.resize(total_syms);
+
+  void* pTables = create_generate_huffman_codes_tables();
+
+  uint max_code_size = 0, total_freq;
+  bool status = generate_huffman_codes(pTables, m_total_syms, pSym_freq, &m_code_sizes[0], max_code_size, total_freq);
+
+  free_generate_huffman_codes_tables(pTables);
+
+  if (!status)
+    return false;
+
+  if (max_code_size > code_size_limit) {
+    if (!prefix_coding::limit_max_code_size(m_total_syms, &m_code_sizes[0], code_size_limit))
+      return false;
+  }
+
+  if (m_encoding) {
+    m_codes.resize(total_syms);
+
+    if (m_pDecode_tables) {
+      crnlib_delete(m_pDecode_tables);
+      m_pDecode_tables = NULL;
+    }
+
+    if (!prefix_coding::generate_codes(m_total_syms, &m_code_sizes[0], &m_codes[0]))
+      return false;
+  } else {
+    m_codes.clear();
+
+    if (!m_pDecode_tables)
+      m_pDecode_tables = crnlib_new<prefix_coding::decoder_tables>();
+
+    if (!prefix_coding::generate_decoder_tables(m_total_syms, &m_code_sizes[0], m_pDecode_tables, compute_decoder_table_bits()))
+      return false;
+  }
+
+  return true;
+}
+
+bool static_huffman_data_model::init(bool encoding, uint total_syms, const uint* pSym_freq, uint code_size_limit) {
+  CRNLIB_ASSERT((total_syms >= 1) && (total_syms <= prefix_coding::cMaxSupportedSyms) && (code_size_limit >= 1));
+
+  crnlib::vector<uint16> sym_freq16(total_syms);
+
+  uint max_freq = 0;
+  for (uint i = 0; i < total_syms; i++)
+    max_freq = math::maximum(max_freq, pSym_freq[i]);
+
+  if (!max_freq)
+    return false;
+
+  if (max_freq <= cUINT16_MAX) {
+    for (uint i = 0; i < total_syms; i++)
+      sym_freq16[i] = static_cast<uint16>(pSym_freq[i]);
+  } else {
+    for (uint i = 0; i < total_syms; i++) {
+      uint f = pSym_freq[i];
+      if (!f)
+        continue;
+
+      uint64 fl = f;
+
+      fl = ((fl << 16) - fl) + (max_freq >> 1);
+      fl /= max_freq;
+      if (fl < 1)
+        fl = 1;
+
+      CRNLIB_ASSERT(fl <= cUINT16_MAX);
+
+      sym_freq16[i] = static_cast<uint16>(fl);
+    }
+  }
+
+  return init(encoding, total_syms, &sym_freq16[0], code_size_limit);
+}
+
+bool static_huffman_data_model::init(bool encoding, uint total_syms, const uint8* pCode_sizes, uint code_size_limit) {
+  CRNLIB_ASSERT((total_syms >= 1) && (total_syms <= prefix_coding::cMaxSupportedSyms) && (code_size_limit >= 1));
+
+  m_encoding = encoding;
+
+  code_size_limit = math::minimum(code_size_limit, prefix_coding::cMaxExpectedCodeSize);
+
+  m_code_sizes.resize(total_syms);
+
+  uint min_code_size = UINT_MAX;
+  uint max_code_size = 0;
+
+  for (uint i = 0; i < total_syms; i++) {
+    uint s = pCode_sizes[i];
+    m_code_sizes[i] = static_cast<uint8>(s);
+    min_code_size = math::minimum(min_code_size, s);
+    max_code_size = math::maximum(max_code_size, s);
+  }
+
+  if ((max_code_size < 1) || (max_code_size > 32) || (min_code_size > code_size_limit))
+    return false;
+
+  if (max_code_size > code_size_limit) {
+    if (!prefix_coding::limit_max_code_size(m_total_syms, &m_code_sizes[0], code_size_limit))
+      return false;
+  }
+
+  if (m_encoding) {
+    m_codes.resize(total_syms);
+
+    if (m_pDecode_tables) {
+      crnlib_delete(m_pDecode_tables);
+      m_pDecode_tables = NULL;
+    }
+
+    if (!prefix_coding::generate_codes(m_total_syms, &m_code_sizes[0], &m_codes[0]))
+      return false;
+  } else {
+    m_codes.

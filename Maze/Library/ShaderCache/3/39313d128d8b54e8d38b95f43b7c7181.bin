@@ -1,0 +1,113 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "Engine/GameViewportClient.h"
+#include "HAL/FileManager.h"
+#include "Misc/CommandLine.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+#include "Misc/CoreDelegates.h"
+#include "Misc/App.h"
+#include "GameMapsSettings.h"
+#include "EngineStats.h"
+#include "RenderingThread.h"
+#include "SceneView.h"
+#include "LegacyScreenPercentageDriver.h"
+#include "AI/NavigationSystemBase.h"
+#include "CanvasItem.h"
+#include "Engine/Canvas.h"
+#include "GameFramework/Volume.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "UObject/UObjectIterator.h"
+#include "UObject/Package.h"
+#include "SceneManagement.h"
+#include "Particles/ParticleSystemComponent.h"
+#include "Engine/NetDriver.h"
+#include "Engine/LocalPlayer.h"
+#include "ContentStreaming.h"
+#include "UnrealEngine.h"
+#include "EngineUtils.h"
+#include "Framework/Application/SlateApplication.h"
+#include "Widgets/SViewport.h"
+#include "Engine/Console.h"
+#include "GameFramework/HUD.h"
+#include "FXSystem.h"
+#include "SubtitleManager.h"
+#include "ImageUtils.h"
+#include "SceneViewExtension.h"
+#include "IHeadMountedDisplay.h"
+#include "IXRTrackingSystem.h"
+#include "EngineModule.h"
+#include "AudioDeviceManager.h"
+#include "AudioDevice.h"
+#include "Audio/AudioDebug.h"
+#include "Sound/SoundWave.h"
+#include "HighResScreenshot.h"
+#include "BufferVisualizationData.h"
+#include "GameFramework/InputSettings.h"
+#include "Components/LineBatchComponent.h"
+#include "Debug/DebugDrawService.h"
+#include "Components/BrushComponent.h"
+#include "Engine/GameEngine.h"
+#include "Logging/MessageLog.h"
+#include "Blueprint/UserWidget.h"
+#include "GameFramework/GameUserSettings.h"
+#include "Engine/UserInterfaceSettings.h"
+#include "Slate/SceneViewport.h"
+#include "Slate/SGameLayerManager.h"
+#include "ActorEditorUtils.h"
+#include "ComponentRecreateRenderStateContext.h"
+#include "DynamicResolutionState.h"
+#include "ProfilingDebugging/CsvProfiler.h"
+#include "IImageWrapper.h"
+#include "IImageWrapperModule.h"
+#include "HAL/PlatformApplicationMisc.h"
+#include "CustomStaticScreenPercentage.h"
+
+#if WITH_EDITOR
+#include "Settings/LevelEditorPlaySettings.h"
+#endif
+#include "Math/UnrealMathUtility.h"
+
+#define LOCTEXT_NAMESPACE "GameViewport"
+
+/** This variable allows forcing full screen of the first player controller viewport, even if there are multiple controllers plugged in and no cinematic playing. */
+bool GForceFullscreen = false;
+
+/** Delegate called at the end of the frame when a screenshot is captured */
+FOnScreenshotCaptured UGameViewportClient::ScreenshotCapturedDelegate;
+
+/** Delegate called right after the viewport is rendered */
+FOnViewportRendered UGameViewportClient::ViewportRenderedDelegate;
+
+/** Delegate called when the game viewport is created. */
+FSimpleMulticastDelegate UGameViewportClient::CreatedDelegate;
+
+/** A list of all the stat names which are enabled for this viewport (static so they persist between runs) */
+TArray<FString> UGameViewportClient::EnabledStats;
+
+/**
+ * UI Stats
+ */
+DECLARE_CYCLE_STAT(TEXT("UI Drawing Time"),STAT_UIDrawingTime,STATGROUP_UI);
+
+static TAutoConsoleVariable<int32> CVarSetBlackBordersEnabled(
+	TEXT("r.BlackBorders"),
+	0,
+	TEXT("To draw black borders around the rendered image\n")
+	TEXT("(prevents artifacts from post processing passes that read outside of the image e.g. PostProcessAA)\n")
+	TEXT("in pixels, 0:off"),
+	ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarScreenshotDelegate(
+	TEXT("r.ScreenshotDelegate"),
+	1,
+	TEXT("ScreenshotDelegates prevent processing of incoming screenshot request and break some features. This allows to disable them.\n")
+	TEXT("Ideally we rework the delegate code to not make that needed.\n")
+	TEXT(" 0: off\n")
+	TEXT(" 1: delegates are on (default)"),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarSecondaryScreenPercentage( // TODO: make it a user settings instead?
+	TEXT("r.SecondaryScreenPercentage.GameViewport"),
+	0,
+	TEXT("Override secondary screen percentage f

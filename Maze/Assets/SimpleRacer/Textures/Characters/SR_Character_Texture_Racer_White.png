@@ -1,0 +1,228 @@
+//===-- MemorySSAUpdater.cpp - Memory SSA Updater--------------------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------===//
+//
+// This file implements the MemorySSAUpdater class.
+//
+//===----------------------------------------------------------------===//
+#include "llvm/Analysis/MemorySSAUpdater.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Analysis/MemorySSA.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Metadata.h"
+#include "llvm/IR/Module.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/FormattedStream.h"
+#include <algorithm>
+
+#define DEBUG_TYPE "memoryssa"
+using namespace llvm;
+
+// This is the marker algorithm from "Simple and Efficient Construction of
+// Static Single Assignment Form"
+// The simple, non-marker algorithm places phi nodes at any join
+// Here, we place markers, and only place phi nodes if they end up necessary.
+// They are only necessary if they break a cycle (IE we recursively visit
+// ourselves again), or we discover, while getting the value of the operands,
+// that there are two or more definitions needing to be merged.
+// This still will leave non-minimal form in the case of irreducible control
+// flow, where phi nodes may be in cycles with themselves, but unnecessary.
+MemoryAccess *MemorySSAUpdater::getPreviousDefRecursive(BasicBlock *BB) {
+  // Single predecessor case, just recurse, we can only have one definition.
+  if (BasicBlock *Pred = BB->getSinglePredecessor()) {
+    return getPreviousDefFromEnd(Pred);
+  } else if (VisitedBlocks.count(BB)) {
+    // We hit our node again, meaning we had a cycle, we must insert a phi
+    // node to break it so we have an operand. The only case this will
+    // insert useless phis is if we have irreducible control flow.
+    return MSSA->createMemoryPhi(BB);
+  } else if (VisitedBlocks.insert(BB).second) {
+    // Mark us visited so we can detect a cycle
+    SmallVector<MemoryAccess *, 8> PhiOps;
+
+    // Recurse to get the values in our predecessors for placement of a
+    // potential phi node. This will insert phi nodes if we cycle in order to
+    // break the cycle and have an operand.
+    for (auto *Pred : predecessors(BB))
+      PhiOps.push_back(getPreviousDefFromEnd(Pred));
+
+    // Now try to simplify the ops to avoid placing a phi.
+    // This may return null if we never created a phi yet, that's okay
+    MemoryPhi *Phi = dyn_cast_or_null<MemoryPhi>(MSSA->getMemoryAccess(BB));
+    bool PHIExistsButNeedsUpdate = false;
+    // See if the existing phi operands match what we need.
+    // Unlike normal SSA, we only allow one phi node per block, so we can't just
+    // create a new one.
+    if (Phi && Phi->getNumOperands() != 0)
+      if (!std::equal(Phi->op_begin(), Phi->op_end(), PhiOps.begin())) {
+        PHIExistsButNeedsUpdate = true;
+      }
+
+    // See if we can avoid the phi by simplifying it.
+    auto *Result = tryRemoveTrivialPhi(Phi, PhiOps);
+    // If we couldn't simplify, we may have to create a phi
+    if (Result == Phi) {
+      if (!Phi)
+        Phi = MSSA->createMemoryPhi(BB);
+
+      // These will have been filled in by the recursive read we did above.
+      if (PHIExistsButNeedsUpdate) {
+        std::copy(PhiOps.begin(), PhiOps.end(), Phi->op_begin());
+        std::copy(pred_begin(BB), pred_end(BB), Phi->block_begin());
+      } else {
+        unsigned i = 0;
+        for (auto *Pred : predecessors(BB))
+          Phi->addIncoming(PhiOps[i++], Pred);
+        InsertedPHIs.push_back(Phi);
+      }
+      Result = Phi;
+    }
+
+    // Set ourselves up for the next variable by resetting visited state.
+    VisitedBlocks.erase(BB);
+    return Result;
+  }
+  llvm_unreachable("Should have hit one of the three cases above");
+}
+
+// This starts at the memory access, and goes backwards in the block to find the
+// previous definition. If a definition is not found the block of the access,
+// it continues globally, creating phi nodes to ensure we have a single
+// definition.
+MemoryAccess *MemorySSAUpdater::getPreviousDef(MemoryAccess *MA) {
+  auto *LocalResult = getPreviousDefInBlock(MA);
+
+  return LocalResult ? LocalResult : getPreviousDefRecursive(MA->getBlock());
+}
+
+// This starts at the memory access, and goes backwards in the block to the find
+// the previous definition. If the definition is not found in the block of the
+// access, it returns nullptr.
+MemoryAccess *MemorySSAUpdater::getPreviousDefInBlock(MemoryAccess *MA) {
+  auto *Defs = MSSA->getWritableBlockDefs(MA->getBlock());
+
+  // It's possible there are no defs, or we got handed the first def to start.
+  if (Defs) {
+    // If this is a def, we can just use the def iterators.
+    if (!isa<MemoryUse>(MA)) {
+      auto Iter = MA->getReverseDefsIterator();
+      ++Iter;
+      if (Iter != Defs->rend())
+        return &*Iter;
+    } else {
+      // Otherwise, have to walk the all access iterator.
+      auto End = MSSA->getWritableBlockAccesses(MA->getBlock())->rend();
+      for (auto &U : make_range(++MA->getReverseIterator(), End))
+        if (!isa<MemoryUse>(U))
+          return cast<MemoryAccess>(&U);
+      // Note that if MA comes before Defs->begin(), we won't hit a def.
+      return nullptr;
+    }
+  }
+  return nullptr;
+}
+
+// This starts at the end of block
+MemoryAccess *MemorySSAUpdater::getPreviousDefFromEnd(BasicBlock *BB) {
+  auto *Defs = MSSA->getWritableBlockDefs(BB);
+
+  if (Defs)
+    return &*Defs->rbegin();
+
+  return getPreviousDefRecursive(BB);
+}
+// Recurse over a set of phi uses to eliminate the trivial ones
+MemoryAccess *MemorySSAUpdater::recursePhi(MemoryAccess *Phi) {
+  if (!Phi)
+    return nullptr;
+  TrackingVH<MemoryAccess> Res(Phi);
+  SmallVector<TrackingVH<Value>, 8> Uses;
+  std::copy(Phi->user_begin(), Phi->user_end(), std::back_inserter(Uses));
+  for (auto &U : Uses) {
+    if (MemoryPhi *UsePhi = dyn_cast<MemoryPhi>(&*U)) {
+      auto OperRange = UsePhi->operands();
+      tryRemoveTrivialPhi(UsePhi, OperRange);
+    }
+  }
+  return Res;
+}
+
+// Eliminate trivial phis
+// Phis are trivial if they are defined either by themselves, or all the same
+// argument.
+// IE phi(a, a) or b = phi(a, b) or c = phi(a, a, c)
+// We recursively try to remove them.
+template <class RangeType>
+MemoryAccess *MemorySSAUpdater::tryRemoveTrivialPhi(MemoryPhi *Phi,
+                                                    RangeType &Operands) {
+  // Detect equal or self arguments
+  MemoryAccess *Same = nullptr;
+  for (auto &Op : Operands) {
+    // If the same or self, good so far
+    if (Op == Phi || Op == Same)
+      continue;
+    // not the same, return the phi since it's not eliminatable by us
+    if (Same)
+      return Phi;
+    Same = cast<MemoryAccess>(Op);
+  }
+  // Never found a non-self reference, the phi is undef
+  if (Same == nullptr)
+    return MSSA->getLiveOnEntryDef();
+  if (Phi) {
+    Phi->replaceAllUsesWith(Same);
+    removeMemoryAccess(Phi);
+  }
+
+  // We should only end up recursing in case we replaced something, in which
+  // case, we may have made other Phis trivial.
+  return recursePhi(Same);
+}
+
+void MemorySSAUpdater::insertUse(MemoryUse *MU) {
+  InsertedPHIs.clear();
+  MU->setDefiningAccess(getPreviousDef(MU));
+  // Unlike for defs, there is no extra work to do.  Because uses do not create
+  // new may-defs, there are only two cases:
+  //
+  // 1. There was a def already below us, and therefore, we should not have
+  // created a phi node because it was already needed for the def.
+  //
+  // 2. There is no def below us, and therefore, there is no extra renaming work
+  // to do.
+}
+
+// Set every incoming edge {BB, MP->getBlock()} of MemoryPhi MP to NewDef.
+static void setMemoryPhiValueForBlock(MemoryPhi *MP, const BasicBlock *BB,
+                                      MemoryAccess *NewDef) {
+  // Replace any operand with us an incoming block with the new defining
+  // access.
+  int i = MP->getBasicBlockIndex(BB);
+  assert(i != -1 && "Should have found the basic block in the phi");
+  // We can't just compare i against getNumOperands since one is signed and the
+  // other not. So use it to index into the block iterator.
+  for (auto BBIter = MP->block_begin() + i; BBIter != MP->block_end();
+       ++BBIter) {
+    if (*BBIter != BB)
+      break;
+    MP->setIncomingValue(i, NewDef);
+    ++i;
+  }
+}
+
+// A brief description of the algorithm:
+// First, we compute what should define the new def, using the SSA
+// construction algorithm.
+// Then, we update the defs below us (and any new phi nodes) in the graph to
+// point to the correct new defs, to ensure we only have one variable, and no
+// discon

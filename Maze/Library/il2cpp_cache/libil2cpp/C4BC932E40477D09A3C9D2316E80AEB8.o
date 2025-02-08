@@ -1,0 +1,162 @@
+in the modified tree that
+ * "node" pointed to in the original tree.
+ */
+static __isl_give isl_schedule_node *isl_schedule_node_graft_before_or_after(
+	__isl_take isl_schedule_node *node, __isl_take isl_schedule_node *graft,
+	int before)
+{
+	if (!node || !graft)
+		goto error;
+	if (check_insert(node) < 0)
+		goto error;
+
+	if (isl_schedule_node_get_type(graft) == isl_schedule_node_domain)
+		graft = extension_from_domain(graft, node);
+
+	if (isl_schedule_node_get_type(graft) != isl_schedule_node_extension)
+		isl_die(isl_schedule_node_get_ctx(node), isl_error_invalid,
+			"expecting domain or extension as root of graft",
+			goto error);
+
+	return graft_extension(node, graft, before);
+error:
+	isl_schedule_node_free(node);
+	isl_schedule_node_free(graft);
+	return NULL;
+}
+
+/* Insert a node "graft" into the schedule tree of "node" such that it
+ * is executed before the node that "node" points to.
+ * The root of "graft" may be either a domain or an extension node.
+ * In the latter case, the domain of the extension needs to correspond
+ * to the outer band nodes of "node".
+ * The elements of the domain or the range of the extension may not
+ * intersect with the domain elements that reach "node".
+ * The schedule tree of "graft" may not be anchored.
+ *
+ * Return a pointer to the same node in the modified tree that
+ * "node" pointed to in the original tree.
+ */
+__isl_give isl_schedule_node *isl_schedule_node_graft_before(
+	__isl_take isl_schedule_node *node, __isl_take isl_schedule_node *graft)
+{
+	return isl_schedule_node_graft_before_or_after(node, graft, 1);
+}
+
+/* Insert a node "graft" into the schedule tree of "node" such that it
+ * is executed after the node that "node" points to.
+ * The root of "graft" may be either a domain or an extension node.
+ * In the latter case, the domain of the extension needs to correspond
+ * to the outer band nodes of "node".
+ * The elements of the domain or the range of the extension may not
+ * intersect with the domain elements that reach "node".
+ * The schedule tree of "graft" may not be anchored.
+ *
+ * Return a pointer to the same node in the modified tree that
+ * "node" pointed to in the original tree.
+ */
+__isl_give isl_schedule_node *isl_schedule_node_graft_after(
+	__isl_take isl_schedule_node *node,
+	__isl_take isl_schedule_node *graft)
+{
+	return isl_schedule_node_graft_before_or_after(node, graft, 0);
+}
+
+/* Split the domain elements that reach "node" into those that satisfy
+ * "filter" and those that do not.  Arrange for the first subset to be
+ * executed before or after the second subset, depending on the value
+ * of "before".
+ * Return a pointer to the tree corresponding to the second subset,
+ * except when this subset is empty in which case the original pointer
+ * is returned.
+ * If both subsets are non-empty, then a sequence node is introduced
+ * to impose the order.  If the grandparent of the original node was
+ * itself a sequence, then the original child is replaced by two children
+ * in this sequence instead.
+ * The children in the sequence are copies of the original subtree,
+ * simplified with respect to their filters.
+ */
+static __isl_give isl_schedule_node *isl_schedule_node_order_before_or_after(
+	__isl_take isl_schedule_node *node, __isl_take isl_union_set *filter,
+	int before)
+{
+	enum isl_schedule_node_type ancestors[] =
+		{ isl_schedule_node_filter, isl_schedule_node_sequence };
+	isl_union_set *node_domain, *node_filter = NULL, *parent_filter;
+	isl_schedule_node *node2;
+	isl_schedule_tree *tree1, *tree2;
+	int empty1, empty2;
+	int in_seq;
+
+	if (!node || !filter)
+		goto error;
+	if (check_insert(node) < 0)
+		goto error;
+
+	in_seq = has_ancestors(node, 2, ancestors);
+	if (in_seq < 0)
+		goto error;
+	node_domain = isl_schedule_node_get_domain(node);
+	filter = isl_union_set_gist(filter, isl_union_set_copy(node_domain));
+	node_filter = isl_union_set_copy(node_domain);
+	node_filter = isl_union_set_subtract(node_filter,
+						isl_union_set_copy(filter));
+	node_filter = isl_union_set_gist(node_filter, node_domain);
+	empty1 = isl_union_set_is_empty(filter);
+	empty2 = isl_union_set_is_empty(node_filter);
+	if (empty1 < 0 || empty2 < 0)
+		goto error;
+	if (empty1 || empty2) {
+		isl_union_set_free(filter);
+		isl_union_set_free(node_filter);
+		return node;
+	}
+
+	if (in_seq) {
+		node = isl_schedule_node_parent(node);
+		parent_filter = isl_schedule_node_filter_get_filter(node);
+		node_filter = isl_union_set_intersect(node_filter,
+					    isl_union_set_copy(parent_filter));
+		filter = isl_union_set_intersect(filter, parent_filter);
+	}
+
+	node2 = isl_schedule_node_copy(node);
+	node = isl_schedule_node_gist(node, isl_union_set_copy(node_filter));
+	node2 = isl_schedule_node_gist(node2, isl_union_set_copy(filter));
+	tree1 = isl_schedule_node_get_tree(node);
+	tree2 = isl_schedule_node_get_tree(node2);
+	tree1 = isl_schedule_tree_insert_filter(tree1, node_filter);
+	tree2 = isl_schedule_tree_insert_filter(tree2, filter);
+	isl_schedule_node_free(node2);
+
+	if (before) {
+		tree1 = isl_schedule_tree_sequence_pair(tree2, tree1);
+		node = graft_or_splice(node, tree1, 1);
+	} else {
+		tree1 = isl_schedule_tree_sequence_pair(tree1, tree2);
+		node = graft_or_splice(node, tree1, 0);
+	}
+
+	return node;
+error:
+	isl_schedule_node_free(node);
+	isl_union_set_free(filter);
+	isl_union_set_free(node_filter);
+	return NULL;
+}
+
+/* Split the domain elements that reach "node" into those that satisfy
+ * "filter" and those that do not.  Arrange for the first subset to be
+ * executed before the second subset.
+ * Return a pointer to the tree corresponding to the second subset,
+ * except when this subset is empty in which case the original pointer
+ * is returned.
+ */
+__isl_give isl_schedule_node *isl_schedule_node_order_before(
+	__isl_take isl_schedule_node *node, __isl_take isl_union_set *filter)
+{
+	return isl_schedule_node_order_before_or_after(node, filter, 1);
+}
+
+/* Split the domain elements that reach "node" into those that satisfy
+ * "filter" and those that do not.  Arrange for the first subset to 

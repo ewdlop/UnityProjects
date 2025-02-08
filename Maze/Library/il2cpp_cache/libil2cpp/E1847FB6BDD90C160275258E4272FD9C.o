@@ -1,0 +1,332 @@
+ num_remaining)
+        return false;
+      ofs += len;
+    } else if (code == cLargeZeroRunCode) {
+      uint len = decode_bits(cLargeZeroRunExtraBits) + cMinLargeZeroRunSize;
+      if (len > num_remaining)
+        return false;
+      ofs += len;
+    } else if ((code == cSmallRepeatCode) || (code == cLargeRepeatCode)) {
+      uint len;
+      if (code == cSmallRepeatCode)
+        len = decode_bits(cSmallNonZeroRunExtraBits) + cSmallMinNonZeroRunSize;
+      else
+        len = decode_bits(cLargeNonZeroRunExtraBits) + cLargeMinNonZeroRunSize;
+
+      if ((!ofs) || (len > num_remaining))
+        return false;
+      const uint prev = model.m_code_sizes[ofs - 1];
+      if (!prev)
+        return false;
+      const uint end = ofs + len;
+      while (ofs < end)
+        model.m_code_sizes[ofs++] = static_cast<uint8>(prev);
+    } else {
+      CRNLIB_ASSERT(0);
+      return false;
+    }
+  }
+
+  if (ofs != total_used_syms)
+    return false;
+
+  if ((pDeltaModel) && (pDeltaModel->get_total_syms())) {
+    uint n = math::minimum(pDeltaModel->m_code_sizes.size(), total_used_syms);
+    for (uint i = 0; i < n; i++) {
+      int codesize = model.m_code_sizes[i] + pDeltaModel->m_code_sizes[i];
+      if (codesize > 16)
+        codesize -= 17;
+      model.m_code_sizes[i] = static_cast<uint8>(codesize);
+    }
+  }
+
+  return model.prepare_decoder_tables();
+}
+
+uint symbol_codec::decode(static_huffman_data_model& model) {
+  CRNLIB_ASSERT(m_mode == cDecoding);
+  CRNLIB_ASSERT(!model.m_encoding);
+
+  const prefix_coding::decoder_tables* pTables = model.m_pDecode_tables;
+
+  while (m_bit_count < (cBitBufSize - 8)) {
+    uint c = 0;
+    if (m_pDecode_buf_next == m_pDecode_buf_end) {
+      if (!m_decode_buf_eof) {
+        m_pDecode_need_bytes_func(m_pDecode_buf_next - m_pDecode_buf, m_pDecode_private_data, m_pDecode_buf, m_decode_buf_size, m_decode_buf_eof);
+        m_pDecode_buf_end = m_pDecode_buf + m_decode_buf_size;
+        m_pDecode_buf_next = m_pDecode_buf;
+        if (m_pDecode_buf_next < m_pDecode_buf_end)
+          c = *m_pDecode_buf_next++;
+      }
+    } else
+      c = *m_pDecode_buf_next++;
+
+    m_bit_count += 8;
+    m_bit_buf |= (static_cast<bit_buf_t>(c) << (cBitBufSize - m_bit_count));
+  }
+
+  uint k = static_cast<uint>((m_bit_buf >> (cBitBufSize - 16)) + 1);
+  uint sym, len;
+
+  if (k <= pTables->m_table_max_code) {
+    uint32 t = pTables->m_lookup[m_bit_buf >> (cBitBufSize - pTables->m_table_bits)];
+
+    CRNLIB_ASSERT(t != cUINT32_MAX);
+    sym = t & cUINT16_MAX;
+    len = t >> 16;
+
+    CRNLIB_ASSERT(model.m_code_sizes[sym] == len);
+  } else {
+    len = pTables->m_decode_start_code_size;
+
+    for (;;) {
+      if (k <= pTables->m_max_codes[len - 1])
+        break;
+      len++;
+    }
+
+    int val_ptr = pTables->m_val_ptrs[len - 1] + static_cast<int>((m_bit_buf >> (cBitBufSize - len)));
+
+    if (((uint)val_ptr >= model.m_total_syms)) {
+      // corrupted stream, or a bug
+      CRNLIB_ASSERT(0);
+      return 0;
+    }
+
+    sym = pTables->m_sorted_symbol_order[val_ptr];
+  }
+
+  m_bit_buf <<= len;
+  m_bit_count -= len;
+
+  return sym;
+}
+
+uint symbol_codec::decode_truncated_binary(uint n) {
+  CRNLIB_ASSERT(n >= 2);
+
+  uint k = math::floor_log2i(n);
+  uint u = (1 << (k + 1)) - n;
+
+  uint i = decode_bits(k);
+
+  if (i >= u)
+    i = ((i << 1) | decode_bits(1)) - u;
+
+  return i;
+}
+
+uint symbol_codec::decode_golomb(uint m) {
+  CRNLIB_ASSERT(m > 1);
+
+  uint q = 0;
+
+  for (;;) {
+    uint k = decode_peek_bits(16);
+
+    uint l = utils::count_leading_zeros16((~k) & 0xFFFF);
+    q += l;
+    if (l < 16)
+      break;
+  }
+
+  decode_remove_bits(q + 1);
+
+  uint r = decode_truncated_binary(m);
+
+  return (q * m) + r;
+}
+
+uint symbol_codec::decode_rice(uint m) {
+  CRNLIB_ASSERT(m > 0);
+
+  uint q = 0;
+
+  for (;;) {
+    uint k = decode_peek_bits(16);
+
+    uint l = utils::count_leading_zeros16((~k) & 0xFFFF);
+
+    q += l;
+
+    decode_remove_bits(l);
+
+    if (l < 16)
+      break;
+  }
+
+  decode_remove_bits(1);
+
+  uint r = decode_bits(m);
+
+  return (q << m) + r;
+}
+
+uint64 symbol_codec::stop_decoding() {
+  CRNLIB_ASSERT(m_mode == cDecoding);
+
+  uint64 n = m_pDecode_buf_next - m_pDecode_buf;
+
+  m_mode = cNull;
+
+  return n;
+}
+
+void symbol_codec::get_bits_init() {
+  m_bit_buf = 0;
+  m_bit_count = 0;
+}
+
+uint symbol_codec::get_bits(uint num_bits) {
+  CRNLIB_ASSERT(num_bits <= 25);
+
+  if (!num_bits)
+    return 0;
+
+  while (m_bit_count < (int)num_bits) {
+    uint c = 0;
+    if (m_pDecode_buf_next == m_pDecode_buf_end) {
+      if (!m_decode_buf_eof) {
+        m_pDecode_need_bytes_func(m_pDecode_buf_next - m_pDecode_buf, m_pDecode_private_data, m_pDecode_buf, m_decode_buf_size, m_decode_buf_eof);
+        m_pDecode_buf_end = m_pDecode_buf + m_decode_buf_size;
+        m_pDecode_buf_next = m_pDecode_buf;
+        if (m_pDecode_buf_next < m_pDecode_buf_end)
+          c = *m_pDecode_buf_next++;
+      }
+    } else
+      c = *m_pDecode_buf_next++;
+
+    m_bit_count += 8;
+    CRNLIB_ASSERT(m_bit_count <= cBitBufSize);
+
+    m_bit_buf |= (static_cast<bit_buf_t>(c) << (cBitBufSize - m_bit_count));
+  }
+
+  uint result = static_cast<uint>(m_bit_buf >> (cBitBufSize - num_bits));
+
+  m_bit_buf <<= num_bits;
+  m_bit_count -= num_bits;
+
+  return result;
+}
+
+void symbol_codec::remove_bits(uint num_bits) {
+  CRNLIB_ASSERT(num_bits <= 25);
+
+  if (!num_bits)
+    return;
+
+  while (m_bit_count < (int)num_bits) {
+    uint c = 0;
+    if (m_pDecode_buf_next == m_pDecode_buf_end) {
+      if (!m_decode_buf_eof) {
+        m_pDecode_need_bytes_func(m_pDecode_buf_next - m_pDecode_buf, m_pDecode_private_data, m_pDecode_buf, m_decode_buf_size, m_decode_buf_eof);
+        m_pDecode_buf_end = m_pDecode_buf + m_decode_buf_size;
+        m_pDecode_buf_next = m_pDecode_buf;
+        if (m_pDecode_buf_next < m_pDecode_buf_end)
+          c = *m_pDecode_buf_next++;
+      }
+    } else
+      c = *m_pDecode_buf_next++;
+
+    m_bit_count += 8;
+    CRNLIB_ASSERT(m_bit_count <= cBitBufSize);
+
+    m_bit_buf |= (static_cast<bit_buf_t>(c) << (cBitBufSize - m_bit_count));
+  }
+
+  m_bit_buf <<= num_bits;
+  m_bit_count -= num_bits;
+}
+
+void symbol_codec::decode_align_to_byte() {
+  CRNLIB_ASSERT(m_mode == cDecoding);
+
+  if (m_bit_count & 7) {
+    remove_bits(m_bit_count & 7);
+  }
+}
+
+int symbol_codec::decode_remove_byte_from_bit_buf() {
+  if (m_bit_count < 8)
+    return -1;
+  int result = static_cast<int>(m_bit_buf >> (cBitBufSize - 8));
+  m_bit_buf <<= 8;
+  m_bit_count -= 8;
+  return result;
+}
+
+uint symbol_codec::decode(adaptive_bit_model& model, bool update_model) {
+  if (m_arith_length < cSymbolCodecArithMinLen) {
+    uint c = get_bits(8);
+    m_arith_value = (m_arith_value << 8) | c;
+
+    m_arith_length <<= 8;
+    CRNLIB_ASSERT(m_arith_length >= cSymbolCodecArithMinLen);
+  }
+
+  CRNLIB_ASSERT(m_arith_length >= cSymbolCodecArithMinLen);
+
+  //uint x = gArithProbMulTab[model.m_bit_0_prob >> (cSymbolCodecArithProbBits - cSymbolCodecArithProbMulBits)][m_arith_length >> (32 - cSymbolCodecArithProbMulLenSigBits)] << 16;
+  uint x = model.m_bit_0_prob * (m_arith_length >> cSymbolCodecArithProbBits);
+  uint bit = (m_arith_value >= x);
+
+  if (!bit) {
+    if (update_model)
+      model.m_bit_0_prob += ((cSymbolCodecArithProbScale - model.m_bit_0_prob) >> cSymbolCodecArithProbMoveBits);
+
+    m_arith_length = x;
+  } else {
+    if (update_model)
+      model.m_bit_0_prob -= (model.m_bit_0_prob >> cSymbolCodecArithProbMoveBits);
+
+    m_arith_value -= x;
+    m_arith_length -= x;
+  }
+
+  return bit;
+}
+
+uint symbol_codec::decode(adaptive_arith_data_model& model) {
+  uint node = 1;
+
+  do {
+    uint bit = decode(model.m_probs[node]);
+
+    node = (node << 1) + bit;
+
+  } while (node < model.m_total_syms);
+
+  return node - model.m_total_syms;
+}
+
+void symbol_codec::start_arith_decoding() {
+  CRNLIB_ASSERT(m_mode == cDecoding);
+
+  m_arith_length = cSymbolCodecArithMaxLen;
+  m_arith_value = 0;
+
+  if (get_bits(1)) {
+    m_arith_value = (get_bits(8) << 24);
+    m_arith_value |= (get_bits(8) << 16);
+    m_arith_value |= (get_bits(8) << 8);
+    m_arith_value |= get_bits(8);
+  }
+}
+
+void symbol_codec::decode_need_bytes() {
+  if (!m_decode_buf_eof) {
+    m_pDecode_need_bytes_func(m_pDecode_buf_next - m_pDecode_buf, m_pDecode_private_data, m_pDecode_buf, m_decode_buf_size, m_decode_buf_eof);
+    m_pDecode_buf_end = m_pDecode_buf + m_decode_buf_size;
+    m_pDecode_buf_next = m_pDecode_buf;
+  }
+}
+
+}  // namespace crnlib
+                                                                       ×iv¿‚€Ú?®«yHªôCÄÈÔ%¹½-l^âõ÷QasÎ:iâ§S!šg¥p¾
+:tF‡’vd3÷ÿÓ¯”´z¹0‘z^€ƒLòÚø\+1wFaÇ>ñ½¾£á›¹­—–€	åaÏP«Û‡zÁ>Â-`Åg"gîô‚Ï>æ6+~Ò~:‚ÁœÇ1bxSş¡#øËuáâ0²w1Ô%M!/+Ëz©-,òä‚TFt" ³'y°VÊd¡œ–YlCÃÈŠ_å†'Ğ·“€BĞÑgàœåKåá­ë­gPcİçEÜ®5ğ®uF_XrÃ@­w¢é	ã+`øPâ	†ì~Ì_7ŸQ©S¿]ÃIØ4Š„0ÿd¾êã¹µñœy»JÔ©÷ÂÃTCj¼2K³åHs3€O[’x•”«Ôì´å’…¥_vSÍÇ;íğ2¼Ç2øÏŒ(gƒ¯;F[& |Û~$Òm\®ºË¿ûFM®›2±z7˜EN‰wÆÌÜ:Í›ïºbÌqSõ£§i8|Ïä±Ï!å1…$÷¿zÆŠ;„Ì†¤Q‰CõË–8j²ô‰¸ ì2Y´T—‹4®xóPr=‹ƒ·H„dÓ:=ê@Ñ_ÈÜ4á©à¢>æKG/\:™2x%|‰OÒ'§r\¸Ì\H¿¡æ%r]ÕaËñ¶ÇB2kØUı)¶Qñ®^ívŞ¡’¶‰¹ûnõÙ>ö	Ó¹!^y•Oı¹=ªãìÀê]¬æê®Qãz]‚¦ò,y6…z²Dœ”=¶eP'„ÊqãçíõÚğÄ]âÂúáä,·›Q»€J‘`È[ß"=Ğv}í 0({E«eÜ´Aç$%—qäDJºd…z©ê!³èÌÇôq×™×–7Ã’wË8fä"N—u}‰Jáwƒ¶úS°„IrÔÚo:#—u™¿–õb\u¤Rx…SGVõsUOœ—ÔtB»ŒÃ@’É‹ÉæXÈÚ4¤+«.Th²sb
+ÊôDZa<~0>îòX¼—áÁ²‡nu˜mn§ĞMŸ|eå§8agZË7l^hF	8C{Ç¾¼hıZ !Îğ"úS9Kë±‹he^ï¸hçÉÌÓÅh£QFêË§@ÈãâV¬Éä¯²^ªw\J¹fr
+¤²ò×*ß:TäÄJ•Ww«`)Í€WĞUÌòÆêÅGº­Z¨È}Ju8ä10N_½[MFh{Ëà€.Hš¶·ïEœ¯&>/K=ât;³wåğˆTá6]Á‰ëøÙ”ÿ;ÜÂY£ãğSù»Ñ‹Ôçø]¶}Ï±³‘eâÛı‚¾f+šM t–}•ÎM˜Éíşæ]¯"u;m'-eP'!h|Y ÑNŞp¤ƒ÷ŒÕòÅ&ÙÏ«n©ûà.WŞˆ„ò²ÿ@t'	máéõË›K–¤å@/½)ÍÚa”\„½Ô_¾údíS§Ê~¿š^»¬­/T¶m}µ¼|Itºzgë0C(1·@¼,X{{á,ìW`*HĞšRSÊè½Ã>§éÿóÍÈòšÉç{¶¯¶±&¿7èKé‹¾ÜqºâÔÁá„°ç¤ßê÷ì<sWu ïá}—`˜çey§@WÎ MVdé@t®®Æ$³×Òùeo9õn(>`s5g*¬æÓ
+,A¥Z‡:¶cÙ©ƒèÿd~R6AÃúcËÕO~Àªÿ]WôeàûcIWrŠ'‘¤\ÿ‚×Ôèd€>5Mİz\ã+£÷¥QŞa„ë&¿Ó 1mÈ™#[}Âé˜iÍ÷øW@­ßK—äpãîUŸ Ì¼¥™ DY%€OÈ•ĞxÕ8HWäh2…ñ-o»1²K¹¦’Pïã"†d›HşaL:åœÏšŞ«k€LšTC¹-ÏÓC¤]ÖHÍÕÆScK-ò¼9ñÒT–«Ig¦±é¡“4‡ÙSC1p3³8EÓÇO>f6“æ£×­}éÔ­˜Eeş,Pİ['‰‡ú†Iºíæ$Sãô¯Ó 4SÙò3…Q’Ğå`R—·ÇY/Áä1‹;ûeÔ¨¹VÎ¼Ğ›ê*kmË]:Uæ\¹×Å„Ã’™½Ÿ jcÂ/â£,nˆ
+Ï¸K!òm)fÔ÷5UÂÁ<	#$µZ”ƒû8v^¿¯e,ù±äñ*äjì)![Ğ–ìÄun"·c#=³3~fÜÄ–°˜ô‡Â~kf%?Ë*A}ë¾~mÜ×ÊR`'¯ó•" DÅ£&ê½T×¦ÛŠ¯]Ş@ÃúpmÚü„JÎê"efíw&õæ…á£ÙdYƒ·é°‰–¾ï•-v5¤ª£s…Ÿá#Ò’1ÜÕ<EÂèV•¼¸s—¥¦—ä™üÊ^Ùå¶FB_/)«NŒL¥î–Í÷]A]pË4E»9s~&N¦Æ;ÕbïFX¯ÎÇãHg^j--yÙKî°ù¤÷‚ÃN+*UFø0º´Øpêig”SÔÁ™^ïN±pDˆïñÀ8‰S/?&v|–Í+è²(ÉbÉ¯WÊ4ûøu@rï¿M|‰,Êè“Á3PH÷M‰Z&¿•nşæÂSûÈĞÆ ·‡ûy›™ŸÂ†XÍ˜PŠ¥Uq-è’WÁjæŒ»&@2Ì^l0­o©N]r¸<Qˆ;Tâê†)ã³ÏŸkŒúv2Ñ­½c‚l\¶FÚ+.‚µ¨Î¯+Õ¯¾»ËçWØr*Wäöbm…÷eY4O$Ş`ß}0=WÚ-i‹ş^ŠQpì•#4Â^ı62XæjWym™èé”<†ĞIN–`îò;Bg§?\ï 8ëF©‹”UC¥ûVÍW0êkN!Ÿ)S¯éÅ±ãV‡d{ ô(NáÒJFáÊñuøÖ03Ø¶x|¦¬q=;Ü‚™C û+«Æ~œ;ı“â8²Ì£ã= âQÅŞ|Õß€ƒ'N³Ö¨Kë¨şŸw:2Å×ã=«Üp^2ëtXÇğ¢8&UÓ_v(>y2İ‹¡î·İjgÓ¼kÔ}Fì“œt>zª

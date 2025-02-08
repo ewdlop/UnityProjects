@@ -1,0 +1,38 @@
+}
+
+        public CompositeActivity TransientWorkflow
+        {
+            get
+            {
+                return this.clonedRootActivity as CompositeActivity;
+            }
+        }
+
+        public ValidationErrorCollection Validate()
+        {
+            TypeProvider typeProvider = CreateTypeProvider(this.originalRootActivity);
+
+            // create service provider
+            ServiceContainer serviceContainer = new ServiceContainer();
+            serviceContainer.AddService(typeof(ITypeProvider), typeProvider);
+
+            ValidationManager validationManager = new ValidationManager(serviceContainer);
+            ValidationErrorCollection errors;
+            using (WorkflowCompilationContext.CreateScope(validationManager))
+            {
+                errors = ValidationHelpers.ValidateObject(validationManager, this.clonedRootActivity);
+            }
+            return XomlCompilerHelper.MorphIntoFriendlyValidationErrors(errors);
+        }
+
+        private void Save()
+        {
+            ValidationErrorCollection errors = Validate();
+            if (errors.HasErrors)
+                throw new WorkflowValidationFailedException(SR.GetString(SR.Error_CompilerValidationFailed), errors);
+
+            //work around !!!for conditions we do diff 
+            object originalConditions = ((Activity)this.originalRootActivity).GetValue(ConditionTypeConverter.DeclarativeConditionDynamicProp);
+            object changedConditions = ((Activity)this.clonedRootActivity).GetValue(ConditionTypeConverter.DeclarativeConditionDynamicProp);
+            if (null != originalConditions)
+                this.modelChangeActions.AddRange(((IWorkflowChangeDiff)orig

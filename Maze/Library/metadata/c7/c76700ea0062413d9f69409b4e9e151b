@@ -1,0 +1,381 @@
+eUnusedFunction(OverriderMD));
+      continue;
+    }
+
+    // Check if this overrider needs a return adjustment.
+    // We don't want to do this for pure virtual member functions.
+    BaseOffset ReturnAdjustmentOffset;
+    if (!OverriderMD->isPure()) {
+      ReturnAdjustmentOffset = 
+        ComputeReturnAdjustmentBaseOffset(Context, OverriderMD, MD);
+    }
+
+    ReturnAdjustment ReturnAdjustment = 
+      ComputeReturnAdjustment(ReturnAdjustmentOffset);
+    
+    AddMethod(Overrider.Method, ReturnAdjustment);
+  }
+}
+
+void ItaniumVTableBuilder::LayoutVTable() {
+  LayoutPrimaryAndSecondaryVTables(BaseSubobject(MostDerivedClass,
+                                                 CharUnits::Zero()),
+                                   /*BaseIsMorallyVirtual=*/false,
+                                   MostDerivedClassIsVirtual,
+                                   MostDerivedClassOffset);
+  
+  VisitedVirtualBasesSetTy VBases;
+  
+  // Determine the primary virtual bases.
+  DeterminePrimaryVirtualBases(MostDerivedClass, MostDerivedClassOffset, 
+                               VBases);
+  VBases.clear();
+  
+  LayoutVTablesForVirtualBases(MostDerivedClass, VBases);
+
+  // -fapple-kext adds an extra entry at end of vtbl.
+  bool IsAppleKext = Context.getLangOpts().AppleKext;
+  if (IsAppleKext)
+    Components.push_back(VTableComponent::MakeVCallOffset(CharUnits::Zero()));
+}
+
+void ItaniumVTableBuilder::LayoutPrimaryAndSecondaryVTables(
+    BaseSubobject Base, bool BaseIsMorallyVirtual,
+    bool BaseIsVirtualInLayoutClass, CharUnits OffsetInLayoutClass) {
+  assert(Base.getBase()->isDynamicClass() && "class does not have a vtable!");
+
+  unsigned VTableIndex = Components.size();
+  VTableIndices.push_back(VTableIndex);
+
+  // Add vcall and vbase offsets for this vtable.
+  VCallAndVBaseOffsetBuilder Builder(MostDerivedClass, LayoutClass, &Overriders,
+                                     Base, BaseIsVirtualInLayoutClass, 
+                                     OffsetInLayoutClass);
+  Components.append(Builder.components_begin(), Builder.components_end());
+  
+  // Check if we need to add these vcall offsets.
+  if (BaseIsVirtualInLayoutClass && !Builder.getVCallOffsets().empty()) {
+    VCallOffsetMap &VCallOffsets = VCallOffsetsForVBases[Base.getBase()];
+    
+    if (VCallOffsets.empty())
+      VCallOffsets = Builder.getVCallOffsets();
+  }
+
+  // If we're laying out the most derived class we want to keep track of the
+  // virtual base class offset offsets.
+  if (Base.getBase() == MostDerivedClass)
+    VBaseOffsetOffsets = Builder.getVBaseOffsetOffsets();
+
+  // Add the offset to top.
+  CharUnits OffsetToTop = MostDerivedClassOffset - OffsetInLayoutClass;
+  Components.push_back(VTableComponent::MakeOffsetToTop(OffsetToTop));
+
+  // Next, add the RTTI.
+  Components.push_back(VTableComponent::MakeRTTI(MostDerivedClass));
+
+  uint64_t AddressPoint = Components.size();
+
+  // Now go through all virtual member functions and add them.
+  PrimaryBasesSetVectorTy PrimaryBases;
+  AddMethods(Base, OffsetInLayoutClass,
+             Base.getBase(), OffsetInLayoutClass, 
+             PrimaryBases);
+
+  const CXXRecordDecl *RD = Base.getBase();
+  if (RD == MostDerivedClass) {
+    assert(MethodVTableIndices.empty());
+    for (const auto &I : MethodInfoMap) {
+      const CXXMethodDecl *MD = I.first;
+      const MethodInfo &MI = I.second;
+      if (const CXXDestructorDecl *DD = dyn_cast<CXXDestructorDecl>(MD)) {
+        MethodVTableIndices[GlobalDecl(DD, Dtor_Complete)]
+            = MI.VTableIndex - AddressPoint;
+        MethodVTableIndices[GlobalDecl(DD, Dtor_Deleting)]
+            = MI.VTableIndex + 1 - AddressPoint;
+      } else {
+        MethodVTableIndices[MD] = MI.VTableIndex - AddressPoint;
+      }
+    }
+  }
+
+  // Compute 'this' pointer adjustments.
+  ComputeThisAdjustments();
+
+  // Add all address points.
+  while (true) {
+    AddressPoints.insert(
+        std::make_pair(BaseSubobject(RD, OffsetInLayoutClass),
+                       VTableLayout::AddressPointLocation{
+                           unsigned(VTableIndices.size() - 1),
+                           unsigned(AddressPoint - VTableIndex)}));
+
+    const ASTRecordLayout &Layout = Context.getASTRecordLayout(RD);
+    const CXXRecordDecl *PrimaryBase = Layout.getPrimaryBase();
+    
+    if (!PrimaryBase)
+      break;
+    
+    if (Layout.isPrimaryBaseVirtual()) {
+      // Check if this virtual primary base is a primary base in the layout
+      // class. If it's not, we don't want to add it.
+      const ASTRecordLayout &LayoutClassLayout =
+        Context.getASTRecordLayout(LayoutClass);
+
+      if (LayoutClassLayout.getVBaseClassOffset(PrimaryBase) !=
+          OffsetInLayoutClass) {
+        // We don't want to add this class (or any of its primary bases).
+        break;
+      }
+    }
+
+    RD = PrimaryBase;
+  }
+
+  // Layout secondary vtables.
+  LayoutSecondaryVTables(Base, BaseIsMorallyVirtual, OffsetInLayoutClass);
+}
+
+void
+ItaniumVTableBuilder::LayoutSecondaryVTables(BaseSubobject Base,
+                                             bool BaseIsMorallyVirtual,
+                                             CharUnits OffsetInLayoutClass) {
+  // Itanium C++ ABI 2.5.2:
+  //   Following the primary virtual table of a derived class are secondary 
+  //   virtual tables for each of its proper base classes, except any primary
+  //   base(s) with which it shares its primary virtual table.
+
+  const CXXRecordDecl *RD = Base.getBase();
+  const ASTRecordLayout &Layout = Context.getASTRecordLayout(RD);
+  const CXXRecordDecl *PrimaryBase = Layout.getPrimaryBase();
+  
+  for (const auto &B : RD->bases()) {
+    // Ignore virtual bases, we'll emit them later.
+    if (B.isVirtual())
+      continue;
+    
+    const CXXRecordDecl *BaseDecl = B.getType()->getAsCXXRecordDecl();
+
+    // Ignore bases that don't have a vtable.
+    if (!BaseDecl->isDynamicClass())
+      continue;
+
+    if (isBuildingConstructorVTable()) {
+      // Itanium C++ ABI 2.6.4:
+      //   Some of the base class subobjects may not need construction virtual
+      //   tables, which will therefore not be present in the construction
+      //   virtual table group, even though the subobject virtual tables are
+      //   present in the main virtual table group for the complete object.
+      if (!BaseIsMorallyVirtual && !BaseDecl->getNumVBases())
+        continue;
+    }
+
+    // Get the base offset of this base.
+    CharUnits RelativeBaseOffset = Layout.getBaseClassOffset(BaseDecl);
+    CharUnits BaseOffset = Base.getBaseOffset() + RelativeBaseOffset;
+    
+    CharUnits BaseOffsetInLayoutClass = 
+      OffsetInLayoutClass + RelativeBaseOffset;
+    
+    // Don't emit a secondary vtable for a primary base. We might however want 
+    // to emit secondary vtables for other bases of this base.
+    if (BaseDecl == PrimaryBase) {
+      LayoutSecondaryVTables(BaseSubobject(BaseDecl, BaseOffset),
+                             BaseIsMorallyVirtual, BaseOffsetInLayoutClass);
+      continue;
+    }
+
+    // Layout the primary vtable (and any secondary vtables) for this base.
+    LayoutPrimaryAndSecondaryVTables(
+      BaseSubobject(BaseDecl, BaseOffset),
+      BaseIsMorallyVirtual,
+      /*BaseIsVirtualInLayoutClass=*/false,
+      BaseOffsetInLayoutClass);
+  }
+}
+
+void ItaniumVTableBuilder::DeterminePrimaryVirtualBases(
+    const CXXRecordDecl *RD, CharUnits OffsetInLayoutClass,
+    VisitedVirtualBasesSetTy &VBases) {
+  const ASTRecordLayout &Layout = Context.getASTRecordLayout(RD);
+  
+  // Check if this base has a primary base.
+  if (const CXXRecordDecl *PrimaryBase = Layout.getPrimaryBase()) {
+
+    // Check if it's virtual.
+    if (Layout.isPrimaryBaseVirtual()) {
+      bool IsPrimaryVirtualBase = true;
+
+      if (isBuildingConstructorVTable()) {
+        // Check if the base is actually a primary base in the class we use for
+        // layout.
+        const ASTRecordLayout &LayoutClassLayout =
+          Context.getASTRecordLayout(LayoutClass);
+
+        CharUnits PrimaryBaseOffsetInLayoutClass =
+          LayoutClassLayout.getVBaseClassOffset(PrimaryBase);
+        
+        // We know that the base is not a primary base in the layout class if 
+        // the base offsets are different.
+        if (PrimaryBaseOffsetInLayoutClass != OffsetInLayoutClass)
+          IsPrimaryVirtualBase = false;
+      }
+        
+      if (IsPrimaryVirtualBase)
+        PrimaryVirtualBases.insert(PrimaryBase);
+    }
+  }
+
+  // Traverse bases, looking for more primary virtual bases.
+  for (const auto &B : RD->bases()) {
+    const CXXRecordDecl *BaseDecl = B.getType()->getAsCXXRecordDecl();
+
+    CharUnits BaseOffsetInLayoutClass;
+    
+    if (B.isVirtual()) {
+      if (!VBases.insert(BaseDecl).second)
+        continue;
+      
+      const ASTRecordLayout &LayoutClassLayout =
+        Context.getASTRecordLayout(LayoutClass);
+
+      BaseOffsetInLayoutClass = 
+        LayoutClassLayout.getVBaseClassOffset(BaseDecl);
+    } else {
+      BaseOffsetInLayoutClass = 
+        OffsetInLayoutClass + Layout.getBaseClassOffset(BaseDecl);
+    }
+
+    DeterminePrimaryVirtualBases(BaseDecl, BaseOffsetInLayoutClass, VBases);
+  }
+}
+
+void ItaniumVTableBuilder::LayoutVTablesForVirtualBases(
+    const CXXRecordDecl *RD, VisitedVirtualBasesSetTy &VBases) {
+  // Itanium C++ ABI 2.5.2:
+  //   Then come the virtual base virtual tables, also in inheritance graph
+  //   order, and again excluding primary bases (which share virtual tables with
+  //   the classes for which they are primary).
+  for (const auto &B : RD->bases()) {
+    const CXXRecordDecl *BaseDecl = B.getType()->getAsCXXRecordDecl();
+
+    // Check if this base needs a vtable. (If it's virtual, not a primary base
+    // of some other class, and we haven't visited it before).
+    if (B.isVirtual() && BaseDecl->isDynamicClass() &&
+        !PrimaryVirtualBases.count(BaseDecl) &&
+        VBases.insert(BaseDecl).second) {
+      const ASTRecordLayout &MostDerivedClassLayout =
+        Context.getASTRecordLayout(MostDerivedClass);
+      CharUnits BaseOffset = 
+        MostDerivedClassLayout.getVBaseClassOffset(BaseDecl);
+      
+      const ASTRecordLayout &LayoutClassLayout =
+        Context.getASTRecordLayout(LayoutClass);
+      CharUnits BaseOffsetInLayoutClass = 
+        LayoutClassLayout.getVBaseClassOffset(BaseDecl);
+
+      LayoutPrimaryAndSecondaryVTables(
+        BaseSubobject(BaseDecl, BaseOffset),
+        /*BaseIsMorallyVirtual=*/true,
+        /*BaseIsVirtualInLayoutClass=*/true,
+        BaseOffsetInLayoutClass);
+    }
+    
+    // We only need to check the base for virtual base vtables if it actually
+    // has virtual bases.
+    if (BaseDecl->getNumVBases())
+      LayoutVTablesForVirtualBases(BaseDecl, VBases);
+  }
+}
+
+/// dumpLayout - Dump the vtable layout.
+void ItaniumVTableBuilder::dumpLayout(raw_ostream &Out) {
+  // FIXME: write more tests that actually use the dumpLayout output to prevent
+  // ItaniumVTableBuilder regressions.
+
+  if (isBuildingConstructorVTable()) {
+    Out << "Construction vtable for ('";
+    MostDerivedClass->printQualifiedName(Out);
+    Out << "', ";
+    Out << MostDerivedClassOffset.getQuantity() << ") in '";
+    LayoutClass->printQualifiedName(Out);
+  } else {
+    Out << "Vtable for '";
+    MostDerivedClass->printQualifiedName(Out);
+  }
+  Out << "' (" << Components.size() << " entries).\n";
+
+  // Iterate through the address points and insert them into a new map where
+  // they are keyed by the index and not the base object.
+  // Since an address point can be shared by multiple subobjects, we use an
+  // STL multimap.
+  std::multimap<uint64_t, BaseSubobject> AddressPointsByIndex;
+  for (const auto &AP : AddressPoints) {
+    const BaseSubobject &Base = AP.first;
+    uint64_t Index =
+        VTableIndices[AP.second.VTableIndex] + AP.second.AddressPointIndex;
+
+    AddressPointsByIndex.insert(std::make_pair(Index, Base));
+  }
+  
+  for (unsigned I = 0, E = Components.size(); I != E; ++I) {
+    uint64_t Index = I;
+
+    Out << llvm::format("%4d | ", I);
+
+    const VTableComponent &Component = Components[I];
+
+    // Dump the component.
+    switch (Component.getKind()) {
+
+    case VTableComponent::CK_VCallOffset:
+      Out << "vcall_offset ("
+          << Component.getVCallOffset().getQuantity() 
+          << ")";
+      break;
+
+    case VTableComponent::CK_VBaseOffset:
+      Out << "vbase_offset ("
+          << Component.getVBaseOffset().getQuantity()
+          << ")";
+      break;
+
+    case VTableComponent::CK_OffsetToTop:
+      Out << "offset_to_top ("
+          << Component.getOffsetToTop().getQuantity()
+          << ")";
+      break;
+    
+    case VTableComponent::CK_RTTI:
+      Component.getRTTIDecl()->printQualifiedName(Out);
+      Out << " RTTI";
+      break;
+    
+    case VTableComponent::CK_FunctionPointer: {
+      const CXXMethodDecl *MD = Component.getFunctionDecl();
+
+      std::string Str = 
+        PredefinedExpr::ComputeName(PredefinedExpr::PrettyFunctionNoVirtual, 
+                                    MD);
+      Out << Str;
+      if (MD->isPure())
+        Out << " [pure]";
+
+      if (MD->isDeleted())
+        Out << " [deleted]";
+
+      ThunkInfo Thunk = VTableThunks.lookup(I);
+      if (!Thunk.isEmpty()) {
+        // If this function pointer has a return adjustment, dump it.
+        if (!Thunk.Return.isEmpty()) {
+          Out << "\n       [return adjustment: ";
+          Out << Thunk.Return.NonVirtual << " non-virtual";
+          
+          if (Thunk.Return.Virtual.Itanium.VBaseOffsetOffset) {
+            Out << ", " << Thunk.Return.Virtual.Itanium.VBaseOffsetOffset;
+            Out << " vbase offset offset";
+          }
+
+          Out << ']';
+        }
+
+        // If this function pointer has a 'this' pointer adjustment,

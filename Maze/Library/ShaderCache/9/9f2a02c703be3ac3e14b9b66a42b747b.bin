@@ -1,0 +1,88 @@
+ed cultures within a group.  
+      For example:
+        <Cultures>en-US,en;en-GB,en</Cultures>
+      This will build 2 targets, outputing to en-US and en-GB sub-folders.  Light will first look
+      for strings in the first culture (en-US or en-GB) then the second (en).
+
+      Cultures of .wxl files will be used when the Culture property is not set.  The culture of a 
+      .wxl file is determined by the Culture attribute in the WixLocalization element in the file
+
+    Sets the OutputFolder metadata on each culture group.  In most cases this is the same as the 
+    first culture in the culture group.  When the Culture's property is unspecified and no .wxl 
+    files are provided this is the same as the output directory.  When the Culture's property 
+    specifies a single culture group and no .wxl files are provided this is the same as the output
+    directory.
+
+    Updates the TargetPath and TargetPdbPath properties to be used in subsequent targets.
+
+    [IN]
+    @(EmbeddedResource) - The list of wxl files to use for localization.
+    $(Cultures) - The list of culture groups to build.
+
+    [OUT]
+    @(CultureGroup) - The list of culture group strings with OutputFolder metadata
+    $(TargetPath) - Property list of target link output MSIs/MSMs
+    $(TargetPdbPath) - Property list of target output pdbs
+
+  ================================================================================================
+  -->
+  <Target
+    Name="AssignCultures"
+    Condition=" ('$(OutputType)' == 'Package' or '$(OutputType)' == 'PatchCreation' or '$(OutputType)' == 'Module')">
+
+    <WixAssignCulture
+      Cultures="$(Cultures)"
+      Files="@(EmbeddedResource)"
+      >
+
+      <Output TaskParameter="CultureGroups" ItemName="CultureGroup" />
+    </WixAssignCulture>
+
+    <!-- Build an itemgroup of outputs -->
+    <CreateItem
+      Include="$(TargetDir)%(CultureGroup.OutputFolder)$(TargetName)$(TargetExt)">
+      <Output TaskParameter="Include"
+              ItemName="_TargetPathItems"/>
+    </CreateItem>
+
+    <!-- Convert the itemgroup to a semicolon-delimited property -->
+    <CreateProperty
+      Value="@(_TargetPathItems)">
+      <Output TaskParameter="Value"
+              PropertyName="TargetPath"/>
+    </CreateProperty>
+
+    <!-- Build an itemgroup of PDB outputs -->
+    <CreateItem
+      Include="$(TargetPdbDir)%(CultureGroup.OutputFolder)$(TargetPdbName)">
+      <Output TaskParameter="Include"
+              ItemName="_TargetPdbPathItems"/>
+    </CreateItem>
+
+    <!-- Convert the itemgroup to a semicolon-delimited property -->
+    <CreateProperty
+      Value="@(_TargetPdbPathItems)">
+      <Output TaskParameter="Value"
+              PropertyName="TargetPdbPath"/>
+    </CreateProperty>
+
+    <!-- Set the sign target items, if we're signing output. -->
+    <CreateItem
+      Include="@(_TargetPathItems)"
+      Condition=" '$(SignOutput)' == 'true' AND '$(SuppressLayout)' != 'true' ">
+      <Output TaskParameter="Include"
+              ItemName="SignTargetPath"/>
+    </CreateItem>
+  </Target>
+
+  <!--
+  ================================================================================================
+  ReadPreviousBindInputsAndBuiltOutputs
+
+    Reads a previous build's Bind contents and built outputs file into @(_BindInputs) and
+    @(_BindBuiltOutputs) respectively.
+
+    Note: Only the *built* outputs are used because using files copied to output folder
+          can cause perpetual incremental build.
+
+          Imagine the case where you have: Msi.wixpr

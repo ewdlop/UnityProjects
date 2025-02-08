@@ -1,0 +1,26 @@
+               return (int)WbemNative.WbemStatus.WBEM_E_INVALID_PARAMETER;
+
+            using (ServiceModelActivity activity = DiagnosticUtility.ShouldUseActivity ?
+                ServiceModelActivity.CreateActivity(true, SR.GetString(SR.WmiGetObject, string.IsNullOrEmpty(objectPath) ? string.Empty : objectPath), ActivityType.WmiGetObject) : null)
+            {
+                try
+                {
+                    ObjectPathRegex objPathRegex = new ObjectPathRegex(objectPath);
+                    ParameterContext parms = new ParameterContext(objPathRegex.ClassName, this.wbemServices, wbemContext, wbemSink);
+                    WbemInstance wbemInstance = new WbemInstance(parms, objPathRegex);
+                    IWmiProvider wmiProvider = this.GetProvider(parms.ClassName);
+                    if (wmiProvider.GetInstance(new InstanceContext(wbemInstance)))
+                    {
+                        wbemInstance.Indicate();
+                    }
+
+                    WbemException.ThrowIfFail(wbemSink.SetStatus(
+                        (int)WbemNative.tag_WBEM_STATUS_TYPE.WBEM_STATUS_COMPLETE,
+                        (int)WbemNative.WbemStatus.WBEM_S_NO_ERROR,
+                        null,
+                        null));
+                }
+                catch (WbemException e)
+                {
+                    DiagnosticUtility.EventLog.LogEvent(TraceEventType.Error, (ushort)System.Runtime.Diagnostics.EventLogCategory.Wmi, (uint)System.Runtime.Diagnostics.EventLogEventId.WmiGetObjectFailed,
+                        TraceUtility.CreateSourceString(this), e.ToString());

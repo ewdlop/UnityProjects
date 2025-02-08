@@ -1,0 +1,173 @@
+)
+			context.class_inst = mono_class_get_generic_container (virtual_method->klass)->context.class_inst;
+		context.method_inst = mono_method_get_context (m)->method_inst;
+
+		ERROR_DECL (error);
+		virtual_method = mono_class_inflate_generic_method_checked (virtual_method, &context, error);
+		mono_error_cleanup (error); /* FIXME: don't swallow the error */
+	}
+
+	if (virtual_method->iflags & METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL) {
+		virtual_method = mono_marshal_get_native_wrapper (virtual_method, FALSE, FALSE);
+	}
+
+	if (virtual_method->iflags & METHOD_IMPL_ATTRIBUTE_SYNCHRONIZED) {
+		virtual_method = mono_marshal_get_synchronized_wrapper (virtual_method);
+	}
+
+	ERROR_DECL (error);
+	InterpMethod *virtual_imethod = mono_interp_get_imethod (domain, virtual_method, error);
+	mono_error_cleanup (error); /* FIXME: don't swallow the error */
+	return virtual_imethod;
+}
+
+typedef struct {
+	InterpMethod *imethod;
+	InterpMethod *target_imethod;
+} InterpVTableEntry;
+
+/* domain lock must be held */
+static GSList*
+append_imethod (MonoDomain *domain, GSList *list, InterpMethod *imethod, InterpMethod *target_imethod)
+{
+	GSList *ret;
+	InterpVTableEntry *entry;
+
+	entry = (InterpVTableEntry*) mono_mempool_alloc (domain->mp, sizeof (InterpVTableEntry));
+	entry->imethod = imethod;
+	entry->target_imethod = target_imethod;
+	ret = g_slist_append_mempool (domain->mp, list, entry);
+
+	return ret;
+}
+
+static InterpMethod*
+get_target_imethod (GSList *list, InterpMethod *imethod)
+{
+	while (list != NULL) {
+		InterpVTableEntry *entry = (InterpVTableEntry*) list->data;
+		if (entry->imethod == imethod)
+			return entry->target_imethod;
+		list = list->next;
+	}
+	return NULL;
+}
+
+static gpointer*
+get_method_table (MonoVTable *vtable, int offset)
+{
+	if (offset >= 0)
+		return vtable->interp_vtable;
+	else
+		return (gpointer*)vtable;
+}
+
+static gpointer*
+alloc_method_table (MonoVTable *vtable, int offset)
+{
+	gpointer *table;
+
+	if (offset >= 0) {
+		table = mono_domain_alloc0 (vtable->domain, m_class_get_vtable_size (vtable->klass) * sizeof (gpointer));
+		vtable->interp_vtable = table;
+	} else {
+		table = (gpointer*)vtable;
+	}
+
+	return table;
+}
+
+static MONO_NEVER_INLINE InterpMethod* // Inlining causes additional stack use in caller.
+get_virtual_method_fast (InterpMethod *imethod, MonoVTable *vtable, int offset)
+{
+	gpointer *table;
+
+#ifndef DISABLE_REMOTING
+	/* FIXME Remoting */
+	if (mono_class_is_transparent_proxy (vtable->klass))
+		return get_virtual_method (imethod, vtable);
+#endif
+
+	table = get_method_table (vtable, offset);
+
+	if (!table) {
+		/* Lazily allocate method table */
+		mono_domain_lock (vtable->domain);
+		table = get_method_table (vtable, offset);
+		if (!table)
+			table = alloc_method_table (vtable, offset);
+		mono_domain_unlock (vtable->domain);
+	}
+
+	if (!table [offset]) {
+		InterpMethod *target_imethod = get_virtual_method (imethod, vtable);
+		/* Lazily initialize the method table slot */
+		mono_domain_lock (vtable->domain);
+		if (!table [offset]) {
+			if (imethod->method->is_inflated || offset < 0)
+				table [offset] = append_imethod (vtable->domain, NULL, imethod, target_imethod);
+			else
+				table [offset] = (gpointer) ((gsize)target_imethod | 0x1);
+		}
+		mono_domain_unlock (vtable->domain);
+	}
+
+	if ((gsize)table [offset] & 0x1) {
+		/* Non generic virtual call. Only one method in slot */
+		return (InterpMethod*) ((gsize)table [offset] & ~0x1);
+	} else {
+		/* Virtual generic or interface call. Multiple methods in slot */
+		InterpMethod *target_imethod = get_target_imethod ((GSList*)table [offset], imethod);
+
+		if (!target_imethod) {
+			target_imethod = get_virtual_method (imethod, vtable);
+			mono_domain_lock (vtable->domain);
+			if (!get_target_imethod ((GSList*)table [offset], imethod))
+				table [offset] = append_imethod (vtable->domain, (GSList*)table [offset], imethod, target_imethod);
+			mono_domain_unlock (vtable->domain);
+		}
+		return target_imethod;
+	}
+}
+
+static void inline
+stackval_from_data (MonoType *type, stackval *result, const void *data, gboolean pinvoke)
+{
+	type = mini_native_type_replace_type (type);
+	if (type->byref) {
+		switch (type->type) {
+		case MONO_TYPE_OBJECT:
+		case MONO_TYPE_CLASS:
+		case MONO_TYPE_STRING:
+		case MONO_TYPE_ARRAY:
+		case MONO_TYPE_SZARRAY:
+			break;
+		default:
+			break;
+		}
+		result->data.p = *(gpointer*)data;
+		return;
+	}
+	switch (type->type) {
+	case MONO_TYPE_VOID:
+		return;
+	case MONO_TYPE_I1:
+		result->data.i = *(gint8*)data;
+		return;
+	case MONO_TYPE_U1:
+	case MONO_TYPE_BOOLEAN:
+		result->data.i = *(guint8*)data;
+		return;
+	case MONO_TYPE_I2:
+		result->data.i = *(gint16*)data;
+		return;
+	case MONO_TYPE_U2:
+	case MONO_TYPE_CHAR:
+		result->data.i = *(guint16*)data;
+		return;
+	case MONO_TYPE_I4:
+		result->data.i = *(gint32*)data;
+		return;
+	case MONO_TYPE_U:
+	case MONO_TYPE_I:
+	

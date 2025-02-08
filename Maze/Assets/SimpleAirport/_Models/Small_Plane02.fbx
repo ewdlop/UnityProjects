@@ -1,0 +1,610 @@
+//
+// ProjectRootElement.cs
+//
+// Author:
+//   Leszek Ciesielski (skolima@gmail.com)
+//
+// (C) 2011 Leszek Ciesielski
+//
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+// 
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+//
+
+using System.Collections.Generic;
+
+using Microsoft.Build.Evaluation;
+using Microsoft.Build.Internal;
+using System.Text;
+using System;
+using System.Xml;
+using System.IO;
+using System.Linq;
+using System.Globalization;
+using Microsoft.Build.Exceptions;
+
+namespace Microsoft.Build.Construction
+{
+        [System.Diagnostics.DebuggerDisplayAttribute("{FullPath} #Children={Count} DefaultTargets={DefaultTargets} "
+                                                     + "ToolsVersion={ToolsVersion} InitialTargets={InitialTargets}")]
+        public class ProjectRootElement : ProjectElementContainer
+        {
+                public override string Condition { get { return null; } set { throw new InvalidOperationException (
+                        "Can not set Condition."); } }
+                string defaultTargets;
+                public string DefaultTargets {
+                        get { return defaultTargets ?? String.Empty; }
+                        set { defaultTargets = value; }
+                }
+
+                string fullPath;
+                public string FullPath {
+                        get { return fullPath; }
+                        set {
+                                fullPath = Path.GetFullPath (value);
+                                DirectoryPath = Path.GetDirectoryName (fullPath);
+                        }
+                }
+
+                string directoryPath;
+                public string DirectoryPath {
+                        get { return directoryPath ?? Directory.GetCurrentDirectory (); }
+                        set { directoryPath = value; }
+                }
+
+                public ICollection<ProjectPropertyElement> Properties {
+                        get { return new CollectionFromEnumerable<ProjectPropertyElement> (
+                                new FilteredEnumerable<ProjectPropertyElement> (AllChildren)); }
+                }
+
+                public ICollection<ProjectChooseElement> ChooseElements {
+                        get { return new CollectionFromEnumerable<ProjectChooseElement> (
+                                new FilteredEnumerable<ProjectChooseElement> (Children)); }
+                }
+
+                public Encoding Encoding {
+                        get { return Encoding.UTF8; }
+                }
+
+                public bool HasUnsavedChanges {
+                        get { return true; }
+                }
+
+                public ICollection<ProjectImportGroupElement> ImportGroups {
+                        get { return new CollectionFromEnumerable<ProjectImportGroupElement> (
+                                new FilteredEnumerable<ProjectImportGroupElement> (Children)); }
+                }
+
+                public ICollection<ProjectImportGroupElement> ImportGroupsReversed {
+                        get { return new CollectionFromEnumerable<ProjectImportGroupElement> (
+                                new FilteredEnumerable<ProjectImportGroupElement> (ChildrenReversed)); }
+                }
+
+                public ICollection<ProjectImportElement> Imports {
+                        get { return new CollectionFromEnumerable<ProjectImportElement> (
+                                new FilteredEnumerable<ProjectImportElement> (AllChildren)); }
+                }
+
+                string initialTargets;
+                public string InitialTargets {
+                        get { return initialTargets ?? String.Empty; }
+                        set { initialTargets = value; }
+                }
+
+                public ICollection<ProjectItemDefinitionGroupElement> ItemDefinitionGroups {
+                        get { return new CollectionFromEnumerable<ProjectItemDefinitionGroupElement> (
+                                new FilteredEnumerable<ProjectItemDefinitionGroupElement> (Children)); }
+                }
+
+                public ICollection<ProjectItemDefinitionGroupElement> ItemDefinitionGroupsReversed {
+                        get { return new CollectionFromEnumerable<ProjectItemDefinitionGroupElement> (
+                                new FilteredEnumerable<ProjectItemDefinitionGroupElement> (ChildrenReversed)); }
+                }
+
+                public ICollection<ProjectItemDefinitionElement> ItemDefinitions {
+                        get { return new CollectionFromEnumerable<ProjectItemDefinitionElement> (
+                                new FilteredEnumerable<ProjectItemDefinitionElement> (AllChildren)); }
+                }
+
+                public ICollection<ProjectItemGroupElement> ItemGroups {
+                        get { return new CollectionFromEnumerable<ProjectItemGroupElement> (
+                                new FilteredEnumerable<ProjectItemGroupElement> (Children)); }
+                }
+
+                public ICollection<ProjectItemGroupElement> ItemGroupsReversed {
+                        get { return new CollectionFromEnumerable<ProjectItemGroupElement> (
+                                new FilteredEnumerable<ProjectItemGroupElement> (ChildrenReversed)); }
+                }
+
+                public ICollection<ProjectItemElement> Items {
+                        get { return new CollectionFromEnumerable<ProjectItemElement> (
+                                new FilteredEnumerable<ProjectItemElement> (AllChildren)); }
+                }
+
+                public DateTime LastWriteTimeWhenRead {
+                        get { return DateTime.MinValue; }
+                }
+
+                public ICollection<ProjectPropertyGroupElement> PropertyGroups {
+                        get { return new CollectionFromEnumerable<ProjectPropertyGroupElement> (
+                                new FilteredEnumerable<ProjectPropertyGroupElement> (Children)); }
+                }
+
+                public ICollection<ProjectPropertyGroupElement> PropertyGroupsReversed {
+                        get { return new CollectionFromEnumerable<ProjectPropertyGroupElement> (
+                                new FilteredEnumerable<ProjectPropertyGroupElement> (ChildrenReversed)); }
+                }
+
+                public string RawXml {
+                        get {
+                                using (var writer = new StringWriter (CultureInfo.InvariantCulture)) {
+                                        Save (writer);
+                                        return writer.ToString ();
+                                }
+                        }
+                }
+
+                public ICollection<ProjectTargetElement> Targets {
+                        get { return new CollectionFromEnumerable<ProjectTargetElement> (
+                                new FilteredEnumerable<ProjectTargetElement> (Children)); }
+                }
+
+                public DateTime TimeLastChanged {
+                        get { return DateTime.Now; }
+                }
+
+                string toolsVersion;
+                public string ToolsVersion {
+                        get { return toolsVersion ?? string.Empty; }
+                        set { toolsVersion = value; }
+                }
+
+                public ICollection<ProjectUsingTaskElement> UsingTasks {
+                        get { return new CollectionFromEnumerable<ProjectUsingTaskElement> (
+                                new FilteredEnumerable<ProjectUsingTaskElement> (Children)); }
+                }
+
+                public int Version {
+                        get { return 0; }
+                }
+
+                ProjectRootElement (ProjectCollection projectCollection)
+                {
+                        ToolsVersion = "4.0";
+                }
+
+                public static ProjectRootElement Create ()
+                {
+                        return Create (ProjectCollection.GlobalProjectCollection);
+                }
+
+                public static ProjectRootElement Create (ProjectCollection projectCollection)
+                {
+                        return new ProjectRootElement (projectCollection);
+                }
+
+                public static ProjectRootElement Create (string path)
+                {
+                        return Create (path, ProjectCollection.GlobalProjectCollection);
+                }
+
+                public static ProjectRootElement Create (XmlReader xmlReader)
+                {
+                        return Create (xmlReader, ProjectCollection.GlobalProjectCollection);
+                }
+
+                public static ProjectRootElement Create (string path, ProjectCollection projectCollection)
+                {
+                        var result = Create (projectCollection);
+                        result.FullPath = path;
+                        return result;
+                }
+
+                public static ProjectRootElement Create (XmlReader xmlReader, ProjectCollection projectCollection)
+                {
+                        var result = Create (projectCollection);
+                        result.ToolsVersion = null;
+                        result.Load (xmlReader);
+                        return result;
+                }
+
+                public ProjectImportElement AddImport (string project)
+                {
+                        var import = CreateImportElement (project);
+                        AppendChild (import);
+                        return import;
+                }
+
+                public ProjectImportGroupElement AddImportGroup ()
+                {
+                        var importGroup = CreateImportGroupElement ();
+                        AppendChild (importGroup);
+                        return importGroup;
+                }
+
+                public ProjectItemElement AddItem (string itemType, string include)
+                {
+                        return AddItem (itemType, include, null);
+                }
+
+                public ProjectItemElement AddItem (string itemType, string include,
+                                                   IEnumerable<KeyValuePair<string, string>> metadata)
+                {
+                        var @group = ItemGroups.
+                                Where (p => string.IsNullOrEmpty (p.Condition)
+                                       && p.Items.Where (s => s.ItemType.Equals (itemType,
+                                                StringComparison.OrdinalIgnoreCase)).FirstOrDefault () != null).
+                                        FirstOrDefault ();
+                        if (@group == null)
+                                @group = AddItemGroup ();
+                        return @group.AddItem (itemType, include, metadata);
+                }
+
+                public ProjectItemDefinitionElement AddItemDefinition (string itemType)
+                {
+                        var @group = ItemDefinitionGroups.
+                                Where (p => string.IsNullOrEmpty (p.Condition)
+                                       && p.ItemDefinitions.Where (s => s.ItemType.Equals (itemType,
+                                                StringComparison.OrdinalIgnoreCase)).FirstOrDefault () != null).
+                                        FirstOrDefault ();
+                        if (@group == null)
+                                @group = AddItemDefinitionGroup ();
+                        return @group.AddItemDefinition (itemType);
+                }
+
+                public ProjectItemDefinitionGroupElement AddItemDefinitionGroup ()
+                {
+                        var @group = CreateItemDefinitionGroupElement ();
+                        ProjectElementContainer last = ItemDefinitionGroupsReversed.FirstOrDefault ();
+                        if (last == null)
+                                last = PropertyGroupsReversed.FirstOrDefault ();
+                        InsertAfterChild (@group, last);
+                        return @group;
+                }
+
+                public ProjectItemGroupElement AddItemGroup ()
+                {
+                        var @group = CreateItemGroupElement ();
+                        ProjectElementContainer last = ItemGroupsReversed.FirstOrDefault ();
+                        if (last == null)
+                                last = PropertyGroupsReversed.FirstOrDefault ();
+                        InsertAfterChild (@group, last);
+                        return @group;
+                }
+
+                public ProjectPropertyElement AddProperty (string name, string value)
+                {
+                        ProjectPropertyGroupElement parentGroup = null;
+                        foreach (var @group in PropertyGroups) {
+                                if (string.IsNullOrEmpty (@group.Condition)) {
+                                        if (parentGroup == null)
+                                                parentGroup = @group;
+                                        var property = @group.Properties.
+                                                Where (p => string.IsNullOrEmpty (p.Condition)
+                                                       && p.Name.Equals (name, StringComparison.OrdinalIgnoreCase)).
+                                                        FirstOrDefault ();
+                                        if (property != null) {
+                                                property.Value = value;
+                                                return property;
+                                        }
+                                }
+                        }
+                        if (parentGroup == null)
+                                parentGroup = AddPropertyGroup ();
+                        return parentGroup.AddProperty (name, value);
+                }
+
+                public ProjectPropertyGroupElement AddPropertyGroup ()
+                {
+                        var @group = CreatePropertyGroupElement ();
+                        var last = PropertyGroupsReversed.FirstOrDefault ();
+                        InsertAfterChild (@group, last);
+                        return @group;
+                }
+
+                public ProjectTargetElement AddTarget (string name)
+                {
+                        var target = CreateTargetElement (name);
+                        AppendChild (target);
+                        return target;
+                }
+
+                public ProjectUsingTaskElement AddUsingTask (string name, string assemblyFile, string assemblyName)
+                {
+                        var usingTask = CreateUsingTaskElement (name, assemblyFile, assemblyName);
+                        AppendChild (usingTask);
+                        return usingTask;
+                }
+
+                public ProjectChooseElement CreateChooseElement ()
+                {
+                        return new ProjectChooseElement (this);
+                }
+
+                public ProjectImportElement CreateImportElement (string project)
+                {
+                        return new ProjectImportElement (project, this);
+                }
+
+                public ProjectImportGroupElement CreateImportGroupElement ()
+                {
+                        return new ProjectImportGroupElement (this);
+                }
+
+                public ProjectItemDefinitionElement CreateItemDefinitionElement (string itemType)
+                {
+                        return new ProjectItemDefinitionElement (itemType, this);
+                }
+
+                public ProjectItemDefinitionGroupElement CreateItemDefinitionGroupElement ()
+                {
+                        return new ProjectItemDefinitionGroupElement (this);
+                }
+
+                public ProjectItemElement CreateItemElement (string itemType)
+                {
+                        return new ProjectItemElement (itemType, this);
+                }
+
+                public ProjectItemElement CreateItemElement (string itemType, string include)
+                {
+                        var item = CreateItemElement (itemType);
+                        item.Include = include;
+                        return item;
+                }
+
+                public ProjectItemGroupElement CreateItemGroupElement ()
+                {
+                        return new ProjectItemGroupElement (this);
+                }
+
+                public ProjectMetadataElement CreateMetadataElement (string name)
+                {
+                        return new ProjectMetadataElement (name, this);
+                }
+
+                public ProjectMetadataElement CreateMetadataElement (string name, string unevaluatedValue)
+                {
+                        var metadata = CreateMetadataElement (name);
+                        metadata.Value = unevaluatedValue;
+                        return metadata;
+                }
+
+                public ProjectOnErrorElement CreateOnErrorElement (string executeTargets)
+                {
+                        return new ProjectOnErrorElement (executeTargets, this);
+                }
+
+                public ProjectOtherwiseElement CreateOtherwiseElement ()
+                {
+                        return new ProjectOtherwiseElement (this);
+                }
+
+                public ProjectOutputElement CreateOutputElement (string taskParameter, string itemType,
+                                                                 string propertyName)
+                {
+                        return new ProjectOutputElement (taskParameter, itemType, propertyName, this);
+                }
+
+                public ProjectExtensionsElement CreateProjectExtensionsElement ()
+                {
+                        return new ProjectExtensionsElement (this);
+                }
+
+                public ProjectPropertyElement CreatePropertyElement (string name)
+                {
+                        return new ProjectPropertyElement (name, this);
+                }
+
+                public ProjectPropertyGroupElement CreatePropertyGroupElement ()
+                {
+                        return new ProjectPropertyGroupElement (this);
+                }
+
+                public ProjectTargetElement CreateTargetElement (string name)
+                {
+                        return new ProjectTargetElement (name, this);
+                }
+
+                public ProjectTaskElement CreateTaskElement (string name)
+                {
+                        return new ProjectTaskElement (name, this);
+                }
+
+                public ProjectUsingTaskBodyElement CreateUsingTaskBodyElement (string evaluate, string body)
+                {
+                        return new ProjectUsingTaskBodyElement (evaluate, body, this);
+                }
+
+                public ProjectUsingTaskElement CreateUsingTaskElement (string taskName, string assemblyFile,
+                                                                       string assemblyName)
+                {
+                        return new ProjectUsingTaskElement (taskName, assemblyFile, assemblyName, this);
+                }
+
+                public ProjectUsingTaskParameterElement CreateUsingTaskParameterElement (string name, string output,
+                                                                                         string required,
+                                                                                         string parameterType)
+                {
+                        return new ProjectUsingTaskParameterElement (name, output, required, parameterType, this);
+                }
+
+                public UsingTaskParameterGroupElement CreateUsingTaskParameterGroupElement ()
+                {
+                        return new UsingTaskParameterGroupElement (this);
+                }
+
+                public ProjectWhenElement CreateWhenElement (string condition)
+                {
+                        return new ProjectWhenElement (condition, this);
+                }
+
+                public static ProjectRootElement Open (string path)
+                {
+                        return Open (path, ProjectCollection.GlobalProjectCollection);
+                }
+
+                public static ProjectRootElement Open (string path, ProjectCollection projectCollection)
+                {
+                        var result = Create (path, projectCollection);
+                        using (var reader = XmlReader.Create (path))
+                                result.Load (reader);
+                        return result;
+                }
+
+                public void Save ()
+                {
+                        if (FullPath == null)
+                                throw new InvalidOperationException ("This project was not given the file path to write to.");
+                        Save (Encoding);
+                }
+
+                public void Save (Encoding saveEncoding)
+                {
+                        using (var writer = new StreamWriter (File.Create (FullPath), saveEncoding)) {
+                                Save (writer);
+                        }
+                }
+
+                public void Save (string path)
+                {
+                        Save (path, Encoding);
+                }
+
+                public void Save (TextWriter writer)
+                {
+                        using (var xmlWriter = XmlWriter.Create (writer, new XmlWriterSettings { Indent = true,
+                                NewLineChars = "\r\n" })) {
+                                Save (xmlWriter);
+                        }
+                }
+
+                public void Save (string path, Encoding encoding)
+                {
+                        FullPath = path;
+                        Save (encoding);
+                }
+
+                public static ProjectRootElement TryOpen (string path)
+                {
+                        return TryOpen (path, ProjectCollection.GlobalProjectCollection);
+                }
+
+                public static ProjectRootElement TryOpen (string path, ProjectCollection projectCollection)
+                {
+                        // this should be non-null only if the project is already cached
+                        // and caching is not yet implemented
+                        return null;
+                }
+
+                internal override void Load (XmlReader reader)
+                {
+                        try {
+                                base.Load (reader);
+                        } catch (XmlException ex) {
+                                throw new InvalidProjectFileException (FullPath, ex.LineNumber, ex.LinePosition, 0, 0,
+                                        ex.Message, null, null, null);
+                        }
+                }
+
+                internal override ProjectElement LoadChildElement (XmlReader reader)
+                {
+                        switch (reader.LocalName) {
+                        case "PropertyGroup":
+                                var prop = CreatePropertyGroupElement ();
+                                AppendChild (prop);
+                                return prop;
+                        case "ItemGroup":
+                                var item = CreateItemGroupElement ();
+                                AppendChild (item);
+                                return item;
+			case "ImportGroup":
+                                return AddImportGroup ();
+                        case "Import":
+                                return AddImport (null);
+                        case "Target":
+                                return AddTarget (null);
+                        case "ItemDefinitionGroup":
+                                var def = CreateItemDefinitionGroupElement ();
+                                AppendChild (def);
+                                return def;
+                        case "UsingTask":
+                                var ut = AddUsingTask (null, null, null);
+                                return ut;
+                        case "Choose":
+                                var choose = CreateChooseElement ();
+                                AppendChild (choose);
+                                return choose;
+                        case "ProjectExtensions":
+                                var ext = CreateProjectExtensionsElement ();
+                                AppendChild (ext);
+                                return ext;
+                        default:
+                                throw CreateError (reader, string.Format ("Child \"{0}\" is not a known node type.", reader.LocalName), -1);
+                        }
+                }
+
+                internal override void LoadAttribute (string name, string value)
+                {
+                        switch (name) {
+                        case "ToolsVersion":
+                                ToolsVersion = value;
+                                break;
+                        case "DefaultTargets":
+                                DefaultTargets = value;
+                                break;
+                        case "InitialTargets":
+                                InitialTargets = value;
+                                break;
+                        default:
+                                base.LoadAttribute (name, value);
+                                break;
+                        }
+                }
+
+                internal override void Save (XmlWriter writer)
+                {
+                        writer.WriteStartElement (XmlName, MSBuildNamespace);
+                        SaveValue (writer);
+                        writer.WriteEndElement ();
+                }
+
+                internal override void SaveValue (XmlWriter writer)
+                {
+                        SaveAttribute (writer, "ToolsVersion", ToolsVersion);
+                        SaveAttribute (writer, "DefaultTargets", DefaultTargets);
+                        SaveAttribute (writer, "InitialTargets", InitialTargets);
+                        base.SaveValue (writer);
+                }
+
+                internal override string XmlName {
+                        get { return "Project"; }
+                }
+        }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          ù4·Pläû¯ˆhπzOùNùpOçætTÉ|¨R<myS„ê$1mÖˇ&ùÅôîvßIç¯í}{|
+4Ùˇ†ôK‹íW-êÒÇ
+ÛË‘¨?dµ™ÏÂ€	Áê¨Î’nÙﬁãÍ?Mf·HÍWÕ˚^èz˛à5ˆ>º·‹–Ùd¬M€3Å`≠èíG:ç™kyÿ{
+⁄yì3éÀÒƒ¬õ¡˝ƒ≤Ã>ñ©Î¡{ÈÅ ÚHT1UY|y	¸˚£Æ1∆Ó7ËJ ∫k´+Â‚ùN#H†â†∏~Ôü5fΩBPB˜ò&KßﬂÔd]i–π~µ8÷Â`Ì∂RNÇkwöá†^é∞ê^kø⁄Ã^x"XRgBbûïÿ}kyNhªÖ¢Jeó?«;aÖüß~ ÈaE`t)ÊSóxÖ54gkZôÖea=E-H=©˚oÒ!Öˆ©«mçshã+‘d:ÌnœaX\ŸÂ—KæyDèxã≥Ù{±ÀüdX(a(A“)¿ro[Ò;dËûÉ·Gü	ZπˇWÜj.‹Ω˙¨+)Ï˝0XKÊ§'AëKØ™–À⁄¿†Ñ–~!j‹Å00∏´ÊGGc%‘¸îıëfÓÛD∑“ë{e"–Øã›3dõgfø˘cH≠}ætzk⁄DzÚÌZ˙Öx§| ~π¬.{x3
+)æ{L–s_µMZê       ˇˇ  ∏       @                                   Ä   ∫ ¥	Õ!∏LÕ!This program cannot be run in DOS mode.
+$       PE  L ÌÜˇˆ        ‡ " 0           :       @                           Ä     äT   @Ö                           Ã9  O    @             &  x#   `     ∞9                                                               H           .text   $                           `.rsrc      @                    @  @.reloc      `      $              @  B                 :      H     P   p  	       ¿%  p  09  Ä                                   BSJB         v4.0.30319     l   0  #~  ú    #Strings    †     #US §     #GUID   ¥  º  #Blob           	   ˙3      
+      	   	                    Å k Ó k  X Û   ’ = ∫ = > = [ = ° = ' =           	 O  O  O
+ ) O 1 O 9 O A O I O Q O .  ¿ .  … .  Ë . # Ò . + . 3 @. ; Q. C î. K îÄ      ˆπ    ∆U            
+            ã     <Module> mscorlib DebuggableAttribute AssemblyTitleAttribute AssemblyFileVersionAttribute AssemblyInformationalVersionAttribute CompilationRelaxationsAttribute AssemblyProductAttribute AssemblyCopyrightAttribute AssemblyCompanyAttribute RuntimeCompatibilityAttribute Microsoft.Build.Tasks.CodeAnalysis.resources.dll System.Reflection .ctor tr System.Diagnostics System.Runtime.CompilerServices Microsoft.CodeAnalysis.BuildTasks.ErrorString.tr.resources Microsoft.Build.Tasks.CodeAnalysis.resources DebuggingModes       ôÄx£˘ÒE©a8rñhm,      ∑z\V4‡âÄ† $  Ä  î      $  RSA1     µ¸êÁgáw:èﬁâ8»‘∫eπ `Y>ñƒíeàú¡?Îµ?¨1Æ”3≈Ó`!g-óÍ1®ÆΩ†/%ÿ}∫o…˝Yé‘⁄5‰L9åECË„;Ñ&=Æ…ıñÉoó»˜GPÂó\d‚üEﬁÙk*+G≠√e+ı√]©        TWrapNonExceptionThrows      Microsoft Corporation  3 .¬© Microsoft Corporation. All rights reserved.   3.3.0.47606  B =3.3.1-beta4-19476-06+39d545dc14bc4d5a546e5e2f58d1ebaca72fcd61  ' "Microsoft.Build.Tasks.CodeAnalysis  i  Œ Ôæ   ë   lSystem.Resources.ResourceReader, mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089#System.Resources.RuntimeResourceSet          PADPADPãÓØìK+Öï¿RÒúfÅØ±Æ/¶∑êU∏º)ﬁû¬Ú«ßÃ±ªèœI†¯⁄⁄ÙΩﬂx@‰-¿Èí…Ûv7ˇq$Ö?bYcΩ˚Ãª§µ≤÷(‚˝¯+€ÅBÃ>vQÑ¶E_ã”ﬂj˜Ωwnú[Áw%  ˜  u  ê  7  :  Ÿ  ı  ç  ;  =   ¯   π   ¬  ?  ê  è  Ä   r  Ω  <  ¯  ⁄  ∞  Ë      £  N  ÿ  8C o m p i l e r _ U n e x p e c t e d E x c e p t i o n     >C o p y R e f A s s e m b l y _ B a d D e s t i n a t i o n 1 $   4C o p y R e f A s s e m b l y _ B a d S o u r c e 3 â   :C o p y R e f A s s e m b l y _ S k i p p i n g C o p y 1 ‡   :C o p y R e f A s s e m b l y _ S o u r c e N o t R e f 1 F  TC s c _ A s s e m b l y A l i a s C o n t a i n s I l l e g a l C h a r a c t e r s µ  (C s c _ I n v a l i d P a r a m e t e r   6C s c _ I n v a l i d P a r a m e t e r W a r n i n g <  BG e n e r a l _ C a n n o t C o n v e r t S t r i n g T o B o o l   LG e n e r a l _ C o u l d N o t S e t H o s t O b j e c t P a r a m e t e r    DG e n e r a l _ D u p l i c a t e I t e m s N o t S u p p o r t e d N  \G e n e r a l _ D u p l i c a t e I t e m s N o t S u p p o r t e d W i t h M e t a d a t a Õ  6G e n e r a l _ E x p e c t e d F i l e M i s s i n g “  6G e n e r a l _ I n c o r r e c t H o s t O b j e c t   @G e n e r a l _ I n v a l i d A t t r i b u t e M e t a d a t a p  TG e n e r a l _ P a r a m e t e r U n s u p p o r t e d O n H o s t C o m p i l e r ◊  :G e n e r a l _ R e f e r e n c e D o e s N o t E x i s t â  0G e n e r a l _ T o o l F i l e N o t F o u n d E  0G e n e r a l _ U n a b l e T o R e a d F i l e Ö  @M a p S o u r c e R o o t s . C o n t a i n s D u p l i c a t e •  NM a p S o u r c e R o o t s . N o S u c h T o p L e v e l S o u r c e R o o t   FM a p S o u r c e R o o t s . N o T o p L e v e l S o u r c e R o o t x  \M a p S o u r c e R o o t s . P a t h M u s t E n d W i t h S l a s h O r B a c k s l a s h ÷  2S h a r e d C o m p i l a t i o n F a l l b a c k &	  ,U s i n g S h a r e d C o m p i l a t i o n o	  @V b c _ E n u m P a r a m e t e r H a s I n v a l i d V a l u e µ	  8V b c _ P a r a m e t e r H a s I n v a l i d V a l u e 
+  V b c _ R e n a m e P D B R
+  "MSB3883: Beklenmeyen √∂zel durum: cHedef √ºr√ºn kodu derleme '{0}' i√ßerik karma denetlemek ba≈üarƒ±sƒ±z oldu. O-ecek var overwritten.UKaynak √ºr√ºn kodu derleme '{0}' i√ßerik karma denetlemek ba≈üarƒ±sƒ±z ol

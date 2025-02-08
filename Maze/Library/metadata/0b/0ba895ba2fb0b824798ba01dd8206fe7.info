@@ -1,0 +1,145 @@
+                return self.thing
+            def foo_two(self):
+                return self.thing
+            def test_one(self):
+                return self.thing
+            def test_two(self):
+                return self.thing
+
+        Foo = patch.object(Foo, 'thing', 'changed')(Foo)
+
+        foo = Foo()
+        self.assertEqual(foo.foo_one(), 'changed')
+        self.assertEqual(foo.foo_two(), 'changed')
+        self.assertEqual(foo.test_one(), 'original')
+        self.assertEqual(foo.test_two(), 'original')
+
+
+    @patch('unittest.mock.patch.TEST_PREFIX', 'bar')
+    def test_patch_dict_test_prefix(self):
+        class Foo(object):
+            def bar_one(self):
+                return dict(the_dict)
+            def bar_two(self):
+                return dict(the_dict)
+            def test_one(self):
+                return dict(the_dict)
+            def test_two(self):
+                return dict(the_dict)
+
+        the_dict = {'key': 'original'}
+        Foo = patch.dict(the_dict, key='changed')(Foo)
+
+        foo =Foo()
+        self.assertEqual(foo.bar_one(), {'key': 'changed'})
+        self.assertEqual(foo.bar_two(), {'key': 'changed'})
+        self.assertEqual(foo.test_one(), {'key': 'original'})
+        self.assertEqual(foo.test_two(), {'key': 'original'})
+
+
+    def test_patch_with_spec_mock_repr(self):
+        for arg in ('spec', 'autospec', 'spec_set'):
+            p = patch('%s.SomeClass' % __name__, **{arg: True})
+            m = p.start()
+            try:
+                self.assertIn(" name='SomeClass'", repr(m))
+                self.assertIn(" name='SomeClass.class_attribute'",
+                              repr(m.class_attribute))
+                self.assertIn(" name='SomeClass()'", repr(m()))
+                self.assertIn(" name='SomeClass().class_attribute'",
+                              repr(m().class_attribute))
+            finally:
+                p.stop()
+
+
+    def test_patch_nested_autospec_repr(self):
+        with patch('unittest.test.testmock.support', autospec=True) as m:
+            self.assertIn(" name='support.SomeClass.wibble()'",
+                          repr(m.SomeClass.wibble()))
+            self.assertIn(" name='support.SomeClass().wibble()'",
+                          repr(m.SomeClass().wibble()))
+
+
+
+    def test_mock_calls_with_patch(self):
+        for arg in ('spec', 'autospec', 'spec_set'):
+            p = patch('%s.SomeClass' % __name__, **{arg: True})
+            m = p.start()
+            try:
+                m.wibble()
+
+                kalls = [call.wibble()]
+                self.assertEqual(m.mock_calls, kalls)
+                self.assertEqual(m.method_calls, kalls)
+                self.assertEqual(m.wibble.mock_calls, [call()])
+
+                result = m()
+                kalls.append(call())
+                self.assertEqual(m.mock_calls, kalls)
+
+                result.wibble()
+                kalls.append(call().wibble())
+                self.assertEqual(m.mock_calls, kalls)
+
+                self.assertEqual(result.mock_calls, [call.wibble()])
+                self.assertEqual(result.wibble.mock_calls, [call()])
+                self.assertEqual(result.method_calls, [call.wibble()])
+            finally:
+                p.stop()
+
+
+    def test_patch_imports_lazily(self):
+        p1 = patch('squizz.squozz')
+        self.assertRaises(ImportError, p1.start)
+
+        with uncache('squizz'):
+            squizz = Mock()
+            sys.modules['squizz'] = squizz
+
+            squizz.squozz = 6
+            p1 = patch('squizz.squozz')
+            squizz.squozz = 3
+            p1.start()
+            p1.stop()
+        self.assertEqual(squizz.squozz, 3)
+
+    def test_patch_propogrates_exc_on_exit(self):
+        class holder:
+            exc_info = None, None, None
+
+        class custom_patch(_patch):
+            def __exit__(self, etype=None, val=None, tb=None):
+                _patch.__exit__(self, etype, val, tb)
+                holder.exc_info = etype, val, tb
+            stop = __exit__
+
+        def with_custom_patch(target):
+            getter, attribute = _get_target(target)
+            return custom_patch(
+                getter, attribute, DEFAULT, None, False, None,
+                None, None, {}
+            )
+
+        @with_custom_patch('squizz.squozz')
+        def test(mock):
+            raise RuntimeError
+
+        with uncache('squizz'):
+            squizz = Mock()
+            sys.modules['squizz'] = squizz
+
+            self.assertRaises(RuntimeError, test)
+
+        self.assertIs(holder.exc_info[0], RuntimeError)
+        self.assertIsNotNone(holder.exc_info[1],
+                            'exception value not propgated')
+        self.assertIsNotNone(holder.exc_info[2],
+                            'exception traceback not propgated')
+
+
+    def test_create_and_specs(self):
+        for kwarg in ('spec', 'spec_set', 'autospec'):
+            p = patch('%s.doesnotexist' % __name__, create=True,
+                      **{kwarg: True})
+            self.assertRaises(TypeError, p.start)
+            self.assertRaise

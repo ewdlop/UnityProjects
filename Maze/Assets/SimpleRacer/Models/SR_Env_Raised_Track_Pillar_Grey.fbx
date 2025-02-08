@@ -1,0 +1,699 @@
+﻿/********************************************************
+ * ADO.NET 2.0 Data Provider for SQLite Version 3.X
+ * Written by Robert Simpson (robert@blackcastlesoft.com)
+ * 
+ * Released to the public domain, use at your own risk!
+ ********************************************************/
+
+namespace Mono.Data.Sqlite
+{
+  using System;
+  using System.Data;
+  using System.Runtime.InteropServices;
+  using System.Collections.Generic;
+
+  /// <summary>
+  /// This internal class provides the foundation of SQLite support.  It defines all the abstract members needed to implement
+  /// a SQLite data provider, and inherits from SqliteConvert which allows for simple translations of string to and from SQLite.
+  /// </summary>
+  internal abstract class SQLiteBase : SqliteConvert, IDisposable
+  {
+    internal SQLiteBase(SQLiteDateFormats fmt)
+      : base(fmt) { }
+
+    static internal object _lock = new object();
+
+    /// <summary>
+    /// Returns a string representing the active version of SQLite
+    /// </summary>
+    internal abstract string Version { get; }
+    /// <summary>
+    /// Returns the number of changes the last executing insert/update caused.
+    /// </summary>
+    internal abstract int Changes { get; }
+    /// <summary>
+    /// Opens a database.
+    /// </summary>
+    /// <remarks>
+    /// Implementers should call SqliteFunction.BindFunctions() and save the array after opening a connection
+    /// to bind all attributed user-defined functions and collating sequences to the new connection.
+    /// </remarks>
+    /// <param name="strFilename">The filename of the database to open.  SQLite automatically creates it if it doesn't exist.</param>
+    /// <param name="flags">The open flags to use when creating the connection</param>
+    /// <param name="maxPoolSize">The maximum size of the pool for the given filename</param>
+    /// <param name="usePool">If true, the connection can be pulled from the connection pool</param>
+    internal abstract void Open(string strFilename, SQLiteOpenFlagsEnum flags, int maxPoolSize, bool usePool);
+    /// <summary>
+    /// Closes the currently-open database.
+    /// </summary>
+    /// <remarks>
+    /// After the database has been closed implemeters should call SqliteFunction.UnbindFunctions() to deallocate all interop allocated
+    /// memory associated with the user-defined functions and collating sequences tied to the closed connection.
+    /// </remarks>
+    internal abstract void Close();
+    /// <summary>
+    /// Sets the busy timeout on the connection.  SqliteCommand will call this before executing any command.
+    /// </summary>
+    /// <param name="nTimeoutMS">The number of milliseconds to wait before returning SQLITE_BUSY</param>
+    internal abstract void SetTimeout(int nTimeoutMS);
+    /// <summary>
+    /// Returns the text of the last error issued by SQLite
+    /// </summary>
+    /// <returns></returns>
+    internal abstract string SQLiteLastError();
+
+    /// <summary>
+    /// When pooling is enabled, force this connection to be disposed rather than returned to the pool
+    /// </summary>
+    internal abstract void ClearPool();
+
+    /// <summary>
+    /// Prepares a SQL statement for execution.
+    /// </summary>
+    /// <param name="cnn">The source connection preparing the command.  Can be null for any caller except LINQ</param>
+    /// <param name="strSql">The SQL command text to prepare</param>
+    /// <param name="previous">The previous statement in a multi-statement command, or null if no previous statement exists</param>
+    /// <param name="timeoutMS">The timeout to wait before aborting the prepare</param>
+    /// <param name="strRemain">The remainder of the statement that was not processed.  Each call to prepare parses the
+    /// SQL up to to either the end of the text or to the first semi-colon delimiter.  The remaining text is returned
+    /// here for a subsequent call to Prepare() until all the text has been processed.</param>
+    /// <returns>Returns an initialized SqliteStatement.</returns>
+    internal abstract SqliteStatement Prepare(SqliteConnection cnn, string strSql, SqliteStatement previous, uint timeoutMS, out string strRemain);
+    /// <summary>
+    /// Steps through a prepared statement.
+    /// </summary>
+    /// <param name="stmt">The SqliteStatement to step through</param>
+    /// <returns>True if a row was returned, False if not.</returns>
+    internal abstract bool Step(SqliteStatement stmt);
+    /// <summary>
+    /// Resets a prepared statement so it can be executed again.  If the error returned is SQLITE_SCHEMA, 
+    /// transparently attempt to rebuild the SQL statement and throw an error if that was not possible.
+    /// </summary>
+    /// <param name="stmt">The statement to reset</param>
+    /// <returns>Returns -1 if the schema changed while resetting, 0 if the reset was sucessful or 6 (SQLITE_LOCKED) if the reset failed due to a lock</returns>
+    internal abstract int Reset(SqliteStatement stmt);
+    internal abstract void Cancel();
+
+    internal abstract void Bind_Double(SqliteStatement stmt, int index, double value);
+    internal abstract void Bind_Int32(SqliteStatement stmt, int index, Int32 value);
+    internal abstract void Bind_Int64(SqliteStatement stmt, int index, Int64 value);
+    internal abstract void Bind_Text(SqliteStatement stmt, int index, string value);
+    internal abstract void Bind_Blob(SqliteStatement stmt, int index, byte[] blobData);
+    internal abstract void Bind_DateTime(SqliteStatement stmt, int index, DateTime dt);
+    internal abstract void Bind_Null(SqliteStatement stmt, int index);
+
+    internal abstract int Bind_ParamCount(SqliteStatement stmt);
+    internal abstract string Bind_ParamName(SqliteStatement stmt, int index);
+    internal abstract int Bind_ParamIndex(SqliteStatement stmt, string paramName);
+
+    internal abstract int ColumnCount(SqliteStatement stmt);
+    internal abstract string ColumnName(SqliteStatement stmt, int index);
+    internal abstract TypeAffinity ColumnAffinity(SqliteStatement stmt, int index);
+    internal abstract string ColumnType(SqliteStatement stmt, int index, out TypeAffinity nAffinity);
+    internal abstract int ColumnIndex(SqliteStatement stmt, string columnName);
+    internal abstract string ColumnOriginalName(SqliteStatement stmt, int index);
+    internal abstract string ColumnDatabaseName(SqliteStatement stmt, int index);
+    internal abstract string ColumnTableName(SqliteStatement stmt, int index);
+    internal abstract void ColumnMetaData(string dataBase, string table, string column, out string dataType, out string collateSequence, out bool notNull, out bool primaryKey, out bool autoIncrement);
+    internal abstract void GetIndexColumnExtendedInfo(string database, string index, string column, out int sortMode, out int onError, out string collationSequence);
+
+    internal abstract double GetDouble(SqliteStatement stmt, int index);
+    internal abstract Int32 GetInt32(SqliteStatement stmt, int index);
+    internal abstract Int64 GetInt64(SqliteStatement stmt, int index);
+    internal abstract string GetText(SqliteStatement stmt, int index);
+    internal abstract long GetBytes(SqliteStatement stmt, int index, int nDataoffset, byte[] bDest, int nStart, int nLength);
+    internal abstract long GetChars(SqliteStatement stmt, int index, int nDataoffset, char[] bDest, int nStart, int nLength);
+    internal abstract DateTime GetDateTime(SqliteStatement stmt, int index);
+    internal abstract bool IsNull(SqliteStatement stmt, int index);
+
+    internal abstract void CreateCollation(string strCollation, SQLiteCollation func, SQLiteCollation func16, IntPtr user_data);
+    internal abstract void CreateFunction(string strFunction, int nArgs, bool needCollSeq, SQLiteCallback func, SQLiteCallback funcstep, SQLiteFinalCallback funcfinal);
+    internal abstract CollationSequence GetCollationSequence(SqliteFunction func, IntPtr context);
+    internal abstract int ContextCollateCompare(CollationEncodingEnum enc, IntPtr context, string s1, string s2);
+    internal abstract int ContextCollateCompare(CollationEncodingEnum enc, IntPtr context, char[] c1, char[] c2);
+
+    internal abstract int AggregateCount(IntPtr context);
+    internal abstract IntPtr AggregateContext(IntPtr context);
+
+    internal abstract long GetParamValueBytes(IntPtr ptr, int nDataOffset, byte[] bDest, int nStart, int nLength);
+    internal abstract double GetParamValueDouble(IntPtr ptr);
+    internal abstract int GetParamValueInt32(IntPtr ptr);
+    internal abstract Int64 GetParamValueInt64(IntPtr ptr);
+    internal abstract string GetParamValueText(IntPtr ptr);
+    internal abstract TypeAffinity GetParamValueType(IntPtr ptr);
+
+    internal abstract void ReturnBlob(IntPtr context, byte[] value);
+    internal abstract void ReturnDouble(IntPtr context, double value);
+    internal abstract void ReturnError(IntPtr context, string value);
+    internal abstract void ReturnInt32(IntPtr context, Int32 value);
+    internal abstract void ReturnInt64(IntPtr context, Int64 value);
+    internal abstract void ReturnNull(IntPtr context);
+    internal abstract void ReturnText(IntPtr context, string value);
+
+    internal abstract void SetPassword(byte[] passwordBytes);
+    internal abstract void ChangePassword(byte[] newPasswordBytes);
+
+    internal abstract void SetUpdateHook(SQLiteUpdateCallback func);
+    internal abstract void SetCommitHook(SQLiteCommitCallback func);
+    internal abstract void SetRollbackHook(SQLiteRollbackCallback func);
+
+    internal abstract int GetCursorForTable(SqliteStatement stmt, int database, int rootPage);
+    internal abstract long GetRowIdForCursor(SqliteStatement stmt, int cursor);
+
+    internal abstract object GetValue(SqliteStatement stmt, int index, SQLiteType typ);
+
+    protected virtual void Dispose(bool bDisposing)
+    {
+    }
+
+    public void Dispose()
+    {
+      Dispose(true);
+    }
+
+    // These statics are here for lack of a better place to put them.
+    // They exist here because they are called during the finalization of
+    // a SqliteStatementHandle, SqliteConnectionHandle, and SqliteFunctionCookieHandle.
+    // Therefore these functions have to be static, and have to be low-level.
+
+    internal static string SQLiteLastError(SqliteConnectionHandle db)
+    {
+#if !SQLITE_STANDARD
+      int len;
+      return UTF8ToString(UnsafeNativeMethods.sqlite3_errmsg_interop(db, out len), len);
+#else
+      return UTF8ToString(UnsafeNativeMethods.sqlite3_errmsg(db), -1);
+#endif
+    }
+
+    internal static void FinalizeStatement(SqliteStatementHandle stmt)
+    {
+      lock (_lock)
+      {
+#if !SQLITE_STANDARD
+        int n = UnsafeNativeMethods.sqlite3_finalize_interop(stmt);
+#else
+      int n = UnsafeNativeMethods.sqlite3_finalize(stmt);
+#endif
+        if (n > 0) throw new SqliteException(n, null);
+      }
+    }
+
+    internal static void CloseConnection(SqliteConnectionHandle db)
+    {
+      lock (_lock)
+      {
+#if !SQLITE_STANDARD
+        int n = UnsafeNativeMethods.sqlite3_close_interop(db);
+#else
+        ResetConnection(db);
+        int n;
+        if (UnsafeNativeMethods.use_sqlite3_close_v2) {
+          n = UnsafeNativeMethods.sqlite3_close_v2(db);
+        } else {
+          n = UnsafeNativeMethods.sqlite3_close(db);
+        }
+#endif
+        if (n > 0) throw new SqliteException(n, SQLiteLastError(db));
+      }
+    }
+
+    internal static void ResetConnection(SqliteConnectionHandle db)
+    {
+      lock (_lock)
+      {
+        IntPtr stmt = IntPtr.Zero;
+
+        do
+        {
+          stmt = UnsafeNativeMethods.sqlite3_next_stmt(db, stmt);
+          if (stmt != IntPtr.Zero)
+          {
+#if !SQLITE_STANDARD
+            UnsafeNativeMethods.sqlite3_reset_interop(stmt);
+#else
+          UnsafeNativeMethods.sqlite3_reset(stmt);
+#endif
+          }
+        } while (stmt != IntPtr.Zero);
+
+        // Not overly concerned with the return value from a rollback.
+        UnsafeNativeMethods.sqlite3_exec(db, ToUTF8("ROLLBACK"), IntPtr.Zero, IntPtr.Zero, out stmt);
+        // but free the error message if any!
+        if (stmt != IntPtr.Zero)
+          UnsafeNativeMethods.sqlite3_free (stmt);
+      }
+    }
+  }
+
+  internal interface ISQLiteSchemaExtensions
+  {
+    void BuildTempSchema(SqliteConnection cnn);
+  }
+
+  [Flags]
+  internal enum SQLiteOpenFlagsEnum
+  {
+    None = 0,
+    ReadOnly = 0x01,
+    ReadWrite = 0x02,
+    Create = 0x04,
+    //SharedCache = 0x01000000,
+    Default = 0x06,
+
+    // iOS Specific
+    FileProtectionComplete = 0x00100000,
+    FileProtectionCompleteUnlessOpen = 0x00200000,
+    FileProtectionCompleteUntilFirstUserAuthentication = 0x00300000,
+    FileProtectionNone = 0x00400000
+  }
+
+  // subset of the options available in http://www.sqlite.org/c3ref/c_config_getmalloc.html
+  public enum SQLiteConfig {
+    SingleThread = 1,
+    MultiThread = 2,
+    Serialized = 3,
+  }
+}
+                                                                                                                                                                                                               = UnixAddressFamily.AF_INET,
+					sin_port = Syscall.htons (0),
+					sin_addr = new InAddr (127, 0, 0, 1),
+				};
+				if (Syscall.bind (so1, address) < 0)
+					UnixMarshal.ThrowExceptionForLastError ();
+
+				// Get actual port number using getsockname()
+				var actualAddress = new SockaddrIn ();
+				if (Syscall.getsockname (so1, actualAddress) < 0)
+					UnixMarshal.ThrowExceptionForLastError ();
+				Assert.AreEqual (actualAddress.sa_family, UnixAddressFamily.AF_INET);
+				var port = Syscall.ntohs (actualAddress.sin_port);
+				Assert.IsTrue (port != 0);
+
+
+				var remoteAddress = new SockaddrIn {
+					sin_family = UnixAddressFamily.AF_INET,
+					sin_port = Syscall.htons (port),
+					sin_addr = new InAddr (127, 0, 0, 1),
+				};
+
+				// Send and receive a few bytes
+				long ret;
+				var buffer1 = new byte[] { 42, 43, 44 };
+				fixed (byte* ptr_buffer1 = buffer1) {
+					var iovecs1 = new Iovec[] {
+						new Iovec {
+							iov_base = (IntPtr) ptr_buffer1,
+							iov_len = (ulong) buffer1.Length,
+						},
+					};
+					var msghdr1 = new Msghdr {
+						msg_name = remoteAddress,
+						msg_iov = iovecs1,
+						msg_iovlen = 1,
+					};
+					ret = Syscall.sendmsg (so2, msghdr1, 0);
+					msghdr1.msg_name = remoteAddress.ToSockaddrStorage ();
+					if (ret >= 0)
+						ret = Syscall.sendmsg (so2, msghdr1, 0);
+				}
+				if (ret < 0)
+					UnixMarshal.ThrowExceptionForLastError ();
+
+				var senderAddress = new SockaddrIn ();
+				var senderAddressStorage = new SockaddrStorage ();
+				var buffer2 = new byte[1024];
+				var buffer3 = new byte[1024];
+				fixed (byte* ptr_buffer2 = buffer2, ptr_buffer3 = buffer3) {
+					var iovecs2 = new Iovec[] {
+						new Iovec {
+							iov_base = (IntPtr) ptr_buffer2,
+							iov_len = (ulong) buffer2.Length,
+						},
+					};
+					var msghdr2 = new Msghdr {
+						msg_name = senderAddress,
+						msg_iov = iovecs2,
+						msg_iovlen = 1,
+					};
+					ret = Syscall.recvmsg (so1, msghdr2, 0);
+					msghdr2.msg_name = senderAddressStorage;
+					iovecs2[0].iov_base = (IntPtr) ptr_buffer3;
+					if (ret >= 0)
+						ret = Syscall.recvmsg (so1, msghdr2, 0);
+				}
+				if (ret < 0)
+					UnixMarshal.ThrowExceptionForLastError ();
+				Assert.AreEqual (senderAddress.sa_family, UnixAddressFamily.AF_INET);
+				Assert.AreEqual (senderAddress.sin_addr, new InAddr (127, 0, 0, 1));
+				var senderAddress2 = SockaddrIn.FromSockaddrStorage (senderAddressStorage);
+				Assert.AreEqual (senderAddress2.sa_family, UnixAddressFamily.AF_INET);
+				Assert.AreEqual (senderAddress2.sin_addr, new InAddr (127, 0, 0, 1));
+
+				Assert.AreEqual (buffer1.Length, ret);
+				for (int i = 0; i < buffer1.Length; i++)
+					Assert.AreEqual (buffer1[i], buffer2[i]);
+				for (int i = 0; i < buffer1.Length; i++)
+					Assert.AreEqual (buffer1[i], buffer3[i]);
+			});
+		}
+
+		public unsafe void ControlMsg (bool useMultipleControlMessages)
+		{
+			// Create two socket pairs and send inner_so1 and inner_so2 over the other socket pair using SCM_RIGHTS
+			WithSocketPair ((inner_so1, inner_so2) => {
+				WithSocketPair ((so1, so2) => {
+					byte[] cmsg;
+					Msghdr msg﻿//------------------------------------------------------------
+// Copyright (c) Microsoft Corporation.  All rights reserved.
+//------------------------------------------------------------
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.IO;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+
+namespace System.IdentityModel
+{
+    /// <summary>
+    /// Encrypts a cookie using <see cref="RSA"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Cookies encrypted with this transform may be decrypted 
+    /// by any machine that shares the same RSA private key (generally 
+    /// associated with an X509 certificate).
+    /// </para>
+    /// <para>
+    /// The given data is encrypted using a random AES256 key.  This key is
+    /// then encrypted using RSA, and the RSA public key is sent in plain text
+    /// so that when decoding the class knows which RSA key to use.
+    /// </para>
+    /// </remarks>
+    public class RsaEncryptionCookieTransform : CookieTransform
+    {
+        //
+        // Produces an encrypted stream as follows:
+        // 
+        // Hashsha?( RSA.ToString( false ) ) +
+        // Length( EncryptRSA( Key + IV )    +
+        // EncryptRSA( Key + IV )            +
+        // Length( EncryptAES( Data )        +
+        // EncryptAES( Data )
+        // 
+
+        RSA _encryptionKey;
+        List<RSA> _decryptionKeys = new List<RSA>();
+        string _hashName = "SHA256";
+
+        /// <summary>
+        /// Creates a new instance of <see cref="RsaEncryptionCookieTransform"/>.
+        /// </summary>
+        /// <param name="key">The provided key will be used as the encryption and decryption key by default.</param>
+        /// <exception cref="ArgumentNullException">When the key is null.</exception>
+        public RsaEncryptionCookieTransform(RSA key)
+        {
+            if (null == key)
+            {
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgumentNull("key");
+            }
+            _encryptionKey = key;
+            _decryptionKeys.Add(_encryptionKey);
+        }
+
+        /// <summary>
+        /// Creates a new instance of <see cref="RsaEncryptionCookieTransform"/>
+        /// </summary>
+        /// <param name="certificate">Certificate whose private key is used to encrypt and decrypt.</param>
+        /// <exception cref="ArgumentNullException">When certificate is null.</exception>
+        /// <exception cref="ArgumentException">When the certificate has no private key.</exception>
+        /// <exception cref="ArgumentException">When the certificate's key is not RSA.</exception>
+        public RsaEncryptionCookieTransform(X509Certificate2 certificate)
+        {
+            if (null == certificate)
+            {
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgumentNull("certificate");
+            }
+            _encryptionKey = X509Util.EnsureAndGetPrivateRSAKey(certificate);
+            _decryptionKeys.Add(_encryptionKey);
+        }
+
+        /// <summary>
+        /// Creates a new instance of <see cref="RsaEncryptionCookieTransform"/>.
+        /// The instance created by this constructor is not usable until the signing and verification keys are set.
+        /// </summary>
+        internal RsaEncryptionCookieTransform()
+        {
+        }
+
+        /// <summary>
+        /// Gets or sets the RSA key used for encryption
+        /// </summary>
+        public virtual RSA EncryptionKey
+        {
+            get { return _encryptionKey; }
+            set
+            {
+                _encryptionKey = value;
+                _decryptionKeys = new List<RSA>(new RSA[] { _encryptionKey });
+            }
+        }
+
+        /// <summary>
+        /// Gets the keys used for decryption
+        /// By default, this property returns a list containing only the encryption key.
+        /// </summary>
+        protected virtual ReadOnlyCollection<RSA> DecryptionKeys
+        {
+            get
+            {
+                return _decryptionKeys.AsReadOnly();
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets the name of the hash algorithm to use.
+        /// </summary>
+        /// <remarks>
+        /// SHA256 is the default algorithm. This may require a minimum platform of Windows Server 2003 and .NET 3.5 SP1.
+        /// If SHA256 is not supported, set HashName to "SHA1".
+        /// </remarks>
+        public string HashName
+        {
+            get { return _hashName; }
+            set
+            {
+                using (HashAlgorithm algorithm = CryptoHelper.CreateHashAlgorithm(value))
+                {
+                    if (algorithm == null)
+                    {
+                        throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgument("value", SR.GetString(SR.ID6034, value));
+                    }
+                    _hashName = value;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Decrypts data using the provided RSA key(s) to decrypt an AES key, which decrypts the cookie.
+        /// </summary>
+        /// <param name="encoded">The encoded data</param>
+        /// <returns>The decoded data</returns>
+        /// <exception cref="ArgumentNullException">The argument 'encoded' is null.</exception>
+        /// <exception cref="ArgumentException">The argument 'encoded' contains zero bytes.</exception>
+        /// <exception cref="NotSupportedException">The platform does not support the requested algorithm.</exception>
+        /// <exception cref="InvalidOperationException">There are no decryption keys or none of the keys match.</exception>
+        public override byte[] Decode(byte[] encoded)
+        {
+            if (null == encoded)
+            {
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgumentNull("encoded");
+            }
+
+            if (0 == encoded.Length)
+            {
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgument("encoded", SR.GetString(SR.ID6045));
+            }
+
+            ReadOnlyCollection<RSA> decryptionKeys = DecryptionKeys;
+
+            if (0 == decryptionKeys.Count)
+            {
+                throw DiagnosticUtility.ThrowHelperInvalidOperation(SR.GetString(SR.ID6039));
+            }
+
+            byte[] encryptedKeyAndIV;
+            byte[] encryptedData;
+            byte[] rsaHash;
+            RSA rsaDecryptionKey = null;
+
+            using (HashAlgorithm hash = CryptoHelper.CreateHashAlgorithm(_hashName))
+            {
+                int hashSizeInBytes = hash.HashSize / 8;
+                using (BinaryReader br = new BinaryReader(new MemoryStream(encoded)))
+                {
+                    rsaHash = br.ReadBytes(hashSizeInBytes);
+                    int encryptedKeyAndIVSize = br.ReadInt32();
+                    if (encryptedKeyAndIVSize < 0)
+                    {
+                        throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new FormatException(SR.GetString(SR.ID1006, encryptedKeyAndIVSize)));
+                    }
+                    //
+                    // Enforce upper limit on key size to prevent large buffer allocation in br.ReadBytes()
+                    //
+
+                    if (encryptedKeyAndIVSize > encoded.Length)
+                    {
+                        throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new FormatException(SR.GetString(SR.ID1007)));
+                    }
+                    encryptedKeyAndIV = br.ReadBytes(encryptedKeyAndIVSize);
+
+                    int encryptedDataSize = br.ReadInt32();
+                    if (encryptedDataSize < 0)
+                    {
+                        throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new FormatException(SR.GetString(SR.ID1008, encryptedDataSize)));
+                    }
+                    //
+                    // Enforce upper limit on data size to prevent large buffer allocation in br.ReadBytes()
+                    //
+                    if (encryptedDataSize > encoded.Length)
+                    {
+                        throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new FormatException(SR.GetString(SR.ID1009)));
+                    }
+
+                    encryptedData = br.ReadBytes(encryptedDataSize);
+                }
+
+                //
+                // Find the decryption key matching the one in XML
+                //
+                foreach (RSA key in decryptionKeys)
+                {
+                    byte[] hashedKey = hash.ComputeHash(Encoding.UTF8.GetBytes(key.ToXmlString(false)));
+                    if (CryptoHelper.IsEqual(hashedKey, rsaHash))
+                    {
+                        rsaDecryptionKey = key;
+                        break;
+                    }
+                }
+            }
+
+            if (rsaDecryptionKey == null)
+            {
+                throw DiagnosticUtility.ThrowHelperInvalidOperation(SR.GetString(SR.ID6040));
+            }
+
+            byte[] decryptedKeyAndIV = CngLightup.OaepSha1Decrypt(rsaDecryptionKey, encryptedKeyAndIV);
+
+            using (SymmetricAlgorithm symmetricAlgorithm = CryptoHelper.NewDefaultEncryption())
+            {
+
+                byte[] decryptionKey = new byte[symmetricAlgorithm.KeySize / 8];
+
+                //
+                // Ensure there is sufficient length in the descrypted key and IV buffer for an IV.
+                //
+                if (decryptedKeyAndIV.Length < decryptionKey.Length)
+                {
+                    throw DiagnosticUtility.ThrowHelperInvalidOperation(SR.GetString(SR.ID6047, decryptedKeyAndIV.Length, decryptionKey.Length));
+                }
+
+                byte[] decryptionIV = new byte[decryptedKeyAndIV.Length - decryptionKey.Length];
+
+                //
+                // Copy key into its own buffer.
+                // The remaining bytes are the IV copy those into a buffer as well.
+                //
+                Array.Copy(decryptedKeyAndIV, decryptionKey, decryptionKey.Length);
+                Array.Copy(decryptedKeyAndIV, decryptionKey.Length, decryptionIV, 0, decryptionIV.Length);
+
+                using (ICryptoTransform decryptor = symmetricAlgorithm.CreateDecryptor(decryptionKey, decryptionIV))
+                {
+                    return decryptor.TransformFinalBlock(encryptedData, 0, encryptedData.Length);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Encode the data.  The data is encrypted using the default encryption algorithm (AES-256), 
+        /// then the AES key is encrypted using RSA and the RSA public key is appended.
+        /// </summary>
+        /// <param name="value">The data to encode</param>
+        /// <exception cref="ArgumentNullException">The argument 'value' is null.</exception>
+        /// <exception cref="ArgumentException">The argument 'value' contains zero bytes.</exception>
+        /// <exception cref="InvalidOperationException">The EncryptionKey is null.</exception>
+        /// <returns>Encoded data</returns>
+        public override byte[] Encode(byte[] value)
+        {
+            if (null == value)
+            {
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgumentNull("value");
+            }
+
+            if (0 == value.Length)
+            {
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgument("value", SR.GetString(SR.ID6044));
+            }
+
+            RSA encryptionKey = EncryptionKey;
+
+            if (null == encryptionKey)
+            {
+                throw DiagnosticUtility.ThrowHelperInvalidOperation(SR.GetString(SR.ID6043));
+            }
+
+            byte[] rsaHash;
+            byte[] encryptedKeyAndIV;
+            byte[] encryptedData;
+
+            using (HashAlgorithm hash = CryptoHelper.CreateHashAlgorithm(_hashName))
+            {
+                rsaHash = hash.ComputeHash(Encoding.UTF8.GetBytes(encryptionKey.ToXmlString(false)));
+            }
+
+            using (SymmetricAlgorithm encryptionAlgorithm = CryptoHelper.NewDefaultEncryption())
+            {
+                encryptionAlgorithm.GenerateIV();
+                encryptionAlgorithm.GenerateKey();
+
+                using (ICryptoTransform encryptor = encryptionAlgorithm.CreateEncryptor())
+                {
+                    encryptedData = encryptor.TransformFinalBlock(value, 0, value.Length);
+                }
+
+                RSACryptoServiceProvider provider = encryptionKey as RSACryptoServiceProvider;
+
+                if ( provider == null )
+                {
+                    throw DiagnosticUtility.ThrowHelperInvalidOperation( SR.GetString( SR.ID6041 ) );
+                }
+
+                //
+                // Concatenate the Key and IV in an attempt to avoid two minimum block lengths in the cookie
+                //
+                byte[] keyAndIV = new byte[encryptionAlgorithm.Key.Length + encryptionAlgorithm.IV.Length];
+                Array.Copy(encryptionAlgorithm.Key, keyAndIV, encryptionAlgorithm.Key.Length);
+                Array.Copy(encryptionAlgorithm.IV, 0, keyAndIV, encryptionAlgorithm.Key.Length, encryptionAlgorithm.IV.Length);
+
+                encryptedKeyAndIV = CngLightup.OaepSha1Encrypt(encryptionKey, keyAndIV);
+            }
+
+            using (MemoryStream ms = new MemoryStream())
+            {
+                using (BinaryWriter bw = new BinaryWriter(ms))
+                {
+                    bw.Write(rsaHash);
+                    bw.Write(encryptedKeyAndIV.Length);
+                    bw.Write(encryptedKeyAndIV);
+                    bw.Write(encryptedData.Length);
+                    bw.Write(encryptedData);
+                    bw.Flush();
+                }
+
+                return ms.ToArray();
+            }
+        }
+    }
+}
+                                                                               oolchain-7-qQrbAC/llvm-toolchain-7-7.0.1/projects/compiler-rt/lib/ubsan/ubsan_value.h ((isIntegerTy())) != (0) index %0 out of bounds for type %1 execution reached an unreachable program point execution reached the end of a value-returning function without returning a value variable leng

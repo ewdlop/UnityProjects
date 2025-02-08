@@ -1,0 +1,31 @@
+isl::union_map ZoneAlgorithm::computePerPHI(const ScopArrayInfo *SAI) {
+  // TODO: If the PHI has an incoming block from before the SCoP, it is not
+  // represented in any ScopStmt.
+
+  auto *PHI = cast<PHINode>(SAI->getBasePtr());
+  auto It = PerPHIMaps.find(PHI);
+  if (It != PerPHIMaps.end())
+    return It->second;
+
+  assert(SAI->isPHIKind());
+
+  // { DomainPHIWrite[] -> Scatter[] }
+  isl::union_map PHIWriteScatter = makeEmptyUnionMap();
+
+  // Collect all incoming block timepoints.
+  for (MemoryAccess *MA : S->getPHIIncomings(SAI)) {
+    isl::map Scatter = getScatterFor(MA);
+    PHIWriteScatter = PHIWriteScatter.add_map(Scatter);
+  }
+
+  // { DomainPHIRead[] -> Scatter[] }
+  isl::map PHIReadScatter = getScatterFor(S->getPHIRead(SAI));
+
+  // { DomainPHIRead[] -> Scatter[] }
+  isl::map BeforeRead = beforeScatter(PHIReadScatter, true);
+
+  // { Scatter[] }
+  isl::set WriteTimes = singleton(PHIWriteScatter.range(), ScatterSpace);
+
+  // { DomainPHIRead[] -> Scatter[] }
+  isl:

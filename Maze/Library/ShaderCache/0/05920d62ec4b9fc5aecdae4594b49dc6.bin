@@ -1,0 +1,182 @@
+=====================================================
+  AfterRebuild
+
+    Redefine this target in your project in order to run tasks just after Rebuild.
+  ==================================================================================================
+  -->
+  <Target Name="AfterRebuild" />
+
+  <!--
+  ==================================================================================================
+  BuildOnlySettings
+
+    This target is called only when doing a real build. It is not called during project load.
+  ==================================================================================================
+    -->
+  <PropertyGroup>
+    <BuildingProject>false</BuildingProject>
+  </PropertyGroup>
+  <Target Name="BuildOnlySettings">
+
+    <CreateProperty Value="true">
+      <Output TaskParameter="Value" PropertyName="BuildingProject" />
+    </CreateProperty>
+
+  </Target>
+
+  <!--
+  ==================================================================================================
+  PrepareForBuild
+
+    Prepare the prerequisites for building.
+  ==================================================================================================
+  -->
+  <PropertyGroup>
+    <PrepareForBuildDependsOn></PrepareForBuildDependsOn>
+  </PropertyGroup>
+  <Target
+    Name="PrepareForBuild" DependsOnTargets="$(PrepareForBuildDependsOn)">
+
+    <!--
+    These CreateProperty calls are required because TargetDir and TargetPath are defined
+    to contain an item list. We want that item list to be expanded so that it can be used
+    as a regular property value and not as an item-list-with-transform.
+    -->
+    <CreateProperty Value="$(TargetDir)">
+      <Output TaskParameter="Value" PropertyName="TargetDir" />
+    </CreateProperty>
+
+    <CreateProperty Value="$(TargetPath)">
+      <Output TaskParameter="Value" PropertyName="TargetPath" />
+    </CreateProperty>
+
+    <CreateProperty Value="$(TargetPdbDir)">
+      <Output TaskParameter="Value" PropertyName="TargetPdbDir" />
+    </CreateProperty>
+
+    <!-- Create the directories for intermediate and final build products. -->
+    <MakeDir Directories="$(IntermediateOutputPath);$(OutDir)" />
+  </Target>
+
+  <!--
+  ==================================================================================================
+  ResolveWixExtensionReferences
+
+    Resolves WiX extension references to full paths. Any properties you use
+    to resolve paths to extensions must be defined before importing this
+    file or the extensions will be automatically resolved to $(WixExtDir).
+
+    [IN]
+    @(WixExtension) - WixExtension item group
+
+    [OUT]
+    @(_ResolvedWixExtensionPaths) - Item group with full paths to extensions
+  ==================================================================================================
+  -->
+  <PropertyGroup>
+    <ResolveWixExtensionReferencesDependsOn>
+      PrepareForBuild
+    </ResolveWixExtensionReferencesDependsOn>
+  </PropertyGroup>
+  <Target
+    Name="ResolveWixExtensionReferences"
+    DependsOnTargets="$(ResolveWixExtensionReferencesDependsOn)"
+    Condition=" '@(WixExtension)' != ''">
+
+    <!--
+    The WixExtensionSearchPaths property is set to find assemblies in the following order:
+
+        (1) $(ReferencePaths) - the reference paths property, which comes from the .USER file.
+        (2) The hintpath from the referenced item itself, indicated by {HintPathFromItem}.
+        (3) Treat the reference's Include as if it were a real file name.
+        (4) Path specified by the WixExtDir property.
+    -->
+    <CreateProperty Condition=" '$(WixExtensionSearchPaths)' == '' " Value="
+      $(ReferencePaths);
+      {HintPathFromItem};
+      {RawFileName};
+      $(WixExtDir)
+      ">
+      <Output TaskParameter="Value" PropertyName="WixExtensionSearchPaths" />
+    </CreateProperty>
+
+    <ResolveWixReferences
+      WixReferences="@(WixExtension)"
+      SearchPaths="$(WixExtensionSearchPaths)"
+      SearchFilenameExtensions=".dll">
+      <Output TaskParameter="ResolvedWixReferences" ItemName="_AllResolvedWixExtensionPaths" />
+    </ResolveWixReferences>
+
+    <!-- Remove duplicate extension items that would cause build errors -->
+    <RemoveDuplicates Inputs="@(_AllResolvedWixExtensionPaths)">
+      <Output TaskParameter="Filtered" ItemName="_ResolvedWixExtensionPaths" />
+    </RemoveDuplicates>
+  </Target>
+
+  <!--
+  ==================================================================================================
+  PreBuildEvent
+
+    Run the pre-build event if there is one.
+  ==================================================================================================
+  -->
+  <PropertyGroup>
+    <PreBuildEventDependsOn>GetTargetPath</PreBuildEventDependsOn>
+  </PropertyGroup>
+  <Target
+    Name="PreBuildEvent"
+    DependsOnTargets="$(PreBuildEventDependsOn)"
+    Condition=" '$(PreBuildEvent)' != '' ">
+
+    <ReplaceString
+      Text="$(PreBuildEvent)"
+      OldValue="!(TargetPath)"
+      NewValue="$(TargetPath)">
+      
+      <Output TaskParameter="Text" PropertyName="ExpandedPreBuildEvent" />
+    </ReplaceString>
+    
+    <ReplaceString
+      Text="$(ExpandedPreBuildEvent)"
+      OldValue="!(TargetPdbPath)"
+      NewValue="$(TargetPdbPath)">
+      
+      <Output TaskParameter="Text" PropertyName="ExpandedPreBuildEvent" />
+    </ReplaceString>
+
+    <Exec WorkingDirectory="$(OutDir)" Command="$(ExpandedPreBuildEvent)" />
+  </Target>
+
+  <!--
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  Resolve References Targets
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  -->
+
+  <!--
+  ==================================================================================================
+  ResolveReferences
+  ==================================================================================================
+  -->
+  <PropertyGroup>
+    <ResolveReferencesDependsOn>
+      BeforeResolveReferences;
+      SplitProjectReferencesByType;
+      ResolveProjectReferences;
+      ResolveVCProjectReferences;
+      ResolveWixLibraryReferences;
+      ResolveWixExtensionReferences;
+      AfterResolveReferences
+    </ResolveReferencesDependsOn>
+  </PropertyGroup>
+  <Target
+    Name="ResolveReferences"
+    DependsOnTargets="$(ResolveReferencesDependsOn)" />
+
+  <!--
+  ==================================================================================================
+  BeforeResolveReferences
+
+    Re

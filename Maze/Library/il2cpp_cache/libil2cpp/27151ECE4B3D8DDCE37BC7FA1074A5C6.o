@@ -1,0 +1,89 @@
+
+	DataprepOperation = Cast< UDataprepSpawnActorsAtLocation >(Objects[0].Get());
+	check(DataprepOperation);
+
+	DetailBuilder.HideCategory(FName(TEXT("Warning")));
+	IDetailCategoryBuilder& ImportSettingsCategoryBuilder = DetailBuilder.EditCategory(FName(TEXT("SelectedAsset_Internal")), FText::GetEmpty(), ECategoryPriority::Important);
+
+	// Hide SelectedAsset property as it is replaced with custom widget
+	DetailBuilder.HideProperty(GET_MEMBER_NAME_CHECKED(UDataprepSpawnActorsAtLocation, SelectedAsset));
+
+	FDetailWidgetRow& CustomAssetImportRow = ImportSettingsCategoryBuilder.AddCustomRow(FText::FromString(TEXT("Selected Asset")));
+
+	CustomAssetImportRow.NameContent()
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("DatasmithActorOperationsLabel", "Selected Asset"))
+			.ToolTipText(LOCTEXT("DatasmithMeshOperationsTooltip", "Selected Asset to spawn Actor from"))
+			.Font(DetailBuilder.GetDetailFont())
+		];
+	
+	CustomAssetImportRow.ValueContent()
+		[
+			CreateWidget()
+		];
+}
+
+bool UDataprepCompactSceneGraphOperation::IsActorVisible(AActor* Actor, TMap<AActor*, bool>& VisibilityMap)
+{
+	if (!Actor)
+	{
+		return false;
+	}
+
+	// For scene compaction, actor visibility is defined as the actor having a MeshComponent (PrimitiveComponent could also be used)
+	// or an attached child that is visible
+	bool* bIsVisible = VisibilityMap.Find(Actor);
+	if (bIsVisible)
+	{
+		return *bIsVisible;
+	}
+
+	TArray<UActorComponent*> Components = Actor->GetComponents().Array();
+	for (UActorComponent* Component : Components)
+	{
+		if (UMeshComponent* MeshComponent = Cast<UMeshComponent>(Component))
+		{
+			VisibilityMap.Add(Actor, true);
+			return true;
+		}
+	}
+
+	TArray<AActor*> AttachedActors;
+	Actor->GetAttachedActors(AttachedActors);
+	for (AActor* AttachedActor : AttachedActors)
+	{
+		if (IsActorVisible(AttachedActor, VisibilityMap))
+		{
+			VisibilityMap.Add(Actor, true);
+			return true;
+		}
+	}
+
+	VisibilityMap.Add(Actor, false);
+	return false;
+}
+
+namespace DatasmithEditingOperationsUtils
+{
+	void FindActorsToMerge(const TArray<AActor*>& ChildrenActors, TArray<AActor*>& ActorsToMerge)
+	{
+		for(AActor* ChildActor : ChildrenActors)
+		{
+			TArray<AActor*> ActorsToVisit;
+			ChildActor->GetAttachedActors(ActorsToVisit);
+
+			bool bCouldBeMerged = ActorsToVisit.Num() > 0;
+			for(AActor* ActorToVisit : ActorsToVisit)
+			{
+				TArray<AActor*> Children;
+				ActorToVisit->GetAttachedActors(Children);
+
+				if(Children.Num() > 0)
+				{
+					bCouldBeMerged = false;
+					break;
+				}
+
+				// Check if we can find a static mesh component
+				UStaticMeshComponent* Component = ActorToVisit->FindComponentByClass<UStaticMeshComponent>();

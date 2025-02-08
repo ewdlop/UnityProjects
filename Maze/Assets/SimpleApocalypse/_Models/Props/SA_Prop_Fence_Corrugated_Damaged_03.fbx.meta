@@ -1,0 +1,44 @@
+ickAxis(joystick, SDL_CONTROLLER_AXIS_RIGHTY, axis);
+
+    SDL_memcpy(ctx->last_state, data, SDL_min(size, sizeof(ctx->last_state)));
+}
+
+static SDL_bool
+HIDAPI_DriverXbox360W_UpdateDevice(SDL_HIDAPI_Device *device)
+{
+    SDL_DriverXbox360W_Context *ctx = (SDL_DriverXbox360W_Context *)device->context;
+    SDL_Joystick *joystick = NULL;
+    Uint8 data[USB_PACKET_LENGTH];
+    int size;
+
+    if (device->num_joysticks > 0) {
+        joystick = SDL_JoystickFromInstanceID(device->joysticks[0]);
+    }
+
+    while ((size = hid_read_timeout(device->dev, data, sizeof(data), 0)) > 0) {
+        if (size == 2 && data[0] == 0x08) {
+            SDL_bool connected = (data[1] & 0x80) ? SDL_TRUE : SDL_FALSE;
+#ifdef DEBUG_JOYSTICK
+            SDL_Log("Connected = %s\n", connected ? "TRUE" : "FALSE");
+#endif
+            if (connected != ctx->connected) {
+                ctx->connected = connected;
+
+                if (connected) {
+                    SDL_JoystickID joystickID;
+
+                    HIDAPI_JoystickConnected(device, &joystickID, SDL_FALSE);
+
+                } else if (device->num_joysticks > 0) {
+                    HIDAPI_JoystickDisconnected(device, device->joysticks[0], SDL_FALSE);
+                }
+            }
+        } else if (size == 29 && data[0] == 0x00 && data[1] == 0x0f && data[2] == 0x00 && data[3] == 0xf0) {
+            /* Serial number is data[7-13] */
+#ifdef DEBUG_JOYSTICK
+            SDL_Log("Battery status (initial): %d\n", data[17]);
+#endif
+            if (joystick) {
+                UpdatePowerLevel(joystick, data[17]);
+            }
+        } else if (size == 29 && data[0] == 0x00 && data[1] == 0x00 && data

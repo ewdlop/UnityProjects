@@ -1,0 +1,70 @@
+nstance of the <see cref="T:System.Xml.Serialization.XmlSchemaImporter" /> class, taking a collection of <see cref="T:System.Xml.Schema.XmlSchema" /> objects representing the XML schemas used by SOAP literal messages defined in a WSDL document. </para>
+        </summary>
+        <param name="schemas">
+          <attribution license="cc4" from="Microsoft" modified="false" />A collection of <see cref="T:System.Xml.Schema.XmlSchema" /> objects.</param>
+      </Docs>
+    </Member>
+    <Member MemberName=".ctor">
+      <MemberSignature Language="C#" Value="public XmlSchemaImporter (System.Xml.Serialization.XmlSchemas schemas, System.Xml.Serialization.CodeIdentifiers typeIdentifiers);" />
+      <MemberSignature Language="ILAsm" Value=".method public hidebysig specialname rtspecialname instance void .ctor(class System.Xml.Serialization.XmlSchemas schemas, class System.Xml.Serialization.CodeIdentifiers typeIdentifiers) cil managed" />
+      <MemberType>Constructor</MemberType>
+      <AssemblyInfo>
+        <AssemblyVersion>1.0.5000.0</AssemblyVersion>
+        <AssemblyVersion>2.0.0.0</AssemblyVersion>
+        <AssemblyVersion>4.0.0.0</AssemblyVersion>
+      </AssemblyInfo>
+      <ReturnValue />
+      <Parameters>
+        <Parameter Name="schemas" Type="System.Xml.Serialization.XmlSchemas" />
+        <Parameter Name="typeIdentifiers" Type="System.Xml.Serialization.CodeIdentifiers" />
+      </Parameters>
+      <Docs>
+        <remarks>
+          <attribution license="cc4" from="Microsoft" modified="false" />
+          <para>Use this constructor when a WSDL document specifies that the data is serialized according to a schema (&lt;soap:body use = 'literal' /&gt;).</para>
+          <para>Instead of directly creating an instance of the <see cref="T:System.Xml.Serialization.XmlSchemaImporter" /> class, use Wsdl.exe or Xsd.exe.</para>
+        </remarks>
+        <summary>
+          <attribution license="cc4" from="Microsoft" modified="false" />
+          <para>Initializes a new instance of the <see cref="T:System.Xml.Serialization.XmlSchemaImporter" /> class, taking a collection of <see cref="T:System.Xml.Schema.XmlSchema" /> objects that represents the XML schemas used by SOAP literal messages, plus classes being generated for bindings defined in a Web Services Description Language (WSDL) document. </para>
+        </summary>
+        <param name="schemas">
+          <attribution license="cc4" from="Microsoft" modified="false" />An <see cref="T:System.Xml.Serialization.XmlSchemas" /> object.</param>
+        <param name="typeIdentifiers">
+          <attribution license="cc4" from="Microsoft" modified="false" />A <see cref="T:System.Xml.Serialization.CodeIdentifiers" /> object that specifies a collection of classes being generated for bindings defined in a WSDL document.</param>
+      </Docs>
+    </Member>
+    <Member MemberName=".ctor">
+      <MemberSignature Language="C#" Value="public XmlSchemaImporter (System.Xml.Serialization.XmlSchemas schemas, System.Xml.Serialization.CodeGenerationOptions options, System.Xml.Serialization.ImportContext context);" />
+      <MemberSignature Language="ILAsm" Value=".method public hidebysig specialname rtspecialname instance void .ctor(class System.Xml.Serialization.XmlSchemas schemas, valuetype System.Xml.Serialization.CodeGenerationOptions options, class System.Xml.Serialization.ImportContext context) cil managed" />
+      <MemberType>Constructor</MemberType>
+      <AssemblyInfo>
+        <AssemblyVersion>2.0.0.0</AssemblyVersion>
+        <AssemblyVersion>4.0.0.0</AssemblyVersion>
+      </AssemblyInfo>
+      <Parameters>
+        <Parameter Name="schemas" Type="System.Xml.Serialization.XmlSchemas" />
+        <Parameter Name="options" Type="System.Xml.Serialization.CodeGenerationOptions" />
+        <Parameter Name="context" Type="System.Xml.Serialization.ImportContext" />
+      </Parameters>
+      <Docs>
+        <remarks>To be added.</remarks>
+        <since version=".NET 2.0" />
+        <summary>
+          <attribution license="cc4" from="Microsoft" modified="false" />
+          <para>Initializes a new instance of the <see cref="T:System.Xml.Serialization.XmlSchemaImporter" /> class for a collection of XML schemas, using the specified code generation options and import context.</para>
+        </summary>
+        <param name="schemas">
+          <attribution license="cc4" from="Microsoft" modified="false" />A collection of <see cref="T:System.Xml.Schema.XmlSchema" /> objects.</param>
+        <param name="options">
+          <attribution license="cc4" from="Microsoft" modified="false" />A <see cref="T:System.Xml.Serialization.CodeGenerationOptions" /> enumeration that specifies code generation options.</param>
+        <param name="context">
+          <attribution license="cc4" from="Microsoft" modified="false" />A <see cref="T:System.Xml.Serialization.ImportContext" /> instance that specifies the import context.</param>
+      </Docs>
+    </Member>
+    <Member MemberName=".ctor">
+      <MemberSignature Language="C#" Value="public XmlSchemaImporter (System.Xml.Serialization.XmlSchemas schemas, System.Xml.Serialization.CodeIdentifiers typeIdentifiers, System.Xml.Serialization.CodeGenerationOptions options);" />
+      <MemberSignature Language="ILAsm" Value=".method public hidebysig specialname rtspecialname instance void .ctor(class System.Xml.Serialization.XmlSchemas schemas, class System.Xml.Serialization.CodeIdentifiers typeIdentifiers, valuetype System.Xml.Serialization.CodeGenerationOptions options) cil managed" />
+      <MemberType>Constructor</MemberType>
+      <AssemblyInfo>
+        <AssemblyVersion>2.

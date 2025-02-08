@@ -1,0 +1,43 @@
+_union(Stores.take(), AccRel.take()));
+  }
+}
+
+void ZoneAlgorithm::addArrayReadAccess(MemoryAccess *MA) {
+  assert(MA->isLatestArrayKind());
+  assert(MA->isRead());
+  ScopStmt *Stmt = MA->getStatement();
+
+  // { DomainRead[] -> Element[] }
+  auto AccRel = intersectRange(getAccessRelationFor(MA), CompatibleElts);
+  AllReads = give(isl_union_map_add_map(AllReads.take(), AccRel.copy()));
+
+  if (LoadInst *Load = dyn_cast_or_null<LoadInst>(MA->getAccessInstruction())) {
+    // { DomainRead[] -> ValInst[] }
+    isl::map LoadValInst = makeValInst(
+        Load, Stmt, LI->getLoopFor(Load->getParent()), Stmt->isBlockStmt());
+
+    // { DomainRead[] -> [Element[] -> DomainRead[]] }
+    isl::map IncludeElement =
+        give(isl_map_curry(isl_map_domain_map(AccRel.take())));
+
+    // { [Element[] -> DomainRead[]] -> ValInst[] }
+    isl::map EltLoadValInst =
+        give(isl_map_apply_domain(LoadValInst.take(), IncludeElement.take()));
+
+    AllReadValInst = give(
+        isl_union_map_add_map(AllReadValInst.take(), EltLoadValInst.take()));
+  }
+}
+
+isl::union_map ZoneAlgorithm::getWrittenValue(MemoryAccess *MA,
+                                              isl::map AccRel) {
+  if (!MA->isMustWrite())
+    return {};
+
+  Value *AccVal = MA->getAccessValue();
+  ScopStmt *Stmt = MA->getStatement();
+  Instruction *AccInst = MA->getAccessInstruction();
+
+  // Write a value to a single element.
+  auto L = MA->isOriginalArrayKind() ? LI->getLoopFor(AccInst->getParent())
+                                     : S

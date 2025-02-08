@@ -1,0 +1,219 @@
+, DeleteTy);
+    EmitBlock(DeleteEnd);
+    return;
+  }
+
+  // We might be deleting a pointer to array.  If so, GEP down to the
+  // first non-array element.
+  // (this assumes that A(*)[3][7] is converted to [3 x [7 x %A]]*)
+  if (DeleteTy->isConstantArrayType()) {
+    llvm::Value *Zero = Builder.getInt32(0);
+    SmallVector<llvm::Value*,8> GEP;
+
+    GEP.push_back(Zero); // point at the outermost array
+
+    // For each layer of array type we're pointing at:
+    while (const ConstantArrayType *Arr
+             = getContext().getAsConstantArrayType(DeleteTy)) {
+      // 1. Unpeel the array type.
+      DeleteTy = Arr->getElementType();
+
+      // 2. GEP to the first element of the array.
+      GEP.push_back(Zero);
+    }
+
+    Ptr = Address(Builder.CreateInBoundsGEP(Ptr.getPointer(), GEP, "del.first"),
+                  Ptr.getAlignment());
+  }
+
+  assert(ConvertTypeForMem(DeleteTy) == Ptr.getElementType());
+
+  if (E->isArrayForm()) {
+    EmitArrayDelete(*this, E, Ptr, DeleteTy);
+  } else {
+    EmitObjectDelete(*this, E, Ptr, DeleteTy);
+  }
+
+  EmitBlock(DeleteEnd);
+}
+
+static bool isGLValueFromPointerDeref(const Expr *E) {
+  E = E->IgnoreParens();
+
+  if (const auto *CE = dyn_cast<CastExpr>(E)) {
+    if (!CE->getSubExpr()->isGLValue())
+      return false;
+    return isGLValueFromPointerDeref(CE->getSubExpr());
+  }
+
+  if (const auto *OVE = dyn_cast<OpaqueValueExpr>(E))
+    return isGLValueFromPointerDeref(OVE->getSourceExpr());
+
+  if (const auto *BO = dyn_cast<BinaryOperator>(E))
+    if (BO->getOpcode() == BO_Comma)
+      return isGLValueFromPointerDeref(BO->getRHS());
+
+  if (const auto *ACO = dyn_cast<AbstractConditionalOperator>(E))
+    return isGLValueFromPointerDeref(ACO->getTrueExpr()) ||
+           isGLValueFromPointerDeref(ACO->getFalseExpr());
+
+  // C++11 [expr.sub]p1:
+  //   The expression E1[E2] is identical (by definition) to *((E1)+(E2))
+  if (isa<ArraySubscriptExpr>(E))
+    return true;
+
+  if (const auto *UO = dyn_cast<UnaryOperator>(E))
+    if (UO->getOpcode() == UO_Deref)
+      return true;
+
+  return false;
+}
+
+static llvm::Value *EmitTypeidFromVTable(CodeGenFunction &CGF, const Expr *E,
+                                         llvm::Type *StdTypeInfoPtrTy) {
+  // Get the vtable pointer.
+  Address ThisPtr = CGF.EmitLValue(E).getAddress();
+
+  QualType SrcRecordTy = E->getType();
+
+  // C++ [class.cdtor]p4:
+  //   If the operand of typeid refers to the object under construction or
+  //   destruction and the static type of the operand is neither the constructor
+  //   or destructor’s class nor one of its bases, the behavior is undefined.
+  CGF.EmitTypeCheck(CodeGenFunction::TCK_DynamicOperation, E->getExprLoc(),
+                    ThisPtr.getPointer(), SrcRecordTy);
+
+  // C++ [expr.typeid]p2:
+  //   If the glvalue expression is obtained by applying the unary * operator to
+  //   a pointer and the pointer is a null pointer value, the typeid expression
+  //   throws the std::bad_typeid exception.
+  //
+  // However, this paragraph's intent is not clear.  We choose a very generous
+  // interpretation which implores us to consider comma operators, conditional
+  // operators, parentheses and other such constructs.
+  if (CGF.CGM.getCXXABI().shouldTypeidBeNullChecked(
+          isGLValueFromPointerDeref(E), SrcRecordTy)) {
+    llvm::BasicBlock *BadTypeidBlock =
+        CGF.createBasicBlock("typeid.bad_typeid");
+    llvm::BasicBlock *EndBlock = CGF.createBasicBlock("typeid.end");
+
+    llvm::Value *IsNull = CGF.Builder.CreateIsNull(ThisPtr.getPointer());
+    CGF.Builder.CreateCondBr(IsNull, BadTypeidBlock, EndBlock);
+
+    CGF.EmitBlock(BadTypeidBlock);
+    CGF.CGM.getCXXABI().EmitBadTypeidCall(CGF);
+    CGF.EmitBlock(EndBlock);
+  }
+
+  return CGF.CGM.getCXXABI().EmitTypeid(CGF, SrcRecordTy, ThisPtr,
+                                        StdTypeInfoPtrTy);
+}
+
+llvm::Value *CodeGenFunction::EmitCXXTypeidExpr(const CXXTypeidExpr *E) {
+  llvm::Type *StdTypeInfoPtrTy = 
+    ConvertType(E->getType())->getPointerTo();
+  
+  if (E->isTypeOperand()) {
+    llvm::Constant *TypeInfo =
+        CGM.GetAddrOfRTTIDescriptor(E->getTypeOperand(getContext()));
+    return Builder.CreateBitCast(TypeInfo, StdTypeInfoPtrTy);
+  }
+
+  // C++ [expr.typeid]p2:
+  //   When typeid is applied to a glvalue expression whose type is a
+  //   polymorphic class type, the result refers to a std::type_info object
+  //   representing the type of the most derived object (that is, the dynamic
+  //   type) to which the glvalue refers.
+  if (E->isPotentiallyEvaluated())
+    return EmitTypeidFromVTable(*this, E->getExprOperand(), 
+                                StdTypeInfoPtrTy);
+
+  QualType OperandTy = E->getExprOperand()->getType();
+  return Builder.CreateBitCast(CGM.GetAddrOfRTTIDescriptor(OperandTy),
+                               StdTypeInfoPtrTy);
+}
+
+static llvm::Value *EmitDynamicCastToNull(CodeGenFunction &CGF,
+                                          QualType DestTy) {
+  llvm::Type *DestLTy = CGF.ConvertType(DestTy);
+  if (DestTy->isPointerType())
+    return llvm::Constant::getNullValue(DestLTy);
+
+  /// C++ [expr.dynamic.cast]p9:
+  ///   A failed cast to reference type throws std::bad_cast
+  if (!CGF.CGM.getCXXABI().EmitBadCastCall(CGF))
+    return nullptr;
+
+  CGF.EmitBlock(CGF.createBasicBlock("dynamic_cast.end"));
+  return llvm::UndefValue::get(DestLTy);
+}
+
+llvm::Value *CodeGenFunction::EmitDynamicCast(Address ThisAddr,
+                                              const CXXDynamicCastExpr *DCE) {
+  CGM.EmitExplicitCastExprType(DCE, this);
+  QualType DestTy = DCE->getTypeAsWritten();
+
+  QualType SrcTy = DCE->getSubExpr()->getType();
+
+  // C++ [expr.dynamic.cast]p7:
+  //   If T is "pointer to cv void," then the result is a pointer to the most
+  //   derived object pointed to by v.
+  const PointerType *DestPTy = DestTy->getAs<PointerType>();
+
+  bool isDynamicCastToVoid;
+  QualType SrcRecordTy;
+  QualType DestRecordTy;
+  if (DestPTy) {
+    isDynamicCastToVoid = DestPTy->getPointeeType()->isVoidType();
+    SrcRecordTy = SrcTy->castAs<PointerType>()->getPointeeType();
+    DestRecordTy = DestPTy->getPointeeType();
+  } else {
+    isDynamicCastToVoid = false;
+    SrcRecordTy = SrcTy;
+    DestRecordTy = DestTy->castAs<ReferenceType>()->getPointeeType();
+  }
+
+  // C++ [class.cdtor]p5:
+  //   If the operand of the dynamic_cast refers to the object under
+  //   construction or destruction and the static type of the operand is not a
+  //   pointer to or object of the constructor or destructor’s own class or one
+  //   of its bases, the dynamic_cast results in undefined behavior.
+  EmitTypeCheck(TCK_DynamicOperation, DCE->getExprLoc(), ThisAddr.getPointer(),
+                SrcRecordTy);
+
+  if (DCE->isAlwaysNull())
+    if (llvm::Value *T = EmitDynamicCastToNull(*this, DestTy))
+      return T;
+
+  assert(SrcRecordTy->isRecordType() && "source type must be a record type!");
+
+  // C++ [expr.dynamic.cast]p4: 
+  //   If the value of v is a null pointer value in the pointer case, the result
+  //   is the null pointer value of type T.
+  bool ShouldNullCheckSrcValue =
+      CGM.getCXXABI().shouldDynamicCastCallBeNullChecked(SrcTy->isPointerType(),
+                                                         SrcRecordTy);
+
+  llvm::BasicBlock *CastNull = nullptr;
+  llvm::BasicBlock *CastNotNull = nullptr;
+  llvm::BasicBlock *CastEnd = createBasicBlock("dynamic_cast.end");
+  
+  if (ShouldNullCheckSrcValue) {
+    CastNull = createBasicBlock("dynamic_cast.null");
+    CastNotNull = createBasicBlock("dynamic_cast.notnull");
+
+    llvm::Value *IsNull = Builder.CreateIsNull(ThisAddr.getPointer());
+    Builder.CreateCondBr(IsNull, CastNull, CastNotNull);
+    EmitBlock(CastNotNull);
+  }
+
+  llvm::Value *Value;
+  if (isDynamicCastToVoid) {
+    Value = CGM.getCXXABI().EmitDynamicCastToVoid(*this, ThisAddr, SrcRecordTy,
+                                                  DestTy);
+  } else {
+    assert(DestRecordTy->isRecordType() &&
+           "destination type must be a record type!");
+    Value = CGM.getCXXABI().EmitDynamicCastCall(*this, ThisAddr, SrcRecordTy,
+                                                DestTy, DestRecordTy, CastEnd);
+    CastNotNull = Builder.G

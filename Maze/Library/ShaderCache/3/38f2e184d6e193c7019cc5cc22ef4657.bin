@@ -1,0 +1,283 @@
+ (false)]
+		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+		public SelectedObjectCollection SelectedItems {
+			get {return selected_items;}
+		}
+
+		[DefaultValue (SelectionMode.One)]
+		public virtual SelectionMode SelectionMode {
+			get { return selection_mode; }
+			set {
+				if (!Enum.IsDefined (typeof (SelectionMode), value))
+					throw new InvalidEnumArgumentException (string.Format("Enum argument value '{0}' is not valid for SelectionMode", value));
+
+				if (selection_mode == value)
+					return;
+					
+				selection_mode = value;
+					
+				switch (selection_mode) {
+				case SelectionMode.None: 
+					SelectedIndices.Clear ();
+					break;
+
+				case SelectionMode.One:
+					// FIXME: Probably this can be improved
+					ArrayList old_selection = (ArrayList) SelectedIndices.List.Clone ();
+					for (int i = 1; i < old_selection.Count; i++)
+						SelectedIndices.Remove ((int)old_selection [i]);
+					break;
+
+				default:
+					break;
+				}
+
+				// UIA Framework: Generates SelectionModeChanged event.
+				OnUIASelectionModeChangedEvent ();
+			}
+		}
+
+		[DefaultValue (false)]
+		public bool Sorted {
+			get { return sorted; }
+			set {
+				if (sorted == value)
+					return;
+
+				sorted = value;
+				if (sorted)
+					Sort ();
+			}
+		}
+
+		[Bindable (false)]
+		[Browsable (false)]
+		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+		[EditorBrowsable (EditorBrowsableState.Advanced)]
+		public override string Text {
+			get {
+				if (SelectionMode != SelectionMode.None && SelectedIndex != -1)
+					return GetItemText (SelectedItem);
+
+				return base.Text;
+			}
+			set {
+
+				base.Text = value;
+
+				if (SelectionMode == SelectionMode.None)
+					return;
+
+				int index;
+
+				index = FindStringExact (value);
+
+				if (index == -1)
+					return;
+
+				SelectedIndex = index;
+			}
+		}
+
+		[Browsable (false)]
+		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+		public int TopIndex {
+			get { return top_index; }
+			set {
+				if (value == top_index)
+					return;
+
+				if (value < 0 || value >= Items.Count)
+					return;
+
+				int page_size = (items_area.Height / ItemHeight);
+				
+				if (Items.Count < page_size)
+					value = 0;
+				else if (!multicolumn)
+					top_index = Math.Min (value, Items.Count - page_size);
+				else
+					top_index = value;
+					
+				UpdateTopItem ();
+				base.Refresh ();
+			}
+		}
+
+		[Browsable (false)]
+		[DefaultValue (false)]
+		public bool UseCustomTabOffsets {
+			get { return use_custom_tab_offsets; }
+			set { 
+				if (use_custom_tab_offsets != value) {
+					use_custom_tab_offsets = value;
+					CalculateTabStops ();
+				}
+			 }
+		}
+
+		[DefaultValue (true)]
+		public bool UseTabStops {
+			get { return use_tabstops; }
+			set {
+				if (use_tabstops == value)
+					return;
+
+				use_tabstops = value;
+				CalculateTabStops ();
+			}
+		}
+
+		protected override bool AllowSelection {
+			get {
+				return SelectionMode != SelectionMode.None;
+			}
+		}
+		#endregion Public Properties
+
+		#region Private Properties
+
+		private int ColumnWidthInternal {
+			get { return column_width_internal; }
+			set { column_width_internal = value; }
+		}
+
+		private int row_count = 1;
+		private int RowCount {
+			get {
+				return MultiColumn ? row_count : Items.Count;
+			}
+		}
+
+		#endregion Private Properties
+
+		#region UIA Framework Properties
+
+		internal ScrollBar UIAHScrollBar {
+			get { return hscrollbar; }
+		}
+
+		internal ScrollBar UIAVScrollBar {
+			get { return vscrollbar; }
+		}
+
+		#endregion UIA Framework Properties
+
+		#region Public Methods
+		[Obsolete ("this method has been deprecated")]
+		protected virtual void AddItemsCore (object[] value)
+		{
+			Items.AddRange (value);
+		}
+
+		public void BeginUpdate ()
+		{
+			suspend_layout = true;
+		}
+
+		public void ClearSelected ()
+		{
+			selected_indices.Clear ();
+		}
+
+		protected virtual ObjectCollection CreateItemCollection ()
+		{
+			return new ObjectCollection (this);
+		}
+
+		public void EndUpdate ()
+		{
+			suspend_layout = false;
+			LayoutListBox ();
+			base.Refresh ();
+		}
+
+		public int FindString (String s)
+		{
+			return FindString (s, -1);
+		}
+
+		public int FindString (string s,  int startIndex)
+		{
+			if (Items.Count == 0)
+				return -1; // No exception throwing if empty
+
+			if (startIndex < -1 || startIndex >= Items.Count)
+				throw new ArgumentOutOfRangeException ("Index of out range");
+
+			startIndex = (startIndex == Items.Count - 1) ? 0 : startIndex + 1;
+
+			int i = startIndex;
+			while (true) {
+				string text = GetItemText (Items [i]);
+				if (CultureInfo.CurrentCulture.CompareInfo.IsPrefix (text, s,
+						CompareOptions.IgnoreCase))
+					return i;
+
+				i = (i == Items.Count - 1) ? 0 : i + 1;
+				if (i == startIndex)
+					break;
+			}
+
+			return NoMatches;
+		}
+
+		public int FindStringExact (string s)
+		{
+			return FindStringExact (s, -1);
+		}
+
+		public int FindStringExact (string s,  int startIndex)
+		{
+			if (Items.Count == 0)
+				return -1; // No exception throwing if empty
+
+			if (startIndex < -1 || startIndex >= Items.Count)
+				throw new ArgumentOutOfRangeException ("Index of out range");
+
+			startIndex = (startIndex + 1 == Items.Count) ? 0 : startIndex + 1;
+
+			int i = startIndex;
+			while (true) {
+				if (String.Compare (GetItemText (Items[i]), s, true) == 0)
+					return i;
+
+				i = (i + 1 == Items.Count) ? 0 : i + 1;
+				if (i == startIndex)
+					break;
+			}
+
+			return NoMatches;
+		}
+
+		public int GetItemHeight (int index)
+		{
+			if (index < 0 || index >= Items.Count)
+				throw new ArgumentOutOfRangeException ("Index of out range");
+				
+			if (DrawMode == DrawMode.OwnerDrawVariable && IsHandleCreated == true) {
+				
+				object o = Items [index];
+				if (item_heights.Contains (o))
+					return (int) item_heights [o];
+				
+				MeasureItemEventArgs args = new MeasureItemEventArgs (DeviceContext, index, ItemHeight);
+				OnMeasureItem (args);
+				item_heights [o] = args.ItemHeight;
+				return args.ItemHeight;
+			}
+
+			return ItemHeight;
+		}
+
+		public Rectangle GetItemRectangle (int index)
+		{
+			if (index < 0 || index >= Items.Count)
+				throw new  ArgumentOutOfRangeException ("GetItemRectangle index out of range.");
+
+			Rectangle rect = new Rectangle ();
+
+			if (MultiColumn) {
+				int col = index / RowCount;
+				int y = index;
+				if (y < 0) // We convert it 

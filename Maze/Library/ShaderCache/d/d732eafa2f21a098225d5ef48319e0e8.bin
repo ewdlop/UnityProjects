@@ -1,0 +1,40 @@
+ else if(
+                baseSharedData->staticData->conversionType==UCNV_MBCS &&
+                baseSharedData->staticData->minBytesPerChar==1 &&
+                baseSharedData->staticData->maxBytesPerChar==2 &&
+                mbcsTable->countStates<=127
+            ) {
+                /* non-stateful base converter, need to modify the state table */
+                int32_t (*newStateTable)[256];
+                int32_t *state;
+                int32_t i, count;
+
+                /* allocate a new state table and copy the base state table contents */
+                count=mbcsTable->countStates;
+                newStateTable=(int32_t (*)[256])uprv_malloc((count+1)*1024);
+                if(newStateTable==NULL) {
+                    ucnv_unload(baseSharedData);
+                    *pErrorCode=U_MEMORY_ALLOCATION_ERROR;
+                    return;
+                }
+
+                uprv_memcpy(newStateTable, mbcsTable->stateTable, count*1024);
+
+                /* change all final single-byte entries to go to a new all-illegal state */
+                state=newStateTable[0];
+                for(i=0; i<256; ++i) {
+                    if(MBCS_ENTRY_IS_FINAL(state[i])) {
+                        state[i]=MBCS_ENTRY_TRANSITION(count, 0);
+                    }
+                }
+
+                /* build the new all-illegal state */
+                state=newStateTable[count];
+                for(i=0; i<256; ++i) {
+                    state[i]=MBCS_ENTRY_FINAL(0, MBCS_STATE_ILLEGAL, 0);
+                }
+                mbcsTable->stateTable=(const int32_t (*)[256])newStateTable;
+                mbcsTable->countStates=(uint8_t)(count+1);
+                mbcsTable->stateTableOwned=TRUE;
+
+                mbcsTable->out

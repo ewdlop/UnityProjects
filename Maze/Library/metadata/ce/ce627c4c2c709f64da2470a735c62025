@@ -1,0 +1,109 @@
+l.Get ());
+			Assert.That (exactlyOne.NamespaceURI, Is.EqualTo (WspNamespace), label.Get ());
+			Assert.That (exactlyOne.LocalName, Is.EqualTo ("ExactlyOne"), label.Get ());
+			label.LeaveScope ();
+
+			label.EnterScope ("wsp:Any");
+			var all = AssertExactlyOneChildElement (exactlyOne);
+			Assert.That (all, Is.Not.Null, label.Get ());
+			Assert.That (all.NamespaceURI, Is.EqualTo (WspNamespace), label.Get ());
+			Assert.That (all.LocalName, Is.EqualTo ("All"), label.Get ());
+			label.LeaveScope ();
+
+			var collection = new PolicyAssertionCollection ();
+
+			label.EnterScope ("assertions");
+			foreach (var node in all.ChildNodes) {
+				if (node is XmlWhitespace)
+					continue;
+				Assert.IsInstanceOfType (typeof (XmlElement), node, label.ToString ());
+				collection.Add ((XmlElement)node);
+			}
+			label.LeaveScope ();
+
+			label.LeaveScope ();
+
+			return collection;
+		}
+
+		public static void TestOperation (MetadataSet metadata, bool soap12, TestLabel label)
+		{
+			label.EnterScope ("TestOperation");
+
+			label.EnterScope ("metadata");
+			WS.ServiceDescription sd = null;
+			foreach (var ms in metadata.MetadataSections) {
+				if (!ms.Dialect.Equals ("http://schemas.xmlsoap.org/wsdl/"))
+					continue;
+				sd = ms.Metadata as WS.ServiceDescription;
+			}
+			Assert.That (sd, Is.Not.Null, label.Get ());
+			Assert.That (sd.Bindings, Is.Not.Null, label.Get ());
+			Assert.That (sd.Bindings.Count, Is.EqualTo (1), label.Get ());
+			var binding = sd.Bindings [0];
+			label.LeaveScope ();
+
+			label.EnterScope ("operation");
+			Assert.That (binding.Operations, Is.Not.Null, label.Get ());
+			Assert.That (binding.Operations.Count, Is.EqualTo (1), label.Get ());
+			var op = binding.Operations [0];
+
+			Assert.That (op.Name, Is.EqualTo ("Hello"), label.Get ());
+			Assert.That (op.ExtensibleAttributes, Is.Null, label.Get ());
+
+			label.EnterScope ("extensions");
+			Assert.That (op.Extensions, Is.Not.Null, label.Get ());
+			Assert.That (op.Extensions.Count, Is.EqualTo (1), label.Get ());
+			Assert.That (op.Extensions [0], Is.AssignableTo<WS.SoapOperationBinding>(), label.Get ());
+			var soap = (WS.SoapOperationBinding)op.Extensions [0];
+			TestSoap (soap, soap12, label);
+			label.LeaveScope ();
+
+			TestSoapMessage (op.Input, soap12, label);
+			TestSoapMessage (op.Output, soap12, label);
+			label.LeaveScope (); // operation
+
+			label.LeaveScope ();
+		}
+
+		static void TestSoap (WS.SoapOperationBinding soap, bool soap12, TestLabel label)
+		{
+			label.EnterScope ("soap");
+			var type = soap12 ? typeof (WS.Soap12OperationBinding) : typeof (WS.SoapOperationBinding);
+			Assert.That (soap.GetType (), Is.EqualTo (type), label.Get ());
+			Assert.That (soap.Style, Is.EqualTo (WS.SoapBindingStyle.Document), label.Get ());
+			Assert.That (soap.SoapAction, Is.EqualTo ("http://tempuri.org/IMyContract/Hello"), label.Get ());
+			Assert.That (soap.Required, Is.False, label.Get ());
+			label.LeaveScope ();
+		}
+
+		static void TestSoapMessage (WS.MessageBinding binding, bool soap12, TestLabel label)
+		{
+			label.EnterScope (binding is WS.InputBinding ? "input" : "output");
+
+			Assert.That (binding, Is.Not.Null, label.Get ());
+			Assert.That (binding.Name, Is.Null, label.Get ());
+			Assert.That (binding.ExtensibleAttributes, Is.Null, label.Get ());
+			Assert.That (binding.Extensions, Is.Not.Null, label.Get ());
+			Assert.That (binding.Extensions.Count, Is.EqualTo (1), label.Get ());
+			Assert.That (binding.Extensions [0], Is.AssignableTo<WS.SoapBodyBinding> (), label.Get ());
+			var body = (WS.SoapBodyBinding)binding.Extensions [0];
+			TestSoapBody (body, soap12, label);
+			label.LeaveScope ();
+		}
+
+		static void TestSoapBody (WS.SoapBodyBinding soap, bool soap12, TestLabel label)
+		{
+			label.EnterScope ("soap-body");
+			var type = soap12 ? typeof (WS.Soap12BodyBinding) : typeof (WS.SoapBodyBinding);
+			Assert.That (soap.GetType (), Is.EqualTo (type), label.Get ());
+			Assert.That (soap.Encoding, Is.Empty, label.Get ());
+			Assert.That (soap.Namespace, Is.Empty, label.Get ());
+			Assert.That (soap.Parts, Is.Null, label.Get ());
+			Assert.That (soap.Use, Is.EqualTo (WS.SoapBindingUse.Literal), label.Get ());
+			label.LeaveScope ();
+		}
+
+		public static void AssertConfig (MetadataSet metadata, XmlDocument xml, TestLabel label)
+		{
+	

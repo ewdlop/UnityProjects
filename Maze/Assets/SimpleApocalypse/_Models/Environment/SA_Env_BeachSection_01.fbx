@@ -1,0 +1,259 @@
+ngstream string;
+        if (error != nullptr)
+        {
+           string << L"Failed to create diagnostics manifest: " <<  *NSStringToFString(error.localizedDescription);
+           Callback(EAzureSpatialAnchorsResult::FailSeeErrorString, string.str().c_str(), L"");
+           return;
+        }
+        
+        string << *NSStringToFString(value);
+        Callback(EAzureSpatialAnchorsResult::Success, L"", string.str().c_str());
+    }];
+}
+
+void FAzureSpatialAnchorsARKitInterop::SubmitDiagnosticsManifestAsync(const FString& ManifestPath, IAzureSpatialAnchors::Callback_Result Callback)
+{
+    if (!Session)
+    {
+        Callback(EAzureSpatialAnchorsResult::FailNoSession, L"");
+    }
+    
+    NSString *Path = FStringToNSString(ManifestPath);
+    [Session.diagnostics submitManifest:Path withCompletionHandler:^(NSError *error) {
+        if (error != nullptr)
+        {
+           std::wstringstream string;
+           string << L"Failed to submit diagnostics manifest: " <<  *NSStringToFString(error.localizedDescription);
+           Callback(EAzureSpatialAnchorsResult::FailSeeErrorString, string.str().c_str());
+           return;
+        }
+        
+        Callback(EAzureSpatialAnchorsResult::Success, L"");
+    }];
+}
+
+void FAzureSpatialAnchorsARKitInterop::CreateNamedARPinAroundAnchor(const FString& InLocalAnchorId, UARPin*& OutARPin)
+{
+    OutARPin = nullptr;
+    // TODO: jeff.fisher
+}
+
+bool FAzureSpatialAnchorsARKitInterop::CreateARPinAroundAzureCloudSpatialAnchor(const FString& PinId, UAzureCloudSpatialAnchor* InAzureCloudSpatialAnchor, UARPin*& OutARPin)
+{
+    OutARPin = nullptr;
+    if (!ARSystem.IsValid())
+    {
+        UE_LOG(LogAzureSpatialAnchorsARKitInterop, Error, TEXT("Attempted to create an ARPin for an AzureCloudSpatialAnchor when no valid AR System was found"));
+    }
+    
+    if (!Session ||
+        !bSessionRunning)
+    {
+        UE_LOG(LogAzureSpatialAnchorsARKitInterop, Error, TEXT("Attempted to create an ARPin for an AzureCloudSpatialAnchor when no Azure Spatial Anchor session was running"));
+        return false;
+    }
+    
+    if (!InAzureCloudSpatialAnchor)
+    {
+        UE_LOG(LogAzureSpatialAnchorsARKitInterop, Error, TEXT("Attempted to create an ARPin for a null AzureCloudSpatialAnchor"));
+        return false;
+    }
+    
+    if (InAzureCloudSpatialAnchor->ARPin)
+    {
+        UE_LOG(LogAzureSpatialAnchorsARKitInterop, Warning, TEXT("Attempted to create an ARPin for an AzureCloudSpatialAnchor that already had an ARPin"));
+        return true;
+    }
+    
+    ASACloudSpatialAnchor *Anchor;
+    {
+        FScopeLock Lock(&CloudAnchorMapMutex);
+        if (!CloudAnchorMap.Contains(InAzureCloudSpatialAnchor->CloudAnchorID))
+        {
+            UE_LOG(LogAzureSpatialAnchorsARKitInterop, Error, TEXT("Attempted to create an ARPin for an invalid AzureCloudSpatialAnchor"));
+            return false;
+        }
+        
+        Anchor = CloudAnchorMap[InAzureCloudSpatialAnchor->CloudAnchorID];
+    }
+    
+    ARAnchor* LocalAnchor = Anchor.localAnchor;
+    if (!LocalAnchor)
+    {
+        UE_LOG(LogAzureSpatialAnchorsARKitInterop, Error, TEXT("Attempted to create an ARPin for an AzureCloudSpatialAnchor without a valid ARAnchor"));
+        return false;
+    }
+    
+    UARPin* ARPin = nullptr;
+    if(!ARSystem->TryGetOrCreatePinForNativeResource(static_cast<void*>(LocalAnchor), PinId, ARPin))
+    {
+        UE_LOG(LogAzureSpatialAnchorsARKitInterop, Error, TEXT("ARKit failed to create an ARPin for the provided ARAnchor"));
+        return false;
+    }
+
+    InAzureCloudSpatialAnchor->ARPin = ARPin;
+    OutARPin = ARPin;
+	return true;
+}
+
+IAzureSpatialAnchors::CloudAnchorID FAzureSpatialAnchorsARKitInterop::GetNextID()
+{
+	FScopeLock Lock(&CurrentIDMutex);
+	int Id = CurrentID;
+	CurrentID++;
+	return Id;
+}
+
+void FAzureSpatialAnchorsARKitInterop::ClearAnchorData(IAzureSpatialAnchors::CloudAnchorID InCloudAnchorID)
+{
+    if (LocalAnchorMap.Contains(InCloudAnchorID))
+    {
+        LocalAnchorMap.Remove(InCloudAnchorID);
+    }
+    
+    {
+        FScopeLock Lock(&CloudAnchorMapMutex);
+        if (CloudAnchorMap.Contains(InCloudAnchorID))
+        {
+            auto CloudAnchor = CloudAnchorMap[InCloudAnchorID].localAnchor;
+            [CloudAnchor release];
+            CloudAnchorMap.Remove(InCloudAnchorID);
+        }
+    }
+}
+
+void FAzureSpatialAnchorsARKitInterop::OnAnchorLocated(ASACloudSpatialAnchorSession* session, ASAAnchorLocatedEventArgs* args)
+{
+    if (!Session ||
+        !bSessionRunning)
+    {
+        return;
+    }
+    
+    if (args.anchor != nullptr)
+    {
+        IAzureSpatialAnchors::CloudAnchorID CloudAnchorID = IAzureSpatialAnchors::CloudAnchorID_Invalid;
+        {
+            FScopeLock Lock(&CloudAnchorMapMutex);
+            for (auto Pair : CloudAnchorMap)
+            {
+                if ([Pair.Value.identifier length] > 0 &&
+                    [Pair.Value.identifier isEqualToString:args.anchor.identifier])
+                {
+                    CloudAnchorID = Pair.Key;
+                    break;
+                }
+            }
+        }
+        
+        auto CloudAnchor = args.anchor;
+        if (CloudAnchorID == IAzureSpatialAnchors::CloudAnchorID_Invalid)
+        {
+            UAzureCloudSpatialAnchor* Anchor = NewObject<UAzureCloudSpatialAnchor>();
+            Anchor->ARPin = nullptr;
+            Anchor->CloudAnchorID = GetNextID();
+            CloudAnchorID = Anchor->CloudAnchorID;
+            
+            LocalAnchorMap.Add(Anchor->CloudAnchorID, Anchor);
+            
+            {
+                FScopeLock Lock(&CloudAnchorMapMutex);
+                [CloudAnchor retain];
+                CloudAnchorMap.Add(Anchor->CloudAnchorID, CloudAnchor);
+            }
+        }
+        
+        AnchorLocatedCallback(args.watcher.identifier, static_cast<int>(args.status), static_cast<int>(CloudAnchorID));
+    }
+}
+
+void FAzureSpatialAnchorsARKitInterop::OnLocateAnchorsCompleted(ASACloudSpatialAnchorSession* session, ASALocateAnchorsCompletedEventArgs* args)
+{
+    if (!Session ||
+        Session != session)
+    {
+        return;
+    }
+    
+    int WatcherIdentifier = args.watcher.identifier;
+    bool Cancelled = args.cancelled;
+    LocateAnchorsCompletedCallback(WatcherIdentifier, Cancelled);
+}
+
+void FAzureSpatialAnchorsARKitInterop::OnSessionUpdated(ASACloudSpatialAnchorSession* session, ASASessionUpdatedEventArgs* args)
+{
+    if (!Session ||
+        Session != session)
+    {
+        return;
+    }
+    
+    float ReadyForCreateProgress = args.status.readyForCreateProgress;
+    float RecommendedForCreateProgress = args.status.recommendedForCreateProgress;
+    int SessionCreateHash = args.status.sessionCreateHash;
+    int SessionLocateHash = args.status.sessionLocateHash;
+    int UserFeedback = static_cast<int>(args.status.userFeedback);
+    SessionUpdatedCallback(ReadyForCreateProgress, RecommendedForCreateProgress, SessionCreateHash, SessionLocateHash, UserFeedback);
+}
+
+void FAzureSpatialAnchorsARKitInterop::OnError(ASACloudSpatialAnchorSession* session, ASASessionErrorEventArgs* args)
+{
+    if (!Session ||
+        Session != session)
+    {
+        return;
+    }
+    
+    int ErrorCode = static_cast<int>(args.errorCode);
+    const FString ErrorMessage = NSStringToFString(args.errorMessage);
+    UE_LOG(LogAzureSpatialAnchorsARKitInterop, Error, TEXT("Azure Spatial Anchors encountered an error, ErrorCode: %d, ErrorMessage: %s"), ErrorCode, *ErrorMessage);
+}
+
+void FAzureSpatialAnchorsARKitInterop::OnLogDebugEvent(ASACloudSpatialAnchorSession* session, ASAOnLogDebugEventArgs* args)
+{
+    const FString Message = NSStringToFString(args.message);
+    UE_LOG(LogAzureSpatialAnchorsARKitInterop, Log, TEXT("Azure Spatial Anchors: %s"), *Message);
+}
+
+NSString* FAzureSpatialAnchorsARKitInterop::FStringToNSString(const FString& fstring)
+{
+    return [NSString stringWithUTF8String:TCHAR_TO_UTF8(*fstring)];
+}
+
+FString FAzureSpatialAnchorsARKitInterop::NSStringToFString(const NSString* nsstring)
+{
+    if (nsstring != nullptr &&
+        [nsstring length] > 0)
+    {
+        return UTF8_TO_TCHAR(std::string(nsstring.UTF8String).c_str());
+    }
+    
+    return FString{};
+}
+
+                                                                                                                                                                                                                                                                                                                                                                                  < v p x _ m e m       P      ¥"    ¥"     ÷   ŸjB—(ßÖ               < i n c l u d e       P      ¥"    ¥"    p÷   ŸjB—(ßÖ  €            < i n c l u d e       `      7r!    6r!    À÷   ŸjB—(ßÖ                 < v p x _ m e m _ i n t r n l . h     `      7r!    ¥"     ÷   ŸjB—(ßÖ                  < v p x _ m e m _ i n t r n l . h     `      7r!    ¥"    €÷   ¦‘B—(ßÖ   €              < v p x _ m e m _ i n t r n l . h     P      8r!    5r!    à÷   ¦‘B—(ßÖ                < v p x _ m e m . h   P      8r!    ¥"    0÷   ¦‘B—(ßÖ                 < v p x _ m e m . h   P      8r!    ¥"    €÷   ¦‘B—(ßÖ   €             < v p x _ m e m . h   P      ¥"    å¤"    Ğ÷   ¦‘B—(ßÖ               < v p x _ p o r t s   P      ¥"    å¤"     ÷   ¦‘B—(ßÖ  €            < v p x _ p o r t s   H      :r!    9r!    p÷   ¹B—(ßÖ               
+ < a r m . h   H      :r!    ¥"    ¸÷   ¹B—(ßÖ                
+ < a r m . h   H      :r!    ¥"     ÷   ¹B—(ßÖ   €            
+ < a r m . h   X      ;r!    9r!    H÷   ¹B—(ßÖ                < a s m d e f s _ m m i . h   X      ;r!    ¥"     ÷   ¹B—(ßÖ                 < a s m d e f s _ m m i . h   X      ;r!    ¥"    ø÷   ¹B—(ßÖ   €             < a s m d e f s _ m m i . h   P      <r!    9r!    P÷   ñßB—(ßÖ                < b i t o p s . h     P      <r!    ¥"     ÷   ñßB—(ßÖ                 < b i t o p s . h     P      <r!    ¥"    ğ÷   ñßB—(ßÖ   €             < b i t o p s . h     `      =r!    9r!    @÷   çC—(ßÖ               $ < e m m i n t r i n _ c o m p a t . h `      =r!    ¥"     ÷   çC—(ßÖ                $ < e m m i n t r i n _ c o m p a t . h `      =r!    ¥"     ÷   çC—(ßÖ   €            $ < e m m i n t r i n _ c o m p a t . h H      >r!    9r!    `÷   çC—(ßÖ               
+ < m e m . h   H      >r!    ¥"    ¨÷   çC—(ßÖ                
+ < m e m . h   H      >r!    ¥"    ğ÷   çC—(ßÖ   €            
+ < m e m . h   P      ?r!    9r!    8÷   ò-C—(ßÖ                < m e m _ o p s . h   P      ?r!    ¥"    ˆ÷   ò-C—(ßÖ                 < m e m _ o p s . h   P      ?r!    ¥"    Ø÷   ò-C—(ßÖ   €             < m e m _ o p s . h   `      @r!    9r!    (÷   ò-C—(ßÖ               " < m e m _ o p s _ a l i g n e d . h   `      @r!    ¥"    ˆ÷   UC—(ßÖ                " < m e m _ o p s _ a l i g n e d . h   `      @r!    ¥"    è÷   UC—(ßÖ   €            " < m e m _ o p s _ a l i g n e d . h   H      Ar!    9r!    H÷   UC—(ßÖ                < m s v c . h H      Ar!    ¥"    ÷   UC—(ßÖ                 < m s v c . h H      Ar!    ¥"    Ø÷   UC—(ßÖ   €             < m s v c . h H      Br!    9r!     ÷   UC—(ßÖ               
+ < p p c . h   H      Br!    ¥"    h÷   UC—(ßÖ                
+ < p p c . h   H      Br!    ¥"    °÷   |C—(ßÖ   €            
+ < p p c . h   X      Cr!    9r!    ø÷   |C—(ßÖ                < s y s t e m _ s t a t e . h X      Cr!    ¥"    P÷   |C—(ßÖ                 < s y s t e m _ s t a t e . h X      Cr!    ¥"    ¨÷   |C—(ßÖ   €             < s y s t e m _ s t a t e . h P      Dr!    9r!     ÷   &£C—(ßÖ                < v p x _ o n c e . h P      Dr!    ¥"    P÷   &£C—(ßÖ                 < v p x _ o n c e . h P      Dr!    ¥"     ÷   &£C—(ßÖ   €             < v p x _ o n c e . h                 Áƒ*ùÿÿÿ`  	         "ÕTœ¾O&¨F!”Ğ‚´a$   ä2Ø°O‰·~Ï¬¢Jı6
+   ?tüÏ€D°Cß‘“s %   íh°äéB”ôÚ1¢A»F.(   úzõüƒBvPXæ©¹2- ÿB   ™.     None     ö   €  !   F4A2031543CF364E73ACA5BE17BBAF2A     d     P   #   d  €,      ¸-  ¸-  È-  €¥TÑ{úA˜$Ÿı˜qsm‰ KM1±M‡ö:Z‘Ş/      ö       %ìİ    ++UE4+Release-4.26     %ìİ    ++UE4+Release-4.26         '¨úW    ö-  ëî              ÿÿÿÿ™.  9   /DMXFixtures/Fireworks/Systems/templates/VFX_FW_Template ÜrK,   /Niagara/Enums/ENiagara_EmitterStateOptions Í
+*   /Niagara/Enums/ENiagaraSystemInactiveMode /b†$   /Niagara/Modules/System/SystemState ïH!   /Script/CoreUObject øI->   /Script/Engine †@…I   /Script/Niagara ƒGZ`   /Script/NiagaraEditor •p¿o   AdditionalDefines  àê   Age ·Íc“   ArrayProperty I°ãi   Attributes ´Ò¢   BaseId K ’   BaseScriptCompileHash Æ)·   bCompleteOnInactive Ïu¿ù   bExposeToLibrary ¾³3   bIsTemplateAsset oÉ+	   bIsValid AÎ   BoolProperty °Š   bUseLegacyNameString ÇÃ	   ByteCode “™w   ByteProperty æN-À   CachedChangeId e’Ìo    CachedNamespacelessVariableName v´×Ò   CachedScriptVM é':   CachedScriptVMId ½¥¸&   CachedUsageInfo *Ø«!	   ChangeId Â7Tç   Class twx‘   ClassStructOrEnum 3gÈ   CompileHash ú¾d   CompileHashFromGraph vÅjš   CompilerVersionID ]€İß   CompileTime †+{!   Constants.SystemState.Loop Delay D)t$   Constants.SystemState.Loop Duration “ÒP   CurrentLoopDuration @-›Û   Custom \~32	   DataHash }FeÃ   DataSetCompiledData ½ıÇß   DataSetComponentOffset ¬oÒ   DataSetToParameters ‚Ò 
+   DebugName ïÚõL!   Default__NiagaraSystemEditorData ÕCƒ
+   DeltaTime 2½í    EdGraph o´]$   EdGraphSchema_NiagaraSystemOverview â÷ºô   EditorData ÀH§Ñ   Emitter.RandomSeed Bìˆ   Engine ·Dæ   Engine.DeltaTime Ôÿr?   Engine.Emitter.InstanceSeed ‘½-%   Engine.Emitter.TotalSpawnedParticles ÇªZØ   Engine.Owner.ExecutionState î÷øÄ   EngineOwner ( NN   ENiagara_EmitterStateOptions WSÃ8   ENiagaraExecutionState LØsù   ENiagaraExecutionStateSource $¢à	   ENiagaraScriptCompileStatus ·Ã;I*   ENiagaraScriptCompileStatus::NCS_UpToDate Ó0<œ   ENiagaraScriptParameterUsage ¼û'n$   ENiagaraScriptParameterUsage::Local ):¼É   ENiagaraScriptUsage ÊÃm'   ENiagaraScriptUsage::SystemSpawnScript X6Š(   ENiagaraScriptUsage::SystemUpdateScript ‰ò¨q   ENiagaraSystemInactiveMode yl~C   Enum VÃ…o   EnumProperty Q×@   ExecutionState Px?   ExecutionStateSource ×¦ß   ExposedParameters µuÖ   FloatComponentByteOffsets 8+¦   FloatComponentRegisterOffsets ¢­Æü   FloatComponentStart  :ñç   FloatProperty û§Şı   ForceRebuildId %îŞ   FriendlyName ÅÊ	   FullName {*Ú<   FunctionDisplayName ¨?ˆE   FunctionScript İ„
+   GraphGuid ¢‚Ëv   Guid CPúh   HalfComponentByteOffsets ¦®²¸   HalfComponentRegisterOffsets õé   HalfComponentStart jÜR`   Inactive Response ;C«Ÿ   Input |Šˆ„	   InputMap ~Î]d   InstanceParamStore jO   Int32ComponentByteOffsets t•Ü   Int32ComponentRegisterOffsets K°   Int32ComponentStart aÎ‹'   Int32Offsets ©Ëá„   InternalConstant Ë×   InternalParameters Çòˆ7   IntProperty ¥Ó6J   LastAssemblyTranslation $ÿ Â   LastBuiltTraversalDataChangeId ùRó   LastCompileStatus °Øã   LastGeneratedVMId ÔÄy   LastHlslTranslation 5n©[   LastOpCount ØÑ™ò   LayoutInfo ‘ÿ   LinearColor CsF   Local qè«º    Local.Module.LoopCountIncreased pg®9	   Location q|°Â   Loop Behavior Î[C}   Loop Delay -§>×   Loop Duration À!dù
+   LoopCount @Gn   LoopCountIncreased ¸_y
+   LoopedAge ïû®   Main L`1ä   MapMain :œD   MapProperty 5”	   MetaData ä€´“	   Metadata ä€Éè   Module.Loop Delay p‹ä*   Module.Loop Duration Â>¬Á   NameProperty ‚òJ   NiagaraBool Ö›D   NiagaraCompileHash ¸~oì   NiagaraDataSetCompiledData +.ô9   NiagaraFloat 5ÈY   NiagaraGraph y7    NiagaraGraphScriptUsageInfo y˜9   NiagaraGraphViewSettings ¬ç   NiagaraInt32 Ä¹"¶   NiagaraNodeFunctionCall ‹J   NiagaraNodeInput ù˜Ì   NiagaraNodeOutput 'ĞèÔ   NiagaraOverview ûf^Ä   NiagaraOverviewNode ×é0   NiagaraParameterDataSetBinding ß/Ë¢)   NiagaraParameterDataSetBindingCollection Ş\˜   NiagaraParameterMap „·(   NiagaraParameters ’•Î   NiagaraParameterStore Q‘   NiagaraScript ºüŒi   NiagaraScript /DMXFixtures/Fireworks/Systems/templates/VFX_FW_Template.VFX_FW_Template:SystemSpawnScript íYGİj   NiagaraScript /DMXFixtures/Fireworks/Systems/templates/VFX_FW_Template.VFX_FW_Template:SystemUpdateScript ó (Ë   NiagaraScriptSource P[-   NiagaraScriptVariable ËTïÃ   NiagaraStackEditorData _—GŞ   NiagaraStatScope èÀÈ×   NiagaraSystem ƒRN^   NiagaraSystemCompiledData 4Bó   NiagaraSystemEditorData +   NiagaraSystemEditorFolder z°¹   NiagaraTypeLayoutInfo ÊË¦r%   NiagaraUserRedirectionParameterStore {»û   NiagaraVariable jí'   NiagaraVariableLayoutInfo ìÈ   NiagaraVariableMetaData Õ9c   NiagaraVariableWithOffset qøŸÎ   NiagaraVMExecutableData ‘¥š   NiagaraVMExecutableDataId ×Å¹ò
+   NodeGraph T… 	   NodeGuid Ñ¬«	   NodePosX Å[ˆ	   NodePosY rFíe   Nodes ¹ş›l   None ôÅ   NormalizedLoopAge Ã>ë   NumTempRegisters úûµU   ObjectProperty AÛ³ê   Out çÑF
+   OutputMap 9×Ê   Outputs ÛÎ   OverviewGraphViewSettings ëçKÆ   OwningSystem ×?g   Package sGˆ   PackageLocalizationNamespace tyˆ   PackageMetaData ,¤e   ParameterData |pÎ
+   ParameterOffset –Ø   Parameters /Î,   PlaybackRangeMax "°!;
+   PrimColor .ë   RapidIterationParameters ~G1[   ReferencedCompileHashes êJõb   RootFolder Üyl¬	   ScaleMod 8ÿJó   Schema ÿ»‹w
+   ScopeName ,¼Šv   ScriptStruct K„ˆ   ScriptType «Ûc'   ScriptUsageType <Áñï	   SecColor ºÙ4   SortedParameterOffsets ÿl   Source V9±·   SparkColor +Zi'   SpawnInstanceParamsDataSetCompiledData À{h/   StackEditorData ™·vª   StatScopes Dúv	   StrProperty ;Ár$   StructProperty 0 œü   System  B-l   System.Age >|èİ   System.bCompleteOnInactive æJÖO   System.CurrentLoopDuration iòm   System.ExecutionState `ÆÉÂ   System.ExecutionStateSource ËÿL   System.LoopCount ^Ç’J   System.LoopedAge 0|[Š   System.NormalizedLoopAge Ô›û   SystemCompiledData æŞ_)   SystemOverviewGraph tK9r   SystemScriptGraph Q¸g2   SystemScriptSource  .Ğ   SystemSpawnScript 1Á   SystemSpawnScript_Main ñ?›Û   SystemSpawnScript_MapMain ôŞø   SystemState ©×ì   SystemState_Func_ ÏÙ–‡   SystemUpdateScript $½Ú   SystemUpdateScript_Main øŞv   SystemUpdateScript_MapMain İFp   TotalFloatComponents †[°Ù   TotalInt32Components Ÿ’Ô´$   Transient.ScalabilityExecutionState —Ùl¥
+   Traversal …ÛÛ5   Type €Frâ   UInt16Property ¸O`0   UInt32Property Ş,8J   UnderlyingType ÷
+ª(   UpdateInstanceParamsDataSetCompiledData şé^¼   UpdateInstanceSystemBinding K„Í   Usage Ëâ¾É   UsageId ªÏé&
+   UsageType s`9z   UseLoopDelay ğÄ   User.PrimColor q†û   User.ScaleMod ‡	»)   User.SecColor ­L(î   User.SparkColor Jß—y   UserDefinedEnum å*òN   UserParameterRedirects {²	   Variable Ëİrx   VariableLayouts MÇ¹
+   Variables ûœ°   VariableToScriptVariable D`Ûì	   Vector2D U0l	   VFX_FW_Template ŠÊI­   Zoom =ı­W              çÿÿÿt       £                     æÿÿÿ-       £                     åÿÿÿ‹       £       

@@ -1,0 +1,121 @@
+OnEnd);
+        }
+
+        /// <summary>
+        /// Generate code for QilNodeType.DataSource.
+        /// </summary>
+        /// <remarks>
+        /// Generates code to retrieve a document using the XmlResolver.
+        /// </remarks>
+        protected override QilNode VisitDataSource(QilDataSource ndSrc) {
+            LocalBuilder locNav;
+
+            // XPathNavigator navDoc = runtime.ExternalContext.GetEntity(uri)
+            this.helper.LoadQueryContext();
+            NestedVisitEnsureStack(ndSrc.Name);
+            NestedVisitEnsureStack(ndSrc.BaseUri);
+            this.helper.Call(XmlILMethods.GetDataSource);
+
+            locNav = this.helper.DeclareLocal("$$$navDoc", typeof(XPathNavigator));
+            this.helper.Emit(OpCodes.Stloc, locNav);
+
+            // if (navDoc == null) goto LabelNextCtxt;
+            this.helper.Emit(OpCodes.Ldloc, locNav);
+            this.helper.Emit(OpCodes.Brfalse, this.iterCurr.GetLabelNext());
+
+            this.iterCurr.Storage = StorageDescriptor.Local(locNav, typeof(XPathNavigator), false);
+
+            return ndSrc;
+        }
+
+        /// <summary>
+        /// Generate code for QilNodeType.Nop.
+        /// </summary>
+        protected override QilNode VisitNop(QilUnary ndNop) {
+            return Visit(ndNop.Child);
+        }
+        
+        /// <summary>
+        /// Generate code for QilNodeType.OptimizeBarrier.
+        /// </summary>
+        protected override QilNode VisitOptimizeBarrier(QilUnary ndBarrier) {
+            return Visit(ndBarrier.Child);
+        }
+
+        /// <summary>
+        /// Generate code for QilNodeType.Error.
+        /// </summary>
+        protected override QilNode VisitError(QilUnary ndErr) {
+            // XmlQueryRuntime.ThrowException(strErr);
+            this.helper.LoadQueryRuntime();
+            NestedVisitEnsureStack(ndErr.Child);
+            this.helper.Call(XmlILMethods.ThrowException);
+
+            if (XmlILConstructInfo.Read(ndErr).ConstructMethod == XmlILConstructMethod.Writer) {
+                this.iterCurr.Storage = StorageDescriptor.None();
+            }
+            else {
+                // Push dummy value so that Location is not None and IL rules are met
+                this.helper.Emit(OpCodes.Ldnull);
+                this.iterCurr.Storage = StorageDescriptor.Stack(typeof(XPathItem), false);
+            }
+
+            return ndErr;
+        }
+
+        /// <summary>
+        /// Generate code for QilNodeType.Warning.
+        /// </summary>
+        protected override QilNode VisitWarning(QilUnary ndWarning) {
+            // runtime.SendMessage(strWarning);
+            this.helper.LoadQueryRuntime();
+            NestedVisitEnsureStack(ndWarning.Child);
+            this.helper.Call(XmlILMethods.SendMessage);
+
+            if (XmlILConstructInfo.Read(ndWarning).ConstructMethod == XmlILConstructMethod.Writer)
+                this.iterCurr.Storage = StorageDescriptor.None();
+            else
+                VisitEmpty(ndWarning);
+
+            return ndWarning;
+        }
+
+        /// <summary>
+        /// Generate code for QilNodeType.True.
+        /// </summary>
+        /// <remarks>
+        /// BranchingContext.OnFalse context: [nothing]
+        /// BranchingContext.OnTrue context:  goto LabelParent;
+        /// BranchingContext.None context:  push true();
+        /// </remarks>
+        protected override QilNode VisitTrue(QilNode ndTrue) {
+            if (this.iterCurr.CurrentBranchingContext != BranchingContext.None) {
+                // Make sure there's an IL code path to both the true and false branches in order to avoid dead
+                // code which can cause IL verification errors.
+                this.helper.EmitUnconditionalBranch(this.iterCurr.CurrentBranchingContext == BranchingContext.OnTrue ?
+                        OpCodes.Brtrue : OpCodes.Brfalse, this.iterCurr.LabelBranch);
+
+                this.iterCurr.Storage = StorageDescriptor.None();
+            }
+            else {
+                // Push boolean result onto the stack
+                this.helper.LoadBoolean(true);
+                this.iterCurr.Storage = StorageDescriptor.Stack(typeof(bool), false);
+            }
+
+            return ndTrue;
+        }
+
+        /// <summary>
+        /// Generate code for QilNodeType.False.
+        /// </summary>
+        /// <remarks>
+        /// BranchingContext.OnFalse context: goto LabelParent;
+        /// BranchingContext.OnTrue context:  [nothing]
+        /// BranchingContext.None context:  push false();
+        /// </remarks>
+        protected override QilNode VisitFalse(QilNode ndFalse) {
+            if (this.iterCurr.CurrentBranchingContext != BranchingContext.None) {
+                // Make sure there's an IL code path to both the true and false branches in order to avoid dead
+                // code which can cause IL verification errors.
+                this.helper.E

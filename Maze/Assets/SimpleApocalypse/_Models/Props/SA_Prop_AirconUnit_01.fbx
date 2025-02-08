@@ -1,0 +1,445 @@
+// Copyright 2016 The Chromium Embedded Framework Authors. Portions copyright
+// 2013 The Chromium Authors. All rights reserved. Use of this source code is
+// governed by a BSD-style license that can be found in the LICENSE file.
+
+// Implementation based on ui/base/ime/win/imm32_manager.cc from Chromium.
+
+#include <windowsx.h>
+#include <msctf.h>
+
+#include "include/base/cef_build.h"
+#include "tests/cefclient/browser/resource.h"
+#include "tests/cefclient/browser/osr_ime_handler_win.h"
+#include "tests/shared/browser/geometry_util.h"
+#include "tests/shared/browser/main_message_loop.h"
+#include "tests/shared/browser/util_win.h"
+
+#define ColorUNDERLINE  0xFF000000    // Black SkColor value for underline,
+                                      // same as Blink.
+#define ColorBKCOLOR    0x00000000    // White SkColor value for background,
+                                      // same as Blink.
+
+namespace client {
+
+namespace {
+
+// Determines whether or not the given attribute represents a selection
+bool IsSelectionAttribute(char attribute) {
+  return (attribute == ATTR_TARGET_CONVERTED ||
+          attribute == ATTR_TARGET_NOTCONVERTED);
+}
+
+// Helper function for OsrImeHandlerWin::GetCompositionInfo() method,
+// to get the target range that's selected by the user in the current
+// composition string.
+void GetCompositionSelectionRange(HIMC imc, int* target_start,
+                                  int* target_end) {
+  int attribute_size = ::ImmGetCompositionString(imc, GCS_COMPATTR, NULL, 0);
+  if (attribute_size > 0) {
+    int start = 0;
+    int end = 0;
+    std::vector<char> attribute_data(attribute_size);
+
+    ::ImmGetCompositionString(imc, GCS_COMPATTR, &attribute_data[0],
+                              attribute_size);
+    for (start = 0; start < attribute_size; ++start) {
+      if (IsSelectionAttribute(attribute_data[start]))
+        break;
+    }
+    for (end = start; end < attribute_size; ++end) {
+      if (!IsSelectionAttribute(attribute_data[end]))
+        break;
+    }
+
+    *target_start = start;
+    *target_end = end;
+  }
+}
+
+// Helper function for OsrImeHandlerWin::GetCompositionInfo() method, to get
+// underlines information of the current composition string.
+void GetCompositionUnderlines(
+    HIMC imc,
+    int target_start,
+    int target_end,
+    std::vector<CefCompositionUnderline> &underlines) {
+  int clause_size = ::ImmGetCompositionString(imc, GCS_COMPCLAUSE, NULL, 0);
+  int clause_length = clause_size / sizeof(uint32);
+  if (clause_length) {
+    std::vector<uint32> clause_data(clause_length);
+
+    ::ImmGetCompositionString(imc, GCS_COMPCLAUSE,
+                              &clause_data[0], clause_size);
+    for (int i = 0; i < clause_length - 1; ++i) {
+      cef_composition_underline_t underline;
+      underline.range.from = clause_data[i];
+      underline.range.to = clause_data[i + 1];
+      underline.color = ColorUNDERLINE;
+      underline.background_color = ColorBKCOLOR;
+      underline.thick = 0;
+
+      // Use thick underline for the target clause.
+      if (underline.range.from >= target_start &&
+          underline.range.to <= target_end) {
+        underline.thick = 1;
+      }
+      underlines.push_back(underline);
+    }
+  }
+}
+
+}  // namespace
+
+OsrImeHandlerWin::OsrImeHandlerWin(HWND hwnd)
+  : ime_status_(false),
+    hwnd_(hwnd),
+    input_language_id_(LANG_USER_DEFAULT),
+    is_composing_(false),
+    cursor_index_(-1),
+    system_caret_(false) {
+  ime_rect_ = { -1, -1, 0, 0 };
+}
+
+OsrImeHandlerWin::~OsrImeHandlerWin() {
+  DestroyImeWindow();
+}
+
+void OsrImeHandlerWin::SetInputLanguage() {
+  // Retrieve the current input language from the system's keyboard layout.
+  // Using GetKeyboardLayoutName instead of GetKeyboardLayout, because
+  // the language from GetKeyboardLayout is the language under where the
+  // keyboard layout is installed. And the language from GetKeyboardLayoutName
+  // indicates the language of the keyboard layout itself.
+  // See crbug.com/344834.
+  WCHAR keyboard_layout[KL_NAMELENGTH];
+  if (::GetKeyboardLayoutNameW(keyboard_layout)) {
+    input_language_id_ =
+        static_cast<LANGID>(_wtoi(&keyboard_layout[KL_NAMELENGTH >> 1]));
+  } else {
+    input_language_id_ = 0x0409;  // Fallback to en-US.
+  }
+}
+
+void OsrImeHandlerWin::CreateImeWindow() {
+  // Chinese/Japanese IMEs somehow ignore function calls to
+  // ::ImmSetCandidateWindow(), and use the position of the current system
+  // caret instead -::GetCaretPos().
+  // Therefore, we create a temporary system caret for Chinese IMEs and use
+  // it during this input context.
+  // Since some third-party Japanese IME also uses ::GetCaretPos() to determine
+  // their window position, we also create a caret for Japanese IMEs.
+  if (PRIMARYLANGID(input_language_id_) == LANG_CHINESE ||
+      PRIMARYLANGID(input_language_id_) == LANG_JAPANESE) {
+    if (!system_caret_) {
+      if (::CreateCaret(hwnd_, NULL, 1, 1))
+        system_caret_ = true;
+    }
+  }
+}
+
+void OsrImeHandlerWin::DestroyImeWindow() {
+  // Destroy the system caret if we have created for this IME input context.
+  if (system_caret_) {
+    ::DestroyCaret();
+    system_caret_ = false;
+  }
+}
+
+void OsrImeHandlerWin::MoveImeWindow() {
+  // Does nothing when the target window has no input focus.
+  if (GetFocus() != hwnd_)
+    return;
+
+  CefRect rc = ime_rect_;
+  int location = cursor_index_;
+
+  // If location is not specified fall back to the composition range start.
+  if (location == -1)
+    location = composition_range_.from;
+
+  // Offset location by the composition range start if required.
+  if (location >= composition_range_.from)
+    location -= composition_range_.from;
+
+  if (location < static_cast<int>(composition_bounds_.size()))
+    rc = composition_bounds_[location];
+  else
+    return;
+
+  HIMC imc = ::ImmGetContext(hwnd_);
+  if (imc) {
+    const int kCaretMargin = 1;
+    if (PRIMARYLANGID(input_language_id_) == LANG_CHINESE) {
+      // Chinese IMEs ignore function calls to ::ImmSetCandidateWindow()
+      // when a user disables TSF (Text Service Framework) and CUAS (Cicero
+      // Unaware Application Support).
+      // On the other hand, when a user enables TSF and CUAS, Chinese IMEs
+      // ignore the position of the current system caret and use the
+      // parameters given to ::ImmSetCandidateWindow() with its 'dwStyle'
+      // parameter CFS_CANDIDATEPOS.
+      // Therefore, we do not only call ::ImmSetCandidateWindow() but also
+      // set the positions of the temporary system caret if it exists.
+      CANDIDATEFORM candidate_position = {
+        0, CFS_CANDIDATEPOS, { rc.x, rc.y }, { 0, 0, 0, 0 }
+      };
+      ::ImmSetCandidateWindow(imc, &candidate_position);
+    }
+    if (system_caret_) {
+      switch (PRIMARYLANGID(input_language_id_)) {
+        case LANG_JAPANESE:
+          ::SetCaretPos(rc.x, rc.y + rc.height);
+          break;
+        default:
+          ::SetCaretPos(rc.x, rc.y);
+          break;
+      }
+    }
+
+    if (PRIMARYLANGID(input_language_id_) == LANG_KOREAN) {
+      // Korean IMEs require the lower-left corner of the caret to move their
+      // candidate windows.
+      rc.y += kCaretMargin;
+    }
+
+    // Japanese IMEs and Korean IMEs also use the rectangle given to
+    // ::ImmSetCandidateWindow() with its 'dwStyle' parameter CFS_EXCLUDE
+    // Therefore, we also set this parameter here.
+    CANDIDATEFORM exclude_rectangle = {
+      0, CFS_EXCLUDE, { rc.x, rc.y },
+      { rc.x, rc.y, rc.x + rc.width, rc.y + rc.height }
+    };
+    ::ImmSetCandidateWindow(imc, &exclude_rectangle);
+
+    ::ImmReleaseContext(hwnd_, imc);
+  }
+}
+
+void OsrImeHandlerWin::CleanupComposition() {
+  // Notify the IMM attached to the given window to complete the ongoing
+  // composition (when given window is de-activated while composing and
+  // re-activated) and reset the composition status.
+  if (is_composing_) {
+    HIMC imc = ::ImmGetContext(hwnd_);
+    if (imc) {
+      ::ImmNotifyIME(imc, NI_COMPOSITIONSTR, CPS_COMPLETE, 0);
+      ::ImmReleaseContext(hwnd_, imc);
+    }
+    ResetComposition();
+  }
+}
+
+void OsrImeHandlerWin::ResetComposition() {
+  // Reset the composition status.
+  is_composing_ = false;
+  cursor_index_ = -1;
+}
+
+
+void OsrImeHandlerWin::GetCompositionInfo(
+    HIMC imc,
+    LPARAM lparam,
+    CefString &composition_text,
+    std::vector<CefCompositionUnderline> &underlines,
+    int& composition_start) {
+  // We only care about GCS_COMPATTR, GCS_COMPCLAUSE and GCS_CURSORPOS, and
+  // convert them into underlines and selection range respectively.
+  underlines.clear();
+
+  int length = static_cast<int>(composition_text.length());
+
+  // Find out the range selected by the user.
+  int target_start = length;
+  int target_end = length;
+  if (lparam & GCS_COMPATTR)
+    GetCompositionSelectionRange(imc, &target_start, &target_end);
+
+  // Retrieve the selection range information. If CS_NOMOVECARET is specified
+  // it means the cursor should not be moved and we therefore place the caret at
+  // the beginning of the composition string. Otherwise we should honour the
+  // GCS_CURSORPOS value if it's available.
+  // TODO(suzhe): Due to a bug in WebKit we currently can't use selection range
+  // with composition string.
+  // See: https://bugs.webkit.org/show_bug.cgi?id=40805
+  if (!(lparam & CS_NOMOVECARET) && (lparam & GCS_CURSORPOS)) {
+    // IMM32 does not support non-zero-width selection in a composition. So
+    // always use the caret position as selection range.
+    int cursor = ::ImmGetCompositionString(imc, GCS_CURSORPOS, NULL, 0);
+    composition_start = cursor;
+  } else {
+    composition_start = 0;
+  }
+
+  // Retrieve the clause segmentations and convert them to underlines.
+  if (lparam & GCS_COMPCLAUSE)
+    GetCompositionUnderlines(imc, target_start, target_end, underlines);
+
+  // Set default underlines in case there is no clause information.
+  if (!underlines.size()) {
+    CefCompositionUnderline underline;
+    underline.color = ColorUNDERLINE;
+    underline.background_color = ColorBKCOLOR;
+    if (target_start > 0) {
+      underline.range.from = 0;
+      underline.range.to = target_start;
+      underline.thick = 0;
+      underlines.push_back(underline);
+    }
+    if (target_end > target_start) {
+      underline.range.from = target_start;
+      underline.range.to = target_end;
+      underline.thick = 1;
+      underlines.push_back(underline);
+    }
+    if (target_end < length) {
+      underline.range.from = target_end;
+      underline.range.to = length;
+      underline.thick = 0;
+      underlines.push_back(underline);
+    }
+  }
+}
+
+bool OsrImeHandlerWin::GetString(HIMC imc, WPARAM lparam, int type,
+                                 CefString& result) {
+  if (!(lparam & type))
+    return false;
+  LONG string_size = ::ImmGetCompositionString(imc, type, NULL, 0);
+  if (string_size <= 0)
+    return false;
+
+  // For trailing NULL - ImmGetCompositionString excludes that.
+  string_size += sizeof(WCHAR);
+
+  std::vector<wchar_t> buffer(string_size);
+  ::ImmGetCompositionString(imc, type, &buffer[0], string_size);
+  result.FromWString(&buffer[0]);
+  return true;
+}
+
+bool OsrImeHandlerWin::GetResult(LPARAM lparam, CefString& result) {
+  bool ret = false;
+  HIMC imc = ::ImmGetContext(hwnd_);
+  if (imc) {
+    ret = GetString(imc, lparam, GCS_RESULTSTR, result);
+    ::ImmReleaseContext(hwnd_, imc);
+  }
+  return ret;
+}
+
+bool OsrImeHandlerWin::GetComposition(
+    LPARAM lparam,
+    CefString &composition_text,
+    std::vector<CefCompositionUnderline> &underlines,
+    int& composition_start) {
+  bool ret = false;
+  HIMC imc = ::ImmGetContext(hwnd_);
+  if (imc) {
+    // Copy the composition string to the CompositionText object.
+    ret = GetString(imc, lparam, GCS_COMPSTR, composition_text);
+
+    if (ret) {
+      // Retrieve the composition underlines and selection range information.
+      GetCompositionInfo(imc, lparam, composition_text, underlines,
+                         composition_start);
+
+      // Mark that there is an ongoing composition.
+      is_composing_ = true;
+    }
+
+    ::ImmReleaseContext(hwnd_, imc);
+  }
+  return ret;
+}
+
+void OsrImeHandlerWin::DisableIME() {
+  CleanupComposition();
+  ::ImmAssociateContextEx(hwnd_, NULL, 0);
+}
+
+void OsrImeHandlerWin::CancelIME() {
+  if (is_composing_) {
+    HIMC imc = ::ImmGetContext(hwnd_);
+    if (imc) {
+      ::ImmNotifyIME(imc, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+      ::ImmReleaseContext(hwnd_, imc);
+    }
+    ResetComposition();
+  }
+}
+
+void OsrImeHandlerWin::EnableIME() {
+  // Load the default IME context.
+  ::ImmAssociateContextEx(hwnd_, NULL, IACE_DEFAULT);
+}
+
+void OsrImeHandlerWin::UpdateCaretPosition(int index) {
+  // Save the caret position.
+  cursor_index_ = index;
+  // Move the IME window.
+  MoveImeWindow();
+}
+
+void OsrImeHandlerWin::ChangeCompositionRange(
+    const CefRange& selection_range,
+    const std::vector<CefRect>& bounds) {
+  composition_range_ = selection_range;
+  composition_bounds_ = bounds;
+  MoveImeWindow();
+}
+
+}  // namespace client
+                                      XÌÚÖyyÖj”<¶ÖíHXñ¸óóÁ³Dàwj5càû½R4§fK+4BTšÉ<yv#ÿé^¬·6¶>hÒ‰GM›ŒXm1ySÏwô´ V¦:à@Ğ×±õëHV·Ï^…qhë×ŠdâOe‹æäÈ¤dQhIÒ„XEÀuÖ.1‰t‹rùô@¦G	*3@ùGÁÆo¥zô¶¶¬ëñ7J%`ÈRøÜnÀI	Ğ+ÔÍË))M¸ü—ø$Æ/Ó•‚¥Ô>]å¼™O¯øl³K¾´ÓXÃÇØ«ü®`;esFá¥·zãäŸ¤=oüœ	HîEe@f|ª:¹o'›+Dç ”®£ôîÔs'ººr{O@å²cIz½Ş+v¨&¿iÀ÷Xu.„^ŠÃ=rj'ÒÇ»»eAl]Şü³Ä2-A]çPV*v ‘K®‚›ÿ‡é–²9Ã|º²I”÷!$,:-Z*ıÕÇ¶mñit<­Å<ºk(Í±à ¹¾Òú³´
+å/e=~ë¶@·$Bú«õ•Gß’±áÊœaS-åy¸X~áe;Zgı­ğmˆ`ÀWvr	>æ}Ø‡„É-UµéHøT1ö'ó5eU‹`„§=ëš“à“Ÿk‚qTÀõ“ŞÑ÷.Â)Û`a€¼º°’T¨6ÖiQn§JS´dø’5ÀZwø/¯=ÜQr`J‚e|n×ÄÃl¤²À9¼·\ñ·òÂVkÙ û¤	~	Öİˆr5…åÕ¦è[g!¦ò]0æµeÄ®R–ùiâv&Ó‚äÖyczÅÉ2ÏH»K¥œû+êjìéÆLE©øİ;B¦Ğ“aíHw-Ëszo‚ÿp58r|EÓ˜
+³{NÖ^ğ–El­Xã™–şŠyÛd’×)v+.Ó¡¼¥'J »ÃÙ¶0'`ü¤{©ërú8æ´lı¹ƒÏ}ºÏ"Äu»u£™’	u|ÙlË
+¦ËpYJÄl8“«-^‰2³}z£ùĞèİ& {ÏÍOKÚb­‚§•Û°›µ&’d'“ƒıgÇà¥¨oêğ×b€Dò{®cø0ÆU’å2œ8H1Û#’¨aIiöÉàßI£ÇâtGÍQo,Ü~A6¿åM.qxğy*ÆCv;Á›&Ğ½²w„Î÷ĞµõZG­c§ÇÊ#‰÷¯a_S»ÄUc'ß”ÑŸ
+j,šc•«oqeœĞ	šp¡ï§âVBI‡ÔÃ”¾İŸ3Öó²’Ä›·Æ
+>„€íın´6çFí¤ÄUİFÓH ÚFn²Õa>½aÖH®°©y÷Æ"6y#¶éšĞWÌ(™6@-è|‚ â®6ó8sVA¨(¥6°A,Â•E
+u¯É°ù vÜ$0¶	²An>»ÉøµÊq~ı§rœ¢ø;^ÌÓüY”š Ú1X´Bƒeˆøkå«bÚñf0vVä–Mt“qÕèeØÔñE»ª‡3*†aÛ*p¸9ø„ƒÖ6+ë©ª2Âè^`ö­¯ÄÂú‹+é\¼»‡¥ıæ¦A9x·Ûwü<¼ğg2ÚíWzãÏwç)NÓ	À4¿{> ×c­›ï¬v³)ú\ş	ÇNwovqÿÿP:GÆ›—²­ì]£9½íCÿÿ«ÒGÑ5°·É'ºI'©ÒM‹ç³^õºâ£Œ õ¶+}l ¢ˆ<n[:¯bW•­Œ†ÿ7¥ã¥¸I„¾~WSñ+b·4Äªt.2{«›ßL
+¯Ê™z^AL/EÖ?âPíÜOÛ†ÒK‹2d$rç©züC	Flv  @?€C3×púÙŒ+¾4#?Ã¬Fá
+®„Ÿ`®‡-VÁ,ã²†mÍëŒŠŸ{'5.ÄÜ½ÛùÔ=°äYH	Pæ EËÊP¬ø9 Ú…¾â¨´)É52ˆñjOãıÆyEëqR2ŞZ&¡tü	AÔ¿ÇÊ"$raˆ&…ƒ¯úôõ­Ü–
+ÛÕF*¾´2·ÛÑüqN‚4ìp1I|Ã–©8­ˆH±DúÍ<£
+sğ°aš"^,Böy¡-5Ÿô·=â‘•¬Sü‚@»ö²÷YÉ+ÇéşÒTcÇäZnãö(/64|XÔƒ—Sİì»çÜ20Ï¼>\†kôNPøŒÖöh³Oä"’¦.›Cœ"3ı 
+u'Xûc]Às“sÌığÜÑ‘å,öÜ–ND7R½­×:n'é)ĞMÈ-]¯UìcUü¡”øø;1TB8ó`nòé­0±1æBY€CÛƒ=®º³7»$sÜû×ÊÉıVæ˜­Œó)sŠOÌ“]™¦²J
+Nr„K:áD4± h«Á§KÖ  {ÇŞ«Io$Š1
+é:Ú®bDé›ØEJßf4¬ÚíEÇkR<¨L >e^¢¹ñRü0, ô&5¾ÚœæRh›TN!ç!l²àgMãü5ª>ÊØ CŸ¯ïİ¬û»€E^A«È„ºZn‘3Õ¸nX˜àu¬Õõüõf‹ÏĞYµ‹;uÜà{EÀ€V—¢ÏË8ÕÌ’6˜{Æ{ø\aˆ«‰—øíçGWl ‰äQÜ¥qQC÷š/Ûˆ€Á«¤Ò»ĞæßLRc ±[¥«¡%u1‡¹†6ªùğE¿ğ'•VZø™Æ…l8úi¥ÍsÿË•€n(óØWtËÃæâuB'®VYâí',ŠîÎšB„};¶Kxû÷sĞÉ»=b‡óÂÜË¶…n3 ˜pH(©’õ›CÏµä›ë
+?G@ÑX-¾}›G«Ä>“%±G&"L†F7õœöåªX¼¬ˆ$Çx1HúóóG„‰' ¬%ûÔßTA-9k‡ÚyvÍ+İt$1ºÙ¯Ÿ¾¦>9°1g˜49ıp¡Ù@Énu¾ ÔñO• ×vƒÉ«9Ê}_éÙzÿéRómhƒæTak¦Óróäíï<v	Õ0Ş˜¬}6ë`TåHÉq§-ÆÏb	N¾6æCa[·d?Î³ÿ™$Ø²¯j˜c‹c[Ú%÷áaHtÿUo6f¬‘º»ı½®
+8É˜ Do„XYWD],ÆL‚‘¥¥|y¼–`[1¹æ©¼ôqÖşÌ½#WÓÊ1ö¼aP- <j@¾\SºihÂ8ßtÜb åÑemêSÅB€¦î°Xå>jeó®å²ôí$áƒD>WM×N¹¥ÜB=œ×jª.£Q³Xï»	=Ì}öŸ/¾Ìå¶­ª¿ğbÃÖ(œGÙî4Sóøy^ïüeú”·Ó0î3T<×Yä¥Ğœ«©
+[1‘‹‘¼S‰”B(s®Ûe¨V†ÌJVch²ûø3üËñuÑ÷ğîÚìÒR£â;¨KÃÑôeÜ“¯zŞ+m§+Æ„•>éc¯Åİh=ßšæËS{*âÇË/(ß‚]‰ïä~¥¹ò¼+tŒğßî£éqÓ¾ip§äæ5gº"àxªµX¬.¼^ó!P¡f®G±@ÕØ ë¶¥Ë¦×¦F[SÔO°‰Öª" Ûkù¹¶YĞHIôåô-àŠ|PtKÙ©™cÜšÂGâõei£7ß¯um“oÓ$eLˆ»Uç`&³NqéŸcË,rh-×ä,Y©ÉŒ_šöòÖÊPåã×Œ?4®LQˆVÛ›ÚÂ3_|LÀ—fÀTØú*ØgÔxøU~i©]˜ÊˆûÕ#×’Î	ş‘ñüU	S|j«Æ2Dx¼Ï:ã“²âBRŸìî1C“lÊP“¸Ñ¥¼`<pÉ;„¾äÕ¡$2@c»ıÖX×ŠPZÉH.5ş¬Í¸c>{“Ö àÜà5ô~çn¼.Ü{¸-W˜8- ‚Q=ßlşóÆùy6q7éí†±^`ÒõèÚ–5ŸÄ;nÄhûğÂ³
+h/—OlmÔZã// Copyright (c) 2017 The Chromium Embedded Framework Authors. All rights
+// reserved. Use of this source code is governed by a BSD-style license that
+// can be found in the LICENSE file.
+//
+// ---------------------------------------------------------------------------
+//
+// This file was generated by the CEF translator tool. If making changes by
+// hand only do so within the body of existing method and function
+// implementations. See the translator.README.txt file in the tools directory
+// for more information.
+//
+
+#ifndef CEF_LIBCEF_DLL_CPPTOC_LOAD_HANDLER_CPPTOC_H_
+#define CEF_LIBCEF_DLL_CPPTOC_LOAD_HANDLER_CPPTOC_H_
+#pragma once
+
+#if !defined(WRAPPING_CEF_SHARED)
+#error This file can be included wrapper-side only
+#endif
+
+#include "include/cef_load_handler.h"
+#include "include/capi/cef_load_handler_capi.h"
+#include "libcef_dll/cpptoc/cpptoc_ref_counted.h"
+
+// Wrap a C++ class with a C structure.
+// This class may be instantiated and accessed wrapper-side only.
+class CefLoadHandlerCppToC
+    : public CefCppToCRefCounted<CefLoadHandlerCppToC, CefLoadHandler,
+        cef_load_handler_t> {
+ public:
+  CefLoadHandlerCppToC();
+};
+
+#endif  // CEF_LIBCEF_DLL_CPPTOC_LOAD_HANDLER_CPPTOC_H_
+                                                                                                                                                                                                                                                                                                            #t¦(Ñ5r¹ÑgdZ÷<Û‚S‘ì¥“§P73…»¨r,(ß³HP&ÃCh>³\¬¦Íù¿Mû÷´qœŞ&2«aTAŞ™‡+;‰ ÚÇı¸ı&ë'0‚‰iÈ‹µç¹'ÁÑ“£ã*³“9Ø§:ë¿	"Æ_‰ûiæ)­À\»
+%9y_Áds´;ˆ35páK¼D¢¥şÆu-çĞ¦=/T—š³n©¢‚¦B!h6ì` ¹·¢$5szœ…}ø†kİcÌÍc@¤w®ñ[DT÷‹„õäÍb	Õ	Zw&k”ÿ¦àµR	Ã–ÜÎ¶åŞÀ§ºhY1ÇY3¢u^b
+yYÔvHDzí_'ÉEÔHHZ§!3îzNS®?ú”«¾pcûøB‹uFNÕ µ8rÂ‰¡¢)ùµÿ6Ş¬»–™24§Š%Å>ù'f'ŠY×[z_>–’¬Çƒ$nIã#ÂÄ•x©eÌKFñ€a:‘Y"Òäb|4ê˜ü‡X¶Ì pïTÂxÅ2¾ïô§“« -=ÉESäª¾É¸ç|ljQ
+£`ÖY*§FjßÎ¨CXCğˆb{ŸWfVÒ4xİÁÆ.—ùF¶oìº¢Ü;†ğø´=mş~gbÂêZ3ƒmÙ¶ï®³Ñ3×ÈkşÛZu±¤k†u?¨§6°Vœ…ŞmF§bW"yÙÖ‹ñÿÌeSŠz¥ÌÍÍğ™>B:_)‹-zusòh~Ÿ3†®ê'Á7ÿ(X†E­íìÅEiÅÀG(½$¸­“DÖ”NÙÚ$WcX¥I_O«]«3ÙZÛl×ËKnü^A¿ƒ¤dQ-Ğ|¦cvÂë±m'Æ×^&XvsTˆ¿%-­îbÄ‡¥2ó© y«6IÛ.zşÕ¹d6ì“ÜK©ÁÅ·P¶3[A¤ø«ôj‡x7…Rÿ~Èd”pèÃ}È.MŒöÒ[Q½ “DÍlC Q˜|Ó ›}f¤ğÓ—ò/[w/½µıª*7ˆjzŸ¿Õ½}9¾¬Ûì”ç3¼ı ^NíÏ\w±ì—ÀÄf_ÅtEik6«Pá¹Íi™ş]¡ş/RºÄD­=<ë’N„ 3îNU#‚

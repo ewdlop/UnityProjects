@@ -1,0 +1,356 @@
+// ==++==
+// 
+//   Copyright (c) Microsoft Corporation.  All rights reserved.
+// 
+// ==--==
+//
+// File: RtType.cs
+//
+// <OWNER>Microsoft</OWNER>
+//
+// Implements System.RuntimeType
+//
+// ======================================================================================
+
+
+using System;
+using System.Reflection;
+using System.Runtime.ConstrainedExecution;
+using System.Globalization;
+using System.Threading;
+using System.Diagnostics;
+#if !NETCORE
+using System.Security.Permissions;
+#endif
+using System.Collections;
+using System.Collections.Generic;
+using System.Runtime;
+using System.Runtime.Serialization;    
+using System.Runtime.CompilerServices;
+using System.Security;
+using System.Text;
+using System.Runtime.Remoting;
+#if FEATURE_REMOTING
+using System.Runtime.Remoting.Proxies;
+using System.Runtime.Remoting.Messaging;
+using System.Runtime.Remoting.Activation;
+using System.Runtime.Remoting.Metadata;
+#endif
+#if !MONO
+using MdSigCallingConvention = System.Signature.MdSigCallingConvention;
+using RuntimeTypeCache = System.RuntimeType.RuntimeTypeCache;
+#endif
+using System.Runtime.InteropServices;
+using DebuggerStepThroughAttribute = System.Diagnostics.DebuggerStepThroughAttribute;
+#if !MONO
+using MdToken = System.Reflection.MetadataToken;
+#endif
+using System.Runtime.Versioning;
+using System.Diagnostics.Contracts;
+
+#if MONO || NETCORE
+using CustomAttribute=System.MonoCustomAttrs;
+#endif
+
+namespace System 
+{
+    // this is a work around to get the concept of a calli. It's not as fast but it would be interesting to 
+    // see how it compares to the current implementation. 
+    // This delegate will disappear at some point in favor of calli 
+
+    internal delegate void CtorDelegate(Object instance);
+
+    // Keep this in sync with FormatFlags defined in typestring.h
+    internal enum TypeNameFormatFlags
+    {
+        FormatBasic         = 0x00000000, // Not a bitmask, simply the tersest flag settings possible
+        FormatNamespace     = 0x00000001, // Include namespace and/or enclosing class names in type names
+        FormatFullInst      = 0x00000002, // Include namespace and assembly in generic types (regardless of other flag settings)
+        FormatAssembly      = 0x00000004, // Include assembly display name in type names
+        FormatSignature     = 0x00000008, // Include signature in method names
+        FormatNoVersion     = 0x00000010, // Suppress version and culture information in all assembly names
+#if _DEBUG
+        FormatDebug         = 0x00000020, // For debug printing of types only
+#endif
+        FormatAngleBrackets = 0x00000040, // Whether generic types are C<T> or C[T]
+        FormatStubInfo      = 0x00000080, // Include stub info like {unbox-stub}
+        FormatGenericParam  = 0x00000100, // Use !name and !!name for generic type and method parameters
+
+        // If we want to be able to distinguish between overloads whose parameter types have the same name but come from different assemblies,
+        // we can add FormatAssembly | FormatNoVersion to FormatSerialization. But we are omitting it because it is not a useful scenario
+        // and including the assembly name will normally increase the size of the serialized data and also decrease the performance.
+        FormatSerialization = FormatNamespace |
+                              FormatGenericParam |
+                              FormatFullInst
+    }
+
+    internal enum TypeNameKind
+    {
+        Name,
+        ToString,
+        SerializationName,
+        FullName,
+    }
+
+    [Serializable]
+    internal partial class RuntimeType : 
+        System.Reflection.TypeInfo, ISerializable, ICloneable
+    {
+        #region Definitions
+
+        internal enum MemberListType
+        {
+            All,
+            CaseSensitive,
+            CaseInsensitive,
+            HandleToInfo
+        }
+
+        // Helper to build lists of MemberInfos. Special cased to avoid allocations for lists of one element.
+        private struct ListBuilder<T> where T : class
+        {
+            T[] _items;
+            T _item;
+            int _count;
+            int _capacity;
+
+            public ListBuilder(int capacity)
+            {
+                _items = null;
+                _item = null;
+                _count = 0;
+                _capacity = capacity;
+            }
+
+            public T this[int index]
+            {
+                get
+                {
+                    Contract.Requires(index < Count);
+                    return (_items != null) ? _items[index] : _item;
+                }
+#if FEATURE_LEGACYNETCF
+                // added for Dev11 466969 quirk
+                set
+                {
+                    Contract.Requires(index < Count);
+                    if (_items != null)
+                        _items[index] = value;
+                    else
+                        _item = value;
+                }
+#endif
+            }
+
+            public T[] ToArray()
+            {
+                if (_count == 0)
+                    return Array.Empty<T> ();
+                if (_count == 1)
+                    return new T[1] { _item };
+
+                Array.Resize(ref _items, _count);
+                _capacity = _count;
+                return _items;
+            }
+
+            public void CopyTo(Object[] array, int index)
+            {
+                if (_count == 0)
+                    return;
+
+                if (_count == 1)
+                {
+                    array[index] = _item;
+                    return;
+                }
+
+                Array.Copy(_items, 0, array, index, _count);
+            }
+
+            public int Count
+            {
+                get
+                {
+                    return _count;
+                }
+            }
+
+            public void Add(T item)
+            {
+                if (_count == 0)
+                {
+                    _item = item;
+                }
+                else                
+                {
+                    if (_count == 1)
+                    {
+                        if (_capacity < 2)
+                            _capacity = 4;
+                        _items = new T[_capacity];
+                        _items[0] = _item;
+                    }
+                    else
+                    if (_capacity == _count)
+                    {
+                        int newCapacity = 2 * _capacity;
+                        Array.Resize(ref _items, newCapacity);
+                        _capacity = newCapacity;
+                    }
+
+                    _items[_count] = item;
+                }
+                _count++;
+            }
+        }
+#if !MONO
+        internal class RuntimeTypeCache
+        {
+            private const int MAXNAMELEN = 1024;
+
+            #region Definitions
+            internal enum CacheType
+            {
+                Method,
+                Constructor,
+                Field,
+                Property,
+                Event,
+                Interface,
+                NestedType
+            }
+
+            private struct Filter
+            {
+                private Utf8String m_name;
+                private MemberListType m_listType;
+                private uint m_nameHash;
+
+                [System.Security.SecurityCritical]  // auto-generated
+                public unsafe Filter(byte* pUtf8Name, int cUtf8Name, MemberListType listType)
+                {
+                    this.m_name = new Utf8String((void*) pUtf8Name, cUtf8Name);
+                    this.m_listType = listType;
+                    this.m_nameHash = 0;
+
+                    if (RequiresStringComparison())
+                    {
+                        m_nameHash = m_name.HashCaseInsensitive();
+                    }
+                }
+
+                public bool Match(Utf8String name) 
+                {
+                    bool retVal = true;
+                    
+                    if (m_listType == MemberListType.CaseSensitive)
+                        retVal = m_name.Equals(name);
+                    else if (m_listType == MemberListType.CaseInsensitive)
+                        retVal = m_name.EqualsCaseInsensitive(name);
+
+                    // Currently the callers of UsesStringComparison assume that if it returns false
+                    // then the match always succeeds and can be skipped.  Assert that this is maintained.
+                    Contract.Assert(retVal || RequiresStringComparison());
+
+                    return retVal;
+                }
+
+                // Does the current match type require a string comparison?
+                // If not, we know Match will always return true and the call can be skipped
+                // If so, we know we can have a valid hash to check against from GetHashToMatch
+                public bool RequiresStringComparison()
+                {
+                    return (m_listType == MemberListType.CaseSensitive) ||
+                           (m_listType == MemberListType.CaseInsensitive);
+                }
+
+                public bool CaseSensitive()
+                {
+                    return (m_listType == MemberListType.CaseSensitive);
+                }
+
+                public uint GetHashToMatch()
+                {
+                    Contract.Assert(RequiresStringComparison());
+
+                    return m_nameHash;
+                }
+            }
+
+            private class MemberInfoCache<T> where T : MemberInfo
+            {
+                #region Private Data Members
+
+                // MemberInfo caches
+                private CerHashtable<string, T[]> m_csMemberInfos;
+                private CerHashtable<string, T[]> m_cisMemberInfos;
+                // List of MemberInfos given out. When m_cacheComplete is false, it may have null entries at the end to avoid
+                // reallocating the list every time a new entry is added.
+                private T[] m_allMembers;
+                private bool m_cacheComplete;
+#if FEATURE_LEGACYNETCF
+                // Dev11 466969 quirk
+                private List<RuntimePropertyInfo> m_ambiguousProperties;
+#endif
+
+                // This is the strong reference back to the cache
+                private RuntimeTypeCache m_runtimeTypeCache;
+                #endregion
+
+                #region Constructor
+#if MDA_SUPPORTED
+                [System.Security.SecuritySafeCritical]  // auto-generated
+#endif
+                internal MemberInfoCache(RuntimeTypeCache runtimeTypeCache)
+                {
+#if MDA_SUPPORTED
+                    Mda.MemberInfoCacheCreation();
+#endif
+                    m_runtimeTypeCache = runtimeTypeCache;
+                }
+                
+#if FEATURE_LEGACYNETCF
+                // Dev11 466969 quirk
+                internal IReadOnlyList<RuntimePropertyInfo> AmbiguousProperties { get { return m_ambiguousProperties; } }
+                
+                private void InitializeAndUpdateAmbiguousPropertiesList(RuntimePropertyInfo parent, RuntimePropertyInfo child)
+                {
+                    Contract.Assert(CompatibilitySwitches.IsAppEarlierThanWindowsPhone8);
+
+                    if (m_ambiguousProperties == null)
+                    {
+                        List<RuntimePropertyInfo> newList = new List<RuntimePropertyInfo>();
+                        Interlocked.CompareExchange(ref m_ambiguousProperties, newList, null);
+                    }
+
+                    lock (m_ambiguousProperties)
+                    {
+                        // record the parent type in case it needs to be pruned later.
+                        Contract.Assert(child.DeclaringType.IsSubclassOf(parent.DeclaringType));
+                        m_ambiguousProperties.Add(parent);
+                    }
+                }
+#endif
+
+                [System.Security.SecuritySafeCritical]  // auto-generated
+                internal MethodBase AddMethod(RuntimeType declaringType, RuntimeMethodHandleInternal method, CacheType cacheType)
+                {
+                    T[] list = null;
+                    MethodAttributes methodAttributes = RuntimeMethodHandle.GetAttributes(method);
+                    bool isPublic = (methodAttributes & MethodAttributes.MemberAccessMask) == MethodAttributes.Public;
+                    bool isStatic = (methodAttributes & MethodAttributes.Static) != 0;
+                    bool isInherited = declaringType != ReflectedType;
+                    BindingFlags bindingFlags = RuntimeType.FilterPreCalculate(isPublic, isInherited, isStatic);
+                    switch (cacheType)
+                    {
+                    case CacheType.Method:
+                        list = (T[])(object)new RuntimeMethodInfo[1] {
+                            new RuntimeMethodInfo(method, declaringType, m_runtimeTypeCache, methodAttributes, bindingFlags, null)
+                        };
+                        break;
+                    case CacheType.Constructor:
+                        list = (T[])(object)new RuntimeConstructorInfo[1] { 
+                            new RuntimeConstructorInfo(method, declaringType, m_runtimeTypeCache, methodAttributes, bindingFlags) 
+                        };
+       

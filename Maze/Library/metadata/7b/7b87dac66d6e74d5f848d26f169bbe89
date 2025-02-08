@@ -1,0 +1,136 @@
+ of active voxel
+    // in a coarse tree from the active voxels in a fine tree
+    struct MaskOp;
+
+    /// Private struct that performs multi-threaded restriction
+    struct RestrictOp;
+
+    /// Private struct that performs multi-threaded prolongation
+    struct ProlongateOp;
+
+    // Private struct that performs multi-threaded computation of grids a fraction levels
+    template<Index Order>
+    struct FractionOp;
+
+    /// Private template struct that performs the actual multi-threading
+    template<typename OpType> struct CookOp;
+
+    // Array of shared pointer to trees, level 0 has the highest resolution.
+    std::vector<TreePtr> mTrees;
+    // Shared point to a transform associated with the finest level grid
+    typename math::Transform::Ptr mTransform;
+};// MultiResGrid
+
+template<typename TreeType>
+MultiResGrid<TreeType>::
+MultiResGrid(size_t levels, ValueType background, double voxelSize)
+    : mTrees(levels)
+    , mTransform(math::Transform::createLinearTransform( voxelSize ))
+{
+    this->initMeta();
+    for (size_t i=0; i<levels; ++i) mTrees[i] = TreePtr(new TreeType(background));
+}
+
+template<typename TreeType>
+MultiResGrid<TreeType>::
+MultiResGrid(size_t levels, const Grid<TreeType> &grid, bool useInjection)
+    : MetaMap(grid)
+    , mTrees(levels)
+    , mTransform( grid.transform().copy() )
+{
+    this->initMeta();
+    mTrees[0].reset( new TreeType( grid.tree() ) );// deep copy input tree
+    mTrees[0]->voxelizeActiveTiles();
+    this->topDownRestrict(useInjection);
+}
+
+template<typename TreeType>
+MultiResGrid<TreeType>::
+MultiResGrid(size_t levels, GridPtr grid, bool useInjection)
+    : MetaMap(*grid)
+    , mTrees(levels)
+    , mTransform( grid->transform().copy() )
+{
+    this->initMeta();
+    mTrees[0] = grid->treePtr();// steal tree from input grid
+    mTrees[0]->voxelizeActiveTiles();
+    grid->newTree();
+    this->topDownRestrict(useInjection);
+}
+
+template<typename TreeType>
+inline TreeType& MultiResGrid<TreeType>::
+tree(size_t level)
+{
+    assert( level < mTrees.size() );
+    return *mTrees[level];
+}
+
+template<typename TreeType>
+inline const TreeType& MultiResGrid<TreeType>::
+constTree(size_t level) const
+{
+    assert( level < mTrees.size() );
+    return *mTrees[level];
+}
+
+template<typename TreeType>
+inline typename TreeType::Ptr MultiResGrid<TreeType>::
+treePtr(size_t level)
+{
+    assert( level < mTrees.size() );
+    return mTrees[level];
+}
+
+template<typename TreeType>
+inline typename TreeType::ConstPtr MultiResGrid<TreeType>::
+constTreePtr(size_t level) const
+{
+    assert( level < mTrees.size() );
+    return mTrees[level];
+}
+
+template<typename TreeType>
+typename Grid<TreeType>::Ptr MultiResGrid<TreeType>::
+grid(size_t level)
+{
+    typename Grid<TreeType>::Ptr grid = Grid<TreeType>::create(this->treePtr(level));
+    math::Transform::Ptr xform = mTransform->copy();
+    if (level>0) xform->preScale( Real(1 << level) );
+    grid->setTransform( xform );
+    grid->insertMeta( *this->copyMeta() );
+    grid->insertMeta( "MultiResGrid_Level", Int64Metadata(level));
+    std::stringstream ss;
+    ss << this->getName() << "_level_" << level;
+    grid->setName( ss.str() );
+    return grid;
+}
+
+template<typename TreeType>
+inline typename Grid<TreeType>::ConstPtr MultiResGrid<TreeType>::
+grid(size_t level) const
+{
+    return const_cast<MultiResGrid*>(this)->grid(level);
+}
+
+template<typename TreeType>
+template<Index Order>
+typename Grid<TreeType>::Ptr MultiResGrid<TreeType>::
+createGrid(float level, size_t grainSize) const
+{
+    assert( level >= 0.0f && level <= float(mTrees.size()-1) );
+
+    typename Grid<TreeType>::Ptr grid(new Grid<TreeType>(this->constTree(0).background()));
+    math::Transform::Ptr xform = mTransform->copy();
+    xform->preScale( math::Pow(2.0f, level) );
+    grid->setTransform( xform );
+    grid->insertMeta( *(this->copyMeta()) );
+    grid->insertMeta( "MultiResGrid_Level", FloatMetadata(level) );
+    std::stringstream ss;
+    ss << this->getName() << "_level_" << level;
+    grid->setName( ss.str() );
+
+    if ( size_t(floorf(level)) == size_t(ceilf(level)) ) {
+        grid->setTree( this->constTree( size_t(floorf(level))).copy() );
+    } else {
+        FractionOp<Order> tmp(*th

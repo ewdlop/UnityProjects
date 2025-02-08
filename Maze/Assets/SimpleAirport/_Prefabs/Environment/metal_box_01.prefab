@@ -1,0 +1,90 @@
+ // TDS 4.2/7.0
+				ProcessMessage (subType);
+				break;
+			case TdsPacketSubType.Param:
+				ProcessOutputParam ();
+				break;
+			case TdsPacketSubType.LoginAck:
+				ProcessLoginAck ();
+				break;
+			case TdsPacketSubType.Authentication: // TDS 7.0
+				ProcessAuthentication ();
+				break;
+			case TdsPacketSubType.ReturnStatus :
+				ProcessReturnStatus ();
+				break;
+			case TdsPacketSubType.ProcId:
+				Comm.Skip (8);
+				break;
+			case TdsPacketSubType.Done:
+			case TdsPacketSubType.DoneProc:
+			case TdsPacketSubType.DoneInProc:
+				ProcessEndToken (subType);
+				break;
+			case TdsPacketSubType.ColumnName:
+				Comm.Skip (8);
+				ProcessColumnNames ();
+				break;
+			case TdsPacketSubType.ColumnInfo:      // TDS 4.2
+			case TdsPacketSubType.ColumnMetadata:  // TDS 7.0
+			case TdsPacketSubType.RowFormat:       // TDS 5.0
+				Columns.Clear ();
+				ProcessColumnInfo ();
+				break;
+			case TdsPacketSubType.ColumnDetail:
+				ProcessColumnDetail ();
+				break;
+			case TdsPacketSubType.TableName:
+				ProcessTableName ();
+				break;
+			case TdsPacketSubType.ColumnOrder:
+				comm.Skip (comm.GetTdsShort ());
+				break;
+			case TdsPacketSubType.Control:
+				comm.Skip (comm.GetTdsShort ());
+				break;
+			case TdsPacketSubType.Row:
+				LoadRow ();
+				break;
+			}
+
+			// VARADHAN: TDS 8 Debugging
+			//Console.WriteLine ("In ProcessSubPacket... exit");
+			return subType;
+		}
+
+		protected void ProcessTableName ()
+		{
+			tableNames = new ArrayList ();
+			int totalLength = comm.GetTdsShort ();
+			int position = 0;
+			int len;
+
+			while (position < totalLength) {
+				if (tdsVersion >= TdsVersion.tds70) {
+					len = comm.GetTdsShort ();
+					position += 2 * (len + 1);
+				}
+				else {
+					len = comm.GetByte ();
+					position += len + 1;
+				}
+				tableNames.Add (comm.GetString (len));
+			}
+		}
+
+		protected void SetCharset (Encoding encoder)
+		{
+			comm.Encoder = encoder;
+		}
+		
+		protected void SetCharset (string charset)
+		{
+			if (charset == null || charset.Length > 30)
+				charset = "iso_1";
+
+			if (this.charset != null && this.charset == charset)
+				return;
+
+			if (charset.StartsWith ("cp")) {
+				encoder = Encoding.GetEncoding (Int32.Parse (cha

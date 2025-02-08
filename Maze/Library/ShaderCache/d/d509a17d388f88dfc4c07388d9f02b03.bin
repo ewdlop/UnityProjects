@@ -1,0 +1,66 @@
+s following test is to see if available input would overflow the output.
+         * It does not catch output of more than one byte that
+         * overflows as a result of a multi-byte character or callback output
+         * from the last source character.
+         * Therefore, those situations also test for overflows and will
+         * then break the loop, too.
+         */
+        if(targetCapacity>0) {
+            /*
+             * Get a correct Unicode code point:
+             * a single UChar for a BMP code point or
+             * a matched surrogate pair for a "supplementary code point".
+             */
+            c=*source++;
+            ++nextSourceIndex;
+            if(c<=0x7f && IS_ASCII_ROUNDTRIP(c, asciiRoundtrips)) {
+                *target++=(uint8_t)c;
+                if(offsets!=NULL) {
+                    *offsets++=sourceIndex;
+                    prevSourceIndex=sourceIndex;
+                    sourceIndex=nextSourceIndex;
+                }
+                --targetCapacity;
+                c=0;
+                continue;
+            }
+            /*
+             * utf8Friendly table: Test for <=0xd7ff rather than <=MBCS_FAST_MAX
+             * to avoid dealing with surrogates.
+             * MBCS_FAST_MAX must be >=0xd7ff.
+             */
+            if(c<=0xd7ff && mbcsIndex!=NULL) {
+                value=mbcsIndex[c>>6];
+
+                /* get the bytes and the length for the output (copied from below and adapted for utf8Friendly data) */
+                /* There are only roundtrips (!=0) and no-mapping (==0) entries. */
+                switch(outputType) {
+                case MBCS_OUTPUT_2:
+                    value=((const uint16_t *)bytes)[value +(c&0x3f)];
+                    if(value<=0xff) {
+                        if(value==0) {
+                            goto unassigned;
+                        } else {
+                            length=1;
+                        }
+                    } else {
+                        length=2;
+                    }
+                    break;
+                case MBCS_OUTPUT_2_SISO:
+                    /* 1/2-byte stateful with Shift-In/Shift-Out */
+                    /*
+                     * Save the old state in the converter object
+                     * right here, then change the local prevLength state variable if necessary.
+                     * Then, if this character turns out to be unassigned or a fallback that
+                     * is not taken, the callback code must not save the new state in the converter
+                     * because the new state is for a character that is not output.
+                     * However, the callback must still restore the state from the converter
+                     * in case the callback function changed it for its output.
+                     */
+                    cnv->fromUnicodeStatus=prevLength; /* save the old state */
+                    value=((const uint16_t *)bytes)[value +(c&0x3f)];
+                    if(value<=0xff) {
+                        if(value==0) {
+                            goto unassigned;
+                        } else if(prevL

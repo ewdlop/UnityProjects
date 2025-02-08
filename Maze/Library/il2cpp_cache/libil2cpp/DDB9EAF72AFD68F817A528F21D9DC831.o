@@ -1,0 +1,196 @@
+remove_redundancies(bmap);
+
+	return bmap;
+error:
+	isl_basic_map_free(bmap);
+	isl_basic_map_free(context);
+	return NULL;
+}
+
+/*
+ * Assumes context has no implicit divs.
+ */
+__isl_give isl_map *isl_map_gist_basic_map(__isl_take isl_map *map,
+	__isl_take isl_basic_map *context)
+{
+	int i;
+
+	if (!map || !context)
+		goto error;
+
+	if (isl_basic_map_plain_is_empty(context)) {
+		isl_space *space = isl_map_get_space(map);
+		isl_map_free(map);
+		isl_basic_map_free(context);
+		return isl_map_universe(space);
+	}
+
+	context = isl_basic_map_remove_redundancies(context);
+	map = isl_map_cow(map);
+	if (!map || !context)
+		goto error;
+	isl_assert(map->ctx, isl_space_is_equal(map->dim, context->dim), goto error);
+	map = isl_map_compute_divs(map);
+	if (!map)
+		goto error;
+	for (i = map->n - 1; i >= 0; --i) {
+		map->p[i] = isl_basic_map_gist(map->p[i],
+						isl_basic_map_copy(context));
+		if (!map->p[i])
+			goto error;
+		if (isl_basic_map_plain_is_empty(map->p[i])) {
+			isl_basic_map_free(map->p[i]);
+			if (i != map->n - 1)
+				map->p[i] = map->p[map->n - 1];
+			map->n--;
+		}
+	}
+	isl_basic_map_free(context);
+	ISL_F_CLR(map, ISL_MAP_NORMALIZED);
+	return map;
+error:
+	isl_map_free(map);
+	isl_basic_map_free(context);
+	return NULL;
+}
+
+/* Drop all inequalities from "bmap" that also appear in "context".
+ * "context" is assumed to have only known local variables and
+ * the initial local variables of "bmap" are assumed to be the same
+ * as those of "context".
+ * The constraints of both "bmap" and "context" are assumed
+ * to have been sorted using isl_basic_map_sort_constraints.
+ *
+ * Run through the inequality constraints of "bmap" and "context"
+ * in sorted order.
+ * If a constraint of "bmap" involves variables not in "context",
+ * then it cannot appear in "context".
+ * If a matching constraint is found, it is removed from "bmap".
+ */
+static __isl_give isl_basic_map *drop_inequalities(
+	__isl_take isl_basic_map *bmap, __isl_keep isl_basic_map *context)
+{
+	int i1, i2;
+	unsigned total, extra;
+
+	if (!bmap || !context)
+		return isl_basic_map_free(bmap);
+
+	total = isl_basic_map_total_dim(context);
+	extra = isl_basic_map_total_dim(bmap) - total;
+
+	i1 = bmap->n_ineq - 1;
+	i2 = context->n_ineq - 1;
+	while (bmap && i1 >= 0 && i2 >= 0) {
+		int cmp;
+
+		if (isl_seq_first_non_zero(bmap->ineq[i1] + 1 + total,
+					    extra) != -1) {
+			--i1;
+			continue;
+		}
+		cmp = isl_basic_map_constraint_cmp(context, bmap->ineq[i1],
+							context->ineq[i2]);
+		if (cmp < 0) {
+			--i2;
+			continue;
+		}
+		if (cmp > 0) {
+			--i1;
+			continue;
+		}
+		if (isl_int_eq(bmap->ineq[i1][0], context->ineq[i2][0])) {
+			bmap = isl_basic_map_cow(bmap);
+			if (isl_basic_map_drop_inequality(bmap, i1) < 0)
+				bmap = isl_basic_map_free(bmap);
+		}
+		--i1;
+		--i2;
+	}
+
+	return bmap;
+}
+
+/* Drop all equalities from "bmap" that also appear in "context".
+ * "context" is assumed to have only known local variables and
+ * the initial local variables of "bmap" are assumed to be the same
+ * as those of "context".
+ *
+ * Run through the equality constraints of "bmap" and "context"
+ * in sorted order.
+ * If a constraint of "bmap" involves variables not in "context",
+ * then it cannot appear in "context".
+ * If a matching constraint is found, it is removed from "bmap".
+ */
+static __isl_give isl_basic_map *drop_equalities(
+	__isl_take isl_basic_map *bmap, __isl_keep isl_basic_map *context)
+{
+	int i1, i2;
+	unsigned total, extra;
+
+	if (!bmap || !context)
+		return isl_basic_map_free(bmap);
+
+	total = isl_basic_map_total_dim(context);
+	extra = isl_basic_map_total_dim(bmap) - total;
+
+	i1 = bmap->n_eq - 1;
+	i2 = context->n_eq - 1;
+
+	while (bmap && i1 >= 0 && i2 >= 0) {
+		int last1, last2;
+
+		if (isl_seq_first_non_zero(bmap->eq[i1] + 1 + total,
+					    extra) != -1)
+			break;
+		last1 = isl_seq_last_non_zero(bmap->eq[i1] + 1, total);
+		last2 = isl_seq_last_non_zero(context->eq[i2] + 1, total);
+		if (last1 > last2) {
+			--i2;
+			continue;
+		}
+		if (last1 < last2) {
+			--i1;
+			continue;
+		}
+		if (isl_seq_eq(bmap->eq[i1], context->eq[i2], 1 + total)) {
+			bmap = isl_basic_map_cow(bmap);
+			if (isl_basic_map_drop_equality(bmap, i1) < 0)
+				bmap = isl_basic_map_free(bmap);
+		}
+		--i1;
+		--i2;
+	}
+
+	return bmap;
+}
+
+/* Remove the constraints in "context" from "bmap".
+ * "context" is assumed to have explicit representations
+ * for all local variables.
+ *
+ * First align the divs of "bmap" to those of "context" and
+ * sort the constraints.  Then drop all constraints from "bmap"
+ * that appear in "context".
+ */
+__isl_give isl_basic_map *isl_basic_map_plain_gist(
+	__isl_take isl_basic_map *bmap, __isl_take isl_basic_map *context)
+{
+	isl_bool done, known;
+
+	done = isl_basic_map_plain_is_universe(context);
+	if (done == isl_bool_false)
+		done = isl_basic_map_plain_is_universe(bmap);
+	if (done == isl_bool_false)
+		done = isl_basic_map_plain_is_empty(context);
+	if (done == isl_bool_false)
+		done = isl_basic_map_plain_is_empty(bmap);
+	if (done < 0)
+		goto error;
+	if (done) {
+		isl_basic_map_free(context);
+		return bmap;
+	}
+	known = isl_basic_map_divs_known(context);
+	if (known < 0)
+		g

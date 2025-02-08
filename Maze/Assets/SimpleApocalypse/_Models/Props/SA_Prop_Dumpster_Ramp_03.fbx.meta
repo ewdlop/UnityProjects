@@ -1,0 +1,58 @@
+// Copyright (c) 2014 The Chromium Embedded Framework Authors. All rights
+// reserved. Use of this source code is governed by a BSD-style license that
+// can be found in the LICENSE file.
+
+#include <list>
+
+#include "libcef_dll/wrapper/cef_browser_info_map.h"
+#include "tests/gtest/include/gtest/gtest.h"
+
+namespace {
+
+struct MyObject {
+  MyObject(int val = 0) : member(val) {}
+  int member;
+};
+
+int g_destruct_ct = 0;
+
+struct MyObjectTraits {
+  static void Destruct(MyObject info) {
+    g_destruct_ct++;
+  }
+};
+
+typedef CefBrowserInfoMap<int, MyObject, MyObjectTraits> MyObjectMap;
+
+class MyVisitor : public MyObjectMap::Visitor {
+ public:
+  MyVisitor(bool remove = false,
+            int remove_browser_id = 0,
+            InfoIdType remove_info_id = 0)
+      : remove_(remove),
+        remove_browser_id_(remove_browser_id),
+        remove_info_id_(remove_info_id) {}
+
+  bool OnNextInfo(int browser_id,
+                  InfoIdType info_id,
+                  InfoObjectType info,
+                  bool* remove) override {
+    Info info_rec;
+    info_rec.browser_id = browser_id;
+    info_rec.info_id = info_id;
+    info_rec.info = info;
+    info_list_.push_back(info_rec);
+
+    // Based on test configuration remove no objects, all objects, or only the
+    // specified object.
+    *remove = remove_ || (browser_id == remove_browser_id_ &&
+                          info_id == remove_info_id_);
+    return true;
+  }
+
+  // Returns true if the specified info was passed to OnNextInfo. Removes the
+  // record if found.
+  bool Exists(int browser_id,
+              InfoIdType info_id,
+              InfoObjectType info) {
+ 

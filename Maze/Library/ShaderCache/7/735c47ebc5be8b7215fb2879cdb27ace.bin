@@ -1,0 +1,97 @@
+0)
+        self.assertEqual(result, 21)
+        self.assertEqual(type(result), float)
+
+        result = f(-1, -2, -3, -4, -5.0, -6.0)
+        self.assertEqual(result, -21)
+        self.assertEqual(type(result), float)
+
+    def test_longdoubleresult(self):
+        f = dll._testfunc_D_bhilfD
+        f.argtypes = [c_byte, c_short, c_int, c_long, c_float, c_longdouble]
+        f.restype = c_longdouble
+        result = f(1, 2, 3, 4, 5.0, 6.0)
+        self.assertEqual(result, 21)
+        self.assertEqual(type(result), float)
+
+        result = f(-1, -2, -3, -4, -5.0, -6.0)
+        self.assertEqual(result, -21)
+        self.assertEqual(type(result), float)
+
+    @need_symbol('c_longlong')
+    def test_longlongresult(self):
+        f = dll._testfunc_q_bhilfd
+        f.restype = c_longlong
+        f.argtypes = [c_byte, c_short, c_int, c_long, c_float, c_double]
+        result = f(1, 2, 3, 4, 5.0, 6.0)
+        self.assertEqual(result, 21)
+
+        f = dll._testfunc_q_bhilfdq
+        f.restype = c_longlong
+        f.argtypes = [c_byte, c_short, c_int, c_long, c_float, c_double, c_longlong]
+        result = f(1, 2, 3, 4, 5.0, 6.0, 21)
+        self.assertEqual(result, 42)
+
+    def test_stringresult(self):
+        f = dll._testfunc_p_p
+        f.argtypes = None
+        f.restype = c_char_p
+        result = f("123")
+        self.assertEqual(result, "123")
+
+        result = f(None)
+        self.assertEqual(result, None)
+
+    def test_pointers(self):
+        f = dll._testfunc_p_p
+        f.restype = POINTER(c_int)
+        f.argtypes = [POINTER(c_int)]
+
+        # This only works if the value c_int(42) passed to the
+        # function is still alive while the pointer (the result) is
+        # used.
+
+        v = c_int(42)
+
+        self.assertEqual(pointer(v).contents.value, 42)
+        result = f(pointer(v))
+        self.assertEqual(type(result), POINTER(c_int))
+        self.assertEqual(result.contents.value, 42)
+
+        # This on works...
+        result = f(pointer(v))
+        self.assertEqual(result.contents.value, v.value)
+
+        p = pointer(c_int(99))
+        result = f(p)
+        self.assertEqual(result.contents.value, 99)
+
+        arg = byref(v)
+        result = f(arg)
+        self.assertNotEqual(result.contents, v.value)
+
+        self.assertRaises(ArgumentError, f, byref(c_short(22)))
+
+        # It is dangerous, however, because you don't control the lifetime
+        # of the pointer:
+        result = f(byref(c_int(99)))
+        self.assertNotEqual(result.contents, 99)
+
+    def test_errors(self):
+        f = dll._testfunc_p_p
+        f.restype = c_int
+
+        class X(Structure):
+            _fields_ = [("y", c_int)]
+
+        self.assertRaises(TypeError, f, X()) #cannot convert parameter
+
+    ################################################################
+    def test_shorts(self):
+        f = dll._testfunc_callback_i_if
+
+        args = []
+        expected = [262144, 131072, 65536, 32768, 16384, 8192, 4096, 2048,
+                    1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1]
+
+  

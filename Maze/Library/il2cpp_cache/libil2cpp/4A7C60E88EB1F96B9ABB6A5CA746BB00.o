@@ -1,0 +1,222 @@
+_neg(bmap->ineq[i] + first, bmap->ineq[j] + first, n);
+}
+
+/* Are inequality constraints "i" and "j" of "bmap" opposite to each other,
+ * apart from the constant term?
+ */
+static isl_bool is_opposite(__isl_keep isl_basic_map *bmap, int i, int j)
+{
+	unsigned total;
+
+	total = isl_basic_map_dim(bmap, isl_dim_all);
+	return is_opposite_part(bmap, i, j, 1, total);
+}
+
+/* Are inequality constraints "i" and "j" of "bmap" equal to each other,
+ * apart from the constant term and the coefficient at position "pos"?
+ */
+static int is_parallel_except(__isl_keep isl_basic_map *bmap, int i, int j,
+	int pos)
+{
+	unsigned total;
+
+	total = isl_basic_map_dim(bmap, isl_dim_all);
+	return is_parallel_part(bmap, i, j, 1, pos - 1) &&
+		is_parallel_part(bmap, i, j, pos + 1, total - pos);
+}
+
+/* Are inequality constraints "i" and "j" of "bmap" opposite to each other,
+ * apart from the constant term and the coefficient at position "pos"?
+ */
+static int is_opposite_except(__isl_keep isl_basic_map *bmap, int i, int j,
+	int pos)
+{
+	unsigned total;
+
+	total = isl_basic_map_dim(bmap, isl_dim_all);
+	return is_opposite_part(bmap, i, j, 1, pos - 1) &&
+		is_opposite_part(bmap, i, j, pos + 1, total - pos);
+}
+
+/* Restart isl_basic_map_drop_redundant_divs after "bmap" has
+ * been modified, simplying it if "simplify" is set.
+ * Free the temporary data structure "pairs" that was associated
+ * to the old version of "bmap".
+ */
+static __isl_give isl_basic_map *drop_redundant_divs_again(
+	__isl_take isl_basic_map *bmap, __isl_take int *pairs, int simplify)
+{
+	if (simplify)
+		bmap = isl_basic_map_simplify(bmap);
+	free(pairs);
+	return isl_basic_map_drop_redundant_divs(bmap);
+}
+
+/* Is "div" the single unknown existentially quantified variable
+ * in inequality constraint "ineq" of "bmap"?
+ * "div" is known to have a non-zero coefficient in "ineq".
+ */
+static isl_bool single_unknown(__isl_keep isl_basic_map *bmap, int ineq,
+	int div)
+{
+	int i;
+	unsigned n_div, o_div;
+	isl_bool known;
+
+	known = isl_basic_map_div_is_known(bmap, div);
+	if (known < 0 || known)
+		return isl_bool_not(known);
+	n_div = isl_basic_map_dim(bmap, isl_dim_div);
+	if (n_div == 1)
+		return isl_bool_true;
+	o_div = isl_basic_map_offset(bmap, isl_dim_div);
+	for (i = 0; i < n_div; ++i) {
+		isl_bool known;
+
+		if (i == div)
+			continue;
+		if (isl_int_is_zero(bmap->ineq[ineq][o_div + i]))
+			continue;
+		known = isl_basic_map_div_is_known(bmap, i);
+		if (known < 0 || !known)
+			return known;
+	}
+
+	return isl_bool_true;
+}
+
+/* Does integer division "div" have coefficient 1 in inequality constraint
+ * "ineq" of "map"?
+ */
+static isl_bool has_coef_one(__isl_keep isl_basic_map *bmap, int div, int ineq)
+{
+	unsigned o_div;
+
+	o_div = isl_basic_map_offset(bmap, isl_dim_div);
+	if (isl_int_is_one(bmap->ineq[ineq][o_div + div]))
+		return isl_bool_true;
+
+	return isl_bool_false;
+}
+
+/* Turn inequality constraint "ineq" of "bmap" into an equality and
+ * then try and drop redundant divs again,
+ * freeing the temporary data structure "pairs" that was associated
+ * to the old version of "bmap".
+ */
+static __isl_give isl_basic_map *set_eq_and_try_again(
+	__isl_take isl_basic_map *bmap, int ineq, __isl_take int *pairs)
+{
+	bmap = isl_basic_map_cow(bmap);
+	isl_basic_map_inequality_to_equality(bmap, ineq);
+	return drop_redundant_divs_again(bmap, pairs, 1);
+}
+
+/* Drop the integer division at position "div", along with the two
+ * inequality constraints "ineq1" and "ineq2" in which it appears
+ * from "bmap" and then try and drop redundant divs again,
+ * freeing the temporary data structure "pairs" that was associated
+ * to the old version of "bmap".
+ */
+static __isl_give isl_basic_map *drop_div_and_try_again(
+	__isl_take isl_basic_map *bmap, int div, int ineq1, int ineq2,
+	__isl_take int *pairs)
+{
+	if (ineq1 > ineq2) {
+		isl_basic_map_drop_inequality(bmap, ineq1);
+		isl_basic_map_drop_inequality(bmap, ineq2);
+	} else {
+		isl_basic_map_drop_inequality(bmap, ineq2);
+		isl_basic_map_drop_inequality(bmap, ineq1);
+	}
+	bmap = isl_basic_map_drop_div(bmap, div);
+	return drop_redundant_divs_again(bmap, pairs, 0);
+}
+
+/* Given two inequality constraints
+ *
+ *	f(x) + n d + c >= 0,		(ineq)
+ *
+ * with d the variable at position "pos", and
+ *
+ *	f(x) + c0 >= 0,			(lower)
+ *
+ * compute the maximal value of the lower bound ceil((-f(x) - c)/n)
+ * determined by the first constraint.
+ * That is, store
+ *
+ *	ceil((c0 - c)/n)
+ *
+ * in *l.
+ */
+static void lower_bound_from_parallel(__isl_keep isl_basic_map *bmap,
+	int ineq, int lower, int pos, isl_int *l)
+{
+	isl_int_neg(*l, bmap->ineq[ineq][0]);
+	isl_int_add(*l, *l, bmap->ineq[lower][0]);
+	isl_int_cdiv_q(*l, *l, bmap->ineq[ineq][pos]);
+}
+
+/* Given two inequality constraints
+ *
+ *	f(x) + n d + c >= 0,		(ineq)
+ *
+ * with d the variable at position "pos", and
+ *
+ *	-f(x) - c0 >= 0,		(upper)
+ *
+ * compute the minimal value of the lower bound ceil((-f(x) - c)/n)
+ * determined by the first constraint.
+ * That is, store
+ *
+ *	ceil((-c1 - c)/n)
+ *
+ * in *u.
+ */
+static void lower_bound_from_opposite(__isl_keep isl_basic_map *bmap,
+	int ineq, int upper, int pos, isl_int *u)
+{
+	isl_int_neg(*u, bmap->ineq[ineq][0]);
+	isl_int_sub(*u, *u, bmap->ineq[upper][0]);
+	isl_int_cdiv_q(*u, *u, bmap->ineq[ineq][pos]);
+}
+
+/* Given a lower bound constraint "ineq" on "div" in "bmap",
+ * does the corresponding lower bound have a fixed value in "bmap"?
+ *
+ * In particular, "ineq" is of the form
+ *
+ *	f(x) + n d + c >= 0
+ *
+ * with n > 0, c the constant term and
+ * d the existentially quantified variable "div".
+ * That is, the lower bound is
+ *
+ *	ceil((-f(x) - c)/n)
+ *
+ * Look for a pair of constraints
+ *
+ *	f(x) + c0 >= 0
+ *	-f(x) + c1 >= 0
+ *
+ * i.e., -c1 <= -f(x) <= c0, that fix ceil((-f(x) - c)/n) to a constant value.
+ * That is, check that
+ *
+ *	ceil((-c1 - c)/n) = ceil((c0 - c)/n)
+ *
+ * If so, return the index of inequality f(x) + c0 >= 0.
+ * Otherwise, return -1.
+ */
+static int lower_bound_is_cst(__isl_keep isl_basic_map *bmap, int div, int ineq)
+{
+	int i;
+	int lower = -1, upper = -1;
+	unsigned o_div;
+	isl_int l, u;
+	int equal;
+
+	o_div = isl_basic_map_offset(bmap, isl_dim_div);
+	for (i = 0; i < bmap->n_ineq && (lower < 0 || upper < 0); ++i) {
+		if (i == ineq)
+			continue;
+		if (!i

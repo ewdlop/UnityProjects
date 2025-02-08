@@ -1,0 +1,209 @@
+				{
+					// if (i == 0)
+					{
+						Dest = ViewInfoPooledRenderTargets.NextCompressedDepthViewNormal;
+					}
+				}
+
+				check((CommonParameters.CompressedMetadata[i] != nullptr) == (Dest != nullptr));
+
+				if (bExtractCompressedMetadata[i])
+				{
+					check(CommonParameters.CompressedMetadata[i]);
+					check(Dest);
+					GraphBuilder.QueueTextureExtraction(CommonParameters.CompressedMetadata[i], Dest);
+				}
+			}
+		}
+
+		// Saves signal histories.
+		for (int32 BatchedSignalId = 0; BatchedSignalId < Settings.SignalBatchSize; BatchedSignalId++)
+		{
+			FScreenSpaceDenoiserHistory* NewHistory = NewFilteringHistory[BatchedSignalId];
+			check(NewHistory);
+
+			for (int32 BufferId = 0; BufferId < HistoryTextureCountPerSignal; BufferId++)
+			{
+				int32 HistoryBufferId = BatchedSignalId * HistoryTextureCountPerSignal + BufferId;
+				GraphBuilder.QueueTextureExtraction(SignalHistory.Textures[HistoryBufferId], &NewHistory->RT[BufferId]);
+			}
+
+			NewHistory->Scissor = Settings.FullResViewport;
+		} // for (uint32 BatchedSignalId = 0; BatchedSignalId < Settings.SignalBatchSize; BatchedSignalId++)
+	}
+	else if (HistoryTextureCountPerSignal >= 2)
+	{
+		// The SignalHistory1 is always generated for temporal history, but will endup useless if there is no view state,
+		// in witch case we do not extract any textures. Don't support a shader permutation that does not produce it, because
+		// it is already a not ideal case for the denoiser.
+		for (int32 BufferId = 1; BufferId < HistoryTextureCountPerSignal; BufferId++)
+		{
+			GraphBuilder.RemoveUnusedTextureWarning(SignalHistory.Textures[BufferId]);
+		}
+	}
+
+	// Final convolution / output to correct
+	if (SignalUsesFinalConvolution(Settings.SignalProcessing))
+	{
+		TStaticArray<FRDGTextureDesc, kMaxBufferProcessingCount> OutputDescs;
+		for (int32 i = 0; i < kMaxBufferProcessingCount; i++)
+		{
+			OutputDescs[i] = HistoryDescs[i];
+		}
+
+		if (Settings.SignalProcessing == ESignalProcessing::ShadowVisibilityMask)
+		{
+			for (int32 BatchedSignalId = 0; BatchedSignalId < Settings.SignalBatchSize; BatchedSignalId++)
+			{
+				OutputDescs[BatchedSignalId].Format = PF_FloatRGBA;
+			}
+		}
+		else
+		{
+			check(0);
+		}
+
+		*OutputSignal = CreateMultiplexedTextures(
+			GraphBuilder,
+			Settings.SignalBatchSize, OutputDescs,
+			GetResourceNames(kDenoiserOutputResourceNames));
+
+		FSSDSpatialAccumulationCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FSSDSpatialAccumulationCS::FParameters>();
+		PassParameters->CommonParameters = CommonParameters;
+		PassParameters->ConvolutionMetaData = ConvolutionMetaData;
+		PassParameters->SignalInput = SignalHistory;
+		PassParameters->SignalOutput = CreateMultiplexedUAVs(GraphBuilder, *OutputSignal);
+
+		FSSDSpatialAccumulationCS::FPermutationDomain PermutationVector;
+		PermutationVector.Set<FSignalProcessingDim>(Settings.SignalProcessing);
+		PermutationVector.Set<FSignalBatchSizeDim>(Settings.SignalBatchSize);
+		PermutationVector.Set<FSSDSpatialAccumulationCS::FStageDim>(FSSDSpatialAccumulationCS::EStage::FinalOutput);
+		PermutationVector.Set<FMultiSPPDim>(true);
+
+		TShaderMapRef<FSSDSpatialAccumulationCS> ComputeShader(View.ShaderMap, PermutationVector);
+		FComputeShaderUtils::AddPass(
+			GraphBuilder,
+			RDG_EVENT_NAME("SSD SpatialAccumulation(Final)"),
+			ComputeShader,
+			PassParameters,
+			FComputeShaderUtils::GetGroupCount(Viewport.Size(), FSSDSpatialAccumulationCS::kGroupSize));
+	}
+	else
+	{
+		*OutputSignal = SignalHistory;
+	}
+} // DenoiseSignalAtConstantPixelDensity()
+
+// static
+IScreenSpaceDenoiser::FHarmonicTextures IScreenSpaceDenoiser::CreateHarmonicTextures(FRDGBuilder& GraphBuilder, FIntPoint Extent, const TCHAR* DebugName)
+{
+	FRDGTextureDesc Desc = FRDGTextureDesc::Create2D(
+		Extent,
+		PF_FloatRGBA,
+		FClearValueBinding::None,
+		TexCreate_ShaderResource | TexCreate_UAV);
+
+	FHarmonicTextures HarmonicTextures;
+	for (int32 HarmonicBorderId = 0; HarmonicBorderId < kHarmonicBordersCount; HarmonicBorderId++)
+	{
+		HarmonicTextures.Harmonics[HarmonicBorderId] = GraphBuilder.CreateTexture(Desc, DebugName);
+	}
+	return HarmonicTextures;
+}
+
+// static
+IScreenSpaceDenoiser::FHarmonicUAVs IScreenSpaceDenoiser::CreateUAVs(FRDGBuilder& GraphBuilder, const FHarmonicTextures& Textures)
+{
+	FHarmonicUAVs UAVs;
+	for (int32 HarmonicBorderId = 0; HarmonicBorderId < kHarmonicBordersCount; HarmonicBorderId++)
+	{
+		UAVs.Harmonics[HarmonicBorderId] = GraphBuilder.CreateUAV(Textures.Harmonics[HarmonicBorderId]);
+	}
+	return UAVs;
+}
+
+/** The implementation of the default denoiser of the renderer. */
+class FDefaultScreenSpaceDenoiser : public IScreenSpaceDenoiser
+{
+public:
+	const TCHAR* GetDebugName() const override
+	{
+		return TEXT("ScreenSpaceDenoiser");
+	}
+
+	virtual EShadowRequirements GetShadowRequirements(
+		const FViewInfo& View,
+		const FLightSceneInfo& LightSceneInfo,
+		const FShadowRayTracingConfig& RayTracingConfig) const override
+	{
+		check(SignalSupportMultiSPP(ESignalProcessing::ShadowVisibilityMask));
+		return IScreenSpaceDenoiser::EShadowRequirements::PenumbraAndClosestOccluder;
+	}
+
+	virtual void DenoiseShadowVisibilityMasks(
+		FRDGBuilder& GraphBuilder,
+		const FViewInfo& View,
+		FPreviousViewInfo* PreviousViewInfos,
+		const FSceneTextureParameters& SceneTextures,
+		const TStaticArray<FShadowVisibilityParameters, IScreenSpaceDenoiser::kMaxBatchSize>& InputParameters,
+		const int32 InputParameterCount,
+		TStaticArray<FShadowVisibilityOutputs, IScreenSpaceDenoiser::kMaxBatchSize>& Outputs) const
+	{
+		RDG_GPU_STAT_SCOPE(GraphBuilder, ShadowsDenoiser);
+
+		FViewInfoPooledRenderTargets ViewInfoPooledRenderTargets;
+		SetupSceneViewInfoPooledRenderTargets(View, &ViewInfoPooledRenderTargets);
+
+		FSSDSignalTextures InputSignal;
+
+		FSSDConstantPixelDensitySettings Settings;
+		Settings.SignalProcessing = ESignalProcessing::ShadowVisibilityMask;
+		Settings.InputResolutionFraction = 1.0f;
+		Settings.ReconstructionSamples = FMath::Clamp(CVarShadowReconstructionSampleCount.GetValueOnRenderThread(), 1, kStackowiakMaxSampleCountPerSet);
+		Settings.PreConvolutionCount = CVarShadowPreConvolutionCount.GetValueOnRenderThread();
+		Settings.bUseTemporalAccumulation = CVarShadowTemporalAccumulation.GetValueOnRenderThread() != 0;
+		Settings.HistoryConvolutionSampleCount = CVarShadowHistoryConvolutionSampleCount.GetValueOnRenderThread();
+		Settings.SignalBatchSize = InputParameterCount;
+
+		for (int32 BatchedSignalId = 0; BatchedSignalId < InputParameterCount; BatchedSignalId++)
+		{
+			Settings.MaxInputSPP = FMath::Max(Settings.MaxInputSPP, InputParameters[BatchedSignalId].RayTracingConfig.RayCountPerPixel);
+		}
+
+		TStaticArray<FScreenSpaceDenoiserHistory*, IScreenSpaceDenoiser::kMaxBatchSize> PrevHistories;
+		TStaticArray<FScreenSpaceDenoiserHistory*, IScreenSpaceDenoiser::kMaxBatchSize> NewHistories;
+		for (int32 BatchedSignalId = 0; BatchedSignalId < InputParameterCount; BatchedSignalId++)
+		{
+			const FShadowVisibilityParameters& Parameters = InputParameters[BatchedSignalId];
+			const FLightSceneProxy* Proxy = Parameters.LightSceneInfo->Proxy;
+			
+			// Scissor the denoiser.
+			{
+				FIntRect LightScissorRect;
+				if (Proxy->GetScissorRect(/* out */ LightScissorRect, View, View.ViewRect))
+				{
+
+				}
+				else
+				{
+					LightScissorRect = View.ViewRect;
+				}
+
+				if (BatchedSignalId == 0)
+				{
+					Settings.FullResViewport = LightScissorRect;
+				}
+				else
+				{
+					Settings.FullResViewport.Union(LightScissorRect);
+				}
+
+				Settings.SignalScissor[BatchedSignalId] = LightScissorRect;
+			}
+
+			ensure(IsSupportedLightType(ELightComponentType(Proxy->GetLightType())));
+
+			Settings.LightSceneInfo[BatchedSignalId] = Parameters.LightSceneInfo;
+			// Get the packed penumbra and hit distance in Penumbra texture.
+			InputSignal.Textures[BatchedSignalId] = Parameters.InputTextures.Mask;
+			PrevHistories[BatchedSignalId] = PreviousViewInfos->ShadowHistories.Find(Settings.LightScen

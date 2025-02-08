@@ -1,0 +1,122 @@
+rtsToMessage (md, version, action, parts);
+			if (headers != null)
+				foreach (var pair in headers)
+					if (pair.Value != null)
+						msg.Headers.Add (CreateHeader (pair.Key, pair.Value));
+			return msg;
+		}
+
+		MessageHeader CreateHeader (MessageHeaderDescription mh, object value)
+		{
+			return MessageHeader.CreateHeader (mh.Name, mh.Namespace, value, mh.MustUnderstand, mh.Actor, mh.Relay);
+		}
+
+		public void DeserializeRequest (Message message, object [] parameters)
+		{
+			string action = message.Headers.Action;
+			MessageDescription md = messages.Find (action);
+			if (md == null)
+				throw new ActionNotSupportedException (String.Format ("Action '{0}' is not supported by this operation.", action));
+
+			var headers = MessageToHeaderObjects (md, message);
+			object [] parts = MessageToParts (md, message);
+			if (md.MessageType != null) {
+#if MOBILE
+				parameters [0] = Activator.CreateInstance (md.MessageType);
+#else
+				parameters [0] = Activator.CreateInstance (md.MessageType, true);
+#endif
+				PartsToMessageObject (md, headers, parts, parameters [0]);
+			}
+			else
+			{
+				int index = 0;
+				foreach (ParameterInfo pi in requestMethodParams)
+					if (!pi.IsOut) {
+						parameters [index] = parts [index];
+						index++;
+					}
+			}
+		}
+
+		public object DeserializeReply (Message message, object [] parameters)
+		{
+			MessageDescription md = null;
+			foreach (MessageDescription mdi in messages)
+				if (!mdi.IsRequest)
+					md = mdi;
+
+			var headers = MessageToHeaderObjects (md, message);
+			object [] parts = MessageToParts (md, message);
+			if (md.MessageType != null) {
+#if MOBILE
+				object msgObject = Activator.CreateInstance (md.MessageType);
+#else
+				object msgObject = Activator.CreateInstance (md.MessageType, true);
+#endif
+				PartsToMessageObject (md, headers, parts, msgObject);
+				return msgObject;
+			}
+			else {
+				int index = ParamsOffset (md.Body);
+				foreach (ParameterInfo pi in replyMethodParams) {
+					if (pi.IsOut || pi.ParameterType.IsByRef)
+						parameters [pi.Position] = parts [index++];
+				}
+				return HasReturnValue (md.Body) ? parts [0] : null;
+			}
+		}
+
+		void PartsToMessageObject (MessageDescription md, Dictionary<MessageHeaderDescription,object> headers, object [] parts, object msgObject)
+		{
+			if (headers != null)
+				foreach (var pair in headers) {
+					var mi = pair.Key.MemberInfo;
+					if (mi is FieldInfo)
+						((FieldInfo) mi).SetValue (msgObject, pair.Value);
+					else
+						((PropertyInfo) mi).SetValue (msgObject, pair.Value, null);
+				}
+
+			var l = new List<MessagePartDescription> (md.Body.Parts);
+			if (md.Body.ReturnValue != null)
+				l.Add (md.Body.ReturnValue);
+			foreach (MessagePartDescription partDesc in l)
+				if (partDesc.MemberInfo is FieldInfo)
+					((FieldInfo) partDesc.MemberInfo).SetValue (msgObject, parts [partDesc.Index]);
+				else if (partDesc.MemberInfo is PropertyInfo)
+					((PropertyInfo) partDesc.MemberInfo).SetValue (msgObject, parts [partDesc.Index], null);
+				// otherwise, it could be null (in case of undefined return value in MessageContract)
+		}
+
+		void MessageObjectToParts (MessageDescription md, object msgObject, Dictionary<MessageHeaderDescription,object> headers, object [] parts)
+		{
+			foreach (var headDesc in md.Headers) {
+				var mi = headDesc.MemberInfo;
+				if (mi is FieldInfo)
+					headers [headDesc] = ((FieldInfo) mi).GetValue (msgObject);
+				else
+					headers [headDesc] = ((PropertyInfo) mi).GetValue (msgObject, null);
+			}
+
+			var l = new List<MessagePartDescription> (md.Body.Parts);
+			if (md.Body.ReturnValue != null)
+				l.Add (md.Body.ReturnValue);
+			foreach (MessagePartDescription partDesc in l) {
+				if (partDesc.MemberInfo == null)
+					continue;
+				if (partDesc.MemberInfo is FieldInfo)
+					parts [partDesc.Index] = ((FieldInfo) partDesc.MemberInfo).GetValue (msgObject);
+				else
+					parts [partDesc.Index] = ((PropertyInfo) partDesc.MemberInfo).GetValue (msgObject, null);
+			}
+		}
+
+		internal static bool HasReturnValue (MessageBodyDescription desc)
+		{
+			return desc.ReturnValue != null && desc.ReturnValue.Type != typeof (void);
+		}
+
+		protected static int ParamsOffset (MessageBodyDescription desc)
+		{
+			return

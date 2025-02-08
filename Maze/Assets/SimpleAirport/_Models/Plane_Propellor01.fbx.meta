@@ -1,0 +1,59 @@
+                const MCFixup &Fixup, MCValue Target,
+                                           uint64_t &FixedValue) {
+  assert(Target.getSymA() && "Relocation must reference a symbol!");
+
+  const MCSymbol &A = Target.getSymA()->getSymbol();
+  if (!A.isRegistered()) {
+    Asm.getContext().reportError(Fixup.getLoc(),
+                                      Twine("symbol '") + A.getName() +
+                                          "' can not be undefined");
+    return;
+  }
+  if (A.isTemporary() && A.isUndefined()) {
+    Asm.getContext().reportError(Fixup.getLoc(),
+                                      Twine("assembler label '") + A.getName() +
+                                          "' can not be undefined");
+    return;
+  }
+
+  MCSection *MCSec = Fragment->getParent();
+
+  // Mark this symbol as requiring an entry in the symbol table.
+  assert(SectionMap.find(MCSec) != SectionMap.end() &&
+         "Section must already have been defined in executePostLayoutBinding!");
+
+  COFFSection *Sec = SectionMap[MCSec];
+  const MCSymbolRefExpr *SymB = Target.getSymB();
+
+  if (SymB) {
+    const MCSymbol *B = &SymB->getSymbol();
+    if (!B->getFragment()) {
+      Asm.getContext().reportError(
+          Fixup.getLoc(),
+          Twine("symbol '") + B->getName() +
+              "' can not be undefined in a subtraction expression");
+      return;
+    }
+
+    // Offset of the symbol in the section
+    int64_t OffsetOfB = Layout.getSymbolOffset(*B);
+
+    // Offset of the relocation in the section
+    int64_t OffsetOfRelocation =
+        Layout.getFragmentOffset(Fragment) + Fixup.getOffset();
+
+    FixedValue = (OffsetOfRelocation - OffsetOfB) + Target.getConstant();
+  } else {
+    FixedValue = Target.getConstant();
+  }
+
+  COFFRelocation Reloc;
+
+  Reloc.Data.SymbolTableIndex = 0;
+  Reloc.Data.VirtualAddress = Layout.getFragmentOffset(Fragment);
+
+  // Turn relocations for temporary symbols into section relocations.
+  if (A.isTemporary()) {
+    MCSection *TargetSection = &A.getSection();
+    assert(
+        SectionMap.find(TargetSec

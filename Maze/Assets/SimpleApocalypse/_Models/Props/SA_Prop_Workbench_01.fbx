@@ -1,0 +1,972 @@
+"""Find modules used by a script, using introspection."""
+
+from __future__ import generators
+import dis
+import imp
+import marshal
+import os
+import sys
+import types
+import struct
+
+if hasattr(sys.__stdout__, "newlines"):
+    READ_MODE = "U"  # universal line endings
+else:
+    # Python < 2.3 compatibility, no longer strictly required
+    READ_MODE = "r"
+
+LOAD_CONST = dis.opmap['LOAD_CONST']
+IMPORT_NAME = dis.opmap['IMPORT_NAME']
+STORE_NAME = dis.opmap['STORE_NAME']
+STORE_GLOBAL = dis.opmap['STORE_GLOBAL']
+STORE_OPS = STORE_NAME, STORE_GLOBAL
+HAVE_ARGUMENT = dis.HAVE_ARGUMENT
+EXTENDED_ARG = dis.EXTENDED_ARG
+
+def _unpack_opargs(code):
+    # enumerate() is not an option, since we sometimes process
+    # multiple elements on a single pass through the loop
+    extended_arg = 0
+    n = len(code)
+    i = 0
+    while i < n:
+        op = ord(code[i])
+        offset = i
+        i = i+1
+        arg = None
+        if op >= HAVE_ARGUMENT:
+            arg = ord(code[i]) + ord(code[i+1])*256 + extended_arg
+            extended_arg = 0
+            i = i+2
+            if op == EXTENDED_ARG:
+                extended_arg = arg*65536
+        yield (offset, op, arg)
+
+# Modulefinder does a good job at simulating Python's, but it can not
+# handle __path__ modifications packages make at runtime.  Therefore there
+# is a mechanism whereby you can register extra paths in this map for a
+# package, and it will be honored.
+
+# Note this is a mapping is lists of paths.
+packagePathMap = {}
+
+# A Public interface
+def AddPackagePath(packagename, path):
+    paths = packagePathMap.get(packagename, [])
+    paths.append(path)
+    packagePathMap[packagename] = paths
+
+replacePackageMap = {}
+
+# This ReplacePackage mechanism allows modulefinder to work around the
+# way the _xmlplus package injects itself under the name "xml" into
+# sys.modules at runtime by calling ReplacePackage("_xmlplus", "xml")
+# before running ModuleFinder.
+
+def ReplacePackage(oldname, newname):
+    replacePackageMap[oldname] = newname
+
+
+class Module:
+
+    def __init__(self, name, file=None, path=None):
+        self.__name__ = name
+        self.__file__ = file
+        self.__path__ = path
+        self.__code__ = None
+        # The set of global names that are assigned to in the module.
+        # This includes those names imported through starimports of
+        # Python modules.
+        self.globalnames = {}
+        # The set of starimports this module did that could not be
+        # resolved, ie. a starimport from a non-Python module.
+        self.starimports = {}
+
+    def __repr__(self):
+        s = "Module(%r" % (self.__name__,)
+        if self.__file__ is not None:
+            s = s + ", %r" % (self.__file__,)
+        if self.__path__ is not None:
+            s = s + ", %r" % (self.__path__,)
+        s = s + ")"
+        return s
+
+class ModuleFinder:
+
+    def __init__(self, path=None, debug=0, excludes=[], replace_paths=[]):
+        if path is None:
+            path = sys.path
+        self.path = path
+        self.modules = {}
+        self.badmodules = {}
+        self.debug = debug
+        self.indent = 0
+        self.excludes = excludes
+        self.replace_paths = replace_paths
+        self.processed_paths = []   # Used in debugging only
+
+    def msg(self, level, str, *args):
+        if level <= self.debug:
+            for i in range(self.indent):
+                print "   ",
+            print str,
+            for arg in args:
+                print repr(arg),
+            print
+
+    def msgin(self, *args):
+        level = args[0]
+        if level <= self.debug:
+            self.indent = self.indent + 1
+            self.msg(*args)
+
+    def msgout(self, *args):
+        level = args[0]
+        if level <= self.debug:
+            self.indent = self.indent - 1
+            self.msg(*args)
+
+    def run_script(self, pathname):
+        self.msg(2, "run_script", pathname)
+        with open(pathname, READ_MODE) as fp:
+            stuff = ("", "r", imp.PY_SOURCE)
+            self.load_module('__main__', fp, pathname, stuff)
+
+    def load_file(self, pathname):
+        dir, name = os.path.split(pathname)
+        name, ext = os.path.splitext(name)
+        with open(pathname, READ_MODE) as fp:
+            stuff = (ext, "r", imp.PY_SOURCE)
+            self.load_module(name, fp, pathname, stuff)
+
+    def import_hook(self, name, caller=None, fromlist=None, level=-1):
+        self.msg(3, "import_hook", name, caller, fromlist, level)
+        parent = self.determine_parent(caller, level=level)
+        q, tail = self.find_head_package(parent, name)
+        m = self.load_tail(q, tail)
+        if not fromlist:
+            return q
+        if m.__path__:
+            self.ensure_fromlist(m, fromlist)
+        return None
+
+    def determine_parent(self, caller, level=-1):
+        self.msgin(4, "determine_parent", caller, level)
+        if not caller or level == 0:
+            self.msgout(4, "determine_parent -> None")
+            return None
+        pname = caller.__name__
+        if level >= 1: # relative import
+            if caller.__path__:
+                level -= 1
+            if level == 0:
+                parent = self.modules[pname]
+                assert parent is caller
+                self.msgout(4, "determine_parent ->", parent)
+                return parent
+            if pname.count(".") < level:
+                raise ImportError, "relative importpath too deep"
+            pname = ".".join(pname.split(".")[:-level])
+            parent = self.modules[pname]
+            self.msgout(4, "determine_parent ->", parent)
+            return parent
+        if caller.__path__:
+            parent = self.modules[pname]
+            assert caller is parent
+            self.msgout(4, "determine_parent ->", parent)
+            return parent
+        if '.' in pname:
+            i = pname.rfind('.')
+            pname = pname[:i]
+            parent = self.modules[pname]
+            assert parent.__name__ == pname
+            self.msgout(4, "determine_parent ->", parent)
+            return parent
+        self.msgout(4, "determine_parent -> None")
+        return None
+
+    def find_head_package(self, parent, name):
+        self.msgin(4, "find_head_package", parent, name)
+        if '.' in name:
+            i = name.find('.')
+            head = name[:i]
+            tail = name[i+1:]
+        else:
+            head = name
+            tail = ""
+        if parent:
+            qname = "%s.%s" % (parent.__name__, head)
+        else:
+            qname = head
+        q = self.import_module(head, qname, parent)
+        if q:
+            self.msgout(4, "find_head_package ->", (q, tail))
+            return q, tail
+        if parent:
+            qname = head
+            parent = None
+            q = self.import_module(head, qname, parent)
+            if q:
+                self.msgout(4, "find_head_package ->", (q, tail))
+                return q, tail
+        self.msgout(4, "raise ImportError: No module named", qname)
+        raise ImportError, "No module named " + qname
+
+    def load_tail(self, q, tail):
+        self.msgin(4, "load_tail", q, tail)
+        m = q
+        while tail:
+            i = tail.find('.')
+            if i < 0: i = len(tail)
+            head, tail = tail[:i], tail[i+1:]
+            mname = "%s.%s" % (m.__name__, head)
+            m = self.import_module(head, mname, m)
+            if not m:
+                self.msgout(4, "raise ImportError: No module named", mname)
+                raise ImportError, "No module named " + mname
+        self.msgout(4, "load_tail ->", m)
+        return m
+
+    def ensure_fromlist(self, m, fromlist, recursive=0):
+        self.msg(4, "ensure_fromlist", m, fromlist, recursive)
+        for sub in fromlist:
+            if sub == "*":
+                if not recursive:
+                    all = self.find_all_submodules(m)
+                    if all:
+                        self.ensure_fromlist(m, all, 1)
+            elif not hasattr(m, sub):
+                subname = "%s.%s" % (m.__name__, sub)
+                submod = self.import_module(sub, subname, m)
+                if not submod:
+                    raise ImportError, "No module named " + subname
+
+    def find_all_submodules(self, m):
+        if not m.__path__:
+            return
+        modules = {}
+        # 'suffixes' used to be a list hardcoded to [".py", ".pyc", ".pyo"].
+        # But we must also collect Python extension modules - although
+        # we cannot separate normal dlls from Python extensions.
+        suffixes = []
+        for triple in imp.get_suffixes():
+            suffixes.append(triple[0])
+        for dir in m.__path__:
+            try:
+                names = os.listdir(dir)
+            except os.error:
+                self.msg(2, "can't list directory", dir)
+                continue
+            for name in names:
+                mod = None
+                for suff in suffixes:
+                    n = len(suff)
+                    if name[-n:] == suff:
+                        mod = name[:-n]
+                        break
+                if mod and mod != "__init__":
+                    modules[mod] = mod
+        return modules.keys()
+
+    def import_module(self, partname, fqname, parent):
+        self.msgin(3, "import_module", partname, fqname, parent)
+        try:
+            m = self.modules[fqname]
+        except KeyError:
+            pass
+        else:
+            self.msgout(3, "import_module ->", m)
+            return m
+        if fqname in self.badmodules:
+            self.msgout(3, "import_module -> None")
+            return None
+        if parent and parent.__path__ is None:
+            self.msgout(3, "import_module -> None")
+            return None
+        try:
+            fp, pathname, stuff = self.find_module(partname,
+                                                   parent and parent.__path__, parent)
+        except ImportError:
+            self.msgout(3, "import_module ->", None)
+            return None
+        try:
+            m = self.load_module(fqname, fp, pathname, stuff)
+        finally:
+            if fp: fp.close()
+        if parent:
+            setattr(parent, partname, m)
+        self.msgout(3, "import_module ->", m)
+        return m
+
+    def load_module(self, fqname, fp, pathname, file_info):
+        suffix, mode, type = file_info
+        self.msgin(2, "load_module", fqname, fp and "fp", pathname)
+        if type == imp.PKG_DIRECTORY:
+            m = self.load_package(fqname, pathname)
+            self.msgout(2, "load_module ->", m)
+            return m
+        if type == imp.PY_SOURCE:
+            co = compile(fp.read()+'\n', pathname, 'exec')
+        elif type == imp.PY_COMPILED:
+            if fp.read(4) != imp.get_magic():
+                self.msgout(2, "raise ImportError: Bad magic number", pathname)
+                raise ImportError, "Bad magic number in %s" % pathname
+            fp.read(4)
+            co = marshal.load(fp)
+        else:
+            co = None
+        m = self.add_module(fqname)
+        m.__file__ = pathname
+        if co:
+            if self.replace_paths:
+                co = self.replace_paths_in_code(co)
+            m.__code__ = co
+            self.scan_code(co, m)
+        self.msgout(2, "load_module ->", m)
+        return m
+
+    def _add_badmodule(self, name, caller):
+        if name not in self.badmodules:
+            self.badmodules[name] = {}
+        if caller:
+            self.badmodules[name][caller.__name__] = 1
+        else:
+            self.badmodules[name]["-"] = 1
+
+    def _safe_import_hook(self, name, caller, fromlist, level=-1):
+        # wrapper for self.import_hook() that won't raise ImportError
+        if name in self.badmodules:
+            self._add_badmodule(name, caller)
+            return
+        try:
+            self.import_hook(name, caller, level=level)
+        except ImportError, msg:
+            self.msg(2, "ImportError:", str(msg))
+            self._add_badmodule(name, caller)
+        else:
+            if fromlist:
+                for sub in fromlist:
+                    if sub in self.badmodules:
+                        self._add_badmodule(sub, caller)
+                        continue
+                    try:
+                        self.import_hook(name, caller, [sub], level=level)
+                    except ImportError, msg:
+                        self.msg(2, "ImportError:", str(msg))
+                        fullname = name + "." + sub
+                        self._add_badmodule(fullname, caller)
+
+    def scan_opcodes(self, co,
+                     unpack = struct.unpack):
+        # Scan the code, and yield 'interesting' opcode combinations
+        # Version for Python 2.4 and older
+        code = co.co_code
+        names = co.co_names
+        consts = co.co_consts
+        opargs = [(op, arg) for _, op, arg in _unpack_opargs(code)
+                  if op != EXTENDED_ARG]
+        for i, (op, oparg) in enumerate(opargs):
+            if c in STORE_OPS:
+                yield "store", (names[oparg],)
+                continue
+            if (op == IMPORT_NAME and i >= 1
+                    and opargs[i-1][0] == LOAD_CONST):
+                fromlist = consts[opargs[i-1][1]]
+                yield "import", (fromlist, names[oparg])
+                continue
+
+    def scan_opcodes_25(self, co):
+        # Scan the code, and yield 'interesting' opcode combinations
+        code = co.co_code
+        names = co.co_names
+        consts = co.co_consts
+        opargs = [(op, arg) for _, op, arg in _unpack_opargs(code)
+                  if op != EXTENDED_ARG]
+        for i, (op, oparg) in enumerate(opargs):
+            if op in STORE_OPS:
+                yield "store", (names[oparg],)
+                continue
+            if (op == IMPORT_NAME and i >= 2
+                    and opargs[i-1][0] == opargs[i-2][0] == LOAD_CONST):
+                level = consts[opargs[i-2][1]]
+                fromlist = consts[opargs[i-1][1]]
+                if level == -1: # normal import
+                    yield "import", (fromlist, names[oparg])
+                elif level == 0: # absolute import
+                    yield "absolute_import", (fromlist, names[oparg])
+                else: # relative import
+                    yield "relative_import", (level, fromlist, names[oparg])
+                continue
+
+    def scan_code(self, co, m):
+        code = co.co_code
+        if sys.version_info >= (2, 5):
+            scanner = self.scan_opcodes_25
+        else:
+            scanner = self.scan_opcodes
+        for what, args in scanner(co):
+            if what == "store":
+                name, = args
+                m.globalnames[name] = 1
+            elif what in ("import", "absolute_import"):
+                fromlist, name = args
+                have_star = 0
+                if fromlist is not None:
+                    if "*" in fromlist:
+                        have_star = 1
+                    fromlist = [f for f in fromlist if f != "*"]
+                if what == "absolute_import": level = 0
+                else: level = -1
+                self._safe_import_hook(name, m, fromlist, level=level)
+                if have_star:
+                    # We've encountered an "import *". If it is a Python module,
+                    # the code has already been parsed and we can suck out the
+                    # global names.
+                    mm = None
+                    if m.__path__:
+                        # At this point we don't know whether 'name' is a
+                        # submodule of 'm' or a global module. Let's just try
+                        # the full name first.
+                        mm = self.modules.get(m.__name__ + "." + name)
+                    if mm is None:
+                        mm = self.modules.get(name)
+                    if mm is not None:
+                        m.globalnames.update(mm.globalnames)
+                        m.starimports.update(mm.starimports)
+                        if mm.__code__ is None:
+                            m.starimports[name] = 1
+                    else:
+                        m.starimports[name] = 1
+            elif what == "relative_import":
+                level, fromlist, name = args
+                if name:
+                    self._safe_import_hook(name, m, fromlist, level=level)
+                else:
+                    parent = self.determine_parent(m, level=level)
+                    self._safe_import_hook(parent.__name__, None, fromlist, level=0)
+            else:
+                # We don't expect anything else from the generator.
+                raise RuntimeError(what)
+
+        for c in co.co_consts:
+            if isinstance(c, type(co)):
+                self.scan_code(c, m)
+
+    def load_package(self, fqname, pathname):
+        self.msgin(2, "load_package", fqname, pathname)
+        newname = replacePackageMap.get(fqname)
+        if newname:
+            fqname = newname
+        m = self.add_module(fqname)
+        m.__file__ = pathname
+        m.__path__ = [pathname]
+
+        # As per comment at top of file, simulate runtime __path__ additions.
+        m.__path__ = m.__path__ + packagePathMap.get(fqname, [])
+
+        fp, buf, stuff = self.find_module("__init__", m.__path__)
+        self.load_module(fqname, fp, buf, stuff)
+        self.msgout(2, "load_package ->", m)
+        if fp:
+            fp.close()
+        return m
+
+    def add_module(self, fqname):
+        if fqname in self.modules:
+            return self.modules[fqname]
+        self.modules[fqname] = m = Module(fqname)
+        return m
+
+    def find_module(self, name, path, parent=None):
+        if parent is not None:
+            # assert path is not None
+            fullname = parent.__name__+'.'+name
+        else:
+            fullname = name
+        if fullname in self.excludes:
+            self.msgout(3, "find_module -> Excluded", fullname)
+            raise ImportError, name
+
+        if path is None:
+            if name in sys.builtin_module_names:
+                return (None, None, ("", "", imp.C_BUILTIN))
+
+            path = self.path
+        return imp.find_module(name, path)
+
+    def report(self):
+        """Print a report to stdout, listing the found modules with their
+        paths, as well as modules that are missing, or seem to be missing.
+        """
+        print
+        print "  %-25s %s" % ("Name", "File")
+        print "  %-25s %s" % ("----", "----")
+        # Print modules found
+        keys = self.modules.keys()
+        keys.sort()
+        for key in keys:
+            m = self.modules[key]
+            if m.__path__:
+                print "P",
+            else:
+                print "m",
+            print "%-25s" % key, m.__file__ or ""
+
+        # Print missing modules
+        missing, maybe = self.any_missing_maybe()
+        if missing:
+            print
+            print "Missing modules:"
+            for name in missing:
+                mods = self.badmodules[name].keys()
+                mods.sort()
+                print "?", name, "imported from", ', '.join(mods)
+        # Print modules that may be missing, but then again, maybe not...
+        if maybe:
+            print
+            print "Submodules that appear to be missing, but could also be",
+            print "global names in the parent package:"
+            for name in maybe:
+                mods = self.badmodules[name].keys()
+                mods.sort()
+                print "?", name, "imported from", ', '.join(mods)
+
+    def any_missing(self):
+        """Return a list of modules that appear to be missing. Use
+        any_missing_maybe() if you want to know which modules are
+        certain to be missing, and which *may* be missing.
+        """
+        missing, maybe = self.any_missing_maybe()
+        return missing + maybe
+
+    def any_missing_maybe(self):
+        """Return two lists, one with modules that are certainly missing
+        and one with modules that *may* be missing. The latter names could
+        either be submodules *or* just global names in the package.
+
+        The reason it can't always be determined is that it's impossible to
+        tell which names are imported when "from module import *" is done
+        with an extension module, short of actually importing it.
+        """
+        missing = []
+        maybe = []
+        for name in self.badmodules:
+            if name in self.excludes:
+                continue
+            i = name.rfind(".")
+            if i < 0:
+                missing.append(name)
+                continue
+            subname = name[i+1:]
+            pkgname = name[:i]
+            pkg = self.modules.get(pkgname)
+            if pkg is not None:
+                if pkgname in self.badmodules[name]:
+                    # The package tried to import this module itself and
+                    # failed. It's definitely missing.
+                    missing.append(name)
+                elif subname in pkg.globalnames:
+                    # It's a global in the package: definitely not missing.
+                    pass
+                elif pkg.starimports:
+                    # It could be missing, but the package did an "import *"
+                    # from a non-Python module, so we simply can't be sure.
+                    maybe.append(name)
+                else:
+                    # It's not a global in the package, the package didn't
+                    # do funny star imports, it's very likely to be missing.
+                    # The symbol could be inserted into the package from the
+                    # outside, but since that's not good style we simply list
+                    # it missing.
+                    missing.append(name)
+            else:
+                missing.append(name)
+        missing.sort()
+        maybe.sort()
+        return missing, maybe
+
+    def replace_paths_in_code(self, co):
+        new_filename = original_filename = os.path.normpath(co.co_filename)
+        for f, r in self.replace_paths:
+            if original_filename.startswith(f):
+                new_filename = r + original_filename[len(f):]
+                break
+
+        if self.debug and original_filename not in self.processed_paths:
+            if new_filename != original_filename:
+                self.msgout(2, "co_filename %r changed to %r" \
+                                    % (original_filename,new_filename,))
+            else:
+                self.msgout(2, "co_filename %r remains unchanged" \
+                                    % (original_filename,))
+            self.processed_paths.append(original_filename)
+
+        consts = list(co.co_consts)
+        for i in range(len(consts)):
+            if isinstance(consts[i], type(co)):
+                consts[i] = self.replace_paths_in_code(consts[i])
+
+        return types.CodeType(co.co_argcount, co.co_nlocals, co.co_stacksize,
+                         co.co_flags, co.co_code, tuple(consts), co.co_names,
+                         co.co_varnames, new_filename, co.co_name,
+                         co.co_firstlineno, co.co_lnotab,
+                         co.co_freevars, co.co_cellvars)
+
+
+def test():
+    # Parse command line
+    import getopt
+    try:
+        opts, args = getopt.getopt(sys.argv[1:], "dmp:qx:")
+    except getopt.error, msg:
+        print msg
+        return
+
+    # Process options
+    debug = 1
+    domods = 0
+    addpath = []
+    exclude = []
+    for o, a in opts:
+        if o == '-d':
+            debug = debug + 1
+        if o == '-m':
+            domods = 1
+        if o == '-p':
+            addpath = addpath + a.split(os.pathsep)
+        if o == '-q':
+            debug = 0
+        if o == '-x':
+            exclude.append(a)
+
+    # Provide default arguments
+    if not args:
+        script = "hello.py"
+    else:
+        script = args[0]
+
+    # Set the path based on sys.path and the script directory
+    path = sys.path[:]
+    path[0] = os.path.dirname(script)
+    path = addpath + path
+    if debug > 1:
+        print "path:"
+        for item in path:
+            print "   ", repr(item)
+
+    # Create the module finder and turn its crank
+    mf = ModuleFinder(path, debug, exclude)
+    for arg in args[1:]:
+        if arg == '-m':
+            domods = 1
+            continue
+        if domods:
+            if arg[-2:] == '.*':
+                mf.import_hook(arg[:-2], None, ["*"])
+            else:
+                mf.import_hook(arg)
+        else:
+            mf.load_file(arg)
+    mf.run_script(script)
+    mf.report()
+    return mf  # for -i debugging
+
+
+if __name__ == '__main__':
+    try:
+        mf = test()
+    except KeyboardInterrupt:
+        print "\n[interrupt]"
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                            ßR¾ìeH-º_‘P³“ÿe?¿-˜õÑösÃ£©š÷q™ı‹õ»›¬-÷
+-â]s‹¡=ë=ÇGií´³P¨ÍŠ—ş+T Ç}<[-P™ äÖÌ®,XçŒÖ©ñà‘KdşWÔMÎÎfôdlmƒÿhôR]^`¨Y!Çˆ!;]eMûp„4r{,Öl¥ı	}íOš¸]Éş—!‰/~ÔÁkW÷Ày¾ ˜M\Ú/©ù8ç+PhÌ›fú{9ÇZ±ù¼“màß´wñ£ïZ¶Šwuû[;Jı¢ò“ú'ÂØcü0üR7XÆÕ[JV¸MPµcO.ÒÁüüóğãÏ²edo2?F#ğºE¸*ed8M³°jèØ2*µ°¸™îºé^»¼ĞÌ/9Ä3H®«€Põ ,.úrîfPŞDe]¿j²}LGO] <íHvI‹6dû¡ÓfùWXÛ¨iÒ¼‘æˆu“MÛ"¾æ	.X´ÍMç	[ş"é;ûè‡8š¬o½“½Õ‚€ÂAÓğÎÇuİ¶möÛ‡\¨„ï”ybÈE9S£œSİ÷å:–à_(øÀÒ×ùÑ]iI,Qì%‰-ÛŒy¸W|bîz’üÔh,ŞÿE¿ ¿uöGÙ4ñ<BÇ¯#¥k&fqšëÙ'ô—e|4SQùÚÌsÌ){£}½‘œéLˆÇÖ¸C"[´("j-]†e–,$–Øf±Fk3¥Ú	B9ïü\õ¢$õ:ÌU)•|şge4°ç4D›´ø¢Ä>l”Qp]Y2ƒ_Ø.`ÏšDVp:‚ÒÛ='#†OxÒÕ‰Í¥‚4y7>;İ÷Õ u‘
+áÄ¿ÄN70'äõäcAtà}‡ä”İ`‚JEvÜüIå'…ü~ µyÅ½?×€hıìTe GPóN~‰mrÓï7ş°³‰o–‚GP_
+“!ÍòºP>Ä*ó%¢“Èôù>2ıhéºñcš ı×hÊWÿnr4u8&3ßaúM¼_š1Îğk£ƒPÅğî““?%¶7h^»1á»jpø 0P6¦M››Y÷ÃexÉ ŞZÓxåU_ æ[xÓcÒØ5E¦x†7¯#á÷4ev7zéUÀW½¸Ê8f8ö#Ñ‡Ê£ßÌ¯İ1ŠŠXoüáÖ"C¤èŸÅUlfá­B†„Mgé‹ÙË¥r¨{$wFqë€Îáãûæ¤‡U1†Ï’õâ²~Í=©í>^h}[s“õ;§–%U‡ÒY×ynİà¾&éßÂ»à”ĞÇˆŸO8“ş±µÓ¯×"ç6¬¤IOæÏ:.iù Ç[ıX÷ÿ÷!IzìŞ_Èoqôî+j_BZé­Üæ¾”C”o/½VÎpò·3¿bN=» ÚÉ58é¸·à%;ûŞ´Fx¿Y×´Z–ÃCı?=İ4‡_‰åæ°ö«§‹„Ç³õ WFÌ,Á½ØÆKÓĞg ÒQ&AE´ãÕ©AeÎ½®F`æ†cªC¯T£ò¥¹ƒkÒlDšì›Q÷²Î Àm¾ãÂÓ·JÚtJ×yåùœ(Lßí¤ÔN Ã8ÜìXµDå¸ÌlªÑ›Æ»ğ?­ëÖ5ßÃ¡O!‚­Ó+¨È2Öló<ï7Ü>´ÖŒ.ìÛCõşÛ’ÌMî¹'Æ­>€ÕGg yØ‹eo@TBê¨S:=oytªT”—é‡J3è¤ú¹¾¸m³R£ıy=e"ãj^F]¥¥DÛ WF€" ]pÎÉ‚Ùa	–-êõ·¢Ã¿I±®YVy“•#ñ¿vÿÏwê·ˆh¡º$†ïFv§ñ—BÁÿÂpùï¯A^ôoÃÊÕuÕÙØüLÁ½k´¿0Áˆ0Gf¤ÌŸ÷%<ÄÂsş³² U¿¾&ã÷ûQHÍyØ¼º7æSÁ—J%e	¬ìĞ¬Ù\G0¥ïL•N¯'WÒ£™tú÷_M›#]"$á
+r—ì"òùÓ$´d¢Á^Ë^Æu[Ÿ	 PSêÈÛV?fcñqÕ7…Fs×å[æñ‡NúÇğóP™B1å
+8#¯³-›Oƒ¼^ïZçZÒ¹Ş¬kïÂéŒ‡Ü)v‰CÂèŸ.cS}í‰úQÔ TA»F³,;åÈòÙ‘Rä‡Ó{qôÅŞAsLlM¶f¬Iı[4ûšzPq; 2àÙaˆé+-O}£È¡ìÁ*f87½³‚±äM1ZÛ HX0¶;$—GNKéQ·uFÉ ¼Ú©­ØJğİÜ\œ=Î¶ã§^A`‘×[xú˜ÆÚXª*Ù6ä®]kuÎ"7»D+§Ì³×µÁÀa»îù‘6B¬A×ıõeö!Nù‰A>œz´lƒ?eF‹¦±`¡57-HaMOŞèˆjå¶£ÒÎq»¬Hò°U–Se‹ÏËNŸch’)­SªğÄ’h•Ä…§åê»±|`g“pµÄÛY‡¤İNıYmÀ™P‚t ¶†ŞÙ\öØ¹Ó…‰‡:ğ–F¯-h:ı¬z¨#ñæ‘TÊc¸p×p{ƒ/Ìçû”µøå`Ú›u ­788ÂE/ÇÙş×ÀLY;G¦¼ŞìÜÆ1g<0ÿ¿nÅ~®1ù¾ŸiÏ´´%;ê7´*+Qè\Ú"xi²UMË;[ŸNlÊ'vÔU.êd˜ÕÙ`b£âxÁÙÿã%âõÀX†zoõPDtURõØŠó,Ø,“I|
+ÑğùÃŸéB»Â±‹@\|³"=¦¥°ä‘D € u–<¸-˜Í_j6ñ'î·¬¬XÁå†²e8ÑABàÔLâ!ÒÃ…Ùã
+Lêq{ S‹å"ûî†ş£#„Y	¼ğO$LÙ•Y.ğ›õX3‹HÔ3NlÇ³ŞıK¹
+}‹J¾µi¼Ş„êÖ+a’e)<n<B*è‡kšlÊÛ1ËKrEÓ+"®s³GIîGĞa@Åæ mÚ)iCÏ«Ì=ø’¹£ÕFèŠ5w‹¦«d–~*X]· =Î=.\ûî´D—¿ë7‚Gl@?"‡ù¸¶áğQSáÑ6ét×úXK;êÒU›†£õE&¤Z“‰);©‰ÔyÛ]OwªG×3ÔÇJŠÔ‚€ÏYâí8¨ùP:hÔ“ÁÖš±¼ ş7£GPò<Ó·S³L*F™ñâØwYœ¦ÚÃ=$¯ë£Ïé£E`ŞP^‘à:,ÕtA­¦ÿ?8U3zSëÊ'øï‡Õj•ã3²²_“Qƒj60§h:ÔĞA\	ì‰Bm”p>iÃ}«f×<9ÍqNÇ16_Ì´…n¥øq¡´?s›oº·ØÅ,‚ÖÃìï<!”mBkÎ»b'n¸dÃştêêâû©q `’ ‚­ÔNÓ¶aŠ?‘™3.¿´ıª5Øw6ö»µNÛØ»k"7Èœ¶/¬-úè‚1µ­F‘H‚McÎ¹†x–^ˆ8h‘¤£ÒÉYÈ´n›tpUk*Dã’åÒ5çC#ş£‰:Ç>ÑÎ¾µ¯`®È…\„ØoïMÉ3ƒ³ŒŠG®Ø¿´°–0f÷üåcÔ}†ÚDHÔ²½âAvSµİA0lWä¿³|`ı¶ÓôİŸŞ`)ŸOQâŒ=–~·äíˆàÈzp»LÙ¬Û
+Ui(Œ/c¤Eâ„“CF³«OĞØ.ıÀJvêåmá¹ù.+ÆZ‹sªMÇ!¬7NLj]DÑ–íØ]MõKÍª¼óFqÒ6øuT1ë¤ ¶ªİÖè÷$T=cöKúÛ8ŠŒŸÅ&Ljª|t®-¤å´İUğù\¤üQà6äÚD…öÕcuùÊjÎ³ÊïÃÂû.’©TåG(ˆ-’2şÏ)¹U0áK4'#Zó¢×‰z•¤İ"ß±"áûrÕÜäê©:Ïú;*Gº.UçÁ8åı 
+´Õ[æ¡ê°.‘PEæ³ıÃ)"G ¯ºÇ‰PNG
+
+   IHDR         óÿa   	pHYs     šœ  
+OiCCPPhotoshop ICC profile  xÚSgTSé=÷ŞôBKˆ€”KoR RB‹€‘&*!	Jˆ!¡ÙQÁEEÈ ˆ€ŒQ,Š
+Øä!¢ƒ£ˆŠÊûá{£kÖ¼÷æÍşµ×>ç¬ó³ÏÀ–H3Q5€©BàƒÇÄÆáä.@
+$p ³d!sı# ø~<<+"À¾ xÓ ÀM›À0‡ÿêB™\€„Àt‘8K€ @zB¦ @F€˜&S   `Ëcbã P- `'æÓ €ø™{ [”! ‘  eˆD h; ¬ÏVŠE X0 fKÄ9 Ø- 0IWfH °· ÀÎ²  0Qˆ…) { `È##x „™ FòW<ñ+®ç*  x™²<¹$9E[-qWW.(ÎI+6aaš@.Ây™24àóÌ   ‘àƒóıxÎ®ÎÎ6¶_-ê¿ÿ"bbãşåÏ«p@  át~Ñş,/³€;€mş¢%îh^ u÷‹f²@µ  éÚWópø~<<E¡¹ÙÙåääØJÄB[aÊW}şgÂ_ÀWılù~<ü÷õà¾â$2]GøàÂÌôL¥Ï’	„bÜæGü·ÿüÓ"ÄIb¹X*ãQqDšŒó2¥"‰B’)Å%Òÿdâß,û>ß5 °j>{‘-¨]cöK'XtÀâ÷  ò»oÁÔ(€hƒáÏwÿï?ıG % €fI’q  ^D$.TÊ³?Ç  D *°AôÁ,ÀÁÜÁü`6„B$ÄÂBB
+d€r`)¬‚B(†Í°*`/Ô@4ÀQh†“p.ÂU¸=púaÁ(¼	AÈa!ÚˆbŠX#™…ø!ÁH‹$ ÉˆQ"K‘5H1RŠT UHò=r9‡\Fº‘;È 2‚ü†¼G1”²Q=ÔµC¹¨7„F¢Ğdt1š ›Ğr´=Œ6¡çĞ«hÚ>CÇ0Àè3Äl0.ÆÃB±8,	“cË±"¬«Æ°V¬»‰õcÏ±wEÀ	6wB aAHXLXNØH¨ $4Ú	7	„QÂ'"“¨K´&ºùÄb21‡XH,#Ö/{ˆCÄ7$‰C2'¹I±¤TÒÒFÒnR#é,©›4H#“ÉÚdk²9”, +È…ääÃä3ää!ò[
+b@q¤øSâ(RÊjJåå4åe˜2AU£šRİ¨¡T5ZB­¡¶R¯Q‡¨4uš9ÍƒIK¥­¢•Óhh÷i¯ètºİ•N—ĞWÒËéGè—èôw†ƒÇˆg(›gw¯˜L¦Ó‹ÇT071ë˜ç™™oUX*¶*|‘Ê
+•J•&•*/T©ª¦ªŞªUóUËT©^S}®FU3Sã©	Ô–«UªPëSSg©;¨‡ªg¨oT?¤~Yı‰YÃLÃOC¤Q ±_ã¼Æ c³x,!k«†u5Ä&±ÍÙ|v*»˜ı»‹=ª©¡9C3J3W³Ró”f?ã˜qøœtN	ç(§—ó~ŠŞï)â)¦4L¹1e\kª–—–X«H«Q«Gë½6®í§¦½E»YûAÇJ'\'GgÎçSÙSİ§
+§M=:õ®.ªk¥¡»Dw¿n§î˜¾^€Lo§Şy½çú}/ıTımú§õGX³$ÛÎ<Å5qo</ÇÛñQC]Ã@C¥a•a—á„‘¹Ñ<£ÕFFŒiÆ\ã$ãmÆmÆ£&&!&KMêMîšRM¹¦)¦;L;LÇÍÌÍ¢ÍÖ™5›=1×2ç›ç›×›ß·`ZxZ,¶¨¶¸eI²äZ¦Yî¶¼n…Z9Y¥XUZ]³F­­%Ö»­»§§¹N“N«ÖgÃ°ñ¶É¶©·°åØÛ®¶m¶}agbg·Å®Ãî“½“}º}ı=‡Ù«Z~s´r:V:ŞšÎœî?}Åô–é/gXÏÏØ3ã¶Ë)ÄiS›ÓGgg¹sƒóˆ‹‰K‚Ë.—>.›ÆİÈ½äJtõq]ázÒõ›³›Âí¨Û¯î6îiî‡ÜŸÌ4Ÿ)Y3sĞÃÈCàQåÑ?Ÿ•0kß¬~OCOgµç#/c/‘W­×°·¥wª÷aï>ö>rŸã>ã<7Ş2ŞY_Ì7À·È·ËOÃo_…ßC#ÿdÿzÿÑ §€%g‰A[ûøz|!¿?:Ûeö²ÙíAŒ ¹AA‚­‚åÁ­!hÈì­!÷ç˜Î‘Îi…P~èÖĞaæa‹Ã~'…‡…W†?pˆXÑ1—5wÑÜCsßDúD–DŞ›g1O9¯-J5*>ª.j<Ú7º4º?Æ.fYÌÕXXIlK9.*®6nl¾ßüíó‡ââã{˜/È]py¡ÎÂô…§©.,:–@LˆN8”ğA*¨Œ%òw%
+yÂÂg"/Ñ6ÑˆØC\*NòH*Mz’ì‘¼5y$Å3¥,å¹„'©¼LLİ›:šv m2=:½1ƒ’‘qBª!M“¶gêgæfvË¬e…²şÅn‹·/•Ék³¬Y-
+¶B¦èTZ(×*²geWf¿Í‰Ê9–«+ÍíÌ³ÊÛ7œïŸÿíÂá’¶¥†KW-Xæ½¬j9²<qyÛ
+ã+†V¬<¸Š¶*mÕO«íW—®~½&zMk^ÁÊ‚ÁµkëU
+å…}ëÜ×í]OX/Yßµaú†>‰Š®Û—Ø(Üxå‡oÊ¿™Ü”´©«Ä¹dÏfÒféæŞ-[–ª—æ—nÙÚ´ßV´íõöEÛ/—Í(Û»ƒ¶C¹£¿<¸¼e§ÉÎÍ;?T¤TôTúT6îÒİµa×ønÑî{¼ö4ìÕÛ[¼÷ı>É¾ÛUUMÕfÕeûIû³÷?®‰ªéø–ûm]­NmqíÇÒı#¶×¹ÔÕÒ=TRÖ+ëGÇ¾şïw-6UœÆâ#pDyäé÷	ß÷:ÚvŒ{¬áÓvg/jBšòšF›Sšû[b[ºOÌ>ÑÖêŞzüGÛœ4<YyJóTÉiÚé‚Ó“gòÏŒ•}~.ùÜ`Û¢¶{çcÎßjoïºtáÒEÿ‹ç;¼;Î\ò¸tò²ÛåW¸Wš¯:_mêtê<ş“ÓOÇ»œ»š®¹\k¹îz½µ{f÷é7Îİô½yñÿÖÕ9=İ½ózo÷Å÷õßİ~r'ıÎË»Ùw'î­¼O¼_ô@íAÙCİ‡Õ?[şÜØïÜjÀw óÑÜG÷…ƒÏş‘õC™Ë††ë8>99â?rıéü§CÏdÏ&ş¢şË®/~øÕë×ÎÑ˜Ñ¡—ò—“¿m|¥ıêÀë¯ÛÆÂÆ¾Éx31^ôVûíÁwÜwï£ßOä| (ÿhù±õSĞ§û“““ÿ˜óüc3-Û  BiTXtXML:com.adobe.xmp     <?xpacket begin="ï»¿" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Adobe XMP Core 5.5-c014 79.151481, 2013/03/13-12:09:15        ">
+   <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+      <rdf:Description rdf:about=""
+            xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+            xmlns:xmpMM="http://ns.adobe.com/xap/1.0/mm/"
+            xmlns:stEvt="http://ns.adobe.com/xap/1.0/sType/ResourceEvent#"
+            xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/"
+            xmlns:dc="http://purl.org/dc/elements/1.1/"
+            xmlns:tiff="http://ns.adobe.com/tiff/1.0/"
+            xmlns:exif="http://ns.adobe.com/exif/1.0/">
+         <xmp:CreatorTool>Adobe Photoshop CC (Windows)</xmp:CreatorTool>
+         <xmp:CreateDate>2013-09-23T16:57:54+01:00</xmp:CreateDate>
+         <xmp:MetadataDate>2013-09-23T16:57:54+01:00</xmp:MetadataDate>
+         <xmp:ModifyDate>2013-09-23T16:57:54+01:00</xmp:ModifyDate>
+         <xmpMM:InstanceID>xmp.iid:1c3a75f2-57e1-4c44-a7c2-205e46485a5e</xmpMM:InstanceID>
+         <xmpMM:DocumentID>xmp.did:b918f322-7b30-3848-8a29-7da79b6a86ed</xmpMM:DocumentID>
+         <xmpMM:OriginalDocumentID>xmp.did:b918f322-7b30-3848-8a29-7da79b6a86ed</xmpMM:OriginalDocumentID>
+         <xmpMM:History>
+            <rdf:Seq>
+               <rdf:li rdf:parseType="Resource">
+                  <stEvt:action>created</stEvt:action>
+                  <stEvt:instanceID>xmp.iid:b918f322-7b30-3848-8a29-7da79b6a86ed</stEvt:instanceID>
+                  <stEvt:when>2013-09-23T16:57:54+01:00</stEvt:when>
+                  <stEvt:softwareAgent>Adobe Photoshop CC (Windows)</stEvt:softwareAgent>
+               </rdf:li>
+               <rdf:li rdf:parseType="Resource">
+                  <stEvt:action>saved</stEvt:action>
+                  <stEvt:instanceID>xmp.iid:1c3a75f2-57e1-4c44-a7c2-205e46485a5e</stEvt:instanceID>
+                  <stEvt:when>2013-09-23T16:57:54+01:00</stEvt:when>
+                  <stEvt:softwareAgent>Adobe Photoshop CC (Windows)</stEvt:softwareAgent>
+                  <stEvt:changed>/</stEvt:changed>
+               </rdf:li>
+            </rdf:Seq>
+         </xmpMM:History>
+         <photoshop:DocumentAncestors>
+            <rdf:Bag>
+               <rdf:li>adobe:docid:photoshop:158aa240-652c-11e1-b5dd-973dc8c20d7e</rdf:li>
+               <rdf:li>adobe:docid:photoshop:aff8e6a7-323f-11d8-9aed-cd0df01e1960</rdf:li>
+               <rdf:li>uuid:2CDE064ACF66E111B4BE8C251A065800</rdf:li>
+               <rdf:li>uuid:9B9F8D04B263E211B8C3924EF12F2764</rdf:li>
+               <rdf:li>uuid:CCE5B22B65F7DD119B6AB6AAF5DF5E0A</rdf:li>
+               <rdf:li>uuid:D0958F0BF763E211B8C3924EF12F2764</rdf:li>
+               <rdf:li>uuid:E3E3E569F463E211B8C3924EF12F2764</rdf:li>
+               <rdf:li>uuid:FF0D4B6FFF63E211B8C3924EF12F2764</rdf:li>
+               <rdf:li>xmp.did:376FBEE6776CE211A2FF9379297EF2CD</rdf:li>
+               <rdf:li>xmp.did:39582CBA086BE211A2FF9379297EF2CD</rdf:li>
+               <rdf:li>xmp.did:3C582CBA086BE211A2FF9379297EF2CD</rdf:li>
+               <rdf:li>xmp.did:3ED30A777961E211B32FD586B5419D43</rdf:li>
+               <rdf:li>xmp.did:406FBEE6776CE211A2FF9379297EF2CD</rdf:li>
+               <rdf:li>xmp.did:5366DE913B74E211A2FF9379297EF2CD</rdf:li>
+               <rdf:li>xmp.did:5E9B2E75896FE211A2FF9379297EF2CD</rdf:li>
+               <rdf:li>xmp.did:77AD33202E6AE211A2FF9379297EF2CD</rdf:li>
+               <rdf:li>xmp.did:79AD33202E6AE211A2FF9379297EF2CD</rdf:li>
+               <rdf:li>xmp.did:7BAD33202E6AE211A2FF9379297EF2CD</rdf:li>
+               <rdf:li>xmp.did:7DAD33202E6AE211A2FF9379297EF2CD</rdf:li>
+               <rdf:li>xmp.did:7FAD33202E6AE211A2FF9379297EF2CD</rdf:li>
+               <rdf:li>xmp.did:878DA7066274E211A2FF9379297EF2CD</rdf:li>
+               <rdf:li>xmp.did:8A8FA5224371E211A2FF9379297EF2CD</rdf:li>
+               <rdf:li>xmp.did:C9B561957261E211B32FD586B5419D43</rdf:li>
+               <rdf:li>xmp.did:F26E9F7C3C6AE211A2FF9379297EF2CD</rdf:li>
+               <rdf:li>xmp.did:F66E9F7C3C6AE211A2FF9379297EF2CD</rdf:li>
+               <rdf:li>xmp.did:F9B628857165E211B32FD586B5419D43</rdf:li>
+            </rdf:Bag>
+         </photoshop:DocumentAncestors>
+         <photoshop:ColorMode>3</photoshop:ColorMode>
+         <photoshop:ICCProfile>sRGB IEC61966-2.1</photoshop:ICCProfile>
+         <dc:format>image/png</dc:format>
+         <tiff:Orientation>1</tiff:Orientation>
+         <tiff:XResolution>720000/10000</tiff:XResolution>
+         <tiff:YResolution>720000/10000</tiff:YResolution>
+         <tiff:ResolutionUnit>2</tiff:ResolutionUnit>
+         <exif:ColorSpace>1</exif:ColorSpace>
+         <exif:PixelXDimension>16</exif:PixelXDimension>
+         <exif:PixelYDimension>16</exif:PixelYDimension>
+      </rdf:Description>
+   </rdf:RDF>
+</x:xmpmeta>
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                            
+<?xpacket end="w"?>ÍOºñ    cHRM  z%  €ƒ  ùÿ  €é  u0  ê`  :˜  o’_ÅF   õIDATxÚœ“±MADßmDH€D4@DFBBDdĞĞ A s’Á÷¸«eï|öH?øÚ™Ù¿Ú?¨djW½R'j©ª[9nÜì¨—êX­üoõI=S·cƒcõÙÅ1R÷µÖ‚ş˜ Ã Œ"±=„Öü5`€ÛˆP$Äœ0ô. ÷™›b•ô)†tŒ:Î*à1 À‹c”ÁÛ/À4 ¯sÚ~f
+|†ú-KLpşkÿ·Ê‡ê{«{¹, nª7âku£-LM­Ö1	Õ‰ºÒ•Æ´Ô™ú¡´ñ~ møªŠÑÌ&|    IEND®B`‚                               áùpÎ>Sé]éî,ñcàñÖ\‘¡&e aXß%ı#l/€™ã€MÑ›ªW‚ò3ÿ€Jº±Û(§L„H1ıİµ¡}WÑş¿kÑÓ`R#ŸL2Èüuí|TG*{Æ‡ñsÇRƒ©Ëg¿)%D,Ùò£ÛBB{V|·w±Mê«ŒQ»ïï7v¶lóŞ©%ÁõÚ§†Q>J‹m’Z¦ş²ÑÿÖ#ĞEøTÃ`³	h5í¬—nÅ½NŒ„zH–#Èİ'Ì¿ › İ&Fßhü±[—wÕ©Ğ[ô¼)ùš¨f¸ó'X‰×«²¦Í¡Í8äñ7t¥Ó?ãøõıuŒ™üe–y} ÷)1ÿnîs¬r×ŸaL0Áí ½åş*÷‚áÎroOTi‚PÒ.—½³à˜9Ìıö±TdÛı¿Th^b›Xx9ò¬Õ6cÇÙ__ï\/¹ç^²ÓÀùÊ93./W¸Ëì
+óÌ˜šÏ~·ÅÇ=b»“£/qŞÔ{¬ve— #úŞ%BødÇğ‹2¨û[24R¡'—+å.|÷¥´«ê¥XŸÖ&á¶¦ÜªXZQBä­ŒÜO‹_¬*²FlÄ0³Í:şb2ÁíÊ(ï² ;)„\‡&Ã=ñÌ!‡ôrªÖµúğX…´q&7^4ÀœK«M//
+//  GTMXcodeCreateUnitTextExecutable.m
+//
+//  Copyright 2007-2009 Google Inc.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License"); you may not
+//  use this file except in compliance with the License.  You may obtain a copy
+//  of the License at
+//
+//  http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+//  WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+//  License for the specific language governing permissions and limitations under
+//  the License.
+//
+
+#import "GTMXcodeMenuItem.h"
+#import "PBXAppDelegate.h"
+#import "PBXExtendedApplication.h"
+#import "GTMXcodePlugin.h"
+#import "NSTask+Script.h"
+#import "GTMMethodCheck.h"
+
+// Implements the Create Unit Test Executable menu item
+@interface GTMXcodeCreateUnitTextExecutable : GTMXcodeMenuItem
+@end
+
+@implementation GTMXcodeCreateUnitTextExecutable
+GTM_METHOD_CHECK(NSTask, gtm_runScript:withArguments:);
+
++ (void)load {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  [GTMXcodePlugin registerMenuItem:[[[self alloc] init] autorelease]];
+  [pool release];
+}
+
+- (NSString*)title {
+  return @"Create UnitTest Executable";
+}
+
+- (void)action:(id)sender {
+  [NSTask gtm_runScript:@"CreateUnitTestExecutable" withArguments:nil];
+}
+
+- (BOOL)validateMenuItem:(id <NSMenuItem>)menuItem {
+  return [NSApp currentProject] != nil;
+}
+
+- (NSMenu*)insertionMenu {
+  return [[NSApp delegate] projectMenu];
+}
+
+- (int)insertionIndex {
+  return 15;
+}
+@end
+                                                                                                                                                                                                                                                                                                                                                                                                      ¢ÿÏo{î}n|WîAØO£	ÔÏ DğxºJ	|²‹k¢SÆåG$(‹™ §¡ñr¸œB¼É;bxq³2O¼ø†"‚g—ÖØåæ™Ã¼Ã¸0RD‹ß7Î*²!tã@¿íI»u(ŒµC8ğÚáõÃI†(l\+Û,½´Ëğ¶oşvï#ÁP¢¨X½ÁNr¼f_Ù¥ª–_”JÉ×<ÏÕÖÌf³)J¹Şğ2Ù ÈŸ½¢iÒËÀdñj@¦,èî´"í¾?ç`Îo
+›mËr%B)ã©$`N¸–½  N²÷pìœ_ûŸgó/ ›í.Û‘r9y	±â‘¦ÿ0D¢°ÁÆ$©­5Í[(IÜéAW7jƒd 2óóœjFqÔéÒ±R,´ÑËb„CùCpJ/KĞÓ <´×ábQ{æ$W#‚Q€*{ “sY\a=ƒ72wÖQk.HD5ÂÀx¿•+yÁ¢Ûgw·@1ò.²Ğ+*#ZÜO‰åX7øòä'bh¸Çï€0#GvBä†&â±³€LN`0+±tGÙ6ü>¶jª´õ™J,šÔ«9¡tDdZ ÈôÊŒŞnüR°Ì)kqÎ`óXZ¿?#×#¥@şği‘>µ°¿"÷hùÅ}:Ü+kĞµÿ
+Wo­õ\§İ™x`}*ÉßBNMÉÃô˜µ?½©š+6äŸz f-„_úŞWñ¤Ú*ŠDKú	G9ÚT³ÜÌZôZÆ“´ƒ(L‚Ú7ID¨Ùz"%&w²2H…3h(d˜‡|$ğ¨=‘yf6«åè6¨	aêS‹Ğ&H¶ïu|ZÔ&Ö€$»·ã·Ø¤Œ±ê*@ÁE†oª§çw+MÅ©»óKdöt’§¢	½g£uÌ†,2ğò¿÷FN§Ô.’·†kñŞ[ÃwÜ=$“ãëœ¯C`ÃtíR=G>V•|d±ÏÜöI·}¬H`pĞ“ºæ«ÑÚ ”àz§Å5×´ˆí4"JwIxçNáæ7ë%GÚ=ğ§o‰ı …†_ñÈ®¾³ROÆõ$‘ëÅËCPæ¥X§š’);GšËà!äÑ\ªE,0ˆ,ZÛxøşûà
+]Å™¦jÅ­Í¥æûIV9äKŸ^{mØsŒeHş¡È¶B5¸“Ñ‹¬`d}­]ıÍ¿v±¥b5ˆTÛ¸$12óÏğ“ÎÀ9”ÔoÁ¹ûàû/ºW,¼ÓìYìÉVIŒ÷RÕºÕÒ ,
+\cTØVÄú»P+ªQ
+÷
+xu‡Wr ïÎİÊ“ôä©Ól¬nWL´]@ÙXÉZ
+öTÄ¸
+My\jeaí1+3_‹¯œñ¾dà¤ğšv_ª¢Î/QYXÓwÓã(r­\áÅÈR’3²y©ı?>û@¾5§îÃq\5@]–E(”¯Ë"Äq¹µ1@NéÀ2îbá©‚ıĞrUÏˆ‰oÙ+ss§ó&Á.eŠ€?†"¸T¶ø.J³c¾ÙÀûÄ!>§>óK‹k"É$Œ¾ğ‡ÜYà‹Ôû$øÅü—Ìå_
+«$M¬ÒwtİÇ
+*´y=œº7UĞ*uĞŸíµ&Vö’‚p½±Ÿ?Cr×¹jŞª†Œ =^¤ño",^Ö£‡`tĞSQ‡KôÅP‹J_IÙu2…×Â¬<øÏlé¬VÄ+ñ]è(ñ…D£øËFï¼V—©ÚK§[Ê×z£d6R7­€Æ–ĞaNÏ*s6kÜh¸s'ã+Å4~J_HWB˜Å&ø+6"6á&17%u ë1€ÃVé`ÙÃ ;Š¡àæ‹¸Õè~öh¢/‹OûÃ™³Ø­
+9@y*_‹¬§·†Ûø„G'>§Õ!Ñ"‡«ßÕê jëÖRÚOjìäÂ2ÄJ”sëYî7I’^Öâœkín“‘Ã'Eåöõ®mèì×aÒ@ÃÕÆzŸs0ø7KÉQ2º.x¾£ÏŞø

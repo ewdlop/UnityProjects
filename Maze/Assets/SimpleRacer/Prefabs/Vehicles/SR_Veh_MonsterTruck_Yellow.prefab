@@ -1,0 +1,328 @@
+seAssemblyResult.GenericError;
+			}
+			return ParseAssemblyResult.OK;
+		}
+
+		private static bool TryParse(string fullName, ref int pos, out string value)
+		{
+			value = null;
+			StringBuilder sb = new StringBuilder();
+			while (pos < fullName.Length && char.IsWhiteSpace(fullName[pos]))
+			{
+				pos++;
+			}
+			int quote = -1;
+			if (pos < fullName.Length && (fullName[pos] == '"' || fullName[pos] == '\''))
+			{
+				quote = fullName[pos++];
+			}
+			for (; pos < fullName.Length; pos++)
+			{
+				char ch = fullName[pos];
+				if (ch == '\\')
+				{
+					if (++pos == fullName.Length)
+					{
+						return false;
+					}
+					ch = fullName[pos];
+					if (ch == '\\')
+					{
+						return false;
+					}
+				}
+				else if (ch == quote)
+				{
+					for (pos++; pos != fullName.Length; pos++)
+					{
+						ch = fullName[pos];
+						if (ch == ',' || ch == '=')
+						{
+							break;
+						}
+						if (!char.IsWhiteSpace(ch))
+						{
+							return false;
+						}
+					}
+					break;
+				}
+				else if (quote == -1 && (ch == '"' || ch == '\''))
+				{
+					return false;
+				}
+				else if (quote == -1 && (ch == ',' || ch == '='))
+				{
+					break;
+				}
+				sb.Append(ch);
+			}
+			value = sb.ToString().Trim();
+			return value.Length != 0 || quote != -1;
+		}
+
+		private static bool TryConsume(string fullName, char ch, ref int pos)
+		{
+			if (pos < fullName.Length && fullName[pos] == ch)
+			{
+				pos++;
+				return true;
+			}
+			return false;
+		}
+
+		private static bool TryParseAssemblyAttribute(string fullName, ref int pos, ref string key, ref string value)
+		{
+			return TryConsume(fullName, ',', ref pos)
+				&& TryParse(fullName, ref pos, out key)
+				&& TryConsume(fullName, '=', ref pos)
+				&& TryParse(fullName, ref pos, out value);
+		}
+
+		internal static ParseAssemblyResult ParseAssemblyName(string fullName, out ParsedAssemblyName parsedName)
+		{
+			parsedName = new ParsedAssemblyName();
+			int pos;
+			ParseAssemblyResult res = ParseAssemblySimpleName(fullName, out pos, out parsedName.Name);
+			if (res != ParseAssemblyResult.OK)
+			{
+				return res;
+			}
+			else
+			{
+				const int ERROR_SXS_IDENTITIES_DIFFERENT = unchecked((int)0x80073716);
+				System.Collections.Generic.Dictionary<string, string> unknownAttributes = null;
+				bool hasProcessorArchitecture = false;
+				bool hasContentType = false;
+				bool hasPublicKeyToken = false;
+				string publicKeyToken;
+				while (pos != fullName.Length)
+				{
+					string key = null;
+					string value = null;
+					if (!TryParseAssemblyAttribute(fullName, ref pos, ref key, ref value))
+					{
+						return ParseAssemblyResult.GenericError;
+					}
+					key = key.ToLowerInvariant();
+					switch (key)
+					{
+						case "version":
+							if (parsedName.Version != null)
+							{
+								return ParseAssemblyResult.DuplicateKey;
+							}
+							parsedName.Version = value;
+							break;
+						case "culture":
+							if (parsedName.Culture != null)
+							{
+								return ParseAssemblyResult.DuplicateKey;
+							}
+							if (!ParseCulture(value, out parsedName.Culture))
+							{
+								return ParseAssemblyResult.GenericError;
+							}
+							break;
+						case "publickeytoken":
+							if (hasPublicKeyToken)
+							{
+								return ParseAssemblyResult.DuplicateKey;
+							}
+							if (!ParsePublicKeyToken(value, out publicKeyToken))
+							{
+								return ParseAssemblyResult.GenericError;
+							}
+							if (parsedName.HasPublicKey && parsedName.PublicKeyToken != publicKeyToken)
+							{
+								Marshal.ThrowExceptionForHR(ERROR_SXS_IDENTITIES_DIFFERENT);
+							}
+							parsedName.PublicKeyToken = publicKeyToken;
+							hasPublicKeyToken = true;
+							break;
+						case "publickey":
+							if (parsedName.HasPublicKey)
+							{
+								return ParseAssemblyResult.DuplicateKey;
+							}
+							if (!ParsePublicKey(value, out publicKeyToken))
+							{
+								return ParseAssemblyResult.GenericError;
+							}
+							if (hasPublicKeyToken && parsedName.PublicKeyToken != publicKeyToken)
+							{
+								Marshal.ThrowExceptionForHR(ERROR_SXS_IDENTITIES_DIFFERENT);
+							}
+							parsedName.PublicKeyToken = publicKeyToken;
+							parsedName.HasPublicKey = true;
+							break;
+						case "retargetable":
+							if (parsedName.Retargetable.HasValue)
+							{
+								return ParseAssemblyResult.DuplicateKey;
+							}
+							switch (value.ToLowerInvariant())
+							{
+								case "yes":
+									parsedName.Retargetable = true;
+									break;
+								case "no":
+									parsedName.Retargetable = false;
+									break;
+								default:
+									return ParseAssemblyResult.GenericError;
+							}
+							break;
+						case "processorarchitecture":
+							if (hasProcessorArchitecture)
+							{
+								return ParseAssemblyResult.DuplicateKey;
+							}
+							hasProcessorArchitecture = true;
+							switch (value.ToLowerInvariant())
+							{
+								case "none":
+									parsedName.ProcessorArchitecture = ProcessorArchitecture.None;
+									break;
+								case "msil":
+									parsedName.ProcessorArchitecture = ProcessorArchitecture.MSIL;
+									break;
+								case "x86":
+									parsedName.ProcessorArchitecture = ProcessorArchitecture.X86;
+									break;
+								case "ia64":
+									parsedName.ProcessorArchitecture = ProcessorArchitecture.IA64;
+									break;
+								case "amd64":
+									parsedName.ProcessorArchitecture = ProcessorArchitecture.Amd64;
+									break;
+								case "arm":
+									parsedName.ProcessorArchitecture = ProcessorArchitecture.Arm;
+									break;
+								default:
+									return ParseAssemblyResult.GenericError;
+							}
+							break;
+						case "contenttype":
+							if (hasContentType)
+							{
+								return ParseAssemblyResult.DuplicateKey;
+							}
+							hasContentType = true;
+							if (!value.Equals("windowsruntime", StringComparison.OrdinalIgnoreCase))
+							{
+								return ParseAssemblyResult.GenericError;
+							}
+							parsedName.WindowsRuntime = true;
+							break;
+						default:
+							if (key.Length == 0)
+							{
+								return ParseAssemblyResult.GenericError;
+							}
+							if (unknownAttributes == null)
+							{
+								unknownAttributes = new System.Collections.Generic.Dictionary<string, string>();
+							}
+							if (unknownAttributes.ContainsKey(key))
+							{
+								return ParseAssemblyResult.DuplicateKey;
+							}
+							unknownAttributes.Add(key, null);
+							break;
+					}
+				}
+				return ParseAssemblyResult.OK;
+			}
+		}
+
+		private static bool ParseVersion(string str, out Version version)
+		{
+			if (str == null)
+			{
+				version = null;
+				return true;
+			}
+			string[] parts = str.Split('.');
+			if (parts.Length < 2 || parts.Length > 4)
+			{
+				version = null;
+				ushort dummy;
+				// if the version consists of a single integer, it is invalid, but not invalid enough to fail the parse of the whole assembly name
+				return parts.Length == 1 && ushort.TryParse(parts[0], System.Globalization.NumberStyles.Integer, null, out dummy);
+			}
+			if (parts[0] == "" || parts[1] == "")
+			{
+				// this is a strange scenario, the version is invalid, but not invalid enough to fail the parse of the whole assembly name
+				version = null;
+				return true;
+			}
+			ushort major, minor, build = 65535, revision = 65535;
+			if (ushort.TryParse(parts[0], System.Globalization.NumberStyles.Integer, null, out major)
+				&& ushort.TryParse(parts[1], System.Globalization.NumberStyles.Integer, null, out minor)
+				&& (parts.Length <= 2 || parts[2] == "" || ushort.TryParse(parts[2], System.Globalization.NumberStyles.Integer, null, out build))
+				&& (parts.Length <= 3 || parts[3] == "" || (parts[2] != "" && ushort.TryParse(parts[3], System.Globalization.NumberStyles.Integer, null, out revision))))
+			{
+				if (parts.Length == 4 && parts[3] != "" && parts[2] != "")
+				{
+					version = new Version(major, minor, build, revision);
+				}
+				else if (parts.Length == 3 && parts[2] != "")
+				{
+					version = new Version(major, minor, build);
+				}
+				else
+				{
+					version = new Version(major, minor);
+				}
+				return true;
+			}
+			version = null;
+			return false;
+		}
+
+		private static bool ParseCulture(string str, out string culture)
+		{
+			if (str == null)
+			{
+				culture = null;
+				return false;
+			}
+			culture = str;
+			return true;
+		}
+
+		private static bool ParsePublicKeyToken(string str, out string publicKeyToken)
+		{
+			if (str == null)
+			{
+				publicKeyToken = null;
+				return false;
+			}
+			publicKeyToken = str.ToLowerInvariant();
+			return true;
+		}
+
+		private static bool ParsePublicKey(string str, out string publicKeyToken)
+		{
+			if (str == null)
+			{
+				publicKeyToken = null;
+				return false;
+			}
+			publicKeyToken = AssemblyName.ComputePublicKeyToken(str);
+			return true;
+		}
+
+		private static bool IsPartial(ParsedAssemblyName name, Version version)
+		{
+			return version == null || name.Culture == null || name.PublicKeyToken == null;
+		}
+
+		private static bool IsStrongNamed(ParsedAssemblyName name)
+		{
+			return name.PublicKeyToken != null && name.PublicKeyToken != "null";
+		}
+	}
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                          ç¸   [Ã„     1À[ÃH5Ò HƒìH²Ñ H£Â LlÒ ¾   PH‹¯™$ A¸™  H‹81Àè_JÿÿHHÒ H5yÑ H=7Ì º™  è09ÿÿSH‰ûè8ÿÿ…Àt#H‹“   H…ÒtöBHBº    [HDÂÃ@ 1À[Ãf.„     fL‹FM…Àt7USH‰ðH‰ËH‰ÖH‰ÏHƒì‹(AÿÐH…ÀH‰„ëè  t1ÀHƒÄ[]Ãf.„     1ÀÃ¸ûÿÿÿëåfD  H‹FPH…ÀtHƒìH‰ÎÿÐ1ÀHƒÄÃ€    1ÀÃ f.„     H‹FXH…ÀtHƒìH‰ÎÿÐ1ÀHƒÄÃ€    1ÀÃ f.„     H‹F`H…ÀtHƒìH‰ÎÿÐ1ÀHƒÄÃ€    1ÀÃ f.„     HÉ$ A¸"   éþ:ÿÿ@ f.„     AUATI‰õUS‰ÕH‰û1Ò¾   HƒìdH‹%(   H‰D$1À‹GP‰$‹GHH‰ç‰D$è¢Eÿÿ1Ò÷õH‹×—$ A‰U ƒ8~ZA‰Ôè†1ÿÿHƒìD‹(H‰ÅATjL9Û ‹D$H.Ò HOÒ A¸9  ¾   P‹D$ PH‹§—$ SH‹81Àè\HÿÿD‰m HƒÄ0H‹D$dH3%(   uHƒÄ[]A\A]ÃèÔ5ÿÿ@ AVAUA‰ÎATUH‰Õå   SI‰ýI‰ôH‰ÓtH‹W0H‹F0½   H‰ÑH1Á€å„µ  öÃtI‹U0I‹D$0H‰ÑH1Áƒá„˜  HƒÍöÃtI‹U0I‹D$0H‰ÑH1Áƒá„W  HƒÍHºã Hº       s%I‹M0I‹D$0H‰ÎH1ÆH…Ö„  H¸       H	ÅöÃtI‹U0I‹D$0H‰ÑH1Áƒá„  HƒÍöÃtI‹U0I‹D$0H‰ÑH1Áƒá„O  HƒÍöÃtI‹U0I‹D$0H‰ÑH1Áƒá„–  HƒÍöÇtI‹U0I‹D$0H‰ÑH1Á€å„M  HÍ   ÷Ã   t"I‹U0I‹D$0H‰ÑH1Á÷Á   „ó  HÍ   ÷Ã   t"I‹U0I‹D$0H‰ÑH1Á÷Á   „™  HÍ   öÃ tI‹U0I‹D$0H‰ÑH1Áƒá „Í  HƒÍ öÇtI‹U0I‹D$0H‰ÑH1Á€å„D  HÍ   öÃ€tI‹U0I‹D$0H‰ÑH1Áá€   „õ  @€Í€öÇtI‹U0I‹D$0H‰ÑH1Á€å„œ  HÍ   ÷Ã   t"I‹U0I‹D$0H‰ÑH1Á÷Á   „2  HÍ   ÷

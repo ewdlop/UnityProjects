@@ -1,0 +1,340 @@
+ def test_patchobject_start_stop(self):
+        original = something
+        patcher = patch.object(PTModule, 'something', 'foo')
+        self.assertIs(something, original)
+        replaced = patcher.start()
+        try:
+            self.assertEqual(replaced, 'foo')
+            self.assertIs(something, replaced)
+        finally:
+            patcher.stop()
+        self.assertIs(something, original)
+
+
+    def test_patch_dict_start_stop(self):
+        d = {'foo': 'bar'}
+        original = d.copy()
+        patcher = patch.dict(d, [('spam', 'eggs')], clear=True)
+        self.assertEqual(d, original)
+
+        patcher.start()
+        try:
+            self.assertEqual(d, {'spam': 'eggs'})
+        finally:
+            patcher.stop()
+        self.assertEqual(d, original)
+
+
+    def test_patch_dict_class_decorator(self):
+        this = self
+        d = {'spam': 'eggs'}
+        original = d.copy()
+
+        class Test(object):
+            def test_first(self):
+                this.assertEqual(d, {'foo': 'bar'})
+            def test_second(self):
+                this.assertEqual(d, {'foo': 'bar'})
+
+        Test = patch.dict(d, {'foo': 'bar'}, clear=True)(Test)
+        self.assertEqual(d, original)
+
+        test = Test()
+
+        test.test_first()
+        self.assertEqual(d, original)
+
+        test.test_second()
+        self.assertEqual(d, original)
+
+        test = Test()
+
+        test.test_first()
+        self.assertEqual(d, original)
+
+        test.test_second()
+        self.assertEqual(d, original)
+
+
+    def test_get_only_proxy(self):
+        class Something(object):
+            foo = 'foo'
+        class SomethingElse:
+            foo = 'foo'
+
+        for thing in Something, SomethingElse, Something(), SomethingElse:
+            proxy = _get_proxy(thing)
+
+            @patch.object(proxy, 'foo', 'bar')
+            def test():
+                self.assertEqual(proxy.foo, 'bar')
+            test()
+            self.assertEqual(proxy.foo, 'foo')
+            self.assertEqual(thing.foo, 'foo')
+            self.assertNotIn('foo', proxy.__dict__)
+
+
+    def test_get_set_delete_proxy(self):
+        class Something(object):
+            foo = 'foo'
+        class SomethingElse:
+            foo = 'foo'
+
+        for thing in Something, SomethingElse, Something(), SomethingElse:
+            proxy = _get_proxy(Something, get_only=False)
+
+            @patch.object(proxy, 'foo', 'bar')
+            def test():
+                self.assertEqual(proxy.foo, 'bar')
+            test()
+            self.assertEqual(proxy.foo, 'foo')
+            self.assertEqual(thing.foo, 'foo')
+            self.assertNotIn('foo', proxy.__dict__)
+
+
+    def test_patch_keyword_args(self):
+        kwargs = {'side_effect': KeyError, 'foo.bar.return_value': 33,
+                  'foo': MagicMock()}
+
+        patcher = patch(foo_name, **kwargs)
+        mock = patcher.start()
+        patcher.stop()
+
+        self.assertRaises(KeyError, mock)
+        self.assertEqual(mock.foo.bar(), 33)
+        self.assertIsInstance(mock.foo, MagicMock)
+
+
+    def test_patch_object_keyword_args(self):
+        kwargs = {'side_effect': KeyError, 'foo.bar.return_value': 33,
+                  'foo': MagicMock()}
+
+        patcher = patch.object(Foo, 'f', **kwargs)
+        mock = patcher.start()
+        patcher.stop()
+
+        self.assertRaises(KeyError, mock)
+        self.assertEqual(mock.foo.bar(), 33)
+        self.assertIsInstance(mock.foo, MagicMock)
+
+
+    def test_patch_dict_keyword_args(self):
+        original = {'foo': 'bar'}
+        copy = original.copy()
+
+        patcher = patch.dict(original, foo=3, bar=4, baz=5)
+        patcher.start()
+
+        try:
+            self.assertEqual(original, dict(foo=3, bar=4, baz=5))
+        finally:
+            patcher.stop()
+
+        self.assertEqual(original, copy)
+
+
+    def test_autospec(self):
+        class Boo(object):
+            def __init__(self, a):
+                pass
+            def f(self, a):
+                pass
+            def g(self):
+                pass
+            foo = 'bar'
+
+            class Bar(object):
+                def a(self):
+                    pass
+
+        def _test(mock):
+            mock(1)
+            mock.assert_called_with(1)
+            self.assertRaises(TypeError, mock)
+
+        def _test2(mock):
+            mock.f(1)
+            mock.f.assert_called_with(1)
+            self.assertRaises(TypeError, mock.f)
+
+            mock.g()
+            mock.g.assert_called_with()
+            self.assertRaises(TypeError, mock.g, 1)
+
+            self.assertRaises(AttributeError, getattr, mock, 'h')
+
+            mock.foo.lower()
+            mock.foo.lower.assert_called_with()
+            self.assertRaises(AttributeError, getattr, mock.foo, 'bar')
+
+            mock.Bar()
+            mock.Bar.assert_called_with()
+
+            mock.Bar.a()
+            mock.Bar.a.assert_called_with()
+            self.assertRaises(TypeError, mock.Bar.a, 1)
+
+            mock.Bar().a()
+            mock.Bar().a.assert_called_with()
+            self.assertRaises(TypeError, mock.Bar().a, 1)
+
+            self.assertRaises(AttributeError, getattr, mock.Bar, 'b')
+            self.assertRaises(AttributeError, getattr, mock.Bar(), 'b')
+
+        def function(mock):
+            _test(mock)
+            _test2(mock)
+            _test2(mock(1))
+            self.assertIs(mock, Foo)
+            return mock
+
+        test = patch(foo_name, autospec=True)(function)
+
+        mock = test()
+        self.assertIsNot(Foo, mock)
+        # test patching a second time works
+        test()
+
+        module = sys.modules[__name__]
+        test = patch.object(module, 'Foo', autospec=True)(function)
+
+        mock = test()
+        self.assertIsNot(Foo, mock)
+        # test patching a second time works
+        test()
+
+
+    def test_autospec_function(self):
+        @patch('%s.function' % __name__, autospec=True)
+        def test(mock):
+            function.assert_not_called()
+            self.assertRaises(AssertionError, function.assert_called)
+            self.assertRaises(AssertionError, function.assert_called_once)
+            function(1)
+            self.assertRaises(AssertionError, function.assert_not_called)
+            function.assert_called_with(1)
+            function.assert_called()
+            function.assert_called_once()
+            function(2, 3)
+            function.assert_called_with(2, 3)
+
+            self.assertRaises(TypeError, function)
+            self.assertRaises(AttributeError, getattr, function, 'foo')
+
+        test()
+
+
+    def test_autospec_keywords(self):
+        @patch('%s.function' % __name__, autospec=True,
+               return_value=3)
+        def test(mock_function):
+            #self.assertEqual(function.abc, 'foo')
+            return function(1, 2)
+
+        result = test()
+        self.assertEqual(result, 3)
+
+
+    def test_autospec_staticmethod(self):
+        with patch('%s.Foo.static_method' % __name__, autospec=True) as method:
+            Foo.static_method()
+            method.assert_called_once_with()
+
+
+    def test_autospec_classmethod(self):
+        with patch('%s.Foo.class_method' % __name__, autospec=True) as method:
+            Foo.class_method()
+            method.assert_called_once_with()
+
+
+    def test_autospec_with_new(self):
+        patcher = patch('%s.function' % __name__, new=3, autospec=True)
+        self.assertRaises(TypeError, patcher.start)
+
+        module = sys.modules[__name__]
+        patcher = patch.object(module, 'function', new=3, autospec=True)
+        self.assertRaises(TypeError, patcher.start)
+
+
+    def test_autospec_with_object(self):
+        class Bar(Foo):
+            extra = []
+
+        patcher = patch(foo_name, autospec=Bar)
+        mock = patcher.start()
+        try:
+            self.assertIsInstance(mock, Bar)
+            self.assertIsInstance(mock.extra, list)
+        finally:
+            patcher.stop()
+
+
+    def test_autospec_inherits(self):
+        FooClass = Foo
+        patcher = patch(foo_name, autospec=True)
+        mock = patcher.start()
+        try:
+            self.assertIsInstance(mock, FooClass)
+            self.assertIsInstance(mock(3), FooClass)
+        finally:
+            patcher.stop()
+
+
+    def test_autospec_name(self):
+        patcher = patch(foo_name, autospec=True)
+        mock = patcher.start()
+
+        try:
+            self.assertIn(" name='Foo'", repr(mock))
+            self.assertIn(" name='Foo.f'", repr(mock.f))
+            self.assertIn(" name='Foo()'", repr(mock(None)))
+            self.assertIn(" name='Foo().f'", repr(mock(None).f))
+        finally:
+            patcher.stop()
+
+
+    def test_tracebacks(self):
+        @patch.object(Foo, 'f', object())
+        def test():
+            raise AssertionError
+        try:
+            test()
+        except:
+            err = sys.exc_info()
+
+        result = unittest.TextTestResult(None, None, 0)
+        traceback = result._exc_info_to_string(err, self)
+        self.assertIn('raise AssertionError', traceback)
+
+
+    def test_new_callable_patch(self):
+        patcher = patch(foo_name, new_callable=NonCallableMagicMock)
+
+        m1 = patcher.start()
+        patcher.stop()
+        m2 = patcher.start()
+        patcher.stop()
+
+        self.assertIsNot(m1, m2)
+        for mock in m1, m2:
+            self.assertNotCallable(m1)
+
+
+    def test_new_callable_patch_object(self):
+        patcher = patch.object(Foo, 'f', new_callable=NonCallableMagicMock)
+
+        m1 = patcher.start()
+        patcher.stop()
+        m2 = patcher.start()
+        patcher.stop()
+
+        self.assertIsNot(m1, m2)
+        for mock in m1, m2:
+            self.assertNotCallable(m1)
+
+
+    def test_new_callable_keyword_arguments(self):
+        class Bar(object):
+            kwargs = None
+            def __init__(self, **kwargs):
+                Bar.kwargs = kw

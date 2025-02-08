@@ -1,0 +1,558 @@
+//
+// System.Xml.Serialization.XmlCustomFormatter.cs
+//
+// Author:
+//   Tim Coleman (tim@timcoleman.com)
+//   Lluis Sanchez Gual (lluis@ximian.com)
+//
+// Copyright (C) Tim Coleman, 2002
+//
+
+//
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+// 
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+//
+
+using System;
+using System.Collections;
+using System.Text;
+using System.Xml;
+using System.Globalization;
+
+namespace System.Xml.Serialization {
+	internal class XmlCustomFormatter {
+
+		#region Methods
+
+		internal static string FromByteArrayBase64 (byte[] value)
+		{
+			return value == null ? String.Empty : Convert.ToBase64String(value);
+		}
+
+		internal static string FromByteArrayHex (byte[] value)
+		{
+			if (value == null) return null;
+			StringBuilder output = new StringBuilder ();
+			foreach (byte val in value)
+				output.Append (val.ToString ("X2", CultureInfo.InvariantCulture));
+			return output.ToString ();
+		}
+
+		internal static string FromChar (char value)
+		{
+			return ((int) value).ToString (CultureInfo.InvariantCulture);
+		}
+
+		internal static string FromDate (DateTime value)
+		{
+			return XmlConvert.ToString (value, "yyyy-MM-dd");
+		}
+
+		internal static string FromDateTime (DateTime value)
+		{
+			return XmlConvert.ToString (value, XmlDateTimeSerializationMode.RoundtripKind);
+		}
+
+		internal static string FromTime (DateTime value)
+		{
+			return XmlConvert.ToString (value, "HH:mm:ss.fffffffzzz");
+		}
+
+		internal static string FromEnum (long value, string[] values, long[] ids)
+		{
+			return FromEnum (value, values, ids, (string) null);
+		}
+
+		internal static string FromEnum (long value, string[] values, long[] ids, string typeName)
+		{
+			StringBuilder sb = new StringBuilder();
+			int length = ids.Length;
+			long valueToProcess = value;
+			int zeroValue = -1;
+
+			for (int i = 0; i < length; i ++) {
+				if (ids[i] == 0) {
+					zeroValue = i;
+				} else {
+					if (valueToProcess == 0) {
+						break;
+					}
+
+					if ((ids[i] & value) == ids[i]) {
+						if (sb.Length != 0)
+							sb.Append (' ');
+						sb.Append (values[i]);
+						valueToProcess &= ~ids[i];
+					}
+				}
+			}
+
+			if (valueToProcess != 0) {
+				if (typeName != null)
+					throw new InvalidOperationException (string.Format (CultureInfo.CurrentCulture,
+						"'{0}' is not a valid value for {1}.", value, typeName));
+				else
+					throw new InvalidOperationException (string.Format (CultureInfo.CurrentCulture,
+						"'{0}' is not a valid value.", value));
+			}
+			if (sb.Length == 0 && zeroValue != -1) {
+				sb.Append (values[zeroValue]);
+			}
+			return sb.ToString ();
+		}
+
+		internal static string FromXmlName (string name)
+		{
+			return XmlConvert.EncodeName (name);
+		}
+
+		internal static string FromXmlNCName (string ncName)
+		{
+			return XmlConvert.EncodeLocalName (ncName);
+		}
+
+		internal static string FromXmlNmToken (string nmToken)
+		{
+			return XmlConvert.EncodeNmToken (nmToken);
+		}
+
+		internal static string FromXmlNmTokens (string nmTokens)
+		{
+			string [] tokens = nmTokens.Split (' ');
+			for (int i=0; i<tokens.Length; i++)
+				tokens [i] = FromXmlNmToken (tokens [i]);
+			return String.Join (" ", tokens);
+		}
+
+		internal static byte[] ToByteArrayBase64 (string value)
+		{
+			return Convert.FromBase64String(value);
+		}
+
+		internal static char ToChar (string value)
+		{
+			return (char) XmlConvert.ToUInt16 (value);
+		}
+
+		internal static DateTime ToDate (string value)
+		{
+			return ToDateTime (value);
+		}
+
+		internal static DateTime ToDateTime (string value)
+		{
+			return XmlConvert.ToDateTime (value, XmlDateTimeSerializationMode.RoundtripKind);
+		}
+
+		internal static DateTime ToTime (string value)
+		{
+			return ToDateTime (value);
+		}
+
+		internal static long ToEnum (string value, Hashtable values, string typeName, bool validate)
+		{
+			// Assuming that h contains map from value to Enumerated Name
+/*
+			You can try : 
+				return ToEnum ("One Two", h, "SomeType");
+			where:
+				(1) no keys and values for h.
+				(2) string keys and long values.
+			
+			according to MSDN docs (for .NET 2.0) the hashtable "consists of the
+			identifiers as keys and the constants as integral numbers"
+*/
+			long enumValue = 0;
+			string[] names = value.Split (' ');
+
+			foreach (string name in names) {
+				object nameValue = values[name];
+				if (nameValue != null) {
+					enumValue |= (long) nameValue;
+				} else if (validate && name.Length != 0) {
+					throw new InvalidOperationException (String.Format ("'{0}' is not a valid member of type {1}.", name, typeName));
+				}
+			}
+
+			return enumValue;
+		}
+
+		internal static string ToXmlName (string value)
+		{
+			return XmlConvert.DecodeName (value);
+		}
+
+		internal static string ToXmlNCName (string value)
+		{
+			return ToXmlName (value);
+		}
+
+		internal static string ToXmlNmToken (string value)
+		{
+			return ToXmlName (value);
+		}
+
+		internal static string ToXmlNmTokens (string value)
+		{
+			return ToXmlName (value);
+		}
+
+		internal static string ToXmlString (TypeData type, object value)
+		{
+			if (value == null) return null;
+			switch (type.XmlType)
+			{
+				case "boolean": return XmlConvert.ToString ((bool)value);
+				case "unsignedByte": return XmlConvert.ToString ((byte)value);
+				case "char": return XmlConvert.ToString ((int)(char)value);
+				case "dateTime": return XmlConvert.ToString ((DateTime)value, XmlDateTimeSerializationMode.RoundtripKind);
+				case "date": return ((DateTime)value).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+				case "time": return ((DateTime)value).ToString("HH:mm:ss.FFFFFFF", CultureInfo.InvariantCulture);
+				case "decimal": return XmlConvert.ToString ((decimal)value);
+				case "double": return XmlConvert.ToString ((double)value);
+				case "short": return XmlConvert.ToString ((Int16)value);
+				case "int": return XmlConvert.ToString ((Int32)value);
+				case "long": return XmlConvert.ToString ((Int64)value);
+				case "byte": return XmlConvert.ToString ((sbyte)value);
+				case "float": return XmlConvert.ToString ((Single)value);
+				case "unsignedShort": return XmlConvert.ToString ((UInt16)value);
+				case "unsignedInt": return XmlConvert.ToString ((UInt32)value);
+				case "unsignedLong": return XmlConvert.ToString ((UInt64)value);
+				case "guid": return XmlConvert.ToString ((Guid)value);
+				case "base64":
+				case "base64Binary": return value == null ? String.Empty : Convert.ToBase64String ((byte[])value);
+				case "hexBinary": return value == null ? String.Empty : XmlConvert.ToBinHexString ((byte[]) value);
+				case "duration": return (string) value;
+			default: return value is IFormattable ? ((IFormattable) value).ToString (null, CultureInfo.InvariantCulture) : value.ToString ();
+			}
+		}
+
+		static string[] allTimeFormats = new string[] {
+			"HH:mm:ss.fffffffzzzzzz",
+			"HH:mm:ss",
+			"HH:mm:ss.f",
+			"HH:mm:ss.ff",
+			"HH:mm:ss.fff",
+			"HH:mm:ss.ffff",
+			"HH:mm:ss.fffff",
+			"HH:mm:ss.ffffff",
+			"HH:mm:ss.fffffff",
+			"HH:mm:ssZ",
+			"HH:mm:ss.fZ",
+			"HH:mm:ss.ffZ",
+			"HH:mm:ss.fffZ",
+			"HH:mm:ss.ffffZ",
+			"HH:mm:ss.fffffZ",
+			"HH:mm:ss.ffffffZ",
+			"HH:mm:ss.fffffffZ",
+			"HH:mm:sszzzzzz",
+			"HH:mm:ss.fzzzzzz",
+			"HH:mm:ss.ffzzzzzz",
+			"HH:mm:ss.fffzzzzzz",
+			"HH:mm:ss.ffffzzzzzz",
+			"HH:mm:ss.fffffzzzzzz",
+			"HH:mm:ss.ffffffzzzzzz",
+		};
+
+		internal static object FromXmlString (TypeData type, string value)
+		{
+			if (value == null) return null;
+
+			switch (type.XmlType)
+			{
+				case "boolean": return XmlConvert.ToBoolean (value);
+				case "unsignedByte": return XmlConvert.ToByte (value);
+				case "char": return (char)XmlConvert.ToInt32 (value);
+				case "dateTime": return XmlConvert.ToDateTime (value, XmlDateTimeSerializationMode.RoundtripKind);
+				case "date": return XmlConvert.ToDateTime (value).Date;
+				case "time": return DateTime.ParseExact(value, allTimeFormats, DateTimeFormatInfo.InvariantInfo, DateTimeStyles.AllowLeadingWhite | DateTimeStyles.AllowTrailingWhite | DateTimeStyles.NoCurrentDateDefault | DateTimeStyles.RoundtripKind);
+				case "decimal": return XmlConvert.ToDecimal (value);
+				case "double": return XmlConvert.ToDouble (value);
+				case "short": return XmlConvert.ToInt16 (value);
+				case "int": return XmlConvert.ToInt32 (value);
+				case "long": return XmlConvert.ToInt64 (value);
+				case "byte": return XmlConvert.ToSByte (value);
+				case "float": return XmlConvert.ToSingle (value);
+				case "unsignedShort": return XmlConvert.ToUInt16 (value);
+				case "unsignedInt": return XmlConvert.ToUInt32 (value);
+				case "unsignedLong": return XmlConvert.ToUInt64 (value);
+				case "guid": return XmlConvert.ToGuid (value);
+				case "base64":
+				case "base64Binary": return Convert.FromBase64String (value);
+				case "hexBinary": return XmlConvert.FromBinHexString (value);
+				case "duration": return value;
+				default: 
+					if (type.Type != null)
+						return Convert.ChangeType (value, type.Type, null);
+					else
+						return value;
+			}
+		}
+
+		internal static string GenerateToXmlString (TypeData type, string value)
+		{
+			if (type.NullableOverride)
+				return "(" + value + " != null ? " + GenerateToXmlStringCore (type, value) + " : null)";
+			else
+				return GenerateToXmlStringCore (type, value);
+		}
+
+		static string GenerateToXmlStringCore (TypeData type, string value)
+		{
+			if (type.NullableOverride)
+				value = value + ".Value";
+			switch (type.XmlType)
+			{
+				case "boolean": return "(" + value + "?\"true\":\"false\")";
+				case "unsignedByte": return value + ".ToString(CultureInfo.InvariantCulture)";
+				case "char": return "((int)(" + value + ")).ToString(CultureInfo.InvariantCulture)";
+				case "dateTime": return "XmlConvert.ToString (" + value + ", XmlDateTimeSerializationMode.RoundtripKind)";
+				case "date": return value + ".ToString(\"yyyy-MM-dd\", CultureInfo.InvariantCulture)";
+				case "time": return value + ".ToString(\"HH:mm:ss.FFFFFFF\", CultureInfo.InvariantCulture)";
+				case "decimal": return "XmlConvert.ToString (" + value + ")";
+				case "double": return "XmlConvert.ToString (" + value + ")";
+				case "short": return value + ".ToString(CultureInfo.InvariantCulture)";
+				case "int": return value + ".ToString(CultureInfo.InvariantCulture)";
+				case "long": return value + ".ToString(CultureInfo.InvariantCulture)";
+				case "byte": return value + ".ToString(CultureInfo.InvariantCulture)";
+				case "float": return "XmlConvert.ToString (" + value + ")";
+				case "unsignedShort": return value + ".ToString(CultureInfo.InvariantCulture)";
+				case "unsignedInt": return value + ".ToString(CultureInfo.InvariantCulture)";
+				case "unsignedLong": return value + ".ToString(CultureInfo.InvariantCulture)";
+				case "guid": return "XmlConvert.ToString (" + value + ")";
+				case "base64":
+				case "base64Binary": return value + " == null ? String.Empty : Convert.ToBase64String (" + value + ")";
+				case "hexBinary": return value + " == null ? String.Empty : ToBinHexString (" + value + ")";
+				case "duration": return value;
+				case "NMTOKEN":
+				case "Name":
+				case "NCName":
+				case "language":
+				case "ENTITY":
+				case "ID":
+				case "IDREF":
+				case "NOTATION":
+				case "token":
+				case "normalizedString":
+				case "string": return value;
+				default: return "((" + value + " != null) ? (" + value + ").ToString() : null)";
+			}
+		}
+
+		internal static string GenerateFromXmlString (TypeData type, string value)
+		{
+			if (type.NullableOverride)
+				return String.Concat ("(", value, " != null ? (", type.CSharpName, "?)", GenerateFromXmlStringCore (type, value), " : null)");
+			else
+				return GenerateFromXmlStringCore (type, value);
+		}
+
+		static string GenerateFromXmlStringCore (TypeData type, string value)
+		{
+			switch (type.XmlType)
+			{
+				case "boolean": return "XmlConvert.ToBoolean (" + value + ")";
+				case "unsignedByte": return "byte.Parse (" + value + ", CultureInfo.InvariantCulture)";
+				case "char": return "(char)Int32.Parse (" + value + ", CultureInfo.InvariantCulture)";
+				case "dateTime": return "XmlConvert.ToDateTime (" + value + ", XmlDateTimeSerializationMode.RoundtripKind)";
+				case "date": return "XmlConvert.ToDateTime (" + value + ").Date";
+				case "time": return "DateTime.ParseExact (" + value + ", \"HH:mm:ss.FFFFFFF\", CultureInfo.InvariantCulture)";
+				case "decimal": return "Decimal.Parse (" + value + ", CultureInfo.InvariantCulture)";
+				case "double": return "XmlConvert.ToDouble (" + value + ")";
+				case "short": return "Int16.Parse (" + value + ", CultureInfo.InvariantCulture)";
+				case "int": return "Int32.Parse (" + value + ", CultureInfo.InvariantCulture)";
+				case "long": return "Int64.Parse (" + value + ", CultureInfo.InvariantCulture)";
+				case "byte": return "SByte.Parse (" + value + ", CultureInfo.InvariantCulture)";
+				case "float": return "XmlConvert.ToSingle (" + value + ")";
+				case "unsignedShort": return "UInt16.Parse (" + value + ", CultureInfo.InvariantCulture)";
+				case "unsignedInt": return "UInt32.Parse (" + value + ", CultureInfo.InvariantCulture)";
+				case "unsignedLong": return "UInt64.Parse (" + value + ", CultureInfo.InvariantCulture)";
+				case "guid": return "XmlConvert.ToGuid (" + value + ")";
+				case "base64:":
+				case "base64Binary": return "Convert.FromBase64String (" + value + ")";
+				case "hexBinary": return "FromBinHexString (" + value + ")";
+				case "duration": return value;
+				default: return value;
+			}
+		}
+
+		#endregion // Methods
+	}
+}
+                                                                                                                               £G¹ÍºØÕeu–ÊqÁ:M…º9Ç<Ì(N¢üÊV!#•·aXóşš²*¦—úê“RÙÓœª•ô”ƒUŞÖÖy{MrU£ÒêçŸ0ö‡_˜ÓPòo]š3Í,^¸c7Z›‚	ÂõàÔ'UåSóŞÈ±›ˆµò7/Šxe˜~ªÚ—÷=Îµ7?N^B«v$R9æ)ñ‰ú—yJBè¤n«ş#~j3‹¤+²Z"}w¢é¯i.%ß©De¹¤v÷DŸ'ı‡8§Jâ¤âQÙƒ?#†İ`xd¬$]ˆÄ
+¢Q H7GRàmš‰(vs?> o?Àœ—À2^éá|Í‘™üFdgŒ(`²s ZYYêQª;(¢ÕQhã<¼Üm|¬·‘Œ[0jÁ`İE"s@Ä\XxìNï;@ĞÜvŠvß‘îOì£Lææäx˜ sÀ$ì:I`Â¹oŸƒAiEş
+[mÜ­½Á•9ºZzX{x: ]ù]0@”UÁ9±…ØC,!.sˆÄ¼;B¬!`Ë‚ûÑà{WğrŸ,?C_ûÅ¨¼Ôa½ FÁ®^´=ÇUÒäı#Ö‰iŠÉ!dñµ¶æ‚ü²«u^®áå¦H^­>Vxıƒc¿u5‡X^Š™mD|È9”¶~/Ybp'£:óiÅs:íw¾8É
+º:!Ã”÷²œÅï²Ôè´Íseÿ@ÎÔ!7âÑá–šÂP|Ob)åâ“]Å9¬9&eñÉñ9©Z³;º™¤&¿_ª‰û€:<¸~´½JlŞ»h¼˜×>ğ¼87%Uƒ\†t‘(¦‡­N˜~t¡^ ÕôÚ]U)’’'¿—¾î§‰>©b$)ìÉÃZ²Ä³:Èá˜Zjãàæ]'OpÊÇ+‹•£Ö°#­)ÓX‰ev§	QÉ÷—ç³½^g¦cUÇb-5Ô÷au‘6û
+ÏHK^Jû;3k…1SÂô³²~%>l[Z–/¼i`Â{<¤ĞHÎûnĞVh.e%ûTr/¤'Ueü!%Xı8eZ[;äP}ÉÕ<9?V±†ÎœœÌÀ@µãIl·>ã[¾¶Zí|_=etÖÇŸqnF"-€^ıkO§ƒÏDñÚú¹YÒ°Ç£Åë ïÄÅ¡!Wë™M­ê0ClÿıÂìó
+$%rŸšsÍj³£¯zhW©Q|~Õ×”$ì¸ó—€ÌÚ*WW§ç:ŞÔûµ[XZ~ KËÒ? “ôO×/àb™…)ÚL@;™$ÛKRÁ™|o‘"ÉÁúó{›ú>É‡h3ÊlU¿¯aQ'7‰òãC~Ä#‚¯Ht¥=[JÔÎ÷'CŠÂYÂ¨ [æ†œ7xÙAĞÙŒaô¿Šéß!1
+!e,RVÛ×Ä]ğQO5©÷2p°3|ãæáÆ£GÕn×¶K<œvIp‡ú+©îLY"£õ·÷ÛĞœZa¬wË=8jv0’OìER¦\“2?³ÙÑ‡µñŒÛ1•ÅHS¢]ôè¾U¥á6C:#ú0ÛÇüS9œıÜrôñ¾¥§Ìûgµ„ï:	ôĞ¬®¿°â^‹SKÍÓ}œ>\¿â¦æn™(¯wÛkÓ)©$ é;Û¼”,æ_¿=¾Fï&Wí.ıÚsk)âÚèô*«Ä{>ÅáÔ "!{¥)—J´3/TpmìkÃTPÈ­Ó+_r=Æ¹¬ú‹˜t^f	$V`3fc©ïXêÒ]çÂáP$–:ì»öƒ6AvƒAáÔ&°PCÒo›I	ÊX(
+ô­"øB<Í;¦#ŒIàĞŸˆÁú%Ü!ş£g5Ãáã“-1	x³¾2İpŒ9­üF`VŒ¦¾JOK)$Üz)Q¤¨ ”¨	 ¦phº”…y™‹é 0­ÿ‘¨ù?ĞÊƒ ×öOYô,]l½zºº]Í#b’¢(	qfrom distutils.util import convert_path
+from distutils import log
+from distutils.errors import DistutilsOptionError
+import distutils
+import os
+
+from setuptools.extern.six.moves import configparser
+
+from setuptools import Command
+
+__all__ = ['config_file', 'edit_config', 'option_base', 'setopt']
+
+
+def config_file(kind="local"):
+    """Get the filename of the distutils, local, global, or per-user config
+
+    `kind` must be one of "local", "global", or "user"
+    """
+    if kind == 'local':
+        return 'setup.cfg'
+    if kind == 'global':
+        return os.path.join(
+            os.path.dirname(distutils.__file__), 'distutils.cfg'
+        )
+    if kind == 'user':
+        dot = os.name == 'posix' and '.' or ''
+        return os.path.expanduser(convert_path("~/%spydistutils.cfg" % dot))
+    raise ValueError(
+        "config_file() type must be 'local', 'global', or 'user'", kind
+    )
+
+
+def edit_config(filename, settings, dry_run=False):
+    """Edit a configuration file to include `settings`
+
+    `settings` is a dictionary of dictionaries or ``None`` values, keyed by
+    command/section name.  A ``None`` value means to delete the entire section,
+    while a dictionary lists settings to be changed or deleted in that section.
+    A setting of ``None`` means to delete that setting.
+    """
+    log.debug("Reading configuration from %s", filename)
+    opts = configparser.RawConfigParser()
+    opts.read([filename])
+    for section, options in settings.items():
+        if options is None:
+            log.info("Deleting section [%s] from %s", section, filename)
+            opts.remove_section(section)
+        else:
+            if not opts.has_section(section):
+                log.debug("Adding new section [%s] to %s", section, filename)
+                opts.add_section(section)
+            for option, value in options.items():
+                if value is None:
+                    log.debug(
+                        "Deleting %s.%s from %s",
+                        section, option, filename
+                    )
+                    opts.remove_option(section, option)
+                    if not opts.options(section):
+                        log.info("Deleting empty [%s] section from %s",
+                                 section, filename)
+                        opts.remove_section(section)
+                else:
+                    log.debug(
+                        "Setting %s.%s to %r in %s",
+                        section, option, value, filename
+                    )
+                    opts.set(section, option, value)
+
+    log.info("Writing %s", filename)
+    if not dry_run:
+        with open(filename, 'w') as f:
+            opts.write(f)
+
+
+class option_base(Command):
+    """Abstract base class for commands that mess with config files"""
+
+    user_options = [
+        ('global-config', 'g',
+         "save options to the site-wide distutils.cfg file"),
+        ('user-config', 'u',
+         "save options to the current user's pydistutils.cfg file"),
+        ('filename=', 'f',
+         "configuration file to use (default=setup.cfg)"),
+    ]
+
+    boolean_options = [
+        'global-config', 'user-config',
+    ]
+
+    def initialize_options(self):
+        self.global_config = None
+        self.user_config = None
+        self.filename = None
+
+    def finalize_options(self):
+        filenames = []
+        if self.global_config:
+            filenames.append(config_file('global'))
+        if self.user_config:
+            filenames.append(config_file('user'))
+        if self.filename is not None:
+            filenames.append(self.filename)
+        if not filenames:
+            filenames.append(config_file('local'))
+        if len(filenames) > 1:
+            raise DistutilsOptionError(
+                "Must specify only one configuration file option",
+                filenames
+            )
+        self.filename, = filenames
+
+
+class setopt(option_base):
+    """Save command-line options to a file"""
+
+    description = "set an option in setup.cfg or another config file"
+
+    user_options = [
+        ('command=', 'c', 'command to set an option for'),
+        ('option=', 'o', 'option to set'),
+        ('set-value=', 's', 'value of the option'),
+        ('remove', 'r', 'remove (unset) the value'),
+    ] + option_base.user_options
+
+    boolean_options = option_base.boolean_options + ['remove']
+
+    def initialize_options(self):
+        option_base.initialize_options(self)
+        self.command = None
+        self.option = None
+        self.set_value = None
+        self.remove = None
+
+    def finalize_options(self):
+        option_base.finalize_options(self)
+        if self.command is None or self.option is None:
+            raise DistutilsOptionError("Must specify --command *and* --option")
+        if self.set_value is None and not self.remove:
+            raise DistutilsOptionError("Must specify --set-value or --remove")
+
+    def run(self):
+        edit_config(
+            self.filename, {
+                self.command: {self.option.replace('-', '_'): self.set_value}
+            },
+            self.dry_run
+        )
+                                                                                                                                                                                                                                                                                                                                                                                                              ?÷±ëSN²à¦ºsV%mÒzuÃœŞío0^
+^¨\â“íÂÕk]åóò×z)/O™ö|{Jùæ©.´wj ='AD!-+2m:uEa‚;ësò'7•Ú•tÔIlğß«¶¹Ô–9Ì¿ãÃÎ²7y+´gÄS×n*-è'Å5’	…Oú<›©µŠOÛÄšÕ2í_‘¥‹*HÑŒ0ÅOùqÔZ`Ö²ßÿâY`!mŸ}	m'B}áê2ëƒ÷
+’ã12Ü#‚Ú’,lÒšš<àØü¥È	)øÇ
+^?IÚNÁ¨,Õo4\æ‰¹¾-ĞV H›ÀKïs¼£Ÿö3…{<DÆNr/U©ô³Íf7xGÀJOº.uş47;µí¦ÔaZ›B§4
+*,l‘ÒİìvÎ²,×…Ì‘ÈrKdË§Joju»rÑ…ÍdX…£\!ïï…í36Ê†s8ñÔ*éå0ÓCgo¯£ŠÙR›•\S•Q¡šMc‚TŠé¨LƒİÍût—	¹.–¡³R™S1é¼-+ntRJzïYñ¬Ğ	î'ÓÓ‡R¾DÑĞiÎWJæ2L°pÑı@vû¶²76Ä·§ÌÕK–ö¢o¼£n%N	Áe$R´–š’vleÎƒx+w_[\"_t4å»–v<´á9¦ƒ³jÁgSÙb™%OgÊˆYY†wú[¯‚ÔÜ¾EĞè&á—ÊÜï7Ø"K´ì:Ôm¤ÜÛbšâ9u/ÿ‘pêÂá·Fê²§jn~şøÕEùüf™T†3%À§	÷½WÈGKşßÙ&'š¡áO7¦†ÏÆÂo™ˆÑ¸ßîÊãÍüYÃm¨àfÇÛDÑ–ÙV<RîÕÅ¤QÑ™ıgú-îºú¬%·ã'_Ånñi½<°”DŠ»©~¦ƒkéÈWg0>²½àÑÓVPhIa…Ñæ—ÈşAy%ò‡‡Ù&EêÌõåcƒ¸‰	h2›,ÚÈØší’6ÎÛ¼T›èŸ Y®9¡¾	)#\kw G]â2òø{é/¾«Æg½*ÏéTt{-4Ö‰ÏX˜ê|bş&·ƒ[ô<ÖõÕÒ¼Ê‰GĞ<'Á!æº®,·ÄfB‚

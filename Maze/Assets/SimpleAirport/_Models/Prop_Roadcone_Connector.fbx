@@ -1,0 +1,620 @@
+lx %d %s %s\n"), &ComponentData, ComponentData.TickRate, ComponentData.bInterpolate ? TEXT("I") : TEXT(" "), ComponentData.bReducedWork ? TEXT("Lo") : TEXT("Hi"));
+						}
+						else
+						{
+							DebugString += FString::Printf(TEXT("%.03f %d %s %s\n"), ComponentData.Significance, ComponentData.TickRate, ComponentData.bInterpolate ? TEXT("I") : TEXT(" "), ComponentData.bReducedWork ? TEXT("Lo") : TEXT("Hi"));
+						}
+					}
+				}
+
+				DrawDebugString(World, Location, DebugString, nullptr, FColor::White, 0.016f, false);
+			}
+
+			DebugTimes.Add(FVector2D(CurrentDebugTimeDisplay, DebugTotalTime));
+
+			float DebugTimeAccumulator = 0.0f;
+			float DebugTimeNum = 0.0f;
+			for(int32 DebugTimeIndex = DebugTimes.Num() - 1, DebugTimeCount = 0; DebugTimeIndex >= 0 && DebugTimeCount < 20; DebugTimeIndex--, DebugTimeCount++)
+			{
+				DebugTimeAccumulator += DebugTimes[DebugTimeIndex].Y;
+				DebugTimeNum += 1.0f;
+			}
+			DebugTimesSmoothed.Add(FVector2D(CurrentDebugTimeDisplay, DebugTimeNum > 0.0f ? DebugTimeAccumulator / DebugTimeNum : 0.0f));
+
+			CurrentDebugTimeDisplay += 0.016f;
+			DebugSmoothedTotalTime = FMath::Max(FMath::CeilToFloat(DebugTimesSmoothed.Last().Y * 0.5f) / 0.5f, Parameters.BudgetInMs);
+			DebugTotalTime = 0.0f;
+		}
+#endif
+	}
+}
+
+#if ENABLE_DRAW_DEBUG
+void FAnimationBudgetAllocator::OnHUDPostRender(AHUD* HUD, UCanvas* Canvas)
+{
+	if(FAnimationBudgetAllocator::bCachedEnabled && bEnabled && GAnimationBudgetDebugEnabled != 0)
+	{
+		if(HUD->GetWorld() == World)
+		{
+			TWeakObjectPtr<UReporterGraph> Graph = Canvas->GetReporterGraph();
+
+			Graph->SetNumGraphLines(2);
+
+			FGraphLine* RawGraphLine = Graph->GetGraphLine(0);
+
+			RawGraphLine->Color = FLinearColor::Gray.CopyWithNewOpacity(0.3f);
+			RawGraphLine->LineName = TEXT("Raw");
+			RawGraphLine->Data = DebugTimes;
+
+			FGraphLine* SmoothedGraphLine = Graph->GetGraphLine(1);
+
+			SmoothedGraphLine->Color = FLinearColor::White;
+			SmoothedGraphLine->LineName = TEXT("Smoothed");
+			SmoothedGraphLine->Data = DebugTimesSmoothed;
+
+			Graph->SetNumThresholds(1);
+
+			FGraphThreshold* Threshold = Graph->GetThreshold(0);
+			Threshold->Color = FLinearColor::White;
+			Threshold->ThresholdName = TEXT("Budget");
+			Threshold->Threshold = Parameters.BudgetInMs;
+
+			Graph->SetNotchesPerAxis(20, 3);
+			Graph->SetAxesMinMax(CurrentDebugTimeDisplay - 10.0f, CurrentDebugTimeDisplay, 0.0f, DebugSmoothedTotalTime * 1.5f);
+			Graph->SetGraphScreenSize(0.1f, 0.9f, 0.1f, 0.3f);
+			Graph->DrawCursorOnGraph(false);
+			Graph->UseTinyFont(true);
+			Graph->SetCursorLocation(CurrentDebugTimeDisplay);
+			Graph->SetStyles(EGraphAxisStyle::Grid, EGraphDataStyle::Lines);
+			Graph->SetLegendPosition(ELegendPosition::Outside);
+			Graph->OffsetDataSets(false);
+			Graph->DrawExtremesOnGraph(false);
+			Graph->bVisible = true;
+			Graph->Draw(Canvas);
+
+			{
+				TMap<AActor*, TArray<int32>> ActorMap;
+				for (int32 ComponentDataIndex = 0; ComponentDataIndex < AllComponentData.Num(); ++ComponentDataIndex)
+				{
+					FAnimBudgetAllocatorComponentData& ComponentData = AllComponentData[ComponentDataIndex];
+					TArray<int32>& ComponentIndexArray = ActorMap.FindOrAdd(ComponentData.Component->GetOwner());
+					ComponentIndexArray.Add(ComponentDataIndex);
+				}
+
+				float LineOffset = 0.0f;
+
+				for(TPair<AActor*, TArray<int32>>& ActorIndicesPair : ActorMap)
+				{
+					// Sort by significance
+					ActorIndicesPair.Value.Sort([this](int32 Index0, int32 Index1)
+					{
+						const FAnimBudgetAllocatorComponentData& ComponentData0 = AllComponentData[Index0];
+						const FAnimBudgetAllocatorComponentData& ComponentData1 = AllComponentData[Index1];
+ 
+						return ComponentData0.Significance < ComponentData1.Significance;
+					});
+
+					FVector Location = ActorIndicesPair.Key->GetActorLocation();
+
+					FString DebugString;
+
+					float SubLineOffset = 0.0f;
+
+					for(int32 ComponentDataIndex : ActorIndicesPair.Value)
+					{
+						FAnimBudgetAllocatorComponentData& ComponentData = AllComponentData[ComponentDataIndex];
+						if(ComponentData.bTickEnabled && !ComponentData.bOnScreen)
+						{
+							if(GAnimationBudgetDebugShowAddresses != 0)
+							{
+								DebugString += FString::Printf(TEXT("0x%llx %d %s %s\n"), &ComponentData, ComponentData.TickRate, ComponentData.bInterpolate ? TEXT("I") : TEXT(" "), ComponentData.bReducedWork ? TEXT("Lo") : TEXT("Hi"));
+							}
+							else
+							{
+								DebugString += FString::Printf(TEXT("%.03f %d %s %s\n"), ComponentData.Significance, ComponentData.TickRate, ComponentData.bInterpolate ? TEXT("I") : TEXT(" "), ComponentData.bReducedWork ? TEXT("Lo") : TEXT("Hi"));
+							}
+
+							SubLineOffset += 15.0f;
+						}
+					}
+
+					Canvas->DrawText(GEngine->GetSmallFont(), FText::FromString(DebugString), 100.0f, 100.0f + LineOffset);
+
+					LineOffset += SubLineOffset;
+				}	
+			}
+		}
+	}
+}
+#endif
+
+void FAnimationBudgetAllocator::RemoveHelper(int32 Index)
+{
+	if(AllComponentData.IsValidIndex(Index))
+	{
+		if(AllComponentData[Index].Component != nullptr)
+		{
+			AllComponentData[Index].Component->SetAnimationBudgetHandle(INDEX_NONE);
+		}
+
+		AllComponentData.RemoveAtSwap(Index, 1, false);
+
+		// Update handle of swapped component
+		const int32 NumRemaining = AllComponentData.Num();
+		if(NumRemaining > 0 && Index != NumRemaining)
+		{
+			if(AllComponentData[Index].Component != nullptr)
+			{
+				AllComponentData[Index].Component->SetAnimationBudgetHandle(Index);
+			}
+		}
+	}
+}
+
+static USkeletalMeshComponentBudgeted* FindRootPrerequisiteRecursive(USkeletalMeshComponentBudgeted* InComponent, TArray<USkeletalMeshComponentBudgeted*>& InVisitedComponents)
+{
+	InVisitedComponents.Add(InComponent);
+
+	USkeletalMeshComponentBudgeted* Root = InComponent;
+
+	for(FTickPrerequisite& TickPrerequisite : InComponent->PrimaryComponentTick.GetPrerequisites())
+	{
+		if(USkeletalMeshComponentBudgeted* PrerequisiteObject = Cast<USkeletalMeshComponentBudgeted>(TickPrerequisite.PrerequisiteObject.Get()))
+		{
+			if(!InVisitedComponents.Contains(PrerequisiteObject))
+			{
+				Root = FindRootPrerequisiteRecursive(PrerequisiteObject, InVisitedComponents);
+			}
+		}
+	}
+
+	return Root;
+}
+
+static USkeletalMeshComponentBudgeted* FindRootPrerequisite(USkeletalMeshComponentBudgeted* InComponent)
+{
+	check(IsInGameThread());
+
+	static TArray<USkeletalMeshComponentBudgeted*> VisitedComponents;
+	VisitedComponents.Reset();
+
+	return FindRootPrerequisiteRecursive(InComponent, VisitedComponents);
+}
+
+void FAnimationBudgetAllocator::RegisterComponent(USkeletalMeshComponentBudgeted* InComponent)
+{
+	if (FAnimationBudgetAllocator::bCachedEnabled && bEnabled)
+	{
+		if (InComponent->GetAnimationBudgetHandle() == INDEX_NONE)
+		{
+			InComponent->bEnableUpdateRateOptimizations = false;
+			InComponent->EnableExternalTickRateControl(true);
+			InComponent->SetAnimationBudgetHandle(AllComponentData.Num());
+
+			// Setup frame offset
+			FAnimBudgetAllocatorComponentData& ComponentData = AllComponentData.Emplace_GetRef(InComponent, Parameters.InitialEstimatedWorkUnitTimeMs, Parameters.StateChangeThrottleInFrames);
+			USkeletalMeshComponentBudgeted* RootPrerequisite = FindRootPrerequisite(InComponent);
+			ComponentData.RootPrerequisite = (RootPrerequisite != nullptr && RootPrerequisite != InComponent) ? RootPrerequisite : nullptr;
+			ComponentData.FrameOffset = CurrentFrameOffset++;
+			ComponentData.bAutoCalculateSignificance = InComponent->GetAutoCalculateSignificance();
+
+			InComponent->SetAnimationBudgetAllocator(this);
+		}
+		else
+		{
+			UpdateComponentTickPrerequsites(InComponent);
+		}
+	}
+}
+
+void FAnimationBudgetAllocator::UnregisterComponent(USkeletalMeshComponentBudgeted* InComponent)
+{
+	if (FAnimationBudgetAllocator::bCachedEnabled && bEnabled)
+	{
+		int32 ManagerHandle = InComponent->GetAnimationBudgetHandle();
+		if(ManagerHandle != INDEX_NONE)
+		{
+			RemoveHelper(ManagerHandle);
+
+			InComponent->bEnableUpdateRateOptimizations = true;
+			InComponent->EnableExternalTickRateControl(false);
+			InComponent->SetAnimationBudgetAllocator(nullptr);
+		}
+	}
+}
+
+void FAnimationBudgetAllocator::UpdateComponentTickPrerequsites(USkeletalMeshComponentBudgeted* InComponent)
+{
+	if (FAnimationBudgetAllocator::bCachedEnabled && bEnabled)
+	{
+		int32 ManagerHandle = InComponent->GetAnimationBudgetHandle();
+		if(ManagerHandle != INDEX_NONE)
+		{
+			FAnimBudgetAllocatorComponentData& ComponentData = AllComponentData[ManagerHandle];
+			USkeletalMeshComponentBudgeted* RootPrerequisite = FindRootPrerequisite(InComponent);
+			ComponentData.RootPrerequisite = (RootPrerequisite != nullptr && RootPrerequisite != InComponent) ? RootPrerequisite : nullptr;
+		}
+	}
+}
+
+void FAnimationBudgetAllocator::AddReferencedObjects(FReferenceCollector& Collector)
+{
+	Collector.AddReferencedObject(World);
+
+	for (FAnimBudgetAllocatorComponentData& ComponentData : AllComponentData)
+	{
+		Collector.AddReferencedObject(ComponentData.Component);
+		Collector.AddReferencedObject(ComponentData.RootPrerequisite);
+	}
+}
+
+void FAnimationBudgetAllocator::HandlePostGarbageCollect()
+{
+	// Remove dead components, readjusting indices
+	bool bRemoved = false;
+	do
+	{
+		bRemoved = false;
+		for(int32 DataIndex = 0; DataIndex < AllComponentData.Num(); ++DataIndex)
+		{
+			if(AllComponentData[DataIndex].Component == nullptr)
+			{
+				// We can remove while iterating here as we swap internally
+				RemoveHelper(DataIndex);
+				bRemoved = true;
+			}
+		}
+	}
+	while(bRemoved);
+}
+
+void FAnimationBudgetAllocator::SetGameThreadLastTickTimeMs(int32 InManagerHandle, float InGameThreadLastTickTimeMs)
+{
+	if(InManagerHandle != INDEX_NONE)
+	{
+		FAnimBudgetAllocatorComponentData& ComponentData = AllComponentData[InManagerHandle];
+		ComponentData.GameThreadLastTickTimeMs = InGameThreadLastTickTimeMs;
+#if ENABLE_DRAW_DEBUG
+		DebugTotalTime += InGameThreadLastTickTimeMs;
+#endif
+	}
+}
+
+void FAnimationBudgetAllocator::SetGameThreadLastCompletionTimeMs(int32 InManagerHandle, float InGameThreadLastCompletionTimeMs)
+{
+	if(InManagerHandle != INDEX_NONE)
+	{
+		FAnimBudgetAllocatorComponentData& ComponentData = AllComponentData[InManagerHandle];
+		ComponentData.GameThreadLastCompletionTimeMs = InGameThreadLastCompletionTimeMs;
+#if ENABLE_DRAW_DEBUG
+		DebugTotalTime += InGameThreadLastCompletionTimeMs;
+#endif
+	}
+}
+
+void FAnimationBudgetAllocator::SetIsRunningReducedWork(USkeletalMeshComponentBudgeted* InComponent, bool bInReducedWork)
+{
+	if (GAnimationBudgetEnabled && bEnabled)
+	{
+		int32 ManagerHandle = InComponent->GetAnimationBudgetHandle();
+		if(ManagerHandle != INDEX_NONE)
+		{
+			FAnimBudgetAllocatorComponentData& ComponentData = AllComponentData[ManagerHandle];
+			ComponentData.bReducedWork = bInReducedWork;
+		}
+	}
+}
+
+void FAnimationBudgetAllocator::SetEnabled(bool bInEnabled)
+{
+	bEnabled = bInEnabled;
+
+	if(!bEnabled)
+	{
+		// Remove all components we are currently tracking
+		for(int32 DataIndex = 0; DataIndex < AllComponentData.Num(); ++DataIndex)
+		{
+			FAnimBudgetAllocatorComponentData& ComponentData = AllComponentData[DataIndex];
+			if(ComponentData.Component != nullptr)
+			{
+				ComponentData.Component->SetAnimationBudgetHandle(INDEX_NONE);
+				ComponentData.Component->bEnableUpdateRateOptimizations = true;
+				ComponentData.Component->EnableExternalTickRateControl(false);
+				ComponentData.Component->SetAnimationBudgetAllocator(nullptr);
+
+				// Re-enable ticking in case the component was currently skipping
+				TickEnableHelper(ComponentData.Component, true);
+			}
+		}
+
+		AllComponentData.Reset();
+	}
+}
+
+bool FAnimationBudgetAllocator::GetEnabled() const
+{
+	return bEnabled;
+}
+
+void FAnimationBudgetAllocator::SetParameters(const FAnimationBudgetAllocatorParameters& InParameters)
+{
+	Parameters = InParameters;
+}
+
+void FAnimationBudgetAllocator::SetParametersFromCVars()
+{
+	Parameters = GBudgetParameters;
+}                                                                                                                                                                                                                                                                 // Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	ApexDestructibleAssetImport.cpp:
+
+	Creation of an APEX NxDestructibleAsset from a binary buffer.
+	SkeletalMesh creation from an APEX NxDestructibleAsset.
+
+	SkeletalMesh creation largely based on FbxSkeletalMeshImport.cpp
+
+=============================================================================*/
+
+#include "ApexDestructibleAssetImport.h"
+
+#if WITH_EDITOR
+#include "Modules/ModuleManager.h"
+#include "Engine/SkeletalMesh.h"
+#include "Materials/Material.h"
+#include "Factories/Factory.h"
+#include "EditorFramework/AssetImportData.h"
+#include "DestructibleComponent.h"
+#include "ApexDestructionModule.h"
+
+DEFINE_LOG_CATEGORY_STATIC(LogApexDestructibleAssetImport, Log, All);
+
+#include "PhysicsPublic.h"
+#include "SkelImport.h"
+#include "PhysXIncludes.h"
+#include "MeshUtilities.h"
+#include "UObject/UObjectHash.h"
+#include "UObject/UObjectIterator.h"
+#include "ComponentReregisterContext.h"
+#include "Rendering/SkeletalMeshModel.h"
+#include "DestructibleMesh.h"
+#include "Factories/FbxSkeletalMeshImportData.h"
+
+PRAGMA_DISABLE_DEPRECATION_WARNINGS
+
+#if WITH_APEX
+
+
+// Set to 1 to match UE transformation of FBX-imported meshes
+#define INVERT_Y_AND_V	1
+
+// Set to 1 to use temporary transform function
+#define USE_TEMPORARY_TRANSFORMATION_FUNCTION 1
+
+
+// Forward declarations and external processing functions
+struct ExistingSkelMeshData;
+
+
+// Temporary transform function, to be removed once the APEX SDK is updated
+#if USE_TEMPORARY_TRANSFORMATION_FUNCTION
+
+static void ApplyTransformationToApexDestructibleAsset( apex::DestructibleAsset& ApexDestructibleAsset, const physx::PxMat44& Transform )
+{
+	// Get the NvParameterized interface to the asset
+	NvParameterized::Interface* AssetParams = const_cast<NvParameterized::Interface*>(ApexDestructibleAsset.getAssetNvParameterized());
+	if (AssetParams != NULL)
+	{
+		// Name buffer used for parameterized array element lookup
+		char ArrayElementName[1024];
+
+		/* surfaceTrace default normal */
+		physx::PxI32 SurfaceTraceSetCount;
+		if (NvParameterized::getParamArraySize(*AssetParams, "surfaceTraceSets", SurfaceTraceSetCount))
+		{
+			for (physx::PxI32 i = 0; i < SurfaceTraceSetCount; ++i)
+			{
+				FCStringAnsi::Sprintf( ArrayElementName, "surfaceTraceSets[%d]", i );
+				NvParameterized::Interface* SurfaceTraceSetParams;
+				if (NvParameterized::getParamRef(*AssetParams, ArrayElementName, SurfaceTraceSetParams))
+				{
+					if (SurfaceTraceSetParams != NULL)
+					{
+						physx::PxI32 SurfaceTraceCount;
+						if (NvParameterized::getParamArraySize(*SurfaceTraceSetParams, "traces", SurfaceTraceCount))
+						{
+							for (physx::PxI32 j = 0; j < SurfaceTraceCount; ++j)
+							{
+								FCStringAnsi::Sprintf( ArrayElementName, "traces[%d].defaultNormal", j );
+								NvParameterized::Handle DefaultNormalHandle(*SurfaceTraceSetParams);
+								if (NvParameterized::findParam(*SurfaceTraceSetParams, ArrayElementName, DefaultNormalHandle) != NULL)
+								{
+									physx::PxVec3 DefaultNormal;
+									DefaultNormalHandle.getParamVec3( DefaultNormal );
+									DefaultNormal = Transform.rotate( DefaultNormal );
+									DefaultNormalHandle.setParamVec3( DefaultNormal );
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		/* For now, we'll just clear the current cached streams. */
+		NvParameterized::Interface* CollisionDataParams;
+		if (NvParameterized::getParamRef(*AssetParams, "collisionData", CollisionDataParams))
+		{
+			if (CollisionDataParams != NULL)
+			{
+				CollisionDataParams->destroy();
+				NvParameterized::setParamRef(*AssetParams, "collisionData", NULL);
+			}
+		}
+
+		/* chunk surface normal */
+		physx::PxI32 AssetChunkCount;
+		if (NvParameterized::getParamArraySize(*AssetParams, "chunks", AssetChunkCount))
+		{
+			for (physx::PxI32 i = 0; i < AssetChunkCount; ++i)
+			{
+				FCStringAnsi::Sprintf( ArrayElementName, "chunks[%d].surfaceNormal", i );
+				NvParameterized::Handle ChunkSurfaceNormalHandle(*AssetParams);
+				if (NvParameterized::findParam(*AssetParams, ArrayElementName, ChunkSurfaceNormalHandle) != NULL)
+				{
+					physx::PxVec3 ChunkSurfaceNormal;
+					ChunkSurfaceNormalHandle.getParamVec3( ChunkSurfaceNormal );
+					ChunkSurfaceNormal = Transform.rotate( ChunkSurfaceNormal );
+					ChunkSurfaceNormalHandle.setParamVec3( ChunkSurfaceNormal );
+				}
+			}
+		}
+
+		/* bounds */
+		physx::PxBounds3 Bounds;
+		if (NvParameterized::getParamBounds3(*AssetParams, "bounds", Bounds))
+		{
+			if (!Bounds.isEmpty())
+			{
+				Bounds = physx::PxBounds3::basisExtent(Transform.transform(Bounds.getCenter()), physx::PxMat33(Transform.column0.getXYZ(), Transform.column1.getXYZ(), Transform.column2.getXYZ()), Bounds.getExtents());
+				NvParameterized::setParamBounds3(*AssetParams, "bounds", Bounds);
+			}
+		}
+
+		/* chunk convex hulls */
+		physx::PxI32 ConvexHullCount;
+		if (NvParameterized::getParamArraySize(*AssetParams, "chunkConvexHulls", ConvexHullCount))
+		{
+			for (physx::PxI32 i = 0; i < ConvexHullCount; ++i)
+			{
+				FCStringAnsi::Sprintf( ArrayElementName, "chunkConvexHulls[%d]", i );
+				NvParameterized::Interface* ConvexHullParams;
+				if (NvParameterized::getParamRef(*AssetParams, ArrayElementName, ConvexHullParams))
+				{
+					if (ConvexHullParams != NULL)
+					{
+						// planes
+						physx::PxI32 UniquePlaneCount;
+						if (NvParameterized::getParamArraySize(*ConvexHullParams, "uniquePlanes", UniquePlaneCount))
+						{
+							for (physx::PxI32 j = 0; j < UniquePlaneCount; ++j)
+							{
+								FCStringAnsi::Sprintf( ArrayElementName, "uniquePlanes[%d].normal", j );
+								NvParameterized::Handle PlaneNormalHandle(*ConvexHullParams);
+								if (NvParameterized::findParam(*ConvexHullParams, ArrayElementName, PlaneNormalHandle) != NULL)
+								{
+									physx::PxVec3 PlaneNormal;
+									PlaneNormalHandle.getParamVec3( PlaneNormal );
+									PlaneNormal = Transform.rotate( PlaneNormal );
+									PlaneNormalHandle.setParamVec3( PlaneNormal );
+								}
+							}
+						}
+
+						// vertices
+						physx::PxBounds3 HullBounds;
+						HullBounds.setEmpty();
+						physx::PxI32 HullVertexCount;
+						if (NvParameterized::getParamArraySize(*ConvexHullParams, "vertices", HullVertexCount))
+						{
+							for (physx::PxI32 j = 0; j < HullVertexCount; ++j)
+							{
+								FCStringAnsi::Sprintf( ArrayElementName, "vertices[%d]", j );
+								NvParameterized::Handle HullVertexHandle(*ConvexHullParams);
+								if (NvParameterized::findParam(*ConvexHullParams, ArrayElementName, HullVertexHandle) != NULL)
+								{
+									physx::PxVec3 HullVertex;
+									HullVertexHandle.getParamVec3( HullVertex );
+									HullVertex = Transform.transform( HullVertex );
+									HullVertexHandle.setParamVec3( HullVertex );
+									HullBounds.include( HullVertex );
+								}
+							}
+						}
+						NvParameterized::setParamBounds3(*ConvexHullParams, "bounds", HullBounds);
+					}
+				}
+			}
+		}
+
+		/* render mesh asset (bounding boxes only) */
+		const physx::PxMat33 Basis(Transform.getBasis(0), Transform.getBasis(1), Transform.getBasis(2));
+		const physx::PxVec3 Offset = Transform.getPosition();
+		NvParameterized::Interface* RenderMeshAssetParams;
+		if (NvParameterized::getParamRef(*AssetParams, "renderMeshAsset", RenderMeshAssetParams))
+		{
+			physx::PxI32 PartBoundsCount;
+			if (NvParameterized::getParamArraySize(*RenderMeshAssetParams, "partBounds", PartBoundsCount))
+			{
+				for (physx::PxI32 i = 0; i < PartBoundsCount; ++i)
+				{
+					FCStringAnsi::Sprintf( ArrayElementName, "partBounds[%d]", i );
+					NvParameterized::Handle PartBoundsHandle(*RenderMeshAssetParams);
+					if (NvParameterized::findParam(*RenderMeshAssetParams, ArrayElementName, PartBoundsHandle) != NULL)
+					{
+						physx::PxBounds3 PartBounds;
+						PartBoundsHandle.getParamBounds3( PartBounds );
+						PartBounds = physx::PxBounds3::transformSafe(Basis, PartBounds);
+						PartBounds.minimum += Offset;
+						PartBounds.maximum += Offset;
+						PartBoundsHandle.setParamBounds3( PartBounds );
+					}
+				}
+			}
+		}
+	}
+}
+#endif // #if USE_TEMPORARY_TRANSFORMATION_FUNCTION
+
+// Storage for destructible mesh settings (including base skeletal mesh)
+struct FExistingDestMeshData
+{
+	FExistingDestMeshData() : BodySetup(NULL) {}
+
+	TSharedPtr<FExistingSkelMeshData>	SkelMeshData;
+	UBodySetup*							BodySetup;
+	TArray<struct FFractureEffect>		FractureEffects;
+};
+
+TSharedPtr<FExistingDestMeshData> SaveExistingDestMeshData(UDestructibleMesh* ExistingDestructibleMesh)
+{
+	TSharedPtr<FExistingDestMeshData> ExistingDestMeshDataPtr;
+
+	if (ExistingDestructibleMesh)
+	{
+		ExistingDestMeshDataPtr = MakeShared<FExistingDestMeshData>();
+
+		// Only save off SkelMeshData if it's been created
+		ExistingDestMeshDataPtr->SkelMeshData = SkeletalMeshHelper::SaveExistingSkelMeshData(ExistingDestructibleMesh, true, INDEX_NONE);
+		ExistingDestMeshDataPtr->BodySetup = ExistingDestructibleMesh->BodySetup;
+		ExistingDestMeshDataPtr->FractureEffects = ExistingDestructibleMesh->FractureEffects;
+	}
+
+	return ExistingDestMeshDataPtr;
+}
+
+static void RestoreExistingDestMeshData(const TSharedPtr<FExistingDestMeshData>& MeshData, UDestructibleMesh* DestructibleMesh)
+{
+	if (MeshData && DestructibleMesh)
+	{
+		// Restore old settings, but resize arrays to make sense with the new NxDestructibleAsset
+		if (MeshData->SkelMeshData)
+		{
+			SkeletalMeshHelper::RestoreExistingSkelMeshData(MeshData->SkelMeshData, DestructibleMesh, INDEX_NONE, false, false, false);
+		}
+		DestructibleMesh->BodySetup =  MeshData->BodySetup;
+		DestructibleMesh->FractureEffects = MeshData->FractureEffects;
+
+		// Resize the depth parameters array to the appropriate size
+		const int32 ParamDepthDifference = (int32)DestructibleMesh->ApexDestructibleAsset->getDepthCount() - DestructibleMesh->DefaultDestructibleParameters.DepthParameters.Num();
+		if (ParamDepthDifference > 0)
+		{
+			for (int32 i = 0; i < ParamDepthDifference; ++i)
+			{
+				DestructibleMesh->DefaultDestructibleParameters.DepthParameters.Add(FDestructibleDepthParameters());
+			}
+		}
+		else
+		if (ParamDepthDifference < 0)
+		{
+			DestructibleMesh->DefaultDestructibleParame

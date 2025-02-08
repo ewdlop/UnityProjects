@@ -1,0 +1,602 @@
+ def __getitem__(self, key):
+        value = tuple.__getitem__(self, key)
+        # Can't replace a tuple entry.
+        return self.convert_with_key(key, value, replace=False)
+
+class BaseConfigurator(object):
+    """
+    The configurator base class which defines some useful defaults.
+    """
+
+    CONVERT_PATTERN = re.compile(r'^(?P<prefix>[a-z]+)://(?P<suffix>.*)$')
+
+    WORD_PATTERN = re.compile(r'^\s*(\w+)\s*')
+    DOT_PATTERN = re.compile(r'^\.\s*(\w+)\s*')
+    INDEX_PATTERN = re.compile(r'^\[\s*(\w+)\s*\]\s*')
+    DIGIT_PATTERN = re.compile(r'^\d+$')
+
+    value_converters = {
+        'ext' : 'ext_convert',
+        'cfg' : 'cfg_convert',
+    }
+
+    # We might want to use a different one, e.g. importlib
+    importer = staticmethod(__import__)
+
+    def __init__(self, config):
+        self.config = ConvertingDict(config)
+        self.config.configurator = self
+
+    def resolve(self, s):
+        """
+        Resolve strings to objects using standard import and attribute
+        syntax.
+        """
+        name = s.split('.')
+        used = name.pop(0)
+        try:
+            found = self.importer(used)
+            for frag in name:
+                used += '.' + frag
+                try:
+                    found = getattr(found, frag)
+                except AttributeError:
+                    self.importer(used)
+                    found = getattr(found, frag)
+            return found
+        except ImportError:
+            e, tb = sys.exc_info()[1:]
+            v = ValueError('Cannot resolve %r: %s' % (s, e))
+            v.__cause__, v.__traceback__ = e, tb
+            raise v
+
+    def ext_convert(self, value):
+        """Default converter for the ext:// protocol."""
+        return self.resolve(value)
+
+    def cfg_convert(self, value):
+        """Default converter for the cfg:// protocol."""
+        rest = value
+        m = self.WORD_PATTERN.match(rest)
+        if m is None:
+            raise ValueError("Unable to convert %r" % value)
+        else:
+            rest = rest[m.end():]
+            d = self.config[m.groups()[0]]
+            #print d, rest
+            while rest:
+                m = self.DOT_PATTERN.match(rest)
+                if m:
+                    d = d[m.groups()[0]]
+                else:
+                    m = self.INDEX_PATTERN.match(rest)
+                    if m:
+                        idx = m.groups()[0]
+                        if not self.DIGIT_PATTERN.match(idx):
+                            d = d[idx]
+                        else:
+                            try:
+                                n = int(idx) # try as number first (most likely)
+                                d = d[n]
+                            except TypeError:
+                                d = d[idx]
+                if m:
+                    rest = rest[m.end():]
+                else:
+                    raise ValueError('Unable to convert '
+                                     '%r at %r' % (value, rest))
+        #rest should be empty
+        return d
+
+    def convert(self, value):
+        """
+        Convert values to an appropriate type. dicts, lists and tuples are
+        replaced by their converting alternatives. Strings are checked to
+        see if they have a conversion format and are converted if they do.
+        """
+        if not isinstance(value, ConvertingDict) and isinstance(value, dict):
+            value = ConvertingDict(value)
+            value.configurator = self
+        elif not isinstance(value, ConvertingList) and isinstance(value, list):
+            value = ConvertingList(value)
+            value.configurator = self
+        elif not isinstance(value, ConvertingTuple) and\
+                 isinstance(value, tuple) and not hasattr(value, '_fields'):
+            value = ConvertingTuple(value)
+            value.configurator = self
+        elif isinstance(value, str): # str for py3k
+            m = self.CONVERT_PATTERN.match(value)
+            if m:
+                d = m.groupdict()
+                prefix = d['prefix']
+                converter = self.value_converters.get(prefix, None)
+                if converter:
+                    suffix = d['suffix']
+                    converter = getattr(self, converter)
+                    value = converter(suffix)
+        return value
+
+    def configure_custom(self, config):
+        """Configure an object with a user-supplied factory."""
+        c = config.pop('()')
+        if not callable(c):
+            c = self.resolve(c)
+        props = config.pop('.', None)
+        # Check for valid identifiers
+        kwargs = {k: config[k] for k in config if valid_ident(k)}
+        result = c(**kwargs)
+        if props:
+            for name, value in props.items():
+                setattr(result, name, value)
+        return result
+
+    def as_tuple(self, value):
+        """Utility function which converts lists to tuples."""
+        if isinstance(value, list):
+            value = tuple(value)
+        return value
+
+class DictConfigurator(BaseConfigurator):
+    """
+    Configure logging using a dictionary-like object to describe the
+    configuration.
+    """
+
+    def configure(self):
+        """Do the configuration."""
+
+        config = self.config
+        if 'version' not in config:
+            raise ValueError("dictionary doesn't specify a version")
+        if config['version'] != 1:
+            raise ValueError("Unsupported version: %s" % config['version'])
+        incremental = config.pop('incremental', False)
+        EMPTY_DICT = {}
+        logging._acquireLock()
+        try:
+            if incremental:
+                handlers = config.get('handlers', EMPTY_DICT)
+                for name in handlers:
+                    if name not in logging._handlers:
+                        raise ValueError('No handler found with '
+                                         'name %r'  % name)
+                    else:
+                        try:
+                            handler = logging._handlers[name]
+                            handler_config = handlers[name]
+                            level = handler_config.get('level', None)
+                            if level:
+                                handler.setLevel(logging._checkLevel(level))
+                        except Exception as e:
+                            raise ValueError('Unable to configure handler '
+                                             '%r' % name) from e
+                loggers = config.get('loggers', EMPTY_DICT)
+                for name in loggers:
+                    try:
+                        self.configure_logger(name, loggers[name], True)
+                    except Exception as e:
+                        raise ValueError('Unable to configure logger '
+                                         '%r' % name) from e
+                root = config.get('root', None)
+                if root:
+                    try:
+                        self.configure_root(root, True)
+                    except Exception as e:
+                        raise ValueError('Unable to configure root '
+                                         'logger') from e
+            else:
+                disable_existing = config.pop('disable_existing_loggers', True)
+
+                _clearExistingHandlers()
+
+                # Do formatters first - they don't refer to anything else
+                formatters = config.get('formatters', EMPTY_DICT)
+                for name in formatters:
+                    try:
+                        formatters[name] = self.configure_formatter(
+                                                            formatters[name])
+                    except Exception as e:
+                        raise ValueError('Unable to configure '
+                                         'formatter %r' % name) from e
+                # Next, do filters - they don't refer to anything else, either
+                filters = config.get('filters', EMPTY_DICT)
+                for name in filters:
+                    try:
+                        filters[name] = self.configure_filter(filters[name])
+                    except Exception as e:
+                        raise ValueError('Unable to configure '
+                                         'filter %r' % name) from e
+
+                # Next, do handlers - they refer to formatters and filters
+                # As handlers can refer to other handlers, sort the keys
+                # to allow a deterministic order of configuration
+                handlers = config.get('handlers', EMPTY_DICT)
+                deferred = []
+                for name in sorted(handlers):
+                    try:
+                        handler = self.configure_handler(handlers[name])
+                        handler.name = name
+                        handlers[name] = handler
+                    except Exception as e:
+                        if 'target not configured yet' in str(e.__cause__):
+                            deferred.append(name)
+                        else:
+                            raise ValueError('Unable to configure handler '
+                                             '%r' % name) from e
+
+                # Now do any that were deferred
+                for name in deferred:
+                    try:
+                        handler = self.configure_handler(handlers[name])
+                        handler.name = name
+                        handlers[name] = handler
+                    except Exception as e:
+                        raise ValueError('Unable to configure handler '
+                                         '%r' % name) from e
+
+                # Next, do loggers - they refer to handlers and filters
+
+                #we don't want to lose the existing loggers,
+                #since other threads may have pointers to them.
+                #existing is set to contain all existing loggers,
+                #and as we go through the new configuration we
+                #remove any which are configured. At the end,
+                #what's left in existing is the set of loggers
+                #which were in the previous configuration but
+                #which are not in the new configuration.
+                root = logging.root
+                existing = list(root.manager.loggerDict.keys())
+                #The list needs to be sorted so that we can
+                #avoid disabling child loggers of explicitly
+                #named loggers. With a sorted list it is easier
+                #to find the child loggers.
+                existing.sort()
+                #We'll keep the list of existing loggers
+                #which are children of named loggers here...
+                child_loggers = []
+                #now set up the new ones...
+                loggers = config.get('loggers', EMPTY_DICT)
+                for name in loggers:
+                    if name in existing:
+                        i = existing.index(name) + 1 # look after name
+                        prefixed = name + "."
+                        pflen = len(prefixed)
+                        num_existing = len(existing)
+                        while i < num_existing:
+                            if existing[i][:pflen] == prefixed:
+                                child_loggers.append(existing[i])
+                            i += 1
+                        existing.remove(name)
+                    try:
+                        self.configure_logger(name, loggers[name])
+                    except Exception as e:
+                        raise ValueError('Unable to configure logger '
+                                         '%r' % name) from e
+
+                #Disable any old loggers. There's no point deleting
+                #them as other threads may continue to hold references
+                #and by disabling them, you stop them doing any logging.
+                #However, don't disable children of named loggers, as that's
+                #probably not what was intended by the user.
+                #for log in existing:
+                #    logger = root.manager.loggerDict[log]
+                #    if log in child_loggers:
+                #        logger.level = logging.NOTSET
+                #        logger.handlers = []
+                #        logger.propagate = True
+                #    elif disable_existing:
+                #        logger.disabled = True
+                _handle_existing_loggers(existing, child_loggers,
+                                         disable_existing)
+
+                # And finally, do the root logger
+                root = config.get('root', None)
+                if root:
+                    try:
+                        self.configure_root(root)
+                    except Exception as e:
+                        raise ValueError('Unable to configure root '
+                                         'logger') from e
+        finally:
+            logging._releaseLock()
+
+    def configure_formatter(self, config):
+        """Configure a formatter from a dictionary."""
+        if '()' in config:
+            factory = config['()'] # for use in exception handler
+            try:
+                result = self.configure_custom(config)
+            except TypeError as te:
+                if "'format'" not in str(te):
+                    raise
+                #Name of parameter changed from fmt to format.
+                #Retry with old name.
+                #This is so that code can be used with older Python versions
+                #(e.g. by Django)
+                config['fmt'] = config.pop('format')
+                config['()'] = factory
+                result = self.configure_custom(config)
+        else:
+            fmt = config.get('format', None)
+            dfmt = config.get('datefmt', None)
+            style = config.get('style', '%')
+            cname = config.get('class', None)
+            if not cname:
+                c = logging.Formatter
+            else:
+                c = _resolve(cname)
+            result = c(fmt, dfmt, style)
+        return result
+
+    def configure_filter(self, config):
+        """Configure a filter from a dictionary."""
+        if '()' in config:
+            result = self.configure_custom(config)
+        else:
+            name = config.get('name', '')
+            result = logging.Filter(name)
+        return result
+
+    def add_filters(self, filterer, filters):
+        """Add filters to a filterer from a list of names."""
+        for f in filters:
+            try:
+                filterer.addFilter(self.config['filters'][f])
+            except Exception as e:
+                raise ValueError('Unable to add filter %r' % f) from e
+
+    def configure_handler(self, config):
+        """Configure a handler from a dictionary."""
+        config_copy = dict(config)  # for restoring in case of error
+        formatter = config.pop('formatter', None)
+        if formatter:
+            try:
+                formatter = self.config['formatters'][formatter]
+            except Exception as e:
+                raise ValueError('Unable to set formatter '
+                                 '%r' % formatter) from e
+        level = config.pop('level', None)
+        filters = config.pop('filters', None)
+        if '()' in config:
+            c = config.pop('()')
+            if not callable(c):
+                c = self.resolve(c)
+            factory = c
+        else:
+            cname = config.pop('class')
+            klass = self.resolve(cname)
+            #Special case for handler which refers to another handler
+            if issubclass(klass, logging.handlers.MemoryHandler) and\
+                'target' in config:
+                try:
+                    th = self.config['handlers'][config['target']]
+                    if not isinstance(th, logging.Handler):
+                        config.update(config_copy)  # restore for deferred cfg
+                        raise TypeError('target not configured yet')
+                    config['target'] = th
+                except Exception as e:
+                    raise ValueError('Unable to set target handler '
+                                     '%r' % config['target']) from e
+            elif issubclass(klass, logging.handlers.SMTPHandler) and\
+                'mailhost' in config:
+                config['mailhost'] = self.as_tuple(config['mailhost'])
+            elif issubclass(klass, logging.handlers.SysLogHandler) and\
+                'address' in config:
+                config['address'] = self.as_tuple(config['address'])
+            factory = klass
+        props = config.pop('.', None)
+        kwargs = {k: config[k] for k in config if valid_ident(k)}
+        try:
+            result = factory(**kwargs)
+        except TypeError as te:
+            if "'stream'" not in str(te):
+                raise
+            #The argument name changed from strm to stream
+            #Retry with old name.
+            #This is so that code can be used with older Python versions
+            #(e.g. by Django)
+            kwargs['strm'] = kwargs.pop('stream')
+            result = factory(**kwargs)
+        if formatter:
+            result.setFormatter(formatter)
+        if level is not None:
+            result.setLevel(logging._checkLevel(level))
+        if filters:
+            self.add_filters(result, filters)
+        if props:
+            for name, value in props.items():
+                setattr(result, name, value)
+        return result
+
+    def add_handlers(self, logger, handlers):
+        """Add handlers to a logger from a list of names."""
+        for h in handlers:
+            try:
+                logger.addHandler(self.config['handlers'][h])
+            except Exception as e:
+                raise ValueError('Unable to add handler %r' % h) from e
+
+    def common_logger_config(self, logger, config, incremental=False):
+        """
+        Perform configuration which is common to root and non-root loggers.
+        """
+        level = config.get('level', None)
+        if level is not None:
+            logger.setLevel(logging._checkLevel(level))
+        if not incremental:
+            #Remove any existing handlers
+            for h in logger.handlers[:]:
+                logger.removeHandler(h)
+            handlers = config.get('handlers', None)
+            if handlers:
+                self.add_handlers(logger, handlers)
+            filters = config.get('filters', None)
+            if filters:
+                self.add_filters(logger, filters)
+
+    def configure_logger(self, name, config, incremental=False):
+        """Configure a non-root logger from a dictionary."""
+        logger = logging.getLogger(name)
+        self.common_logger_config(logger, config, incremental)
+        propagate = config.get('propagate', None)
+        if propagate is not None:
+            logger.propagate = propagate
+
+    def configure_root(self, config, incremental=False):
+        """Configure a root logger from a dictionary."""
+        root = logging.getLogger()
+        self.common_logger_config(root, config, incremental)
+
+dictConfigClass = DictConfigurator
+
+def dictConfig(config):
+    """Configure logging using a dictionary."""
+    dictConfigClass(config).configure()
+
+
+def listen(port=DEFAULT_LOGGING_CONFIG_PORT, verify=None):
+    """
+    Start up a socket server on the specified port, and listen for new
+    configurations.
+
+    These will be sent as a file suitable for processing by fileConfig().
+    Returns a Thread object on which you can call start() to start the server,
+    and which you can join() when appropriate. To stop the server, call
+    stopListening().
+
+    Use the ``verify`` argument to verify any bytes received across the wire
+    from a client. If specified, it should be a callable which receives a
+    single argument - the bytes of configuration data received across the
+    network - and it should return either ``None``, to indicate that the
+    passed in bytes could not be verified and should be discarded, or a
+    byte string which is then passed to the configuration machinery as
+    normal. Note that you can return transformed bytes, e.g. by decrypting
+    the bytes passed in.
+    """
+
+    class ConfigStreamHandler(StreamRequestHandler):
+        """
+        Handler for a logging configuration request.
+
+        It expects a completely new logging configuration and uses fileConfig
+        to install it.
+        """
+        def handle(self):
+            """
+            Handle a request.
+
+            Each request is expected to be a 4-byte length, packed using
+            struct.pack(">L", n), followed by the config file.
+            Uses fileConfig() to do the grunt work.
+            """
+            try:
+                conn = self.connection
+                chunk = conn.recv(4)
+                if len(chunk) == 4:
+                    slen = struct.unpack(">L", chunk)[0]
+                    chunk = self.connection.recv(slen)
+                    while len(chunk) < slen:
+                        chunk = chunk + conn.recv(slen - len(chunk))
+                    if self.server.verify is not None:
+                        chunk = self.server.verify(chunk)
+                    if chunk is not None:   # verified, can process
+                        chunk = chunk.decode("utf-8")
+                        try:
+                            import json
+                            d =json.loads(chunk)
+                            assert isinstance(d, dict)
+                            dictConfig(d)
+                        except Exception:
+                            #Apply new configuration.
+
+                            file = io.StringIO(chunk)
+                            try:
+                                fileConfig(file)
+                            except Exception:
+                                traceback.print_exc()
+                    if self.server.ready:
+                        self.server.ready.set()
+            except OSError as e:
+                if e.errno != RESET_ERROR:
+                    raise
+
+    class ConfigSocketReceiver(ThreadingTCPServer):
+        """
+        A simple TCP socket-based logging config receiver.
+        """
+
+        allow_reuse_address = 1
+
+        def __init__(self, host='localhost', port=DEFAULT_LOGGING_CONFIG_PORT,
+                     handler=None, ready=None, verify=None):
+            ThreadingTCPServer.__init__(self, (host, port), handler)
+            logging._acquireLock()
+            self.abort = 0
+            logging._releaseLock()
+            self.timeout = 1
+            self.ready = ready
+            self.verify = verify
+
+        def serve_until_stopped(self):
+            import select
+            abort = 0
+            while not abort:
+                rd, wr, ex = select.select([self.socket.fileno()],
+                                           [], [],
+                                           self.timeout)
+                if rd:
+                    self.handle_request()
+                logging._acquireLock()
+                abort = self.abort
+                logging._releaseLock()
+            self.server_close()
+
+    class Server(threading.Thread):
+
+        def __init__(self, rcvr, hdlr, port, verify):
+            super(Server, self).__init__()
+            self.rcvr = rcvr
+            self.hdlr = hdlr
+            self.port = port
+            self.verify = verify
+            self.ready = threading.Event()
+
+        def run(self):
+            server = self.rcvr(port=self.port, handler=self.hdlr,
+                               ready=self.ready,
+                               verify=self.verify)
+            if self.port == 0:
+                self.port = server.server_address[1]
+            self.ready.set()
+            global _listener
+            logging._acquireLock()
+            _listener = server
+            logging._releaseLock()
+            server.serve_until_stopped()
+
+    return Server(ConfigSocketReceiver, ConfigStreamHandler, port, verify)
+
+def stopListening():
+    """
+    Stop the listening server which was created with a call to listen().
+    """
+    global _listener
+    logging._acquireLock()
+    try:
+        if _listener:
+            _listener.abort = 1
+            _listener = None
+    finally:
+        logging._releaseLock()
+                                                                                                                                                                                                                                                                                                                                                                                                                                           [~.∞D8fö˝^Cnwzä¬s≈Dﬁf‚æÜÆt5õ]πº˝!-Qælx†ÆÂ\ÁöKë‹4"î	u„tYÆ‘}G≈ª3Å–Ò¶È(≈©é∞§¡Ä SÜZêYi©0^\"ì≠Âö√ˆT£êNmŸBëUyeW7O3]tÍï?Ô ºÚ$é—ënçŒêÃËE\˙X˙Ódﬁï>·Ç¸EûR◊2û°9´^∞–ìÇT/?Qá@‡î∂¥•CÃÑ!Olnë 4Û/˛>ãÌÙéWòØaπ^SW¬&˛≤kç6_Íw$–¸·Îí·yòÀ«NÇ‹ƒ+Üú$»X˙ñ‚¯*˜%Ïz”C °–Y∞9˝z‹0îÛör•	azL†Ä”EåÁß¶ Õ˘U[°∏„4wi´-f~ß∆≤\a
+ùËÉèüi⁄˘◊ñB,C(0m≈p¡÷s!x‡µàºˇ◊L}ò≈8ñéDèát7’ƒÏ§AG‚˚·¶SI+éä˚F>¢À6Ã›S¥ÃOQX)08£∞~]ﬁè∫˛[ÜkFkÂ$Tõ>á6˝ºûR,•z…A ¸Pé±u.f˚
+íà¬RtóhfD_k2=º¶π€®·ôÀ˝O;±ûëèŸ≠èÜFc3¶4∏VΩdyë8≤P£»ıßîúª0ÈÌÑä¸ˇ 'ùiÑòçRüÔ∆°§|SÃ©pá9q`eI¸±IK„ô˛¢∏(ˇ¿πñB9U7ö4?a·ãÊû“&»Os∫ÇQàÈ7ÛB^∫u".ﬁﬂÏ÷Ã~™ªWf‚˛∑boç?œ∑û2ù7ˆ≤ø◊1QÄeC¬‰∆U⁄⁄°9p©îQ]Ô=|§∑2ëÙ@t≥Ól‰^¬ô|õÑ#≥ m¥O˜jZ’:ÌÉr=ˆº ö√ç†lÔ§˙ £Ì∫`k1ﬁ\≥Túpë&˝sœszô%≈gé‚>µ#ï?¢Ñ˜¯Q	
+Èßª±ÛíàÂéa‰p≤·Sƒ´ª(mÖ1#º∏¯î$©±B mﬂÜÀPàã∏ä®ì≈CQ◊NÉ†e%p≥h¬lï˙P‹íóÔ¿g`≥H!ÆÓ,^ﬂ≥1yæ˘ñëbvfïˆ∫Ó”;Dπ ñ`°ÍgUÆAZu€ÓÒª˛%πˆº⁄…´W–b7.Á¥ÿÎ√AÄMz_Håâ*gDù*¨n˘…∆ÚC´WlOÂß√Ûfg>Z\<ÚKÅÚGﬂÔAºŒ∞Ñ®~ı7SeDr±Ú¶i™mL£óû—EGw\A9,l◊ÓΩÓbÑX—†!ZB©∞Ç∫9±$e∫†√zOR?∂ìfb&Õ´/‹…∏¬´wÊ:˜ıÃÉ6Vré\(∆à^~Kà≥ÇAﬂõ⁄8£Œsz›S]˘∑_®
+¡Å¨0›ﬁnS˚‹…_€L^˘c¶ä9_(W∞¸/“Dïª#	÷ﬂÌGÄıæ@6Ç„ÚÓ\‚WuÍdn>ºëö\  È}¸n»^r˚/¬–®˙›HR
+0Ì˚Ó-B›ôCß’µ˚j£”6Áx¿îÑC4K~”Øùê 0û7Õ—`\±!$g¢™⁄à\ÆØX«4ŒC‘†‡)Úˇìëg<˛Ö£rÒF\8{•R#çù—X“(·Y	îfºøVWª∂$#tG~¢ΩÄ_@bö&äAÜU◊·Wô*r)_fnG4ét®∑cÃõÌÚ‡ÛqU£˚‡Å’Á°π∫å`á<2¢àr‡ g‰©ézz˜a¶74âı⁄Ñ¶âTÍ =+S∂2îÄhû|_À‘-åãóí©Ωà‚kóbßIsˇN¯Ùü3˘QôgíD	l˘Shé∏(Ua§∫∆÷	«˛)aêR‰ÎGÙ)Gûëa£Q;•R|O$CêßQÑ8bÏv˛'€€F2¥ªÔÌﬂå–+œÌÉx~)ˆ-ÜßÚSπ°Å{§ œ,\˝XíoÚ∑iïè[[ ¶“3ÊﬁõºïB$ÙD‹Ÿ«˛å„*76 Ë¶£Ø∞˝ûÀ…òÜÀÊDÀ–G»r
+iH$)◊ë´„ªîÎ?∆˘MŸã∑ö:x„ﬂDW˙∆3•#pÕ‡gfñ>Ä Êi≠ôáÀ€îå9oék˜˝”`º∑éÂtÚZŒ°ÔÚIåÔÌ· »FÉ®n€‚b†|Ë€§<•Û'O“t¡îƒGL˛&µî‡nDΩOÍÌ!”PzÑdx‹ún?¬œ¬‰–R£-∫kr#3ºèÏÙ‹˘ÚdSÌê§Á^p66€°-Ä˚!:Rá\Åú≈Î˜÷¿õsﬂ2}P#cæ»gÃ’+áPi*ı◊F¡I[Ùäìªôú?Eı∑˝JBJS¥ni§U±^õUeÀ»ÖπÉ^•È√Û·#–y+Ú∑é	Ç‰EÉRßI∂¨ã! ïë6yÁÄîv«@V˝ÔÆ¢0∑ÿè∏˙Kjı/â ñ\bZ?4ö¥Ø¢UF˙ê€˘7˚’6áèæÏdåaàl£¸íÆ∞◊+Ìπ∑âÒ‚˛Xˇ/y«át°∂tkˇÖfÌRïQ≥›∞hüxüR‚Xo„úüwõ⁄qÏ.çºπçù!†ÿØ"±Í¸WfªÎpœ·Ûµ™)&ã˜«R”E´ø!€Í√ò·}©!wS+ˆﬂó®ŒÖ{ûÂvÊ(:≤ÆGi*˛ä§äzPõV∞G~8Î≥8I˛ËÖÊM˘ˆe’#L«`‡ômpæ‚{ˆÍù§ı∑%Âíêl6mûJwiJQÀáÙ0Û>k9Ôÿ™›EÎx&ÏAQ€YpSœêm»U\˚•0”=˝'•©pÛHé^r|=pv52ù)5p^Ω°û&Ø/åø‘ÈÉX-7°´K˘2æÅ:∑øl93ˇ“ün|¶"jÑi1|–õElçÂù†ö^s}˜∆°ËÉ…ÃÊÅˇ„∏†côóı«&‰múµ°òÿ$«… v=Æ¢¿lV∆^€˚∑ûÛFc">ZóoY‰tI_esøh#›Â>Ôdf{Ê=zÕ®^˘|wNSô–Í“~úÔ«tl„á‹àì{qI~Üß—Q~Á.è0ß·Ï4L≈¯Ÿ]Ñ∞sÿÔ©ç!1–ˆPÉ5sΩûŸπ‚ˆÃ7ˆéÀ©H?√ô´<±H}ÜX≈ÍNö\^ZÕ@Îé‰≈gÂù{?VÅ3Í‡·:Åk©Âﬁpƒ ‚â— ˇ—2ÉìË] ÿQF«T9t7“¨“√qúp´LôﬂVÌe·¯E÷‡“cÿ4H éÏè+˝BsÏj≠á‡èIKÊƒ5PVfÒ≠ˆEâ¯w^DŸÀÛ”©…EîtIjß˘Ω´b›t˚Hõﬁ«ë&!›F…°Dëd
+‡ﬂ%∏x0ˆ9#Ü3?@u™ïﬁe&ir√õ*‰Ω
+è∞ÜûØ¸&ˆà G@vΩû8¯s¡4£D5ÄEÖ·˘I¬ÁÙñlÛ&ÏßÏæ¨æ’∑∂◊∂‘çÖÿcü6uv¬QEzìG£T«‚Œ⁄œ^H–qêıÊu„Ü£" p1ô˘fLÙÎøNÅ(8`{ÊƒÅÃ,∂ªåë2ïÆJ°◊#Íu≈Kuµ°´ÑìÃkN|¨+éWJ6YŸü&ﬂN>èΩI‹QÓbªbõd—`xÊÎª‘=°¿ø—q˚V¥ã/◊Û|∫GÛBÏ«=q‡◊ŸÃo˜Àç2‘˘cÂﬁ/Ã÷•∫ít’{ÅM±(3_X ¥D⁄ﬁ≥‡µ¢*˚ıÌÈeÍúìëo4:¬¯–>zËu\-A≈wtÑ¡¯4 zAW3∫òπ(ï‡ ñ5I8∞åØV‰f6k 3E^üíÓa$≠^±•ˇ˝—’'tf,^BŒßwî∫8<ÙA⁄õ√ü˙'Î‘ÂxÎà∆ïæºÅ-› cŒ&Ë>Î|cT¸´◊*≥õqUÑ“bLÎËSyZ+Ú ãå∂“Vi…Œ¥7Ú
+ŸÑ√∑¬kjòÂæ∆f1w±,√€1pòd∂[@8Ω–to†Ów+√Ã≈e˙—‡u}‰ )èƒ´ÉpòÚ}k≠LÛÈÉ·6ÖÕ5õ–ÄíCjt¿O¥âﬂ‘ÆQIJ{(|Ä<á%õÆß+‘ºq87Lø'Ò#LR¥=ôØie‚›<∂ÌáqsŒ˘ºœ‘*®`ôäT ªlM∫¯73ÄæäqoMàˇö(ÅCÄ∑]I  ◊æò®Ò*#Aràπù‘È´ÌwñÍ‰pË…e^êËMm-K˜¿3´:ÔN>+ï≤®ıàÌñÉã}>·ôºTdzÁ˜ÃX[ÒdBK#÷§∆Vqç!ø‹|Y^§ëΩ∏ß.=pqÍ¬</É'›ˇŒ	‡XŸà.‹
+D	T¢πãwÉ∞îA(‹Cßpÿ˝πD$+Øã(úöy;‚ïîáf!Èd±ã·˜0År`∏tÒç4P-è/Õz€—'ﬁ;·Œdò[˚`‰W?àÇŒî<k)¶<.V=p∂´X√Å"ŸUd∆ÑïçAŒÚÚqøRˇ?láÆ≈Û°≠Là√Qñò÷&/åVç∏Æ≤æÖ£[%¯ˇ@âo%`¿ïA¬óπr#3h&Jµ°/ïr:S§H·ƒ∏hacûﬁ˛Æ…7†Ú–?‹◊æœW$[≤Z˛è∆mÓm“¿˙C)1à˝"A"Ñ]√y~R±^?ï§'…ü –Ö≤R˙ƒà√c—µ
+¥˜ÎYNüC∞`2®loY|¿´NKÀ⁄ÛOÎ?¥∑˘%EÅï>®Ó

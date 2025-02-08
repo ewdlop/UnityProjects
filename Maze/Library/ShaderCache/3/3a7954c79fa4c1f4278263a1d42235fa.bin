@@ -1,0 +1,85 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Security.Authentication.ExtendedProtection;
+using System.Diagnostics;
+
+namespace System.Net
+{
+    internal class ServiceNameStore
+    {
+        private List<string> serviceNames;
+        private ServiceNameCollection serviceNameCollection;
+
+        public ServiceNameCollection ServiceNames
+        {
+            get {                
+                if (serviceNameCollection == null) {
+                    serviceNameCollection = new ServiceNameCollection(serviceNames);                
+                }                
+                return serviceNameCollection;
+            }
+        }
+
+        public ServiceNameStore()
+        {
+            serviceNames = new List<string>();
+            serviceNameCollection = null; // set only when needed (due to expensive item-by-item copy)
+        }
+
+        private bool AddSingleServiceName(string spn)
+        {
+            spn = ServiceNameCollection.NormalizeServiceName(spn);
+            if (Contains(spn)) 
+            {
+                return false;
+            }
+            else 
+            {
+                serviceNames.Add(spn);
+                return true;
+            }
+        }
+
+        public bool Add(string uriPrefix)
+        {
+            Debug.Assert(!String.IsNullOrEmpty(uriPrefix));
+
+            string[] newServiceNames = BuildServiceNames(uriPrefix);
+            
+            bool addedAny = false;
+            foreach (string spn in newServiceNames) 
+            {
+                if (AddSingleServiceName(spn)) 
+                {
+                    addedAny = true;
+
+                    if (Logging.On) 
+                    {
+                        Logging.PrintInfo(Logging.HttpListener, "ServiceNameStore#" +
+                            ValidationHelper.HashString(this) + "::Add() " 
+                            + SR.GetString(SR.net_log_listener_spn_add, spn, uriPrefix));
+                    }
+                }
+            }
+            
+            if (addedAny) 
+            {
+                serviceNameCollection = null;
+            }
+            else if (Logging.On)
+            {
+                Logging.PrintInfo(Logging.HttpListener, "ServiceNameStore#" +
+                    ValidationHelper.HashString(this) + "::Add() " 
+                    + SR.GetString(SR.net_log_listener_spn_not_add, uriPrefix));
+            }
+
+            return addedAny;
+        }
+
+        public bool Remove(string uriPrefix)
+        {
+            Debug.Assert(!String.IsNullOrEmpty(uriPrefix));
+
+            string newServiceName = BuildSimpleServiceName(uriPrefix);
+            newServiceName = ServiceNameCollection.NormalizeServiceName(newServiceName);
+            bool needToRemove = Contai

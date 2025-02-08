@@ -1,0 +1,1122 @@
+; RUN: llc < %s -mtriple=arm64-eabi -mcpu=cyclone -aarch64-neon-syntax=apple | FileCheck -enable-var-scope %s
+; RUN: llc < %s -mtriple=arm64-eabi -mcpu=cortex-a57 | FileCheck -enable-var-scope --check-prefix=CHECK-A57 %s
+; rdar://13082402
+
+define float @t1(i32* nocapture %src) nounwind ssp {
+entry:
+; CHECK-LABEL: t1:
+; CHECK: ldr s0, [x0]
+; CHECK: scvtf s0, s0
+  %tmp1 = load i32, i32* %src, align 4
+  %tmp2 = sitofp i32 %tmp1 to float
+  ret float %tmp2
+}
+
+define float @t2(i32* nocapture %src) nounwind ssp {
+entry:
+; CHECK-LABEL: t2:
+; CHECK: ldr s0, [x0]
+; CHECK: ucvtf s0, s0
+  %tmp1 = load i32, i32* %src, align 4
+  %tmp2 = uitofp i32 %tmp1 to float
+  ret float %tmp2
+}
+
+define double @t3(i64* nocapture %src) nounwind ssp {
+entry:
+; CHECK-LABEL: t3:
+; CHECK: ldr d0, [x0]
+; CHECK: scvtf d0, d0
+  %tmp1 = load i64, i64* %src, align 4
+  %tmp2 = sitofp i64 %tmp1 to double
+  ret double %tmp2
+}
+
+define double @t4(i64* nocapture %src) nounwind ssp {
+entry:
+; CHECK-LABEL: t4:
+; CHECK: ldr d0, [x0]
+; CHECK: ucvtf d0, d0
+  %tmp1 = load i64, i64* %src, align 4
+  %tmp2 = uitofp i64 %tmp1 to double
+  ret double %tmp2
+}
+
+; rdar://13136456
+define double @t5(i32* nocapture %src) nounwind ssp optsize {
+entry:
+; CHECK-LABEL: t5:
+; CHECK: ldr [[REG:w[0-9]+]], [x0]
+; CHECK: scvtf d0, [[REG]]
+  %tmp1 = load i32, i32* %src, align 4
+  %tmp2 = sitofp i32 %tmp1 to double
+  ret double %tmp2
+}
+
+; Check that we load in FP register when we want to convert into
+; floating point value.
+; This is much faster than loading on GPR and making the conversion
+; GPR -> FPR.
+; <rdar://problem/14599607>
+;
+; Check the flollowing patterns for signed/unsigned:
+; 1. load with scaled imm to float.
+; 2. load with scaled register to float.
+; 3. load with scaled imm to double.
+; 4. load with scaled register to double.
+; 5. load with unscaled imm to float.
+; 6. load with unscaled imm to double.
+; With loading size: 8, 16, 32, and 64-bits.
+
+; ********* 1. load with scaled imm to float. *********
+define float @fct1(i8* nocapture %sp0) {
+; CHECK-LABEL: fct1:
+; CHECK: ldr b[[REGNUM:[0-9]+]], [x0, #1]
+; CHECK-NEXT: ucvtf [[REG:s[0-9]+]], s[[REGNUM]]
+; CHECK-NEXT: fmul s0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i8, i8* %sp0, i64 1
+  %pix_sp0.0.copyload = load i8, i8* %addr, align 1
+  %val = uitofp i8 %pix_sp0.0.copyload to float
+  %vmull.i = fmul float %val, %val
+  ret float %vmull.i
+}
+
+define float @fct2(i16* nocapture %sp0) {
+; CHECK-LABEL: fct2:
+; CHECK: ldr h[[REGNUM:[0-9]+]], [x0, #2]
+; CHECK-NEXT: ucvtf [[REG:s[0-9]+]], s[[REGNUM]]
+; CHECK-NEXT: fmul s0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i16, i16* %sp0, i64 1
+  %pix_sp0.0.copyload = load i16, i16* %addr, align 1
+  %val = uitofp i16 %pix_sp0.0.copyload to float
+  %vmull.i = fmul float %val, %val
+  ret float %vmull.i
+}
+
+define float @fct3(i32* nocapture %sp0) {
+; CHECK-LABEL: fct3:
+; CHECK: ldr s[[REGNUM:[0-9]+]], [x0, #4]
+; CHECK-NEXT: ucvtf [[REG:s[0-9]+]], s[[REGNUM]]
+; CHECK-NEXT: fmul s0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i32, i32* %sp0, i64 1
+  %pix_sp0.0.copyload = load i32, i32* %addr, align 1
+  %val = uitofp i32 %pix_sp0.0.copyload to float
+  %vmull.i = fmul float %val, %val
+  ret float %vmull.i
+}
+
+; i64 -> f32 is not supported on floating point unit.
+define float @fct4(i64* nocapture %sp0) {
+; CHECK-LABEL: fct4:
+; CHECK: ldr x[[REGNUM:[0-9]+]], [x0, #8]
+; CHECK-NEXT: ucvtf [[REG:s[0-9]+]], x[[REGNUM]]
+; CHECK-NEXT: fmul s0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i64, i64* %sp0, i64 1
+  %pix_sp0.0.copyload = load i64, i64* %addr, align 1
+  %val = uitofp i64 %pix_sp0.0.copyload to float
+  %vmull.i = fmul float %val, %val
+  ret float %vmull.i
+}
+
+; ********* 2. load with scaled register to float. *********
+define float @fct5(i8* nocapture %sp0, i64 %offset) {
+; CHECK-LABEL: fct5:
+; CHECK: ldr b[[REGNUM:[0-9]+]], [x0, x1]
+; CHECK-NEXT: ucvtf [[REG:s[0-9]+]], s[[REGNUM]]
+; CHECK-NEXT: fmul s0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i8, i8* %sp0, i64 %offset
+  %pix_sp0.0.copyload = load i8, i8* %addr, align 1
+  %val = uitofp i8 %pix_sp0.0.copyload to float
+  %vmull.i = fmul float %val, %val
+  ret float %vmull.i
+}
+
+define float @fct6(i16* nocapture %sp0, i64 %offset) {
+; CHECK-LABEL: fct6:
+; CHECK: ldr h[[REGNUM:[0-9]+]], [x0, x1, lsl #1]
+; CHECK-NEXT: ucvtf [[REG:s[0-9]+]], s[[REGNUM]]
+; CHECK-NEXT: fmul s0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i16, i16* %sp0, i64 %offset
+  %pix_sp0.0.copyload = load i16, i16* %addr, align 1
+  %val = uitofp i16 %pix_sp0.0.copyload to float
+  %vmull.i = fmul float %val, %val
+  ret float %vmull.i
+}
+
+define float @fct7(i32* nocapture %sp0, i64 %offset) {
+; CHECK-LABEL: fct7:
+; CHECK: ldr s[[REGNUM:[0-9]+]], [x0, x1, lsl #2]
+; CHECK-NEXT: ucvtf [[REG:s[0-9]+]], s[[REGNUM]]
+; CHECK-NEXT: fmul s0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i32, i32* %sp0, i64 %offset
+  %pix_sp0.0.copyload = load i32, i32* %addr, align 1
+  %val = uitofp i32 %pix_sp0.0.copyload to float
+  %vmull.i = fmul float %val, %val
+  ret float %vmull.i
+}
+
+; i64 -> f32 is not supported on floating point unit.
+define float @fct8(i64* nocapture %sp0, i64 %offset) {
+; CHECK-LABEL: fct8:
+; CHECK: ldr x[[REGNUM:[0-9]+]], [x0, x1, lsl #3]
+; CHECK-NEXT: ucvtf [[REG:s[0-9]+]], x[[REGNUM]]
+; CHECK-NEXT: fmul s0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i64, i64* %sp0, i64 %offset
+  %pix_sp0.0.copyload = load i64, i64* %addr, align 1
+  %val = uitofp i64 %pix_sp0.0.copyload to float
+  %vmull.i = fmul float %val, %val
+  ret float %vmull.i
+}
+
+
+; ********* 3. load with scaled imm to double. *********
+define double @fct9(i8* nocapture %sp0) {
+; CHECK-LABEL: fct9:
+; CHECK: ldr b[[REGNUM:[0-9]+]], [x0, #1]
+; CHECK-NEXT: ucvtf [[REG:d[0-9]+]], d[[REGNUM]]
+; CHECK-NEXT: fmul d0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i8, i8* %sp0, i64 1
+  %pix_sp0.0.copyload = load i8, i8* %addr, align 1
+  %val = uitofp i8 %pix_sp0.0.copyload to double
+  %vmull.i = fmul double %val, %val
+  ret double %vmull.i
+}
+
+define double @fct10(i16* nocapture %sp0) {
+; CHECK-LABEL: fct10:
+; CHECK: ldr h[[REGNUM:[0-9]+]], [x0, #2]
+; CHECK-NEXT: ucvtf [[REG:d[0-9]+]], d[[REGNUM]]
+; CHECK-NEXT: fmul d0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i16, i16* %sp0, i64 1
+  %pix_sp0.0.copyload = load i16, i16* %addr, align 1
+  %val = uitofp i16 %pix_sp0.0.copyload to double
+  %vmull.i = fmul double %val, %val
+  ret double %vmull.i
+}
+
+define double @fct11(i32* nocapture %sp0) {
+; CHECK-LABEL: fct11:
+; CHECK: ldr s[[REGNUM:[0-9]+]], [x0, #4]
+; CHECK-NEXT: ucvtf [[REG:d[0-9]+]], d[[REGNUM]]
+; CHECK-NEXT: fmul d0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i32, i32* %sp0, i64 1
+  %pix_sp0.0.copyload = load i32, i32* %addr, align 1
+  %val = uitofp i32 %pix_sp0.0.copyload to double
+  %vmull.i = fmul double %val, %val
+  ret double %vmull.i
+}
+
+define double @fct12(i64* nocapture %sp0) {
+; CHECK-LABEL: fct12:
+; CHECK: ldr d[[REGNUM:[0-9]+]], [x0, #8]
+; CHECK-NEXT: ucvtf [[REG:d[0-9]+]], d[[REGNUM]]
+; CHECK-NEXT: fmul d0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i64, i64* %sp0, i64 1
+  %pix_sp0.0.copyload = load i64, i64* %addr, align 1
+  %val = uitofp i64 %pix_sp0.0.copyload to double
+  %vmull.i = fmul double %val, %val
+  ret double %vmull.i
+}
+
+; ********* 4. load with scaled register to double. *********
+define double @fct13(i8* nocapture %sp0, i64 %offset) {
+; CHECK-LABEL: fct13:
+; CHECK: ldr b[[REGNUM:[0-9]+]], [x0, x1]
+; CHECK-NEXT: ucvtf [[REG:d[0-9]+]], d[[REGNUM]]
+; CHECK-NEXT: fmul d0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i8, i8* %sp0, i64 %offset
+  %pix_sp0.0.copyload = load i8, i8* %addr, align 1
+  %val = uitofp i8 %pix_sp0.0.copyload to double
+  %vmull.i = fmul double %val, %val
+  ret double %vmull.i
+}
+
+define double @fct14(i16* nocapture %sp0, i64 %offset) {
+; CHECK-LABEL: fct14:
+; CHECK: ldr h[[REGNUM:[0-9]+]], [x0, x1, lsl #1]
+; CHECK-NEXT: ucvtf [[REG:d[0-9]+]], d[[REGNUM]]
+; CHECK-NEXT: fmul d0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i16, i16* %sp0, i64 %offset
+  %pix_sp0.0.copyload = load i16, i16* %addr, align 1
+  %val = uitofp i16 %pix_sp0.0.copyload to double
+  %vmull.i = fmul double %val, %val
+  ret double %vmull.i
+}
+
+define double @fct15(i32* nocapture %sp0, i64 %offset) {
+; CHECK-LABEL: fct15:
+; CHECK: ldr s[[REGNUM:[0-9]+]], [x0, x1, lsl #2]
+; CHECK-NEXT: ucvtf [[REG:d[0-9]+]], d[[REGNUM]]
+; CHECK-NEXT: fmul d0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i32, i32* %sp0, i64 %offset
+  %pix_sp0.0.copyload = load i32, i32* %addr, align 1
+  %val = uitofp i32 %pix_sp0.0.copyload to double
+  %vmull.i = fmul double %val, %val
+  ret double %vmull.i
+}
+
+define double @fct16(i64* nocapture %sp0, i64 %offset) {
+; CHECK-LABEL: fct16:
+; CHECK: ldr d[[REGNUM:[0-9]+]], [x0, x1, lsl #3]
+; CHECK-NEXT: ucvtf [[REG:d[0-9]+]], d[[REGNUM]]
+; CHECK-NEXT: fmul d0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i64, i64* %sp0, i64 %offset
+  %pix_sp0.0.copyload = load i64, i64* %addr, align 1
+  %val = uitofp i64 %pix_sp0.0.copyload to double
+  %vmull.i = fmul double %val, %val
+  ret double %vmull.i
+}
+
+; ********* 5. load with unscaled imm to float. *********
+define float @fct17(i8* nocapture %sp0) {
+entry:
+; CHECK-LABEL: fct17:
+; CHECK: ldur b[[REGNUM:[0-9]+]], [x0, #-1]
+; CHECK-NEXT: ucvtf [[REG:s[0-9]+]], s[[REGNUM]]
+; CHECK-NEXT: fmul s0, [[REG]], [[REG]]
+  %bitcast = ptrtoint i8* %sp0 to i64
+  %add = add i64 %bitcast, -1
+  %addr = inttoptr i64 %add to i8*
+  %pix_sp0.0.copyload = load i8, i8* %addr, align 1
+  %val = uitofp i8 %pix_sp0.0.copyload to float
+  %vmull.i = fmul float %val, %val
+  ret float %vmull.i
+}
+
+define float @fct18(i16* nocapture %sp0) {
+; CHECK-LABEL: fct18:
+; CHECK: ldur h[[REGNUM:[0-9]+]], [x0, #1]
+; CHECK-NEXT: ucvtf [[REG:s[0-9]+]], s[[REGNUM]]
+; CHECK-NEXT: fmul s0, [[REG]], [[REG]]
+  %bitcast = ptrtoint i16* %sp0 to i64
+  %add = add i64 %bitcast, 1
+  %addr = inttoptr i64 %add to i16*
+  %pix_sp0.0.copyload = load i16, i16* %addr, align 1
+  %val = uitofp i16 %pix_sp0.0.copyload to float
+  %vmull.i = fmul float %val, %val
+  ret float %vmull.i
+}
+
+define float @fct19(i32* nocapture %sp0) {
+; CHECK-LABEL: fct19:
+; CHECK: ldur s[[REGNUM:[0-9]+]], [x0, #1]
+; CHECK-NEXT: ucvtf [[REG:s[0-9]+]], s[[REGNUM]]
+; CHECK-NEXT: fmul s0, [[REG]], [[REG]]
+  %bitcast = ptrtoint i32* %sp0 to i64
+  %add = add i64 %bitcast, 1
+  %addr = inttoptr i64 %add to i32*
+  %pix_sp0.0.copyload = load i32, i32* %addr, align 1
+  %val = uitofp i32 %pix_sp0.0.copyload to float
+  %vmull.i = fmul float %val, %val
+  ret float %vmull.i
+}
+
+; i64 -> f32 is not supported on floating point unit.
+define float @fct20(i64* nocapture %sp0) {
+; CHECK-LABEL: fct20:
+; CHECK: ldur x[[REGNUM:[0-9]+]], [x0, #1]
+; CHECK-NEXT: ucvtf [[REG:s[0-9]+]], x[[REGNUM]]
+; CHECK-NEXT: fmul s0, [[REG]], [[REG]]
+  %bitcast = ptrtoint i64* %sp0 to i64
+  %add = add i64 %bitcast, 1
+  %addr = inttoptr i64 %add to i64*
+  %pix_sp0.0.copyload = load i64, i64* %addr, align 1
+  %val = uitofp i64 %pix_sp0.0.copyload to float
+  %vmull.i = fmul float %val, %val
+  ret float %vmull.i
+
+}
+
+; ********* 6. load with unscaled imm to double. *********
+define double @fct21(i8* nocapture %sp0) {
+entry:
+; CHECK-LABEL: fct21:
+; CHECK: ldur b[[REGNUM:[0-9]+]], [x0, #-1]
+; CHECK-NEXT: ucvtf [[REG:d[0-9]+]], d[[REGNUM]]
+; CHECK-NEXT: fmul d0, [[REG]], [[REG]]
+  %bitcast = ptrtoint i8* %sp0 to i64
+  %add = add i64 %bitcast, -1
+  %addr = inttoptr i64 %add to i8*
+  %pix_sp0.0.copyload = load i8, i8* %addr, align 1
+  %val = uitofp i8 %pix_sp0.0.copyload to double
+  %vmull.i = fmul double %val, %val
+  ret double %vmull.i
+}
+
+define double @fct22(i16* nocapture %sp0) {
+; CHECK-LABEL: fct22:
+; CHECK: ldur h[[REGNUM:[0-9]+]], [x0, #1]
+; CHECK-NEXT: ucvtf [[REG:d[0-9]+]], d[[REGNUM]]
+; CHECK-NEXT: fmul d0, [[REG]], [[REG]]
+  %bitcast = ptrtoint i16* %sp0 to i64
+  %add = add i64 %bitcast, 1
+  %addr = inttoptr i64 %add to i16*
+  %pix_sp0.0.copyload = load i16, i16* %addr, align 1
+  %val = uitofp i16 %pix_sp0.0.copyload to double
+  %vmull.i = fmul double %val, %val
+  ret double %vmull.i
+}
+
+define double @fct23(i32* nocapture %sp0) {
+; CHECK-LABEL: fct23:
+; CHECK: ldur s[[REGNUM:[0-9]+]], [x0, #1]
+; CHECK-NEXT: ucvtf [[REG:d[0-9]+]], d[[REGNUM]]
+; CHECK-NEXT: fmul d0, [[REG]], [[REG]]
+  %bitcast = ptrtoint i32* %sp0 to i64
+  %add = add i64 %bitcast, 1
+  %addr = inttoptr i64 %add to i32*
+  %pix_sp0.0.copyload = load i32, i32* %addr, align 1
+  %val = uitofp i32 %pix_sp0.0.copyload to double
+  %vmull.i = fmul double %val, %val
+  ret double %vmull.i
+}
+
+define double @fct24(i64* nocapture %sp0) {
+; CHECK-LABEL: fct24:
+; CHECK: ldur d[[REGNUM:[0-9]+]], [x0, #1]
+; CHECK-NEXT: ucvtf [[REG:d[0-9]+]], d[[REGNUM]]
+; CHECK-NEXT: fmul d0, [[REG]], [[REG]]
+  %bitcast = ptrtoint i64* %sp0 to i64
+  %add = add i64 %bitcast, 1
+  %addr = inttoptr i64 %add to i64*
+  %pix_sp0.0.copyload = load i64, i64* %addr, align 1
+  %val = uitofp i64 %pix_sp0.0.copyload to double
+  %vmull.i = fmul double %val, %val
+  ret double %vmull.i
+
+}
+
+; ********* 1s. load with scaled imm to float. *********
+define float @sfct1(i8* nocapture %sp0) {
+; CHECK-LABEL: sfct1:
+; CHECK: ldr b[[REGNUM:[0-9]+]], [x0, #1]
+; CHECK-NEXT: sshll.8h [[SEXTREG1:v[0-9]+]], v[[REGNUM]], #0
+; CHECK-NEXT: sshll.4s v[[SEXTREG:[0-9]+]], [[SEXTREG1]], #0
+; CHECK: scvtf [[REG:s[0-9]+]], s[[SEXTREG]]
+; CHECK-NEXT: fmul s0, [[REG]], [[REG]]
+; CHECK-A57-LABEL: sfct1:
+; CHECK-A57: ldrsb w[[REGNUM:[0-9]+]], [x0, #1]
+; CHECK-A57-NEXT: scvtf [[REG:s[0-9]+]], w[[REGNUM]]
+; CHECK-A57-NEXT: fmul s0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i8, i8* %sp0, i64 1
+  %pix_sp0.0.copyload = load i8, i8* %addr, align 1
+  %val = sitofp i8 %pix_sp0.0.copyload to float
+  %vmull.i = fmul float %val, %val
+  ret float %vmull.i
+}
+
+define float @sfct2(i16* nocapture %sp0) {
+; CHECK-LABEL: sfct2:
+; CHECK: ldr h[[REGNUM:[0-9]+]], [x0, #2]
+; CHECK-NEXT: sshll.4s v[[SEXTREG:[0-9]+]], v[[REGNUM]], #0
+; CHECK: scvtf [[REG:s[0-9]+]], s[[SEXTREG]]
+; CHECK-NEXT: fmul s0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i16, i16* %sp0, i64 1
+  %pix_sp0.0.copyload = load i16, i16* %addr, align 1
+  %val = sitofp i16 %pix_sp0.0.copyload to float
+  %vmull.i = fmul float %val, %val
+  ret float %vmull.i
+}
+
+define float @sfct3(i32* nocapture %sp0) {
+; CHECK-LABEL: sfct3:
+; CHECK: ldr s[[REGNUM:[0-9]+]], [x0, #4]
+; CHECK-NEXT: scvtf [[REG:s[0-9]+]], s[[REGNUM]]
+; CHECK-NEXT: fmul s0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i32, i32* %sp0, i64 1
+  %pix_sp0.0.copyload = load i32, i32* %addr, align 1
+  %val = sitofp i32 %pix_sp0.0.copyload to float
+  %vmull.i = fmul float %val, %val
+  ret float %vmull.i
+}
+
+; i64 -> f32 is not supported on floating point unit.
+define float @sfct4(i64* nocapture %sp0) {
+; CHECK-LABEL: sfct4:
+; CHECK: ldr x[[REGNUM:[0-9]+]], [x0, #8]
+; CHECK-NEXT: scvtf [[REG:s[0-9]+]], x[[REGNUM]]
+; CHECK-NEXT: fmul s0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i64, i64* %sp0, i64 1
+  %pix_sp0.0.copyload = load i64, i64* %addr, align 1
+  %val = sitofp i64 %pix_sp0.0.copyload to float
+  %vmull.i = fmul float %val, %val
+  ret float %vmull.i
+}
+
+; ********* 2s. load with scaled register to float. *********
+define float @sfct5(i8* nocapture %sp0, i64 %offset) {
+; CHECK-LABEL: sfct5:
+; CHECK: ldr b[[REGNUM:[0-9]+]], [x0, x1]
+; CHECK-NEXT: sshll.8h [[SEXTREG1:v[0-9]+]], v[[REGNUM]], #0
+; CHECK-NEXT: sshll.4s v[[SEXTREG:[0-9]+]], [[SEXTREG1]], #0
+; CHECK: scvtf [[REG:s[0-9]+]], s[[SEXTREG]]
+; CHECK-NEXT: fmul s0, [[REG]], [[REG]]
+; CHECK-A57-LABEL: sfct5:
+; CHECK-A57: ldrsb w[[REGNUM:[0-9]+]], [x0, x1]
+; CHECK-A57-NEXT: scvtf [[REG:s[0-9]+]], w[[REGNUM]]
+; CHECK-A57-NEXT: fmul s0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i8, i8* %sp0, i64 %offset
+  %pix_sp0.0.copyload = load i8, i8* %addr, align 1
+  %val = sitofp i8 %pix_sp0.0.copyload to float
+  %vmull.i = fmul float %val, %val
+  ret float %vmull.i
+}
+
+define float @sfct6(i16* nocapture %sp0, i64 %offset) {
+; CHECK-LABEL: sfct6:
+; CHECK: ldr h[[REGNUM:[0-9]+]], [x0, x1, lsl #1]
+; CHECK-NEXT: sshll.4s v[[SEXTREG:[0-9]+]], v[[REGNUM]], #0
+; CHECK: scvtf [[REG:s[0-9]+]], s[[SEXTREG]]
+; CHECK-NEXT: fmul s0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i16, i16* %sp0, i64 %offset
+  %pix_sp0.0.copyload = load i16, i16* %addr, align 1
+  %val = sitofp i16 %pix_sp0.0.copyload to float
+  %vmull.i = fmul float %val, %val
+  ret float %vmull.i
+}
+
+define float @sfct7(i32* nocapture %sp0, i64 %offset) {
+; CHECK-LABEL: sfct7:
+; CHECK: ldr s[[REGNUM:[0-9]+]], [x0, x1, lsl #2]
+; CHECK-NEXT: scvtf [[REG:s[0-9]+]], s[[REGNUM]]
+; CHECK-NEXT: fmul s0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i32, i32* %sp0, i64 %offset
+  %pix_sp0.0.copyload = load i32, i32* %addr, align 1
+  %val = sitofp i32 %pix_sp0.0.copyload to float
+  %vmull.i = fmul float %val, %val
+  ret float %vmull.i
+}
+
+; i64 -> f32 is not supported on floating point unit.
+define float @sfct8(i64* nocapture %sp0, i64 %offset) {
+; CHECK-LABEL: sfct8:
+; CHECK: ldr x[[REGNUM:[0-9]+]], [x0, x1, lsl #3]
+; CHECK-NEXT: scvtf [[REG:s[0-9]+]], x[[REGNUM]]
+; CHECK-NEXT: fmul s0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i64, i64* %sp0, i64 %offset
+  %pix_sp0.0.copyload = load i64, i64* %addr, align 1
+  %val = sitofp i64 %pix_sp0.0.copyload to float
+  %vmull.i = fmul float %val, %val
+  ret float %vmull.i
+}
+
+; ********* 3s. load with scaled imm to double. *********
+define double @sfct9(i8* nocapture %sp0) {
+; CHECK-LABEL: sfct9:
+; CHECK: ldrsb w[[REGNUM:[0-9]+]], [x0, #1]
+; CHECK-NEXT: scvtf [[REG:d[0-9]+]], w[[REGNUM]]
+; CHECK-NEXT: fmul d0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i8, i8* %sp0, i64 1
+  %pix_sp0.0.copyload = load i8, i8* %addr, align 1
+  %val = sitofp i8 %pix_sp0.0.copyload to double
+  %vmull.i = fmul double %val, %val
+  ret double %vmull.i
+}
+
+define double @sfct10(i16* nocapture %sp0) {
+; CHECK-LABEL: sfct10:
+; CHECK: ldr h[[REGNUM:[0-9]+]], [x0, #2]
+; CHECK-NEXT: sshll.4s [[SEXTREG1:v[0-9]+]], v[[REGNUM]], #0
+; CHECK-NEXT: sshll.2d v[[SEXTREG:[0-9]+]], [[SEXTREG1]], #0
+; CHECK: scvtf [[REG:d[0-9]+]], d[[SEXTREG]]
+; CHECK-NEXT: fmul d0, [[REG]], [[REG]]
+; CHECK-A57-LABEL: sfct10:
+; CHECK-A57: ldrsh w[[REGNUM:[0-9]+]], [x0, #2]
+; CHECK-A57-NEXT: scvtf [[REG:d[0-9]+]], w[[REGNUM]]
+; CHECK-A57-NEXT: fmul d0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i16, i16* %sp0, i64 1
+  %pix_sp0.0.copyload = load i16, i16* %addr, align 1
+  %val = sitofp i16 %pix_sp0.0.copyload to double
+  %vmull.i = fmul double %val, %val
+  ret double %vmull.i
+}
+
+define double @sfct11(i32* nocapture %sp0) {
+; CHECK-LABEL: sfct11:
+; CHECK: ldr s[[REGNUM:[0-9]+]], [x0, #4]
+; CHECK-NEXT: sshll.2d v[[SEXTREG:[0-9]+]], v[[REGNUM]], #0
+; CHECK: scvtf [[REG:d[0-9]+]], d[[SEXTREG]]
+; CHECK-NEXT: fmul d0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i32, i32* %sp0, i64 1
+  %pix_sp0.0.copyload = load i32, i32* %addr, align 1
+  %val = sitofp i32 %pix_sp0.0.copyload to double
+  %vmull.i = fmul double %val, %val
+  ret double %vmull.i
+}
+
+define double @sfct12(i64* nocapture %sp0) {
+; CHECK-LABEL: sfct12:
+; CHECK: ldr d[[REGNUM:[0-9]+]], [x0, #8]
+; CHECK-NEXT: scvtf [[REG:d[0-9]+]], d[[REGNUM]]
+; CHECK-NEXT: fmul d0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i64, i64* %sp0, i64 1
+  %pix_sp0.0.copyload = load i64, i64* %addr, align 1
+  %val = sitofp i64 %pix_sp0.0.copyload to double
+  %vmull.i = fmul double %val, %val
+  ret double %vmull.i
+}
+
+; ********* 4s. load with scaled register to double. *********
+define double @sfct13(i8* nocapture %sp0, i64 %offset) {
+; CHECK-LABEL: sfct13:
+; CHECK: ldrsb w[[REGNUM:[0-9]+]], [x0, x1]
+; CHECK-NEXT: scvtf [[REG:d[0-9]+]], w[[REGNUM]]
+; CHECK-NEXT: fmul d0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i8, i8* %sp0, i64 %offset
+  %pix_sp0.0.copyload = load i8, i8* %addr, align 1
+  %val = sitofp i8 %pix_sp0.0.copyload to double
+  %vmull.i = fmul double %val, %val
+  ret double %vmull.i
+}
+
+define double @sfct14(i16* nocapture %sp0, i64 %offset) {
+; CHECK-LABEL: sfct14:
+; CHECK: ldr h[[REGNUM:[0-9]+]], [x0, x1, lsl #1]
+; CHECK-NEXT: sshll.4s [[SEXTREG1:v[0-9]+]], v[[REGNUM]], #0
+; CHECK-NEXT: sshll.2d v[[SEXTREG:[0-9]+]], [[SEXTREG1]], #0
+; CHECK: scvtf [[REG:d[0-9]+]], d[[SEXTREG]]
+; CHECK-NEXT: fmul d0, [[REG]], [[REG]]
+; CHECK-A57-LABEL: sfct14:
+; CHECK-A57: ldrsh w[[REGNUM:[0-9]+]], [x0, x1, lsl #1]
+; CHECK-A57-NEXT: scvtf [[REG:d[0-9]+]], w[[REGNUM]]
+; CHECK-A57-NEXT: fmul d0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i16, i16* %sp0, i64 %offset
+  %pix_sp0.0.copyload = load i16, i16* %addr, align 1
+  %val = sitofp i16 %pix_sp0.0.copyload to double
+  %vmull.i = fmul double %val, %val
+  ret double %vmull.i
+}
+
+define double @sfct15(i32* nocapture %sp0, i64 %offset) {
+; CHECK-LABEL: sfct15:
+; CHECK: ldr s[[REGNUM:[0-9]+]], [x0, x1, lsl #2]
+; CHECK-NEXT: sshll.2d v[[SEXTREG:[0-9]+]], v[[REGNUM]], #0
+; CHECK: scvtf [[REG:d[0-9]+]], d[[SEXTREG]]
+; CHECK-NEXT: fmul d0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i32, i32* %sp0, i64 %offset
+  %pix_sp0.0.copyload = load i32, i32* %addr, align 1
+  %val = sitofp i32 %pix_sp0.0.copyload to double
+  %vmull.i = fmul double %val, %val
+  ret double %vmull.i
+}
+
+define double @sfct16(i64* nocapture %sp0, i64 %offset) {
+; CHECK-LABEL: sfct16:
+; CHECK: ldr d[[REGNUM:[0-9]+]], [x0, x1, lsl #3]
+; CHECK-NEXT: scvtf [[REG:d[0-9]+]], d[[REGNUM]]
+; CHECK-NEXT: fmul d0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i64, i64* %sp0, i64 %offset
+  %pix_sp0.0.copyload = load i64, i64* %addr, align 1
+  %val = sitofp i64 %pix_sp0.0.copyload to double
+  %vmull.i = fmul double %val, %val
+  ret double %vmull.i
+}
+
+; ********* 5s. load with unscaled imm to float. *********
+define float @sfct17(i8* nocapture %sp0) {
+entry:
+; CHECK-LABEL: sfct17:
+; CHECK: ldur b[[REGNUM:[0-9]+]], [x0, #-1]
+; CHECK-NEXT: sshll.8h [[SEXTREG1:v[0-9]+]], v[[REGNUM]], #0
+; CHECK-NEXT: sshll.4s v[[SEXTREG:[0-9]+]], [[SEXTREG1]], #0
+; CHECK: scvtf [[REG:s[0-9]+]], s[[SEXTREG]]
+; CHECK-NEXT: fmul s0, [[REG]], [[REG]]
+; CHECK-A57-LABEL: sfct17:
+; CHECK-A57: ldursb w[[REGNUM:[0-9]+]], [x0, #-1]
+; CHECK-A57-NEXT: scvtf [[REG:s[0-9]+]], w[[REGNUM]]
+; CHECK-A57-NEXT: fmul s0, [[REG]], [[REG]]
+  %bitcast = ptrtoint i8* %sp0 to i64
+  %add = add i64 %bitcast, -1
+  %addr = inttoptr i64 %add to i8*
+  %pix_sp0.0.copyload = load i8, i8* %addr, align 1
+  %val = sitofp i8 %pix_sp0.0.copyload to float
+  %vmull.i = fmul float %val, %val
+  ret float %vmull.i
+}
+
+define float @sfct18(i16* nocapture %sp0) {
+; CHECK-LABEL: sfct18:
+; CHECK: ldur h[[REGNUM:[0-9]+]], [x0, #1]
+; CHECK-NEXT: sshll.4s v[[SEXTREG:[0-9]+]], v[[REGNUM]], #0
+; CHECK: scvtf [[REG:s[0-9]+]], s[[SEXTREG]]
+; CHECK-NEXT: fmul s0, [[REG]], [[REG]]
+  %bitcast = ptrtoint i16* %sp0 to i64
+  %add = add i64 %bitcast, 1
+  %addr = inttoptr i64 %add to i16*
+  %pix_sp0.0.copyload = load i16, i16* %addr, align 1
+  %val = sitofp i16 %pix_sp0.0.copyload to float
+  %vmull.i = fmul float %val, %val
+  ret float %vmull.i
+}
+
+define float @sfct19(i32* nocapture %sp0) {
+; CHECK-LABEL: sfct19:
+; CHECK: ldur s[[REGNUM:[0-9]+]], [x0, #1]
+; CHECK-NEXT: scvtf [[REG:s[0-9]+]], s[[REGNUM]]
+; CHECK-NEXT: fmul s0, [[REG]], [[REG]]
+  %bitcast = ptrtoint i32* %sp0 to i64
+  %add = add i64 %bitcast, 1
+  %addr = inttoptr i64 %add to i32*
+  %pix_sp0.0.copyload = load i32, i32* %addr, align 1
+  %val = sitofp i32 %pix_sp0.0.copyload to float
+  %vmull.i = fmul float %val, %val
+  ret float %vmull.i
+}
+
+; i64 -> f32 is not supported on floating point unit.
+define float @sfct20(i64* nocapture %sp0) {
+; CHECK-LABEL: sfct20:
+; CHECK: ldur x[[REGNUM:[0-9]+]], [x0, #1]
+; CHECK-NEXT: scvtf [[REG:s[0-9]+]], x[[REGNUM]]
+; CHECK-NEXT: fmul s0, [[REG]], [[REG]]
+  %bitcast = ptrtoint i64* %sp0 to i64
+  %add = add i64 %bitcast, 1
+  %addr = inttoptr i64 %add to i64*
+  %pix_sp0.0.copyload = load i64, i64* %addr, align 1
+  %val = sitofp i64 %pix_sp0.0.copyload to float
+  %vmull.i = fmul float %val, %val
+  ret float %vmull.i
+
+}
+
+; ********* 6s. load with unscaled imm to double. *********
+define double @sfct21(i8* nocapture %sp0) {
+entry:
+; CHECK-LABEL: sfct21:
+; CHECK: ldursb w[[REGNUM:[0-9]+]], [x0, #-1]
+; CHECK-NEXT: scvtf [[REG:d[0-9]+]], w[[REGNUM]]
+; CHECK-NEXT: fmul d0, [[REG]], [[REG]]
+  %bitcast = ptrtoint i8* %sp0 to i64
+  %add = add i64 %bitcast, -1
+  %addr = inttoptr i64 %add to i8*
+  %pix_sp0.0.copyload = load i8, i8* %addr, align 1
+  %val = sitofp i8 %pix_sp0.0.copyload to double
+  %vmull.i = fmul double %val, %val
+  ret double %vmull.i
+}
+
+define double @sfct22(i16* nocapture %sp0) {
+; CHECK-LABEL: sfct22:
+; CHECK: ldur h[[REGNUM:[0-9]+]], [x0, #1]
+; CHECK-NEXT: sshll.4s [[SEXTREG1:v[0-9]+]], v[[REGNUM]], #0
+; CHECK-NEXT: sshll.2d v[[SEXTREG:[0-9]+]], [[SEXTREG1]], #0
+; CHECK: scvtf [[REG:d[0-9]+]], d[[SEXTREG]]
+; CHECK-NEXT: fmul d0, [[REG]], [[REG]]
+; CHECK-A57-LABEL: sfct22:
+; CHECK-A57: ldursh w[[REGNUM:[0-9]+]], [x0, #1]
+; CHECK-A57-NEXT: scvtf [[REG:d[0-9]+]], w[[REGNUM]]
+; CHECK-A57-NEXT: fmul d0, [[REG]], [[REG]]
+  %bitcast = ptrtoint i16* %sp0 to i64
+  %add = add i64 %bitcast, 1
+  %addr = inttoptr i64 %add to i16*
+  %pix_sp0.0.copyload = load i16, i16* %addr, align 1
+  %val = sitofp i16 %pix_sp0.0.copyload to double
+  %vmull.i = fmul double %val, %val
+  ret double %vmull.i
+}
+
+define double @sfct23(i32* nocapture %sp0) {
+; CHECK-LABEL: sfct23:
+; CHECK: ldur s[[REGNUM:[0-9]+]], [x0, #1]
+; CHECK-NEXT: sshll.2d v[[SEXTREG:[0-9]+]], v[[REGNUM]], #0
+; CHECK: scvtf [[REG:d[0-9]+]], d[[SEXTREG]]
+; CHECK-NEXT: fmul d0, [[REG]], [[REG]]
+  %bitcast = ptrtoint i32* %sp0 to i64
+  %add = add i64 %bitcast, 1
+  %addr = inttoptr i64 %add to i32*
+  %pix_sp0.0.copyload = load i32, i32* %addr, align 1
+  %val = sitofp i32 %pix_sp0.0.copyload to double
+  %vmull.i = fmul double %val, %val
+  ret double %vmull.i
+}
+
+define double @sfct24(i64* nocapture %sp0) {
+; CHECK-LABEL: sfct24:
+; CHECK: ldur d[[REGNUM:[0-9]+]], [x0, #1]
+; CHECK-NEXT: scvtf [[REG:d[0-9]+]], d[[REGNUM]]
+; CHECK-NEXT: fmul d0, [[REG]], [[REG]]
+  %bitcast = ptrtoint i64* %sp0 to i64
+  %add = add i64 %bitcast, 1
+  %addr = inttoptr i64 %add to i64*
+  %pix_sp0.0.copyload = load i64, i64* %addr, align 1
+  %val = sitofp i64 %pix_sp0.0.copyload to double
+  %vmull.i = fmul double %val, %val
+  ret double %vmull.i
+
+}
+
+; Check that we do not use SSHLL code sequence when code size is a concern.
+define float @codesize_sfct17(i8* nocapture %sp0) optsize {
+entry:
+; CHECK-LABEL: codesize_sfct17:
+; CHECK: ldursb w[[REGNUM:[0-9]+]], [x0, #-1]
+; CHECK-NEXT: scvtf [[REG:s[0-9]+]], w[[REGNUM]]
+; CHECK-NEXT: fmul s0, [[REG]], [[REG]]
+  %bitcast = ptrtoint i8* %sp0 to i64
+  %add = add i64 %bitcast, -1
+  %addr = inttoptr i64 %add to i8*
+  %pix_sp0.0.copyload = load i8, i8* %addr, align 1
+  %val = sitofp i8 %pix_sp0.0.copyload to float
+  %vmull.i = fmul float %val, %val
+  ret float %vmull.i
+}
+
+define double @codesize_sfct11(i32* nocapture %sp0) minsize {
+; CHECK-LABEL: sfct11:
+; CHECK: ldr w[[REGNUM:[0-9]+]], [x0, #4]
+; CHECK-NEXT: scvtf [[REG:d[0-9]+]], w[[REGNUM]]
+; CHECK-NEXT: fmul d0, [[REG]], [[REG]]
+entry:
+  %addr = getelementptr i32, i32* %sp0, i64 1
+  %pix_sp0.0.copyload = load i32, i32* %addr, align 1
+  %val = sitofp i32 %pix_sp0.0.copyload to double
+  %vmull.i = fmul double %val, %val
+  ret double %vmull.i
+}
+
+; Adding fp128 custom lowering makes these a little fragile since we have to
+; return the correct mix of Legal/Expand from the custom method.
+;
+; rdar://problem/14991489
+
+define float @float_from_i128(i128 %in) {
+; CHECK-LABEL: float_from_i128:
+; CHECK: bl {{_?__floatuntisf}}
+  %conv = uitofp i128 %in to float
+  ret float %conv
+}
+
+define double @double_from_i128(i128 %in) {
+; CHECK-LABEL: double_from_i128:
+; CHECK: bl {{_?__floattidf}}
+  %conv = sitofp i128 %in to double
+  ret double %conv
+}
+
+define fp128 @fp128_from_i128(i128 %in) {
+; CHECK-LABEL: fp128_from_i128:
+; CHECK: bl {{_?__floatuntitf}}
+  %conv = uitofp i128 %in to fp128
+  ret fp128 %conv
+}
+
+define i128 @i128_from_float(float %in) {
+; CHECK-LABEL: i128_from_float
+; CHECK: bl {{_?__fixsfti}}
+  %conv = fptosi float %in to i128
+  ret i128 %conv
+}
+
+define i128 @i128_from_double(double %in) {
+; CHECK-LABEL: i128_from_double
+; CHECK: bl {{_?__fixunsdfti}}
+  %conv = fptoui double %in to i128
+  ret i128 %conv
+}
+
+define i128 @i128_from_fp128(fp128 %in) {
+; CHECK-LABEL: i128_from_fp128
+; CHECK: bl {{_?__fixtfti}}
+  %conv = fptosi fp128 %in to i128
+  ret i128 %conv
+}
+
+                                                                                                       1473
+1475
+1476
+1478
+1479
+1480
+1536
+1984
+2027
+2036
+2038
+2042
+2070
+2074
+2075
+2084
+2085
+2088
+2089
+2094
+2137
+2140
+2144
+2160
+2208
+8207
+8208
+64285
+64286
+64287
+64297
+64298
+64336
+67584
+67871
+67872
+68097
+68100
+68101
+68103
+68108
+68112
+68152
+68155
+68159
+68160
+68325
+68327
+68409
+68416
+69216
+69247
+69632
+124928
+125136
+125143
+125252
+125259
+126464
+126720
+126976
+END
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 ï»¿namespace System.Web.Mvc.Async {
+    using System;
+    using System.Collections.Generic;
+    using System.Globalization;
+    using System.Linq;
+    using System.Reflection;
+    using System.Text;
+    using System.Web.Mvc.Resources;
+
+    internal sealed class AsyncActionMethodSelector {
+
+        public AsyncActionMethodSelector(Type controllerType) {
+            ControllerType = controllerType;
+            PopulateLookupTables();
+        }
+
+        public Type ControllerType {
+            get;
+            private set;
+        }
+
+        public MethodInfo[] AliasedMethods {
+            get;
+            private set;
+        }
+
+        public ILookup<string, MethodInfo> NonAliasedMethods {
+            get;
+            private set;
+        }
+
+        private AmbiguousMatchException CreateAmbiguousActionMatchException(IEnumerable<MethodInfo> ambiguousMethods, string actionName) {
+            string ambiguityList = CreateAmbiguousMatchList(ambiguousMethods);
+            string message = String.Format(CultureInfo.CurrentCulture, MvcResources.ActionMethodSelector_AmbiguousMatch,
+                actionName, ControllerType.Name, ambiguityList);
+            return new AmbiguousMatchException(message);
+        }
+
+        private AmbiguousMatchException CreateAmbiguousMethodMatchException(IEnumerable<MethodInfo> ambiguousMethods, string methodName) {
+            string ambiguityList = CreateAmbiguousMatchList(ambiguousMethods);
+            string message = String.Format(CultureInfo.CurrentCulture, MvcResources.AsyncActionMethodSelector_AmbiguousMethodMatch,
+                methodName, ControllerType.Name, ambiguityList);
+            return new AmbiguousMatchException(message);
+        }
+
+        private static string CreateAmbiguousMatchList(IEnumerable<MethodInfo> ambiguousMethods) {
+            StringBuilder exceptionMessageBuilder = new StringBuilder();
+            foreach (MethodInfo methodInfo in ambiguousMethods) {
+                exceptionMessageBuilder.AppendLine();
+                exceptionMessageBuilder.AppendFormat(CultureInfo.CurrentCulture, MvcResources.ActionMethodSelector_AmbiguousMatchType, methodInfo, methodInfo.DeclaringType.FullName);
+            }
+
+            return exceptionMessageBuilder.ToString();
+        }
+
+        public ActionDescriptorCreator FindAction(ControllerContext controllerContext, string actionName) {
+            List<MethodInfo> methodsMatchingName = GetMatchingAliasedMethods(controllerContext, actionName);
+            methodsMatchingName.AddRange(NonAliasedMethods[actionName]);
+            List<MethodInfo> finalMethods = RunSelectionFilters(controllerContext, methodsMatchingName);
+
+            switch (finalMethods.Count) {
+                case 0:
+                    return null;
+
+                case 1:
+                    MethodInfo entryMethod = finalMethods[0];
+                    return GetActionDescriptorDelegate(entryMethod);
+
+                default:
+                    throw CreateAmbiguousActionMatchException(finalMethods, actionName);
+            }
+        }
+
+        private ActionDescriptorCreator GetActionDescriptorDelegate(MethodInfo entryMethod) {
+            // Is this the FooAsync() / FooCompleted() pattern?
+            if (IsAsyncSuffixedMethod(entryMethod)) {
+                string completionMethodName = entryMethod.Name.Substring(0, entryMethod.Name.Length - "Async".Length) + "Completed";
+                MethodInfo completionMethod = GetMethodByName(completionMethodName);
+                if (completionMethod != null) {
+                    return (actionName, controllerDescriptor) => new ReflectedAsyncActionDescriptor(entryMethod, completionMethod, actionName, controllerDescriptor);
+                }
+                else {
+                    throw Error.AsyncActionMethodSelector_CouldNotFindMethod(completionMethodName, ControllerType);
+                }
+            }
+
+            // Fallback to synchronous method
+            return (actionName, controllerDescriptor) => new ReflectedActionDescriptor(entryMethod, actionName, controllerDescriptor);
+        }
+
+        private static string GetCanonicalMethodName(MethodInfo methodInfo) {
+            string methodName = methodInfo.Name;
+            return (IsAsyncSuffixedMethod(methodInfo))
+                ? methodName.Substring(0, methodName.Length - "Async".Length)
+                : methodName;
+        }
+
+        internal List<MethodInfo> GetMatchingAliasedMethods(ControllerContext controllerContext, string actionName) {
+            // find all aliased methods which are opting in to this request
+            // to opt in, all attributes defined on the method must return true
+
+            var methods = from methodInfo in AliasedMethods
+                          let attrs = ReflectedAttributeCache.GetActionNameSelectorAttributes(methodInfo)
+                          where attrs.All(attr => attr.IsValidName(controllerContext, actionName, methodInfo))
+                          select methodInfo;
+            return methods.ToList();
+        }
+
+        private static bool IsAsyncSuffixedMethod(MethodInfo methodInfo) {
+            return methodInfo.Name.EndsWith("Async", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsCompletedSuffixedMethod(MethodInfo methodInfo) {
+            return methodInfo.Name.EndsWith("Completed", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsMethodDecoratedWithAliasingAttribute(MethodInfo methodInfo) {
+            return methodInfo.IsDefined(typeof(ActionNameSelectorAttribute), true /* inherit */);
+        }
+
+        private MethodInfo GetMethodByName(string methodName) {
+            List<MethodInfo> methods = (from MethodInfo methodInfo in ControllerType.GetMember(methodName, MemberTypes.Method, BindingFlags.Instance | BindingFlags.Public | BindingFlags.InvokeMethod | BindingFlags.IgnoreCase)
+                                        where IsValidActionMethod(methodInfo, false /* stripInfrastructureMethods */)
+                                        select methodInfo).ToList();
+
+            switch (methods.Count) {
+                case 0:
+                    return null;
+
+                case 1:
+                    return methods[0];
+
+                default:
+                    throw CreateAmbiguousMethodMatchException(methods, methodName);
+            }
+        }
+
+        private static bool IsValidActionMethod(MethodInfo methodInfo) {
+            return IsValidActionMethod(methodInfo, true /* stripInfrastructureMethods */);
+        }
+
+        private static bool IsValidActionMethod(MethodInfo methodInfo, bool stripInfrastructureMethods) {
+            if (methodInfo.IsSpecialName) {
+                // not a normal method, e.g. a constructor or an event
+                return false;
+            }
+
+            if (methodInfo.GetBaseDefinition().DeclaringType.IsAssignableFrom(typeof(AsyncController))) {
+                // is a method on Object, ControllerBase, Controller, or AsyncController
+                return false;
+            };
+
+            if (stripInfrastructureMethods) {
+                if (IsCompletedSuffixedMethod(methodInfo)) {
+                    // do not match FooCompleted() methods, as these are infrastructure methods
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private void PopulateLookupTables() {
+            MethodInfo[] allMethods = ControllerType.GetMethods(BindingFlags.InvokeMethod | BindingFlags.Instance | BindingFlags.Public);
+            MethodInfo[] actionMethods = Array.FindAll(allMethods, IsValidActionMethod);
+
+            AliasedMethods = Array.FindAll(actionMethods, IsMethodDecoratedWithAliasingAttribute);
+            NonAliasedMethods = actionMethods.Except(AliasedMethods).ToLookup(GetCanonicalMethodName, StringComparer.OrdinalIgnoreCase);
+        }
+
+        private static List<MethodInfo> RunSelectionFilters(ControllerContext controllerContext, List<MethodInfo> methodInfos) {
+            // remove all methods which are opting out of this request
+            // to opt out, at least one attribute defined on the method must return false
+
+            List<MethodInfo> matchesWithSelectionAttributes = new List<MethodInfo>();
+            List<MethodInfo> matchesWithoutSelectionAttributes = new List<MethodInfo>();
+
+            foreach (MethodInfo methodInfo in methodInfos) {
+                ICollection<ActionMethodSelectorAttribute> attrs = ReflectedAttributeCache.GetActionMethodSelectorAttributes(methodInfo);
+                if (attrs.Count == 0) {
+                    matchesWithoutSelectionAttributes.Add(methodInfo);
+                }
+                else if (attrs.All(attr => attr.IsValidForRequest(controllerContext, methodInfo))) {
+                    matchesWithSelectionAttributes.Add(methodInfo);
+                }
+            }
+
+            // if a matching action method had a selection attribute, consider it more specific than a matching action method
+            // without a selection attribute
+            return (matchesWithSelectionAttributes.Count > 0) ? matchesWithSelectionAttributes : matchesWithoutSelectionAttributes;
+        }
+
+    }
+}
+                               ëŞ›.÷µş5m£´Ò@‹ÒùÕÓ	|Õ†êgqCJ+O€&æâ[àÙtïñs¥Çó”¿¥ÅkÊ6ı#Ü{húƒh7ĞDkE„Éj1o®N¥/±ÈÅèë?IôdW~ı£ša@áÿ[~ë­õÂ`tÚEÑ@hşs©¯âÎö1Úw"ßÌw¤ÅTÆ¨__Œ£Wœ°è"„ä_A¶¡& tşï(L+§,t‰Wœeİvr›—Ø&ÕşĞ«ZÎÃˆ´Ö-…jîO&,¸­''\Sv+¨Ûvß‘¨r¿×ëûA@Ü¾j39P+n¼‘bÚÏ~û´ ¸]íjÂz¹§HC™q‰Áqú‰KåSE|QÔT=üÅËtGrCÍl˜úq°ÃyDƒÿnÄm ˆîqå.?\÷œx'5ª±6wüfÍ£5J)hn³SK÷˜k7ùk_×4#vt©ğšD ³½c6³¸ıÌ’MU´Q;Q5Ú}<0Bñ¼Ê¨>e*ø•‚ÂË0µ¢^…QóÕ)Èœ²ğfT!%y+?™>å…D€>ÔãÑ-2wLM<œJvÛæ	é‹ëÍ‹¶/ø¹[ÆuDç§ÍÏÖˆk»˜p'
+ÚÖé8›{'¹´­À÷2ùüÎ\G{’ãÇm&y(–Xé£á†VTt‘¤…×iBKüÌİ,Í…û‘óW±áì]µD RØÛÉEğÃo”¤á=Ûk÷LŠü–ÊÌ–÷?:h£ß	ù ô¦ªâX½AÆğ8â¶û°¯H	åáGl••X)‰õÅÏ³yn»Ÿ,—È§«‚³>ä$-ş0QˆqdÌ;ÌUöaøé5Ò¨M
+'Óêí°yÀ,®×K²ñœÙïæX½5>›Ü=ğEw!ó»±® íH‰ëæuÀ…¶ËC8w&dÚH¹È®®ŠŒíPëE%º9Š`Ì³Ëş†|våâÿúoYv‘ç¾nÌÅ¦»m›—ã:XØÛ©€@CIgÌ ½ªOmGÒöƒ0*-ªÚg!ˆÒ÷·½[is]m¦ÅOÙŸàqŠ§†{Ä3E½Ùh-xTÜúMæ
+©Ó'$DÎçsúI°úP¶%öm~·+/ó«3¸Mõ¾ôüÉ¥y@S™‚öd‚š˜ŸœØî ;ÊtB=ªÉTŸ×6àÎ…ÂCáşO¡ÆåøcÎşĞ;x)CÈµK ˆJ·o‹0Üu†IQ€A¶n¨ß Ú©Vì¾vğ›kYvÛ
+¡›ùÈ˜+•eæ;O™´ÅåU£ aJ…(Ï¶ôïí­a÷"–´·ÜWØP)ÀŒeêÚ„_„İVƒM¨gl¤dˆ1uBˆœ³À¾(t¸KíÉ²îÛ†”+Æ¸Má'çR°¡ñ6	ª®)Ö2­…ì/ˆ4§*Ğ%&<èñäf‡œp”÷|Ú0ôóK;iş.ñ74Zˆ–
+2)>è¸ì½êxˆLß[µæãlÆÌ¯\…ëfÌŠöÌ§á“©y«–RƒhÖ´òXëbí¼[ò™±ïŞ3Ğ¢rƒ˜#½Ä-Õ¢H5é'Ëß¥2†°¾aÄEGI3:öãóî“²ú'7«ß…nŒKß·áûûˆŸ"ÌfY‚ªûãùÄ!Ø÷‘2’¹Pù ×Ô‹Ókm´Ñâşî÷¯A›ñÔ4]­­ëhrL"Ó&z, –à(½«¦0‹šycÿİqiìÆ»K] 8_ß*KvU-foş•æ+0…İƒ!I7nCÀŠ¢‹¼üµ”ÎšºÉ: Ñ¤À.pWn¬«ÑyªÌ28ŠÀ»ÍYÈL”a1ú~m£ït·÷/dØ¨îù ×´_cD
+¦rÂõfi¬ŞÄªÉİÑzÏp±$üÖB“Æ¹0ÓÿfÕË7Ş÷Ù˜‹}Z@ºmÙÂy¥czÛì¬ë×G‚s6ş}UÀöa_Š×`…8û 4¢R6œ…kßcVÂh1KYë¡D€läG“~šPvÑ.¸şƒV‹Üc8…7²R-	LTAH_™»3Ğqˆî¸ÊéD&Ôê?p¹ÓĞûw_¡2ÿ".$X?U|¯êÁ¸êwíEJ½P )lïôBNPR
+Ù,õ“³ŞB‡¡™wJšáy¼Psé=U·QÙmã¯c›½l/Â‰qÉcã&åòn$Æ¾İúpN?¿XAAqXÑeú+*<D«_Ö‹Ô¢‹QqÉ£!Û4Ô©î)\zpµæm_NÈ±›Ì-×W
+Qh¤Ñ¦ºzŒ ·…s‰rß‡îÍÚûªŞß§¶íİ&d
+8\Û>Í
+•ùe‰EßRó¹|n «ÓÇÁ.ÑÙ	ºËr  =gÑùVöÕ¹ÅçÜssÎÊÚ?¨„ÀşÜã!ÀîK¶0wífóMú<„…ßê¤Ò ˆ(V›ÃZ‚«ÉŞ€ÕSæÌğä6&N` @h/**ª[Šk·¿Ôrn;Dóä$<ã£2b/t §›*Û–X‰oªk/ÎsåÏÜàşÖ8\êÆšVS©õÕ|z5ç NÒÃ»¦0ÈğH#Tè4½›‡«Ë’~N†VŒé?wEÒÉ¦Êqİü—6dLemÍú!R

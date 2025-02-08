@@ -1,0 +1,53 @@
+           DisposeTimer();
+            }
+            else {
+                // the finalizer is calling, so don't touch managed state
+            }
+        }
+
+        private void DisposeTimer() {
+            lock (_timerLock) {
+                if (_timer != null) {
+                    _timer.Dispose();
+                    _timer = null;
+                }
+            }
+        }
+
+        private void PBytesMonitorThread(object state) {
+            // callbacks are queued and can unleash all at once, so concurrent invocations must be prevented
+            if (Interlocked.Exchange(ref _inPBytesMonitorThread, 1) != 0)
+                return;
+
+            try {
+                if (_disposed) {
+                    return;
+                }
+
+#if DBG
+                Debug.Trace("CacheMemory", "\r\n\r\n***BEG** PBytesMonitorThread " + DateTime.Now.ToString("T", CultureInfo.InvariantCulture));
+#endif
+                // get another sample
+                long privateBytes = NextSample();
+                
+                // adjust frequency of timer and pressure marks after the sample is captured
+                Adjust();
+
+                if (privateBytes > _highPressureMark) {
+                    // induce a GC if necessary
+                    CollectInfrequently(privateBytes);
+                }
+
+#if DBG
+                Debug.Trace("CacheMemory", "**END** PBytesMonitorThread " 
+                            + "privateBytes=" + privateBytes
+                            + ", _highPressureMark=" + _highPressureMark);
+#endif
+
+            }
+            finally {
+                Interlocked.Exchange(ref _inPBytesMonitorThread, 0);
+            }
+        }
+
+        p

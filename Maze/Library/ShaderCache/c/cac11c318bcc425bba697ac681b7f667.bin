@@ -1,0 +1,76 @@
+o -n "$ARM_CPU_FLAGS" | "$EGREP" -i -c '(neon|asimd)')
+	if [[ ("$ARM_NEON" -ne "0" || "$HAVE_ARM_NEON" -ne "0") ]]; then
+		echo
+		echo "************************************" | tee -a "$TEST_RESULTS"
+		echo "Testing: ARM NEON code generation" | tee -a "$TEST_RESULTS"
+		echo
+
+		OBJFILE=blake2.o; rm -f "$OBJFILE" 2>/dev/null
+		CXX="$CXX" CXXFLAGS="$RELEASE_CXXFLAGS ${PLATFORM_CXXFLAGS[@]}" "$MAKE" "${MAKEARGS[@]}" $OBJFILE 2>&1 | tee -a "$TEST_RESULTS"
+
+		COUNT=0
+		FAILED=0
+		DISASS_TEXT=$("$DISASS" "${DISASSARGS[@]}" "$OBJFILE" 2>/dev/null)
+
+		# BLAKE2_NEON_Compress32: 30 each vld1q_u8 and vld1q_u64
+		# BLAKE2_NEON_Compress64: 22 each vld1q_u8 and vld1q_u64
+		COUNT1=$(echo -n "$DISASS_TEXT" | "$EGREP" -i -c 'ldr.*q|vld.*128')
+		COUNT2=$(echo -n "$DISASS_TEXT" | "$EGREP" -i -c 'ldp.*q')
+		COUNT=$(($COUNT1 + $(($COUNT2 + $COUNT2))))
+		if [[ ("$COUNT" -lt "25") ]]; then
+			FAILED=1
+			echo "ERROR: failed to generate expected vector load instructions" | tee -a "$TEST_RESULTS"
+		fi
+
+		# BLAKE2_NEON_Compress{32|64}: 6 each vst1q_u32 and vst1q_u64
+		COUNT=$(echo -n "$DISASS_TEXT" | "$EGREP" -i -c 'str.*q|vstr')
+		if [[ ("$COUNT" -lt "6") ]]; then
+			FAILED=1
+			echo "ERROR: failed to generate expected vector store instructions" | tee -a "$TEST_RESULTS"
+		fi
+
+		# BLAKE2_NEON_Compress{32|64}: 409 each vaddq_u32 and vaddq_u64
+		COUNT=$(echo -n "$DISASS_TEXT" | "$EGREP" -i -c 'add.*v|vadd')
+		if [[ ("$COUNT" -lt "400") ]]; then
+			FAILED=1
+			echo "ERROR: failed to generate expected vector add instructions" | tee -a "$TEST_RESULTS"
+		fi
+
+		# BLAKE2_NEON_Compress{32|64}: 559 each veorq_u32 and veorq_u64
+		COUNT=$(echo -n "$DISASS_TEXT" | "$EGREP" -i -c 'eor.*v|veor')
+		if [[ ("$COUNT" -lt "550") ]]; then
+			FAILED=1
+			echo "ERROR: failed to generate expected vector xor instructions" | tee -a "$TEST_RESULTS"
+		fi
+
+		if [[ ("$FAILED" -eq "0") ]]; then
+			echo "Verified vector load, store, add, xor machine instructions" | tee -a "$TEST_RESULTS"
+		fi
+	fi
+
+	############################################
+	# ARM carryless multiply code generation
+
+	ARM_PMULL=$(echo -n "$ARM_CPU_FLAGS" | "$GREP" -i -c pmull)
+	if [[ ("$ARM_PMULL" -ne "0" || "$HAVE_ARM_CRYPTO" -ne "0") ]]; then
+		echo
+		echo "************************************" | tee -a "$TEST_RESULTS"
+		echo "Testing: ARM carryless multiply code generation" | tee -a "$TEST_RESULTS"
+		echo
+
+		OBJFILE=gcm.o; rm -f "$OBJFILE" 2>/dev/null
+		CXX="$CXX" CXXFLAGS="$RELEASE_CXXFLAGS ${PLATFORM_CXXFLAGS[@]}" "$MAKE" "${MAKEARGS[@]}" $OBJFILE 2>&1 | tee -a "$TEST_RESULTS"
+
+		COUNT=0
+		FAILED=0
+		DISASS_TEXT=$("$DISASS" "${DISASSARGS[@]}" "$OBJFILE" 2>/dev/null)
+
+		COUNT=$(echo -n "$DISASS_TEXT" | "$GREP" -v pmull2 | "$GREP" -i -c pmull)
+		if [[ ("$COUNT" -eq "0") ]]; then
+			FAILED=1
+			echo "ERROR: failed to generate pmull instruction" | tee -a "$TEST_RESULTS"
+		fi
+
+		COUNT=$(echo -n "$DISASS_TEXT" | "$GREP" -i -c pmull2)
+		if [[ ("$COUNT" -eq "0") ]]; then
+			FAILED=1

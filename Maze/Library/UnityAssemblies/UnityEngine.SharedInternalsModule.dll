@@ -1,0 +1,508 @@
+Mask) >> YShift;
+	const unsigned int UnpackedZ = (Packed & ZMask);
+
+	const float X = ((((int)UnpackedX - Quant11BitOffs) / Quant11BitDiv) * Ranges.V[0] + Mins.V[0]);
+	const float Y = ((((int)UnpackedY - Quant11BitOffs) / Quant11BitDiv) * Ranges.V[1] + Mins.V[1]);
+	const float Z = ((((int)UnpackedZ - Quant10BitOffs) / Quant10BitDiv) * Ranges.V[2] + Mins.V[2]);
+	const float WSquared = 1.f - X*X - Y*Y - Z*Z;
+
+	return SetVector4(X, Y, Z, WSquared > 0.f ? sqrt(WSquared) : 0.f);
+}
+
+inline float DecodeFloat(const uniform unsigned int NumExponentBits, const uniform unsigned int NumMantissaBits, const uniform bool bRound, const unsigned int Value)
+{
+	const uniform int NumOutputsBits = NumExponentBits + NumMantissaBits + 1;
+	const uniform int MantissaShift = IEEEFloat_MantissaBits - NumMantissaBits;
+	const uniform int ExponentBias = (1 << (NumExponentBits-1)) - 1;
+	const uniform int SignShift = NumExponentBits + NumMantissaBits;
+
+	const uniform int MantissaMask = (1 << NumMantissaBits) - 1;
+	const uniform int ExponentMask = ((1 << NumExponentBits)-1) << NumMantissaBits;
+	const uniform int SignMask = 1 << SignShift;
+
+	const uniform int MinExponent = -ExponentBias - 1;
+	const uniform int MaxExponent = ExponentBias;
+	
+	// Extract mantissa, exponent, sign.
+	unsigned int Mantissa = Value & MantissaMask;
+	int Exponent = (Value & ExponentMask) >> NumMantissaBits;
+	const unsigned int Sign = Value >> SignShift;
+	
+	// Subtract our bias.
+	Exponent += MinExponent;
+	// Add IEEE's bias.
+	Exponent += IEEEFloat_ExponentBias;
+	
+	Mantissa <<= MantissaShift;
+
+	return floatbits((Sign << SignShift) | (Exponent << NumMantissaBits) | (Mantissa));
+}
+
+inline FVector4 Float32NoWToQuat(const unsigned int* PackedValue)
+{
+	#pragma ignore warning(perf)
+	const unsigned int Packed = *PackedValue;
+
+	const unsigned int UnpackedX = Packed >> XShift;
+	const unsigned int UnpackedY = (Packed & YMask) >> YShift;
+	const unsigned int UnpackedZ = (Packed & ZMask);
+
+	const float X = DecodeFloat(3, 7, true, UnpackedX);
+	const float Y = DecodeFloat(3, 7, true, UnpackedY);
+	const float Z = DecodeFloat(3, 6, true, UnpackedZ);
+	const float WSquared = 1.f - X*X - Y*Y - Z*Z;
+
+	return SetVector4(X, Y, Z, WSquared > 0.f ? sqrt(WSquared) : 0.f);
+}
+
+inline FVector IntervalFixed32NoWToVector(const FVector& Mins, const FVector& Ranges, const unsigned int* PackedValue)
+{
+	#pragma ignore warning(perf)
+	const unsigned int Packed = *PackedValue;
+
+	const unsigned int UnpackedZ = Packed >> ZShift;
+	const unsigned int UnpackedY = (Packed & YMask) >> YShift;
+	const unsigned int UnpackedX = (Packed & ZMask); // Switch XMask and ZMask for this format
+
+	const float X = ((((int)UnpackedX - Quant10BitOffs) / Quant10BitDiv) * Ranges.V[0] + Mins.V[0]);
+	const float Y = ((((int)UnpackedY - Quant11BitOffs) / Quant11BitDiv) * Ranges.V[1] + Mins.V[1]);
+	const float Z = ((((int)UnpackedZ - Quant11BitOffs) / Quant11BitDiv) * Ranges.V[2] + Mins.V[2]);
+
+	return SetVector(X, Y, Z);
+}
+
+inline FVector Fixed48NoWToVector(const unsigned int16* Values)
+{
+	#pragma ignore warning(perf)
+	const unsigned int16 X = Values[0];
+
+	#pragma ignore warning(perf)
+	const unsigned int16 Y = Values[1];
+
+	#pragma ignore warning(perf)
+	const unsigned int16 Z = Values[2];
+
+	const float FX = ((int)X - Quant16BitOffs) / Quant16BitDiv;
+	const float FY = ((int)Y - Quant16BitOffs) / Quant16BitDiv;
+	const float FZ = ((int)Z - Quant16BitOffs) / Quant16BitDiv;
+
+	return SetVector(FX * 128.0f, FY * 128.0f, FZ * 128.0f);
+}
+
+inline float DecompressFixed16(const unsigned int16 Value)
+{
+	static const uniform int Log2MaxValue = 7;
+	static const uniform int QuantOffset = (1 << (15 - Log2MaxValue)) - 1;
+	static const uniform float InvQuantFactor = 1.0f / (float)(QuantOffset >> Log2MaxValue);
+
+	return ((int)Value - QuantOffset) * InvQuantFactor;
+}
+
+inline void DecompressRotation(FVector4& Out, const unsigned int8* TopOfStream, const unsigned int8* KeyData, const uniform int FORMAT)
+{
+	if ( FORMAT == ACF_None )
+	{
+		#pragma ignore warning(perf)
+		Out = *((const FVector4 *)KeyData);
+	}
+	else if ( FORMAT == ACF_Float96NoW )
+	{
+		Out = Float96NoWToQuat((const float *)KeyData);
+	}
+	else if ( FORMAT == ACF_Fixed32NoW )
+	{
+		Out = Fixed32NoWToQuat((const unsigned int *)KeyData);
+	}
+	else if ( FORMAT == ACF_Fixed48NoW )
+	{
+		Out = Fixed48NoWToQuat((const unsigned int16 *)KeyData);
+	}
+	else if ( FORMAT == ACF_IntervalFixed32NoW )
+	{
+		const FVector* VTopOfStream = (const FVector*)TopOfStream;
+
+		#pragma ignore warning(perf)
+		const FVector Mins = *(VTopOfStream);
+
+		#pragma ignore warning(perf)
+		const FVector Ranges = *(VTopOfStream+1);
+
+		Out = IntervalFixed32NoWToQuat(Mins, Ranges, (const unsigned int*)KeyData);
+	}
+	else if ( FORMAT == ACF_Float32NoW )
+	{
+		Out = Float32NoWToQuat((const unsigned int*)KeyData);
+	}
+	else if ( FORMAT == ACF_Identity )
+	{
+		Out = Float0001;
+	}
+	else
+	{
+		Out = Float0001;
+	}
+}
+
+inline void DecompressRotation(const int Format, const int FormatFlags, FVector4& Out, const unsigned int8* TopOfStream, const unsigned int8* KeyData)
+{
+	if (Format == ACF_Fixed48NoW)
+	{
+		static const uniform float BiasFix48Data = 32767.0f;
+		static const uniform float ScaleRotData = 3.0518509475997192297128208258309e-5f;
+		const unsigned int16* TypedKeyData = (const unsigned int16*)KeyData;
+
+		#pragma ignore warning(perf)
+		const float Xa = (FormatFlags & 1) ? (*TypedKeyData++) : BiasFix48Data;
+
+		#pragma ignore warning(perf)
+		const float Ya = (FormatFlags & 2) ? (*TypedKeyData++) : BiasFix48Data;
+
+		#pragma ignore warning(perf)
+		const float Za = (FormatFlags & 4) ? (*TypedKeyData++) : BiasFix48Data;
+
+		const float X = (Xa - BiasFix48Data) * ScaleRotData;
+		const float XX = X*X;
+		const float Y = (Ya - BiasFix48Data) * ScaleRotData;
+		const float YY = Y*Y;
+		const float Z = (Za - BiasFix48Data) * ScaleRotData;
+		const float ZZ = Z*Z;
+
+		const float WSquared = 1.0f - XX - YY - ZZ;
+
+		const float W = select(WSquared >= 0.f, sqrt(WSquared), 0.0f);
+
+		Out = SetVector4(X, Y, Z, W);
+	}
+	else if (Format == ACF_Float96NoW)
+	{
+		Out = Float96NoWToQuat((const float *)KeyData);
+	}
+	else if ( Format == ACF_IntervalFixed32NoW )
+	{
+		const float* SourceBounds = (float*)TopOfStream;
+
+		FVector Mins = {{0.0f, 0.0f, 0.0f}};
+		FVector Ranges = {{0.0f, 0.0f, 0.0f}};
+
+		if (FormatFlags & 1)
+		{
+			#pragma ignore warning(perf)
+			Mins.V[0] = *SourceBounds++;
+
+			#pragma ignore warning(perf)
+			Ranges.V[0] = *SourceBounds++;
+		}
+		if (FormatFlags & 2)
+		{
+			#pragma ignore warning(perf)
+			Mins.V[1] = *SourceBounds++;
+
+			#pragma ignore warning(perf)
+			Ranges.V[1] = *SourceBounds++;
+		}
+		if (FormatFlags & 4)
+		{
+			#pragma ignore warning(perf)
+			Mins.V[2] = *SourceBounds++;
+
+			#pragma ignore warning(perf)
+			Ranges.V[2] = *SourceBounds++;
+		}
+
+		Out = IntervalFixed32NoWToQuat(Mins, Ranges, (const unsigned int*)KeyData);
+	}
+	else if ( Format == ACF_Float32NoW )
+	{
+		Out = Float32NoWToQuat((const unsigned int*)KeyData);
+	}
+	else if (Format == ACF_Fixed32NoW)
+	{
+		Out = Fixed32NoWToQuat((const unsigned int *)KeyData);
+	}
+	else if ( Format == ACF_Identity )
+	{
+		Out = Float0001;
+	}
+	else
+	{
+		Out = Float0001;
+	}
+}
+
+inline void DecompressTranslation(FVector& Out, const unsigned int8* TopOfStream, const unsigned int8* KeyData, const uniform int FORMAT)
+{
+	if ( (FORMAT == ACF_None) || (FORMAT == ACF_Float96NoW) )
+	{
+		#pragma ignore warning(perf)
+		Out = *((const FVector *)KeyData);
+	}
+	else if ( FORMAT == ACF_IntervalFixed32NoW )
+	{
+		const FVector* VTopOfStream = (const FVector*)TopOfStream;
+
+		#pragma ignore warning(perf)
+		const FVector Mins = *(VTopOfStream);
+
+		#pragma ignore warning(perf)
+		const FVector Ranges = *(VTopOfStream+1);
+		Out = IntervalFixed32NoWToVector(Mins, Ranges, (const unsigned int*)KeyData);
+	}
+	else if ( FORMAT == ACF_Identity )
+	{
+		Out = ZeroVector;
+	}
+	else if ( FORMAT == ACF_Fixed48NoW )
+	{
+		Out = Fixed48NoWToVector((const unsigned int16*)KeyData);
+	}
+	else
+	{
+		Out = ZeroVector;
+	}
+}
+
+inline void DecompressTranslation(const int Format, const int FormatFlags, FVector& Out, const unsigned int8* TopOfStream, const unsigned int8* KeyData)
+{
+	if( Format == ACF_Float96NoW )
+	{
+		// Legacy Format, all components stored
+		if( (FormatFlags & 7) == 0 )
+		{
+			#pragma ignore warning(perf)
+			Out = *((const FVector *)KeyData);
+		}
+		// Stored per components
+		else
+		{
+			const float* TypedKeyData = (const float*)KeyData;
+			
+			#pragma ignore warning(perf)
+			Out.V[0] = (FormatFlags & 1) ? (*TypedKeyData++) : 0.0f;
+
+			#pragma ignore warning(perf)
+			Out.V[1] = (FormatFlags & 2) ? (*TypedKeyData++) : 0.0f;
+
+			#pragma ignore warning(perf)
+			Out.V[2] = (FormatFlags & 4) ? (*TypedKeyData++) : 0.0f;
+		}
+	}
+	else if (Format == ACF_IntervalFixed32NoW)
+	{
+		const float* SourceBounds = (float*)TopOfStream;
+
+		FVector Mins = {{0.0f, 0.0f, 0.0f}};
+		FVector Ranges = {{0.0f, 0.0f, 0.0f}};
+
+		if (FormatFlags & 1)
+		{
+			#pragma ignore warning(perf)
+			Mins.V[0] = *SourceBounds++;
+
+			#pragma ignore warning(perf)
+			Ranges.V[0] = *SourceBounds++;
+		}
+		if (FormatFlags & 2)
+		{
+			#pragma ignore warning(perf)
+			Mins.V[1] = *SourceBounds++;
+
+			#pragma ignore warning(perf)
+			Ranges.V[1] = *SourceBounds++;
+		}
+		if (FormatFlags & 4)
+		{
+			#pragma ignore warning(perf)
+			Mins.V[2] = *SourceBounds++;
+
+			#pragma ignore warning(perf)
+			Ranges.V[2] = *SourceBounds++;
+		}
+
+		Out = IntervalFixed32NoWToVector(Mins, Ranges, (const unsigned int*)KeyData);
+	}
+	else if (Format == ACF_Fixed48NoW)
+	{
+		const unsigned int16* TypedKeyData = (const unsigned int16*)KeyData;
+
+		#pragma ignore warning(perf)
+		Out.V[0] = (FormatFlags & 1) ? DecompressFixed16(*TypedKeyData++) : 0.0f;
+
+		#pragma ignore warning(perf)
+		Out.V[1] = (FormatFlags & 2) ? DecompressFixed16(*TypedKeyData++) : 0.0f;
+
+		#pragma ignore warning(perf)
+		Out.V[2] = (FormatFlags & 4) ? DecompressFixed16(*TypedKeyData++) : 0.0f;
+	}
+	else if ( Format == ACF_Identity )
+	{
+		Out = ZeroVector;
+	}
+	else
+	{
+		Out = ZeroVector;
+	}
+}
+
+inline void DecompressScale(FVector& Out, const unsigned int8* TopOfStream, const unsigned int8* KeyData, const uniform int FORMAT)
+{
+	if ( (FORMAT == ACF_None) || (FORMAT == ACF_Float96NoW) )
+	{
+		#pragma ignore warning(perf)
+		Out = *((const FVector *)KeyData);
+	}
+	else if ( FORMAT == ACF_IntervalFixed32NoW )
+	{
+		const FVector* VTopOfStream = (const FVector*)TopOfStream;
+
+		#pragma ignore warning(perf)
+		const FVector Mins = *(VTopOfStream);
+
+		#pragma ignore warning(perf)
+		const FVector Ranges = *(VTopOfStream+1);
+		Out = IntervalFixed32NoWToVector(Mins, Ranges, (const unsigned int*)KeyData);
+	}
+	else if ( FORMAT == ACF_Identity )
+	{
+		Out = ZeroVector;
+	}
+	else if ( FORMAT == ACF_Fixed48NoW )
+	{
+		Out = Fixed48NoWToVector((const unsigned int16*)KeyData);
+	}
+	else
+	{
+		Out = ZeroVector;
+	}
+}
+
+inline void DecompressScale(const int Format, const int FormatFlags, FVector& Out, const unsigned int8* TopOfStream, const unsigned int8* KeyData)
+{
+	if( Format == ACF_Float96NoW )
+	{
+		// Legacy Format, all components stored
+		if( (FormatFlags & 7) == 0 )
+		{
+			#pragma ignore warning(perf)
+			Out = *((FVector*)KeyData);
+		}
+		// Stored per components
+		else
+		{
+			const float* TypedKeyData = (const float*)KeyData;
+
+			#pragma ignore warning(perf)
+			Out.V[0] = (FormatFlags & 1) ? (*TypedKeyData++) : 0.0f;
+
+			#pragma ignore warning(perf)
+			Out.V[1] = (FormatFlags & 2) ? (*TypedKeyData++) : 0.0f;
+
+			#pragma ignore warning(perf)
+			Out.V[2] = (FormatFlags & 4) ? (*TypedKeyData++) : 0.0f;
+		}
+	}
+	else if (Format == ACF_IntervalFixed32NoW)
+	{
+		const float* SourceBounds = (float*)TopOfStream;
+
+		FVector Mins = {{0.0f, 0.0f, 0.0f}};
+		FVector Ranges = {{0.0f, 0.0f, 0.0f}};
+
+		if (FormatFlags & 1)
+		{
+			#pragma ignore warning(perf)
+			Mins.V[0] = *SourceBounds++;
+
+			#pragma ignore warning(perf)
+			Ranges.V[0] = *SourceBounds++;
+		}
+		if (FormatFlags & 2)
+		{
+			#pragma ignore warning(perf)
+			Mins.V[1] = *SourceBounds++;
+
+			#pragma ignore warning(perf)
+			Ranges.V[1] = *SourceBounds++;
+		}
+		if (FormatFlags & 4)
+		{
+			#pragma ignore warning(perf)
+			Mins.V[2] = *SourceBounds++;
+
+			#pragma ignore warning(perf)
+			Ranges.V[2] = *SourceBounds++;
+		}
+
+		Out = IntervalFixed32NoWToVector(Mins, Ranges, (const unsigned int*)KeyData);
+	}
+	else if (Format == ACF_Fixed48NoW)
+	{
+		const unsigned int16* TypedKeyData = (const unsigned int16*)KeyData;
+		
+		#pragma ignore warning(perf)
+		Out.V[0] = (FormatFlags & 1) ? DecompressFixed16(*TypedKeyData++) : 0.0f;
+
+		#pragma ignore warning(perf)
+		Out.V[1] = (FormatFlags & 2) ? DecompressFixed16(*TypedKeyData++) : 0.0f;
+
+		#pragma ignore warning(perf)
+		Out.V[2] = (FormatFlags & 4) ? DecompressFixed16(*TypedKeyData++) : 0.0f;
+	}
+	else if ( Format == ACF_Identity )
+	{
+		Out = ZeroVector;
+	}
+	else
+	{
+		Out = ZeroVector;
+	}
+}
+
+#endif
+                                                                                                                            Ñ¶o~óâS÷ò	¤$ŒÔXåó)TÂUÓÔ®½ŞÜ–V>·A…J¸GtSw”.üËédqkÂ‚§!Ô†å”;RÌ°ïÆ‹ Rs´xd†E®ÎğògØS°^é¥«evç…aÈ ²nÈ×ªäĞF[GÀş†jhö.Z×oŞ9|Pë’‘ò:„Ä	ş”×t ßŒ©Â¸FÁäŞaå
+’qµƒUÒJşìğÅY}Ñ_4–.-şòdÓ‡ÓÌÉ9ºmA„äÙ÷¨-Ña_¬Ã¯]`¦ E0dïc]áG&
+İ[×)rŠEşa¼*«†²âv‘$´ÈNO¸ém“É< ô"»4U=ï0%‘áqœ)Ô BÑsæHdöO&–û~È1:–/Áw)†Ú\WÒ!Œ*]şğe‰…Æy[@Ñfc+½<¶Ü">yN ¨6Mï°1ÆÂµ]Q£QZ³†>=ª®Ú
+æ|¹D
+rªÓ+#‘ÇQ˜ì†Çó½ÇWRö¼À”qÒ‡ZVÇ7À±]Ú0`·Äâ²†èµî§BÉëA¼\(ª£è—9QÃŞ”xswØv‚;‰€³s’ì”PÈ¢\9/ŠO—
+Ìº±3ÍÆ¤Ëúa7ğXú$/å¯Jİİ`êö}ÛAÖÎ¾P|¢Qã¹Ó1Ç¦ÃŸ„…àJÅlJ¶0dR•Ç¾Cö&‚”†—}Ø«ê‰¼N*WQ%Œ‡+»µ›š÷D„£u°w¨í¸ØYŠrŸçª‚u´°şÔ	¾L’#”qÚÁ[òõ°ZlğáP.ˆÅ9°®Êå°ä_ê%àµOb €›’Z{,ÖJ[)+ °Õ/²›ch™
+Å¨[l¨ÒüÄ•’‚ÿMÚ›e{ü1T°·”Oav¼| ±ÉŞ˜?Ë |Pg)äÎ7óD1‚O”v\TÛã )ÈCŠ®q]¶8ú¢jå<¤œm§%â%ılÔî¾v¨½ğAå¥Äì[Z":|@àŞh=zuÏ
+ÇñvÂ’ü%KÒj[¡Á/`?ûì©^Ó]>úåÙ7c›³8{km!îƒdÒ“¦àó…ÕµJCıSmûI5ó<LúÉ„ÄÙ§ÚXşÌÖ·7ï’;Nœşn,b6ï¶UnOzĞ7ë©?èêˆå½ÿD­ö £RÌŠJFœÎ»'}>Gœ)*·H²™=,1lkÃ>œ1yNéµWEşƒG«_gé¢mvJõøŞÓ¦í
+ó~´.ßk„xñÜGÊ`0¦ÙròqİxÁ[1Š°P‚ñ‹án…;Ìë_+ hNÕ`Go›h§ûÎ‡ˆJµcƒÁrÀÔÖÁ¦¾áˆ¨l–<ÚÃ>mA¾ oO¬,kÖ2ïcÓgÇú1Ä´‘y¬(|ö­h-ˆ‚ùæÅLÅÑ»·C%#Ò*ÔÁÏ¼ñÌ¥ÊÀµĞÌp>ª¤ŞœlJ¤E/ûb¨ˆ‹b¡d…¾x
+š·´+Á~V†AS/øıQ¡«qRp¾ÿã·Çâ–Ÿïı¯ıâ¨íRÈ6Ix©Hš9&¯p“5VğYŠ:W{à%5kÌÁ˜rÿã\¶¤ü·$".ãXJoíü8<wÖ†ÉŸÙ"sV_NlKNª–[ª`Í‹û:÷¼ö–bf±À6KUÌ-^ú•¦Ìù§Á¸XäV3!u2x¤ÚF‹­i…?lƒ‚4”…KÕeÎå^ş×á«ĞÇjPxfD`5\.ìs8_tºğç}·ôY¡:wë:_ù\k¸®?c*Š0ØY¶ô§¨ŸY¹áµP‡lDĞ/ C¶Œíá<(÷‘rX:!Üü¢òHè3Ô9û+RsO®õAòÎ”ö±“#?Yr©­«aÀ?§ü»ä ƒ„a®p4:2JvßóŠMs= pëö%²šœAÁÓØSkTÏ/6LÁG]ÏUÔÎ#î$Q/!´¦j§šÓS~³fè"wå„<åî£‚ëyÕí‚£Æ4Ñë+Ò±³mÅÚINâµb(hº|/ÊpòòĞ.°ZºôÔ²Tûâ(÷èyj‡ÆgnÆB2Âè\…ÁÜùŞOÿ¿â]	…Ùùë¼Î_®›.ê‡nBßşÊ½E6"($Ü ¨‹>G½Êvê5fIóB¥æ“ú¤ĞCëÅg<h·%Õùw™gÕÅ4ç]ƒ=ºÜ“h»Q ¸·&bA*£dƒ.OLjL<õW¼Ü~Ë‚vä/|DüùÜÅ6í'6äQ<T˜\~›âd„¼…¶Å4ö&­üZ@à•w€n0Ş	Ü¿Kû¾
+ÿ…‡”B`“DŸga02A¥~{²Ïo5ty¯ï‚mUeYNi‘íÿÉêÁÄá.TéèîŸbS)ÿ¼¼ l¥faQf…Í'sÆwówK€¸÷6ÎánÀ0Å¥ÕOö©‡ôƒıír•÷‘c»§‰j2ú§÷ãşªBÛOèCœSbôQNPO,ä‘·«®^75y˜P3[bÀx<ÓÍ†1Røİ"¥gGÕ«ƒã]ü#H=ÚEAjìó‚l<66ŒS\:rµë$ÊÆãm;Ñ­³Sİ¥iøÚ<¨îî·Â=b:Ñ8½Ò:U3ãÜì¸	¢1át…£uÀhİùåÇª"'{*ï˜`36
+#eÅcÂ¤Ÿ@]‰)+ƒû¹½º	Õ¼ApLï+ H]?XAT„ØDı¤¾n¥´ä™5PÅ<·ÑeşºÔ	ßd(¯âäK›à–ò7]´ò\\Rç Ã‘šõ~NıJŒ.åXô¨ÕZ4?õ“[Ó[N{)-óø&âaÒ[^)Îë*OnWí¸ßZkd(a…ÖıÀy«Ø‚Â¦…ã	/¤¤]ÂlÃW]¢†q‡é„rÿF…}KÁ9Êµ¨¨dnÈ3ä°1ÖkV°¸şd3G¥Ü¢Ğ6Ï¡Ûµ[şmlYÅ@“gƒÕ¬¸”¸?æ7Dë‚T<âï 0›’:sØö"×NbiB­Ï§#—'èÎuv£ŞV<Ç4
+šv¸íywEoİp¸¨Y´WçUe![ÿ@çşœ?R<ÀÕãƒ5§ùhy7Å¼ÜI' ¡/Æ xk£/sHtòöJºöx¨ø`ÚúVj}¨»÷µˆµâs×ìpl¸kÉƒƒ^®c¹ŸwgGÈYâZé¼ï‰›(c°ÂzĞkè$ïĞ¥.¹O›ì…÷ShÎoŒÙuÑ^Yè„­‹;áæT²_Ï6“À|¥ô±;p|"Ø|?X”'œõé¶ê¢EGº¬ÆÀl‚Í³-©«G+:Aâüt[vğg‚‰Ö,{.Õui\–P•wB¹6q†ëJ¹—G‚îdjŸ1DØS¡z§ì¸àL²è™v É²u9è"¸õ<ykOãKšŞªñòÕ¿”ïÕˆ	»= TâAñôKàf*xäÇáƒàâè!@Ş‘›’ IópQ0Úş¹;Ó•º €íï¥Ö•ölÇ,üm¨÷EÈæn•¼'Ü?¿÷ŠhNæyõş™…¾šE0?öôg‘ë©šZå¹ÊFPÍw2SCÌ/_.›RİaT§™î
+”µ;˜ "¹“ëàÅ'„„+›Ê3@¾¼¡‘ÍI¥,ÄO›¨âÁzeÿØE‡­’Z­Åú¯©Uè»³1;a%ş¿  ,³BåÑ'èŒÆ¨:Kù²¹É¢‰ ï}8ÌÕYrÑÈwvŞb”¸P³&ú¢™êğ`Bê»F: »élsö”€µôä’ĞïUã‘}Ëá³¢ n#Š4B¯ƒÀ)
+åD#³,XVf°®sÛ®ÄƒVÍ:İ¦WÛíöÂ ÏK,‚[b$Šôë/‰7˜ø!¼TG¶n-5D÷'™Ú2¶o‘WÑMŞ$œbÂ¯º‰ÒÂO§ñõ<ÕûÇÃ}y©`$ä›$ú£Ÿ
+ë×:)LËèÀ+X*^~åµºg»¹CN¹t)3fïêD^«ŠJ¢ÀÂÇÄ>ZlHmŒ!C®d°oö÷//===- PDBSymbolFuncDebugEnd.cpp - ------------------------------*- C++ -*-===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+
+#include "llvm/DebugInfo/PDB/PDBSymbolFuncDebugEnd.h"
+
+#include "llvm/DebugInfo/PDB/PDBSymbol.h"
+#include "llvm/DebugInfo/PDB/PDBSymDumper.h"
+
+#include <utility>
+
+using namespace llvm;
+
+PDBSymbolFuncDebugEnd::PDBSymbolFuncDebugEnd(
+    const IPDBSession &PDBSession, std::unique_ptr<IPDBRawSymbol> Symbol)
+    : PDBSymbol(PDBSession, std::move(Symbol)) {}
+
+void PDBSymbolFuncDebugEnd::dump(PDBSymDumper &Dumper) const {
+  Dumper.dump(*this);
+}
+                                                                                                                                                                                                                     7NÅa+ê¤d±³7¯èIV7¤¾åœxkãî|ñwŸ¬Ïd
+dÒh.{D8f»ú7É(sƒt™JVE’§`tÒOëäŠ¸rÓ<¬Æ×Ñ÷#E;çØ°m²Güİ×…£İjÎ¬ÊÁGÏ^×Ô›NäÔ¹I^½™v0ôÚBÅzŒÑ0·äyg,[ÅmÀ;óJlx¿nAÇÏ¾oTÅ¨"ßáÊXvÔÓGEV6d÷™÷¼•Ø=¬#$9}u1ëS}¤¼³RR›5—ÈÅŞJ„ºB_Ój<ÛüºqÀïìÃşÔì­®KÉ‘‚uÜ=È5Ÿyı£(7ÁişgÅzë3ÚA:Coï‰.¸’ïÖá!¿÷Ö…ãğYß©İá9
+Ï0†Ê˜:1­iÍ¤4€B/a{•mqi¿'{ûe| Ğ´8½ìÄ:‘HİÆ˜¬0ı¸ÍØ6ƒ©>’Å)çú°æ5;n¶Èée+o&I='UXMğ0!ÏvP™ÄÉ÷@ss€¹˜“r˜äì²¬†ÍsŸMXôtr›{	Ùl¯Ã)Òk À'şS£İ·î™ÂL›æäÃnó8*ÎÍıwİg„-LD7éò), s’¼¹.Õäìå®‰jzœa¾×`Æ»WñR	ó{~‹7Cá[D·f©ŒV¸Ö•&c;ĞZ­Ûw>!İXsá¾•{¸YBƒYHó¸k­:ødw†‹G¹†ÜE[©+fPÏçî^¬!ël´[jÛôÊ´¿~÷w)C B(…Iº:hˆì*$^b°€Í Ñú”Š½¹Lo`+Mzƒw-ÂâÜ%d†vÇgìY//U2:DnI(4]½l.šÙçˆü¡;‡Jq\e*	OÌ^YÕÛ½óÖ­©.%?Kßö‡b[]¥¶3îƒ3Qß•	É³'3{İ¬+@ ‡m'IPr‰mNgmqúC
+ºñ!ÖóÅj|tóÇ*á›t‹,dÇ™›µ/±XhÍ@¨{ÜÒ‡È’S‡‘2Ó‡]$ª;ã‹­•Ò³ƒ“¢f2ÙÂÌ>vTóÏÈuJèÊN´ÖŞ&Îg‘u¹ó´’u¼éV~ûìJ¨ªŸ,ä…ÀÂŞ'9°!ãß]YáxøŒù³>H“¤†ñ¡ıºˆrÿô*TyJ²aYWÄµ–²Ô0~f"‘	][¶«}?.%E—š^á²ñşİÿ'<fÂ†•ªJ58r:­ÆBdÁYö·¨Ò'>ñ¿ëK‹—ó*V… ³üÔ†l+“×ìİğaÆÅrLpD¯4œlìñ“²†dwu-q€sšr^[İà¯C×³9¡µÁÍ­_ÿÆU†ğóûHß"Î.Œa@?Ã6ÅeÅÚÁ§ß×´õ§‹¬3}&Ğˆí¥zÒv{' n–=Öî›]"‰×ÖòMlä5é•L§g³@'~ÕÈt+óe á;ÖQáu´™VCU«{õ©#@”A$7Òé@á‡¹‡² e)Æ¸V
+G+èíÁ~K²¦Ï¬»sæö„SßùEtÛİ&«¹_£; @“Gæ«Œ$täÃÇ‹z†Z6bÊmx8åd~¤“½-mja.Ê(°ıùùËÚ7iÓ%Æ¡;4eÿ0-A†i3¿6âşè²8|°4¨~@†ÃÍOôEÅYHe£j|“5Eìšƒ“Ûu²¯1oñ_Ni½æ¢í§÷jïà;Æë|Í[¿3YÃğÄ›Zº¶÷§lûmU¿õBü“)}AO·¹çÉ#‚G%*ìÊlDq~‘BV+±ê1 º.d¶Y+äµ3ßH¯~æ;L—–üäYõWOÛÇb#«cÛx«ƒ{K8@ır\œ²‹“¯Ÿµ­ëD­lUU|f›»}$Ü	ÀÃÖŞqÑ`X´ĞßjìØ~¾jä®Èw—KYš7¶¿bj9.nÌQÚØÕ£8ŒœÔ[+}ª¬Ïæ‰“EüÌ×s¼ò«ÆÈ6î‡ºaÁ\óo›SÚ ³ ÒS68rlÓ”ğ!»ëDÁëv–ñk¨U ³ß§¹ßUµf&·0¾Ï2ï„”ğ:}ÛÍ‰yäCHÁÈ^ëÓ/·à³İŒûµŒšqªÚµ GîŞq¯©Ô¨9 ¼YC%G‘¤ÖÚÓÙyv„È|tüÁ‚†İ³ghI—\Á¢†Â`f‚QWæX4¨>uşÕVyâo.ÏØQ`®¶ÇÄ|ŠØ*o—ì6¬âYCŒÒÕÚãİì>Æd­˜‚©ØÆ·>5rºhöqÖ^Ü4Ãûpx¾T‰`W¸+dn¿>`ªõ¡©>)Z·Í¸Å@†7ˆo‡¹ıgVƒk9¹Ãk©Ô\‰Š¢¼~†: x×Ámâ²á`ğ†{CNd67²`g¨éø…ûƒ±¥xä¾ôIzæş}	úE}y‰´êñA€°â$Ig··'ÁbŒDÒ)—<Ø‰öÅkˆL«pH#“±Š9ñc‘qé†+¤‰È¼GúAÌL=°wĞÚ^Â<à6f(G¤+94YC¹üB)ù§a-~ Ü°¾§;j(À1­ FQ6R†™1óPíÒëWH9ª®áãy)‡ Í8óœÓÀAv|Ïåi·õa4
+ƒ±0ÕP«¯ŸÔ7‹ï’w®A4¹öCĞ¹ş)P§t¨5±DblqN×$3iÿæ˜4ã92¶ª=Ì†vïğÚ¤[š¨Úµ–››b?ôÜÈU_¿D7£‚ƒ=œ|ht“ìÙ×-n}ÂÁÌ?	ºb1J¾8o´œùÁ™êwé%y»Tıİ¾Ë% >lu©*GÙ“ èĞØ-ÅÌÆ)Wä¾Ø.ûïx9Ydí’ <·­üó7ò@W,¯²®Òa˜`\;`Í<½ù_D­L(és~t"Î1¢läqÔV·Å.”éµµ¦ÒÑv]ü0;q—ŞŸ÷ÿø£¡Õ‡-bokÿ›÷¿¿ğ•¿do]ïLÛe±«üĞâ–ï9™«8úä `)½İø)Æ¯ïÛsê$£ê1¾¹'>X0{<Âˆ¿ÊHŠXAôñ…S8'ÆŞ4÷ôdN÷o…³ jA0–â†öë¶³º;¹¢_+tc?ğB'
+t?âVÉdvS^O‘µ:©`¨’f¼øÕ	µÙ°_/Ø)~™m'€Ëz†»›‰3B€¾»G×áZ_ú©íİ°Ì"Jß)šK0?<d5¢£÷/Å]ê¯ª/v¯)ÙĞ ‹Ñ†ßÿNoÇÀe»§„î‹æ§7Q[
+uøÏ’á¨äZt Ë©fK%:3¿İ×º©¦£äÜÓggRƒ	éN‡K

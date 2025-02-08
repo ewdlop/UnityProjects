@@ -1,0 +1,2091 @@
+//
+// PaddingModeTest.cs - NUnit Test Cases for PaddingMode
+//
+// Author:
+//	Sebastien Pouliot (sebastien@ximian.com)
+//
+// (C) 2003 Motus Technologies Inc. (http://www.motus.com)
+// Copyright (C) 2004, 2008 Novell, Inc (http://www.novell.com)
+//
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+// 
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+//
+
+using System;
+using System.Security.Cryptography;
+
+using NUnit.Framework;
+
+namespace MonoTests.System.Security.Cryptography {
+
+	[TestFixture]
+	public class PaddingModeTest {
+
+		private static byte[] key1 = { 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef };
+		private static byte[] key2 = { 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01 };
+		private static byte[] key3 = { 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef };
+
+		public void AssertEquals (string msg, byte[] array1, byte[] array2) 
+		{
+			Assert.AreEqual (array1, array2, msg);
+		}
+
+		protected byte[] CombineKeys (byte[] key1, byte[] key2, byte[] key3) 
+		{
+			int k1l = key1.Length;
+			int k2l = key2.Length;
+			int k3l = key3.Length;
+			byte[] key = new byte [k1l + k2l + k3l];
+			Array.Copy (key1, 0, key, 0, k1l);
+			Array.Copy (key2, 0, key, k1l, k2l);
+			Array.Copy (key3, 0, key, k1l + k2l, k3l);
+			return key;
+		}
+
+		private byte[] Decrypt (SymmetricAlgorithm algo, PaddingMode padding, byte[] data) 
+		{
+			algo.IV = new byte [algo.BlockSize >> 3];
+			algo.Mode = CipherMode.CBC;
+			algo.Padding = padding;
+			ICryptoTransform ct = algo.CreateDecryptor ();
+			return ct.TransformFinalBlock (data, 0, data.Length);
+		}
+
+		private byte[] Encrypt (SymmetricAlgorithm algo, PaddingMode padding, byte[] data) 
+		{
+			algo.IV = new byte [algo.BlockSize >> 3];
+			algo.Mode = CipherMode.CBC;
+			algo.Padding = padding;
+			ICryptoTransform ct = algo.CreateEncryptor ();
+			return ct.TransformFinalBlock (data, 0, data.Length);
+		}
+
+		private byte[] GetData (byte size) 
+		{
+			byte[] data = new byte [size];
+			for (byte i=0; i < size; i++) {
+				data [i] = i;
+			}
+			return data;
+		}
+
+		private TripleDES GetTripleDES () 
+		{
+			TripleDES tdes = TripleDES.Create ();
+			tdes.Key = CombineKeys (key1, key2, key3);
+			return tdes;
+		}
+
+		[Test]
+		[ExpectedException (typeof (CryptographicException))]
+		public void TripleDESNone_SmallerThanOneBlockSize () 
+		{
+			TripleDES tdes = GetTripleDES ();
+			byte[] data = GetData (7);
+			byte[] encdata = Encrypt (tdes, PaddingMode.None, data);
+		}
+
+		[Test]
+		public void TripleDESNone_ExactlyOneBlockSize () 
+		{
+			TripleDES tdes = GetTripleDES ();
+			byte[] data = GetData (8);
+			byte[] encdata = Encrypt (tdes, PaddingMode.None, data);
+			Assert.AreEqual ("23-61-AC-E6-C5-17-10-51", BitConverter.ToString (encdata), "TripleDESNone_ExactlyOneBlockSize_Encrypt");
+			byte[] decdata = Decrypt (tdes, PaddingMode.None, encdata);
+			AssertEquals ("TripleDESNone_ExactlyOneBlockSize_Decrypt", data, decdata);
+		}
+
+		[Test]
+		[ExpectedException (typeof (CryptographicException))]
+		public void TripleDESNone_MoreThanOneBlockSize () 
+		{
+			TripleDES tdes = GetTripleDES ();
+			byte[] data = GetData (12);
+			byte[] encdata = Encrypt (tdes, PaddingMode.None, data);
+		}
+
+		[Test]
+		public void TripleDESNone_ExactMultipleBlockSize () 
+		{
+			TripleDES tdes = GetTripleDES ();
+			byte[] data = GetData (48);
+			byte[] encdata = Encrypt (tdes, PaddingMode.None, data);
+			// note: encrypted data is truncated to a multiple of block size
+			Assert.AreEqual ("23-61-AC-E6-C5-17-10-51-BF-AB-79-9C-CD-5E-79-40-16-81-0D-6B-40-E6-B2-E9-86-34-8A-9E-5D-56-DA-D1-0C-8C-76-0A-E1-69-A1-0A-B5-B5-7F-FC-5A-D0-6E-6A", BitConverter.ToString (encdata), "TripleDESNone_ExactMultipleBlockSize_Encrypt");
+			byte[] decdata = Decrypt (tdes, PaddingMode.None, encdata);
+			AssertEquals ("TripleDESNone_ExactMultipleBlockSize_Decrypt", GetData (48), decdata);
+		}
+
+		[Test]
+		public void TripleDESPKCS7_SmallerThanOneBlockSize () 
+		{
+			TripleDES tdes = GetTripleDES ();
+			byte[] data = GetData (7);
+			byte[] encdata = Encrypt (tdes, PaddingMode.PKCS7, data);
+			Assert.AreEqual ("C6-59-0E-E3-7F-26-92-B0", BitConverter.ToString (encdata), "TripleDESPKCS7_SmallerThanOneBlockSize_Encrypt");
+			byte[] decdata = Decrypt (tdes, PaddingMode.PKCS7, encdata);
+			AssertEquals ("TripleDESPKCS7_SmallerThanOneBlockSize_Decrypt", data, decdata);
+		}
+
+		[Test]
+		public void TripleDESPKCS7_ExactlyOneBlockSize () 
+		{
+			TripleDES tdes = GetTripleDES ();
+			byte[] data = GetData (8);
+			byte[] encdata = Encrypt (tdes, PaddingMode.PKCS7, data);
+			Assert.AreEqual ("23-61-AC-E6-C5-17-10-51-C0-60-5B-6A-5C-B7-69-62", BitConverter.ToString (encdata), "TripleDESPKCS7_ExactlyOneBlockSize_Encrypt");
+			byte[] decdata = Decrypt (tdes, PaddingMode.PKCS7, encdata);
+			AssertEquals ("TripleDESPKCS7_ExactlyOneBlockSize_Decrypt", data, decdata);
+		}
+
+		[Test]
+		public void TripleDESPKCS7_MoreThanOneBlockSize () 
+		{
+			TripleDES tdes = GetTripleDES ();
+			byte[] data = GetData (12);
+			byte[] encdata = Encrypt (tdes, PaddingMode.PKCS7, data);
+			Assert.AreEqual ("23-61-AC-E6-C5-17-10-51-D9-CB-92-8C-76-89-35-84", BitConverter.ToString (encdata), "TripleDESPKCS7_MoreThanOneBlockSize_Encrypt");
+			byte[] decdata = Decrypt (tdes, PaddingMode.PKCS7, encdata);
+			AssertEquals ("TripleDESPKCS7_MoreThanOneBlockSize_Decrypt", data, decdata);
+		}
+
+		[Test]
+		public void TripleDESPKCS7_ExactMultipleBlockSize () 
+		{
+			TripleDES tdes = GetTripleDES ();
+			byte[] data = GetData (48);
+			byte[] encdata = Encrypt (tdes, PaddingMode.PKCS7, data);
+			Assert.AreEqual ("23-61-AC-E6-C5-17-10-51-BF-AB-79-9C-CD-5E-79-40-16-81-0D-6B-40-E6-B2-E9-86-34-8A-9E-5D-56-DA-D1-0C-8C-76-0A-E1-69-A1-0A-B5-B5-7F-FC-5A-D0-6E-6A-73-61-63-1C-58-A2-9C-B3", BitConverter.ToString (encdata), "TripleDESPKCS7_ExactMultipleBlockSize_Encrypt");
+			byte[] decdata = Decrypt (tdes, PaddingMode.PKCS7, encdata);
+			AssertEquals ("TripleDESPKCS7_ExactMultipleBlockSize_Decrypt", data, decdata);
+		}
+		
+		[Test]
+		public void TripleDESZeros_SmallerThanOneBlockSize () 
+		{
+			TripleDES tdes = GetTripleDES ();
+			byte[] data = GetData (7);
+			byte[] encdata = Encrypt (tdes, PaddingMode.Zeros, data);
+			Assert.AreEqual ("B8-5C-5B-A5-06-0B-7E-C6", BitConverter.ToString (encdata), "TripleDESZeros_SmallerThanOneBlockSize_Encrypt");
+			byte[] decdata = Decrypt (tdes, PaddingMode.Zeros, encdata);
+			Assert.AreEqual ("00-01-02-03-04-05-06-00", BitConverter.ToString (decdata), "TripleDESZeros_SmallerThanOneBlockSize_Decrypt");
+		}
+
+		[Test]
+		public void TripleDESZeros_ExactlyOneBlockSize () 
+		{
+			TripleDES tdes = GetTripleDES ();
+			byte[] data = GetData (8);
+			byte[] encdata = Encrypt (tdes, PaddingMode.Zeros, data);
+			Assert.AreEqual ("23-61-AC-E6-C5-17-10-51", BitConverter.ToString (encdata), "TripleDESZeros_ExactlyOneBlockSize_Encrypt");
+			byte[] decdata = Decrypt (tdes, PaddingMode.Zeros, encdata);
+			AssertEquals ("TripleDESZeros_ExactlyOneBlockSize_Decrypt", data, decdata);
+		}
+
+		[Test]
+		public void TripleDESZeros_MoreThanOneBlockSize () 
+		{
+			TripleDES tdes = GetTripleDES ();
+			byte[] data = GetData (12);
+			byte[] encdata = Encrypt (tdes, PaddingMode.Zeros, data);
+			Assert.AreEqual ("23-61-AC-E6-C5-17-10-51-6E-75-2E-33-12-09-5D-66", BitConverter.ToString (encdata), "TripleDESZeros_MoreThanOneBlockSize_Encrypt");
+			byte[] decdata = Decrypt (tdes, PaddingMode.Zeros, encdata);
+			Assert.AreEqual ("00-01-02-03-04-05-06-07-08-09-0A-0B-00-00-00-00", BitConverter.ToString (decdata), "TripleDESZeros_MoreThanOneBlockSize_Decrypt");
+		}
+
+		[Test]
+		public void TripleDESZeros_ExactMultipleBlockSize () 
+		{
+			TripleDES tdes = GetTripleDES ();
+			byte[] data = GetData (48);
+			byte[] encdata = Encrypt (tdes, PaddingMode.Zeros, data);
+			Assert.AreEqual ("23-61-AC-E6-C5-17-10-51-BF-AB-79-9C-CD-5E-79-40-16-81-0D-6B-40-E6-B2-E9-86-34-8A-9E-5D-56-DA-D1-0C-8C-76-0A-E1-69-A1-0A-B5-B5-7F-FC-5A-D0-6E-6A", BitConverter.ToString (encdata), "TripleDESZeros_ExactMultipleBlockSize_Encrypt");
+			byte[] decdata = Decrypt (tdes, PaddingMode.Zeros, encdata);
+			AssertEquals ("TripleDESZeros_ExactMultipleBlockSize_Decrypt", GetData (48), decdata);
+		}
+
+		private Rijndael GetAES () 
+		{
+			Rijndael aes = Rijndael.Create ();
+			aes.Key = CombineKeys (key1, key2, key3);
+			return aes;
+		}
+
+		[Test]
+		[ExpectedException (typeof (CryptographicException))]
+		public void RijndaelNone_SmallerThanOneBlockSize () 
+		{
+			Rijndael aes = GetAES ();
+			byte[] data = GetData (8);
+			byte[] encdata = Encrypt (aes, PaddingMode.None, data);
+		}
+
+		[Test]
+		public void RijndaelNone_ExactlyOneBlockSize () 
+		{
+			Rijndael aes = GetAES ();
+			byte[] data = GetData (16);
+			byte[] encdata = Encrypt (aes, PaddingMode.None, data);
+			Assert.AreEqual ("79-42-36-2F-D6-DB-F1-0C-87-99-58-06-D5-F6-B0-BB", BitConverter.ToString (encdata), "RijndaelNone_ExactlyOneBlockSize_Encrypt");
+			byte[] decdata = Decrypt (aes, PaddingMode.None, encdata);
+			AssertEquals ("RijndaelNone_ExactlyOneBlockSize_Decrypt", data, decdata);
+		}
+
+		[Test]
+		[ExpectedException (typeof (CryptographicException))]
+		public void RijndaelNone_MoreThanOneBlockSize () 
+		{
+			Rijndael aes = GetAES ();
+			byte[] data = GetData (20);
+			byte[] encdata = Encrypt (aes, PaddingMode.None, data);
+		}
+
+		[Test]
+		public void RijndaelNone_ExactMultipleBlockSize () 
+		{
+			Rijndael aes = GetAES ();
+			byte[] data = GetData (48);
+			byte[] encdata = Encrypt (aes, PaddingMode.None, data);
+			// note: encrypted data is truncated to a multiple of block size
+			Assert.AreEqual ("79-42-36-2F-D6-DB-F1-0C-87-99-58-06-D5-F6-B0-BB-E1-27-3E-21-5A-BE-D5-12-F4-AF-06-8D-0A-BD-02-64-02-CB-FF-D7-32-19-5E-69-3C-54-C2-8C-A1-D7-72-FF", BitConverter.ToString (encdata), "RijndaelNone_ExactMultipleBlockSize_Encrypt");
+			byte[] decdata = Decrypt (aes, PaddingMode.None, encdata);
+			AssertEquals ("RijndaelNone_ExactMultipleBlockSize_Decrypt", GetData (48), decdata);
+		}
+
+		[Test]
+		public void RijndaelPKCS7_SmallerThanOneBlockSize () 
+		{
+			Rijndael aes = GetAES ();
+			byte[] data = GetData (8);
+			byte[] encdata = Encrypt (aes, PaddingMode.PKCS7, data);
+			Assert.AreEqual ("AB-E0-20-5E-BC-28-A0-B7-A7-56-A3-BF-13-55-13-7E", BitConverter.ToString (encdata), "RijndaelPKCS7_SmallerThanOneBlockSize_Encrypt");
+			byte[] decdata = Decrypt (aes, PaddingMode.PKCS7, encdata);
+			AssertEquals ("RijndaelPKCS7_SmallerThanOneBlockSize_Decrypt", data, decdata);
+		}
+
+		[Test]
+		public void RijndaelPKCS7_ExactlyOneBlockSize () 
+		{
+			Rijndael aes = GetAES ();
+			byte[] data = GetData (16);
+			byte[] encdata = Encrypt (aes, PaddingMode.PKCS7, data);
+			Assert.AreEqual ("79-42-36-2F-D6-DB-F1-0C-87-99-58-06-D5-F6-B0-BB-60-CE-9F-E0-72-3B-D6-D1-A5-F8-33-D8-25-31-7F-D4", BitConverter.ToString (encdata), "RijndaelPKCS7_ExactlyOneBlockSize_Encrypt");
+			byte[] decdata = Decrypt (aes, PaddingMode.PKCS7, encdata);
+			AssertEquals ("RijndaelPKCS7_ExactlyOneBlockSize_Decrypt", data, decdata);
+		}
+
+		[Test]
+		public void RijndaelPKCS7_MoreThanOneBlockSize () 
+		{
+			Rijndael aes = GetAES ();
+			byte[] data = GetData (20);
+			byte[] encdata = Encrypt (aes, PaddingMode.PKCS7, data);
+			Assert.AreEqual ("79-42-36-2F-D6-DB-F1-0C-87-99-58-06-D5-F6-B0-BB-06-3F-D3-51-8D-55-E9-2F-02-4A-4E-F2-91-55-31-83", BitConverter.ToString (encdata), "RijndaelPKCS7_MoreThanOneBlockSize_Encrypt");
+			byte[] decdata = Decrypt (aes, PaddingMode.PKCS7, encdata);
+			AssertEquals ("RijndaelPKCS7_MoreThanOneBlockSize_Decrypt", data, decdata);
+		}
+
+		[Test]
+		public void RijndaelPKCS7_ExactMultipleBlockSize () 
+		{
+			Rijndael aes = GetAES ();
+			byte[] data = GetData (48);
+			byte[] encdata = Encrypt (aes, PaddingMode.PKCS7, data);
+			Assert.AreEqual ("79-42-36-2F-D6-DB-F1-0C-87-99-58-06-D5-F6-B0-BB-E1-27-3E-21-5A-BE-D5-12-F4-AF-06-8D-0A-BD-02-64-02-CB-FF-D7-32-19-5E-69-3C-54-C2-8C-A1-D7-72-FF-37-42-81-21-47-A7-E0-AA-64-A7-8B-65-25-95-AA-54", BitConverter.ToString (encdata), "RijndaelPKCS7_ExactMultipleBlockSize_Encrypt");
+			byte[] decdata = Decrypt (aes, PaddingMode.PKCS7, encdata);
+			AssertEquals ("RijndaelPKCS7_ExactMultipleBlockSize_Decrypt", data, decdata);
+		}
+		
+		[Test]
+		public void RijndaelZeros_SmallerThanOneBlockSize () 
+		{
+			Rijndael aes = GetAES ();
+			byte[] data = GetData (8);
+			byte[] encdata = Encrypt (aes, PaddingMode.Zeros, data);
+			Assert.AreEqual ("DD-BE-D7-CE-E2-DD-5C-A3-3E-44-A1-76-00-E5-5B-5D", BitConverter.ToString (encdata), "RijndaelZeros_SmallerThanOneBlockSize_Encrypt");
+			byte[] decdata = Decrypt (aes, PaddingMode.Zeros, encdata);
+			Assert.AreEqual ("00-01-02-03-04-05-06-07-00-00-00-00-00-00-00-00", BitConverter.ToString (decdata), "RijndaelZeros_SmallerThanOneBlockSize_Decrypt");
+		}
+
+		[Test]
+		public void RijndaelZeros_ExactlyOneBlockSize () 
+		{
+			Rijndael aes = GetAES ();
+			byte[] data = GetData (16);
+			byte[] encdata = Encrypt (aes, PaddingMode.Zeros, data);
+			Assert.AreEqual ("79-42-36-2F-D6-DB-F1-0C-87-99-58-06-D5-F6-B0-BB", BitConverter.ToString (encdata), "RijndaelZeros_ExactlyOneBlockSize_Encrypt");
+			byte[] decdata = Decrypt (aes, PaddingMode.Zeros, encdata);
+			AssertEquals ("RijndaelZeros_ExactlyOneBlockSize_Decrypt", data, decdata);
+		}
+
+		[Test]
+		public void RijndaelZeros_MoreThanOneBlockSize () 
+		{
+			Rijndael aes = GetAES ();
+			byte[] data = GetData (20);
+			byte[] encdata = Encrypt (aes, PaddingMode.Zeros, data);
+			Assert.AreEqual ("79-42-36-2F-D6-DB-F1-0C-87-99-58-06-D5-F6-B0-BB-04-6C-F7-A5-DE-FF-B4-30-29-7A-0E-04-3B-D4-B8-F2", BitConverter.ToString (encdata), "RijndaelZeros_MoreThanOneBlockSize_Encrypt");
+			byte[] decdata = Decrypt (aes, PaddingMode.Zeros, encdata);
+			Assert.AreEqual ("00-01-02-03-04-05-06-07-08-09-0A-0B-0C-0D-0E-0F-10-11-12-13-00-00-00-00-00-00-00-00-00-00-00-00", BitConverter.ToString (decdata), "RijndaelZeros_MoreThanOneBlockSize_Decrypt");
+		}
+
+		[Test]
+		public void RijndaelZeros_ExactMultipleBlockSize () 
+		{
+			Rijndael aes = GetAES ();
+			byte[] data = GetData (48);
+			byte[] encdata = Encrypt (aes, PaddingMode.Zeros, data);
+			Assert.AreEqual ("79-42-36-2F-D6-DB-F1-0C-87-99-58-06-D5-F6-B0-BB-E1-27-3E-21-5A-BE-D5-12-F4-AF-06-8D-0A-BD-02-64-02-CB-FF-D7-32-19-5E-69-3C-54-C2-8C-A1-D7-72-FF", BitConverter.ToString (encdata), "RijndaelZeros_ExactMultipleBlockSize_Encrypt");
+			byte[] decdata = Decrypt (aes, PaddingMode.Zeros, encdata);
+			AssertEquals ("RijndaelZeros_ExactMultipleBlockSize_Decrypt", GetData (48), decdata);
+		}
+
+		// Enum tests
+
+		[Test]
+		public void PaddingModeEnum ()
+		{
+			Assert.AreEqual (4, (int)PaddingMode.ANSIX923, "ANSIX923");
+			Assert.AreEqual (5, (int)PaddingMode.ISO10126, "ISO10126");
+			Assert.AreEqual (1, (int)PaddingMode.None, "None");
+			Assert.AreEqual (2, (int)PaddingMode.PKCS7, "PKCS7");
+			Assert.AreEqual (3, (int)PaddingMode.Zeros, "Zeros");
+		}
+
+		// SymmetricAlgorithm tests
+
+		private byte[] GetKey (SymmetricAlgorithm sa) 
+		{
+			byte[] key = new byte [sa.KeySize >> 3];
+			// no weak key this way (DES, TripleDES)
+			for (byte i=0; i < key.Length; i++)
+				key [i] = i;
+			return key;
+		}
+
+		private byte[] GetIV (SymmetricAlgorithm sa)
+		{
+			return new byte [sa.BlockSize >> 3];
+		}
+
+		private ICryptoTransform GetEncryptor (SymmetricAlgorithm sa, PaddingMode mode) 
+		{
+			sa.Mode = CipherMode.ECB; // basic (no) mode
+			sa.Padding = mode;
+			return sa.CreateEncryptor (GetKey (sa), GetIV (sa));
+		}
+
+		private ICryptoTransform GetDecryptor (SymmetricAlgorithm sa, PaddingMode mode)
+		{
+			sa.Mode = CipherMode.ECB; // basic (no) mode
+			sa.Padding = mode;
+			return sa.CreateDecryptor (GetKey (sa), GetIV (sa));
+		}
+
+		// the best way to verify padding is to:
+		// a. encrypt data larger than one block with a padding mode "X"
+		// b. decrypt the data with padding mode "None"
+		// c. compare the last (padding) bytes with the expected padding
+		private void ANSIX923_Full (SymmetricAlgorithm sa)
+		{
+			int bs = (sa.BlockSize >> 3);
+			// one full block
+			byte[] data = new byte [bs]; // in bytes
+			ICryptoTransform enc = GetEncryptor (sa, PaddingMode.ANSIX923);
+			byte[] encdata = enc.TransformFinalBlock (data, 0, data.Length);
+			// one block of padding is added			
+			Assert.AreEqual (data.Length * 2, encdata.Length, "one more block added");
+
+			ICryptoTransform dec = GetDecryptor (sa, PaddingMode.None);
+			byte[] decdata = dec.TransformFinalBlock (encdata, 0, encdata.Length);
+			Assert.AreEqual (encdata.Length, decdata.Length, "no unpadding");
+
+			int pd = decdata.Length - data.Length;
+			// now validate padding - ANSI X.923 is all 0 except last byte (length)
+			for (int i=0; i < bs - 1; i++)
+				Assert.AreEqual (0x00, decdata [decdata.Length - pd + i], i.ToString ());
+			Assert.AreEqual (pd, decdata [decdata.Length - 1], "last byte");
+		}
+
+		private void ANSIX923_Partial (SymmetricAlgorithm sa)
+		{
+			int bs = (sa.BlockSize >> 3);
+			// one and an half block
+			byte[] data = new byte [bs + (bs >> 1)]; // in bytes
+			ICryptoTransform enc = GetEncryptor (sa, PaddingMode.ANSIX923);
+			byte[] encdata = enc.TransformFinalBlock (data, 0, data.Length);
+			// one block of padding is added			
+			Assert.AreEqual (bs * 2, encdata.Length, "one more block added");
+
+			ICryptoTransform dec = GetDecryptor (sa, PaddingMode.None);
+			byte[] decdata = dec.TransformFinalBlock (encdata, 0, encdata.Length);
+			Assert.AreEqual (encdata.Length, decdata.Length, "no unpadding");
+
+			int pd = decdata.Length - data.Length;
+			// now validate padding - ANSI X.923 is all 0 except last byte (length)
+			for (int i = 0; i < pd - 1; i++)
+				Assert.AreEqual (0x00, decdata [decdata.Length - pd + i], i.ToString ());
+			Assert.AreEqual (pd, decdata [decdata.Length - 1], "last byte");
+		}
+
+		private void ISO10126_Full (SymmetricAlgorithm sa)
+		{
+			int bs = (sa.BlockSize >> 3);
+			// one full block
+			byte [] data = new byte [bs]; // in bytes
+			ICryptoTransform enc = GetEncryptor (sa, PaddingMode.ISO10126);
+			byte [] encdata = enc.TransformFinalBlock (data, 0, data.Length);
+			// one block of padding is added			
+			Assert.AreEqual (data.Length * 2, encdata.Length, "one more block added");
+
+			ICryptoTransform dec = GetDecryptor (sa, PaddingMode.None);
+			byte [] decdata = dec.TransformFinalBlock (encdata, 0, encdata.Length);
+			Assert.AreEqual (encdata.Length, decdata.Length, "no unpadding");
+
+			int pd = decdata.Length - data.Length;
+			// now validate padding - ISO10126 is all random except last byte (length)
+			Assert.AreEqual (pd, decdata [decdata.Length - 1], "last byte");
+		}
+
+		private void ISO10126_Partial (SymmetricAlgorithm sa)
+		{
+			int bs = (sa.BlockSize >> 3);
+			// one and an half block
+			byte [] data = new byte [bs + (bs >> 1)]; // in bytes
+			ICryptoTransform enc = GetEncryptor (sa, PaddingMode.ISO10126);
+			byte [] encdata = enc.TransformFinalBlock (data, 0, data.Length);
+			// one block of padding is added			
+			Assert.AreEqual (bs * 2, encdata.Length, "one more block added");
+
+			ICryptoTransform dec = GetDecryptor (sa, PaddingMode.None);
+			byte [] decdata = dec.TransformFinalBlock (encdata, 0, encdata.Length);
+			Assert.AreEqual (encdata.Length, decdata.Length, "no unpadding");
+
+			int pd = decdata.Length - data.Length;
+			// now validate padding - ISO10126 is all random except last byte (length)
+			Assert.AreEqual (pd, decdata [decdata.Length - 1], "last byte");
+		}
+		private void PKCS7_Full (SymmetricAlgorithm sa)
+		{
+			int bs = (sa.BlockSize >> 3);
+			// one full block
+			byte[] data = new byte [bs]; // in bytes
+			ICryptoTransform enc = GetEncryptor (sa, PaddingMode.PKCS7);
+			byte[] encdata = enc.TransformFinalBlock (data, 0, data.Length);
+			// one block of padding is added			
+			Assert.AreEqual (data.Length * 2, encdata.Length, "one more block added");
+
+			ICryptoTransform dec = GetDecryptor (sa, PaddingMode.None);
+			byte[] decdata = dec.TransformFinalBlock (encdata, 0, encdata.Length);
+			Assert.AreEqual (encdata.Length, decdata.Length, "no unpadding");
+
+			int pd = decdata.Length - data.Length;
+			// now validate padding - PKCS7 is all padding char
+			for (int i = 0; i < bs; i++)
+				Assert.AreEqual (pd, decdata [decdata.Length - pd + i], i.ToString ());
+		}
+
+		private void PKCS7_Partial (SymmetricAlgorithm sa)
+		{
+			int bs = (sa.BlockSize >> 3);
+			// one and an half block
+			byte[] data = new byte[bs + (bs >> 1)]; // in bytes
+			ICryptoTransform enc = GetEncryptor (sa, PaddingMode.PKCS7);
+			byte[] encdata = enc.TransformFinalBlock (data, 0, data.Length);
+			// one block of padding is added			
+			Assert.AreEqual (bs * 2, encdata.Length, "one more block added");
+
+			ICryptoTransform dec = GetDecryptor (sa, PaddingMode.None);
+			byte[] decdata = dec.TransformFinalBlock (encdata, 0, encdata.Length);
+			Assert.AreEqual (encdata.Length, decdata.Length, "no unpadding");
+
+			int pd = decdata.Length - data.Length;
+			// now validate padding - PKCS7 is all padding char
+			for (int i = 0; i < pd; i++)
+				Assert.AreEqual (pd, decdata [decdata.Length - pd + i], i.ToString ());
+		}
+
+		private void Zeros_Full (SymmetricAlgorithm sa)
+		{
+			int bs = (sa.BlockSize >> 3);
+			// one full block
+			byte [] data = new byte [bs]; // in bytes
+			for (int i = 0; i < data.Length; i++)
+				data [i] = 0xFF;
+
+			ICryptoTransform enc = GetEncryptor (sa, PaddingMode.Zeros);
+			byte [] encdata = enc.TransformFinalBlock (data, 0, data.Length);
+			// NO extra block is used for zero padding
+			Assert.AreEqual (data.Length, encdata.Length, "no extra block added");
+
+			ICryptoTransform dec = GetDecryptor (sa, PaddingMode.None);
+			byte [] decdata = dec.TransformFinalBlock (encdata, 0, encdata.Length);
+			Assert.AreEqual (encdata.Length, decdata.Length, "no unpadding");
+
+			// now validate absence of padding
+			Assert.AreEqual (0xFF, decdata [decdata.Length - 1], "no padding");
+		}
+
+		private void Zeros_Partial (SymmetricAlgorithm sa)
+		{
+			int bs = (sa.BlockSize >> 3);
+			// one and an half block
+			byte [] data = new byte [bs + (bs >> 1)]; // in bytes
+			for (int i=0; i < data.Length; i++)
+				data [i] = 0xFF;
+
+			ICryptoTransform enc = GetEncryptor (sa, PaddingMode.Zeros);
+			byte [] encdata = enc.TransformFinalBlock (data, 0, data.Length);
+			// one block of padding is added			
+			Assert.AreEqual (bs * 2, encdata.Length, "one more block added");
+
+			ICryptoTransform dec = GetDecryptor (sa, PaddingMode.None);
+			byte [] decdata = dec.TransformFinalBlock (encdata, 0, encdata.Length);
+			Assert.AreEqual (encdata.Length, decdata.Length, "no unpadding");
+
+			int pd = decdata.Length - data.Length;
+			// now validate padding - Zeros is all 0x00 char
+			for (int i = 0; i < pd; i++)
+				Assert.AreEqual (0x00, decdata [decdata.Length - pd + i], i.ToString ());
+		}
+		// ANSI X.923
+
+		[Test]
+		public void DES_ANSIX923_Full ()
+		{
+			ANSIX923_Full (DES.Create ());
+		}
+
+		[Test]
+		public void DES_ANSIX923_Partial ()
+		{
+			ANSIX923_Partial (DES.Create ());
+		}
+
+		[Test]
+		public void RC2_ANSIX923_Full ()
+		{
+			ANSIX923_Full (RC2.Create ());
+		}
+
+		[Test]
+		public void RC2_ANSIX923_Partial ()
+		{
+			ANSIX923_Partial (RC2.Create ());
+		}
+
+		[Test]
+		public void Rijndael_ANSIX923_Full () 
+		{
+			ANSIX923_Full (Rijndael.Create ());
+		}
+
+		[Test]
+		public void Rijndael_ANSIX923_Partial ()
+		{
+			ANSIX923_Partial (Rijndael.Create ());
+		}
+
+		[Test]
+		public void TripleDES_ANSIX923_Full ()
+		{
+			ANSIX923_Full (TripleDES.Create ());
+		}
+
+		[Test]
+		public void TripleDES_ANSIX923_Partial ()
+		{
+			ANSIX923_Partial (TripleDES.Create ());
+		}
+
+		// ISO 10126
+
+		[Test]
+		public void DES_ISO10126_Full ()
+		{
+			ISO10126_Full (DES.Create ());
+		}
+
+		[Test]
+		public void DES_ISO10126_Partial ()
+		{
+			ISO10126_Partial (DES.Create ());
+		}
+
+		[Test]
+		public void RC2_ISO10126_Full ()
+		{
+			ISO10126_Full (RC2.Create ());
+		}
+
+		[Test]
+		public void RC2_ISO10126_Partial ()
+		{
+			ISO10126_Partial (RC2.Create ());
+		}
+
+		[Test]
+		public void Rijndael_ISO10126_Full ()
+		{
+			ISO10126_Full (Rijndael.Create ());
+		}
+
+		[Test]
+		public void Rijndael_ISO10126_Partial ()
+		{
+			ISO10126_Partial (Rijndael.Create ());
+		}
+
+		[Test]
+		public void TripleDES_ISO10126_Full ()
+		{
+			ISO10126_Full (TripleDES.Create ());
+		}
+
+		[Test]
+		public void TripleDES_ISO10126_Partial ()
+		{
+			ISO10126_Partial (TripleDES.Create ());
+		}
+		// PKCS #7
+
+		[Test]
+		public void DES_PKCS7_Full ()
+		{
+			PKCS7_Full (DES.Create ());
+		}
+
+		[Test]
+		public void DES_PKCS7_Partial ()
+		{
+			PKCS7_Partial (DES.Create ());
+		}
+
+		[Test]
+		public void RC2_PKCS7_Full ()
+		{
+			PKCS7_Full (RC2.Create ());
+		}
+
+		[Test]
+		public void RC2_PKCS7_Partial ()
+		{
+			PKCS7_Partial (RC2.Create ());
+		}
+
+		[Test]
+		public void Rijndael_PKCS7_Full ()
+		{
+			PKCS7_Full (Rijndael.Create ());
+		}
+
+		[Test]
+		public void Rijndael_PKCS7_Partial ()
+		{
+			PKCS7_Partial (Rijndael.Create ());
+		}
+
+		[Test]
+		public void TripleDES_PKCS7_Full ()
+		{
+			PKCS7_Full (TripleDES.Create ());
+		}
+
+		[Test]
+		public void TripleDES_PKCS7_Partial ()
+		{
+			PKCS7_Partial (TripleDES.Create ());
+		}
+
+		// Zeros
+
+		[Test]
+		public void DES_Zeros_Full ()
+		{
+			Zeros_Full (DES.Create ());
+		}
+
+		[Test]
+		public void DES_Zeros_Partial ()
+		{
+			Zeros_Partial (DES.Create ());
+		}
+
+		[Test]
+		public void RC2_Zeros_Full ()
+		{
+			Zeros_Full (RC2.Create ());
+		}
+
+		[Test]
+		public void RC2_Zeros_Partial ()
+		{
+			Zeros_Partial (RC2.Create ());
+		}
+
+		[Test]
+		public void Rijndael_Zeros_Full ()
+		{
+			Zeros_Full (Rijndael.Create ());
+		}
+
+		[Test]
+		public void Rijndael_Zeros_Partial ()
+		{
+			Zeros_Partial (Rijndael.Create ());
+		}
+
+		[Test]
+		public void TripleDES_Zeros_Full ()
+		{
+			Zeros_Full (TripleDES.Create ());
+		}
+
+		[Test]
+		public void TripleDES_Zeros_Partial ()
+		{
+			Zeros_Partial (TripleDES.Create ());
+		}
+
+		// Padding mismatches
+
+		// the best way to test bad padding is to:
+		// a. encrypt data larger than one block with a padding mode "X"
+		// b. decrypt the data with padding mode "Y" (different with Y)
+		// c. check if the "bad" padding was removed correctly
+		//
+		// returns (bitmask)
+		// 1 - length difference
+		// 2 - original data lost
+		// 4 - CryptographicException thrown while decryption
+		private int Mismatch (PaddingMode encrypt, PaddingMode decrypt)
+		{
+			SymmetricAlgorithm sa = SymmetricAlgorithm.Create ();
+			int bs = (sa.BlockSize >> 3);
+			// one full block
+			byte [] data = new byte [bs]; // in bytes
+			ICryptoTransform enc = GetEncryptor (sa, encrypt);
+			byte [] encdata = enc.TransformFinalBlock (data, 0, data.Length);
+
+			int result = 0;
+			try {
+				ICryptoTransform dec = GetDecryptor (sa, decrypt);
+				byte [] decdata = dec.TransformFinalBlock (encdata, 0, encdata.Length);
+				
+				if (data.Length != decdata.Length)
+					result += 1;
+
+				for (int i=0; i < data.Length; i++) {
+					if (data [i] != decdata [i]) {
+						result += 2;
+						break;
+					}
+				}
+			}
+			catch (CryptographicException) {
+				result += 4;
+			}
+			return result;
+		}
+		[Test]
+		public void ANSIX923_ISO10126 () 
+		{
+			Assert.AreEqual (0, Mismatch (PaddingMode.ANSIX923, PaddingMode.ISO10126));
+		}
+
+		[Test]
+		public void ANSIX923_None ()
+		{
+			Assert.AreEqual (1, Mismatch (PaddingMode.ANSIX923, PaddingMode.None));
+		}
+
+		[Test]
+		public void ANSIX923_PKCS7 ()
+		{
+			Assert.AreEqual (4, Mismatch (PaddingMode.ANSIX923, PaddingMode.PKCS7));
+		}
+
+		[Test]
+		public void ANSIX923_Zeros ()
+		{
+			Assert.AreEqual (1, Mismatch (PaddingMode.ANSIX923, PaddingMode.Zeros));
+		}
+
+		[Test]
+		public void ISO10126_ANSIX923 ()
+		{
+			Assert.AreEqual (4, Mismatch (PaddingMode.ISO10126, PaddingMode.ANSIX923));
+		}
+
+		[Test]
+		public void ISO10126_None ()
+		{
+			Assert.AreEqual (1, Mismatch (PaddingMode.ISO10126, PaddingMode.None));
+		}
+
+		[Test]
+		public void ISO10126_PKCS7 ()
+		{
+			Assert.AreEqual (4, Mismatch (PaddingMode.ISO10126, PaddingMode.PKCS7));
+		}
+
+		[Test]
+		public void ISO10126_Zeros ()
+		{
+			Assert.AreEqual (1, Mismatch (PaddingMode.ISO10126, PaddingMode.Zeros));
+		}
+
+		[Test]
+		public void None_ANSIX923 ()
+		{
+			Assert.AreEqual (4, Mismatch (PaddingMode.None, PaddingMode.ANSIX923));
+		}
+
+		[Test]
+		public void None_ISO10126 ()
+		{
+			Assert.AreEqual (4, Mismatch (PaddingMode.None, PaddingMode.ISO10126));
+		}
+		[Test]
+		public void None_PKCS7 ()
+		{
+			Assert.AreEqual (4, Mismatch (PaddingMode.None, PaddingMode.PKCS7));
+		}
+
+		[Test]
+		public void None_Zeros ()
+		{
+			Assert.AreEqual (0, Mismatch (PaddingMode.None, PaddingMode.Zeros));
+		}
+		[Test]
+		public void PKCS7_ANSIX923 ()
+		{
+			Assert.AreEqual (4, Mismatch (PaddingMode.PKCS7, PaddingMode.ANSIX923));
+		}
+
+		[Test]
+		public void PKCS7_ISO10126 ()
+		{
+			Assert.AreEqual (0, Mismatch (PaddingMode.PKCS7, PaddingMode.ISO10126));
+		}
+		[Test]
+		public void PKCS7_None ()
+		{
+			Assert.AreEqual (1, Mismatch (PaddingMode.PKCS7, PaddingMode.None));
+		}
+
+		[Test]
+		public void PKCS7_Zeros ()
+		{
+			Assert.AreEqual (1, Mismatch (PaddingMode.PKCS7, PaddingMode.Zeros));
+		}
+		[Test]
+		public void Zeros_ANSIX923 ()
+		{
+			Assert.AreEqual (4, Mismatch (PaddingMode.Zeros, PaddingMode.ANSIX923));
+		}
+
+		[Test]
+		public void Zeros_ISO10126 ()
+		{
+			Assert.AreEqual (4, Mismatch (PaddingMode.Zeros, PaddingMode.ISO10126));
+		}
+		[Test]
+		public void Zeros_None ()
+		{
+			Assert.AreEqual (0, Mismatch (PaddingMode.Zeros, PaddingMode.None));
+		}
+
+		[Test]
+		public void Zeros_PKCS7 ()
+		{
+			Assert.AreEqual (4, Mismatch (PaddingMode.Zeros, PaddingMode.PKCS7));
+		}
+
+		// MACTripleDES tests
+		private string MAC (PaddingMode padding, int length)
+		{
+			byte[] key = new byte [24] { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+			MACTripleDES mac = new MACTripleDES (key);
+			mac.Padding = padding;
+			byte[] data = new byte [length];
+			byte[] hash = mac.TransformFinalBlock (data, 0, data.Length);
+			string result = BitConverter.ToString (mac.Hash);
+			return result;
+		}
+
+		// Note: TripleDES block size is 8 bytes
+
+		[Test]
+		public void MACTripleDES_ANSIX923 () 
+		{
+			Assert.AreEqual ("F6-61-3E-C8-E4-A4-D1-A8", MAC (PaddingMode.ANSIX923, 8), "Full");
+			Assert.AreEqual ("62-C3-78-B0-27-FC-EB-E0", MAC (PaddingMode.ANSIX923, 4), "Partial");
+		}
+
+		[Test]
+		public void MACTripleDES_ISO10126 ()
+		{
+			// ISO 10126 use random in it's padding so we can't use it to get "repeatable" results
+			// (i.e. each call will get different result). This isn't a padding to use for MACing!!!
+			Assert.AreEqual (23, MAC (PaddingMode.ISO10126, 8).Length, "Full");
+			Assert.AreEqual (23, MAC (PaddingMode.ISO10126, 4).Length, "Partial");
+		}
+
+		[Test]
+		public void MACTripleDES_None ()
+		{
+			Assert.AreEqual ("46-34-5C-8E-EB-DC-74-5C", MAC (PaddingMode.None, 8), "Full");
+		}
+
+		[Test]
+		[ExpectedException (typeof (CryptographicException))]
+		public void MACTripleDES_None_Partial ()
+		{
+			// Illegal - must be a multiple of block size
+			MAC (PaddingMode.None, 4);
+		}
+
+		[Test]
+		public void MACTripleDES_PKCS7 ()
+		{
+			Assert.AreEqual ("17-71-9F-D5-0B-EF-1D-07", MAC (PaddingMode.PKCS7, 8), "Full");
+			Assert.AreEqual ("5B-3A-13-6F-3F-6F-13-22", MAC (PaddingMode.PKCS7, 4), "Partial");
+		}
+
+		[Test]
+		public void MACTripleDES_Zeros ()
+		{
+			Assert.AreEqual ("46-34-5C-8E-EB-DC-74-5C", MAC (PaddingMode.Zeros, 8));
+			Assert.AreEqual ("46-34-5C-8E-EB-DC-74-5C", MAC (PaddingMode.Zeros, 4));
+		}
+
+		// https://bugzilla.novell.com/show_bug.cgi?id=366623
+
+		[Test]
+		public void ANSIX923_366623 ()
+		{
+			TripleDES algo = GetTripleDES ();
+			algo.IV = new byte [algo.BlockSize >> 3];
+			algo.Mode = CipherMode.ECB;
+			algo.Padding = PaddingMode.ANSIX923;
+
+			ICryptoTransform enc = algo.CreateEncryptor ();
+			byte[] data = new byte [2] { 0xff, 0xff };
+			byte[] encdata = enc.TransformFinalBlock (data, 0, 2);
+			ICryptoTransform dec = algo.CreateDecryptor ();
+			byte[] decdata = dec.TransformFinalBlock (encdata, 0, encdata.Length);
+			Assert.AreEqual (data, decdata);
+		}
+	}
+}
+                                                                                                   PK
+     œ0F            	   META-INF/PK
+    ›0F|nİ©S  ;     META-INF/MANIFEST.MF…T]oÚ0}”ÿ`ñ´JÄ$]ª>”‡VP¡¶›&íaòœ[bjlÏvüûİš”AÕ‡H‰ï¹>çÜÌ˜Ïà|ô¬Ze$¡q\[^ˆ
+lw<—°)y„Áæ!ÆÛŒ\Æ 3V"ãRå0¡\ãRHß –àìòè.©{hü{”„ÁíÊHXòÌc;l«rm32áRTÛ‰Èx¿=İø•¦X¯Jãä<N’/aPZ™‘Â{“ëõšBWm°ÜÕšlŒ¶>š3şÂµ°B7+yY:pÙUï8Xz!©ÅK§KË¡ÿ„ë•Ñ
+G~ õCXçT´IÂ9¨c›ş’UlÓ|fŞım” M­q½ËjGÌU¯!¦W3_+İHæœa¾Èƒ'­‘¥±Ê£„&çµø{Ø=[!!ç$ËÈÏÙ”ÔÃ/Àµ ø[
+ùd¼¬å˜¨JX­jy0g}œ`áQ×\›­‹£í+ùÄÏHÇj7$3T„ŒÙÊ•Òµ s¤‚L}NÛBÿYd?èÜê%pÿõ9êO™ó3‹g9ºq˜&Ãóôóh.Ú
+³ı†´•Ò6ô·Âøæø	 ‘Œ SİÀSÁA98p$k§1¤Ü…İ`z{3¹GÖR÷ß`QÓ×O®yY3í`dT%15…iäÀÔ§-sì³Î1¿.lØOâ³Ş‡>L;Ê©?tú	‡»µ[,LÁ:'³^ãx:›>nW42¼óôÉ%ïTÕüûÃô£GüPK
+     š0F               org/PK
+     š0F               org/eclipse/PK
+     š0F               org/eclipse/jetty/PK
+     ›0F               org/eclipse/jetty/xml/PK
+    ›0Fö?Kòñ  U  1   org/eclipse/jetty/xml/XmlParser$NoopHandler.classTëRÓ@ş6M	-¡ÜAD.¢¤åT¼@AE£Öağ.íZ‚iZ“Ô©/àCøşvF¼ığ|(Ç³!Ëx)š™äœ=—ï|çìn¾}ÿòÀe¬$ĞŠ‰$˜”Ú”üL'ab&‰‹¸ÔF!³®h¸ÊßqDİ×pA»Ë¢-\}İq„»bsÏC:WqK¦(ØVÕæ¾ğıWf½l›Ûeûw=á…™Y†–¢¨ú{lşåÍ0Œ4C™–cù‹FÓècJo1¨+•¢`èÈYØ¬•w…û˜ïÚdéÎU
+ÜŞâ®%×¡Q•œÚ6+•j4©¦Â©U•æèùÜõWmQ-¹}ş’›6wJfŞw-§”=–E—å<^7—}2îÖ|áÍÅj®%;ù%‰!aËö6y™ºŠ¿%§tj¯ïO˜ÉÕz¶Ğª8†ë´N1jaî?[TÛó>/<ßàÕpÒÉ|¥æÄš%©h”Ó2YGºuô`NG)èÔ0¯#‹7t,â¦†%Ë¸Å0ñ»Ã0ÚØú°«ÂõÌÛâ¯Ù~4~ÌF£l„Ë/oGã£Í1dßCM h¼Pİ”º+KÍ:p=°V“'+GWià/n:•%áooä	^”Ë~#}ä0D.:ù[C—'ü•ŠãÓ™ˆæ0d9ê¦€aú%è£—öò¡m:;ån‡œ &í>”ÀÒ‘™8 Ë|„’™<@ì™ôÒ7%İl	6ËâÙzÉ'aûp:,0@q
+AÁ I	Ì)/N²-óä=TõéÔŸ I	À–dËàìahØ†³"8©“¦Úi±@Å9¨#]¥¨óô^ÀxXø5Å¨$Õ}ƒ~ìâĞBZì34oÑ~Èª²Š¬ºe[ƒÆî`­cœİØeñ"vFÄÎˆØ!;#à¤&Ø)HgĞTQ¨:ÉV’ıP~ PK
+    ›0FÖŠHÛ  &  ,   org/eclipse/jetty/xml/XmlParser$Node$1.class•U]SU~6'aÉº@ÊG?¤hHĞRŠ…R¤•š„¶¡Xª¶]–3Éâf7înúCœáÖ/ìE;#Ğ±3¢7½ğOø?G}Ï&“¤cföœ÷¼çıx÷¼çä÷¿şÀ$6ÃèÃŒfôcNH×Å0¯ Œ7°(†›2>še·p[!ƒOd¬(èÂœŒ;øTA2BŸ•‘“±*ã®I§oEBè‰eoq	Áœ?©+–Å%Ss]îJÉØN!ÍuÓ(»<½Í=ïYz·d¦–Ì»šãr'.Üf%È;š÷´‚„ŞÌ¶¶£¥MÍ*¤ócXÚîğŠ†Ÿ aÎ°o^Âl¢½Ğ'£®Ú%mOÆ°x®RÚäÎš¶ir‘İÖ5s]s±®)ƒ"»Hh/iü²`TÔÜßõ$°Äè#*–EŸı6¿ÕÍm®{dÜ•÷4ı«¬Vö3R)©å;'£í•qÊãğ’½ÃıœD³Ÿœ[dç‚¥y‡s'ªšŠg˜é;šg;sía˜§àJŞ®8:¿eˆÊu×ÆEPªø²¥›¶Kçå^ÑŞRqyƒ¸ â]DUáŠŠÓ8£â¬Ğ­áŒuŸá¡Š<’ñ¹„x;`T|/e<VñOU\BBB¬Á,gç+zqÙä%nyË»:/{†MGt©Q–[)—mÇã[«eQ2h²ìÊÙ^¬n!k*Æ‘¦®o¯I$D×Úãdñ%ô5ìÖŠıMµ-;ºA"Ñ¢Ï[œ£8M×¹ëÆ§&è:]oó5ÇZtíYÆpE'õµPSëºÆ·Õ¤‚8©+-[qè?Ò7ğ^xgşŞ·‘ÈqİşuE3]ï$:qkZv1zûé=@ŞZjWˆu,‰ˆFöçA±Fˆ¾!òp‘¤›€ÑÜŸLíCJí#<K²}_’>€÷hThëA7‹à}Z«äM>ˆcâ¢n®Åûƒ¢‰xzò'„Ş |N‚ô
+op¤`mu ù{Ü¨-„ş ™Ôoï!šúá,éc¯ à=(—µA–Á§í‡~dÏ)óá]!@`§!³3³³ˆ³ó˜d0Ã¢X`ƒÈ²î³‹Xcq<fÃĞØˆO#FşT´Q*L€ş¢RHÒ'¨é5jc>Yşwd|ğ§OœîTìw5²ÓÉ¨{8'8g’am M½x®CteíŒ‰ªRÈa£”n¸Nh2‰ãD(•]Å)6…(›À0É)’g0İTF z[Æm\¦šT1^¥ÂPyŞÈ!NÕµCì°¹¦pJ5\d‘XNÖ"¶b/D,{_sîirÕ°)©°šÂ5Æ‡¾6Œp¤^Ò…±„sÿşï_PK
+    ›0FËZœ  Ø  /   org/eclipse/jetty/xml/XmlParser$Attribute.classQÛJ#A=5™d2qŒn¼®waa“(ÎƒŠ°‚\A	ú$l“0™,3 ¥ ,ìƒàoxyğÅ?X¬î„,¬eèªêSuNUMßııs`«9¤ñÙ…9mæ,:X"¤Ï"Ñ’„B¥)ºÂEÔğTD-Bæ¬+Âg3ÛA¨Â×âÛº·H©J°wÛ?˜9V	"yĞiÕd|,j¡éÔ®‹°*â@ßû ­~	Áı¦X¡ÖQyûQ$ãİP$‰äÔZ¥7|Yƒ_‰ô›R©ÿ¼ú'­ğPÄ‰Œ¿¸<9E|º§!ÕYp²X¶b–ª½%sGíN\—{(?ĞİĞ,.–=dàxÈÂq°B(}x Âø¿ÖßkMYW„TQÿ¦åwD°Ê¯•æ'´øãö&ÊŸâã"ÂG§Œkd¬üT^»U^¿AêÊ<¶İÃ¦¸ôˆ<=a”ñ•y|LT`y2ÑGÇ“˜ê·ñÙë\º|ër Ñ =A¯WĞ$L%§ş'¿![˜1vãìõª6x.÷PK
+    š0F´!h0Ö  ö   '   org/eclipse/jetty/xml/configure_6_0.dtdíYmoÛÈşÎ_1e`À9Ètl Àµ–tĞÙŠO­í¸–\PôÃŠ\ILù¢.W…Óı÷ÎÌîR$-Êrz-p@ƒäâîÎÎË3ÏÌ.»?<¥	<JUÄyÖóÏ‚w>È,Ì£8›÷üÑøÃÉ÷ßÿñO'gş}ÏëşáäÄ›,âğ¯^Hˆòp•ÊLƒ^/ñ—,B/u®`†ÿp‚—«y Ã$^2ø9M.ólÏWJhÜÂDE 0Ò ’$ÿZ€€/âQ@>ı"CšÃTz¡]##˜®ák¬8­ÿZ¡šòŒ¥îÀı
+…d\¢$‰$­Höd!	ZÌQ¸’^*–K„’S©yT êA–T·„Ê–¢@[X¹?{@7ÈD*{şDÚï?Šd%»§ø¾µ?½Ô šfû<Ó{AbHİ]bğ}‹˜å
+EğÜNMl$i–Ô¨¹GİSšÒßJÒum¼OôÄñL™<âc*Ö7÷Ğ$¡É‘*)4p<(Òİ;ùµO½’z¥2©<Åpu
+8”û‘”Tèpaâ!Ôœ¡Ä¸}¡AÎG¸ßr©r.:0]¨^ÊKÆ³%Ä3\Äâ›Y«ÂE,e„;œ0x‡w“Ñä3Áå‡»÷£kğ1h›kü‡^ß†´aó g›Rb½¹ËÍ½Ê—Réµß¯
+ø4¸ù8ÿÍıåÕ`2`-ëÇëBËÔI©Š«Ê›|¾&“ğ9‘X*¼İŞßŒ†WàC(õ`¬¦åær!”µT›ñı³ùq­åf”i9ÇW79Îø1Ï)²Íû$zs•¯¦‰Ü„¸lSğŠ)­ˆ3½IhöÔÎñìÈÌşøpƒ2¥D‘’EQ>ßÓzxÃ¹K°rnÅ«ôåÍ`<6&ñT¸»|øëğ®´
+ª…¤uşÃğoGÏÜn­ËX‹—¦Û]ÛVíVêjø~ğñfbDr&V‰n§¹Í•™G/ÉvzîZQµÁ²®cN	CCnAˆUˆ·´g’Ô¥†7>E²t<‡S¼Pdõ4gŠ#N)7ãu=?ÌÓ@„©n×—ôÆïC€Ôâfö=‹ƒ›á-Ú[ÇG&İ.Ş~Ç@soFãêŒ£&f.ğÕ•y(@Ä[7İ™‹œ^0ƒ@H\ÈOHº˜–ä‰‘ĞIäÈ>\)E+3Hœd
+å
+’/©8‰ÄÔ4¡1çv,a­
+ÃVH”ÆÒnå™­Íø-‹›Ç2£===uèufTûùéÉ©†ƒ$³ƒ:z´gZ]íÍ.Áx±aÈfù*CbPí+ı@áÄXjgÀìZ>qU<5ÕØ¾u\îHÚÃ²šã°*ë&+äQ,}Dj@Vë@È: uxhl–»ÍÈ]¨tÉÉÖâ¯‹XK¯XŠ‡ÑiJf!•ç³­Zì¹X;°a²ÅËÄ{¥n¸bÍ±Qd
+tÁ´X c°\Hüş"9ØÕh[\²µ·­¤)Vã=ÛP˜)£m45%NP_RhìYBŠD¹ì1¹‘	Ø'±ÇpÄEâ°§Á#GCtGı»Ò Dÿõ«Ğ?ÿFôW­ßôyi<G~?Ìç¯„9ğy+Ì¯[`Ş[×v,€«ˆCE[ê-_Ù«`8+É•ŒëW#dë¤ÒñM|Ğ
++VÑqİ@Ç!ÌH½äáØÀ>²Ôo:ÖQé
+°8]–5Eö3ˆzDÖs9€vÜxÂTÚëŸ”­H«ìñİÔÊ!ÅÔE‚ Y4èÕ¨"AVÆtæÍn.óZ¹~Ï\VÇ¹ª•hp7ÿl{ËˆÂWÓX+¡ÖpíÖÀ2ğ²VK‘u´ƒ@¨ğjH¨Ÿ
+kRÍsÜ«O{ƒ@A0Ö0¯É ¹Šç1ÁœC=•9¤ÅQÏÏÏıÚaú­ííÌœØø%Õ‰ê‘OMçæ é=Ôyeˆ&Å(ƒS5§=?vËÏ¡ùYõĞwÆ'Çü¼q2=çÃ õïë8ÏĞe£$1ÇhÎw
+×½­u€4å0¶+±IaİMìÏãŒÚ4XæEl‰Æ*İ…D=¦ôNJĞ$¥¬Š²ÿ³Ò~V"Wµ²îh…¶ØØ²úªö‰©‡PJwL9İd¸ÄV{4f);FxÆ­=€ªÙXLÊƒÔ%‘Äz˜ğ¼&Lª»Úh]/ë¤çµÎFÇ¯ÂÊ…ZE(“!9ã7ãÂÃX°ÔúYCµÕItcÎóÛ‘‡ğŸŞÉtİt ı!û‘ZÍëT¸eÂO%ÖÁK¶ì'3šq´¹äl?n‘¸”|ŒóU‘¬ËûµÚ½¤’3©(Z\jbnIìËøÆ¹²a%°´%6]›—şa‹#Vw+I:nó(Õ¯Iªu@‰õ·ğ€à…;h`¿—ê,Ğ(/€İòŒîw ó‘@œ=V‹á ãi›OæA"²y`nm0H¶IªwİSş±}Í™iSòùògéh"WJ¡—¸}{òÙkÊ¿ÿ=n²¯|ñ˜¼{çw*Ûd„_›‰gL=¦½ëè0µšÑ<Ñyå‚=îïh¸	÷0ÓjÍ.öx»Ã­`â·AJ9u»uOYV|P\RŸD±ÀßÇÄÃ©ùÈaUlÈ3j&iÇ¼u ô¾‚‰ík Õ¡ÿ¼-Ã¡»Ì@òzWñ£‡ÊÏOÿyY…À+/øPš·»İl¿Ğ{Önzmí&¼Ünz{ÛMx¹İôö¶›°¿İdÏµö›<º—<Œ{Àùg?‘üåÓ­õ'Öp^Àï¶h£5ô!
+-ó©T‚u­ì:<×¯ø—NÓò&»zåâ¹Ïå‰ç?Æ˜Ü˜Öò8ªeİMîÙ/ˆpº¯3r‚¹ÔNÖó˜ËÓúÎÃÛûÉçÚıi}¼z|¬|®ÙÑÉí­Æ@NGş·Al±ø_ì÷œ‰•v¯‚±T˜‡¶Í(/6¾DÓpİÎ•»ßÀœS|Wh¨p”3+Í¾½ÍÀ·Y³S,•hm_‰PK
+    š0F.Õ^#$	  Ì"  '   org/eclipse/jetty/xml/configure_7_6.dtdíYmoÛFşÎ_1ÇÀ€]Ètlà€ö,¹PmÅUÏog)AƒÃ}XQ+‰9¾¨Ë•b¡êïÌìòÕ¤,§¹.HZŠ»;;/Ï<3»ì~ÿ…°–*’¸çzo]±ŸLƒxŞs‡£ûão¿ıûwÇ§î÷ÓıÛñ±3^)à_½0MüU$cz³Ä_2õU°Ô‰‚şÃ	N¢æôÃ`™Jïç(¼LâY0_)¡q7ğC‘¦ÀPƒÃäs
+>‰µ€dòIú(4‰t|»FNa²Ï^à´Tş²B5%$3Iİ‡
+‰§p‰’@†’´"Ùã…L%h1GáJ:‘X.QJ¤^$ÓP²¤¼%”¶)ÚÂÊıÃq º¸@,"ÙsÇ2ÕîÅZ„+Ù=Á÷PùÓëIõR©iæ¡Ë3İ£sCê6‰Á÷-b–+Ás;Il°‘¤YR·¯æ™8zìĞ”‹B’®jã| 'g”Êp‘ØÔÜ`ÜC“„&G‚¯¤Ğ8Àñ Hwïäçr4`è•Ô+ãğL%†«kTÀQ/ß¤DBû¡æ%ˆÀíSr†8Âı–K•ÑÉÊ@-u"Ö0]J?˜(!˜á"GØŒ\å/¹–SÜñø˜Á;¸Çá .ïïŞ¯ÁÅ m¯ñz}KnÑ†í£œmûJ‰ÍöV,·*YJ¥7îEYÀ‡şÍû¸o.¯úã>ËhY?Ú¤ZF™”í ^—E–e?>úãñ#¸œL,Şon†ƒ+pá(ı`¤¦æör!”ğµTÛÑ}´ıa£åvk9ÇW7	Îø!IB)âí»0z{•¬&¡Üú¸l›òŠ	­b½iöÄÎñì©™ışñeJİŸN•LÓüùÖÃÎ_‚ƒK¦X¥/oú£‘1‰§ÂİíøşŸƒ»Ü*4ª–Öùƒ½>>[p×¿µ.c-^šnwm[Õ¬ÔÕà]ÿıÍØ,˜Ê™X…ºœú6Wfr0}Iv¦gÓŠ²–y3ö”00çUÈX%ˆzK}&Q³ô0ãÆ§H˜×áÇq5Õ™æˆWòÍx]Ïõ“È~$½ÛÍ%½q/Àó<@zÉf^87ƒ[´
+‡&åÎ¾a ¹7ÃQyÆA3çøêÊ<ä ò­š™‹¼2‹€O|ÈOH¼˜–è‰•Ğá4#|¥­4Î q’i”«H²¤%BS×„ÆœCê±¤µJc!Y7J»•c¶ò`8ã·,n¬eL!zzzêĞëØ¨öóÓS¦’ÌêèĞ:œiuµ#4»ãEä†!›%«É­Oõ/÷…c©E3<hùÄ•ñÄTdû6ãóŒ¨,­	«¼vBºB.ÅòGÄÖd¶TÉ¬RûƒÆÆI¶¹•ÎyÙZüyhé¤Káó0º3ŠÈ,¤ódV¨Åtf"L¶`Úa'×Wl8b:5E:eZLÑ1X2$ş‘ìl´-0ñÆ)êiŠ•ÁxÏ6&AòhMM™Ô›¤ûŸ"‘G.^'>73^û$ö¸PœCö4xÑ=£şó¦4ÈÑı*ôÏ¿ıeë>ÏçÈï†ùü•0Ç">o…ùuÌ[`›u…`Æ*âFÑ–jÛ—÷+˜™•äJFÈõ«R8)w|$´ÄŠet\×Ğ±3R?¹?6°—ÌõkÂCÇ:*ZaDË¼¦HÀQÈša.{ĞG˜ªC{ı—²i•=ŞL­RL]$šEƒN…(då~LgŞ4s™ÓÊeğWæ²*¾ÈU­üCƒÍüSô–…)®&VBmJàÚ¬À2ğ RD«¥Èf´ƒ@(Ÿò*H¨+RÍ1sÜ©N{ƒ@…A0Ö0§Î ‰
+æÁœC=•9¨Ó›œ¹•õ[Å¡íÔœÚø%Õ‰ò!‘ONgæ°é€=Ø9yˆ&(ƒS5¡=ï»%gĞƒä´|ğ;åÓcrV;ñĞú÷uœgè²Ö ’˜C4ç›N‰ë* MÙírlRX›¡‰ıyS›Ë$,Ñd'ËìR¢‚Súö'%¨“R\FÙÿYi7+‘«ZY‰Z¡;¡¯Z`/’˜z¥tÏ”Ğİ@ŒKlµGc–B±c„cÜJĞØA ¨šÅ8?H(™J¬‡Ï©Ã¤¼«-€Öõ²JzNéáltüÊ/]ª•„2’3¾îÇ‚¹ÖÏªB7&=Ò9Ïm?FîÃº‘ÿèÊiúCö#µê;W©°`Â9VÁK¶ì&3šq°‹¹ål7n‘¸”\É*7ù[ånRÉ™T-.5·Æ$öe|a‹\Ú°XÚ’mÌKw¿ŠÅ«º•$¶y”ª×$å: ÄæKx@ğÂØí¥*ÔJÅ$`·|ÆC¤û`>¨@fÅb8 ÆxÚ¦çÒ¥¹Šxî™ÛA’m’êm÷„¯93mJ>_ş,Mär)ô·oO>{Mùïÿ ÇMöå/~“woİNi HFø­xÆÔCÚ»Š3P©õƒW¾ !ØãşÅñ†›pb­6ü˜Åcw˜£%L|T ”“l·î	+ĞŠŠKd¡ñ£Høûx82:¬Š-yFÍ$í·®„Ş—0Q,à¹RúÏQvøİe’×gÙà0Úx(ÿõÇûË2^yÁ‡Òœæv³ıBïY»é´µ›ğr»éìl7áåvÓÙÙnÂîv“=×ÚoòèNò0îÌ?»‰ä§·ÖŸXÃy_¼Û¢ÖĞÇ(´ÌÉH¥¬ıh¥éğ\½â_fšæ7Ùå+'û|‘Ÿˆpş:˜ò)Ë€‡µ¼rYÏ&÷ìWD8ÙÕ†9Ş\êLÖó™µËÓêÎƒÛ‡ñÇÊıiu¼||,}®iè¿ñ:PIÌ¶¯…
+Ä$¬L©Eõ~M‹şìÀÊx](ü5‚‹FıˆrnÂºW„åÙ¨‹ØÒ­{½x†G8Í
+=wjq&%—^îÑır³¸§Ú‘šƒñ?7Íú»ü;øÌÄR_Ëë‘TÈ¬¶qÌ¯ª>M'şpz;WÙFºŸ9ÅÍZjò™¥ã›½ŸÂ‡l³zïŸ+Ñz xM’ÿPK
+    ›0F@x~Áh	  Î  )   org/eclipse/jetty/xml/XmlAppendable.class­Wû{å~'›d7›„5`!\B„°ìæ†ˆ¢	¡a ‰6‘"“Í,lv—İY„b­(½ˆZ/Ø^h+ŞZEI0¤*ÖÖVíıöCÿ‚ş<<µï÷Íìdv³‘›<óİæûÎyÏyÏ9ßì§ÿ¹ô>€µø§G¼Pğ€ëñMÑ<(šoyğ·ã¨—pşˆÇ¼ğâ¨˜|Ûƒïˆş»¢ùhuã¸óÄöÇDÿ¸Oˆşû¥xO‰æi!õNxÑ€g…¨ˆÑEó#~ìÁIóày^ğàENyğqæ§üLô/‰3§İ8ãÁË^qVÌÏ¹ñŠ¯–¢¯•âu¼QŠŸã¥xo‰æ¼X{ÛƒwÜ¸àÆ˜‚âî»ZC[ºøvìÓjQ-6ÜĞm$#±á&sBñXÊĞbÆN-šÖÄÓ†‚½­‰„Ò£:÷»"±!=Æ-J»‚¢CN)˜gnO‘(EkáıÜYÒiF:I©+sß7OÇÒÂ3Å©„æâæH,b´(úÍ‘xCWÚH¤îÖµÑ¦éçWï$úP|ˆ§ËvDbzgztPOöÜÂöxX‹îÔ’1·‘HJ€‹'‡ôp4’HéûtÃ8Üph4Úpïh4Ët—Ó3¹xxôX8>D$
+¼[…õ„¡kİW°ĞŸßrp†wù\4Ãîvñ²8CMíL»òuÇ¹£G#ğ6ÿôê:´DÓêÙzË½šA)ƒiCO	Z²E	gfÑr8‘¡f]öÖ<á’?€b×4`–¢fkæíyÎö¬;f.…ù„øDøĞSsd’­å¢ğfh
+¶ÏhŞõè÷¢ĞæÖV¦‚)×µù¿~uı¿¸ù‡£ñ”.C}•v‡XmY>ü¹YÀ´QòÙ¯  ²BA…cC»¡'5#äÙ‹
+Öû¯/ EbF#BTTÁü|aÆ.f–uÇÓÉ°¾5"K]şzqŒu#_ÑêM
+ñ*¶âNÑt‹¦G4\tOÏÖºõbò®‚Öª/û§âĞÿe9×€ŠVlR [Ğ¤bZTlÄWÜ˜kí¦t$:¤',mŞH›«êÉëë†ê5õÕU™Ò»¡ZÅ.1«7¶xULâ—n¼'ÖŞÍ*v!NÆÄ»ËøPÅ¯ğ‘Š_ã7*>Æoy¬&j4‰nXtE5Ú¨¨RÅ5Z"’ƒé¸xSÒ¼¼_fN?)Ø½›÷”«AÈÜƒJonP±*~‡O,›2¥=Õ‡µ(M7tûŠPPÊ€LUÉĞ¿_Å§øLAy®xÑfx‰İ‚`¿Ç»nüAÅñ'7ş¬â/ø+OÅßğ‰Š¿ã3ÿÀG„µ¡ZÁM³ù,Å]ƒûô0+ÔÅí]ä¾éAOWøåe¤I
+êòVÈø•U)±¶Â?}#wTä»Ü4:…F´d·~ ÍÈĞ³ÔeÕƒ…şĞŒïJRéÁ”d¿½=/”ÂD:5¢ Æ©ÚtY–Rk‰^‰ê±acD:‰ßOÅaÂl¥{ıí«Yÿİ‘Ô–Ñ„qX¾ßÅ6OäºÁ–U$#†—EVy¡ĞıúánBçeÎ™	§‹Cs²èíˆÍÛ‚¬ív#ª-Õ©0c²së–óõv~OÁ'’›ßÓÍœÀÃ9™cŸÈeÙ3Ëù>$ßoæÃlçx×X{8oãìnJr±/LBéÖ^D×yy¨­—=Pƒ¹X…mU™Û±; 9ê@'EŠQà.¹r·Tô5KÑF’Ü`ÑEæ*¢µRÁs›­ÀM-•-¶Û»k‡b	¼(Wn#Ï¯q ÷Ør=–\1Ê¼ÇÒ°İÒP.öçQ±nu¨(±U”Ø*JpIÉU±ÓRñÏ²o\¤|1*›„·ï"JÇ |sÆ07#I‹ÇP¸€²IÌã[Ÿï†qTÔññÍg3¸± ½S«‰˜B,%Úå˜Ï•JN^ÉĞ¹“A#Lı6ò6y›…\Œ„›\Y6ôâ^®Ş³©OÀã3WB)oÀW
+4qÈĞBñŞ·ÈZ°ìû…Gåã¨4­f_€ÇâŞÀ[î’F-b¬€Ñ]Éø®bd×2²;éÎ^š3ECŸmLÿ›¤1}¼‰úiÌ}·_few1f¾|]7`ô$.èšÙ¸ë5ÉäÉ'ı¿ƒìtĞ N¶]dè²Mé²Lqr°'Sig/äœ~ŒÓ®‹©eÉK8\<¥-K^—”ÅCD—™-Š ˜İ $Èr²–(%›$WËLÃÎa›œVe¦Mrº<3­•ÓêÌt‰œŞ”™
+«Ë–Hõ+PÎ}®;İÊ¢&\!3b.#ª‚V¶‘¤R#HÙ^"ÉQ:rv#x
+œÀ~œâ¹3HØ‘\ãĞ¸ßÅ@9Å3füµ½xCÒ‹:ÇóQrÅÊU´*sÅßx¯ĞANïµã@T!ªR·BgÑ¿Ò¢ŠS³:¤±\VÚ(*-NU}¶ªû,U+¾ äjfĞy„ì>àĞ¹ÂÖ¹"OüôÙ9|œ»EêÔÏ*‡Ú](>JËf>ÂÄ<æHÈzE½õÓ²ş²Ã–w°†fFZŞbF[ v«z%b¿“°EÓœgÂ”Î;?c…yÜ?dÃÙğCÌÜ›cäzA®ş@>MÏä	‚|öš #Ó@öaŸÅù¤U3:fÃ¹·îÚ>uÖê“‰çñy†Ä¸/æ)ÇÅÓaÃî°awX¡!F{äÅ3$3É~£µüÿ/«jw“˜3‰`ŸÖÔ}`®Õ_FÃ€0ÛelQ¶Ê‡X®ÍB=å‘ü†fKï|ˆÆ“òDÙe4N`‡#Ì›ø43ôëÓËXÆ*tÎÑÜWøUÆkŒ=b9dî³kU	
+*®bÈ˜ÃòñëÊ"óßœ‰âŞO˜7+üíµVAGínQHAëşkèÖMàÖ1¼£PòZ%y­3»Í2naa†åòj“÷sŸ—Š…EKùi¼IŒçùùö6ï­wˆú+ö!Kkn!œ IOĞ†Bî\’J•w\)ik¿M~¿¤\qİ/‰6­/EÁU¨nWÈ.óiâ~‹ùÍVñTø`îG‘Y$/Qà¤ÃåªCÅ¡iEò°<ıÿPK
+    š0FÜ\Ä;	  #  '   org/eclipse/jetty/xml/configure_9_0.dtdíYmoÛÈş¾¿bÊÀ¨}éØ@k-ù ³W…¸¶\PôÃŠ\ILù¢#WŠ…ªÿ½3³ËW‘²•»p@ƒäâÎÎÎË³ÏÌ.û?<G!¬UšI<pÎİ·¨ØKü œñÓ‡Óï¿ÿÓŸOÏ®„èÿáôTLAøW/ø‰·ŠT¬Ao–øKe^,u’Âÿ¡€HÒ¹«¼0XfÊı¢´Ş¸¸œûS^'ñ,˜¯R©q]ğB™e.ÀXƒÃäk¾Èµ„dúEy¨>©£|˜nàk (–©ŸWh°‚dOJ÷àa…Jb®Q¨P‘}¤{²P™-ç¨<U"’Ë%*BÍ‘Ò‹ÄÏ í ŸªKBeI™¡WlÜ_„ èãb ±ŒÔÀ™¨L;Wk®Tÿß_AíÏ` ¤ÕÍ”&Éc‡%“KRCæ¶©Á÷j–+TÁ²½š&vØhÒ¬©?Lç¹:zìŸ‘ÈU©I×­Ÿè‰3e*\ãc$70˜ğÔHğR%5p>(çı÷êë©Ò«4ÆáYšD˜®¾1Gİb=ÒIí-L>d:gPqF$.ŸiP3D®·\¦‰ô=˜®è2±…ÙRyÁ,@Á'±:Biœà,o¨µòqÅÓS†ñèıd<ùGpıáı»ñ-8˜´í-şÃ¨oÉÂ-ú°}T³í0Måf{/—Û‡4YªToœ«ª‚OÃ»#pŞ<\ß'CÖÑ1ÿi“iåZ¶£x]UYÕ9ùü0N&àğ¶bÍğf|ÿp7İ€W@tŠ›t{½©ô´J·OŒÑöÇVÛq¬Õ_İ%(ñc’„JÆÛwa"õö&YMCµõpÚ6ãSšÄz’ôÔJÏXÚ7ÒïP§ÒCßOU–Ï4Şğş%è¸âŠ5úúnøôd\bÑ†OèR-)Ò£¿?îˆ¿ŞÛp±û…íŠísÚÍ¹½~¼›q_Íä*ÔûgŒoŒpàãc—Ğ#ªe©TÍPp¯ÂÜ™†âª–s^U02ÔçÖ;Mp?XR4[8ß8fÜÄ©4gAŒë$ÀHŒS,Æó—D®ô"åŞo®és®ëO.y%,BîF÷è”*‘¢¾ë™-yyòİ	Ç ¾?Uš ºÄW7æ¡ˆ±s=¹×HüÓxD˜ü„ÌŒÈV¢-HèçÁ[¥)Í41!uŠy–ËL²¤
+&CS¥ÆM‰ÜdYm•JC65ÑTv)a–ra<ã·¬n¬UL™z~~îÑëØ˜öÓósn’ÎÚ(hJZ[íåÎNÁ´ûaæfÉ*FöR,â@YÅ”jÄÀ% ´zæÒyfŠ·}›~Îäko‚ÃiQ\![!Ùb}$æëR_êl×¥=W ³q’/FáB£â¶]Z‰l)=ÆpF¹…|ŸÌJ³8rÎ=ÀJ…»2X†vX¶áŒçBú¾©âóf†Áš¢ğø‹ô`¤mŠ7¢,(d)–=Ûu˜}RdÛXjê ¤æ%ÓØØx”‰"sñ:ñ¸Ûq[€Ôq!AÔ×@OCG9W!ÌóÊpÙ¶	
+ìß„ıù7b¿ê{Îç…ëœ÷ı Ÿr¬ñóNßv€¼´yÓØ³ğe¤"
+i}©w…E;ƒ› ÷’BÉø¸=eŠÀ7ÑqËè(H±Û<^CŒÔo¾Øk¶¢g#­°I¢eQY`Ïƒ GhÍp+»Ğ!Mí¡µşE›Y•CŞÎ¬œSÜ¹È$Eƒ¢Æ”
+òòuDgŞ´S™è¤2ø=SY`ªú¡¡vú)û‚ÊxÂNÊtSÖ~XµÀ…p=B™«
+›³Â z¬á ~n¬i5‡<Şâ¢.v @@0	Ö1Ñ$$æœC}•9ÆşÀI.œÚqz®òHwnÎtü’ÊDõÉçªs`}¢hÑ¥ uğFMhÍ†Ü’@r^=óÙ2¹hœ]/ø¸hã{å¶l4¤æ¥şd%;Jl;8±bêÒ`™d%¤ƒ‚t(~qÍ/4À  ˆÜP¹^˜DX°ÃXq„ÿ§¬ı”E¡ê ,ji“JÜØ üµcÃ^A1-‚é†*¡[…§ØF =YÊ”£"…‰)Ad9 e6“â UbDø
+KeÄ˜,PbC^]ÖÖFxUgDÑÁˆ(a_y•›¹ŠRfÊ
+š9Q¾"«wš­Ò6fD²	Ñé>g¾†u+9ÒmÕ+¸©‘Ìj®\çÉ’&?4Y‡.ùòÓ‘ÈQ­È}T³ıÈERKÕ:HVY¸)îçj÷š©š©”ÒÅ…(ğÍı(ˆæV¢ÚÛó–4U+às¦ŒME´ši¤Âÿ>IÈ0ãMGO×vş#k%å¾BK=²ï„Zwòìe~c_ñ¹ >ôiIöuàDóŞy]UeàÔ³KÊºšu+*Ô‘½ı¹¬”ªTn¾…$Olá£ı‘ªÓQ£b•d$ÚÈÈ.¹ÃEc,:-dÄÄ(Ñ€Ü«ŠÕğ7ÎÓ2‡îıİPÆs×\pÚln³¹ßöÏøGùšÂRÃîôZ0©+´ĞK\¾›ìMë?ş‰7,P¼ø7˜ıÿÖéUJR€ÿ4	À¸zLk7ö½©¯f?Cgªo€vâ¿s€ ã&ß£X§~Ì“GÆ÷¸K+ øu`ZÎòÕúgl@'@(/‘ÅÆ_e¶ÀßÇT"ó±ÆšØ‘AÚyéBh ŠrPõè?'%d8ä/ôÀ1(V÷‰øƒñÆCE§+ìtwİ*¼…Dm¢½ïí¾uÜé{EWß/÷½boß/÷½boßûû^\GãËc{ÉÃòèì'’¿}º·ÑÄ^‚'ğ'Û< /ôAı9©TRõ:Zi;â×?F,sK‹ËöêµÈ?Åg4”_>êò±vXÍkĞ¨ö\x`¿„ÂÙ¾~ĞèqçJçºv?Æ6îwë+î&Ÿë·¼uê!·òí©-¥£x¤IÌŞ¯eÈiØüğÓÈë‡'h›ô[§VÅëÒà_#½èÔ/È)ïMXÊä¢>›Wâñ Ûºõ`¯ÂğÅ¬ÒKÑÈ4±›^z{@N_·?Ëµ=ÛsjpşÛnµaÉ0ÿÃV>w±rLlìí'•"·Úî±¸TûâO½±?Oó»5Ìõ0Š“·Ô’•³¤½IÃ‡|±æ	 0¢ëpĞ6ÿ/PK
+    ›0F×ÚÛ‰-
+  L  .   org/eclipse/jetty/xml/XmlConfiguration$1.class•W|ÅÿOnîör·!!  Û@| ¢D1H—„¾¥­›Ëæ²pÙ»{`m­­ÕÖjmkÁ¯©à-X8©â'Ö"TE‹µ«Rñ«µUK|³wIîÂRp3³oŞ{óŞ›ÿ{3³ëèÃÛ œÍÎÈÅ…¸F4×Äu¾@.¾ïÇõü 7øq£„
+Ò$ÜÀq³„[àø‰·ñSüLÂÏ%Ü&†¿°Rô«ÈÃuÜ;ÄèÎ îÂİ¢ù¥„_	òjA¾'€QX#š_‹æŞ\¬Å:1ºÏûEÿ@ b½h~#ø+FÄÒEóP¿Ã&1±YB2€J±b¶Ñ ÆVÑü^xõˆ˜Ø&T>*„îâÛE³CÂcALÂNÑ<îÇÂú'x
+OKxFÂ.§/UÌ˜Å0äÒÈ¥S	Ç=n²MMMfÈêò¨Úak†ÎP™bJØZ<5ôhÂ4Uİ+¶Ñ®EÃÓœn¶Úª5ª’¼oŠ¦köT†š‹ş/¤lÜ<^c´¨ùMWíÍª9Gi¥0bD•ø<ÅÔÄwšÈí6<ƒ\§ëªYW,K%JYÄ0ca5×:,5¼Dµí®ğòöxxA{¼ÆĞ[µXÂT„¿¥ãÉ™ Ç‡†ÆeØßØ¼DÚÂ¿¨ÃÏ08cÖY‡&ÙP”AŸÓfË„i“³éµ½ñ%:×•vÇ—ÍÈUu«Ëê0†á±«ÕíjÊb±ªF¿:²›ö•ô)¦YJ]\Õ©ËÑ¨ñ,U»²Wèsgh†Ö:[è4L"{Åš–ˆ{ÿt½Ò!ğÍŒCè#K¢9ñ(C…í†.àÑZÕš®¨µ€0D5mMìâ°kfõÑE)ş6ùi4/€ë>G‡eã¥«£3Cîã”²©Ä?Ò=Ü©És³Ã2åD@Ï¤¹¼&[‰.%	gm''o‘ğ,Õ	p1ÕªXâ“ğG@“Ó;a’¡Ów+E±TJ$â8ËÔ:µ¸S[¦Ec—VšŒ„U§kÂı¢U%dhçkõhÜ°ÈòzÕn3ZdìÆó2¦áb5¸DF-ö0Œ=µÍ—±b8¸«ÒÜUw•e+¦]•b–ğ‚ŒñÅ)¦Ú³26>ÀÉØ‡—
+º'áÆ~ÚU7¤Èxa¨úÿf”ôC®ä‚’+®”ğšŒ¿âodÿz†cÈ%jët#¡·Ôš¦a2”°³Á°SÓ½ù.ãu ˆº”oà€„¿Ë¸oÊxo&dÄ?d¼ƒÆ,oS’qïÊxïËø Êø'ş%š$ü[Æğ±ŒOğ)C°ª##ÿÅa	ÿ“qŸÉ8Šc2&³æ¡=e\f^æ#øÉLb~™å² •ºş`ÎT¬6Â¯Ì‚L–XÌ±|BªÌ
+ÈN62+dCd6”ÉlNŞ0ŸÌFÊN=óeV,ôÔ.¨©5§®±¡„ö’Øi2ÍN§ÚsªE½wëN˜)Y[ÒWµ);\‹ 4+ÿ©¶_E©*µ+ñs;ÅÙæ	‰vaİKÄPZT+Î:x2¦&÷Ú3p‚êDœ…aLÈe9—Ã*—Nå6ÃE.2—'“©ÅT[ã”qá”R7âDstfjz§±”Â9)t|Er©Ö®o@‰FUË*ÖYÂÇq':GâF,1b1'^g”‰Îºµ9Agè$1è5np(¦¢&¹öÎÍe™bêÙYÛeÙj»w¢ƒ,/©]t)°2°àrìç·)V=YQWÛ)y,P‹(İuu¹&ÒW)¥;ÀØ“`£ïæáéHğù.ûuŠÛ%iz‹º¼±•ªG·“\+Ñl9êEJÔÕ¹.[r§ôÁ9Ç)ôRmÃŒH]ÓÌ¾‹MÆ,Im#b,£+ b©ı~gò¸.äWõk¾f·	[\bµÈµê8jMÕrÎÕğìôÀÙŠeı_S]ƒªÚ&§JEN;CÂªBHŞÍgL87"*ıø0ï`˜”Í¡Øö*ÑU;L’Ê¦~¿X¼Å©vƒ³P™ºúHû´xœv#4`ÎIK[¡: %$øè:Ú¤ÚõirVeuxüZ_=–Åq[•(ôâ2ít~ÛhJC-ûßï˜P>Ößîh¦WQBh>™Hÿİ½÷¢L~çjÖì„®;y»†.h8a1)ÿï&rÎÎ¹Y:gÑã8H/¤‹SP îs õt¥£tıj1fgĞh}{¨Ï/+ßVV±9e[àÙè0Î¤ÖGŒà·¡Æ²#_E=Ä¬)5üjâË%Æ"CÀ“ğú’ê+
+ıG›D€QLBŞ¼H7æsú^è)oêA‡^Ñ#ë‰ZÑƒ!9ô‘—ş(ÊAùS˜°y·Ğå¾Ã“QOÅ+1’#¶cTCyee7NKbôüµÇŞ(ÛV_±mªg"/â£Wc~EŸPí-ö\Äé·cLz4ÑW^ìõ‘¡g{‹|ü²$Jâû!œ™Ä—
+¿œDéJäc7Æ$16‰¯\ËÙÚc÷±z±Ì6r¢ÁYÇùZM¢§å2ÄWaešè¬znØ
+¾0Mr´†¶`\µ·âI.ö&QVA¿”“ïITÜ…Æ­¨$÷«ª}ôîŒÕR±Ôƒñ"cÄh‘üÅ¾bg—‹öœnœÛƒ‰P<ö	¥çû••E\|ßTì­w™™i}%MOØI+1ZŒ¶c’[ªV! F„yGl÷Zz«Š}œRŞƒ< 9dŞT¶œ€3‘p58İ:ıt%Äd‡¨ç°öâÎÈá«1ˆßƒR¾ùzLâ÷¢š¯C§óû1ƒ?ˆY|æğ‡°˜oB”oFœoA'ïÆU¼×’VñG±†ïÀzşvòx’?—ø8@sù3x‡ïÂGüYªÏ±R¾›UóçÙT¾‡Eø^ÖÄ_`‹ù‹lßÇnæ/³[ù+ìn¾Ÿ­ã¯²Hf#mão°§ù›l‹íço³D;È?`‡ø!ö.}ÂßgÇø‡N’¼†a„fákäy5¥Ål4Ñh†3šC£N0ó(ï¢(Á|, Úz’ZˆE”F«(:—Ò¬×ã2,¦ÜÍ¡×Â×éoIÜDí7èÇÙ
+’ø&qøYDS ±Å”ãÍ¤ÕÇªq9Z ’–±ÕÑÌÙÚ“VÄàe›(ö2ö-´A£4~‡
+KH"Ñ»b)âğ°w1Ä±™‰ÔN§};ıJÈ’”:ñ§¼0ˆ%µ~yq¹ÃYtL	¦L‚‘È=‚B	‡qÆQ$,cìÎ“°ü0F}
+ïQäIè’°‚¨siôFJ¸BÂ·£ü0‚ÎïZ«ò9G:Mˆ7u‚Ê®tªÖ·ñ§¿
+ß¥ÓßÕˆĞ(@n\ñÏÿ9PK
+    ›0F¾ŸUòu
+  ¸  -   org/eclipse/jetty/xml/XmlParser$Handler.classW	`Tåşf¯·yy@L\p$(jØ€‹‚¨‰šÄ0!@i/›—ÍÂfwÙ}Z­+¶õèõ¢-"¢ô0XÛj{híik/[{·Z”Î¼İ¼lÂJ‚bş÷ÿóÿ3óÍñÏüûÂ{O=`>)E8ŸPQƒë\¯Â‰O
+åS2Ü àF
+n’ÅÍ2|ZÅÜ¢âVÜæÅí*Êğ¡|Vø>§âóØ*Ã6wÈŞ2Ü%Ãİràá»·_À}Ât1Àƒ
+’Åv_Ä—dø²;Š11Ó#2{ThÉìq‘ö„Ì¾"lOz±³»Q°[E%®ób|Tû”{U<}BÙ§à9ù¬û½øªĞ¿æÅ×åûÙÎ‹AY±Ï+ø¦‚®N3àOs¼Û h±˜‘¬ê©”‘"œÒO†ƒF(I¤ŒàÃ47ûû¢Áö¾è2=™2’³„­šàé4’Éx’0Ãâ3)½?ØZ×nkè	3ñQog(3~“àîŒÅEyq3.ÒcİQƒEÌ‡Rû¸è6{#©Yó3Çb”ÃçFbó|Â¬Š1OÏ^Å~©·ü2©)3šÓ}]Fr…ŞeJiS<¤GWéÉˆ¬sD—@!(¶-³Ç´eØw(jèÌã¬ÅZÊÔ“fCÔè3bìª–Š¦5úz=Õcá`«™ŒÄÂÕã¢ä‡£ÎdbWÚ4R–mîş„nöŠ)‡±(ÂlRöŒ»O7Cü¥K`:É›EQq@³ŞÇv»×å¾:k`÷~jY^Ì:éŠY~õÆ»Ø	ëÅUÓFğÔKÄÌaïLh5õĞÚ%zÂr5_?+¿Å7šïAµS,¥àÛ¼6bİ¶óÎù€Î'•EÂ±xRt¶õFØ„„bÜJÅêúÆFÙwv¥{Õõœ[ñ”ÁúœQ#ÆB½zR™†xDÙ 'c,“pbÅWD¤:Œ~öfîN©=º©G²‹cÂ†)©'G³0	óÇY(Â’F*]o4ÄÌˆ¹‘P3./Í¡ª1–H›­ñt2$UÀ™ˆtó˜’QÍREä^L´óı4¨áb\¢¡	+|‡¯âxŠŒQC-ê5,{»ò(ª„0¿¤a15\ˆßÅ÷|_Ãğ2~ˆiø1~¢á¼ªà§^ÃÏ4ü¿ ”Œö†_âW~×5ü¿Õğ†pÿ¿WğÄŸ4¼‰?+ø‹x‹0õı[Ã_ñ7×ğ¼%J_jX…6ÿcX§áßø†$Rbı2üoKŞ·×7,[Ñ¸´¹\Á;ş‡ƒ„)£_D»å’yÛê–776/®Õğ.ŞÓp%®â€•W1ó!=ñês—v­1B¦FDÎî†åË—.¯åÉ¢ºuMµ9å¸§<Ê¥±J#—`—Üœ·å¡x”)¡|WNgäÛ‘ï«^#šàÛ¼ĞèÑÓQÓ>4¹puáº3êØ7€Ó­cv„l·;º"»dì>3î!òT=2RÜïæqÇ«G³àö[Ô„EJÙBêêñGØædˆ¤¤²[U¯K˜aµ'îc]Z²Ë}ùU#›0Õr`çé‚óÌñâ!†«&»eVÿ9¶¢`+Õ´‰›ôM›")®Å®Td“ñ>0¹½9ÃR°O-°ÛX‘jµåT[D@ù
+TLË9\ÿÃr€}Å:<ÒêKEãl®\N½›¤ÆšÛ—4-7tëfú+FVV{‹•ú
+np/àn3²°G*ÔGó3è‰ÌãŒåWî¿Ò9Fø™XÈ¹½—S=_T/8:ÕVÿg“F‘ä‰’NYÑ(2¥“Ûz8òÚ™J‡a[ ØN®(ôr³”Fãá`S<¶"3sÌC\»®4wéÀ‘ûëŠŞd|ƒ¼3¬ yôD‚Ÿ0ü.”c‡‘rM?âK€;€z6¸äMB¨( au€2ªbÎÙÖ)Óèkdhä)b¿‹ù72 £‘M
+K¶FÓ}±,ÊùLÿDsó÷uÈÜytH‹·¾Ü²’y0ğº˜ÿš°„f…ááÀÜ@å.P`7½pvp»Ú×.¸pï‚‡©JG%ï{w¡è	KìR'‹bjCµ`
+µbµcu`äE@"-hµ`­ÀÊœÒEÌ-{%<¨2x†å–ÂÅr/ƒ›:¡Òå˜DzÌ’œL’Ï,Ó±‘°iü¶®r3fÚƒâ´­ğÌ©rûİƒ˜P:ÁïÎ`"SæV¹ÅF>åñ»ı.6´Ê“e™4ˆ{üJªçBo¶Ç,,òy·a•¯hsÑ¡»ÑœÛğíAé~”U©~Å¯²ìm˜íçyÇnÅIBñÉÂ÷ &gÉ¾&—ï…âÚ+Ø~h‡Ï»“-$¬vJ[Àïa?l·HYãYÑ ülGÙèƒT¥dNb™êwàxöcÚĞætÑ}B+ôålšÁŒûpznáófP>ˆiùKf¯œ3×ïÀL76{iû¡A‰ÓŠÎzLgO÷ÀIa”P/ÊhN¤µ8™ú°Ö¡–RXL&.¦4B´&mÄÚ„Gé
+<IWb]…Aº¯Ğµx¶àºoÒüÎ»‘ßc7‘F7“Ÿn¡Jº•ªè6jåyİneÀfL€‰³Ğ¨ÿv\ŠÕ(â$¿bšÂi~3>ŒËà¥i8ÏÚõJ^å!Ï:ùY³Ëyæ°f:ÏœÖ¬!Î>'gu7ÓÜlÑ,|•<xkÑÃWFA/º%Q¦ 2Ñqó *XÃ‹¡ÿ×Zc”GbU±„gÎZz®)o£Ô1é f(è;È™½ğVc.ç?~­f“/1MnöJ¹†8‘cî\èò¹òÃŠ›Ë
+ãÔüe6Œ8É…Í.âó6ã¬¶áxÀ¶¢˜¶a:İÁ7øNşu°tVĞİ–ß0‰¨¶üéHö½^9äOåüÉ³¬?ÅO*œ1‘Œ6“Ÿâ93ŸÈ™YsÔ¶M›>€“‡l6([–îG)=€™ô Îæùùômˆ3ÏÛN¬´eH§øjËlàY!ÎÃé·9ÀI"†´H¸ö¢¬ƒîÆ)ra?i§nÚTVÚÁ¦=ŒYôæÓ£|ÏÆ2zÌ6Ï—g^‹m^‹m^‹m^Ëhó|‡›·›ru{Ó„«z*JgW àO÷¢²c7æ”ÎÍà´@ånù[:‡ÊNçOg8÷aş 81\â'Z×m''İ.TQÆ?9+Ş†\p/#şwƒÈúøöˆÅì0õ ¼Ò¸ÔÂ€Î' ü¤y
+íƒFÏp?{‹h°Å6°Å9`½7i#öQëÕ9¬uG ¹p +ŸÕŸãÎ8Èµ÷ jèù<„u6ÂºÂa`ù¥š‹äe¼’ó
+Öy–è?;«ÿœªJ«³ósyÎX·x¬ÚùbÖ€­5`Œ³æt]ÄrJ~I†WÎÉà¼Ñ²^¶d•gOÙ²T|<WWT\cÕWá¼X7AänaK‹¸~ma=~mÁr8şPK
+    ›0F}Qºÿ    2   org/eclipse/jetty/xml/ConfigurationProcessor.classÍJ1…ÏmÇÆ«V[W.ÜiAÌÂå,‹‚0hQwÇ8d˜&%™J}5>€%f¤ø;¨ÙœËÇ=ç$y~y|p€-†u†!PZ•›~:1·’Ğ>ÖZÚQ!œ“p=Hrq/¸–%¿8KâÄØŒË´PS'y.ËòÏ'¿šca´ı*å—­‘Ñw*›YQ*£ãá%!LÈ—ï.Ú
+¡3~z“Ë´Œ‡?!:œ§rZe8†.¡7¨_;73›Ê#Uøğí/İckRéœ±û•°Wåz¡ó½¡Gèÿçwİóû;;˜[BÕi„&àu¡ç‘§×•7ÒşL¼gÕÏ¬¡å5ò,À–¾PK
+    ›0FÑ“$On  l#  %   org/eclipse/jetty/xml/XmlParser.class•X	|Õ}şş»+Íj5–uø²­õ½:×6Æ&’lã$Ù{¤Ik¯w—İ‘-r 	$$¦MK’‡¦·{ĞÆÆX¶ã$Ğ$@MiÚ´¥MIè	Iïæ ÷{3³—´:øı¤÷Ş¼÷ş÷ùö¥w¿ôU 7ÊceèÃwÔğ]5üµşFÀr¼¦áïĞğšÚù{ß €×ø¼®¿Àğ†ÿÀ?áŸıø?şÕàM¼Àñ#5ü{€°ÿ¡`ìá?ø/ü·ÿSÿÅÿiø±?)ÇOñ35¼íÇÏı¸æÇ;~¼À\×<ñ‹G¯Úz#€ñ‹””K©hdMüš”ù%@XÊÕ «aF@*d¦:®Ô¤*€µRMšR£†Yj˜­0ÏÑdn xÍ/ó8Km ]rƒ_êÔ<_¼¡®-P–I½‚tÊ"M+´Kü²T“e
+€|õÉr…gE@BÒÀ~Åp—4ú¥É/Í~iñK+Õ%aÅüJMV©Õj¸Ñ/kx_nòËZ¿¬SP7kò>MÚÒ._O"b
+ôÎxÜLm‰é´™Öd½ l“e¥¢}ÃOµ[x$f¦4Ù@Õõ$IwCàíÚ¹C°¤+‘›ı±h2m†˜–u2<lEcáXb0Ü•4Sí$r(eF¢)³ßê6’‚™]GŒã†s¼P¶;:7¬ái®*<íp>cF|0¼›ŒÅÛ¸i…ïìíjß@xíPÒH¥[ìÃ‘ğÈ±XØÙK‡woÚ·Ë^Ú¬$ú¸:n¦lV6NML	¨°¥‰uK"n™qËU‚M:E˜Tå¡ÛmıGy!<v¯c*”¥‡F’†5$¨Ï’Õ>Mïì;BõòØw(bEˆ£#Z´š7Ô°—»[lkÏìŠÆÍác}fjÑ3D¿Ûk¤¢êÛİôYCQâ_TÄ¸Ší}ÇbY}jF¿•H,LóÛ[¨8nÄ¢Ã¢0‡"–@¯¼Íd*AÃr;‚¶Şh›?ú°&5¹…Œ†(éf¤MkoŞ}¡³ó”³m¤ßLZÑD¼)‚>Mçß¦†ÈBEÆE·Å­¨Ey–„¦ò<[±qã©•š.TEáĞ´ö9æœj(fP:{cvšŠJ‰ë^+qTPWàQêÒÄQ3½aî"7¤¹uÏVú£‰:ã«˜\“x¤¢¯ñšŠe2›ñvÁüÉ È³í‚M¡‚{ñä°µ;1œê7Û¦r°¥*I©ˆHÛ ‚Ú	q‘É¡ŒˆSãÍ±Yš2ˆš[€z_wW¯}À+ŞH¢_°|zÌ²:h²‰œu:¦ÕÍ‚¶b¦®üŞáTL°ÖEM„·GcïA}¾¨
+ëŠBpÁúBG••qlúx=Ñx6ĞÆà`P¦Ìt"vÜÌÄÓÆ	ãi¼JŠØkg6JMyDwæ¢›W’Q^ñ¦£CM¶°äÑF¿™N/]¹r¥à–Ğ”Y­aŠâY™CºJ!½iºHÇ$ë’Õ
+Éêi#É«œ7*kŞ†L…ÊàX£p,3ÿøšîïà§Ämwœ,K«UQÒq1Ã8®#¸ûğ÷"¥ãƒø3T[ô…Òqt«™cødÊ×e«lÓe»ìĞäV]:q†õ‹¼¶I£Èl1ÉEº••A—ÛävA£:tiµi¥6Zsæ—Ÿ•&ÿ%F,ÍÓ¥K·ôh²S—]r‡.½x\Ç/à1]vËMîÔe¯Ü%X9dYÉ¶pØe!ã¼¦İÍ¤Ã™2–ˆ‡Ó¼pÌ`rĞeŸìÔ)P‚ĞnûZ0<fœÆV°Ï¦‡“ÉDÊ2#mAMèrPîÖåırÓ“ËˆPq¡Â§S\TÕ,MQLÆXë´.¶$Sæ@tDl˜BñD<WÕéMF¤Å±ÌTÜˆµ0´u9¤,Z96N””‡UBİ·eÛ®=;{‚ïpt—J%lozRÇ/ãqM]ú¤_Ç˜uj',•Œãûƒ„6i\ÀMuRÀ÷+àÓ,#
+KT—#rT—˜Ó%.	]’xœUel†Û<Ùõf†J-Üh2[­×å^Ié’V(iNÚ;Îè2,‡uü®×å„Œèrçu¹O>À~k:IZ—ûU”ivk£âæN^I¿§˜ø &ÒåÃò%Ôv_”—ÆCÔZ3ÑH¦Õ6Úƒr»âè!öUù­.•éò°<Â–c‹_aÍvôf«(èôKÁh<˜é»xlZ©“ÔIP—Ë'İ½î¡É@P=Á––¼ñ(ÌQaÔO¡M>©Ë§ä[…©´˜÷jšZãy¤ÅS·ÃÎî¸K[Ñ6D0/Ÿ˜òÄ­)Rù^‹›':ãiËˆ«ÎiyhÒ²–kĞUÃj¿‰· aµ7ÛbÏ½ç·î¤—²ÒwE'lgJ}2m™ŠYRİÅÎßL©^áæiö
+EºéªÜŞæD"fÔÆ´3lî`DíÂÆ¨‡bŸ³Ü«@ùIef•E›\›„¯›ä˜èÔ« gÛÚPÃ„İg€Ïƒí¦û8S„û	´hÊšÍ€=a¤¨ÆÉ•»g(•8¡ŞYvç_Ê‡yBQšğN€Ât³0y/TûÁñ½ıl+hfTó6l±½{»|±vª˜u‹?¨fénÊeWzpYœ•Èş(š<l»ŒûNvEÓdÑËgğ4º-’ª¢ıÆ¾ÁêCS½¸fÊ®lY˜…0ù‡Y:N’îu2öx:…Ç6TE4½ÕìÜWæT?É¤ç¢eŠP)(gíN;ÑÜqãy¸/íW_%E#Û|kï†ÌXREÌVsÀ(¦ô©$§l]c¢­óüÇ€ï¥~Jğ’•‹:‹úLI?£<5FÜ"N6VÜĞ^¢Ê¥(Ükf­%V‚Q°pÜûmÌoó&xQl?mâfÕåSpš­œÙÙêŒGÌ•ú|T@'===Ü—Î”šBdsh€y8)#s3E`Ü¯<oñ…“g R¦2©hmh\a™Î³‹Ğ‡å ü¸A=,¸ò¨ç	{ä?ö:·oñŸoì÷	ş³?´×|‘Øóıö÷,ŞáË„ã‡ùõ¼(áÜÕx	¥W¡í¿ÿE”qà²ü"<—¡w5bÆ(*ªg¢r}uÕüÓğWWŸEIuÍeÌêi¹ŒÙ£˜³Ö×8Û7Š¹ç‰Ï‹p\2…>lÄLl¦LİXˆ4a':°ÛpnG/à­5xq^ˆV|#—MÔÉÃx„üw §^Âiø÷|x”wWÀskáÕğIŸbï¦áÔuBf7<ÜàŸ-øc®à¢ñpN,xc+ŒÇfÍàş<a mæç8¸\æÕJ±GVÔ‹Ê¡(gIÑÇ³Thw3qÏklEíE”ÔFuã3(ÅÕuuW0ß‹³¨ïávÕÓê…-WP¯¶t~qô s{‘s;ó¹ØWğ¹Äkæ£_šA?«G!Å2ïW°ü
+V¨½ºnE.Ôl“»Š†ıäêizö<Y¯ÂRjz=ğ!ÚcùàìXúÌåØGûióoa6¢„¹—PG¢7Ó_Û¿…ÛK5è±Iz©E›>D|˜~úMô9Zş	b=CuşO¦(%o@)ñÔáñiR}„Şà¬||)_ñb®½§Œq!kŒ®1”¯,FÙ5,¥WlÖğK×PÍñmø7n¶çJ5ÍåM>³\7Ym‘ñè(°ù©¬;”ÚûÚœéÎ—â"|Ÿuá“?/çªæ0“8Êš¨İ/îÊI…}áqŠñŠôYaĞÊŠPE¥œ´‰TáWpš,<jÃK%7Ÿ Üµ°Ëm	)µÃêòX-q1>']`NŠjccÓE´^ExSõÊKXÕM/X}³‰ÔÇõ—±æ"|g¯¿™“Á‰?àøeøCšáĞ€/æÉÒ˜•¥¿jËRÉú~Í•¥k¨ÔğëóxôE%ºi¬DÏ‘h~¿å§\å×Øû"*raîU;ãMQmè×˜]¾Îõ7˜…Ï¡>+B=~Û5G==ôlÎÕ¤Ïw&7TÄ/s“ë©F¹ˆ›®bí~FÓºn7{ZHÿfÔô>gjóĞÙå
+X{Nc—WÑA†×WoÅFæà[8UorÖ›9b‹¾[ o¢y¶5?ƒí/À¯¦g9ìğâÖçĞÙ¦lw[­ï\VÚ6ºğY|™«?£¿ÉxşsÆì+ÌºÁ”ú-Fò_2rÿŠ1úmJü*cô;”õ»yûTV+§ğût¶\ş):‡OĞ¾HzS§çpŞÍØ:<ï ¢áifÑŒÊ æƒ‹¶úFõ±^ùìH^—ÓÉâ<Üîè¡P	WÑµ¿éºGÑ“Ô‰°×QïÓû~—±×e™_‡K¶I]C6ãê²ËÕƒ.Wë'åjçx®.c×(î(ÎÛ[äí‡äíGy¼­Ïò¶Wğ¥Éx»êòö&yS69øNºZë}Oî³šf~L‚?¡?%×?£û¼M÷ù9İçÚñ«ä»ØëØÃXÙ'’ç6³ÒÄ—ñÛmº³n³Íu›=nSy;·)Ğ_Å³NĞ{6¬”Á×˜³ÏÊ<ûìv½¦z‡fµ¸sŒ1SW5WïÅ]ìr›©Héiâ½¯`ŸÏaOË‹ÎNsşÎæ6_­¯2<ŠgPS›Yûâ`›/ÇĞ’<†î&ùZßø`.«õåP¿€»Y«ßŸ£)Ç=Yqhã}Ê¸µ>Z·­¤¶„·×–œ³)ì%ä5÷ŠÔÉ|êÒ1í¦fˆåR†›¥ÛDÇmR.™‰]¬9÷Hú˜ì’RKfã„ÌÁ2Ÿ–Z|^nÀ—¥/ËBb]ŒWe	^—¥â—eR#Ë¥VVÈ|i…Ò$!iµ]¢—µóıCĞÇ,³Ãv	±—áUY!® +û×T~–l)áêëNæê\yØ?~Ï.^ÛaV#psÕ5ÔhxS=`ãÛ¨¸†/\G|v‡xÊş{^õ/–Wúñ'øÓ"Õ§dlõi/¨>/)–ü2éx`ßô€¿Éì;Ø;=àW˜²Ç{¦ü-æyx¾}(9g·ù°~Ö‚ÌÛa±{3Pƒ¾Ëè¿ 9?æşzRş¶MÿU˜6„ì#´ë çAÎk9ñF”óxşPK
+    ›0FÌÉË8H
+  ,  *   org/eclipse/jetty/xml/XmlParser$Node.classVitTå~î7w2“ÉÍÂ$F2‚€a2“0ˆJ5	A@ÔHH41¸¤“dƒ“…™µµEêVm«•Ö­h›.¨qÉ¤H¥R5´¶ıa—?9==İşô´=µí±œTû¼÷ŞLB2êØ9s¿ïı–wß¾7Ş{é8€óñ³Bq@†;}\è‹2ÜU„»q÷ÉâK²¸ß‹5>,Á²ø²_ñÁƒ¯Ê…}’ák<ìƒeqH ¯{ñ™‘Gå1÷ál<!Ã7=8ìÁ“ôà)¹û-Y|[†¾#¨ß•á{"Á÷:âÅÓrõ/õbÔ‹ç|xxñ‚/z0æÃyÈx0®Aoìk0šâ©ÉX:Ok€O×P,05T·¦ú¢ñdb(î›æ¾èŞşdôÚşä¶X*O-Ü]ÉDš•-»c7Ç¢Ãf"]ŸJÅöµp›ç…m‰¾˜9œ"Ãš\wíÍdl /ºµ{w¼Çlh"ŞeÆú4øgœ¶™©Ä@Ï
+ºb¦™¢È…ë9'º‡M¯½î#EÎŞ&¢.êmÚ$5h;D“¡˜¹‹Ô	³IC[(?#ÌÑÂ“›éØŞh–kº¡¦Šm´Œ_Ú’ˆ·÷wÇSWÇº“qQu°'–l¥²v6õX?'-Á¯™KsW‚zL¹ÉeÉí˜cáñÕPÜfÆznÚ²èZñõ”? 	ûâæ6‡Z(T“¯Ûˆvµğ®Õär‘Ç"+æ,&4-Š†•¡šç)c&Ffh.¿œ"\”ãb¨®Ş4‡NÜJ†®P-ï¢ŒòPsÍÜxÕPŸS¨<m©ğ<3Ö³”]±Ş^óCÍs­h’(fô$ã±”%k»íÓ©ÈålÇœZë¦´L©D¿D§w¼æà¹ÊPn\W÷ğN9G†ÉŞxªATø ¶Á¹Naí¨i÷à(H˜ñTÌLåÖgf]ivn’ğ¶<¯6æç(©J¾XOO<^~áªUÖæYr–=S{WMS\#ë?Å3íX;“MwÚLÅzÌ)°¾¶ÁáTOü²„”™’,ƒ•rÙÀZ4¸õ6¡ßÀl4ğ	\Ä’aà%t{pŒå<ï,6°ëü/8xE 2lÂ\*ÜÚÑaàZtjXğñ``:¼Š×—Q¦¬n@—×:!CİzÀœY)5”çp†²Ù"Û	'ñ	ì6»ô .bØ#ÌMì£dr÷§ôïÚ¥\É×dE±jŒrˆ²³Tç#ÚòóÄ:o0srû•¹ËıÒÛ·kBK| OJòâ`o×\«µZígVÙ›nÄñ=Ã±dZ.ä(Oì©^Ò¹Ê¦!`{,9LpE~•™•¬ 64 3ëòªúÓÕFúÍ·.—h‚éJK¡_‘³àæ*ĞU¡F®áÿ~DÔ´ã>ëÎç³´€³£’¤äK­Á‚ù1S-˜fÍLUk¾ÔÚ¯à·	—ãr>ğªùÌZfx®°kz82w¸vZİºÂuGQ áexÆàu­Ñ+u{ã0.­«Ô¢P¡ŞpO 8àöû2(:„bëÀƒğ‹ğVêÇàé¸­İb…q”´í×µ‘÷ÇŸ#_®à¸ÅĞ]{u”(7Ê•T!–+V+ª›U	®Q¥èç^ZùÑLÜ&ÊßÈ‡ì•„ÜXlæ§‹NØbYH VBšmå=eAÛpùo'¼úûDu{Ğfı¯öàŞÄ2Â…ÿ¡Í5)F¶Íå,´D=÷¨eÚ+,—pS-°„2ì š±ÈÚlä`NäYäÃ”WÎn$réI\Î lÈ”Á¼	„ÃÇàïG¹½S‘A¥>áÅ)ƒc(ApêÚÜC!<šõË|Jµu.ªj¬S!tªğ)ot¤+êPëÜ½×çPÖ;[Ùós*{IÚÈBå	G(ßÂÙèMú|ûJÖÓ+4‹P—Cè	I<Ô‹ğDNÂ];êj
+Êúøa,‹\AÀà©åY£û]Ô·j§-r69@5£H]É`ŞL«´ ¤¶0B7ã"ÕjÉ&·RÔXqè¾Yéêéú¤‡Û-¸‹´IhÚÒÓ4„&Ë‘¼Å±ß<J¤&P$S‹¸d*ªƒ.º¥ªs†MçÍpÃ¦”›ì‚åòËùmÊ†L‹2¨ÕFg‘î%é8ÊÔÎöög5ò[ZjSLÊ,&q‡É«¼Ì Âz›Iƒkm•£Áa¬¨Š[ëN xë^A°^t+é†‚€>º_Ñş¿˜!S5
+)SŠ2™¨P7#¨na…Ø‡°ºkÔm¸˜ûëÔ–¬y˜ØIYuæpú°‹t
+YoDjÑd}V“õVe°5ñÁ5‰B-jûƒÍİQè®%’R"üI”0Îf-ƒª=%‡°…ú!\è¨©÷6	œÊJ©ò+XÂ„«Íà&]K;FpkYXg¡Ë­b<µ;]+WÓ½Ph;áWPwa‰º‡¸[Õ}Ø®îÇuêô¨±K=„=êálT†q.nr¢2•Õ<åøP ±•¸ıë¼bğaã ‡r±Âö¨ÏÖsyX£¦Eô‹‘Ô£ñ1–òÇYÊŸ˜—gÆe	70è0x¤Õ„#œ[¯t&«6Ğ*Õv§)a´øîVÈzvj>M®Ï°û<KÎ£˜O©«çQ­^È6Ïª^ã8] !¶IeA{¹Hm)"¡3åH[íe»•j%ì“XÀöÀ–lfô*Ç>aòÎ.YGgX¡À‘A°‡ìNr×”;ñ²%\»h!úÁ4);+_ƒW½N',’Kl´¬ZåTk#‰zQ„›q1…Í^‡¬%Š+ÃÌøêV¶y£ê¼u´hkİ´=m/¾‰õK2ú½øël 9Ë¬Òa&ĞË†L:±—İ\½`q+K-•ç°óğø9O¥6œ"ëë#ş&DGÄiEv¡Ş4]¢ë#eL™pÇÌJÍûşÈš]¯íÍZ™¬Êıª¦Cäá‹øëdß¦i× ú©„´ã¬`KºUÊ:ËQ¤ŠÖA1‹R+³TO\(â!²C~%6³U²šN	V*ó-èêmöS¬]¿Å"õ;æïQ§ş€õGlPÂ6õgtpÿõôª¿2ƒÿ†AõwÜ®şêÜ­ş‰ûÔ¿ğú7Tïâi½ Ncœ1y\ı'Õ{xÓ¥á7.…·]®lĞq‰Óğ¡#Y®ÓY²=êTÖ§¬ˆÑ,h«åNqb¾IµÓX7O:Õ$ª<¸µâ4
+Y"ƒ>^¿·óêå;İÊ#ß1œ×Œcõ¬<p•Ìh%¾,cŸ“‹öCöSe^|wäxH¨Yä´wÏxH|FÈù³ø\O®\È4ˆ-Ãç±ßš¿€9ŸÅı îe[)äsÓşy¸¾…ÿPK
+    ›0F#Ô¥     9   org/eclipse/jetty/xml/ConfigurationProcessorFactory.class•N½
+Â0¼¯ÖV\]t1CÇB§‚B}bH‰‰¤Qì«9ø >”hAp°‹ßpÇı|çí Ã8EšbD˜)ÖÎ´:{´³[ï„lç	»EYóg†[ÅªàµUù¯²,WL
+£Odµ¡e×£aı­9aR¹³²ĞFæı¶‚‹à|»êÖÙ?Ÿ(aú}u³¯¥	¡;Š	ÄÃğ’PK
+    ›0F[™(  ÁQ  B   org/eclipse/jetty/xml/XmlConfiguration$JettyXmlConfiguration.class¥|	|TåÕş9ï½3÷ÎÌM	ƒ„=da•a‘°(Q( V’!„³ î.U‹­uƒZT\b­¶Á%iA»€U«µ‹_­­Ö­ŸŸZÅ~­[|ÏyïÉL2Aşıó3÷¾÷½ïzŞsóœs§}şèÓûˆh¢z>HÏóÖ M•Ë}|K ß–Ëwär«¼ın–ómr¹]Úİaó6ßiñ]oR6oµy»Ü¿'Mî¶ùû6ï°ù©º%HY|¯rŸÍ¤á¼3H'óı!ºÇ-~(Hƒx«Å-AÊ—Eç‡-şÅ?”â£6?¤aü#›e˜KÏÖïâÇ¥ô ”ò“ü”\Ú,Şmq»Í{dò§ƒ4÷Ê|?±ù§ïò~~FŸµùgÿ<Ä¿à_Êèl>hós6ÿÊæçm~ÁæmşµÍ/É”/Ëå7ryE.¿•Ëïäò{¹üA.¯Úü_2Ù½ÿÑæ×‚´ˆo±9,Cÿ)À¯óŸ¥ô¹¼añ›2í_m~K„y‹Èìm›ß±ù]›ß“W“ªÿòûü? 5Úü‘Tş=Èó"÷CAş”ÿ!¥ÿ•wÿ”ÿ’ËÛ²ÃÏ¤îsYÛRúRê¾’	$¥Kİá á£wiœœÑrE–Â=¯”¥Œ ]¦LKù‚t…ÊÊo+ËVvPT0H—¨””øqKeÙ*ÛV½l•c«Ş6/²xÅÅ8@•k«<êc«°­úBJê[õ³UÄVım5ÀæU¶:Ñæ~Òh ­Ùj°­ò-5ÄRCe€a!5\ËÈ ¥
+‚j´*”K‘­ŠmUb«1¶k«q¶½©	Ğ5ÑæË nu’\&ÉJår²L2Yôü^KM±TYö¨©AÚ©¦Yjº­fˆN‘>3mU.=fÙjvPÍQsmuªÜO³Õ<KUé oÅÑ¨Ó-u†¥æ3™«šj™rç¯‹nŠ­ÖÕŒ]ÒÔ¯«™Êä[ÕP_ß„6•õÕ1&§¢®.Ö0»6ÚØkd9¿¾¡fl¬ª6¾±16v]¬©é¢±›7Ô]¾¡vQ´¡1Ö0\ºa˜ìUUõukâ5ÍÑ¦x}SAÏ=g§¶D_ÿ´x]¼i“Q0úl¬d¶^I¯ùñºXeó†Õ±†¥ÑÕµ1Y}U´öìhC\½J³imŸ.3tœiÆq.cxÆşXœ)kcZUà
+¯.Ö4ö¬Åó§Ÿ\W²mCŸQvú4˜ß=¬.âÍZÒ­Z¿ ºQ‹AôÀ€øÄH4‡„F¤œûÂÕëbUMSGw¯b²jë£Õ±HÓ¨_½.]_’üõZ9˜z§¼ÕUxÙ7ı„.Ú˜8¥>]O+œ1p£œ»¹*¶Qö…aûd\[v]tC¬º¼	j»º¹	#ú6Ek›qçzÈ¨NkÇñW¿ÍLCR©¬_Ò\µvA¬im}ur*ŒrÇl¨Eßtæ¦xíXTà} ÚPÓ¼!V×„eå¤¼o”%©x5–¯«a¾Ié½§u7µî»šA†wwZ¦fp€1K-€Á²d·Ş!L9†™¥*âè‡¨’B%d`©J<.‰×ÔE›´ÊLûO‡•cÕİ»íâø¬Ğ–Ğ­Á)bá”qROÎ¨ZSw†BcÆ1õ?O¦ëŸÒ¹!¶¦½ÇºÊ"æ×%fŠdhsj<V+M|k¤À”ßMåt‹ÔusFŒ64‡q­Ìp$fm¬n¸h.CSŞWÔÖÆj¢µåUU±ÆÆÔƒ£ÑbhP–?ˆÃßèi‡Y¥Mjp†Å›š«šê¦
+Xw¶Xì¶ˆoŠ-Üsá&uF3
+“ƒŞ@ş0¦¼•‘bSb8$Ü¬<– ÃİäáêÒĞc/^ãˆZ¶êañXKÁ¿`©3™úa÷›bMåÑ‹–ÖÏ®¯ÕûôÌ¨0]ctŠivv–S¼€iXıÒ-õlg6ÇšÅ+ú¢òôªJö_ªõ)X•²š¾=Mtò×O’/’úÚeHWX‹™ÊcÿÒ8³Üƒ9!]¼ú&Æ4ºg‡Ó¹zDıĞøš¦µ¢úºo¸‡vûgKÅLÓw	=ÈÏØØŒÅÄ1Ú»‹.uŒÁ¦ùÿ96e4ªÚ`Ä ×ÄôMìĞ„Û{`xm†FñÆXºô¬¡)–fÎñ‹ÑÔ†W¸Ì_»p¡¸_ÕÚ¸àšfçV  >ÏF‹rW±ÍxSlæ«“zŞÅçä®6éõµä*šL4Úø£0¨h­¥–¸Sjì¯÷zúàu0¾±>¦¯2¼±IO²{cC=°©é"½¬²ÿÀY%åiÊP ½Õ±5ÑæÚ¦³]Rá$&XõuĞİ¹{5ZV7¯I÷îËYÍl¬Áõ¢ö&Ò”t!ÂşDk×Ô7€Ÿ€¦Øà‚X·¾®şÂºyõM©-zub‹'gánÔ:¸˜Ğ7
+-ˆ6áœëj¼¦id±ûæ<d<"Òìai½îßÅæ{è§]¢4¤'‰z¦«–ZÊDL%Çh¯½½Ú<©ğøû@¥—Ô77TÅN‘wm2FVæĞïé:KíĞ‹ôk‡^¢Wú-ıÎá µL-wÔ
+u£VªsëîòµTò£uÕùÂ2±ü5õò«ãkÖÄ`ù/oØx5©@æôœİ›¸~M¾>¾üQú†:ÏQ«D“;*?Ş˜_W¯ßë‚îŒ“ıÌ×åc—ê|‡Şç^ŠªÕªRÕ/¢ÿqøÙôî´’yÑÆµÚ¢û¤ÒÛºõ±j]tRPÈœ®ë´ÈÄğã1fG­•Ø½£â.}Æg:¼€¯KvÔ:‘÷ztÙà¨:U/,fğ×Äi-2"&XLe}~cs¼IâšüªN"’_A˜ˆ”Õ¨Æª<«:>u³T³£6©µYö²*jêêbÕP‰š²ü4y¹çâã¨‹Õ%ºTäo,‡c,×eÎÖÁ8MWUÆ.Äb<Ì6Ø‹<ˆs8Ì}Et¸œ%B\$—sår¾\Î“ËFá<YàäƒŸËzò2s¬ÒİR~¬¡R‰6A*—©Ë-u…£®TW9êjuÔlPuÁG]«®ÃÒ—/˜N×Ë3tğ7ÚQ7ÈF¿©nÅsÔMêfÀå×1dG}KmÅˆKW,šë¨[Ô·-õ¦AÇæéºU!$ú®£nS·C:êGİ©îrÔ6µİQß“ËİêûOá2GíP×9ê©»W.÷©–ºßQ¨Ó—=‰Ö5ÅÓé´£’çeà%ÏåS»™XÔ«¾ık™¡£V®{ÍÖjÊ÷ÈZşPèÁĞü¦ú|K=â¨ªGe¼ÇÄ „NssL=¸€#Ê!J C4oE|cP+§S}’SãÉ×0—ga%ùP+õc8mkoeP´½´ª]^WP Q©æFà@¾Ìóá{7â	 âÕÂFk;«#=˜¢Œßïê;W¯™ËtG=®€#tÑ– ßŠ…UÀ™–WW7ÄÄTÔüK¿ä1¥•£TO¹8ªM7ıÓRíÚ£¶Ô^ _'èóh®KcœJ[]¾÷hVhÖòjİ§ğ‚x£Ş¦<
+Üz-š8ê§€[µO m?Ÿ¦b_‹¹ø*¾Zf&¡Ú=ò¦¢îÑTEİ¦ú*­˜K4±NO"ª±ÕQÏªŸAÉ:R±Aü†£~ª_¨_BÈP‡ãŒˆ,{ÉEØ\y,uÀQÕsh3·n“£~¥VCéüN¨Yº¶¡şB9r>ø´iÿ?	>¦âÌİÓZaÁ+õ˜-;=]“fäÄp¦§Ö7×¥:•lµ¶¾fìüúšñÌız
+á</6Oóµ©Ánnwˆÿx	Ì³©>a0éÉ¹d9ot®JR¦Ğ¬/ª¥%4_³˜oA·ô‘û
+#Ú‰Æ8úîÍt±qc¬®Zó¿n+ê¾ÈNÆ##Gëêëâ §JÄgæ iJÆ15Î(Y|EµFĞŞ£Óc‡©:Ë]!“VdHıÁÖ1üRÉùc4Gk…ßG«!	«©Şóğá‚Ñ32ÆÖë’8à,Ü¼±£L§t“{†Q»l/ã&×H»–|Mòºëñ;I‚‡>à\ÉíÇ£µç¸ ÛØƒş¢ñÀ„—Pç€°tOgK»oøØº“Pë`T˜áãÇ!JåùZèöÂhƒ|qÉ°õLbÆ^ìµ îg–@cóêFÏ¼ûTTdÔèœÔ“?úYs+O›_±d^ò3AÊ[É­7ÕŸm˜mL1Ô6'êbÉúìxãœØêæš¹urxÕÚˆ€)LÁµa_µ¼ÆvP“ Î™_#´4_æ¬¤?ç¸>¦íİ$y¼:ìk/èQ3NuóÈ_‡h]óÏ'ôğÊ°õˆ#ãú«NÿõŞbñÆEÍ«kã’¡Æ!@¸£/4ÇâƒI¡c–éàÓM¤½Ñx‘d­cpF^æºOzŸ®Ö0A¬!'ŞX‚T£5àTÈÒ-cj"„­4Ä7ÄÅOv2QI<œ$Ú#uÒF¦‰Ç§éÉóÇl Ÿ™bvºÇQÇ«66ìây$Õ|R2Ä"{?°¿\B½“QE¼¡Å^æ{)ØŒÈWáêÃÙ™õ!³;÷xàï?·§€Àöìh³ Kq&•±Z.™1F|™%”Ğ'ISß4o’Ñ´€§•±Íw×é[ïÔĞ¯)¦)¥íÂ5gSgòZÃAÏ^ìåÖOşør‘.µ,±;—yÇÅæBpõMÑx]ã’b5!€]†?ÇÕy(~ÖE®h39áÑyË”HÊ[×’ø†µ1·sËjÜÜ‡ë>2´sÒH:²À®:wyQâÑcª6£Ç–«ÛDùô<M%¦È %É=’/Ñ+úş[ú®a¼ù=ı­^ÅÓXÜw_ánR»PPô_¸ú¥’ûĞQvÜô½N’Äü3ıÅë|Z›¸(,:H·UÔFÆSd?…K"¿iè!s¥)ŸH9<Â<ˆúó`=|¡;„7¼”Ş 7õ”è¯X¹Ò¥·°vƒŞFy0©
+‹ŞéÀ£‰»EïZôE#¥Ÿş]ß§ÿA7Yá¿1¸¿¹ğIòµ“µ ø Uc•övZYÜFƒ¸=Dvn¨…|¹Nå^ÊZ±—²Wì¦^¹9mÔÛm‘‹Rn.Å^¹.%Rã‚ÑMÜÚ¨ïn:aa‘Ìf´Q¿¢VÌmêí÷‡L‰‡“Í#¨¢B. Z.¤M\”C!Í¢ph†¬8)Íô!}„]Ù´‘şNcgŸx§âÖB¦‡i”EŸ–[ôc¨ÿÕ“3-Ò"ù§+õ*ê,e¨'’ùrÏ´QÿÅî)æ ÆßFŠ÷Ğ‰Š*R³ä ½Ut€ş"MÛh`©¹—A@ƒË|{)…!e~£Ô
+[Şû´NJa«†–ÙûY¶ü-T±Ÿ¡áeH Fäl£QÛ)¶JÍš	ä`eÁÂİj7.E‚¨WÄ	FB{¨Ğ e¿”Š-Û‚•v|;âÛCÅL;¨OQÄ¿‡JàY°§1•-Ô+QÑNcñ8´ÌÚKã“;Á=Ø‰8±ˆµ›NÚ/[ÆqN*,Ñ+Çiö+i…Ü~áLã¼C¼ÚG<‡8ry"ğ$*âRšÈ“iO¡¹<•*y}ƒgĞZ>…6r95òlº˜çÒõ|İÄóh+Ï§;yİÏ•ô0/¤'yíCŸ_ğÙô/£7y}ÈçÑÇ¼’ñ78‹Ïç0¯æ|®ÒŠ²…²èNEÿ‚¢é~ØÆgP­¥³és”lº˜æĞ°œ Iô%}E”d Œá0Jsé9:BGaĞ•´Ÿ:˜´bõÔÍæşZÉÀ”9‡s(*À¢‚Ñç¬ğdjÌGäh&FsÇ8„1D-×s„úC-¡•ó-öuĞh²µ©J*Øb¿…ayCğ|XZ¿w„F¸¯;°ÚE¾ş¡YÛ_Ò mÊw¬M  
+ë	æ–B½æ¨|ÜšG'µÓäÖ.à´ê§¯£,®ÕÂîëvÖâ$/›C‰»1›ø0eaM‰©Ùá,APÎƒã^®Á™~ô¢ú‚bmeefÄ<@yEÌ"W³kÃY\<PŒÆñ%Œ¦,â£ñçŒ ÃÍ6*n§)	U.ƒ*ËÑeã§4uM3¨…Œ-äQwXş¼ë°ü¦7¬´ÌŠXe¶*Dì6šşC;p"Øãs—ÿ÷ŸŸPŠû¥Äã¯Äıfâ2Qs‰g6âş(ñœY¸Ï§Á_{­ñ««§à~wÄÎ¡—¼Ù(´POÑÏkMy^ç™úy¹Oã¹\?ÏóËó,<ÏÒÏ“-y€çÙú¹À–ç¡x£Ÿûåè½Q1WWX9è<¢÷²ÅİNB\‘¬m6ş*ñ·Õø«ÇßÅ…€İtjmrK§µP­[š·¬…¢n±Å³İâé(áÏ@q¦[œâ¤B)-@©(y*å¸¬Lcáşª(³RöÌ”£5q´+ï°¸ûKôÙG¬ıröG­]PÃÛÕ56áªù#p1ÄÃB/Š_Jù
+ÁWB¯¦“ø:™·Ğ¾–Îàëi=ß@uxßÄ[éRş6]Ãß~İ
+üú.İÎwÒİ|?Àßãòİü#ŞÁOñ=ÜÎ÷ñ3¼“7/ğƒü·ğ«ü0¿Æğ[hù.?Æ¡õ'ÜÊŸñ.ş’ŸPCøi5œÛÔHnW5¼G­ã­j#ÿD›ßFàZ1<™àšf ‡Åı˜ûZÎ!Zj$ÍáŞœ‹ƒ½†ÿÛkw;ÿÁk£K¸Q”\7Šç¹¼u‚Ù*®±ÎÔ†}8LaØ‡!Kö}E¥>·ÔA1
+
+±Å.iöñü‡¡{é9Yã ü|A£€O}¾¤¹¾€RòËE?6A½±”–bíÿ*g¿Dø…ƒ]ú8ÕFgË#–¹']f‹‹ô¹zñ-)ó,±ä8ßù-.·)³Ğ`ù
+#¦.+ö 'b£9^-¦í¡LÛèô¥;G\ã
+¢÷Ê²EÕÎUû†(£(ZîyRÂsW¹«qaç|Q½ˆ)_$ª»zÙ®²@»¸÷=T­sOÈµÑ4À2ÜF5ÏĞò%ƒ‘`ÆV‰ÛÔ!ŞNë¶a˜«X¿Î>½iÕ–¸,h”†"ÔÆmßNº'‡àù7”9˜Í-×i¬¸"âì3ï¥ÍºK[rY2t–ºêË²"YûJ³Ò^á^áì4)’î5¡,'â"à‹·Ñ‰nÿÄÉDrÚé‚%z¬-½€ÉÏËzSİBå9Buš"`šŒ	 >¡6jØFcŒR'ì´S#V?4B!ì`ÑMÛ(»šQ.ilq0Àë‘pöæ7",şÂ%âdğˆ.“RÄ’¹Czî½4nE
+¦LìzÊ¶ôMónºh?hæ/`›¯…¸÷*ï>!–¸Ö»gy÷*ï>ñ^´…ïä»€?î½
+Xñÿ÷wù¹+S­UqçİÏ›]ç
+àfaªÏÑXş0ëyšÅ¿¦yü-à—i1¿BËùwTˆó«ÔÀ¤Ëø5ğ«7èe~“şÈ¥×ømzßÅÊ> Çúæ#¶ùïXçÇœË‡¸ÿ«ı‚G¡Æó¿±îÃ\¦Oç>E1W(/R~^¢,®RŞ ‚¼Eõâ›Tß©zó]*·«0? úó~5€_Pù5ˆßÅó@»¿õ>QÃøKôïP£±Ã•¥Æ¨°¼ Æª“ÔÉj’*ÃóL5EU ´TMU«Ô4ÈbºŠ«SÔzU®šÕ©‚“<üçeğ0Ÿ ¶ô:J"ñ 8ØPîÇ
+°í½"¨óŞòH"ıõÛStİ ”¶{o³x?<Ã‰`‚9ü*çˆØ²øG`¹ƒ˜Ù¼‹¦p>J½øİcŞn ›y(Ú9`²?àaxRıÀ‘‡£ä¨,:¡ÏÇ¨« |HvêÖë¾@y `©[’Hİ¢q\şç÷òhU›4	RŸ¬6jæë£Y*ÆE\¼Ÿ§ViöjA·gs	Öbó"^Æcx,ö¶„—º2Ğìuù½=ÂİµK®óPrã-¹ãJ‹@<|P¿ZìÒÓO Ë·€°"lÏA[;h8zj…÷^y‚Å;°±c¶3ÜvˆsG-…cÙŒ?ñ0'…’cñ$‹K¹ƒÊ…–ö8†×LF‹îs”ú¡È<áòa¤“qjàÕG¤öS‚b€Ğ×'cM¥±ğ)\æ:9ç…áWñ‚BN_¼Î(Ê£K4^†
+ÛéÒˆQs™®ÉİK—­Úİt9^äãÅúEß½tÀêÊÊyÛFW-+‘¨µ05h¿Z8‘ebî5qDæÅñx) Š|±:‡¾„úª¥4HEêl¨Ö2*W+¨BC‹ÕJZªÎ£åP+ÔùÉX½qÂT„m†ŞÖt("éÒ<)º‚Oá™^¬.’Û¾Ük?C‡Gn«Y^ü"ó0²xv¿½@b¤8—Oõ’KÊ÷QØû–i{é’vÓµŒì¤¼âÂít]]¿L3ÿ‹»äTŒ|je«
+«µ4÷€ÕÄ~rå¸dxûñ>NCS6ExW¤äÜšÓ½µg‘:
++²øş
+¨â®~>ş$ˆìWbC¢ëŠ¥¶Ó Ô#ûfú1=C7Tº|¨“è”ÀgûÜX©“¸LíJ\äĞoLú°›zd*»’Â	œ$ÕŒi¢¡jR›2A	.²\BÔ¥t­ºLj†»ƒdjæºR¡ä"Õ(Z…¸ş¨ -K -ô*!<İ
+±¿á%nÔĞ£´ZÂZmYiLqŸé%n,`ãÍ‹Âó*K<–gËK
+Ë1}–"¡›‚I•DIâí·ôÛtÊ1;9'?C[…¡Q¡|ÈÄ|ä¹ZhX™¿D†^#Kªé|e£Ê¿_¨g2èõyAoQ+öVI·Òí wÒcÔ
+úàË9ˆ½I]½êèí”§n¦ê[4Lm¥1êªT·Ñ•êvºIİA·ªìÜEwª»éõ}zHí ÇÔıÔªî¥ÇÕNzJ=HO«‡èy8•?ê´D®¤\^‡à§{àÒÄZô8pPº“ñR:¬üÅä‘¿˜<ò½#÷ÑAít@»¼#(Eç‘»­yG>•¬Ã”ü4P™©ŸÓ©Û0V+l?Mà­- {ÒWdöIS³êab
+øQ>ÃÕJè\ƒÖ“,pz7"@İAê%æWÜFß{3J}’&(u“xn"¢´¸[ún NÌ¥§îPílñ±ÎÆû Te–Qjz‡};iLqØ–a@ëÃ„#V8°%À•ƒn¢oÉİ_ñ”ØÎ¬¼ßÑ|´kÀ¨¡(‚˜ùÖ²@I§‚•H( 
+V	‡QÓ/h-¤Æáßus¹soóŒÂŸ…²R	2n_	î‡?â¸_2¸pAê	€Å“”¥¢\ÕF'¨İĞÊv¢öĞHõ4MP?¡I
++Tûè4õ-TÏÒ2õ3:GıœÖ©_R:@¨ç¨	ï/V/ĞUêEÚª^¢;ÔË´Cı†îS¯Ğ¨Û£~OÏª?Ğ‹êUúHı‰¾P¯ÓaõgvÔ_8¬Şà~ê¯Ü_½Í3Õ;<O½«µúQÄ’i„—œAÓ¼ôß4P×iMÒu6]O@Ô¾ü}¢³oğX!^Î+àvúÓxîíˆJ%´%OûQò¨ÏÑšn€ ÎĞv`Ò$îËçHv¦r¯DÉOWÑóš¤Yô,İÈ‹ÑÃNÚ†Ûó~G©×:Aëı§œ£Xóa ‹èû)Œ*T‡n‘J7<ïı¥Ğ¬	:`¬ÃôPWõ)³æ+ÿ+²Ó,èÜ¤•y™ñ2°Å=&ºí°íÚH§ÜˆJ;SÜI«YM¹v²&F¬Dn»H²ÍÇNl·À®lI‰´UÜÑiCS¬á÷óÃÄ4cH$ÃÅlrïìDøÔÔx™İBƒäı]İŞ·ÓXy;:İP¶¥JÒI/Ôs±ÇI…»X'Ì#¶dÌwCi:’s5È© ÆÿŒú_ÔG}Fqˆ£Õa¯Ğği†A³“~ZaX´Ú°©ÆQ£‘M—½èJ#¶}èzôû–Ñî2"´ÛDÏùô²1„Ş2FĞ'ÆH:lS‡1šÙ(âÆcŒå“qÚ0î‚—]îfÍW'³æã½¬y QåşTÚÂŠ7x&òœ†4‡²¤9”%Í¡,áx’çB<V«¾	>4ÒË¸ä^Æı0ÍpGND·§8İ^çÔİöÂ›ŞÖàê@ÓTÕşÔK†“ÎĞÊ_*æÑ­…NXIfØŸÓa{5zôñE2¢JwIÉv0¥# ›®”å¼„EÑÏ<Ş¿°8w»ø¤’ƒôÜS©õ7&IË›Ú!¼°S÷¾ç}dK¨œK)Š:óöC…Áp-c*…Œi”kL§|c§Ğ©ÆLZ`”§|d\˜ôâ“^|aÇh¯Ò8&¢ô3Âš˜¶³ó“Xq"
+V”çÑT°¯»ÓØ—8İ{#f;}_v|GÄ,ó«RKÒ/:·.Igã¶²ùãqB\±÷ñ'~ÿı{q/øswhÔ	gŒĞÏ÷èç¾¦<çàù^ıì÷‰³–ôö/¹-Ÿ*"Z›@áóhXeõÏ£ûpËË£¸9yt²,kr%—ù!îû§öĞ.çHéA&qøŞG:w7Z´€Qõ4l£ ÑNµO²R-à„ ´>	z—Dµ–I;=Œ‰|)|2™†=«3J©ƒQ’q:™Æäó©±€"ÆBl,¢aÆb˜ıYt·q6İc,§ûô±’1Î¥ÇŒó¨Í¨¦=Æú­±–^3âô¶±>4Ö³eÔ²clàFç¹À¸€KŒa4&?¦½ÃêÏeoÃ_­Ö ñ!|c•ˆßÒ\­u?E9Ÿcòq\Ê“Pîi’ÉÓy† ‡';üZC@‰Ç÷Ğ\ƒ~.@%q–•ôƒnÏGÜC½: uv6è%›ş~¿ÿK‚ÚÒ‚×vĞÌtãïŒÖym§;„½²6l>ÎÖJ×ù„œfZî Ÿã”äÍ» A<i3%ØX65Ùƒ€„o5Ó˜›éj†VOŸ¸4QOÖ±Ÿ¨'¢Ï×v¼ñ§øÚhNš%ğ‘ûˆ —Ù5¶d :OÏçII
+EB…d 'âÈ@?LèQ(b¶"øF·@KÇ“´:8è5{ÌmæLÂrB°[,ÇI˜Pøª#i_­ûé&ãxµ¡”ÚP¢mËÑ/"f§©lE€AÆ%€½Ë(Ç¸¦r7®¢éÆ54×ØBóŒki¡qk\OkŒoRÜ¸‘j›é:c+m5n¡ïß†9}‡4n¥ß¥'Ûh¯qí7î¤ŸÛèEc;½j|Ş4î¦÷ô©q}eÜË~c'‡ŒûùDãb<ÈŒ‡x’ñp’zŞE£´)9ˆ‡§ğ:m@´P›MPû¯×6N¿âZ”lª¥ğÄb|oÒŞ ï}:ëP
+Ñ§TÎõÅnMÖ™EÓáÃÅcû©CzdŸèTÒ ''rr’¢÷(jèèÜLšœ®A$îRÏ›„z×*í?L¢Õ®BëÏAïiŞùü—^ú’è~ ĞAs%¨K!â(“¦ô^ZúL¼p…Éß½ƒ6¥4#ÚÈxi”Å¨“¯˜ÕEîo6ŠÜÏFE¹?r³%Zs~,fr 
+ä‡mUPû]„«-ó‰›e¾âN£+N$V¤C…ÏÅÍF|
+7Aœñ$î)Ê6„t¶—÷ĞXãiĞ·ŸĞLÉ9Æ>Zjì…{†¢Æ³Z)ãˆ§€D5èô‡|gMxàj}8Œ½|Ãû™A6­£g‘%7jÜœ	ÚåöLs¹	GçO®áf¼w ÜÑD%)fğ}HTält{£Ï ïòœTIËÿ4Ïûn¿u’˜v:İû.×½CJá¤+s$ÓBŸÙN¹¹;$šjåV£T<í@³ ´ Ë{½.ûÃÖıt’Oqöv‰!†ˆÖF»¾¥'vH}`‹ÁÒo§ô³»ŸÕáõ{@~ı …{)lJO½›Äò'{œ«Ìûuğµ*Üàİ–`Aÿ—!toéxK¨_¡7]7,Ù…>%ZC%îzZKP›'aÉSÛÈXÙªÙ‘«¥YùåÍÊvjÓ­îÓ­†c„û¶‘¯¤u/İ·BŞï¦İ­ò#=+$†zz¿´İ©Ûæ£íNİÖgoZ;ùf±/‘”°wBPV8 ßùÌHP,‘Â­zko¤2ĞŸ¦¤Ìäa‹—ó7ùFjçGäÿ;‹~’úYÊ@Tküü
+…ßÑ(ã4ÆøM6^§©ÆŸÏ…¥¼x~—–ïÓyÆ€ç©Îøˆ.0şN—¢?¡o‡èãŸt‡ñí0>Óù‚~`|IO föÿFàs˜‚Ğ¾d2ıÆÄü¦Ÿşfé3D_™Y¬Ìlîe†8læğ 3ÌƒÍx´Ù‹Í1òDs0—™ù<ËÂsÌá¼ĞÁKÍQ¼Ò,àóÍÑ¼Î,âf³„/5Çğåæx¾ÑœÈ7›“øs
+ßgNå‡Íiüˆy
+?n–ó“ælŞgÆ¯™üy:€ò!s¶ş7`ÉÃazŸé­¡ÑpÂ¤v$Kï$Ş²¢,]„5ÕáW –^Ì›øB´›I¯ófG˜G¿ã‹$§Á7ëG£ô¤.ÁòkÔ›/÷
+òÏÑÊG+ùLX ?ZÙüĞ­$áë$?79ÉÏMë0x »f[™ƒËáÃ|™08u»ørÌá"Q_´wg=„Yİw‡<Lª§AGi¹x“ÇG@ø¼¤Å	_‘¯³d‡È×›‰üé Ö¥¸7bayÜë0…A»òÎ°øŠPŞi_©¿ûÈç›A_/íëËU|µ…Õy¿:Ñû¾Â6Ú¿²Q<·ĞıŒÙÊıhêõO?ÍÅ)?:Q‹€téıy#ÁnMâ—^~2ú3ÙËşoÁßµ|—¼„Ñ%y}´X#ƒ¯¸µ”«²D~|dæÎô±FÉnš×š[VQÑš;+­âôÖÜ9ió[sg§UœÑšûLZÅ³­¹s½Š@!´æşÌ{Pâ¦g|%®õ#>ñ·ÓÏ[sáµÕ½E;ıR`å h _Â «5%;s 3;³—¢ê¹=ô+ƒ¸3pİD!å•ş¹0Ï£lsõ1Ï§Af”F˜«i¬YE¥f5Í4ctš¹†Î4kh¹¹–V›qŠ›ë¨Ñ\O›µ´ÅÜ@7šut›¹‘î6/ ÌzÔl¢6sí3/¤æfúµyıÉ¼”›—%SßwCŸ
+u@ò Cœ­Ÿöá4İ:PP¯î×`\ŸÉ/mäì’Îûh2|>ªVœ÷!m<õ¡ôos\F5’œÀà:Şù×kÈQ*Lzaù­êh—ÔÜ¢ßó7½OÑÉÜ_'sæ_'»*êK.ÍÇ7òMÒø jø-úÉ0Lâz¶ÿ<L‚\¯ÛÛÿPK
+    ›0F•R©.í  °   ,   org/eclipse/jetty/xml/XmlConfiguration.classX	|×yÿÒ¢­–KÌíE–VÇrY`!À€uf<Z«…Õ®<;Èé‘¶9êi›¤us§m“´‚ĞÇ´Në¦iÓ¦·Û¤MïônR;Ä‰ûoöÖÊùIzÇ7ßûÏwÏ÷ôòw>ı<€-âÖÂÀŸ©áÏÕğjøKåÇ¼bà¯Mü_ÆWLü­‰¿3ñUõàïMüƒ‰4ñO&şÙÄ¿˜øW_3ño&şİÄ˜øOÿåÇ„Bøo?Vàû?jø_5|]ßğãÿğª‚{ÍÏí7Õêzğ-¯û±¯˜ø¶š¿£†W¼aühñ£EªÈ.Õjå3eŸ¿bRëÇVñHêÔ¨“¹2¯NæË5,4¤¾;¥ÁE¦,6e	Ñå?v	/5e™{Eêd¹¬PÃJ5¬2dµ©ÜëÇa	úe4’"kYgÈzC6rŸG¤É/Í2¤¥§¤µÃjxB–FÔUÃ¨l5œ–VCÚi7$lÈFC6²Ù-†l5ä~C:ÙfÈ†l7d‡!;éôË.ÙM«ÉC,>l»îä‰ñDw*y:Ë8–O%CÉ¤ít'¬tÚN ¨îéH°¶'åÄÂv4ŸHÛá3êp8ãÆáD*îIÅb¶³“§‡‡'œøxÜŸS§ëOöœ±ÎYá„•Œ…5&yjã±¤åf›RLcèí&ÏÂáá‘Ô{t lÉğp:31‘r\{´;•HØQ%1Ì>mEİ”3Ù“²FmG°¨õk;ÖHÂ&êÃÈôº0—˜eÀIEít:åğŞ³SÉhRWËI«÷­™„æĞ,d¯öZ×“B>º¿”ÒY$æ ëÄ“±E”ş‘3Ô\K ±S¶ãNjà»‚ÉRŒo8ã$ó¼§IÛ;Ú£é£î(8ı“J½Ú³‰ ı®l¨NÇ“qw k¼µMÍ³0Ÿ¯;5j+ãÅ“v_f|Äv†”û”x©¨•8n9qµÏkr1£Z†ùå¶ür;©5J–İ¹¦Rı›ó¥îXœÖ4³|%*RÌ¹ÑÒtš;èZÑ³ô†ŒÅÑ.æK ­°ÿBÔĞAlÈ^Cº™MÓ­©I§2N”Š-Ó¢¨—§­áCÉ‰Œ;¨1Å÷±Ş	–f!â©ìc×±­q²¸âCö3)Ó¶ëébÈ*Ş§­İü&š{Y§5¸‘ÍA‡ßMJ	ªâëò©«ƒXç¨«#¦Æ³«`Ãì$2„5ËŒÙî!/é2ÈÊÓn[9mÖ‰7—À^êÅUiºK¤¢Ü«ÍÅ­½¡iúÛš§“X‘S#gJó2ÿhQSÅõ*ÈãV"ş”½Ï>menº,ØrïSÁ–ÒkFÁ¸g/i:Y9*}–#NC…ÇÔÌÎE· ­È:T8šq;é†éÛñx4Ü¥§£öi›Ô¨*ÔUîX>Z5êĞ˜“:Ÿ­âKJ~r"—ôûîæ-Ñw3pV33­¨
+Îu›6²B¬¯XŸ¦ûr‡6«CôC¥o_g‹âÉm¶ªÙIx¯U7)ãú½¼>Wª-./5í
+;€§p>€sjx›\d÷¾E‚ğ>|‰Ñ6»š&¸¯2c>p‡;†7¶óKaÈÁ€’Ã³8±m¸£][Ş’s»‡]TXmµÈÃÒÃ¬.0nÊ1–Ğ6U m®@Û2ÖQ//öÂ
+nsİ‰aO‹öq¶)#Öd»Ò¯DòrÆ¬ò•CYÆóçÏ—°yv*cnn‡{ùÒà^k2H¦™ãLÄpxßĞ¾`Î£v8¼¿Opyuû—=YXÈ ƒVzŒ•,€Àğ5|?ŞÀ»ğn~ÃÒ+}é— ~Ÿ
+ÈnñÃxšèåÅ`o&ĞmÙ;;÷Ğ»Ás¶“fdíjÜÔ¾±1ÈdL’kWã±¡m4îÙíï\³¯¿{(2°¿ xpàØŞCİÁÆDo6f­õ–jÜ£2H1gø2ws_IOü£¶j*UÖ|œƒ)­©íE¹¼9.}üä9!èœ]v­«Ø…«×Døüh ßƒï5äÑ€œ”ÇøMÈãr* Ãx^°å»øÊä	±X"Šú`6Ò1+Á6Åµ÷*öÊcÉ³ÉÔùd°¤Ÿ	º¬¶;‚¬üÁx2¨9"hœÖåÄ2ã,½Exrx'z{‚®ã¥$Q±ø4nªµÜEıfW6KoRæ<mH, cÈõª†
+Õ_°¼@=šIºññb“)¢Î/¢:NJÅ‰œ5$q)}¬¿IÉD.Ï4yo*•°­Rüî1Ë¡ÃTÎÌ+âœtíÄÁ1&|	Ø¡¤kÇÊõ¤’±’c)‹Ç(ûR­Ñ©ã©øhN&í‘.Ç±&{âi\3ÃçP³ÉØ{Z%´İœš–åšW xĞs}dQa_¸óòd@IğcøñEú³K ¸•gO\œëƒ]'¦yUµÄıÅáZ^ÃŠ½³`İlºQö_Ó›ZÁªÌ˜»ÅÖ±Ë<jç:ÿ-MÓú‰
+]YùncÆÚd?ÃÙT·­™ZÓâ‹é¦rz—v”ùön¾a	vTº±Ì®Gg§Iù}âÂš˜°“¸¶Šp3|QˆĞP¸íxuZ‹ßÕ4ã5é®d²h€ûÉŒ•˜©_~TË<ÛR¤¥«Ÿş_Z<‹%%·‰¢K1f¥ûì®nùb_Ro–Årw·òª/šÑİ³qØŒø¶·¸ª”»©õnğ©˜ê„ÃeWòÙ¹n¶—uåŠîJW›»º¬(”Õú@Ú&+s,Ü¥Ûz¾ÌuTÉ¢>ÑÔ€?ÇV>f3È·fõÊŸ(<ìŠz²U¼öÅTE\ÚTñæ¢åxók
+Û"x÷AÇôz2»{Ouf,ğ®7÷Woç\<jçj™ßjŞZé¥3Ú‰500 ËÕÕ†«åê²Á®«0ÉıSeû·•íÙ?å÷ßÇ={X®ëUW›§ÿ÷ï(Ú¿“{¶¹š-­¦±ã¼ ~õÍ!çO @5|¤¾ı&æD¦PópŒzó:j{ÔÂÏE¯ZÔqÑª´]ÃÜPı¼=Í÷¦Ş´Ğ›ê½©¡UO‹¼‹½i‰7İãMK½i™Õş$ÇÃ”°`b¥¾£X!œÆ&Äğ Æ°qÀôâ,†ÀI$É"u‚?í—¦¥2x‘BÔÏ¤U~J[m!¹~šva£D¼ŸáªŠèã½\U“ú>¼ŸZ/g-s04…å¡›XAó¬¼ŠU…åêË¸7Òûb¨å*‚!®©ùškhœÂZµ»†uW±¾õöE˜}­·Ûn]"n’ï%æ^ì×sµÖxj9¾‹o»€ùÚãï&çÓXOm¡ÏvÑ_ÑcJ›%D¡LøYü WÏhm~ë¥¨zƒ°Õ>`àƒ>1ğá;ÄıŸÖğäGñ1­ãÇ=¥
+søœYÇ›ØÀÕ}õM×ĞL›¯!Ôs-‘›h´L¡m
+í½Ê}/†$kº>\b„6Á¿Ã×v{™O›a cÁ¿˜=3´3I@µ
+fx†´`7>ÈÆ!ª1DNQ‰3TA™#È³?o³<ó4UÜ6ü~‘ïR†Y¡…Oæ—ürÁ65Óls1ëÿ¯ZÙfàÍlÓ¢l°ñ®ĞLÿÔŞëÑ³g€3ød‘>ÅØüur?KC\Âv\F7® Ï)?W~€Êÿ
+uX;]ùƒYåõM”¯R·àlYØO!Tğ_¯ßD§o¾†-Ï šoÈî¿Š‹xÏel{		7ğ€ ·õ¶%håb‡àììµ…ÃzpÕà1î;^BÍEş¾ñEµùŞÄ®H.Êv{QÆ6×ïáº†qSèºu{ólİ6ıtß-…Å¿`Kèöûh¬œQ;0Wéu?[ßdA~	õøYÇ‹ˆà6Ão3<^bº½L~Søı|éØ…•tÁo-„ÍtÄ%€×óF¿N§\É&à|Ô¬xó<×~Um«H¾ŠkÙx
+s'œçPÌU…rW£‰_ÑïxYl¯O‘v½"Èêr¯Írƒ4ŞQ³ {8+%ê”ÑZnà@Ê¡^+*6uy]ëh¿Ïğ¹Šçû|vkV6¿‚½‡¤UjŠôgQ‹±nÑ/:şp¿>É#—Ê ê‹“¼`Bg*Á¦CogÅù2aU~ôßÄAÍ!V­Ã‘Óõáëèy„ÑÓûúz[_ÂÆÖÏ¢ÿ˜­Š[\xëµ>â­0úDZ§pôÖ%-¯h35ï½0}ïÇbß×±Ê÷¬ñ½Š&ßkhó}[}w°İ÷-<è{!ùmôùŞ(JÛ~ü£ü4=ÄÈû…_EÄßÁïRü—³Vòı^6ºæ m>ÏÜ­«3–[`2^¿µÜJm]>¹ß³Ú4¯*Î?ÀNç¬®ÄùÅJœU•8ÿ¨§Lã¤>Œ/e9ïèú|íÅu^oAíg0©¾Œcƒ?>™sFj.ãÄ`Ä¸ŒÈ`Ä¼ŒG#H:É‰´Ç8‘ø8ª² 8E€ O 0B€D@F@lĞ€ÓF ¦Æ4@\œÑ g5@Âçòî¼äl»ÔÜ{)¯órjå§}ˆ-Í#üŒ?ÊLyœ>Eÿ‰ë?e«¢8«™;dNÖ61ñ	&ğ'QûÿPK
+    š0FzÙh±é    
+   about.htmlUMoÛH=¯~×‡ı ,+N°‹ºU¸‹¦Fít·Ç‘D[ÓH3êÌÈŠşı’#ÙNš­–G&ÉGNüëÕ‡Åæój	…«JXİ½½¹^À(Œ¢/Qtµ¹‚ÿşÙ¼¿éäÖÎÈÌEÑòv }F…sõë(jÛvÒ^L´ÙE›Ñ#MÙuøZï7É]>J‚Øz¨Je/_ ˜Îf³ŞÏÛ¢ÈéQ¡À¶!~mäşr´ĞÊ¡rá¦«qYº9|pû¾¬Æ¢»¼^_½úkNG!9éJLæ©n\õ‡ †0©Î;(…Ú]–·áİÚ38ï­aSHC\ò8Oâ:™Îà½èÆp~v6‹£:ù…\.’™¡²HvIÀf›a™•²¶ït£rá¤VP‰{´ öB–"-DY²©ÀqÌºlv!şøík£İ›BøsÀĞ‹ƒ…¼%”}ü„Êùemô^ætv:İ @CğMe½ÅÍ%³² ·ş¿áU“ IÁ'4–É³$RËÕÍ@„…)z2Æ¼=ÖzëZağÈùäŒr˜Sôº;Æ]İ0éSYá &Ü>Ñö½pJÜ‰2Âº÷Ó³I/ Ÿ6#‘<£1_Cã;,„O±Gî³³MÑòv½9½g\~Æa`ôN¨Sk²yT1ôå^½3¢êĞJª{…By³AV¥×àõÖ÷>—9(íÀ`†r½ÈÊ%½ve[£«'"8©vü+”¢T;ÂË%OzÚ8ZÚ‘¨4a\wPÊÇ“•6GÍür¹İ¢aÄ%Y	¬kbÖKØ@C¤¨"BQÃÒ/ÄšÌsìÇæ”=À¢ÀìŞ¿{ûw{˜ú:ÛŠGcÒJW|CÕSl“G?| 8;ö+(ş³äv§J´Ô:®D+-óËe&|‰°ÔíøÇSHÓ`·ö˜?çl©¾”³ÇñDÛpSªXê„T¼~8Rß›/Í£ªâ4ù‚ÎuaCã(M€Ú-·\­Êîuœš(ñ_¼¨î”|X˜®v“/4Wûª.±"âıÆĞ
+©dlÆò®‹›Íš
+ØlgR½¶4Ö{“Æ¬mµÉ¹…´@äÖÓ4¹+Ğµò7Ìï%|Ö¶¹•&ÅIB×F–¼¿§Àª½6¤èO4C9*xk4Şã®„’XÂî©8	VÔ/iı£v¹±ßcğ¨İ èÃ4œ²˜²Ò*ÌtU¡É$íjzóètv†`òİ³Eª’¨Š…sÚæ,\®YvL”fÔÉRAº YıRK´‡¦E|Ñù{MüPK
+     œ0F               META-INF/maven/PK
+     œ0F            !   META-INF/maven/org.eclipse.jetty/PK
+     œ0F            +   META-INF/maven/org.eclipse.jetty/jetty-xml/PK
+    *0F!Œf¥Ÿ  ç  2   META-INF/maven/org.eclipse.jetty/jetty-xml/pom.xml”[oÓ0Çß÷)ÂÄRìtUˆ4‰­bâmòœÓÆ•kÛéÔïí\š¤aŞr.>ùûwOœ+¹j‚íŠıé43&c¼"kˆä„f€¤Zào73|"–™ã­fMöf³A›·>ï,ŠFøçìêÖ\‘	mˆ `Oi6ÖŞy%)1LŠgü,øW†w„ëóûè>B[&'AçD0îÓ%‹|š&6å,×€–`Ì.Æu¨L$Ê°9¡Æ:|<¬Ä¸)S× ´U|DgèZŸE£wÑhô>ÆuÀ©ÀñJ¦ÀTA¥w|'C,áşÏcAV|uá`<,á 0Œ3Ã@ÇØ]V
+š*–;¼É]¯ç:vÈF1ng¹S…âI«•5-º"æ2<a%sP®LEä¡)‡PïV’3z%¯ÿTQEzü•“Kdº¶*ã5óœ;F¥ÕØµÙkt5"sàlÛës¿×åU’Ê¢Ç÷‡`k@¸néÄ¨bÜr´³€¦ël»Û^§Z®»¾Êk•	6mĞ›İsøè Ósô–ó€wÙ£|†ñ~LAÌ¥
+nn¿L›H>N¿|­UßÕ…%Q·€J1g‹B‘>I[‹fl=J5Â	ãíqôs…daòÂ|¶—£FªİÏ.ï.ÂéõÏ.®§“ËÛ;4›ØwÚ®Ñá}ôÏ
+|x›µ{!#…F+¹”O`›3‘>–üş“|w!ßı†ã5é,zãvÒË.\[å›ÆÍ£¶[*‘‚ ‡=Ò¸vM­ç.ğ¡ê¶İfƒf¢òì;KÜéíKz‘Fd¤ä4#®+Oª5vÊÂ¸]ƒ¢5µÛ11~%”ßƒ[¶ë×ª»cròPK
+    œ0F­Ó´s   y   9   META-INF/maven/org.eclipse.jetty/jetty-xml/pom.propertiesÉÍ
+‚@ àû<Å€gwa•OA‘Ğ©^`ÒI6lWÆiÉ·ïçú}Å‘#)xÛğL™#	ØSD[£mZïZïq¹¢«¬‡Ì²†»q¦1ùg•µ5L’^Ëiì’L†‡9,+›«n@¢áNƒ~óåû9ÃPK
+     œ0F            	          íA    META-INF/PK
+    ›0F|nİ©S  ;             ¤'   META-INF/MANIFEST.MFPK
+     š0F                      ıA¬  org/PK
+     š0F                      ıAÎ  org/eclipse/PK
+     š0F                      ıAø  org/eclipse/jetty/PK
+     ›0F                      ıA(  org/eclipse/jetty/xml/PK
+    ›0Fö?Kòñ  U  1           ´\  org/eclipse/jetty/xml/XmlParser$NoopHandler.classPK
+    ›0FÖŠHÛ  &  ,           ´œ  org/eclipse/jetty/xml/XmlParser$Node$1.classPK
+    ›0FËZœ  Ø  /           ´û
+  org/eclipse/jetty/xml/XmlParser$Attribute.classPK
+    š0F´!h0Ö  ö   '           ´ä  org/eclipse/jetty/xml/configure_6_0.dtdPK
+    š0F.Õ^#$	  Ì"  '           ´ÿ  org/eclipse/jetty/xml/configure_7_6.dtdPK
+    ›0F@x~Áh	  Î  )           ´h  org/eclipse/jetty/xml/XmlAppendable.classPK
+    š0FÜ\Ä;	  #  '           ´)  org/eclipse/jetty/xml/configure_9_0.dtdPK
+    ›0F×ÚÛ‰-
+  L  .           ´Û2  org/eclipse/jetty/xml/XmlConfiguration$1.classPK
+    ›0F¾ŸUòu
+  ¸  -           ´T=  org/eclipse/jetty/xml/XmlParser$Handler.classPK
+    ›0F}Qºÿ    2           ´H  org/eclipse/jetty/xml/ConfigurationProcessor.classPK
+    ›0FÑ“$On  l#  %           ´qI  org/eclipse/jetty/xml/XmlParser.classPK
+    ›0FÌÉË8H
+  ,  *           ´"Y  org/eclipse/jetty/xml/XmlParser$Node.classPK
+    ›0F#Ô¥     9           ´²c  org/eclipse/jetty/xml/ConfigurationProcessorFactory.classPK
+    ›0F[™(  ÁQ  B           ´®d  org/eclipse/jetty/xml/XmlConfiguration$JettyXmlConfiguration.classPK
+    ›0F•R©.í  °   ,           ´§  org/eclipse/jetty/xml/XmlConfiguration.classPK
+    š0FzÙh±é    
+           ´Ş›  about.htmlPK
+     œ0F                      ÿÿïŸ  META-INF/maven/PK
+     œ0F            !          ÿÿ   META-INF/maven/org.eclipse.jetty/PK
+     œ0F            +          ÿÿ[   META-INF/maven/org.eclipse.jetty/jetty-xml/PK
+    *0F!Œf¥Ÿ  ç  2           ´¤   META-INF/maven/org.eclipse.jetty/jetty-xml/pom.xmlPK
+    œ0F­Ó´s   y   9           ´“£  META-INF/maven/org.eclipse.jetty/jetty-xml/pom.propertiesPK      ¬  ]¤                                                                                                                                                                                                                                     ƒY,¼x1 ÂµÇ-xü‰Ê
+§ÿúÀòïf”¥]=g&#ëuâõ>Õr¾:ÿ˜æò^4ûz‘J ~ëò{ë‹*Şéï®¯V^ÃôA¥OÛúŒZÒzÓ¨jÔ$µ«Íñ‘ñ¸^eìZ¤ÊH"U
+$š|8ps†Dò\`¥” …ÿ¤sÚ^ X,ùKäkü“Neø, »}üÁ_WÅ   €Ï­w¾“_¼ g—Wo;{”Ãhš£)¦µªàì³Ş}Œë/üğGŸ½{ÀÕk¯÷ŒóÍ
+u™ówpFı£=®üŸìšFÉJX¾ÛÂÚa{–î²ëˆ“ŸÎÎr{²ç»zLÕş?k‘×{f—ïy³mÚÒøhºõÛ;=¹/ÆocñşøéÏÿ¾ÚıÊb×kåÒ´ıŞ¦mÚ¦mÚ¦·i›6•‰å Â ŒbÎ¢i›Ê”vÙmŠÂ ŒDÂ¸„q¡ãOuL•1ua'C¥ØK,TÚT¿mz;İe»ì]v›ŞÕŞNo³hı2=ÿ«W¯^Põ²RTÓ»ìítWÛ”TÚeoÓ¦¨´¯‰§èe·ÇÊF¥R©”´Q!½MUÚ¸êô\­¤RT¥t" öKŠå¢Íp²³|ª˜R®hÖœåóù}^¤Ù)Ø)f{ºâåTPUùh¤ô.åæ•WÏFï»¿//------------------------------------------------------------------------------
+// <auto-generated>
+//     This code was generated by a tool.
+//     Runtime Version:4.0.30319.235
+//
+//     Changes to this file may cause incorrect behavior and will be lost if
+//     the code is regenerated.
+// </auto-generated>
+//------------------------------------------------------------------------------
+
+namespace System.Activities.Core.Presentation {
+    using System;
+    
+    
+    /// <summary>
+    ///   A strongly-typed resource class, for looking up localized strings, etc.
+    /// </summary>
+    // This class was auto-generated by the StronglyTypedResourceBuilder
+    // class via a tool like ResGen or Visual Studio.
+    // To add or remove a member, edit your .ResX file then rerun ResGen
+    // with the /str option, or rebuild your VS project.
+    [global::System.CodeDom.Compiler.GeneratedCodeAttribute("System.Resources.Tools.StronglyTypedResourceBuilder", "4.0.0.0")]
+    [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+    [global::System.Runtime.CompilerServices.CompilerGeneratedAttribute()]
+    internal class SR {
+        
+        private static global::System.Resources.ResourceManager resourceMan;
+        
+        private static global::System.Globalization.CultureInfo resourceCulture;
+        
+        [global::System.Diagnostics.CodeAnalysis.SuppressMessageAttribute("Microsoft.Performance", "CA1811:AvoidUncalledPrivateCode")]
+        internal SR() {
+        }
+        
+        /// <summary>
+        ///   Returns the cached ResourceManager instance used by this class.
+        /// </summary>
+        [global::System.ComponentModel.EditorBrowsableAttribute(global::System.ComponentModel.EditorBrowsableState.Advanced)]
+        internal static global::System.Resources.ResourceManager ResourceManager {
+            get {
+                if (object.ReferenceEquals(resourceMan, null)) {
+                    global::System.Resources.ResourceManager temp = new global::System.Resources.ResourceManager("System.Activities.Core.Presentation.SR", typeof(SR).Assembly);
+                    resourceMan = temp;
+                }
+                return resourceMan;
+            }
+        }
+        
+        /// <summary>
+        ///   Overrides the current thread's CurrentUICulture property for all
+        ///   resource lookups using this strongly typed resource class.
+        /// </summary>
+        [global::System.ComponentModel.EditorBrowsableAttribute(global::System.ComponentModel.EditorBrowsableState.Advanced)]
+        internal static global::System.Globalization.CultureInfo Culture {
+            get {
+                return resourceCulture;
+            }
+            set {
+                resourceCulture = value;
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Add an activity.
+        /// </summary>
+        internal static string AddActivityHintText {
+            get {
+                return ResourceManager.GetString("AddActivityHintText", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Add new case.
+        /// </summary>
+        internal static string AddNewCase {
+            get {
+                return ResourceManager.GetString("AddNewCase", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Connect items automatically.
+        /// </summary>
+        internal static string AutoConnect {
+            get {
+                return ResourceManager.GetString("AutoConnect", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Split connector automatically.
+        /// </summary>
+        internal static string AutoSplit {
+            get {
+                return ResourceManager.GetString("AutoSplit", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Cannot construct line segment between point {0} and point {1}..
+        /// </summary>
+        internal static string CannotConstructConnectionSegment {
+            get {
+                return ResourceManager.GetString("CannotConstructConnectionSegment", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Cannot create link..
+        /// </summary>
+        internal static string CannotCreateLink {
+            get {
+                return ResourceManager.GetString("CannotCreateLink", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Cannot create transition from a state to its descendant..
+        /// </summary>
+        internal static string CannotCreateTransitionFromAncestorToDescendant {
+            get {
+                return ResourceManager.GetString("CannotCreateTransitionFromAncestorToDescendant", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Cannot create transition to a composite state..
+        /// </summary>
+        internal static string CannotCreateTransitionToCompositeState {
+            get {
+                return ResourceManager.GetString("CannotCreateTransitionToCompositeState", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to {0} activity is copied to the clipboard. Please paste it in your workflow as appropriate..
+        /// </summary>
+        internal static string CannotPasteSendReplyOrReceiveReply {
+            get {
+                return ResourceManager.GetString("CannotPasteSendReplyOrReceiveReply", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Cannot set a composite state as the initial state..
+        /// </summary>
+        internal static string CannotSetCompositeStateAsInitialState {
+            get {
+                return ResourceManager.GetString("CannotSetCompositeStateAsInitialState", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Cannot set a final state as the initial state..
+        /// </summary>
+        internal static string CannotSetFinalStateAsInitialState {
+            get {
+                return ResourceManager.GetString("CannotSetFinalStateAsInitialState", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Case{0}.
+        /// </summary>
+        internal static string CaseFormat {
+            get {
+                return ResourceManager.GetString("CaseFormat", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Change Case Value.
+        /// </summary>
+        internal static string ChangeCaseValue {
+            get {
+                return ResourceManager.GetString("ChangeCaseValue", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Change type collection.
+        /// </summary>
+        internal static string ChangeTypeCollectionEditingScopeDesc {
+            get {
+                return ResourceManager.GetString("ChangeTypeCollectionEditingScopeDesc", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Clear initial state.
+        /// </summary>
+        internal static string ClearInitialState {
+            get {
+                return ResourceManager.GetString("ClearInitialState", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Transition.
+        /// </summary>
+        internal static string ConnectionAutomationPropertiesName {
+            get {
+                return ResourceManager.GetString("ConnectionAutomationPropertiesName", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to ConnectionConfigurationName &apos;{0}&apos; does not exist in configuration file..
+        /// </summary>
+        internal static string ConnectionNotFoundInConfig {
+            get {
+                return ResourceManager.GetString("ConnectionNotFoundInConfig", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Select and press Ctrl-C to copy the transition..
+        /// </summary>
+        internal static string CopyTransitionToolTip {
+            get {
+                return ResourceManager.GetString("CopyTransitionToolTip", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Cannot use a query correlation initializer when a message is XmlSerializable..
+        /// </summary>
+        internal static string CorrelationInitializerNotSupported {
+            get {
+                return ResourceManager.GetString("CorrelationInitializerNotSupported", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Add parameter.
+        /// </summary>
+        internal static string CreateParameter {
+            get {
+                return ResourceManager.GetString("CreateParameter", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Create transition.
+        /// </summary>
+        internal static string CreateTransition {
+            get {
+                return ResourceManager.GetString("CreateTransition", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to (Custom).
+        /// </summary>
+        internal static string CustomConnectionStringLabel {
+            get {
+                return ResourceManager.GetString("CustomConnectionStringLabel", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Default case already exists..
+        /// </summary>
+        internal static string DefaultCaseExists {
+            get {
+                return ResourceManager.GetString("DefaultCaseExists", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Define....
+        /// </summary>
+        internal static string DefineContent {
+            get {
+                return ResourceManager.GetString("DefineContent", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Expected argument named &apos;{0}&apos; was not found.
+        ///.
+        /// </summary>
+        internal static string DelegateArgumentMissing {
+            get {
+                return ResourceManager.GetString("DelegateArgumentMissing", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to The directionality of activity delegate argument &apos;{0}&apos; in DelegateArguments dictionary is &apos;{1}&apos;. The expected directionality is &apos;{2}&apos;.
+        ///.
+        /// </summary>
+        internal static string DelegateArgumentsDirectionalityMismatch {
+            get {
+                return ResourceManager.GetString("DelegateArgumentsDirectionalityMismatch", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to The argument provided for the delegate input named &apos;{0}&apos; had an invalid type.  The delegate input is of type &apos;{1}&apos; and the argument is of type &apos;{2}&apos;.  The argument&apos;s type must be coercible to the delegate input&apos;s type.
+        ///.
+        /// </summary>
+        internal static string DelegateInArgumentTypeMismatch {
+            get {
+                return ResourceManager.GetString("DelegateInArgumentTypeMismatch", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to The argument provided for the delegate output named &apos;{0}&apos; had an invalid type.  The delegate output is of type &apos;{1}&apos; and the argument is of type &apos;{2}&apos;.  The delegate output&apos;s type must be coercible to the argument&apos;s type.
+        ///.
+        /// </summary>
+        internal static string DelegateOutArgumentTypeMismatch {
+            get {
+                return ResourceManager.GetString("DelegateOutArgumentTypeMismatch", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to A switch case with the key &apos;{0}&apos; already exists. Choose a different key..
+        /// </summary>
+        internal static string DuplicateCaseKey {
+            get {
+                return ResourceManager.GetString("DuplicateCaseKey", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to The collection already contains the key &apos;{0}&apos;. Please choose a different key..
+        /// </summary>
+        internal static string DuplicateKeyName {
+            get {
+                return ResourceManager.GetString("DuplicateKeyName", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Editing Command.
+        /// </summary>
+        internal static string EditingCommand {
+            get {
+                return ResourceManager.GetString("EditingCommand", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Editing Connection Settings.
+        /// </summary>
+        internal static string EditingConnectionSettings {
+            get {
+                return ResourceManager.GetString("EditingConnectionSettings", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Editing Parameters.
+        /// </summary>
+        internal static string EditingParameters {
+            get {
+                return ResourceManager.GetString("EditingParameters", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Edit Parameters.
+        /// </summary>
+        internal static string EditParametersUndoUnitName {
+            get {
+                return ResourceManager.GetString("EditParametersUndoUnitName", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Double-click to edit state details..
+        /// </summary>
+        internal static string EditStateToolTip {
+            get {
+                return ResourceManager.GetString("EditStateToolTip", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Double-click to edit transition details.
+        /// </summary>
+        internal static string EditTransitionTooltip {
+            get {
+                return ResourceManager.GetString("EditTransitionTooltip", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to (empty).
+        /// </summary>
+        internal static string EmptyName {
+            get {
+                return ResourceManager.GetString("EmptyName", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Equals() and/or GetHashCode() on type &apos;{0}&apos; were not overridden correctly..
+        /// </summary>
+        internal static string EqualityError {
+            get {
+                return ResourceManager.GetString("EqualityError", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Workflow Designer.
+        /// </summary>
+        internal static string ErrorMessageBoxTitle {
+            get {
+                return ResourceManager.GetString("ErrorMessageBoxTitle", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to &lt;Enter an expression&gt;.
+        /// </summary>
+        internal static string ExpressionDefaultText {
+            get {
+                return ResourceManager.GetString("ExpressionDefaultText", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Create Link(s).
+        /// </summary>
+        internal static string FCCreateLink {
+            get {
+                return ResourceManager.GetString("FCCreateLink", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Delete Link(s).
+        /// </summary>
+        internal static string FCDeleteLink {
+            get {
+                return ResourceManager.GetString("FCDeleteLink", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Delete Flowchart node.
+        /// </summary>
+        internal static string FCDeleteShape {
+            get {
+                return ResourceManager.GetString("FCDeleteShape", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to False branch already exists..
+        /// </summary>
+        internal static string FCFalseBranchExists {
+            get {
+                return ResourceManager.GetString("FCFalseBranchExists", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Connection can only be from True or False branch..
+        /// </summary>
+        internal static string FCFlowConditionLinkError {
+            get {
+                return ResourceManager.GetString("FCFlowConditionLinkError", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to The True and False branches have already been defined..
+        /// </summary>
+        internal static string FCFlowConditionLinksExist {
+            get {
+                return ResourceManager.GetString("FCFlowConditionLinksExist", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to False.
+        /// </summary>
+        internal static string FCFlowDecisionFalseMarker {
+            get {
+                return ResourceManager.GetString("FCFlowDecisionFalseMarker", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to True.
+        /// </summary>
+        internal static string FCFlowDecisionTrueMarker {
+            get {
+                return ResourceManager.GetString("FCFlowDecisionTrueMarker", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Cannot connect to the connection point..
+        /// </summary>
+        internal static string FCInvalidLink {
+            get {
+                return ResourceManager.GetString("FCInvalidLink", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Move Flowchart Link.
+        /// </summary>
+        internal static string FCLinkMove {
+            get {
+                return ResourceManager.GetString("FCLinkMove", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Cannot create more than one outgoing connection for this activity..
+        /// </summary>
+        internal static string FCNextLinkDefined {
+            get {
+                return ResourceManager.GetString("FCNextLinkDefined", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Resize Flowchart.
+        /// </summary>
+        internal static string FCResizeUndoUnitName {
+            get {
+                return ResourceManager.GetString("FCResizeUndoUnitName", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to True branch already exists..
+        /// </summary>
+        internal static string FCTrueBranchExists {
+            get {
+                return ResourceManager.GetString("FCTrueBranchExists", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Fill Delegate Arguments.
+        /// </summary>
+        internal static string FillDelegateArguments {
+            get {
+                return ResourceManager.GetString("FillDelegateArguments", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to FlowSwitch case rename.
+        /// </summary>
+        internal static string FlowSwitchCaseRenameEditingScopeDesc {
+            get {
+                return ResourceManager.GetString("FlowSwitchCaseRenameEditingScopeDesc", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to FlowSwitch DefaultCaseDisplayName change.
+        /// </summary>
+        internal static string FlowSwitchDefaultCaseDisplayNameEditingScopeDesc {
+            get {
+                return ResourceManager.GetString("FlowSwitchDefaultCaseDisplayNameEditingScopeDesc", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Drag a line to connect to the initial state.
+        /// </summary>
+        internal static string InitialStateConnectionPointTooltip {
+            get {
+                return ResourceManager.GetString("InitialStateConnectionPointTooltip", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to FlowSwitch cases must be unique..
+        /// </summary>
+        internal static string InvalidFlowSwitchCaseMessage {
+            get {
+                return ResourceManager.GetString("InvalidFlowSwitchCaseMessage", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Item Move.
+        /// </summary>
+        internal static string ItemMove {
+            get {
+                return ResourceManager.GetString("ItemMove", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Move link.
+        /// </summary>
+        internal static string MoveLink {
+            get {
+                return ResourceManager.GetString("MoveLink", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to &lt;Input case here&gt;.
+        /// </summary>
+        internal static string NewCaseHint {
+            get {
+                return ResourceManager.GetString("NewCaseHint", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Case key value cannot be converted from/to type string..
+        /// </summary>
+        internal static string NotSupportedCaseKeyStringConversion {
+            get {
+                return ResourceManager.GetString("NotSupportedCaseKeyStringConversion", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to The Encoding with code page &apos;{0}&apos; is not supported..
+        /// </summary>
+        internal static string NotSupportedEncoding {
+            get {
+                return ResourceManager.GetString("NotSupportedEncoding", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to (null).
+        /// </summary>
+        internal static string NullName {
+            get {
+                return ResourceManager.GetString("NullName", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to The entered key is invalid.
+        /// </summary>
+        internal static string NullOrEmptyKeyName {
+            get {
+                return ResourceManager.GetString("NullOrEmptyKeyName", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Parameters.
+        /// </summary>
+        internal static string ParameterDialogTitle {
+            get {
+                return ResourceManager.GetString("ParameterDialogTitle", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Cannot paste the transition if one of the selected source states is a Final state..
+        /// </summary>
+        internal static string PasteTransitionOnFinalState {
+            get {
+                return ResourceManager.GetString("PasteTransitionOnFinalState", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Cannot paste the transition if the selection contains any item that is not a State..
+        /// </summary>
+        internal static string PasteTransitionOnNonStateItem {
+            get {
+                return ResourceManager.GetString("PasteTransitionOnNonStateItem", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Select and press Ctrl-V to paste the transition..
+        /// </summary>
+        internal static string PasteTransitionToolTip {
+            get {
+                return ResourceManager.GetString("PasteTransitionToolTip", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Cannot paste the transition because &apos;{0}&apos; has all connection points occupied..
+        /// </summary>
+        internal static string PasteTransitionWithoutAvailableConnectionPoints {
+            get {
+                return ResourceManager.GetString("PasteTransitionWithoutAvailableConnectionPoints", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Cannot paste the transition if the destination state of the copied transition is removed or not in the StateMachine..
+        /// </summary>
+        internal static string PasteTransitionWithoutDestinationState {
+            get {
+                return ResourceManager.GetString("PasteTransitionWithoutDestinationState", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to &apos;{0}&apos; is not a concrete type of ActivityDelegate..
+        /// </summary>
+        internal static string PropertyIsNotAConcreteActivityDelegate {
+            get {
+                return ResourceManager.GetString("PropertyIsNotAConcreteActivityDelegate", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to &apos;{0}&apos; is not an ActivityDelegate..
+        /// </summary>
+        internal static string PropertyIsNotAnActivityDelegate {
+            get {
+                return ResourceManager.GetString("PropertyIsNotAnActivityDelegate", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Property Reference Change.
+        /// </summary>
+        internal static string PropertyReferenceChange {
+            get {
+                return ResourceManager.GetString("PropertyReferenceChange", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to &apos;{0}&apos; cannot be resolved..
+        /// </summary>
+        internal static string PropertyReferenceNotResolved {
+            get {
+                return ResourceManager.GetString("PropertyReferenceNotResolved", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Reorder items.
+        /// </summary>
+        internal static string ReorderItems {
+            get {
+                return ResourceManager.GetString("ReorderItems", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Set initial state.
+        /// </summary>
+        internal static string SetInitialState {
+            get {
+                return ResourceManager.GetString("SetInitialState", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Drag a line to create a new transition that shares the same trigger.
+        /// </summary>
+        internal static string SharedTriggerToolTip {
+            get {
+                return ResourceManager.GetString("SharedTriggerToolTip", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Go to {0}.
+        /// </summary>
+        internal static string StateLinkButtonToolTip {
+            get {
+                return ResourceManager.GetString("StateLinkButtonToolTip", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Resize StateMachine.
+        /// </summary>
+        internal static string StateMachineResize {
+            get {
+                return ResourceManager.GetString("StateMachineResize", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Resize State.
+        /// </summary>
+        internal static string StateResize {
+            get {
+                return ResourceManager.GetString("StateResize", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Drag a line to create a transition.
+        /// </summary>
+        internal static string TransitionConnectionPointTooltip {
+            get {
+                return ResourceManager.GetString("TransitionConnectionPointTooltip", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Request in ReceiveReply &apos;{0}&apos; does not belong to the workflow..
+        /// </summary>
+        internal static string UnrootedRequestInReceiveReply {
+            get {
+                return ResourceManager.GetString("UnrootedRequestInReceiveReply", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Request in SendReply &apos;{0}&apos; does not belong to the workflow..
+        /// </summary>
+        internal static string UnrootedRequestInSendReply {
+            get {
+                return ResourceManager.GetString("UnrootedRequestInSendReply", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to View message....
+        /// </summary>
+        internal static string ViewMessageContent {
+            get {
+                return ResourceManager.GetString("ViewMessageContent", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to View parameter....
+        /// </summary>
+        internal static string ViewParameterContent {
+            get {
+                return ResourceManager.GetString("ViewParameterContent", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to ActivityDelegate arguments don&apos;t match. Check your activity configuration to make sure it is in sync with the declared ActivityDelegate..
+        /// </summary>
+        internal static string WrongNumberOfArgumentsForActivityDelegate {
+            get {
+                return ResourceManager.GetString("WrongNumberOfArgumentsForActivityDelegate", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string for the automation name of ParallelSeparator
+        /// </summary>
+        internal static string ParallelSeparatorAutomationName
+        {
+            get
+            {
+                return ResourceManager.GetString("ParallelSeparatorAutomationName", resourceCulture);
+            }
+        }
+    }
+}
+                                                                                       878278.1337773416!image-logo/892277811.png</logo>
+              <modules>
+                <module type="videopanel" id="1.2649891">
+                  <param name="name">Livematcher</param>
+                  <param name="pagesize">4</param>
+                  <param name="showprograms">true</param>
+                  <param name="showclips">true</param>
+                  <param name="keyword">live</param>
+                  <param name="groupselector">false</param>
+                  <param name="hideoptions">false</param>
+                  <param name="selectortoptext">Alla</param>
+                  <param name="ids">1.2384877</param>
+                </module>
+                <module type="videopanel" id="1.2417061">
+                  <param name="name">Hela handbollsmatcher</param>
+                  <param name="pagesize">4</param>
+                  <param name="showprograms">true</param>
+                  <param name="showclips">true</param>
+                  <param name="keyword">Hela handbollsmatcher</param>
+                  <param name="groupselector">false</param>
+                  <param name="hideoptions">false</param>
+                  <param name="selectortoptext">Alla</param>
+                  <param name="ids">1.2417052</param>
+                </module>
+                <module type="videopanel

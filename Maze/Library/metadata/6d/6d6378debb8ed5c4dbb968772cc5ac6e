@@ -1,0 +1,188 @@
+ const std::string& url = request->url();
+      const std::string& relative_path = url.substr(url_path_.length());
+      CefRefPtr<CefZipArchive::File> file = archive_->GetFile(relative_path);
+      if (file.get()) {
+        handler = new CefStreamResourceHandler(
+            request->mime_type_resolver().Run(url),
+            file->GetStreamReader());
+      }
+    }
+
+    if (!handler.get())
+      return false;
+
+    request->Continue(handler);
+    return true;
+  }
+
+  std::string url_path_;
+  std::string archive_path_;
+  std::string password_;
+
+  bool archive_load_started_;
+  bool archive_load_ended_;
+  CefRefPtr<CefZipArchive> archive_;
+
+  // List of requests that are pending while the archive is being loaded.
+  typedef std::vector<scoped_refptr<CefResourceManager::Request> >
+      PendingRequests;
+  PendingRequests pending_requests_;
+
+  // Must be the last member.
+  base::WeakPtrFactory<ArchiveProvider> weak_ptr_factory_;
+
+  DISALLOW_COPY_AND_ASSIGN(ArchiveProvider);
+};
+
+}  // namespace
+
+
+// CefResourceManager::ProviderEntry implementation.
+
+struct CefResourceManager::ProviderEntry {
+  ProviderEntry(Provider* provider,
+                int order,
+                const std::string& identifier)
+    : provider_(provider),
+      order_(order),
+      identifier_(identifier),
+      deletion_pending_(false) {
+  }
+
+  scoped_ptr<Provider> provider_;
+  int order_;
+  std::string identifier_;
+
+  // List of pending requests currently associated with this provider.
+  RequestList pending_requests_;
+
+  // True if deletion of this provider is pending.
+  bool deletion_pending_;
+};
+
+
+// CefResourceManager::RequestState implementation.
+
+CefResourceManager::RequestState::~RequestState() {
+  // Always execute the callback.
+  if (callback_.get())
+    callback_->Continue(true);
+}
+
+
+// CefResourceManager::Request implementation.
+
+void CefResourceManager::Request::Continue(
+    CefRefPtr<CefResourceHandler> handler) {
+  if (!CefCurrentlyOn(TID_IO)) {
+    CefPostTask(TID_IO,
+        base::Bind(&CefResourceManager::Request::Continue, this, handler));
+    return;
+  }
+
+  if (!state_.get())
+    return;
+
+  // Disassociate |state_| immediately so that Provider::OnRequestCanceled is
+  // not called unexpectedly if Provider::OnRequest calls this method and then
+  // calls CefResourceManager::Remove*.
+  CefPostTask(TID_IO,
+      base::Bind(&CefResourceManager::Request::ContinueOnIOThread,
+                 base::Passed(&state_), handler));
+}
+
+void CefResourceManager::Request::Stop() {
+  if (!CefCurrentlyOn(TID_IO)) {
+    CefPostTask(TID_IO,
+        base::Bind(&CefResourceManager::Request::Stop, this));
+    return;
+  }
+
+  if (!state_.get())
+    return;
+
+  // Disassociate |state_| immediately so that Provider::OnRequestCanceled is
+  // not called unexpectedly if Provider::OnRequest calls this method and then
+  // calls CefResourceManager::Remove*.
+  CefPostTask(TID_IO,
+      base::Bind(&CefResourceManager::Request::StopOnIOThread,
+                 base::Passed(&state_)));
+}
+
+CefResourceManager::Request::Request(scoped_ptr<RequestState> state)
+    : state_(state.Pass()),
+      params_(state_->params_) {
+  CEF_REQUIRE_IO_THREAD();
+
+  ProviderEntry* entry = *(state_->current_entry_pos_);
+  // Should not be on a deleted entry.
+  DCHECK(!entry->deletion_pending_);
+
+  // Add this request to the entry's pending request list.
+  entry->pending_requests_.push_back(this);
+  state_->current_request_pos_ = --entry->pending_requests_.end();
+}
+
+// Detaches and returns |state_| if the provider indicates that it will not
+// handle the request. Note that |state_| may already be NULL if OnRequest
+// executes a callback before returning, in which case execution will continue
+// asynchronously in any case.
+scoped_ptr<CefResourceManager::RequestState>
+    CefResourceManager::Request::SendRequest() {
+  CEF_REQUIRE_IO_THREAD();
+  Provider* provider = (*state_->current_entry_pos_)->provider_.get();
+  if (!provider->OnRequest(this))
+    return state_.Pass();
+  return scoped_ptr<RequestState>();
+}
+
+bool CefResourceManager::Request::HasState() {
+  CEF_REQUIRE_IO_THREAD();
+  return (state_.get() != NULL);
+}
+
+// static
+void CefResourceManager::Request::ContinueOnIOThread(
+    scoped_ptr<RequestState> state,
+    CefRefPtr<CefResourceHandler> handler) {
+  CEF_REQUIRE_IO_THREAD();
+  // The manager may already have been deleted.
+  base::WeakPtr<CefResourceManager> manager = state->manager_;
+  if (manager)
+    manager->ContinueRequest(state.Pass(), handler);
+}
+
+// static
+void CefResourceManager::Request::StopOnIOThread(
+    scoped_ptr<RequestState> state) {
+  CEF_REQUIRE_IO_THREAD();
+  // The manager may already have been deleted.
+  base::WeakPtr<CefResourceManager> manager = state->manager_;
+  if (manager)
+    manager->StopRequest(state.Pass());
+}
+
+
+// CefResourceManager implementation.
+
+CefResourceManager::CefResourceManager()
+    : url_filter_(base::Bind(GetFilteredUrl)),
+      mime_type_resolver_(base::Bind(GetMimeType)) {
+}
+
+CefResourceManager::~CefResourceManager() {
+  CEF_REQUIRE_IO_THREAD();
+  RemoveAllProviders();
+
+  // Delete all entryies now. Requests may still be pending but they will not
+  // call back into this manager due to the use of WeakPtr.
+  if (!providers_.empty()) {
+    ProviderEntryList::iterator it = providers_.begin();
+    for (; it != providers_.end(); ++it)
+      delete *it;
+    providers_.clear();
+  }
+}
+
+void CefResourceManager::AddContentProvider(const std::string& url,
+                       

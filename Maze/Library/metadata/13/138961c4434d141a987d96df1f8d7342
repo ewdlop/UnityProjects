@@ -1,0 +1,220 @@
+ase MONO_TYPE_U4:
+		sp->data.i = *(guint32*)res_buf;
+		break;
+	case MONO_TYPE_I8:
+		sp->data.l = *(gint64*)res_buf;
+		break;
+	case MONO_TYPE_U8:
+		sp->data.l = *(guint64*)res_buf;
+		break;
+	case MONO_TYPE_R4:
+		sp->data.f_r4 = *(float*)res_buf;
+		break;
+	case MONO_TYPE_R8:
+		sp->data.f = *(double*)res_buf;
+		break;
+	case MONO_TYPE_TYPEDBYREF:
+	case MONO_TYPE_VALUETYPE:
+		/* The result was written to vt_sp */
+		sp->data.p = vt_sp;
+		break;
+	case MONO_TYPE_GENERICINST:
+		if (MONO_TYPE_IS_REFERENCE (rtype)) {
+			sp->data.p = *(gpointer*)res_buf;
+		} else {
+			/* The result was written to vt_sp */
+			sp->data.p = vt_sp;
+		}
+		break;
+	default:
+		g_print ("%s\n", mono_type_full_name (rtype));
+		g_assert_not_reached ();
+		break;
+	}
+}
+
+static MONO_NEVER_INLINE void
+do_debugger_tramp (void (*tramp) (void), InterpFrame *frame)
+{
+	MonoLMFExt ext;
+	interp_push_lmf (&ext, frame);
+	tramp ();
+	interp_pop_lmf (&ext);
+}
+
+static MONO_NEVER_INLINE MonoException*
+do_transform_method (InterpFrame *frame, ThreadContext *context)
+{
+	MonoLMFExt ext;
+	/* Don't push lmf if we have no interp data */
+	gboolean push_lmf = frame->parent != NULL;
+	ERROR_DECL (error);
+
+	/* Use the parent frame as the current frame is not complete yet */
+	if (push_lmf)
+		interp_push_lmf (&ext, frame->parent);
+
+	mono_interp_transform_method (frame->imethod, context, error);
+
+	if (push_lmf)
+		interp_pop_lmf (&ext);
+
+	return mono_error_convert_to_exception (error);
+}
+
+static MONO_NEVER_INLINE guchar*
+copy_varargs_vtstack (MonoMethodSignature *csig, stackval *sp, guchar *vt_sp_start)
+{
+	stackval *first_arg = sp - csig->param_count;
+	guchar *vt_sp = vt_sp_start;
+
+	/*
+	 * We need to have the varargs linearly on the stack so the ArgIterator
+	 * can iterate over them. We pass the signature first and then copy them
+	 * one by one on the vtstack. At the end we pass the original vt_stack
+	 * so the callee (MINT_ARGLIST) can find the varargs space.
+	 */
+	*(gpointer*)vt_sp = csig;
+	vt_sp += sizeof (gpointer);
+
+	for (int i = csig->sentinelpos; i < csig->param_count; i++) {
+		int align, arg_size;
+		arg_size = mono_type_stack_size (csig->params [i], &align);
+		vt_sp = (guchar*)ALIGN_PTR_TO (vt_sp, align);
+
+		stackval_to_data (csig->params [i], &first_arg [i], vt_sp, FALSE);
+		vt_sp += arg_size;
+	}
+
+	vt_sp += sizeof (gpointer);
+	vt_sp = (guchar*)ALIGN_PTR_TO (vt_sp, MINT_VT_ALIGNMENT);
+
+	((gpointer*)vt_sp) [-1] = vt_sp_start;
+
+	return vt_sp;
+}
+
+/*
+ * These functions are the entry points into the interpreter from compiled code.
+ * They are called by the interp_in wrappers. They have the following signature:
+ * void (<optional this_arg>, <optional retval pointer>, <arg1>, ..., <argn>, <method ptr>)
+ * They pack up their arguments into an InterpEntryData structure and call interp_entry ().
+ * It would be possible for the wrappers to pack up the arguments etc, but that would make them bigger, and there are
+ * more wrappers then these functions.
+ * this/static * ret/void * 16 arguments -> 64 functions.
+ */
+
+#define MAX_INTERP_ENTRY_ARGS 8
+
+#define INTERP_ENTRY_BASE(_method, _this_arg, _res) \
+	InterpEntryData data; \
+	(data).rmethod = (_method); \
+	(data).res = (_res); \
+	(data).this_arg = (_this_arg); \
+	(data).many_args = NULL;
+
+#define INTERP_ENTRY0(_this_arg, _res, _method) {	\
+	INTERP_ENTRY_BASE (_method, _this_arg, _res); \
+	interp_entry (&data); \
+	}
+#define INTERP_ENTRY1(_this_arg, _res, _method) {	  \
+	INTERP_ENTRY_BASE (_method, _this_arg, _res); \
+	(data).args [0] = arg1; \
+	interp_entry (&data); \
+	}
+#define INTERP_ENTRY2(_this_arg, _res, _method) {  \
+	INTERP_ENTRY_BASE (_method, _this_arg, _res); \
+	(data).args [0] = arg1; \
+	(data).args [1] = arg2; \
+	interp_entry (&data); \
+	}
+#define INTERP_ENTRY3(_this_arg, _res, _method) { \
+	INTERP_ENTRY_BASE (_method, _this_arg, _res); \
+	(data).args [0] = arg1; \
+	(data).args [1] = arg2; \
+	(data).args [2] = arg3; \
+	interp_entry (&data); \
+	}
+#define INTERP_ENTRY4(_this_arg, _res, _method) {	\
+	INTERP_ENTRY_BASE (_method, _this_arg, _res); \
+	(data).args [0] = arg1; \
+	(data).args [1] = arg2; \
+	(data).args [2] = arg3; \
+	(data).args [3] = arg4; \
+	interp_entry (&data); \
+	}
+#define INTERP_ENTRY5(_this_arg, _res, _method) {	\
+	INTERP_ENTRY_BASE (_method, _this_arg, _res); \
+	(data).args [0] = arg1; \
+	(data).args [1] = arg2; \
+	(data).args [2] = arg3; \
+	(data).args [3] = arg4; \
+	(data).args [4] = arg5; \
+	interp_entry (&data); \
+	}
+#define INTERP_ENTRY6(_this_arg, _res, _method) {	\
+	INTERP_ENTRY_BASE (_method, _this_arg, _res); \
+	(data).args [0] = arg1; \
+	(data).args [1] = arg2; \
+	(data).args [2] = arg3; \
+	(data).args [3] = arg4; \
+	(data).args [4] = arg5; \
+	(data).args [5] = arg6; \
+	interp_entry (&data); \
+	}
+#define INTERP_ENTRY7(_this_arg, _res, _method) {	\
+	INTERP_ENTRY_BASE (_method, _this_arg, _res); \
+	(data).args [0] = arg1; \
+	(data).args [1] = arg2; \
+	(data).args [2] = arg3; \
+	(data).args [3] = arg4; \
+	(data).args [4] = arg5; \
+	(data).args [5] = arg6; \
+	(data).args [6] = arg7; \
+	interp_entry (&data); \
+	}
+#define INTERP_ENTRY8(_this_arg, _res, _method) {	\
+	INTERP_ENTRY_BASE (_method, _this_arg, _res); \
+	(data).args [0] = arg1; \
+	(data).args [1] = arg2; \
+	(data).args [2] = arg3; \
+	(data).args [3] = arg4; \
+	(data).args [4] = arg5; \
+	(data).args [5] = arg6; \
+	(data).args [6] = arg7; \
+	(data).args [7] = arg8; \
+	interp_entry (&data); \
+	}
+
+#define ARGLIST0 InterpMethod *rmethod
+#define ARGLIST1 gpointer arg1, InterpMethod *rmethod
+#define ARGLIST2 gpointer arg1, gpointer arg2, InterpMethod *rmethod
+#define ARGLIST3 gpointer arg1, gpointer arg2, gpointer arg3, InterpMethod *rmethod
+#define ARGLIST4 gpointer arg1, gpointer arg2, gpointer arg3, gpointer arg4, InterpMethod *rmethod
+#define ARGLIST5 gpointer arg1, gpointer arg2, gpointer arg3, gpointer arg4, gpointer arg5, InterpMethod *rmethod
+#define ARGLIST6 gpointer arg1, gpointer arg2, gpointer arg3, gpointer arg4, gpointer arg5, gpointer arg6, InterpMethod *rmethod
+#define ARGLIST7 gpointer arg1, gpointer arg2, gpointer arg3, gpointer arg4, gpointer arg5, gpointer arg6, gpointer arg7, InterpMethod *rmethod
+#define ARGLIST8 gpointer arg1, gpointer arg2, gpointer arg3, gpointer arg4, gpointer arg5, gpointer arg6, gpointer arg7, gpointer arg8, InterpMethod *rmethod
+
+static void interp_entry_static_0 (ARGLIST0) INTERP_ENTRY0 (NULL, NULL, rmethod)
+static void interp_entry_static_1 (ARGLIST1) INTERP_ENTRY1 (NULL, NULL, rmethod)
+static void interp_entry_static_2 (ARGLIST2) INTERP_ENTRY2 (NULL, NULL, rmethod)
+static void interp_entry_static_3 (ARGLIST3) INTERP_ENTRY3 (NULL, NULL, rmethod)
+static void interp_entry_static_4 (ARGLIST4) INTERP_ENTRY4 (NULL, NULL, rmethod)
+static void interp_entry_static_5 (ARGLIST5) INTERP_ENTRY5 (NULL, NULL, rmethod)
+static void interp_entry_static_6 (ARGLIST6) INTERP_ENTRY6 (NULL, NULL, rmethod)
+static void interp_entry_static_7 (ARGLIST7) INTERP_ENTRY7 (NULL, NULL, rmethod)
+static void interp_entry_static_8 (ARGLIST8) INTERP_ENTRY8 (NULL, NULL, rmethod)
+static void interp_entry_static_ret_0 (gpointer res, ARGLIST0) INTERP_ENTRY0 (NULL, res, rmethod)
+static void interp_entry_static_ret_1 (gpointer res, ARGLIST1) INTERP_ENTRY1 (NULL, res, rmethod)
+static void interp_entry_static_ret_2 (gpointer res, ARGLIST2) INTERP_ENTRY2 (NULL, res, rmethod)
+static void interp_entry_static_ret_3 (gpointer res, ARGLIST3) INTERP_ENTRY3 (NULL, res, rmethod)
+static void interp_entry_static_ret_4 (gpointer res, ARGLIST4) INTERP_ENTRY4 (NULL, res, rmethod)
+static void interp_entry_static_ret_5 (gpointer res, ARGLIST5) INTERP_ENTRY5 (NULL, res, rmethod)
+static void interp_entry_static_ret_6 (gpointer res, ARGLIST6) INTERP_ENTRY6 (NULL, res, rmethod)
+static void interp_entry_static_ret_7 (gpointer res, ARGLIST7) INTERP_ENTRY7 (NULL, res, rmethod)
+static void interp_entry_static_ret_8 (gpointer res, ARGLIST8) INTERP_ENTRY8 (NULL, res, rmethod)
+static void interp_entry_instance_0 (gpointer this_arg, ARGLIST0) INTERP_ENTRY0 (this_arg, NULL, rmethod)
+static void interp_entry_instance_1 (gpointer this_arg, ARGLIST1) INTERP_ENTRY1 (this_arg, NULL, rmethod)
+static void interp_entry_instance_2 (gpointer this_arg, ARGLIST2) INTERP_ENTRY2 (this_arg, NULL, rmethod)
+static void interp_entry_instance_3 (gpointer this_arg, ARGLIST

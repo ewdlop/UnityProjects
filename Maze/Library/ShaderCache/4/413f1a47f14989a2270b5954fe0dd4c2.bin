@@ -1,0 +1,108 @@
+﻿// Copyright (c) Microsoft Open Technologies, Inc. All rights reserved. See License.txt in the project root for license information.
+
+using System.Collections.Generic;
+using System.Linq;
+using System.Reactive.Concurrency;
+using System.Reactive.Disposables;
+using System.Reactive.Subjects;
+
+namespace System.Reactive.Linq
+{
+    internal class QueryLanguageEx : IQueryLanguageEx
+    {
+        #region Create
+
+        public virtual IObservable<TResult> Create<TResult>(Func<IObserver<TResult>, IEnumerable<IObservable<object>>> iteratorMethod)
+        {
+            return new AnonymousObservable<TResult>(observer =>
+                iteratorMethod(observer).Concat().Subscribe(_ => { }, observer.OnError, observer.OnCompleted));
+        }
+
+        public virtual IObservable<Unit> Create(Func<IEnumerable<IObservable<object>>> iteratorMethod)
+        {
+            return new AnonymousObservable<Unit>(observer =>
+                iteratorMethod().Concat().Subscribe(_ => { }, observer.OnError, observer.OnCompleted));
+        }
+
+        #endregion
+
+        #region Expand
+
+        public virtual IObservable<TSource> Expand<TSource>(IObservable<TSource> source, Func<TSource, IObservable<TSource>> selector, IScheduler scheduler)
+        {
+            return new AnonymousObservable<TSource>(observer =>
+            {
+                var outGate = new object();
+                var q = new Queue<IObservable<TSource>>();
+                var m = new SerialDisposable();
+                var d = new CompositeDisposable { m };
+                var activeCount = 0;
+                var isAcquired = false;
+
+                var ensureActive = default(Action);
+
+                ensureActive = () =>
+                {
+                    var isOwner = false;
+
+                    lock (q)
+                    {
+                        if (q.Count > 0)
+                        {
+                            isOwner = !isAcquired;
+                            isAcquired = true;
+                        }
+                    }
+
+                    if (isOwner)
+                    {
+                        m.Disposable = scheduler.Schedule(self =>
+                        {
+                            var work = default(IObservable<TSource>);
+
+                            lock (q)
+                            {
+                                if (q.Count > 0)
+                                    work = q.Dequeue();
+                                else
+                                {
+                                    isAcquired = false;
+                                    return;
+                                }
+                            }
+
+                            var m1 = new SingleAssignmentDisposable();
+                            d.Add(m1);
+                            m1.Disposable = work.Subscribe(
+                                x =>
+                                {
+                                    lock (outGate)
+                                        observer.OnNext(x);
+
+                                    var result = default(IObservable<TSource>);
+                                    try
+                                    {
+                                        result = selector(x);
+                                    }
+                                    catch (Exception exception)
+                                    {
+                                        lock (outGate)
+                                            observer.OnError(exception);
+                                    }
+
+                                    lock (q)
+                                    {
+                                        q.Enqueue(result);
+                                        activeCount++;
+                                    }
+
+                                    ensureActive();
+                                },
+                                exception =>
+                                {
+                                    lock (outGate)
+                                        observer.OnError(exception);
+                                },
+                                () =>
+                                {
+   

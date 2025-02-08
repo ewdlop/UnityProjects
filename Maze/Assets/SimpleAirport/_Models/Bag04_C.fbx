@@ -1,0 +1,334 @@
+    FieldPosition& pos,
+                                  UErrorCode& status) const;
+
+
+
+    /**
+     * Initialize interval patterns locale to this formatter
+     *
+     * This code is a bit complicated since
+     * 1. the interval patterns saved in resource bundle files are interval
+     *    patterns based on date or time only.
+     *    It does not have interval patterns based on both date and time.
+     *    Interval patterns on both date and time are algorithm generated.
+     *
+     *    For example, it has interval patterns on skeleton "dMy" and "hm",
+     *    but it does not have interval patterns on skeleton "dMyhm".
+     *
+     *    The rule to generate interval patterns for both date and time skeleton are
+     *    1) when the year, month, or day differs, concatenate the two original
+     *    expressions with a separator between,
+     *    For example, interval pattern from "Jan 10, 2007 10:10 am"
+     *    to "Jan 11, 2007 10:10am" is
+     *    "Jan 10, 2007 10:10 am - Jan 11, 2007 10:10am"
+     *
+     *    2) otherwise, present the date followed by the range expression
+     *    for the time.
+     *    For example, interval pattern from "Jan 10, 2007 10:10 am"
+     *    to "Jan 10, 2007 11:10am" is
+     *    "Jan 10, 2007 10:10 am - 11:10am"
+     *
+     * 2. even a pattern does not request a certain calendar field,
+     *    the interval pattern needs to include such field if such fields are
+     *    different between 2 dates.
+     *    For example, a pattern/skeleton is "hm", but the interval pattern
+     *    includes year, month, and date when year, month, and date differs.
+     *
+     *
+     * @param status    output param set to success/failure code on exit
+     */
+    void initializePattern(UErrorCode& status);
+
+
+
+    /**
+     * Set fall back interval pattern given a calendar field,
+     * a skeleton, and a date time pattern generator.
+     * @param field      the largest different calendar field
+     * @param skeleton   a skeleton
+     * @param status     output param set to success/failure code on exit
+     */
+    void setFallbackPattern(UCalendarDateFields field,
+                            const UnicodeString& skeleton,
+                            UErrorCode& status);
+
+
+
+    /**
+     * get separated date and time skeleton from a combined skeleton.
+     *
+     * The difference between date skeleton and normalizedDateSkeleton are:
+     * 1. both 'y' and 'd' are appeared only once in normalizeDateSkeleton
+     * 2. 'E' and 'EE' are normalized into 'EEE'
+     * 3. 'MM' is normalized into 'M'
+     *
+     ** the difference between time skeleton and normalizedTimeSkeleton are:
+     * 1. both 'H' and 'h' are normalized as 'h' in normalized time skeleton,
+     * 2. 'a' is omitted in normalized time skeleton.
+     * 3. there is only one appearance for 'h', 'm','v', 'z' in normalized time
+     *    skeleton
+     *
+     *
+     *  @param skeleton               given combined skeleton.
+     *  @param date                   Output parameter for date only skeleton.
+     *  @param normalizedDate         Output parameter for normalized date only
+     *
+     *  @param time                   Output parameter for time only skeleton.
+     *  @param normalizedTime         Output parameter for normalized time only
+     *                                skeleton.
+     *
+     */
+    static void  U_EXPORT2 getDateTimeSkeleton(const UnicodeString& skeleton,
+                                    UnicodeString& date,
+                                    UnicodeString& normalizedDate,
+                                    UnicodeString& time,
+                                    UnicodeString& normalizedTime);
+
+
+
+    /**
+     * Generate date or time interval pattern from resource,
+     * and set them into the interval pattern locale to this formatter.
+     *
+     * It needs to handle the following:
+     * 1. need to adjust field width.
+     *    For example, the interval patterns saved in DateIntervalInfo
+     *    includes "dMMMy", but not "dMMMMy".
+     *    Need to get interval patterns for dMMMMy from dMMMy.
+     *    Another example, the interval patterns saved in DateIntervalInfo
+     *    includes "hmv", but not "hmz".
+     *    Need to get interval patterns for "hmz' from 'hmv'
+     *
+     * 2. there might be no pattern for 'y' differ for skeleton "Md",
+     *    in order to get interval patterns for 'y' differ,
+     *    need to look for it from skeleton 'yMd'
+     *
+     * @param dateSkeleton   normalized date skeleton
+     * @param timeSkeleton   normalized time skeleton
+     * @return               whether the resource is found for the skeleton.
+     *                       TRUE if interval pattern found for the skeleton,
+     *                       FALSE otherwise.
+     */
+    UBool setSeparateDateTimePtn(const UnicodeString& dateSkeleton,
+                                 const UnicodeString& timeSkeleton);
+
+
+
+
+    /**
+     * Generate interval pattern from existing resource
+     *
+     * It not only save the interval patterns,
+     * but also return the extended skeleton and its best match skeleton.
+     *
+     * @param field           largest different calendar field
+     * @param skeleton        skeleton
+     * @param bestSkeleton    the best match skeleton which has interval pattern
+     *                        defined in resource
+     * @param differenceInfo  the difference between skeleton and best skeleton
+     *         0 means the best matched skeleton is the same as input skeleton
+     *         1 means the fields are the same, but field width are different
+     *         2 means the only difference between fields are v/z,
+     *        -1 means there are other fields difference
+     *
+     * @param extendedSkeleton      extended skeleton
+     * @param extendedBestSkeleton  extended best match skeleton
+     * @return                      whether the interval pattern is found
+     *                              through extending skeleton or not.
+     *                              TRUE if interval pattern is found by
+     *                              extending skeleton, FALSE otherwise.
+     */
+    UBool setIntervalPattern(UCalendarDateFields field,
+                             const UnicodeString* skeleton,
+                             const UnicodeString* bestSkeleton,
+                             int8_t differenceInfo,
+                             UnicodeString* extendedSkeleton = NULL,
+                             UnicodeString* extendedBestSkeleton = NULL);
+
+    /**
+     * Adjust field width in best match interval pattern to match
+     * the field width in input skeleton.
+     *
+     * TODO (xji) make a general solution
+     * The adjusting rule can be:
+     * 1. always adjust
+     * 2. never adjust
+     * 3. default adjust, which means adjust according to the following rules
+     * 3.1 always adjust string, such as MMM and MMMM
+     * 3.2 never adjust between string and numeric, such as MM and MMM
+     * 3.3 always adjust year
+     * 3.4 do not adjust 'd', 'h', or 'm' if h presents
+     * 3.5 do not adjust 'M' if it is numeric(?)
+     *
+     * Since date interval format is well-formed format,
+     * date and time skeletons are normalized previously,
+     * till this stage, the adjust here is only "adjust strings, such as MMM
+     * and MMMM, EEE and EEEE.
+     *
+     * @param inputSkeleton            the input skeleton
+     * @param bestMatchSkeleton        the best match skeleton
+     * @param bestMatchIntervalPattern the best match interval pattern
+     * @param differenceInfo           the difference between 2 skeletons
+     *                                 1 means only field width differs
+     *                                 2 means v/z exchange
+     * @param adjustedIntervalPattern  adjusted interval pattern
+     */
+    static void U_EXPORT2 adjustFieldWidth(
+                            const UnicodeString& inputSkeleton,
+                            const UnicodeString& bestMatchSkeleton,
+                            const UnicodeString& bestMatchIntervalPattern,
+                            int8_t differenceInfo,
+                            UnicodeString& adjustedIntervalPattern);
+
+    /**
+     * Concat a single date pattern with a time interval pattern,
+     * set it into the intervalPatterns, while field is time field.
+     * This is used to handle time interval patterns on skeleton with
+     * both time and date. Present the date followed by
+     * the range expression for the time.
+     * @param format         date and time format
+     * @param formatLen      format string length
+     * @param datePattern    date pattern
+     * @param field          time calendar field: AM_PM, HOUR, MINUTE
+     * @param status         output param set to success/failure code on exit
+     */
+    void concatSingleDate2TimeInterval(const UChar* format,
+                                       int32_t formatLen,
+                                       const UnicodeString& datePattern,
+                                       UCalendarDateFields field,
+                                       UErrorCode& status);
+
+    /**
+     * check whether a calendar field present in a skeleton.
+     * @param field      calendar field need to check
+     * @param skeleton   given skeleton on which to check the calendar field
+     * @return           true if field present in a skeleton.
+     */
+    static UBool U_EXPORT2 fieldExistsInSkeleton(UCalendarDateFields field,
+                                                 const UnicodeString& skeleton);
+
+
+    /**
+     * Split interval patterns into 2 part.
+     * @param intervalPattern  interval pattern
+     * @return the index in interval pattern which split the pattern into 2 part
+     */
+    static int32_t  U_EXPORT2 splitPatternInto2Part(const UnicodeString& intervalPattern);
+
+
+    /**
+     * Break interval patterns as 2 part and save them into pattern info.
+     * @param field            calendar field
+     * @param intervalPattern  interval pattern
+     */
+    void setIntervalPattern(UCalendarDateFields field,
+                            const UnicodeString& intervalPattern);
+
+
+    /**
+     * Break interval patterns as 2 part and save them into pattern info.
+     * @param field            calendar field
+     * @param intervalPattern  interval pattern
+     * @param laterDateFirst   whether later date appear first in interval pattern
+     */
+    void setIntervalPattern(UCalendarDateFields field,
+                            const UnicodeString& intervalPattern,
+                            UBool laterDateFirst);
+
+
+    /**
+     * Set pattern information.
+     *
+     * @param field            calendar field
+     * @param firstPart        the first part in interval pattern
+     * @param secondPart       the second part in interval pattern
+     * @param laterDateFirst   whether the first date in intervalPattern
+     *                         is earlier date or later date
+     */
+    void setPatternInfo(UCalendarDateFields field,
+                        const UnicodeString* firstPart,
+                        const UnicodeString* secondPart,
+                        UBool laterDateFirst);
+
+
+    // from calendar field to pattern letter
+    static const UChar fgCalendarFieldToPatternLetter[];
+
+
+    /**
+     * The interval patterns for this locale.
+     */
+    DateIntervalInfo*     fInfo;
+
+    /**
+     * The DateFormat object used to format single pattern
+     */
+    SimpleDateFormat*     fDateFormat;
+
+    /**
+     * The 2 calendars with the from and to date.
+     * could re-use the calendar in fDateFormat,
+     * but keeping 2 calendars make it clear and clean.
+     */
+    Calendar* fFromCalendar;
+    Calendar* fToCalendar;
+
+    /**
+     * Date time pattern generator
+     */
+    DateTimePatternGenerator* fDtpng;
+
+    /**
+     * Following are interval information relavent (locale) to this formatter.
+     */
+    UnicodeString fSkeleton;
+    PatternInfo fIntervalPatterns[DateIntervalInfo::kIPI_MAX_INDEX];
+};
+
+inline UBool
+DateIntervalFormat::operator!=(const Format& other) const  {
+    return !operator==(other);
+}
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif // _DTITVFMT_H__
+//eof
+                                                                                                                                                                                                                                                                                                                                                            Ð4o·%DŒ¦:µF±¿—‚'‚nñ)‘¾¦Œÿ*ó­ çh8e‹Ÿé´Ô±”:‹oÖˆ½VNx©Ÿ|´y²“P>çHô¿ ,ÍôcñGf†ÿv® ˆèdBpÚFdàêü¼‚´	Ê·†›Ù¬yË›5¶Òö†üe/¯Qš¦@Úm‰$9|GƒžºaþÖ_’¯OÂ)2Œà¯zi·âN-4˜¸ñK•dëžHCè!°!„|Æ:Ýå¬QÕ$B;5oØßï•Õ(šå]ñ«DïlÇÎb³ÐÈš²¼i!>èµÛ=ý¤Ïoh¹5û’¹ÐQË¨©ï¤þ´£Cb³e`sp¦‹¥‚'é²	“xþ'Q[d¢#YÜm£þæqÖØ'¡ùžÉîvë;»¦]gáº`yIóñåzŽ†\õ±„0Ä$	HÖÒkX)=.ÏD’Cºltˆ´¢]?ë*í•¶É1«DJAÅLÀÀ`¯T;fD5‹ ^ùìÅyD•aDÒ–Ÿ˜´Xs	ªœ¸3’rõw‘|G·hÙ‹QÐ±FéuüUaLpÚ»Ø”ŒžZ$F×áÏèœÙ,WfÓ.›ìzc9šìù‡-Eyp´z½#2AŽN‘kÙˆ§ƒ´áÁ.’f &Ò²}ÐÜLÕ«Œ‡²;[ü),$©Ùô`G‡ÖÔÓ×„Zof‹Wj)š¿D$Ð6¬3èS÷.1eÕµ!%`š%<„q¾‰£ :Í>8:`fÂäðüÎO5§‰‚ú×ê|°¶Þ°­H‹V›n=™¢~Õä:Iªk”†©ýˆåøCZüË2P7#uÃ$8l<Ll3Ì|þ»ýåüšÌk2«ÆÚ×õh
+H‹>b$¯ÓÞé19oLÔÍ¼ýÎ<m‘ËÒsõ¡$>ù¦6 ÀK/ši‹Ž­Ùr]orµ»å»ëÊy£ëDýo*òëéoøã×æùN>à@L¥MmñFæ7¶8_KRý4‘5o‰âF¼!ú¥^xŽùÒ3#çÞ¿i§’Tò9W›Ì`~]dm…~…úôO
+Íé6ºL˜p”*Ú|æOØ3ï=3a¾W:ç>%îè‚ÕBÎhêî¶‹Ií±íwca³2>gY¼¶5”¸¤AØ?^²2ÆJõy'N§;ir*ð[¨Æ›HM{Ô¦†äyUa¾aÐS¹Þohã­!>_ ™Pð{ÐkÒä8ZÈ ¬mûP¦€umÊÙu.½ñ	±küg.‰þƒ§àn.ö#³’¿miÎP#…F0ƒü9To±«/&lFŸè$‡ÐÉ‘ËJ´B•»yÊ„ZW‹ªQYÓçeñ!gf“óÊs'’“¹†5Šj6¾YÒÐ†Æö‹¡kËhÄð½È˜ü»&|éœÂÍ–µŽBtêr`Z (	€¹Ð:<¦œÂ?W… âZkÖõŒ}Ìpwógš	>!oè£WfJ\ZÚ¯'#Ã´
+c†°&ØþíTï õPí×!Ô5RsXJ'—a2-^À„Ü{¶¬îÙ;“ØyhÂô‰ÏU¹Ò¼ÓÜwû»¤AgÕÜáBŸYG	cÉnÆVeIÊ1¢\-³’‡µ-žÖûä.A!ëšfdÕ[w‘¸]Þþë~7
+æzåq…LöbC«DæAC*YT»AuÅâ  v{‹SøV³)fPF «Bz£†Ý¤žsb%a<0-<0ˆÒ1¿x)Ó€êj1œQ­X+5¿äãbXô]‘ˆ\Š.^58²õ"þ.f »×ÃJ½2~5%‘$}€Æw¬#$|aqï!šìaÃA3vp ;?=¯¤	:Er@`—
+ƒ_pÏ©7æÔIœÝI&ºÔ•¬Ÿ~ƒÊR6¨”2ÙB§iöcáïB¡DŸNåÿ¼éòi >b°ŒRðClò¡U<°(DäÛñf8ÙÐªA‘'?f;”sWÑ©OÒë¥ž™½v­EAÄ‡N•ð Î›Ÿ=…q~_Š7íò}•lôÈZ¹˜¤I0mÖ(Í
+Á ÎùUnm«¯;ü¤6Ìo5>ŒÀ§Z¥s{:¯ %t.æâËFR—ç‚î¹ÀuÎákôµ»¸=¨ß1¼ÍîÎ&!†Ìp'ðïy»ÐYx®n§8KãQgºÇïƒÊ?ÐÔ‘2Ž­ž?G·Õbzwôù8Îï€¡ Òy>9žñ)žçšvH¿qlÜ¶'ÓÑS× -q®Æ0ÂTA,\ÒÙŒ-6ù]VƒóºuÛÐ‹§®€Œú"^=@›hëòj&ì’÷	½ŽG¶Uf>Ñþ3!7¢è¼÷h³Ü{»"¶¬+OÜükšþ‹Wä:eš;}·q #âRH¿}2e@&ÿ¢B“À¼¡…`Qr2[•béöpÍ­t3yø†Ê5LùóíÈHcãµ%n9?Rú6s{ÊŠkò¤^âÛ¥qh9;†~tÏ–íÌê;äâÞ¡}%¤éÕFù¸š·UÑ…[{üÓµÇ¯Œ³ó0vëåO	1.õ‡(9/¡O05{r¿ß{ÀÓçŽ¤é «éæuø6´íÛBö4<VlÇjnk¶ëòë˜ æù¯P«Q1–¹xŠ_¢03ob’ÍÓGJ8pGÓ´"Øh]pnñúÔ„‰ÜËTW
+®Ÿ˜Ñ"‰o²FèÆô‡LkuòÝüƒÃÐ‡„Úg_àtÚDåÍtc0j¼†¬ºyþÃÊ>•=ƒªåÙ¥UŒ¬¥Us.u\-MW½°âø$Ä¾S,©©—HÑÏ³?[Þ|k.§š^õ
+ÿO•ZGýÎÌ;Õ*Cƒñ©ø0!0vèÒI0¢ãÝ·ÞWÅ÷zô¹¿j;,¦wå§~$Ht‚ÀÈ~žÎÖ[Ä$ºËç®BŒdq¹pîÀ|âƒ‹'u½ŸKŸ9Ë;ÿ6)9ßûn›÷…gÉœ—[Å
+è{“¥#Ø´¦q-Ø‰ÝÏeÒßç±NMò{÷”(Öõð1|´µ˜B,Lfüåp4q!?¶¡ÈÌöÝq¥Ïÿëù¤Ì'°ñÉ
+Z¦» óž2û·”³°áÇs8+ì\GÈÆ¶±õ²ßEu¦µõ¶¼%š§‹ŽÀˆœd,Òë² ©}…½”XÌõz3á‚*]—Vp¨ùþŒ¨'¥Úa®·ÕiºËÙPË«ÊãÐ~©ÑŽùz£îc8çRùŸë>ZÚlb¹G=ž\)Ÿ|£zØf1…JòžŠ	.iõ¹Œ2oÜZ €Õ_Ù‡Žª6ŸàQ0w)7WŽkÓ rþ}›÷~t‚ðy›>N®ƒlÇ›ÕqÂBÆÙ¦‰CšY‘yªMÝo¥ŸsS6( m</ûwkš×ÃÃö fd‰ã«‰7Œ%ë*™úïõô°«ÿfþoZ³¬ÇÌ×¹kÊ*_Îó½Å€Z\•£ ©4m‰ù'ý ÚƒåUã›,ÌÜB²•¥K©•MÑ‡<•j(
+ÁBX÷¯d¢páœ¡Îªšé8®íó|ÇxÓ~QåóÐå&Èü@ Ã„mìï—Æßc›3Q>T_k–b-{
+ãB±?Ú¨Ýû¬óôîu¤9„ÎŸ¶:SÚØÕÕ<¡J
+5p–ÊL‡8Âþ]ëûÀË.9ÆD2Œ|GOÍ +³9ò`yÍXkÚª¼Æ!¡ßÑ-€TN¿úÜNP„9M@OõU¯/‡©Ey‚n‚6g›'ð¡†Úüê'Ç
+ÓÍ!cpW{Ò—Ø[¬°š…Ô!ˆÐƒ+¸§øÃBáô|ŠÁìÂBJ
+ÝYÀ$„¤6æÂ6üA@«°ñà„©­û'ç‚KV¹ö”T1&+ñ‚øœtKäÇ"t%€óÔÑö²xubº@ h2[ß/MVÙFU™ãz@™/[õ ÚÑÓY$ÃbïÈOk£¨çXÓ4(­ ;ÌaEB±”FN^C{ÝûxH¬Q^Gl­{Î ë9Â+ˆµ;4~<‹]åŽÓÝbvoÂ·²ý×3¿þ«1×( ÄÉ=?†›²ž„é9éGê‘›@$„ÂÉøÅ_Æ|¯,£~@â¿rù;6?ÈÚýE“y%ùm‰p5i<%«Õb2Øñá¯ÍB‚LËS¨MËš[a›4¬Àf¢–êºº%}ƒÂßŒ†ÿÂ„ô¹èRj	'y%’D¶•¶ì&ds¾ÙFƒ§hý™a_v.Òy¿Àv¿ðÇçe™ÆþÍ6ÇjÂöü¸ ä1‹„RóÍO* ¨†ÛLSzÅuæáÔŒO¿¯yçœ›Óa£V}†e³ó[•*â\&.2A@æ^ü%²ÏÈ2Ôqcp&üñ¦t§CÑ›ËEkÓL'k’£›~:ß
+¼ß‡YÖÆ¦e 4õiÅiýlà"_:Â©²ÆRX¨˜­£2]\£Ÿ@@Ø$Øf@†zû,íÔP¡?ÿwµvÞiÆ›@Î•Rü ªJ]…;yü•
+';Ó§é$µàû°¡?	ƒôÖ~´ýµY0‚Ê=vxØðð¢ùY2O…A<ÇžÎü>>‰ÙP'·¢°ÃBÙU=Á±iý‰¡öfIY­p¯U:0N¸H±ø†;ruÝõÎ!W
+Wïgµ%V‰PNG
+
+   IHDR  V     ÎÒ)-   	pHYs     šœ  
+OiCCPPhotoshop ICC profile  xÚSgTSé=÷ÞôBKˆ€”KoR RB‹€‘&*!	Jˆ!¡ÙQÁEEÈ ˆŽŽ€ŒQ,Š
+Øä!¢Žƒ£ˆŠÊûá{£kÖ¼÷æÍþµ×>ç¬ó³ÏÀ–H3Q5€©BàƒÇÄÆáä.@
+$p ³d!sý# ø~<<+"À¾ xÓ ÀM›À0‡ÿêB™\€„Àt‘8K€ @zŽB¦ @F€˜&S   `Ëcbã P- `'æÓ €ø™{ [”! ‘  eˆD h; ¬ÏVŠE X0 fKÄ9 Ø- 0IWfH °· ÀÎ²  0Qˆ…) { `È##x „™ FòW<ñ+®ç*  x™²<¹$9E[-qWW.(ÎI+6aaš@.Ây™24àóÌ   ‘àƒóýxÎ®ÎÎ6Ž¶_-ê¿ÿ"bbãþåÏ«p@  át~Ñþ,/³€;€mþ¢%îh^ u÷‹f²@µ  éÚWópø~<<E¡¹ÙÙåääØJÄB[aÊW}þgÂ_ÀWýlù~<ü÷õà¾â$2]GøàÂÌôL¥Ï’	„bÜæGü·ÿüÓ"ÄIb¹X*ãQqŽDšŒó2¥"‰B’)Å%Òÿdâß,û>ß5 °j>{‘-¨]cöK'XtÀâ÷  ò»oÁÔ(€hƒáÏwÿï?ýG % €fI’q  ^D$.TÊ³?Ç  D *°AôÁ,ÀÁÜÁü`6„B$ÄÂBB
+d€r`)¬‚B(†Í°*`/Ô@4ÀQh†“p.ÂU¸=púažÁ(¼	AÈa!ÚˆbŠX#Ž™…ø!ÁH‹$ ÉˆQ"K‘5H1RŠT UHò=r9‡\Fº‘;È 2‚ü†¼G1”²Q=ÔµC¹¨7„F¢Ðdt1š ›Ðr´=Œ6¡çÐ«hÚ>CÇ0Àè3Äl0.ÆÃB±8,	“cË±"¬«Æ°V¬»‰õcÏ±wEÀ	6wB aAHXLXNØH¨ $4Ú	7	„QÂ'"“¨K´&ºùÄb21‡XH,#Ö/{ˆCÄ7$‰C2'¹I±¤TÒÒFÒnR#é,©›4H#“ÉÚdk²9”, +È…ääÃä3ää!ò[
+b@q¤øSâ(RÊjJåå4åe˜2AU£šRÝ¨¡T5ZB­¡¶R¯Q‡¨4uš9ÍƒIK¥­¢•Óhh÷i¯ètºÝ•N—ÐWÒËéGè—èôw†ƒÇˆg(›gw¯˜L¦Ó‹ÇT071ë˜ç™™oUX*¶*|‘Ê
+•J•&•*/T©ª¦ªÞªUóUËT©^S}®FU3Sã©	Ô–«UªPëSSg©;¨‡ªg¨oT?¤~Yý‰YÃLÃOC¤Q ±_ã¼Æ c³x,!k«†u5Ä&±ÍÙ|v*»˜ý»‹=ª©¡9C3J3W³Ró”f?ã˜qøœtN	ç(§—ó~ŠÞï)â)¦4L¹1e\kª–—–X«H«Q«Gë½6®í§¦½E»YûAÇJ'\'GgÎçSÙSÝ§
+§M=:õ®.ªk¥¡»Dw¿n§î˜ž¾^€žLo§Þy½çú}/ýTýmú§õGX³$ÛÎ<Å5qo</ÇÛñQC]Ã@C¥a•a—á„‘¹Ñ<£ÕFFŒiÆ\ã$ãmÆmÆ£&&!&KMêMîšRM¹¦)¦;L;LÇÍÌÍ¢ÍÖ™5›=1×2ç›ç›×›ß·`ZxZ,¶¨¶¸eI²äZ¦Yî¶¼n…Z9Y¥XUZ]³F­­%Ö»­»§§¹N“N«žÖgÃ°ñ¶É¶©·°åØÛ®¶m¶}agbg·Å®Ãî“½“}º}ý=‡Ù«Z~s´r:V:ÞšÎœî?}Åô–é/gXÏÏØ3ã¶Ë)ÄiS›ÓGgg¹sƒóˆ‹‰K‚Ë.—>.›ÆÝÈ½äJtõq]ázÒõ›³›Âí¨Û¯î6îiî‡ÜŸÌ4Ÿ)žY3sÐÃÈCàQåÑ?Ÿ•0kß¬~OCOgµç#/c/‘W­×°·¥wª÷aï>ö>rŸã>ã<7Þ2ÞY_Ì7À·È·ËOÃož_…ßC#ÿdÿzÿÑ §€%g‰A[ûøz|!¿Ž?:Ûeö²ÙíAŒ ¹AA‚­‚åÁ­!hÈì­!÷ç˜Î‘Îi…P~èÖÐaæa‹Ã~'…‡…W†?ŽpˆXÑ1—5wÑÜCsßDúD–DÞ›g1O9¯-J5*>ª.j<Ú7º4º?Æ.fYÌÕXXIlK9.*®6nl¾ßüíó‡ââã{˜/È]py¡ÎÂô…§©.,:–@LˆN8”ðA*¨Œ%òw%Ž
+yÂÂg"/Ñ6ÑˆØC\*NòH*Mz’ì‘¼5y$Å3¥,å¹„'©¼LLÝ›:žšv m2=:½1ƒ’‘qBª!M“¶gêgæfvË¬e…²þÅn‹·/•Ék³¬Y-
+¶B¦èTZ(×*²geWf¿Í‰Ê9–«ž+ÍíÌ³ÊÛ7œïŸÿíÂá’¶¥†KW-Xæ½¬j9²<qyÛ
+ã+†V¬<¸Š¶*mÕO«íW—®~½&zMk^ÁÊ‚ÁµkëU
+å…}ëÜ×í]OX/Yßµaú†>‰Š®Û—Ø(Üxå‡oÊ¿™Ü”´©«Ä¹dÏfÒféæÞ-ž[–ª—æ—nÙÚ´ßV´íõöEÛ/—Í(Û»ƒ¶C¹£¿<¸¼e§ÉÎÍ;?T¤TôTúT6îÒÝµa×ønÑî{¼ö4ìÕÛ[¼÷ý>É¾ÛUUMÕfÕeûIû³÷?®‰ªéø–ûm]­NmqíÇÒý#¶×¹ÔÕÒ=TRÖ+ëGÇ¾þïw-6UœÆâ#pDyäé÷	ß÷:ÚvŒ{¬áÓvg/jBšòšF›Sšû[b[ºOÌ>ÑÖêÞzüGÛœ4<YyJóTÉiÚé‚Ó“gòÏŒ•}~.ùÜ`Û¢¶{çcÎßjoïºtáÒEÿ‹ç;¼;Î\ò¸tò²ÛåW¸Wš¯:_mêtê<þ“ÓOÇ»œ»š®¹\k¹îz½µ{f÷éž7ÎÝô½yñÿÖÕž9=Ý½ózo÷Å÷õßÝ~r'ýÎË»Ùw'î­¼O¼_ô@íAÙCÝ‡Õ?[þÜØïÜjÀw óÑÜG÷…ƒÏþ‘õC™Ë††ëž8>99â?rýéü§CÏdÏ&žþ¢þË®/~øÕë×ÎÑ˜Ñ¡—ò—“¿m|¥ýêÀë¯ÛÆÂÆ¾Éx31^ôVûíÁwÜwï£ßOä| (ÿhù±õSÐ§û“““ÿ˜óüc3-Û    cHRM  z%  €ƒ  ùÿ  €é  u0  ê`  :˜  o’_ÅF  ª„IDATxÚìw`EûÇ?»WÒ;¤@(¡7APšH ˆbWÔ×ŠŠí+¶Ÿ½+ôµ÷†((EzWz‘Þ!…ôK.åîv\îr{-—»„˜¯ï¾äv÷™™Ý™yö;Ï<óŒÔ»woµ´´”`Q\\LlllÐòQQQ„’¿oXyQÿ¢þEý‹úoŒåß¶m›„€@@¯@@@@@@@@@+A¬±ð	©wïÞj(	dff’––&Þä	€ªª®LYYY¤¦¦ŠÊ9Mq:Õ¿$	_è“Iÿ¯]»VT˜@ƒ@„´*#TùÆ¶*FQL&&“	UUk$3²,£(JÐùŸìòŠ¢PXXxÚ>¿¨Qÿ!/I’$Ñ´iSŒFcÐ¤/Týy²ëz#VvÛ—ÇÅÒªu+"##‘eûl©ŠZ?ŠU’QÔ äÕÆùa°)6t²®îó—\ÿôýÑd	U	Â’'Õòý×PþÊè·Á–¿‘È‡Zÿ'ûó7”¼M±Qf.£°°ãÇRØA¬ê«”ÉdÂl6Ó<½9‰‰‰4ï1ˆÎÝÏ¤ez:QaÚ/½fäØ°St’OÒÜñÃâ|Ü.PJ$×dÕÚ¨¦2iÞ¿êå\5vOGU‘$É¥þ\òª:§ºümÿW­úŸý¼„£þUyºÈVÝ§ªŠËo´¿UÕ%Ïª¼¬•~-¡´¿PåÕªwØPùŸŽò%¥%ìß¿Ÿ;vÏñ¨ãdge#¦,±jäª¸¸˜Ô´TZtèFëÞçÑ»G7ŽšX¿û0¥eU;ï´Buÿ°¨'U'1ókT©ÙòR‹üüCÕ.©5Ó UÉÝ^#yüé$€näFòxª‚§úxWbãX¹’mÞ2ä”×YÕ©.÷+H`·x©žùªU÷¨ªŠ¢ùÛžf•¼bÓœSESv¥ÂÜh‰¢(N«® F'F>::š–-[rÞyç±víZt:Š¢y,“èèhA¬±jxRe2™ˆŽ‰¦iË6¤õN÷ÎY·ó æòJTUq#Uö!eèÍâ¨q&p‹—T‡Š]õÍÌTjeó´XHxêuÉÇËPíSh>Ë¯úxrÕíù/Ö07§©£ês’‹ÅÈi)rüv'gª'é’$ª¦2]-SUmÆ…,9	““¨U‘-@UlÕepÞ_Uð;UÛˆU(ÄªöòÅÅÅlÝº•èèhzôèAii)ñ	ñ˜L&JJJ„ÕJ@@«†%U &“‰äÔdRºô§UóflÞ{syŠM©&VNk…/ë‡ý£Ú2)š¬ã¹THa¨¨èe‰ø¹%Ü¢&‹U@T«6+_Óqj“‰Nb%¹0 Éir1Yy¥ZÕÏ¯d©“Ü‰YÕ‡IòAÌ$’¥b«&FvOË”W2åJžÝˆ™«uË• ©nÿº/	Åfõ~Ýa±²Ù|¿öR%4b!|¬‚–/**bÓ¦M´lÙ’’Ò¢¢£ÈÉÊ!&&&ä)ZA¬B"W•j%F½}x4V«S‰ÙiEPl6çGNuNñTXqû°–Wèyðú‹yê£Ÿˆ
+3òÈ—1ýë_©,+×N¬©®$)_ÌJò ¾îÒf¯Ö"_{ª’s*Pòj‘Ã`In#vÇt¢/9É‹•ÊCÞ+¡òb¹B;íç}*ÏÓ²¥õ}B+¯Ø\ˆ•ËôŸÆúå…p)ŠÝâe³U[µÜ§éû€¬†è|¢¼¢(!ùø5tùOvù¢¢"š4i‚^§Ç¨7RQQ!H•€€ Vk­Âña•ìéhN6›ÅN¨l6Å†ªh-Wª‹#Æ(fÀ¦Ø(,-';§‚];1ù?—Ñ<5™Ýûr ;ßÅQ¹úÃíàZ+Xñ*ßOîR	m*CrZÝ$4k÷ÜWôI.W%·ó’ï,IÒüíAÄ<þU}Ò¾jRåýïj‹—›£¹‡#»¹rÊã2ÅçIªT·„ÊqN’@uw´é8,‰ªŸé6URCs>Q>Ô©À†.ÿ© èð!û G–PõZA°±j –eWBŠÍ†Ù\†¢ØPl6››Õª!VŽ^ŒNað™ÈhžŒ,Ë$&&‘””DaI)‹…³»wà³ÃRfv™2Ñ*¾ÖÍS¹þ’óè˜ÑY–Ù{è(_ÎZÀÎý‡#7nÄHª•íI­ñFNÇ§/<BltÏ¾÷oÙé‘‡$¹Ù«$‰±ç‹,Kü<¹öºäb…ªŠÅãŸ4A³ä&¼úðí”˜Ëxèå)1—pÕEƒ¹xH?ÞþêWþÞº½NÇ¥ÃÎa@¯®ÄÅD‘_dbÉÚÌY²UUHkšÄóÿµ§óØ+PRjF’àò‡0jÈ9¼ûåOÍÊáÿšàñvï?Äsï|ìA¸œ+TÓyJÕTiRªÉ—ÝGËæÕQÞiµ5r«®ÂÇ*tys©¹QÄêt†ÅNrlV+ªÎŠb³a³ZPlÖª«œ‹EUˆ¦œ/¿ƒÁˆ¢X™²²JºthO˜ÑèLúÑ»nfô°Ýüï»™¬Þ¼ÓÅê‘a<}ïM„Ìœ·‹ÕÊÅÃÏå©‰7qç/’—ß0ŠÝÅÂtö‰Žàœ3»°bíz4óy.£bW’téyÐÉ2ßþ6Ï«ÕÊ>}(!ÉRµmË%¶”êpl—$¬•v"ÁÕâ½ofTí{d³Tb©(çîÇÑ·G6þ»‡ù+Ò£S;®¸p‰q1|òãïØ¬g:W\4„ßþZmqÂžžÍfàHVWþí´4WûB¡‚âp.W5«øTw)Wkž×=¦]§*«ˆ¸?«Æ 4”ö'„Ö¼Š
+¡Î±j,F+UÅf³AÕÇÕf³b³X°Y+Q\¬V²µœë.;I’±Z­$&&Ÿ@~~Ûwî¡¢ÒB·.ÈË/àÙ·f_XLa±‰Êr3NxU%£YSb££X´ê>üê ö<Ì%#“œKZ“x^xì^þX´œmZÑ4)‘E+ÿæÝÏ¾Ãj³qnïžÜ|å%4KiJöñ|þ÷ý¯,]³žgšÀ€³Ïdìmÿ¥¬¢œ™3^gæÜE|øõÏÜyý8®=‚û¦½Lb\,S¸ƒ¯fÎ¡Kû¶tn—ÁÆm;yî0—•0¨wwTUeß¡£ô;³+’b¥¢Ò®½»wnÏ×£UóT²ç3ãÛ_X³a?½ÿ²“Œý>ãe®žø8…EÅ´ÏhÅ×]N›–ÍÉ/,â×ùK™½hgÑ‰§¸ƒ%kÖÓ¹]³,eÖ‚ev¢&IX-Õqœ÷9“+þæß½PÄÊf%=9‰¾=ºðïž<?ýS@å×y‹xáá{Ö¯3ç.r+€g÷`ñªØ¹ï óÃd'Òvbu</Ÿ¹‹–ã:uè:]çœÊ'±ò$SZ§xoNîv+7b†ÖÞïT ª†‡ªA§¸ü§’¼°Z	4œÖ›0»*%EUP;©²OZZ'Ñ²YéØ<‰ˆˆ¬V+z½LÛvíèÜ©é-Ò‰ŠŠ -5™m;ö°aË¿Xm6–­ÝÀæwqèè1¬–J¬••ö-•ìÙ€£YÙ8»7\6’&ñ±,Xº’{§<ÏÚõ›°ÙìD`ÀÙg²dÕ?<rŒ1çá’ó‘Ö4‘©÷ßŽ,É|þãoDE†3yâ­$ÄD²~Ëv 2ÒS9£CÂÃŒô=³6K%m[6§¼¢‚­ÿîtZgFÈÆ­ÿ²}÷^úõ:ƒQC`­¬DFeÀÙg²mç~Ÿ¿˜ÈˆpzwïŒÕRAR\4/>z/	±1|ùÓl=OÞ{	1Q|ðÕ”•WPQYÉÛŸ|©¸ˆèˆp^xäš§6åÛYRd*á®Æ1¨w'™éÕµ#s-gÍú-X­¬–Jl–J'!Ú¼c7Çó¸ýªK@±9ºmVé)IU÷ìÂj©Àj©ÄRYÉ–»‘$‰ô”&ÎçÝºk/¹…Ü<n4¨¶j‹•b¯w€øØúžÙ•¾gv£ï™ÝÐË6k¥l[,X­l.‡ö·›Í‚Íæ8oõ<mÊªý×Þ?E©Õýu-êÑÐå?•äU¯!`„ÅªÁXVÕè[Qª}¬œ¾Vö©@UQÈh–Byy9:«UOaQFc8Å&²¤cëŽ=ä`±(X¬Vb"ÃÈ/,vZ"Ö*³ÙÊ]=ËMWŽaÜÈÜ8î6ÿ»‹÷?ÿŽ-;vWY2`îâüïÛŸ™½`	?}ôCúŸÍœ¿–0qòÿ‘}<—ÂbIñq\6ò<Z¥§±~ó6 ÚµJ'¹‰pd´lNÓÄ8Ú¶nÁÖ{ì«‡ªÅì¿–ð¿o¦kÇv¼ÿÂ“´No†Íf¥_ÏžDF„³dõ?,Yµ–ûn½žaçôfáòÕÐ£ÑÀÇßüÄ—ñïî½Œ>ˆèÈ~Ÿ¿˜Û¯‡N–ùiö| .<€¨ÈÞüèK~·ˆ¹‹–óí{/3rè ¾žù –¯áë_f;÷A³OJN²S^^Áû_üÈ“÷ßÎÅÃ8‰•j³¡«šF¬¨¨Äfµ:ý¹ÊËíÓˆ²$¡T¸Šò
+>þæg½ûF9µ*ÅfsÞ“Ñ¢9÷Þr½³yÜõÈTJKM.ÓtJÕt¥«Å
+—)<ExÔs:Ðþ¯ìˆƒ¥j—jâ¤ù³X¡†´Ü?T

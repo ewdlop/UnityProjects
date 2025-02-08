@@ -1,0 +1,66 @@
+import errno
+import os
+import random
+import selectors
+import signal
+import socket
+import sys
+from test import support
+from time import sleep
+import unittest
+import unittest.mock
+import tempfile
+from time import monotonic as time
+try:
+    import resource
+except ImportError:
+    resource = None
+
+
+if hasattr(socket, 'socketpair'):
+    socketpair = socket.socketpair
+else:
+    def socketpair(family=socket.AF_INET, type=socket.SOCK_STREAM, proto=0):
+        with socket.socket(family, type, proto) as l:
+            l.bind((support.HOST, 0))
+            l.listen()
+            c = socket.socket(family, type, proto)
+            try:
+                c.connect(l.getsockname())
+                caddr = c.getsockname()
+                while True:
+                    a, addr = l.accept()
+                    # check that we've got the correct client
+                    if addr == caddr:
+                        return c, a
+                    a.close()
+            except OSError:
+                c.close()
+                raise
+
+
+def find_ready_matching(ready, flag):
+    match = []
+    for key, events in ready:
+        if events & flag:
+            match.append(key.fileobj)
+    return match
+
+
+class BaseSelectorTestCase(unittest.TestCase):
+
+    def make_socketpair(self):
+        rd, wr = socketpair()
+        self.addCleanup(rd.close)
+        self.addCleanup(wr.close)
+        return rd, wr
+
+    def test_register(self):
+        s = self.SELECTOR()
+        self.addCleanup(s.close)
+
+        rd, wr = self.make_socketpair()
+
+        key = s.register(rd, selectors.EVENT_READ, "data")
+        self.assertIsInstance(key, selectors.SelectorKey)
+        s

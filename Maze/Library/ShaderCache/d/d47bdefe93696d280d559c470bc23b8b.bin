@@ -1,0 +1,78 @@
+            length=1;
+                } else if(value<=0xffff) {
+                    length=2;
+                } else if((value&0x800000)==0) {
+                    value|=0x8e800000;
+                    length=4;
+                } else if((value&0x8000)==0) {
+                    value|=0x8f008000;
+                    length=4;
+                } else {
+                    length=3;
+                }
+                break;
+#endif
+            default:
+                /* must not occur */
+                return -1;
+            }
+
+            /* is this code point assigned, or do we use fallbacks? */
+            if( MBCS_FROM_U_IS_ROUNDTRIP(stage2Entry, c) ||
+                (FROM_U_USE_FALLBACK(useFallback, c) && value!=0)
+            ) {
+                /*
+                 * We allow a 0 byte output if the "assigned" bit is set for this entry.
+                 * There is no way with this data structure for fallback output
+                 * to be a zero byte.
+                 */
+                /* assigned */
+                *pValue=value;
+                return length;
+            }
+        }
+    }
+
+    cx=sharedData->mbcs.extIndexes;
+    if(cx!=NULL) {
+        length=ucnv_extSimpleMatchFromU(cx, c, pValue, useFallback);
+        return length>=0 ? length : -length;  /* return abs(length); */
+    }
+
+    /* unassigned */
+    return 0;
+}
+
+
+#if 0
+/*
+ * This function has been moved to ucnv2022.c for inlining.
+ * This implementation is here only for documentation purposes
+ */
+
+/**
+ * This version of ucnv_MBCSFromUChar32() is optimized for single-byte codepages.
+ * It does not handle the EBCDIC swaplfnl option (set in UConverter).
+ * It does not handle conversion extensions (_extFromU()).
+ *
+ * It returns the codepage byte for the code point, or -1 if it is unassigned.
+ */
+U_CFUNC int32_t
+ucnv_MBCSSingleFromUChar32(UConverterSharedData *sharedData,
+                       UChar32 c,
+                       UBool useFallback) {
+    const uint16_t *table;
+    int32_t value;
+
+    /* BMP-only codepages are stored without stage 1 entries for supplementary code points */
+    if(c>=0x10000 && !(sharedData->mbcs.unicodeMask&UCNV_HAS_SUPPLEMENTARY)) {
+        return -1;
+    }
+
+    /* convert the Unicode code point in c into codepage bytes (same as in _MBCSFromUnicodeWithOffsets) */
+    table=sharedData->mbcs.fromUnicodeTable;
+
+    /* get the byte for the output */
+    value=MBCS_SINGLE_RESULT_FROM_U(table, (uint16_t *)sharedData->mbcs.fromUnicodeBytes, c);
+    /* is this code point assigned, or do we use fallbacks? */
+    if(useFallback ? va

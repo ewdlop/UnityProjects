@@ -1,0 +1,2577 @@
+'2.4.3 (truncation, ) \n[GCC]',
+             ('CPython', '2.4.3', '', '', 'truncation', '', 'GCC')),
+            ('2.4.3 (truncation,) \n[GCC]',
+             ('CPython', '2.4.3', '', '', 'truncation', '', 'GCC')),
+            ('2.4.3 (truncation) \n[GCC]',
+             ('CPython', '2.4.3', '', '', 'truncation', '', 'GCC')),
+            ):
+            # branch and revision are not "parsed", but fetched
+            # from sys._git.  Ignore them
+            (name, version, branch, revision, buildno, builddate, compiler) \
+                   = platform._sys_version(input)
+            self.assertEqual(
+                (name, version, '', '', buildno, builddate, compiler), output)
+
+        # Tests for python_implementation(), python_version(), python_branch(),
+        # python_revision(), python_build(), and python_compiler().
+        sys_versions = {
+            ("2.6.1 (r261:67515, Dec  6 2008, 15:26:00) \n[GCC 4.0.1 (Apple Computer, Inc. build 5370)]",
+             ('CPython', 'tags/r261', '67515'), self.save_platform)
+            :
+                ("CPython", "2.6.1", "tags/r261", "67515",
+                 ('r261:67515', 'Dec  6 2008 15:26:00'),
+                 'GCC 4.0.1 (Apple Computer, Inc. build 5370)'),
+
+            ("IronPython 2.0 (2.0.0.0) on .NET 2.0.50727.3053", None, "cli")
+            :
+                ("IronPython", "2.0.0", "", "", ("", ""),
+                 ".NET 2.0.50727.3053"),
+
+            ("2.6.1 (IronPython 2.6.1 (2.6.10920.0) on .NET 2.0.50727.1433)", None, "cli")
+            :
+                ("IronPython", "2.6.1", "", "", ("", ""),
+                 ".NET 2.0.50727.1433"),
+
+            ("2.7.4 (IronPython 2.7.4 (2.7.0.40) on Mono 4.0.30319.1 (32-bit))", None, "cli")
+            :
+                ("IronPython", "2.7.4", "", "", ("", ""),
+                 "Mono 4.0.30319.1 (32-bit)"),
+
+            ("2.5 (trunk:6107, Mar 26 2009, 13:02:18) \n[Java HotSpot(TM) Client VM (\"Apple Computer, Inc.\")]",
+            ('Jython', 'trunk', '6107'), "java1.5.0_16")
+            :
+                ("Jython", "2.5.0", "trunk", "6107",
+                 ('trunk:6107', 'Mar 26 2009'), "java1.5.0_16"),
+
+            ("2.5.2 (63378, Mar 26 2009, 18:03:29)\n[PyPy 1.0.0]",
+             ('PyPy', 'trunk', '63378'), self.save_platform)
+            :
+                ("PyPy", "2.5.2", "trunk", "63378", ('63378', 'Mar 26 2009'),
+                 "")
+            }
+        for (version_tag, scm, sys_platform), info in \
+                sys_versions.items():
+            sys.version = version_tag
+            if scm is None:
+                if hasattr(sys, "_git"):
+                    del sys._git
+            else:
+                sys._git = scm
+            if sys_platform is not None:
+                sys.platform = sys_platform
+            self.assertEqual(platform.python_implementation(), info[0])
+            self.assertEqual(platform.python_version(), info[1])
+            self.assertEqual(platform.python_branch(), info[2])
+            self.assertEqual(platform.python_revision(), info[3])
+            self.assertEqual(platform.python_build(), info[4])
+            self.assertEqual(platform.python_compiler(), info[5])
+
+    def test_system_alias(self):
+        res = platform.system_alias(
+            platform.system(),
+            platform.release(),
+            platform.version(),
+        )
+
+    def test_uname(self):
+        res = platform.uname()
+        self.assertTrue(any(res))
+        self.assertEqual(res[0], res.system)
+        self.assertEqual(res[1], res.node)
+        self.assertEqual(res[2], res.release)
+        self.assertEqual(res[3], res.version)
+        self.assertEqual(res[4], res.machine)
+        self.assertEqual(res[5], res.processor)
+
+    @unittest.skipUnless(sys.platform.startswith('win'), "windows only test")
+    def test_uname_win32_ARCHITEW6432(self):
+        # Issue 7860: make sure we get architecture from the correct variable
+        # on 64 bit Windows: if PROCESSOR_ARCHITEW6432 exists we should be
+        # using it, per
+        # http://blogs.msdn.com/david.wang/archive/2006/03/26/HOWTO-Detect-Process-Bitness.aspx
+        try:
+            with support.EnvironmentVarGuard() as environ:
+                if 'PROCESSOR_ARCHITEW6432' in environ:
+                    del environ['PROCESSOR_ARCHITEW6432']
+                environ['PROCESSOR_ARCHITECTURE'] = 'foo'
+                platform._uname_cache = None
+                system, node, release, version, machine, processor = platform.uname()
+                self.assertEqual(machine, 'foo')
+                environ['PROCESSOR_ARCHITEW6432'] = 'bar'
+                platform._uname_cache = None
+                system, node, release, version, machine, processor = platform.uname()
+                self.assertEqual(machine, 'bar')
+        finally:
+            platform._uname_cache = None
+
+    def test_java_ver(self):
+        res = platform.java_ver()
+        if sys.platform == 'java':
+            self.assertTrue(all(res))
+
+    def test_win32_ver(self):
+        res = platform.win32_ver()
+
+    def test_mac_ver(self):
+        res = platform.mac_ver()
+
+        if platform.uname().system == 'Darwin':
+            # We're on a MacOSX system, check that
+            # the right version information is returned
+            fd = os.popen('sw_vers', 'r')
+            real_ver = None
+            for ln in fd:
+                if ln.startswith('ProductVersion:'):
+                    real_ver = ln.strip().split()[-1]
+                    break
+            fd.close()
+            self.assertFalse(real_ver is None)
+            result_list = res[0].split('.')
+            expect_list = real_ver.split('.')
+            len_diff = len(result_list) - len(expect_list)
+            # On Snow Leopard, sw_vers reports 10.6.0 as 10.6
+            if len_diff > 0:
+                expect_list.extend(['0'] * len_diff)
+            self.assertEqual(result_list, expect_list)
+
+            # res[1] claims to contain
+            # (version, dev_stage, non_release_version)
+            # That information is no longer available
+            self.assertEqual(res[1], ('', '', ''))
+
+            if sys.byteorder == 'little':
+                self.assertIn(res[2], ('i386', 'x86_64'))
+            else:
+                self.assertEqual(res[2], 'PowerPC')
+
+
+    @unittest.skipUnless(sys.platform == 'darwin', "OSX only test")
+    def test_mac_ver_with_fork(self):
+        # Issue7895: platform.mac_ver() crashes when using fork without exec
+        #
+        # This test checks that the fix for that issue works.
+        #
+        pid = os.fork()
+        if pid == 0:
+            # child
+            info = platform.mac_ver()
+            os._exit(0)
+
+        else:
+            # parent
+            cpid, sts = os.waitpid(pid, 0)
+            self.assertEqual(cpid, pid)
+            self.assertEqual(sts, 0)
+
+    def test_dist(self):
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                'ignore',
+                r'dist\(\) and linux_distribution\(\) '
+                'functions are deprecated .*',
+                DeprecationWarning,
+            )
+            res = platform.dist()
+
+    def test_libc_ver(self):
+        if os.path.isdir(sys.executable) and \
+           os.path.exists(sys.executable+'.exe'):
+            # Cygwin horror
+            executable = sys.executable + '.exe'
+        elif sys.platform == "win32" and not os.path.exists(sys.executable):
+            # App symlink appears to not exist, but we want the
+            # real executable here anyway
+            import _winapi
+            executable = _winapi.GetModuleFileName(0)
+        else:
+            executable = sys.executable
+        res = platform.libc_ver(executable)
+
+        self.addCleanup(support.unlink, support.TESTFN)
+        with open(support.TESTFN, 'wb') as f:
+            f.write(b'x'*(16384-10))
+            f.write(b'GLIBC_1.23.4\0GLIBC_1.9\0GLIBC_1.21\0')
+        self.assertEqual(platform.libc_ver(support.TESTFN),
+                         ('glibc', '1.23.4'))
+
+    @support.cpython_only
+    def test__comparable_version(self):
+        from platform import _comparable_version as V
+        self.assertEqual(V('1.2.3'), V('1.2.3'))
+        self.assertLess(V('1.2.3'), V('1.2.10'))
+        self.assertEqual(V('1.2.3.4'), V('1_2-3+4'))
+        self.assertLess(V('1.2spam'), V('1.2dev'))
+        self.assertLess(V('1.2dev'), V('1.2alpha'))
+        self.assertLess(V('1.2dev'), V('1.2a'))
+        self.assertLess(V('1.2alpha'), V('1.2beta'))
+        self.assertLess(V('1.2a'), V('1.2b'))
+        self.assertLess(V('1.2beta'), V('1.2c'))
+        self.assertLess(V('1.2b'), V('1.2c'))
+        self.assertLess(V('1.2c'), V('1.2RC'))
+        self.assertLess(V('1.2c'), V('1.2rc'))
+        self.assertLess(V('1.2RC'), V('1.2.0'))
+        self.assertLess(V('1.2rc'), V('1.2.0'))
+        self.assertLess(V('1.2.0'), V('1.2pl'))
+        self.assertLess(V('1.2.0'), V('1.2p'))
+
+        self.assertLess(V('1.5.1'), V('1.5.2b2'))
+        self.assertLess(V('3.10a'), V('161'))
+        self.assertEqual(V('8.02'), V('8.02'))
+        self.assertLess(V('3.4j'), V('1996.07.12'))
+        self.assertLess(V('3.1.1.6'), V('3.2.pl0'))
+        self.assertLess(V('2g6'), V('11g'))
+        self.assertLess(V('0.9'), V('2.2'))
+        self.assertLess(V('1.2'), V('1.2.1'))
+        self.assertLess(V('1.1'), V('1.2.2'))
+        self.assertLess(V('1.1'), V('1.2'))
+        self.assertLess(V('1.2.1'), V('1.2.2'))
+        self.assertLess(V('1.2'), V('1.2.2'))
+        self.assertLess(V('0.4'), V('0.4.0'))
+        self.assertLess(V('1.13++'), V('5.5.kw'))
+        self.assertLess(V('0.960923'), V('2.2beta29'))
+
+    def test_parse_release_file(self):
+
+        for input, output in (
+            # Examples of release file contents:
+            ('SuSE Linux 9.3 (x86-64)', ('SuSE Linux ', '9.3', 'x86-64')),
+            ('SUSE LINUX 10.1 (X86-64)', ('SUSE LINUX ', '10.1', 'X86-64')),
+            ('SUSE LINUX 10.1 (i586)', ('SUSE LINUX ', '10.1', 'i586')),
+            ('Fedora Core release 5 (Bordeaux)', ('Fedora Core', '5', 'Bordeaux')),
+            ('Red Hat Linux release 8.0 (Psyche)', ('Red Hat Linux', '8.0', 'Psyche')),
+            ('Red Hat Linux release 9 (Shrike)', ('Red Hat Linux', '9', 'Shrike')),
+            ('Red Hat Enterprise Linux release 4 (Nahant)', ('Red Hat Enterprise Linux', '4', 'Nahant')),
+            ('CentOS release 4', ('CentOS', '4', None)),
+            ('Rocks release 4.2.1 (Cydonia)', ('Rocks', '4.2.1', 'Cydonia')),
+            ('', ('', '', '')), # If there's nothing there.
+            ):
+            self.assertEqual(platform._parse_release_file(input), output)
+
+    def test_popen(self):
+        mswindows = (sys.platform == "win32")
+
+        if mswindows:
+            command = '"{}" -c "print(\'Hello\')"'.format(sys.executable)
+        else:
+            command = "'{}' -c 'print(\"Hello\")'".format(sys.executable)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            with platform.popen(command) as stdout:
+                hello = stdout.read().strip()
+                stdout.close()
+                self.assertEqual(hello, "Hello")
+
+        data = 'plop'
+        if mswindows:
+            command = '"{}" -c "import sys; data=sys.stdin.read(); exit(len(data))"'
+        else:
+            command = "'{}' -c 'import sys; data=sys.stdin.read(); exit(len(data))'"
+        command = command.format(sys.executable)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            with platform.popen(command, 'w') as stdin:
+                stdout = stdin.write(data)
+                ret = stdin.close()
+                self.assertIsNotNone(ret)
+                if os.name == 'nt':
+                    returncode = ret
+                else:
+                    returncode = ret >> 8
+                self.assertEqual(returncode, len(data))
+
+    def test_linux_distribution_encoding(self):
+        # Issue #17429
+        with tempfile.TemporaryDirectory() as tempdir:
+            filename = os.path.join(tempdir, 'fedora-release')
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write('Fedora release 19 (Schr\xf6dinger\u2019s Cat)\n')
+
+            with mock.patch('platform._UNIXCONFDIR', tempdir):
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        'ignore',
+                        r'dist\(\) and linux_distribution\(\) '
+                        'functions are deprecated .*',
+                        DeprecationWarning,
+                    )
+                    distname, version, distid = platform.linux_distribution()
+
+                self.assertEqual(distname, 'Fedora')
+            self.assertEqual(version, '19')
+            self.assertEqual(distid, 'Schr\xf6dinger\u2019s Cat')
+
+
+class DeprecationTest(unittest.TestCase):
+
+    def test_dist_deprecation(self):
+        with self.assertWarns(DeprecationWarning) as cm:
+            platform.dist()
+        self.assertEqual(str(cm.warning),
+                         'dist() and linux_distribution() functions are '
+                         'deprecated in Python 3.5')
+
+    def test_linux_distribution_deprecation(self):
+        with self.assertWarns(DeprecationWarning) as cm:
+            platform.linux_distribution()
+        self.assertEqual(str(cm.warning),
+                         'dist() and linux_distribution() functions are '
+                         'deprecated in Python 3.5')
+
+if __name__ == '__main__':
+    unittest.main()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                vdâšomá`ïŠ_•nRxJñ º'Hw5€MÓıq>Íˆ8;³^ÿ™’TP§}aèçr‹ìúpëtóö‘Ğ!·…Ü‹XõVÖîÎÕY7 Å4÷¯¶#İ¦E[—ïîÑWsqú#U:´0Rş5$k¹a5·VE”'cœÃŒÒ•ÊÁ•ßø¿¢T5î
+bÿ“cŒ2şä¶?G/K_(àÛqÙÅµÔIÎf	Ã§ZfSNRYXôE¥À-äÿ_oŒjÆÍÔŸ•XË÷®okÂŸ ø©•4`mP9†ÃzË¿üˆOeåÃ¢…¼=®Vì™v&„ÓÄb}™Èr™k¦÷ß]fÇ¶ŞÂ½j/Ÿv†	wF1ü½XFM_”÷š€ÿÈÁà†€@=8åØ¸3é¡vUYr×8é…¿jT“nÔyı(íQÃ;ƒÊY^Vxçx}8²G¸hïŒëœµæºK¶¼)¡Oè”i2­àTP¿Ô'gX$*ÅòÌ·\V AŒÿÌ‚æâ&[7–¸kœ)=èê„˜oHq-ÉFN5öí-ˆ"˜C˜Ÿ2 34¬xœYÕÚFàl¥»¾A)ô!DiC\ñ¸åUvgİ´7U%H=	âè/:#
+«¨¸«èc1;9¥s0™®ü¦>¯W9VáÍŸ"¶Û¼}âW»o`š¡ù!¢îÊµÏ½Á–è\éF)zâuÔ
+vbeÎmõ«Ì\cï*QäN\­Ç¾~:Öb}“wÕûIsşL#A0T¨OğÔŸdÚ"¡²fO€0É¨iğ[\¶Àsµhz/7ŠŞÊs{ä<£L~IC	¢&àÙvŸ…³‚d{ÄÄ´šĞ7t|¤êx?'>6{Q!ÌUU	í¨R¹Iƒå30û·DİPO+Ÿ]‡.ƒ‚Ğëåíí847ò~˜—í¼W*©ˆRADÍyE“" û™M2VõÍî%,ÇQ5–!–Jx¥´ÓcMÕp¦ú0yœcezïq>ÀH_³û‘1¢Øö1ù1ÏŠUŠynn‰ø5ÿFê8Kü"ìíqªÌ¦jì+9äğÅ”«•tµë2j…¼(‰÷Ag/aµãm¯ ‰…#Ÿ	À; ×ÛÎj»&]Óo¤àŸĞ°Ä4OC5ÅLÏj)•ñ˜…øwò71o@ Ñç‘ëÑ§¨ÎM«.BN/h²hì?^€áH¾„ÒÌ37Ëşß»oü˜Êj¯hîü7ÔÊÔµ÷Ynt¾õW¹ækı¯4¥"]>ÂøŠdl²ªTŸs}]ÑLÒ;ºú®¤îÇäˆõjŠüŸ€(šÓÔGét8=HİŠ”»ø:¿ùÄ‰ÕÌB8FÿG¼£GKNşP¸Òm>åÒ,ûHçíD,fV_Ì²C­q§oÁohGòæß÷(jÂP‘°_ğ¶÷¶?HøÛŒÃµ©Vİ|o1Ö¡;É{qãUc”RO.7G!´/áô<¾ÒÀåûˆaì‰µqØ d’XßæÎˆ(„É ‚Pœ~vB3û)Zòùİ7<\­ìyeWÃ¢)B1Cf‚Şuo¨Ãºb
+Üï-¼dñËŞGïÙÉùŞiÈÅ×VÈ("„@%3QÌ~õ1k’†ëÎÜğ¿^¶¥Ú³¥¡]4ş¼@,(Àó#z:¹åjèn±0Îà;q,–—X´ÒÕqìİªEëâˆ§tü_ïœ Gå¨ª/ñ…şÿ¨gsûúRëŸ|Š¤µ^y«Ï—†íõ@0¡Å0ÆQl‡ïxUqZ–æQ"êuiZØ…½äUO;¯C°¾&§2{„ ù7Éw¹”·´£¹ş;H¼¦W¢ÍL”zÑYİÊb¦+Ã¶4àğ¶Dsœ¡„@b…/‡êMùH3¿Â$Ï]†z[–¸\h®âèú,'Z¢´ÛC6BéşùL™ËoZ™Ÿ¿XûW=ƒı#Ş9'aûâ¶2¸3••ŠœuV|xİ°L+&‡Áª7–aç˜Ë½c‹D2âJ¤* \‡®İöÿ¢eˆ¥Hb±ŒDÀÙ`Üïá¤ã½ïá±¿e]y4k	Ş1•ª>¸|¼é)w”(fY£.ˆûÕû:¾Ìú¾<m§bÏ½1+n¨•Ò±èÒ•jL¬ê¨ÜçJYÏü°še±7wï>ü¾P½L%şÿñÆ¾öv’È³è]#*æŞ‘sŠšRî<[ëHã%ğKWíğZìGdÍvÛ²cŠõjr@ÆkIğKˆÅÁ¼Yß“şDÍ„[xº`dj«W!†âŸs¤É=×u#=Ğ¿¨ÚÎƒVŞ•¾=Ä”¡É–üÎ‰WZ3Áã*r•!§ e÷å„1p „ìcñHpA)sı?º´}ÏÏx¥Äm»ƒ|¦úŞ°„# 'å$)‰(‘.~·y`Ã&p«øm zäã½äiX¨ÒtæŞğ¡CÙáoÌä:w’ıè¢AKVjÁÑ;EP·4Ëq;-Œ¤6Ùµ´F^ÉVÁDlår
+±÷B«*4¡ØcÅXåI0”ÆrBbóÊ¼Ké‹ºd•l¾(eç›—È^`á–p¼ —ë³$©#Ç³İ)>İìÊy&-Øt|2¯kº„şö3ÉâKâ@ß ßé1¤í¦Ó2S6É                     ‰      ;               2020.2.1f1 şÿÿÿ      ÿÿfš†!ë5˜9İ4QÁóB   í          7  €ÿÿÿÿ     €            ¦ €² €                      E €                   Ş  €#          €           . €,          €           5   a €                   Ş  €#          €           . €,          €           † €r €                   Ş  €#      	    €           . €,      
+    €           H €« €ÿÿÿÿ   €          1  €1  €ÿÿÿÿ   @           Ş  € €                  Q  €j  €                  ñ  €J   ÿÿÿÿ    À           1  €1  €ÿÿÿÿ    €            Ş  € €                     €j  €ÿÿÿÿ    €            \   ›  €ÿÿÿÿ    €            H €r   ÿÿÿÿ    €           1  €1  €ÿÿÿÿ   @            Ş  € €                   Q  €j  €                   H €w   ÿÿÿÿ    €           1  €1  €ÿÿÿÿ   @            Ş  € €                   Q  €j  €                   H €€   ÿÿÿÿ    €           1  €1  €ÿÿÿÿ   @            Ş  € €                   Q  €j  €                   y €
+ €                     Ş  €#      !    €           . €,      "    €            €…   ÿÿÿÿ#   @          1  €1  €ÿÿÿÿ$               Ş  € €   %               . €j  €   &               Õ €“   ÿÿÿÿ'    €           1  €1  €ÿÿÿÿ(    À            Ş  € €   )                  €j  €ÿÿÿÿ*    €            H €›  €ÿÿÿÿ+    €           1  €1  €ÿÿÿÿ,   @            Ş  € €   -                Q  €j  €   .                y €
+ €   /                 Ş  €#      0    €           . €,      1    €             €§      2    @            ¾ €¶      3    @            Ş  €#      4    €           . €,      5    €           H €»   ÿÿÿÿ6   €           1  €1  €ÿÿÿÿ7   @            Ş  € €   8                Q  €j  €   9                H €Æ   ÿÿÿÿ:   €           1  €1  €ÿÿÿÿ;   @            Ş  € €   <                Q  €j  €   =                H €Ø   ÿÿÿÿ>   €           1  €1  €ÿÿÿÿ?   @            Ş  € €   @                Q  €j  €   A              MonoImporter PPtr<EditorExtension> m_FileID m_PathID PPtr<PrefabInstance> m_ExternalObjects SourceAssetIdentifier type assembly name m_UsedFileIDs m_DefaultReferences executionOrder icon m_UserData m_AssetBundleName m_AssetBundleVariant     s    ÿÿ£Gñ×ÜZ56 :!@iÁJ*          €7  €ÿÿÿÿ     €            ¦ €² €                       E €                   Ş  €          €           . €          €           (   a €                   Ş  €          €           . €          €           † €r €                   Ş  €      	    €           . €      
+    €           H €« €ÿÿÿÿ   €          1  €1  €ÿÿÿÿ   @           Ş  € €                  Q  €j  €                  H €ê €ÿÿÿÿ   €           1  €1  €ÿÿÿÿ   @            Ş  € €                   Q  €j  €                   ñ  €=   ÿÿÿÿ   €           1  €1  €ÿÿÿÿ   €            Ş  € €                    €j  €ÿÿÿÿ   €            H €›  €ÿÿÿÿ   €           1  €1  €ÿÿÿÿ   @            Ş  € €                   Q  €j  €                   y €
+ €                   Ş  €          €           . €          €           y €Q                       Ş  €          €           . €           €           Ş  €X      !                H €i   ÿÿÿÿ"   €           1  €1  €ÿÿÿÿ#   @            Ş  € €   $                Q  €j  €   %                H €u   ÿÿÿÿ&   €           1  €1  €ÿÿÿÿ'   @            Ş  € €   (                Q  €j  €   )              PPtr<EditorExtension> m_FileID m_PathID PPtr<PrefabInstance> m_DefaultReferences m_Icon m_ExecutionOrder m_ClassName m_Namespace                       \       ày¯     `       0+                                                                                                                                            ày¯                                                                                    SpriteSecondaryTexturesModule   ƒ*  using System;
+using System.Collections.Generic;
+using System.Linq;
+using UnityEditor.U2D.Sprites;
+using UnityEditorInternal;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace UnityEditor._2D.Sprite.Editor
+{
+    [RequireSpriteDataProvider(typeof(ISecondaryTextureDataProvider), typeof(ITextureDataProvider))]
+    internal class SpriteSecondaryTexturesModule : SpriteEditorModuleBase
+    {
+        private static class Styles
+        {
+            public static readonly string invalidEntriesWarning = L10n.Tr("Invalid secondary Texture entries (without names or Textures) have been removed.");
+            public static readonly string nameUniquenessWarning = L10n.Tr("Every secondary Texture attached to the Sprite must have a unique name.");
+            public static readonly string builtInNameCollisionWarning = L10n.Tr("The names _MainTex and _AlphaTex are reserved for internal use.");
+            public static readonly GUIContent panelTitle = EditorGUIUtility.TrTextContent("Secondary Textures");
+            public static readonly GUIContent name = EditorGUIUtility.TrTextContent("Name");
+            public static readonly GUIContent texture = EditorGUIUtility.TrTextContent("Texture");
+            public const float textFieldDropDownWidth = 18.0f;
+        }
+
+
+        ReorderableList m_ReorderableList;
+        Vector2 m_ReorderableListScrollPosition;
+        string[] m_SuggestedNames;
+        private IMGUIContainer m_SecondaryTextureInspectorContainer;
+        internal List<SecondarySpriteTexture> secondaryTextureList { get; private set; }
+
+        public override string moduleName
+        {
+            get { return Styles.panelTitle.text; }
+        }
+
+        public override bool ApplyRevert(bool apply)
+        {
+            if (apply)
+            {
+                var secondaryTextureDataProvider = spriteEditor.GetDataProvider<ISecondaryTextureDataProvider>();
+
+
+                // Remove invalid entries.
+                var validEntries = secondaryTextureList.FindAll(x => (x.name != null && x.name != "" && x.texture != null));
+                if (validEntries.Count < secondaryTextureList.Count)
+                    Debug.Log(Styles.invalidEntriesWarning);
+
+                secondaryTextureDataProvider.textures = validEntries.ToArray();
+            }
+
+            return true;
+        }
+
+        public override bool CanBeActivated()
+        {
+            var dataProvider = spriteEditor.GetDataProvider<ISpriteEditorDataProvider>();
+            return dataProvider != null && dataProvider.spriteImportMode != SpriteImportMode.None;
+        }
+
+        public override void DoPostGUI()
+        {
+        }
+
+        public void SecondaryTextureReorderableListUI()
+        {
+            using (new EditorGUI.DisabledScope(spriteEditor.editingDisabled))
+            {
+                var windowDimension = spriteEditor.windowDimension;
+
+                GUILayout.BeginArea(new Rect(0, 0, 290, 290), Styles.panelTitle, GUI.skin.window);
+                m_ReorderableListScrollPosition = GUILayout.BeginScrollView(m_ReorderableListScrollPosition);
+                m_ReorderableList.DoLayoutList();
+                GUILayout.EndScrollView();
+                GUILayout.EndArea();
+
+                // Deselect the list item if left click outside the panel area.
+                UnityEngine.Event e = UnityEngine.Event.current;
+                if (e.type == EventType.MouseDown && e.button == 0)
+                {
+                    m_ReorderableList.index = -1;
+                    OnSelectCallback(m_ReorderableList);
+                    spriteEditor.RequestRepaint();
+                }
+            }
+        }
+
+        public override void DoMainGUI()
+        {
+        }
+
+        public override void DoToolbarGUI(Rect drawArea)
+        {
+        }
+
+        public override void OnModuleActivate()
+        {
+            var secondaryTextureDataProvider = spriteEditor.GetDataProvider<ISecondaryTextureDataProvider>();
+            secondaryTextureList = secondaryTextureDataProvider.textures == null ? new List<SecondarySpriteTexture>() : secondaryTextureDataProvider.textures.ToList();
+
+            m_ReorderableListScrollPosition = Vector2.zero;
+            m_ReorderableList = new ReorderableList(secondaryTextureList, typeof(SecondarySpriteTexture), false, false, true, true);
+            m_ReorderableList.drawElementCallback = DrawSpriteSecondaryTextureElement;
+            m_ReorderableList.onAddCallback = AddSpriteSecondaryTextureElement;
+            m_ReorderableList.onRemoveCallback = RemoveSpriteSecondaryTextureElement;
+            m_ReorderableList.onCanAddCallback = CanAddSpriteSecondaryTextureElement;
+            m_ReorderableList.elementHeightCallback = (int index) => (EditorGUIUtility.singleLineHeight * 3) + 5;
+            m_ReorderableList.onSelectCallback = OnSelectCallback;
+
+            spriteEditor.selectedSpriteRect = null;
+
+            string suggestedNamesPrefs = EditorPrefs.GetString("SecondarySpriteTexturePropertyNames");
+            if (!string.IsNullOrEmpty(suggestedNamesPrefs))
+            {
+                m_SuggestedNames = suggestedNamesPrefs.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+
+                for (int i = 0; i < m_SuggestedNames.Length; ++i)
+                    m_SuggestedNames[i] = m_SuggestedNames[i].Trim();
+
+                Array.Sort(m_SuggestedNames);
+            }
+            else
+                m_SuggestedNames = null;
+
+            m_SecondaryTextureInspectorContainer = new IMGUIContainer(SecondaryTextureReorderableListUI)
+            {
+                style =
+                {
+                    flexGrow = 0,
+                    flexBasis = 1,
+                    flexShrink = 0,
+                    minWidth = 290,
+                    minHeight = 290,
+                    bottom = 24,
+                    right = 24,
+                    position = new StyleEnum<Position>(Position.Absolute)
+                },
+                name = "SecondaryTextureInspector"
+            };
+            spriteEditor.GetMainVisualContainer().Add(m_SecondaryTextureInspectorContainer);
+        }
+
+        void OnSelectCallback(ReorderableList list)
+        {
+            // Preview the current selected secondary texture.
+            Texture2D previewTexture = null;
+            int width = 0, height = 0;
+
+            var textureDataProvider = spriteEditor.GetDataProvider<ITextureDataProvider>();
+            if (textureDataProvider != null)
+            {
+                previewTexture = textureDataProvider.previewTexture;
+                textureDataProvider.GetTextureActualWidthAndHeight(out width, out height);
+            }
+
+            if (m_ReorderableList.index >= 0 && m_ReorderableList.index < secondaryTextureList.Count)
+                previewTexture = secondaryTextureList[m_ReorderableList.index].texture;
+
+            if (previewTexture != null)
+                spriteEditor.SetPreviewTexture(previewTexture, width, height);
+        }
+
+        public override void OnModuleDeactivate()
+        {
+            DisplayMainTexture();
+            if (spriteEditor.GetMainVisualContainer().Contains(m_SecondaryTextureInspectorContainer))
+                spriteEditor.GetMainVisualContainer().Remove(m_SecondaryTextureInspectorContainer);
+        }
+
+        void DrawSpriteSecondaryTextureElement(Rect rect, int index, bool isActive, bool isFocused)
+        {
+            bool dataModified = false;
+            float oldLabelWidth = EditorGUIUtility.labelWidth;
+            EditorGUIUtility.labelWidth = 70.0f;
+            SecondarySpriteTexture secondaryTexture = secondaryTextureList[index];
+
+            // "Name" text field
+            EditorGUI.BeginChangeCheck();
+            var r = new Rect(rect.x, rect.y + 5, rect.width - Styles.textFieldDropDownWidth, EditorGUIUtility.singleLineHeight);
+            string newName = EditorGUI.TextField(r, Styles.name, secondaryTexture.name);
+            dataModified = EditorGUI.EndChangeCheck();
+
+            // Suggested names
+            if (m_SuggestedNames != null)
+            {
+                var popupRect = new Rect(r.x + r.width, r.y, Styles.textFieldDropDownWidth, EditorGUIUtility.singleLineHeight);
+                EditorGUI.BeginChangeCheck();
+                int selected = EditorGUI.Popup(popupRect, -1, m_SuggestedNames, EditorStyles.textFieldDropDown);
+                if (EditorGUI.EndChangeCheck())
+                {
+                    newName = m_SuggestedNames[selected];
+                    dataModified = true;
+                }
+            }
+
+            if (dataModified)
+            {
+                if (!string.IsNullOrEmpty(newName) && newName != secondaryTexture.name && secondaryTextureList.Exists(x => x.name == newName))
+                    Debug.LogWarning(Styles.nameUniquenessWarning);
+                else if (newName == "_MainTex" || newName == "_AlphaTex")
+                    Debug.LogWarning(Styles.builtInNameCollisionWarning);
+                else
+                    secondaryTexture.name = newName;
+            }
+
+            // "Texture" object field
+            EditorGUI.BeginChangeCheck();
+            r.width = rect.width;
+            r.y += EditorGUIUtility.singleLineHeight;
+            secondaryTexture.texture = EditorGUI.ObjectField(r, Styles.texture, secondaryTexture.texture, typeof(Texture2D), false) as Texture2D;
+            dataModified = dataModified || EditorGUI.EndChangeCheck();
+
+            if (dataModified)
+            {
+                secondaryTextureList[index] = secondaryTexture;
+                spriteEditor.SetDataModified();
+            }
+
+            EditorGUIUtility.labelWidth = oldLabelWidth;
+        }
+
+        void AddSpriteSecondaryTextureElement(ReorderableList list)
+        {
+            m_ReorderableListScrollPosition += new Vector2(0.0f, list.elementHeightCallback(0));
+            secondaryTextureList.Add(new SecondarySpriteTexture());
+            spriteEditor.SetDataModified();
+        }
+
+        void RemoveSpriteSecondaryTextureElement(ReorderableList list)
+        {
+            DisplayMainTexture();
+            secondaryTextureList.RemoveAt(list.index);
+            spriteEditor.SetDataModified();
+        }
+
+        bool CanAddSpriteSecondaryTextureElement(ReorderableList list)
+        {
+            return list.count < 8;
+        }
+
+        void DisplayMainTexture()
+        {
+            ITextureDataProvider textureDataProvider = spriteEditor.GetDataProvider<ITextureDataProvider>();
+            if (textureDataProvider != null && textureDataProvider.previewTexture != null)
+            {
+                Texture2D mainTexture = textureDataProvider.previewTexture;
+                int width = 0, height = 0;
+                textureDataProvider.GetTextureActualWidthAndHeight(out width, out height);
+                spriteEditor.SetPreviewTexture(mainTexture, width, height);
+            }
+        }
+    }
+}
+                        SpriteSecondaryTexturesModule      UnityEditor._2D.Sprite.Editor                                                                                                                   nce JoinForTesting() has returned.
+  AtomicFlag join_for_testing_returned_;
+#endif
+
+  DISALLOW_COPY_AND_ASSIGN(PlatformNativeWorkerPoolWin);
+};
+
+}  // namespace internal
+}  // namespace base
+
+#endif  // BASE_TASK_TASK_SCHEDULER_PLATFORM_NATIVE_WORKER_POOL_WIN_H_
+                                                                                                                                                                                                                                              n³ÔBÿ'eÉ™Û2™‰T%‘—úçšæğ¾ã¼[1ê÷;Şòéß<¹9¾g´ï&¯ãö/ôŞÏaÿãWÿš%ë\Õ³mè	LÒkj[ağ:f n¹CiO£¢hµèÜõÍ„E9™«gò.¾Ş^4²§¢•Ş
+Á%¸9¸ÇmÜ~Ú(ö»}Ÿ’fûZ¶7N”{ÏÙN:/6ÿàú<=Æj£ı±âÊÊËû7* .€Õ 
+\ ^­èŒ<óÈ%ãUìpÈ[_€dšâ6"Uènş¹+oíŞ'ä;ëÑÙ‘Ï3ûñ³°?ø4¿5Ûûôöo¦—¶Û;Ùw|GQÑLöù×2RI ‰¸Á š ^·,ïÙsŸ…šao¿¶Æò433"‡Œ2¾ä<ºøÕ}oçNnûÙÑ[W^»èÉø\ë|'ÒPäq»ÒSÿ„+§ú+ëÌôÅÙÏãéö™hÆ5ïÑ]‰ÍşîVë¾jı}oÛíÛâÆ]ãz¢¥ïÉæ²ìÑ°|ÑX‡m|ßÿó]­Ù]ßƒ6GY#s™³¸ÍNø¡ÿ.P4¤ f½ñ<I-z‰¶S^ÿ•+ğÈ#»v!ËşÛï¢ó=H>€>.Ÿ‡2¹Yx¼ä&W*O\Éçî×ş×¦Óæí…n{from test.support import run_unittest, unload, check_warnings, CleanImport
+import unittest
+import sys
+import importlib
+from importlib.util import spec_from_file_location
+import pkgutil
+import os
+import os.path
+import tempfile
+import shutil
+import zipfile
+
+# Note: pkgutil.walk_packages is currently tested in test_runpy. This is
+# a hack to get a major issue resolved for 3.3b2. Longer term, it should
+# be moved back here, perhaps by factoring out the helper code for
+# creating interesting package layouts to a separate module.
+# Issue #15348 declares this is indeed a dodgy hack ;)
+
+class PkgutilTests(unittest.TestCase):
+
+    def setUp(self):
+        self.dirname = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dirname)
+        sys.path.insert(0, self.dirname)
+
+    def tearDown(self):
+        del sys.path[0]
+
+    def test_getdata_filesys(self):
+        pkg = 'test_getdata_filesys'
+
+        # Include a LF and a CRLF, to test that binary data is read back
+        RESOURCE_DATA = b'Hello, world!\nSecond line\r\nThird line'
+
+        # Make a package with some resources
+        package_dir = os.path.join(self.dirname, pkg)
+        os.mkdir(package_dir)
+        # Empty init.py
+        f = open(os.path.join(package_dir, '__init__.py'), "wb")
+        f.close()
+        # Resource files, res.txt, sub/res.txt
+        f = open(os.path.join(package_dir, 'res.txt'), "wb")
+        f.write(RESOURCE_DATA)
+        f.close()
+        os.mkdir(os.path.join(package_dir, 'sub'))
+        f = open(os.path.join(package_dir, 'sub', 'res.txt'), "wb")
+        f.write(RESOURCE_DATA)
+        f.close()
+
+        # Check we can read the resources
+        res1 = pkgutil.get_data(pkg, 'res.txt')
+        self.assertEqual(res1, RESOURCE_DATA)
+        res2 = pkgutil.get_data(pkg, 'sub/res.txt')
+        self.assertEqual(res2, RESOURCE_DATA)
+
+        del sys.modules[pkg]
+
+    def test_getdata_zipfile(self):
+        zip = 'test_getdata_zipfile.zip'
+        pkg = 'test_getdata_zipfile'
+
+        # Include a LF and a CRLF, to test that binary data is read back
+        RESOURCE_DATA = b'Hello, world!\nSecond line\r\nThird line'
+
+        # Make a package with some resources
+        zip_file = os.path.join(self.dirname, zip)
+        z = zipfile.ZipFile(zip_file, 'w')
+
+        # Empty init.py
+        z.writestr(pkg + '/__init__.py', "")
+        # Resource files, res.txt, sub/res.txt
+        z.writestr(pkg + '/res.txt', RESOURCE_DATA)
+        z.writestr(pkg + '/sub/res.txt', RESOURCE_DATA)
+        z.close()
+
+        # Check we can read the resources
+        sys.path.insert(0, zip_file)
+        res1 = pkgutil.get_data(pkg, 'res.txt')
+        self.assertEqual(res1, RESOURCE_DATA)
+        res2 = pkgutil.get_data(pkg, 'sub/res.txt')
+        self.assertEqual(res2, RESOURCE_DATA)
+
+        names = []
+        for moduleinfo in pkgutil.iter_modules([zip_file]):
+            self.assertIsInstance(moduleinfo, pkgutil.ModuleInfo)
+            names.append(moduleinfo.name)
+        self.assertEqual(names, ['test_getdata_zipfile'])
+
+        del sys.path[0]
+
+        del sys.modules[pkg]
+
+    def test_unreadable_dir_on_syspath(self):
+        # issue7367 - walk_packages failed if unreadable dir on sys.path
+        package_name = "unreadable_package"
+        d = os.path.join(self.dirname, package_name)
+        # this does not appear to create an unreadable dir on Windows
+        #   but the test should not fail anyway
+        os.mkdir(d, 0)
+        self.addCleanup(os.rmdir, d)
+        for t in pkgutil.walk_packages(path=[self.dirname]):
+            self.fail("unexpected package found")
+
+    def test_walkpackages_filesys(self):
+        pkg1 = 'test_walkpackages_filesys'
+        pkg1_dir = os.path.join(self.dirname, pkg1)
+        os.mkdir(pkg1_dir)
+        f = open(os.path.join(pkg1_dir, '__init__.py'), "wb")
+        f.close()
+        os.mkdir(os.path.join(pkg1_dir, 'sub'))
+        f = open(os.path.join(pkg1_dir, 'sub', '__init__.py'), "wb")
+        f.close()
+        f = open(os.path.join(pkg1_dir, 'sub', 'mod.py'), "wb")
+        f.close()
+
+        # Now, to juice it up, let's add the opposite packages, too.
+        pkg2 = 'sub'
+        pkg2_dir = os.path.join(self.dirname, pkg2)
+        os.mkdir(pkg2_dir)
+        f = open(os.path.join(pkg2_dir, '__init__.py'), "wb")
+        f.close()
+        os.mkdir(os.path.join(pkg2_dir, 'test_walkpackages_filesys'))
+        f = open(os.path.join(pkg2_dir, 'test_walkpackages_filesys', '__init__.py'), "wb")
+        f.close()
+        f = open(os.path.join(pkg2_dir, 'test_walkpackages_filesys', 'mod.py'), "wb")
+        f.close()
+
+        expected = [
+            'sub',
+            'sub.test_walkpackages_filesys',
+            'sub.test_walkpackages_filesys.mod',
+            'test_walkpackages_filesys',
+            'test_walkpackages_filesys.sub',
+            'test_walkpackages_filesys.sub.mod',
+        ]
+        actual= [e[1] for e in pkgutil.walk_packages([self.dirname])]
+        self.assertEqual(actual, expected)
+
+        for pkg in expected:
+            if pkg.endswith('mod'):
+                continue
+            del sys.modules[pkg]
+
+    def test_walkpackages_zipfile(self):
+        """Tests the same as test_walkpackages_filesys, only with a zip file."""
+
+        zip = 'test_walkpackages_zipfile.zip'
+        pkg1 = 'test_walkpackages_zipfile'
+        pkg2 = 'sub'
+
+        zip_file = os.path.join(self.dirname, zip)
+        z = zipfile.ZipFile(zip_file, 'w')
+        z.writestr(pkg2 + '/__init__.py', "")
+        z.writestr(pkg2 + '/' + pkg1 + '/__init__.py', "")
+        z.writestr(pkg2 + '/' + pkg1 + '/mod.py', "")
+        z.writestr(pkg1 + '/__init__.py', "")
+        z.writestr(pkg1 + '/' + pkg2 + '/__init__.py', "")
+        z.writestr(pkg1 + '/' + pkg2 + '/mod.py', "")
+        z.close()
+
+        sys.path.insert(0, zip_file)
+        expected = [
+            'sub',
+            'sub.test_walkpackages_zipfile',
+            'sub.test_walkpackages_zipfile.mod',
+            'test_walkpackages_zipfile',
+            'test_walkpackages_zipfile.sub',
+            'test_walkpackages_zipfile.sub.mod',
+        ]
+        actual= [e[1] for e in pkgutil.walk_packages([zip_file])]
+        self.assertEqual(actual, expected)
+        del sys.path[0]
+
+        for pkg in expected:
+            if pkg.endswith('mod'):
+                continue
+            del sys.modules[pkg]
+
+    def test_walk_packages_raises_on_string_or_bytes_input(self):
+
+        str_input = 'test_dir'
+        with self.assertRaises((TypeError, ValueError)):
+            list(pkgutil.walk_packages(str_input))
+
+        bytes_input = b'test_dir'
+        with self.assertRaises((TypeError, ValueError)):
+            list(pkgutil.walk_packages(bytes_input))
+
+
+class PkgutilPEP302Tests(unittest.TestCase):
+
+    class MyTestLoader(object):
+        def create_module(self, spec):
+            return None
+
+        def exec_module(self, mod):
+            # Count how many times the module is reloaded
+            mod.__dict__['loads'] = mod.__dict__.get('loads', 0) + 1
+
+        def get_data(self, path):
+            return "Hello, world!"
+
+    class MyTestImporter(object):
+        def find_spec(self, fullname, path=None, target=None):
+            loader = PkgutilPEP302Tests.MyTestLoader()
+            return spec_from_file_location(fullname,
+                                           '<%s>' % loader.__class__.__name__,
+                                           loader=loader,
+                                           submodule_search_locations=[])
+
+    def setUp(self):
+        sys.meta_path.insert(0, self.MyTestImporter())
+
+    def tearDown(self):
+        del sys.meta_path[0]
+
+    def test_getdata_pep302(self):
+        # Use a dummy finder/loader
+        self.assertEqual(pkgutil.get_data('foo', 'dummy'), "Hello, world!")
+        del sys.modules['foo']
+
+    def test_alreadyloaded(self):
+        # Ensure that get_data works without reloading - the "loads" module
+        # variable in the example loader should count how many times a reload
+        # occurs.
+        import foo
+        self.assertEqual(foo.loads, 1)
+        self.assertEqual(pkgutil.get_data('foo', 'dummy'), "Hello, world!")
+        self.assertEqual(foo.loads, 1)
+        del sys.modules['foo']
+
+
+# These tests, especially the setup and cleanup, are hideous. They
+# need to be cleaned up once issue 14715 is addressed.
+class ExtendPathTests(unittest.TestCase):
+    def create_init(self, pkgname):
+        dirname = tempfile.mkdtemp()
+        sys.path.insert(0, dirname)
+
+        pkgdir = os.path.join(dirname, pkgname)
+        os.mkdir(pkgdir)
+        with open(os.path.join(pkgdir, '__init__.py'), 'w') as fl:
+            fl.write('from pkgutil import extend_path\n__path__ = extend_path(__path__, __name__)\n')
+
+        return dirname
+
+    def create_submodule(self, dirname, pkgname, submodule_name, value):
+        module_name = os.path.join(dirname, pkgname, submodule_name + '.py')
+        with open(module_name, 'w') as fl:
+            print('value={}'.format(value), file=fl)
+
+    def test_simple(self):
+        pkgname = 'foo'
+        dirname_0 = self.create_init(pkgname)
+        dirname_1 = self.create_init(pkgname)
+        self.create_submodule(dirname_0, pkgname, 'bar', 0)
+        self.create_submodule(dirname_1, pkgname, 'baz', 1)
+        import foo.bar
+        import foo.baz
+        # Ensure we read the expected values
+        self.assertEqual(foo.bar.value, 0)
+        self.assertEqual(foo.baz.value, 1)
+
+        # Ensure the path is set up correctly
+        self.assertEqual(sorted(foo.__path__),
+                         sorted([os.path.join(dirname_0, pkgname),
+                                 os.path.join(dirname_1, pkgname)]))
+
+        # Cleanup
+        shutil.rmtree(dirname_0)
+        shutil.rmtree(dirname_1)
+        del sys.path[0]
+        del sys.path[0]
+        del sys.modules['foo']
+        del sys.modules['foo.bar']
+        del sys.modules['foo.baz']
+
+
+    # Another awful testing hack to be cleaned up once the test_runpy
+    # helpers are factored out to a common location
+    def test_iter_importers(self):
+        iter_importers = pkgutil.iter_importers
+        get_importer = pkgutil.get_importer
+
+        pkgname = 'spam'
+        modname = 'eggs'
+        dirname = self.create_init(pkgname)
+        pathitem = os.path.join(dirname, pkgname)
+        fullname = '{}.{}'.format(pkgname, modname)
+        sys.modules.pop(fullname, None)
+        sys.modules.pop(pkgname, None)
+        try:
+            self.create_submodule(dirname, pkgname, modname, 0)
+
+            importlib.import_module(fullname)
+
+            importers = list(iter_importers(fullname))
+            expected_importer = get_importer(pathitem)
+            for finder in importers:
+                spec = pkgutil._get_spec(finder, fullname)
+                loader = spec.loader
+                try:
+                    loader = loader.loader
+                except AttributeError:
+                    # For now we still allow raw loaders from
+                    # find_module().
+                    pass
+                self.assertIsInstance(finder, importlib.machinery.FileFinder)
+                self.assertEqual(finder, expected_importer)
+                self.assertIsInstance(loader,
+                                      importlib.machinery.SourceFileLoader)
+                self.assertIsNone(pkgutil._get_spec(finder, pkgname))
+
+            with self.assertRaises(ImportError):
+                list(iter_importers('invalid.module'))
+
+            with self.assertRaises(ImportError):
+                list(iter_importers('.spam'))
+        finally:
+            shutil.rmtree(dirname)
+            del sys.path[0]
+            try:
+                del sys.modules['spam']
+                del sys.modules['spam.eggs']
+            except KeyError:
+                pass
+
+
+    def test_mixed_namespace(self):
+        pkgname = 'foo'
+        dirname_0 = self.create_init(pkgname)
+        dirname_1 = self.create_init(pkgname)
+        self.create_submodule(dirname_0, pkgname, 'bar', 0)
+        # Turn this into a PEP 420 namespace package
+        os.unlink(os.path.join(dirname_0, pkgname, '__init__.py'))
+        self.create_submodule(dirname_1, pkgname, 'baz', 1)
+        import foo.bar
+        import foo.baz
+        # Ensure we read the expected values
+        self.assertEqual(foo.bar.value, 0)
+        self.assertEqual(foo.baz.value, 1)
+
+        # Ensure the path is set up correctly
+        self.assertEqual(sorted(foo.__path__),
+                         sorted([os.path.join(dirname_0, pkgname),
+                                 os.path.join(dirname_1, pkgname)]))
+
+        # Cleanup
+        shutil.rmtree(dirname_0)
+        shutil.rmtree(dirname_1)
+        del sys.path[0]
+        del sys.path[0]
+        del sys.modules['foo']
+        del sys.modules['foo.bar']
+        del sys.modules['foo.baz']
+
+    # XXX: test .pkg files
+
+
+class NestedNamespacePackageTest(unittest.TestCase):
+
+    def setUp(self):
+        self.basedir = tempfile.mkdtemp()
+        self.old_path = sys.path[:]
+
+    def tearDown(self):
+        sys.path[:] = self.old_path
+        shutil.rmtree(self.basedir)
+
+    def create_module(self, name, contents):
+        base, final = name.rsplit('.', 1)
+        base_path = os.path.join(self.basedir, base.replace('.', os.path.sep))
+        os.makedirs(base_path, exist_ok=True)
+        with open(os.path.join(base_path, final + ".py"), 'w') as f:
+            f.write(contents)
+
+    def test_nested(self):
+        pkgutil_boilerplate = (
+            'import pkgutil; '
+            '__path__ = pkgutil.extend_path(__path__, __name__)')
+        self.create_module('a.pkg.__init__', pkgutil_boilerplate)
+        self.create_module('b.pkg.__init__', pkgutil_boilerplate)
+        self.create_module('a.pkg.subpkg.__init__', pkgutil_boilerplate)
+        self.create_module('b.pkg.subpkg.__init__', pkgutil_boilerplate)
+        self.create_module('a.pkg.subpkg.c', 'c = 1')
+        self.create_module('b.pkg.subpkg.d', 'd = 2')
+        sys.path.insert(0, os.path.join(self.basedir, 'a'))
+        sys.path.insert(0, os.path.join(self.basedir, 'b'))
+        import pkg
+        self.addCleanup(unload, 'pkg')
+        self.assertEqual(len(pkg.__path__), 2)
+        import pkg.subpkg
+        self.addCleanup(unload, 'pkg.subpkg')
+        self.assertEqual(len(pkg.subpkg.__path__), 2)
+        from pkg.subpkg.c import c
+        from pkg.subpkg.d import d
+        self.assertEqual(c, 1)
+        self.assertEqual(d, 2)
+
+
+class ImportlibMigrationTests(unittest.TestCase):
+    # With full PEP 302 support in the standard import machinery, the
+    # PEP 302 emulation in this module is in the process of being
+    # deprecated in favour of importlib proper
+
+    def check_deprecated(self):
+        return check_warnings(
+            ("This emulation is deprecated, use 'importlib' instead",
+             DeprecationWarning))
+
+    def test_importer_deprecated(self):
+        with self.check_deprecated():
+            pkgutil.ImpImporter("")
+
+    def test_loader_deprecated(self):
+        with self.check_deprecated():
+            pkgutil.ImpLoader("", "", "", "")
+
+    def test_get_loader_avoids_emulation(self):
+        with check_warnings() as w:
+            self.assertIsNotNone(pkgutil.get_loader("sys"))
+            self.assertIsNotNone(pkgutil.get_loader("os"))
+            self.assertIsNotNone(pkgutil.get_loader("test.support"))
+            self.assertEqual(len(w.warnings), 0)
+
+    @unittest.skipIf(__name__ == '__main__', 'not compatible with __main__')
+    def test_get_loader_handles_missing_loader_attribute(self):
+        global __loader__
+        this_loader = __loader__
+        del __loader__
+        try:
+            with check_warnings() as w:
+                self.assertIsNotNone(pkgutil.get_loader(__name__))
+                self.assertEqual(len(w.warnings), 0)
+        finally:
+            __loader__ = this_loader
+
+    def test_get_loader_handles_missing_spec_attribute(self):
+        name = 'spam'
+        mod = type(sys)(name)
+        del mod.__spec__
+        with CleanImport(name):
+            sys.modules[name] = mod
+            loader = pkgutil.get_loader(name)
+        self.assertIsNone(loader)
+
+    def test_get_loader_handles_spec_attribute_none(self):
+        name = 'spam'
+        mod = type(sys)(name)
+        mod.__spec__ = None
+        with CleanImport(name):
+            sys.modules[name] = mod
+            loader = pkgutil.get_loader(name)
+        self.assertIsNone(loader)
+
+    def test_get_loader_None_in_sys_modules(self):
+        name = 'totally bogus'
+        sys.modules[name] = None
+        try:
+            loader = pkgutil.get_loader(name)
+        finally:
+            del sys.modules[name]
+        self.assertIsNone(loader)
+
+    def test_find_loader_missing_module(self):
+        name = 'totally bogus'
+        loader = pkgutil.find_loader(name)
+        self.assertIsNone(loader)
+
+    def test_find_loader_avoids_emulation(self):
+        with check_warnings() as w:
+            self.assertIsNotNone(pkgutil.find_loader("sys"))
+            self.assertIsNotNone(pkgutil.find_loader("os"))
+            self.assertIsNotNone(pkgutil.find_loader("test.support"))
+            self.assertEqual(len(w.warnings), 0)
+
+    def test_get_importer_avoids_emulation(self):
+        # We use an illegal path so *none* of the path hooks should fire
+        with check_warnings() as w:
+            self.assertIsNone(pkgutil.get_importer("*??"))
+            self.assertEqual(len(w.warnings), 0)
+
+    def test_iter_importers_avoids_emulation(self):
+        with check_warnings() as w:
+            for importer in pkgutil.iter_importers(): pass
+            self.assertEqual(len(w.warnings), 0)
+
+
+def test_main():
+    run_unittest(PkgutilTests, PkgutilPEP302Tests, ExtendPathTests,
+                 NestedNamespacePackageTest, ImportlibMigrationTests)
+    # this is necessary if test is run repeated (like when finding leaks)
+    import zipimport
+    import importlib
+    zipimport._zip_directory_cache.clear()
+    importlib.invalidate_caches()
+
+
+if __name__ == '__main__':
+    test_main()
+                                                                                                                                                                                                                                                                                                                                                                                                                         ”s¿Š!eˆ„!F´ŒËµÀ‡dÃˆ¢yŞ¤bS`ğyÒ;Y<í•:ìƒaÚ5KG%Ñœ¹u—Âşp¥`IÛœ-FÕKgÊßLzã*{BóAÉ¡ìêxQ3NÊ§Ä¥ïã®%s‡”\u¸hã„ö 4‡"H;rIbŸ?²&Ï•wF³À½dat„¦?~¬-úHA¬d««¯LÔ‹I"ÎéERØ”Ö€”ü‘æ08ş³"÷`s/†j)vĞ,üô>élIïÒ•s[“¬ç«ÜOÓ6¦"èîù1énGşmòÜB”WFv¹jZ<r¹äB.¬@”ƒ¤Á’ IØ-Ók£ò;¶˜|ëùNßÅg$í]Êxt¼PÉ%Œ‘„G9Ñ0Ì3«²R6@PQ›[j\—;?3MÂ&AV +©4!YåæxÔœï(lW¬E‘#sG‘„ÖÔEBjjæÃÜ> QNİyÃ^l‘ï@›¦èJÁÈ…ÒcSÜ‚gÖœîìÅË¤ì=;¯¹Øæ9”ısÌœ,ó<ÏJ°Kôc0xš7Û®¨£wùçdåÚ&×è&ÂŒ­è{ÕvóV›/I>ŸÂƒÀ€"+d¤!n*âgÙçkt®çx¹„bñ^àd=g¬¾µc­%İâ_ÏYLÄÿ­ gÔƒ¢R¿@‚>bw›±”õÑpb¥dC€¥Ã·ä{ùñÚ¸/Bb=zò*ïüa*	wï|•QdZ¢ tš_T’e|È=n¡Ó©ÉáQh×±İR•Šw´foıÓ‚C–ı ­†Îp{‚
+r=Ğ¾µâ™–‰kÉ2jĞlJ+uæºÄÖí[Ş»ì:ŞD–[œàæ:„oCfYõÒCú”eè˜Ô©ˆ< ¼ìoWÜ?Ï)z©=ä·o#Ò¨òºäxÆE¦[vÁŒ¯Ö 6´¼4ÌxgSŒİ•¸©Ö?qË,dj/ád­¼ŞÚğmêõ9ŒoüÚáD£m	b‹³…p‘1½W¯µÂ†*0ÒÑmëm¯àçjk~œŠîås¤O5ãò»WŠíº=Ä½PåjZ¸H®ò	î¸ ¾DM
+DuéØ™‘rI×ÂWªo?'Ã?½™ç[qÿª<›óÒ}OUº¦~ß¥èÖYËöNR•í•ÜßŒ	Ên ÏCû?’ÊÀ şÎ`ï5Kd¯ ÒâàÄòTdO@„œ‰“ù›nÄ×BHŠ8Ğ"„£€—uv|4¸Ç>/0ƒ&8=ÓyÄÇˆeQ–#‘qÃí6H/íŒ.ø;s–o©6¤uî’=_{Ù6éËWO¾¢o*•#æÜ.‡7´ƒÆÈqXñs]ÑßÑE¨ÀïË+ËŠº¹0äşÊÊ†áuØ!·æœÁÙÚ9ıáZ[¿è"ÂW|áùö[Çõ^¾¨¾i1ÃËÎÇ<hK§FA~r„ûöÿå Ùàê\ìIÆS•›jYB™à5DİM2,ÁY|uámŒs&Ô¥yƒf7qE×KüRß§¥´}ä]æA¬®¡$ÀÖŠˆ|©¶h+{•ìıç¹üz×+Gz|"çÚ\D¥swV[ü½TSz
+ÓİNMŞ~]OfzJ.6®Ÿiİ°¿Æ @j¸H cÈŒô½H®“	xi€6 B‹P=šßm®…ªêl“ …aû„gZ»/ó¸0úí{¬â`•3`ó(áb~ö¸î(=ğ„évO·HòNªµ…@Éˆ |‘:ÂÜIäøğ™Ì?ZÍéÅ;®ŠÍÊcM=„PŞvŸ+’E.U;:¡<N””³F¡Í2m`pø/(ì!„Î¼|ÉŠñÂeªi‹ÎåLÉo^­G£,¸˜o$(¿A7ÕÔ¢ÂE;®$&Cñ­~7ËÈ%†<öRƒª’4«Ü|%{»uRéÏB7¼G’-Vº!NŞ}èî7\ÄÎ`Vò)$$ ø¬¥5ñ  Ú'      ResB             Ö     	   Û  Û  ½      %  A  £   ?  ©   ª   «   ¬   ¹   R $   B G N   M R O   N I O   X F O   M Z N   N G N   P L N   R O N   A Z N   B T N   E R N   L B P   S S P   T O P   M O P   D O P   C O P   C L P   F K P   G I P   S H P   P H P   E G P   A F N   H N L   S L L   A L L   G E L   M D L   C Z K   M W K   I S K   H R K   N O K   Z M K   R O L   P E N   M Z M   A Z M   T M M   B A M   S Z L   Z W L   L V L   L T L   I T L   L S L   M N T   T M T   B D T   U Z S   T Z S   X T S   A R S   S O S   T J S   G H S   K G S   X P T   T R Y   X X X   U G X   K P W   Z M W   V U V   U Y U   X F U   X A U   K Z T   W S T   K E S   Y E R   X D R   I D R   S C R   Z A R   S A R   Q A R   G T Q   S Y P   B W P   C U P   K H R   M Y R   B Y R   M V R   S U R   M U R   I R R   N P R   O M R   P K R   L K R   T J R   M K D   F J D   B H D   S G D   A E D   Y D D   X B D   S B D   B B D   N A D   A M D   S R D   L R D   I Q D   X P D   J O D   T N D   B N D   J M D   G M D   B M D   M A D   X B A   C N ¥   J P ¥   N Z $   M X $   N T $   U S $   H K $   E C $   C A $   M G A   S V C   C U C   C R C   X B C   R U B   E T B   B O B   X B B   P A B   A O A   A N G   S D G   X A G   R W F   L U F   H U F   F R F   G N F   K M F   M L F   H T G   M M K   S K K   D K K   P G K   S E K   E E K   L A K   U A H   P Y G   A W G   B Z D   B S D   R S D   L Y D   S T D   T T D   K W D   Z W D   K Y D   G Y D   D Z D   C V E   M A F   M C F   C D F   D J F   V E F   B I F   C H F   a o u r   C F P F   e u r o   F C F A   p l a t i n   l u r   C F P   l u r   M a l i   l u r   g a l l   k i p   L a o s   a r c ¼h a n t   g i p   L a o s   l u r   S u i s   l u r   S i r i a   p a l l a d i o m   l u r   L i b a n   l u r   G i n e a   l u r   K o n g o   y u a n   S i n a   r i a l   O m a n   l u r   E g i p t   r i a l   I r a n   y e n   J a p a n   b e s o   K u b a   p e s o   K u b a   2 . 0 . 9 8 . 5 2   f e s o   K u b a   d o l l a r   S U   z o l l a r   S U   c e d i   G h a n a   d a l a   S a m o a   t a l a   S a m o a   z a l a   S a m o a   l u r   M o n a c o   z i r h a m   E A U   d i r h a m   E A U   c ' h i p   L a o s   l u r   T u r k i a   l u r   M a r o k o   l u r   I t a l i a   r i a l   Y e m e n   l u r   R w a n d a   p e s o   C h i l e   f e s o   C h i l e   b e s o   C h i l e   l u r   S o u d a n   r i a l   Q a t a r   z i n a r   I r a q   d i n a r   I r a q   l a t s   L a t v i a   r o u p i   N e p a l   r o u b l   R u s i a   l u r   K o m o r e z   l a r i   J o r j i a   r e a l   B r a z i l   l e k   A l b a n i a   r o u p i   I n d i a   l u r   B u r u n d i   r o u p i   M o r i s   d i n a r   Y e m e n   z i n a r   Y e m e n   l e u   M o l d o v a   d i n a r   L i b i a   z i n a r   L i b i a   g u n a   K r o a t i a   l e v   B u l g a r i a   v i r r   E t i o p i a   b i r r   E t i o p i a   k u n a   K r o a t i a   d o l l a r   F i d j i   l u r   D j i b o u t i   g y a t   M y a n m a r   g o u r d e   H a i t i   k y a t   M y a n m a r   z o l l a r   F i d j i   l o t i   L e s o t h o   z r a m   A r m e n i a   l e u   R o u m a n i a   p e s o   U r u g u a y   f e s o   U r u g u a y   z i n a r   K o w e i t   f l o r i n   A r u b a   b a t a c a   M a c a u   b e s o   U r u g u a y   f a t a c a   M a c a u   p a t a c a   M a c a u   v a t u   V a n u a t u   z i n a r   S e r b i a   d i n a r   S e r b i a   l u r   C F A   B E A C   d r a m   A r m e n i a   d i n a r   K o w e i t   b e s o   M e c ¼h i k o   l u r   C F A   B C E A O   d o n g   V i ê t   N a m   n a k f a   E r i t r e a   l u r   S u   S o u d a n   b a »a n g a   T o n g a   f a »a n g a   T o n g a   l u r   J i b r a l t a r   v a h t   T h a i l a n d   b a h t   T h a i l a n d   p a »a n g a   T o n g a   d a l a s i   G a m b i a   z a l a s i   G a m b i a   g w a c h a   Z a m b i a   g w a c h a   M a l a w i   z o n g   V i ê t   N a m   b a l b o a   P a n a m á   v a l b o a   P a n a m á   z o l l a r   B r u n e i   d o l l a r   B r u n e i   k w a c h a   M a l a w i   z i r h a m   M a r o k o   d i r h a m   M a r o k o   p e s o   M e c ¼h i k o   f e s o   M e c ¼h i k o   m o n e i z   d i a n a v   z o l l a r   B e l i z e   d o l l a r   B e l i z e   d o l l a r   K a n a d a   z o l l a r   K a n a d a   k w a c h a   Z a m b i a   f u l a   B o t s w a n a   b u l a   B o t s w a n a   b e s o   K o l o m b i a   k w a n z a   A n g o l a   f e s o   K o l o m b i a   g w a n z a   A n g o l a   p e s o   K o l o m b i a   d i n a r   B a h r e i n   r a n d   S u a f r i k a   r i e l   K a m b o d j a   z i n a r   T u n i z i a   z l o t y   P o l o n i a   d i n a r   T u n i z i a   r o u b l   B e l a r u s   z o l l a r   G u y a n a   p u l a   B o t s w a n a   z i n a r   A l j e r i a   d i n a r   A l j e r i a   n a i r a   N i g e r i a   z i n a r   B a h r e i n   d o l l a r   G u y a n a   d o l l a r   L i b e r i a   z o l l a r   L i b e r i a   f e s o   F i l i p i n e z   l i t a s   L i t u a n i a   d i n a r   J o r d a n i a   c ' h u n a   K r o a t i a   r o u b l   s o v i e d e l   r o u p i   S e c h e l e z   l u r   a o u r   F r a ñ s   k u r u n e n n   T c h e k   z i n a r   J o r d a n i a   b e s o   F i l i p i n e z   c ' h o u r d e   H a i t i   g u r u n e n n   T c h e k   p e s o   F i l i p i n e z   s o m   K y r g y z s t a n   d o l l a r   B a h a m a s   p e s o   D o m i n i k a n   f e s o   D o m i n i k a n   b e s o   D o m i n i k a n   z o l l a r   B a h a m a s   z o l l a r   N a m i b i a   d o l l a r   N a m i b i a   g o l ó n   S a l v a d o r   c o l ó n   S a l v a d o r   s h i l l i n g   K e n y a   z o l l a r   B e r m u d a   d o l l a r   B e r m u d a   c ' h y a t   M y a n m a r   z o l l a r   J a m a i k a   d o l l a r   J a m a i k a   z o l l a r   S u r i n a m   d o l l a r   S u r i n a m   r o u p i   P a k i s t a n   g u r u n e n n   S v e d e n   s o m   O u z b e k i s t a n   d e n g e   K a z a k s t a n   t e n g e   K a z a k s t a n   k u r u n e n n   S v e d e n   z e n g e   K a z a k s t a n   r o u p i   S r i   L a n k a   r o u p i   I n d o n e z i a   d o l l a r   B a r b a d o s   z o l l a r   B a r b a d o s   f o r i n t   H u n g a r i a   z e n a r   M a k e d o n i a   d e n a r   M a k e d o n i a   z u g r i k   M o n g o l i a   t u g r i k   M o n g o l i a   d u g r i k   M o n g o l i a   w o n   K o r e a   a r   S u   n u e v o   s o l   P e r o u   c ' h w a c h a   Z a m b i a   c ' h w a n z a   A n g o l a   c ' h w a c h a   M a l a w i   z a k a   B a n g l a d e s h   t a k a   B a n g l a d e s h   d a k a   B a n g l a d e s h   l u r   L u k s e m b o u r g   z o l l a r   Z i m b a b w e   k u r u n e n n   I s l a n d   g u r u n e n n   I s l a n d   e s c u d o   K a b   G l a s   h r y v n i a   U k r a i n a   c ' h o l ó n   S a l v a d o r   d o l l a r   S i n g a p o u r   z o l l a r   S i n g a p o u r   l e m p i r a   H o n d u r a s   g u a r a n i   P a r a g u a y   r u f i y a a   M a l d i v e z   b e s o   A r c ¼h a n t i n a   k u r u n e n n   E s t o n i a   r i n g g i t   M a l a y s i a   l u r   S a i n t   H e l e n a   d o l l a r   H o n g   K o n g   z o l l a r   H o n g   K o n g   k u r u n e n n   D a n m a r k   g u r u n e n n   D a n m a r k   m e t i c a l   M o z a m b i k   v e t i c a l   M o z a m b i k   z o l l a r   A o s t r a l i a   d o l l a r   A o s t r a l i a   s h i l l i n g   S o m a l i a   f e s o   A r c ¼h a n t i n a   p e s o   A r c ¼h a n t i n a   c o l ó n   C o s t a   R i c a   g o l ó n   C o s t a   R i c a   n g u l t r u m   B h o u t a n   s h i l l i n g   O u g a n d a   v o l i v a r   V e n e z u e l a   g o r d o b a   N i c a r a g u a   c o r d o b a   N i c a r a g u a   g u r u n e n n   N o r v e g i a   k u r u n e n n   N o r v e g i a   g u r u n e n n   S l o v a k i a   k u r u n e n n   S l o v a k i a   s h i l l i n g   T a n z a n i a   b o l i v i a n o   B o l i v i a   v o l i v i a n o   B o l i v i a   g u e t z a l   G u a t e m a l a   q u e t z a l   G u a t e m a l a   b o l i v a r   V e n e z u e l a   r o u b l   T a d j i k i s t a n   v a n a t   A z e r b a i d j a n   m a n a t   A z e r b a i d j a n   a r i a r y   M a d a g a s k a r   b e s o   g e m m a d u s   K u b a   f e s o   k e m m a d u s   K u b a   p e s o   k e m m a d u s   K u b a   c ' h o l ó n   C o s t a   R i c a   v a n a t   T u r k m e n i s t a n   m a n a t   T u r k m e n i s t a n   s o m o n i   T a d j i k i s t a n   w o n   K o r e a   a n   N o r z h   l u r   I n i z i   F a l k l a n d   l e o n e   S i e r r a   L e o n e   o u g u i y a   M a o u r i t a n i a   z o l l a r   I n i z i   C a y m a n   c ' h u r u n e n n   S l o v a k i a   a f g h a n i   A f g h a n i s t a n   d o l l a r   n e v e z   T a i w a n   z o l l a r   n e v e z   T a i w a n   d o l l a r   Z e l a n d - N e v e z   z o l l a r   Z e l a n d - N e v e z   k o d   m o n e i z   a m p r o u i ñ   l i l a n g e n i   S w a z i l a n d   s h e k e l   n e v e z   I s r a e l   c ' h u e t z a l   G u a t e m a l a   c ' h o r d o b a   N i c a r a g u a   d o l l a r   I n i z i   C a y m a n   d o l l a r   I n i z i   S a l o m o n   z o l l a r   I n i z i   S a l o m o n   r i y a l   A r a b i a   S a o u d a t   d o l l a r   K a r i b   a r   r e t e r   z o l l a r   K a r i b   a r   r e t e r   u n a n e n n   k e n a o z   e u r o p a t   d o l l a r   Z i m b a b w e   ( 2 0 0 9 )   u n a n e n n   v o n e i z   e u r o p a t   z o l l a r   Z i m b a b w e   ( 2 0 0 9 )   g w i r i o ù   t e n n a ñ   a r b e n n i k   g i n a   P a p o u a   G i n e a - N e v e z   k i n a   P a p o u a   G i n e a - N e v e z   l u r   s t e r l i n g   B r e i z h - V e u r   l e u   R o u m a n i a   ( 1 9 5 2  2 0 0 6 )   g w a c h a   Z a m b i a   ( 1 9 6 8  2 0 1 2 )   z o l l a r   T r i n i d a d   h a   T o b a g o   d o l l a r   T r i n i d a d   h a   T o b a g o   c ' h i n a   P a p o u a   G i n e a - N e v e z   k w a c h a   Z a m b i a   ( 1 9 6 8  2 0 1 2 )   d o b r a   S ã o   T o m é   h a   P r í n c i p e   z o b r a   S ã o   T o m é   h a   P r í n c i p e   d o l l a r   Z i m b a b w e   ( 1 9 8 0  2 0 0 8 )   u n a n e n n   j e d i ñ   e u r o p a t   ( X B C )   u n a n e n n   j e d i ñ   e u r o p a t   ( X B D )   c ' h w a c h a   Z a m b i a   ( 1 9 6 8  2 0 1 2 )   f l o r i n   A n t i l h e z   n e d e r l a n d a t   m e t i c a l   M o z a m b i k   ( 1 9 8 0  2 0 0 6 )   v e t i c a l   M o z a m b i k   ( 1 9 8 0  2 0 0 6 )   m a n a t   A z e r b a i d j a n   ( 1 9 9 3  2 0 0 6 )   m a n a t   T u r k m e n i s t a n   ( 1 9 9 3  2 0 0 9 )   v a n a t   T u r k m e n i s t a n   ( 1 9 9 3  2 0 0 9 )   v a r k   k e m m a d u s   B o s n i a   h a   H e r z e g o v i n a   m a r k   k e m m a d u s   B o s n i a   h a   H e r z e g o v i n a   )Ül u r   U n a n i e z h   e t r e b r o a d e l   a n   h e n t o ù - h o u a r n    š n V z ó ²± 6› 2§ æ Õ ¢ †< ª ñ 2 8 ² q ª! Ö   l ’ß Î Ú8 ÎÕ &º  ç “
+ 6  RO	 b3	 ŠE S ÂW Ò& V ^ æa R Ñ æ ‚ V ¶a † *
+ Æ­ jM N ¢
+ ²k	 vø j u : õ "†  à   Z ô N  A ~ Û ò Ï ^ - Öe RM Jğ ®•	 ş+ r ´ ’ “ ^Ç JA 6  â  ÿ ¾  r  A Æ = Òe Æß	 ê‰ * ö „
+ Zû VÏ 
+á  ¡ ¢¾ ª "Ñ z > C ‚ º£	 Ê î Â Ğ	 F! ¾ « –G Şÿ º2 ¾û ‚ ; 
+J Ša Zù bÔ Î  J p   n fÖ Š ã ò ^	 ¦ · " o ®í
+ & y	  N – r v· î’ zk .« ¢ ± n) f u
+ ~’ * 	 ‚Å FŠ  Z .  ’— Ã BS B\ ¦2 :
+ : rá –’ b  f– v  ê ³ ¶ƒ B  šõ jı	  N/ ¶ Î  I † î Î ®  Ò » Ê%	 F W ş ' § öj Ş ¨ ~q  ú»  Ú ± Ê 	 ç } &å å¤ > Ö â *Ë G ¢c q 2ù  
+ • æÙ Â9 Ûñ ú ê â º ) # .H >í š Û o ¦+ º ´ êî–t ó êî–t ó±±±±û êî–t óÑ§Ñ§Ã êî–t óÄÕÕÕç êî–t ó¢¢¢¢‘ êî–t ó8888& êî–t óqqqqM êî–t ó!!!!1 êî–t óñ êî–t óßßßß‡	 êî–t ó8888) êî–t óÕÕÕÕÇ êî–t óººººÌ êî–t ó“
+“
+“
+“
+Ï
+ êî–t ó}O	O	O	‹ êî–t óEEEE7 êî–t óSSSSa êî–t ói^^^t êî–t óaaaaa êî–t óµÑÑÑ™ êî–t ó•æ•æ÷ êî–t óo‚‚‚\ êî–t ó±“ êî–t ó*
+*
+f
+*
+f
+ êî–t óMM^M^ êî–t ó±
+¢
+¢
+¢
+À
+ êî–t ók	k	k	k	]	 êî–t ó††††y êî–t ó    á êî–t ó êî–t óeeees êî–t óöğöğŞ êî–t ó•	•	•	•	A	 êî–t ó++++< êî–t óî	“î	“_ êî–t óÇÇÇÇW
+ êî–t ó    • êî–t óAAQAQ êî–t ó===== êî–t óeeeeV êî–t óß	ß	ß	ß	9
+ êî–t ó¾¾¾¾/ êî–t ó. êî–t óñÑÑÑÁ êî–t ó êî–t ó£	£	£	£	²	 êî–t ó!!!!! êî–t óGGGGS êî–t óÿÿÿÿñ êî–t ó22222 êî–t óûûûûû êî–t óaaaaQ êî–t óùùùùù êî–t óGÔGÔº êî–t óq‘ êî–t ócpppI êî–t óããáã êî–t óË êî–t ó····Ô êî–t óoooo€ êî–t óí
+í
+í
+í
+Ş
+ êî–t ó
+N
+N< êî–t órr`r` êî–t ó’’’’¦ êî–t ó««««¹ êî–t óÁ)Á) êî–t óÁ	u
+u
+u
+H
+ êî–t óÅÅÅÅÆ êî–t óZZZZZ êî–t ó êî–t ó————Š êî–t ó2222G êî–t óáá¡á¡ êî–t ó’’’’£ êî–t óB–„–„ êî–t óƒƒƒƒt êî–t ó êî–t óõõõõ êî–t óı	ı	ı	ı	ı	 êî–t óü
+ êî–t óIIII; êî–t ó êî–t ó. êî–t ó»»»»¨ êî–t ó%	%	%	%			 êî–t óWWW êî–t ó§§§§ êî–t ójjjj~ êî–t ó»»»»Å êî–t ó"V êî–t ó* êî–t óçççç êî–t óğåååÚ êî–t óqqqq‡ êî–t ó####/ êî–t óÛÛÛs êî–t óooÁo êî–t ó++++1 êî–t ó´´´´â½ 
+"&* ¶"&*..226: >BF6J N:B FJRVZNZ^bfújnr vz ~†Šb–f# š¢jn' + rvz~¦‚/ ª®²†Š3 ¶º’–¾ÂÆÊšÎÒ2]Ö¢Ú6ª®Ş²¶âæ7 êîòöúş; º
+¾Â^"Æ&Ê*.26>BFnÎÒJNÖvzÚR? ~VŞZâ^bfC êjîG nörK úvO š¢¦ª®S ²º¾W Â[ ÆÊzÎş~‚æÀ Ã Æ É Ì Ï Ò Õ Ø Û Ş á ä ç ê í ğ ó ö ù ü ÿ             # & ) , / 2 5 8 ; > A D G J M P S V Y \ _ b e h k n q t w z } € ƒ † ‰ Œ  ’ • ˜ ›  ¡ ¤ § ª ­ ° ³ ¶ ¹ ¼ ¿ Â Å È Ë Î Ñ Ô × Ú İ à ã æ é ì ï ò õ ø û ş    
+        " % ( + . 1 4 7 : = @ C F I L O R U X [ ^ a d g j m p s v y |  ‚ … ˆ ‹  ‘ ” — š    £ ¦ © ¬ ¯ ² µ ¸ » ¾ Á Ä Ç Ê Í Ğ Ó Ö Ù Ü ß â å è ë î ñ ô c 
+* "&*.26:>FJ B FJRVN^bfrv–f# ¢rz~¦‚¶º’ÂšÒ2]Ú6ª®Şæ7 îòöş; 
+Â^"Æ.>BnJNÖvz? ~ŞZâ^fC G nrK vS Î‚æ÷ P P P P# P. P9 PD PO PZ Pe Pp P{ P† P‘ Pœ P§ P² P½ PÈ PÓ PŞ Pé Pô Pÿ P
+ P P  P+ P6 PA PL PW Pb Pm Px Pƒ P P™ P¤ P¯ Pº PÅ PĞ PÛ Pæ Pñ Pü P P P P( P3 P> PI PT P_ Pj Pu P€ P‹ P– P¡ P¬ P· PÂ PÍ PØ Pã Pî Pù P P P P% P0 P; PF PQ P\ Pg Pr P} Pˆ P“ P P© P´ P¿ PÊ PÕ Pà Pë Pö P P P P" P- P   †z %  A  § `                                                                                                                    #ifndef VULKAN_ANDROID_H_
+#define VULKAN_ANDROID_H_ 1
+
+/*
+** Copyright (c) 2015-2020 The Khronos Group Inc.
+**
+** SPDX-License-Identifier: Apache-2.0
+*/
+
+/*
+** This header is generated from the Khronos Vulkan XML API Registry.
+**
+*/
+
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
+
+#define VK_KHR_android_surface 1
+struct ANativeWindow;
+#define VK_KHR_ANDROID_SURFACE_SPEC_VERSION 6
+#define VK_KHR_ANDROID_SURFACE_EXTENSION_NAME "VK_KHR_android_surface"
+typedef VkFlags VkAndroidSurfaceCreateFlagsKHR;
+typedef struct VkAndroidSurfaceCreateInfoKHR {
+    VkStructureType                   sType;
+    const void*                       pNext;
+    VkAndroidSurfaceCreateFlagsKHR    flags;
+    struct ANativeWindow*             window;
+} VkAndroidSurfaceCreateInfoKHR;
+
+typedef VkResult (VKAPI_PTR *PFN_vkCreateAndroidSurfaceKHR)(VkInstance instance, const VkAndroidSurfaceCreateInfoKHR* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkSurfaceKHR* pSurface);
+
+#ifndef VK_NO_PROTOTYPES
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateAndroidSurfaceKHR(
+    VkInstance                                  instance,
+    const VkAndroidSurfaceCreateInfoKHR*        pCreateInfo,
+    const VkAllocationCallbacks*                pAllocator,
+    VkSurfaceKHR*                               pSurface);
+#endif
+
+
+#define VK_ANDROID_external_memory_android_hardware_buffer 1
+struct AHardwareBuffer;
+#define VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_SPEC_VERSION 3
+#define VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME "VK_ANDROID_external_memory_android_hardware_buffer"
+typedef struct VkAndroidHardwareBufferUsageANDROID {
+    VkStructureType    sType;
+    void*              pNext;
+    uint64_t           androidHardwareBufferUsage;
+} VkAndroidHardwareBufferUsageANDROID;
+
+typedef struct VkAndroidHardwareBufferPropertiesANDROID {
+    VkStructureType    sType;
+    void*              pNext;
+    VkDeviceSize       allocationSize;
+    uint32_t           memoryTypeBits;
+} VkAndroidHardwareBufferPropertiesANDROID;
+
+typedef struct VkAndroidHardwareBufferFormatPropertiesANDROID {
+    VkStructureType                  sType;
+    void*                            pNext;
+    VkFormat                         format;
+    uint64_t                         externalFormat;
+    VkFormatFeatureFlags             formatFeatures;
+    VkComponentMapping               samplerYcbcrConversionComponents;
+    VkSamplerYcbcrModelConversion    suggestedYcbcrModel;
+    VkSamplerYcbcrRange              suggestedYcbcrRange;
+    VkChromaLocation                 suggestedXChromaOffset;
+    VkChromaLocation                 suggestedYChromaOffset;
+} VkAndroidHardwareBufferFormatPropertiesANDROID;
+
+typedef struct VkImportAndroidHardwareBufferInfoANDROID {
+    VkStructureType            sType;
+    const void*                pNext;
+    struct AHardwareBuffer*    buffer;
+} VkImportAndroidHardwareBufferInfoANDROID;
+
+typedef struct VkMemoryGetAndroidHardwareBufferInfoANDROID {
+    VkStructureType    sType;
+    const void*        pNext;
+    VkDeviceMemory     memory;
+} VkMemoryGetAndroidHardwareBufferInfoANDROID;
+
+typedef struct VkExternalFormatANDROID {
+    VkStructureType    sType;
+    void*              pNext;
+    uint64_t           externalFormat;
+} VkExternalFormatANDROID;
+
+typedef VkResult (VKAPI_PTR *PFN_vkGetAndroidHardwareBufferPropertiesANDROID)(VkDevice device, const struct AHardwareBuffer* buffer, VkAndroidHardwareBufferPropertiesANDROID* pProperties);
+typedef VkResult (VKAPI_PTR *PFN_vkGetMemoryAndroidHardwareBufferANDROID)(VkDevice device, const VkMemoryGetAndroidHardwareBufferInfoANDROID* pInfo, struct AHardwareBuffer** pBuffer);
+
+#ifndef VK_NO_PROTOTYPES
+VKAPI_ATTR VkResult VKAPI_CALL vkGetAndroidHardwareBufferPropertiesANDROID(
+    VkDevice                                    device,
+    const struct AHardwareBuffer*               buffer,
+    VkAndroidHardwareBufferPropertiesANDROID*   pProperties);
+
+VKAPI_ATTR VkResult VKAPI_CALL vkGetMemoryAndroidHardwareBufferANDROID(
+    VkDevice                                    device,
+    const VkMemoryGetAndroidHardwareBufferInfoANDROID* pInfo,
+    struct AHardwareBuffer**                    pBuffer);
+#endif
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
+                                                                                                                                                                                                                                                                                               «ÜØºv.3²—‹1¡Ó—îUË1«ˆQ‚ZLxQ’*+lÖ-HÔ#ÖEÀEFSáIÀÈÈ_Jò¼äz/ÏÛ«ÜÖü…ä¬ºŠ&-C_U³Şc»ïh¾Q˜½§Q»™u@ÕßîÄ;Â kŒalğCZ~š'ğ(ìYrÂ/÷hú‡‡uƒ1üY/4/$dT©Ìc
+šn‘Õ:S’İZÔ”4	6-åe3Ù¶XŞÒ÷²N÷EÑ¼Èæ^LˆMÿ¢¿ı”¢:95:¦`H¢‘¾ÍÍî :
+®Òƒpv¸;~ıÚ‹šCòÇ ²,%[ƒNOà>‡ĞK$Zƒd&œ¬ªB‹à@>öoâĞxÂ#ÅÎ…õ¶ÓB¼ayÓz®	• ‹®óeÖ^‡/|÷Æäã©[ÔK®
+Æ]]#gÔÀ’ìhòÙ|>]â
+<FŠ{/ƒz•Íä	è†Ó·‹V¯´Õ¡™«‘¨şÔŞ<µ?™øÀ¿ç¿ƒÜ6Gı‰ ®…½“·GqA@"Z‘DqDòaÕXó-¥x,†±1	Å­~@:‚b»vu£ªø¬‹ñ<ó@–’¾ ŒğØ××€”ü@d®¢genh/“„‹Å3SâµŸùáŒfêÑÂKİ§‡5Ì|uGf)W˜ıŠ„ğâ÷LÒÄ—Û 0QˆAŠù›÷´Ì­8NiSÆCâ8šÿ–£öZXr¾DØZâÇêf»×›¸ó‹C·ër1›„ÆrdĞQ'\ÿ«B†‘æ{Ñ!İïËààÍMŞŠƒ@Øò#bÃüHëoEGŒÎ\LäJx_Ó\ iß{ä|Ó5\ZeïXúú\‚{#´$ĞĞ–¾e¤»/ Ÿ4v9
+Œl.Ã±Ï&¥Y‚ááxÉ´:>ƒ¢ÆlËÿ
+'b³ÊW9-UĞKS]Â±4Émª‹¬«iŸ§ eÂ"tŸÒ`2E-¬¾Z1>„¥+j©†ù˜óĞÚjëTŒÁåŒ¾£SÁ‚o„»àÃ%yFÄO&W!I<û"/'°‰ö0á“¡Ğhxİ.c‚àÁ›£Ùy×¥´ş¿Fç<‹¦å;ƒ DÚ½¨ Yz½g˜Ñæ<bj{­J×"ç |ïÆO["É,v
+¯êÕı3Â8^÷îcf¥67ÆMcŞı"²ow…­D3—eÈ°3oû‚$¶dâ'£Âªıu¶bS{cHÙAŞ ò"»;¢ŸS»r:ÚÁbGMèù[ØŠk‹÷£ãªé¥õÑ[â!N¼¤l(ôv!|;ûTr3ÕJMr7à<ÒPÇ‰6)÷,ºCŞî¤eS˜níĞ¯p¶Œ*ÿÈñ*Ô“Ã’C•®¹ÚƒÛ½% Ÿ8£åî]W·’"#"±ù_nW±ÍÈö]±ın)N¶ÄªğŒèÆó†DåÊ™Cù¥±è;Ïk]L.š@æxóN¬eù|•Œâú&'£xÉ|Õ°±wJG3iìÿ^îEşú‘µº‹eÁaÔtÏ< øµËnÜÚidu8ƒàÙ§¦ÉëˆPjr®ÙHbñ¢Z(#ˆß•ó†=4¨ïn7ølœÓ˜0•z(àÜpìĞíå1›ƒí`:ic^+p>Hìfğ0/®ÚŸÚjn'8Õ÷	&‹³âQSŒ‰ÜO×dÎ[Ùhæq)š”x³ºVßÏÒ?:WŠ ^1¾Ü¤Ğ4ôòÎF°y¡7;%¾à4şøJ/o³—ö
+|‘éB³râfD²ŸxôÌsêF rõ|Rï{ö–™(l‹ú˜¤t›Ø©Ğ][¸pøÖO•èbQk¸ql!$fBÕƒ2µ‡ı0òë”¾fQ”ÍªDÅF»Ä"·"8±Ô¹Ïğ!“&¹<Ä–ÿ0âo¢àg»öºQ¿¶‚òLsÀ;ÃànŠDã÷É-î£DJÑş3ù 7•ó1Ç­†ZIs“©§Òo¨´­‰À$K!‡nW¡=ß?Ğ«(€Üüµ+×W"Cºû5Ö|fªÑôiÿ¨¹lHÚ;^'÷`x¬ê$z89³è¯%m1‘êldôYÏc5ÙÅ2J½}Œ aüË«-É)‚ùÌğ°Ÿ“—İ*¾-"kÃïN/ªËpR›Ê Jæ}Ò€	ÍìGO<ù’ŞâÊğø™ÌY*µÒíÖŠX:dÄú
+cT³Sü“³&ºbÈßÑi?¦®êoo"·¬ë¨
+OÈ™¤SMà¡µSµ÷V )ÓZ;óƒUÔo
+*–Úw¾qY™qH!í/V‘CW‚£‰›#I©‚‚1…Bt_45uo¾ÓJá¶Ï„ŒsP°6¨EÈèÍ8Zò½£B§/lĞ¨¶Uh‰PJ:â@k%ßÃ"¢^¶sLÂb6a2âPZ×õØT%J‘0êº¿ úí±IRY}àºª”§T‹¸I
+ÄA.X«y"Cò!/¨Ú¿‚ğ•Ø•dÉ–ºb>ëYÄ \d«ªY°«kÖ•¦ ™r¨¯Íçˆ õE0Ku·÷”]ÙÈ+Y¦ZÃô]FIZË?'Ğ´ì&·2Ó„|Ú*Û)#XËPç2Ğ¬×H¦QoiBöZİOm:¯ğ-ş )ğpEs‹ö±SçÓg±ËG¶3Wo²«vò 
+©›¬ÇuZ-,ŒPiQœ(—-Îòá	iæÈæáø°ŠN¨½›.‹ˆ1ĞDàö|Ñós‚Ä‡ê¢¡ oÆsüÂ¯ÃƒO­¾öN0“\;Í3*\ŞĞœîLÔáyÛ*‹jôm¬ü»¥‰,ò©2í§9µ8ô¿ÕŞ"Š«(lÇH.[ùÖYaŞ
+Ú®‰˜ĞÈ9j2Ía$2êÔTo¹Sê)axwàLÕut ¿“ÎÎú’›ì7©F“Rú(7™Ş•áÆáÂøM„æPyyÿd:NüœW,¯N°•“VMÊìæ{MÒd¶«U>¿bİ¹èd«-`î¹®–aHRò«.dˆ2n8°*ÎåÇBIºo¶ı:-bXaôÂ"Ù5>[y²NÊ Ü4”é§âÿÇÙâªúùáı?ˆ%M±|Ó)¨ßğTµ¤w]É}MQv/Hw%EØ±tØá¥)lZ;Üá\ÙC5åë¾B¾"@Š ®oX~ì½N„‹ÉDCˆqvU]ğ¼9<—.üŸF¾BİÑ{®E¨ÖsŸ|ÊHfXw!½Á<ÚOFA;1®ú…/l
+6è²€ù¤3…ÅÆ`É T¥/ÑF²zUî­ùßÑ+ÅñûW“â©séFW°8'>ëÄL,•±ııš&ÉÑ²¥?V0?MÓEÎeÌv÷$ù7U¢qú÷f}´: ÈìælÃd=X±aN@ŞñÕ±:pÄPŸ\fŒè!îûàä àšy‡œR¦Pûg-§y7O9Ğ¼Ë#ğ¾BTSaçuißg±MÍZP‡oŸFù­KSˆ
+D7 ıŒÌnÁIn©rèÄÇ%Ø‡åª]/Puø.·®–ŠÏ0$„¨ÿUØ¨3.Uÿc'ÃŞÔ–y¢7–Z™=O›3}ÚEÌå8‚¯b¬*¾?d«pG6Ø=<bö„¡Û—\?‡ÔòN‚‘á£¬ö‡¤“át	ÁıÅvE:Ş‡ª5úP|ó•î¼é]tÏÀ$Ê?ğ¿ŸQªÇû&íåz±-;˜L˜=[Ö[½d)6ÉÌw[´dåÛÏõz(w|A
+ÃÎîW¶NúÂàVr;ÍOK|Õˆz1D5İ.ı,dÀ(%äÛQÀø.l[„,Ìm…BîıÏÁbğG`Ë”Y}¼Ö lbG_õ*Ö6éçK¸õ2é€éóÌ<j{§e†ixïüN`b‚ÆŠßU/q–˜ Ÿnù‹=+ÇÈÒˆÂ¤ÂM…iÆN«¸‚NIZ×şU¾xvT;æNx–Y½² -“_hÈzîzGšàd}mVî­î¯8:UdøT-²åJP•à[K¥cTwV/ïÍĞÂ³wd²àÎ?¼ÃjÄ	¹E„0iM§?OÎTÄ<ÅÉıOÒú™°ÄvæBÇ	8rAİu±-õ‘İ)UŠÈÔ…6zùe½@*VfŒk'g©­?dòX“ÒIhCNÇ_ƒ§»¯ ­ÚıcûKÒŸƒDõ»sï¬Qüà„o7şDÿùå8ÛÏBô80C\[tiÃÂâÔ‹Y7î‚ÇÎe*;"Æö²‡âøLiÕIcÃ^©	2ke¬.MÅdÑÖ:A‡9¡˜ÈÉtÂ.*0<àÄ²IpzTDeîà>ãXNÔ¹ƒçÔğ¯ˆ,º	ºí0nÑïéëØ[=5BYQ„Öa¥Åáãõf¢ŒBÅÂaè4›áònÑí;†´ñ{¡	ïl.ıödfDÍŠgCü¹*jñ*µ…GˆL%baÍXE³ú; C)ˆ?aj {JÚäıĞ`oŒÚéj<ê2‘"ƒ¹®lb=Mä©Ÿ|ÔKKbÇÓj‚ùU#æxá>ùàyŠK†?mÚT7±:v°o¼•³ÌXô–·_îgyˆËF™ù`mP
+ Ì_$2#ZœØÚ9å65>Ó¤}§N¨ “>T×¥ÅsÂ_»ÚÏr/ üıi[_=OggS         {      Ş~Ç½vorbis    "V  ÿÿÿÿ ú  ÿÿÿÿ©OggS          {     …ÊıMÿÿÿÿÿÿÿÿÿÿÿÿÿÿvorbis   Xiph.Org libVorbis I 20040629      ENCODER=Adobe(R) Audition(R)vorbis"BCV @  B*­c:È!Œ¢ BÊ)ÇBĞ!£$Cˆ:Æ5ÇcG¹dŠBÉĞU  @  ¤WPrI-çœs£WÌqè çœså gÌq	%çœs9ç’r1çœs£Wr)-çœsGŠq§çœs¤GŠq¨çœsm1·’rÎ9çœsæ ‡Rr®5çœs¤gr%çœsÆ gÌqë çœsŒ5·ÔrÎ9çœsÎ9çœsÎ9çœsŒ1çœsÎ9çœsn1çs®9çœsÎ9çsÎ9çœs 4d    ¡(Šâ(²
+ È  @qG‘K±ËÑ$Y      H†¤HŠ¥Xfi&z¢(š¢*«²iÊ²,Ë²ëº.²
+ H  PQÅpY d  `(Š£8äX’¥Y„†¬ €    PG±Mñ$Ïò<Ïó<Ïó<Ïó<Ïó<Ïó<Ïó<Y     ‚(dBCV @  !CR\
+BCBÎC©¥ƒà)…%cÒS¬A!|ï=÷Ş{ïĞU    a8ˆÇ$!„b'Dq¦ !„å$XÊyè$İƒB¸œ{Ë¹÷Ş{ 4d   À „B!„B)¤”RH)¦˜bŠ)ÇsÌ1Ç ƒ2è “N:É¤’N:Ê$£Rk)µSL±åc­µÖœs¯A)cŒ1ÆcŒ1ÆcŒ1Æ#Y €  dA!„RH)¦˜rÌ1ÇBCV €     ER$Gr$G’$É’,I“<Ë³<Ë³<MÔDMUÕUm×öm_ömßÕeßöeÛÕe]–eİµm]Ö]]×u]×u]×u]×u]×u]×ĞU € €ä8ä8äH¤H
+²
+   €£8ŠãHäX%Y’&i–gy–§yš¨‰²
+        €¢(Š£8$Y–¦i§z¢(šªªŠ¦©ªªjš¦iš¦iš¦iš¦iš¦iš¦iš¦iš¦iš¦iš¦iš¦i¡!«  	  ÇqGqÇq$G’$ 4d      CQEr,Ç’4K³<ËÓDÏô\Q6uSWm 4d          Çs<Çs<É“<Ës<Ç“<IÓ4MÓ4MÓ4MÓ4MÓ4MÓ4MÓ4MÓ4MÓ4MÓ4MÓ4MÓ4MÓ4MÓ4MBCV d  ÏB)-Fˆ˜£Ø{ï½÷Ş{e<’ˆIí1ôÔ1±gÆ#f”£Ø)ÏBbè<tJ1ˆ)õR2Æ ÆØc!”Y! „f $	44       $O4Q4O       Ió Mô M                                                                   <ğDĞD       4QDQDÕ       MOÑT                                                                   4ĞDğD       4QDÕ<Q       MÑTQ                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        8  X…†¬ â                                                                                0à  `B(4dE ' `pË  G’4  IÒ4  Ğ4M ÀÒ4Q                                                                  0à  `B(4d%  `0MXÀ² šĞ4€ç<`š @  @ @€š‹² ˆ 0(Š$Y–çAÓ4M¡iš&Šğ<ÏExç™&DÑóL¢èy¦	ÓEÓ¢hš  
+  lĞ”X Ğ• @H €AQ,ËóDQMSU]šæy¢(Š¦©ª®Mó<QEÓTU×…çy¢)š¦iªªëÂóDÑ4MSUU×uáy¢hš¦©ª®ëºğ<Q4MÓTU×•eˆ¢(š¦iªªëÊ2EÓ4MUu]Y¢hšªêº®+Ë@MSU]×ue˜¦jªªëÊ²,LSU]W–e ª®ëº²lÛ Uu]×•eÛ¸®ëÊ²,Û6 ×•eY¶m    FĞIF•EØhÂ… Ğ@  `ŒRŠ)e“PJ	cRJ*¥’’RJ¥TRJ©”JJJ)•’QJ)µ–*)©””R%¥¤’R*  ìÀ ìÀB(4d%  @‚cŒ9'¥TŠ1çœ“R*Å˜sÎI)cÌ9ç¤”Œ1æœsRJÆœsÎ9)%cÎ9çœ”Ò9çœƒPJ)¥sÎA(¥”Bç ”RJéœs
+  *p  °Qds‚‘ BCV ©  Ç±,MÓ4ÏEK’4Ï=OMÕ’$ÏEÏMSåy(Š¢hšªJEOEÑ4U•,‹¢iš¦ªº.[EÓ4MUu]˜¦(ªªëÊ.LSMÓue²­šªêº²Û6MUu]Y®ëº²lëÀu]W–m]  x‚ P«#œ² È   AH)…R
+!¥BJ)„  8  ˜P
+Y	 ¤  B!„B!„B!„B!„B!„B!„B!„B!„B!„B!„Î9çœsÎ9çœsÎ9çœsÎ9çœsÎ9çœsÎ9çœsÎ9çœsÎ9çœsÎ9çœsÎ9çœsÎ9çœs ±+ v"lXá¤h,°Ğ• @8  `Œ1ÎY¬µÖZ+¥”’Pk­µÖš)¤”„cŒ1Æ˜1)µcŒ1ÆŒ9G-ÆcŒ1¶VJl1ÆcŒ±µRbŒ1ÆcŒ1Æ[Œ1ÆcŒ1¶cŒ1ÆcŒ1ÆcŒ1ÆcŒ1¶cŒ1ÆcŒ1ÆcŒ1ÆcŒ1ÆcŒ1Æcl1ÆcŒ1ÆcŒ1Æc, ÀäÁ *ÁÆV’Î
+GƒY	 ä  Æ(Å˜cÎA¡”JI­uÎ9!”RJI©´”bÊ˜sÎA¥”JI©¥Ô9ç ”RJJ)¥”Zj­sB¥”RJJ)¥ÔR!”RJ*)¥”Rk­¥B(¥””RJ)¥ÔZ‹¡”J)%¥”RI-µ–Z*¡”TRJ)¥”Rk©µVJI%¥”RJ)¥Ôbk)”’RI)µ”RJ­ÅØb)­¤”RJ)¥ÖRl­µØRJ)¥–ZJ)µ[j-¥”RK)¥–RK-ÆÖZK)¥ÔRj©¥”Rl­µ˜Rj-¥ÔRk-µØRj-µ”Rk©¥”Zk-¶ØZk)µ”RJ©µ[Š±µÔJJ)µÔZj-¶[k­¥ÖZj)¥[Œ1Æck1¥”RK©¥ €  Œ¨´;Í¸òQÈ0²    i’9I©&9Å ”æœSJ)¥4D–dbP™Œ9I9C¤1¤ õL‘Ç”bCH*tŠ9l5ùXB±eŒp)Å    „  (˜ #m €™	
+¡ÁA& <@DH ‰	ŠÒ….!‚tdñÀ…7¸á„m        ğ P ÑÌUX\`dhlptx|€„      |  $"@DD4s ! €      €         OggS   -      {     ‘ck¦7kylvy’š“‘·¸°§À»Üéàãû–ÚÖüÜôŸƒ»¡WUñ/Út•mĞ]Ùszûßã¯5õejú_Ås~­F¥–ÑbßÜùª\A»:Øù‘ˆxì|" x 9ßªª*ÊÃÊÅÃ0>	ç…l>Öü8NùGcz³?HGnó!sØ=>|¿ù›RR9ü©íL\6AùÊ~·Æ¥;wGÉO—Fç5VÃ„Qzz2A‰µj+U9şÇùCş àáó‡üÀr¾¾•©ªªf=ßÖZ™wÛ¶ÙwyKa1±ioè9kèf¾Z¦œÛfßã'ßışç0KûÛñÄ/GÆ0æf=Rü:™íú¶&ÿÜcñ0K³©üÊ÷gnîå×{3±äïíÿôİ±d;™„ÕM3ş·ù ğğ·ù ğ@ùVUU¹«¡¡¯½åhºµ”œíã¦³­yÛÒ–İ‘Ûîîéö4O¥W'è6äî‰åtÒüÕàÓÄğîrÓ§×MqÏíçÅĞbÔfCX½5ıÂÍîÈo)QéT—âT™ß	ş·ù ğğÇùCş à| ªª²fıß£ÒPŞ(°²=Ëœš·¡şceÖ‚š_ß>|ÏäfaMmnmŸçËüË|Úš×èÜjşu[ã»Ş˜KÍøÒM»_<Ä]M'ë©è›ıJïê¸ú‡_‡R\s//şÇù	 ğğÇùCş àää\UU…?õÃ3š0²Ş¬¹ÏÆM£—­Ff¨È>3ŸÆ4ÿWf½­şÃ«Óeî÷iO*²¹íÛGö÷gî!sìTÇ¾§¾u<{2³m“Í¤ùk7tìénFµv“µj£—)•¸½j/%´4Ş§ù# <ôişH "ß†Î9gª
+·Ä<¼ìllİ¼*=Ößrÿú^ö²,›‘ÙVUôãÖ¿ú±ûéšßsF{ªó=½óŒ:"2ŸOëí:óOoïı[Ùûª¶Ìgf÷¶—]¿¼:îıë¡sš´ÚÙGGÏÍõWù]s)ö<4œp¬‡õò+eóÌŞ§ù# <ôişHD <ßÑp˜—«ªX`Ìºkó~bYç>É nv|ª–÷àKõÀ¤¬­~f)¶—í5«|>2İÎ[?ı{ï©#ugÆ­Êék«z;OXOımFtNêßqã÷¼ñè„ó÷´›÷?ü¶íı–	Ok²‹ówË9v:İzõn¥Sí§\)=Ûï>íBó]Ş§ù‰ˆxèÓü‘ „Üp8 W™*Œ”§1>Mb³í³æ5İš>ùÖü›Æ›¿WáÏàù73–õÎÍÚ¦ìc½«m¶ÙÔœíóà|´§÷Ñ»±~Ş7>Ÿ˜¶?l™ÿ?3>ñ9³ÿãñ‡mÇ'ØR¦;ÿV÷òj}*mÆ(ãëŞ§ö7ú3+Û&½á“{²¿ìÜ”Ü\§-Å·pX¯Ş§ù© ú4$€ÑPnĞ×¬*ÕJ”ÑŞúÇ^«eÁ¼™iû„ÔøcƒÎÿÛlÅÈ)Ì¾_}¶©HëpİĞÿt³9zæ7ìs}b'£ïíqòì¹û}ßŸÉîÛ9ßê´91Ohå¥¨İŸ?­?½ß÷ÑøQóHï¼½aõ¸!ÿıÏyÛ«->„FSjhúïú=•iÁ·Óu.Ş§ù# <ôişH È™áĞ×¹r™Êûõd›fæÌBæ¬è6Ş”¢«šM|¦´YC[Lÿæ£f¶TßOïóãè§îïÇyş­£kìùtßÏŸ\¿m'ØôG_öñq®aê3†“¹Û::ê÷“ÇÛ;¿çı~»év­1iÅ¯æn¶{¸‡û}äç^Ç]x—ùcş à!/óÇüÀCÃ¡ïppOË«\¡ºå›s±üúÔçg«Ï«;ÉòêTO×ÛW{Oç4ûl5şKkïİÃÿó÷{ü«©\Ûl¼Û“œ×í~Î®otìÉong$Ò6ŞÇìh+mš™6ŞC}¤mš'ÿå?9ıı¯Ûç†QÚ”çÖ¼úqÏŞ1Æ£GŸÚÿÉ©óÒ©lÃŞÙ>??šj.÷í~­=cÏ÷4eŸŸN?tßsıİëñùÄÆ —ùcş à!/ócş àA‡ÃÑhµ¼Yeb˜–ÌgÓ½QÛjí1}êŸæNUøQıŒ3vuŞëEoŞõr<=/³^{ñuŞd$¿{Ë|zz”3|l;èdÕİ§äFú«CgûWCïGçô`”Ün“Z=ı‰ïÒ¶i›Ôi××ÖYÌhû%ñŞhÒ­Ÿ8|èh´÷ÏÉïû˜ÿ;ôşÿóŞşúùğ=>?4tîtÜèÑ	âŸOÆ?Ú%që÷#ñ¥Û3ı—ù1 ğ—ù1 ğ †Ãåpèß~/“+”i€f?6æÃØ6Î^yÉøg‰’ö&©hî•Š\Ûö©Ï†Ÿ¿{ºZ	¿síòİ{ıû4í·×®j‡U'uŒ¸¿9›&MÓ_mšúİ6iÚäë+£™CGã¿ù§v#Ñtß4tíÉHo³N{Ïñ¾Ó[Ìíóõ	:?´Y†QÇéğºóîv{“ÍÙ¼şÃ–éıÇÒŸÃ<Ìö¶m½—ù1 ğ—ùcş à¹áp8\ø§O“«~î„WmíúmÛ Ş2Œv-
+m™bœ²6çZº¯íO«ı ımİÆ_™wû§ö¯2RÇš•èK“ÌöyŠwæŞûİéˆIÓD«f#’o•¤uäÑûÛÖ1FD‘_“j4:ÿÿ¯SÜÇ>ã!»¿e_=›éÜéé~é7lm¼;áh8çë–—Ìİ:¯fÆãŞß÷Ù¹—ù1 ğ—ùªˆ1àAÈ/Ã}ï…gŒW#õonbÿ¶a¡ÉÄÄd6õ·âÃuÙwàÌ~Ë{ö¯?ÒÓçÅµ­ìo›cëõóÙµ~ËÓğş¦t›şNû)I:dÎ^{˜¶Có#mÚÎ¦c4oÏF£mÓ÷¦i¾ud´³­|´©¯V;óUóÆø¹çÉNGÜzkï‰ïvf»ú¿·Æ·ûvşäãçŞzvÈ¢oßS«ïÔcü;.nùĞóø[ëá¯óëÃ7lÇ±¿<—ù1ÀC^æ«"Æ€!7-··=ç9cŠÑ%Ì3,Û=ÌÁöÛäÖêç›mî=Ş>¾š¾æåÏŸ¬½ékˆŸ_ªÚÏñü©½}İh“êª¬os:õW¤¯·¦T57’6¿c¦ÖÉÓõ—gGÏS#÷32ÚŒ¤Ú™6_­cv¾GŒ_ísúYëõÎûy2ÄOÍûZª+½ºONsûœã­{ÿô÷9ÿåß#¢ã¦¿vŒØ×=]{»=k}õKsSÆÊÇi^‡ùš î0?1 Âö½®‹í_x.#=&ıæ9{óZJn†¿=ÿÓêã×sâÍÍù\Aß>?>ìõUñ3•­Ï×|ÚöæóÓ/œ?õsôS{'NŸGúıºÍÉÃ>Üßş½æUÏôñTŞÎ¬&³3/£™s¦m;dĞqÌ·2tĞfô^šÜIä0ç"Uq._úÕ2SIŒ1©»ŒiÎô®³£I’F’û¦Iš:½çEÔw›v¦îš¤šfÎ_“èÛÕãú:[ûÄsÔµ™óœßèóÜ	§?¼>|mûäæT.w­~‡ù‰ˆx¸ÃüT b¸¼/ûÙ{áÓ?½fŒØg`¾ı·ï|Ñ$Oò¹»æSÛßÙÜï«_:í—ælqÖ×ÚÄ¸ÇÍ§Èã{HröÌú‰EŞÏæûó;«g?¿^úë’×ãôú©çÜúîYşïNóV’ä[ÍóŒM;\ïcÚ~ãhÎ=?ìóşºkGÿÖH;ÒK’º‹Ì&Õjóvúvù5z™|ëLş¶FÓTÛ$ïÙwÙ§Ş·õwGO5>jÒV÷3Î:*ñI4š4¤ù——£ÓjÃ½û¼·õß…sóOØÓ0Ûp³³~‡ù‰ˆ8¸ÃüDÄ < ·\î{ïmm3si7¼-Ïm›9­·ş~îéÍh’mn´Ö?µİ¦?õ)úÓŞ}Ÿ^¿FÖígß¶İUòÄáµÜ>ÆMngşæ„L^;wÚOæÃ©³iNnŞÄø×æ«^æHÓ½ôšLíü¾”ä{Ñ1ÒFf¦füêWÆH*™wmÒvh’ÑîfÒ´oe„dö÷ùÿHgwä®MÒ†jÓ÷)£É}ªæ åïGr÷÷<NoĞ$šß’œxÂÿ/ù‡Î‡£¶¿¬¾{î÷ÿáô÷É£?÷lo ~‡ù Üa~"b Äh88zîu{ùÜ¹ŒZ°‹ñ&­ç§–vøÏ¶ùÛT~ëû5ÿ¢ÄÕ£¿ÔRÆÛÛŸ\Ş­å×<¯z_êıÚëïÚçÇm¼izÓ•îç,}ï}3ß<öéIWO“ƒ©±y¿Û’Ù/Ãğ }¿õCÒÙŒet&éÌG2š‘9|“´úZ^íŒş“éıof›&i›»Hçì™õ>LòwFŸ;Nùd÷ÿë}}Ê×“hZı’HIzèh‘¶‰JgÒßÉ£—Ğù“³ù¿¾cÏè|ÂÆó{NŸL÷ÑKv‡ùS <Üa~&b „µ×ç¹ïõ^Ì‹zkOÿÛM=kÕ77å†|¾ÉÍíc\cwó»7ú‘ö§Ş¶%7Íï_»İí'm¶nï¯®e¿Í¼oì?¹½¹Êú¡äª§g'sÿ~rÚ9K¿¿oÎÎ’û“ÉÁ•¯CÒT›?ï0&I~4òöôıEŒ™¶ãM†œK›gKŸT«™3ùøjt~Eş5éh‹!ÉŸ5Ã‘kIGí›t:ÈÏ†‡›fí}›|ŒD›ö½™šz{œq	m“4f?~›¢4™iH›$i:£{ŞõÓ)sÙGmôöüknÎËlvŸhhäÜ½rî†^YıÙ{H>Í¦}^şm»ÎOyİ·Ï$ç6ÑCëÍşõëä·gW—W'>Ûy÷ìÆl=¹zÿe²÷ía~ºızıÀV’#?½Nvô‘mFyüÃÖ0¦óÎHûñoF†ñzrı·4‰$é¡i;Û1Rw"iCÓ¶m›ßïb8µzıN3?R}Oµš5'{î³[ÔÜäà­rĞI…s‡;ù¤îıwŸz=úÙ¿úı´}]¶¯u333)Šp2;“‡æ'õÅÉ§²“§ú&ë¬mîtÕíøÿÇVgiI:)4'ÓZN6ªFj™ÜÚRµ8½¤,]*¤Çz‹Îï¾-ÓJ·çlo?îMÒÉ©ÛM'§ï1µ[Ë¦._HÎ¶—/597õØƒ‘><z¨ÎãÇ§$I—&Ç¶KãÄG]>VÒqéz·foÚ/ŞtØ_~Ä0‘Z÷ı8;	%¿Œã8mÒñúøúíÏ_öV^®×BÛ
+Übzã«ë×Í÷„ÛÏxğ¸£ùë|(š¥¸Lğè8—Ùz3‡l\Ì?ww(ô³¡ãÑö³¤kª2RêwòÇº‘ó°½ØĞ@äYjñ23íGëd]°ºóN©[*gê0$~%=çƒËÅ(8ECÛZÙ¶3SdÚp{È…Ç¤ÛU5v¶+o}nG³´ÔeÛÚWró-–İºñz;8vkì	}öáxŞyÏ'zÔ˜hÇ1Ë¾l5¤2¿FBH¼¼tCÑd|6œ97>8>@¡OggS  €K      {     ’³:ÿJÿåÔÿ}ÿJÿÿ
+ÿ.«Ù±¢¢­Ÿš’×aIÏ”D)_¨€ò8àÚgc„àÿ í?åßá·„ÿKíaêú+ó`qí,ğåàYï½oÿö»y
+lçxÚŞAÛ›Ä×ŸÜL¹“vú‹§z3:¯÷Ôì¸–Ú{³³ÂÆPIŞQ[wCÉ®§_/‡†!¦\•z›Ã•ß¾Ô+”y´©¬öîë3dˆíuçC6'¦ïíÍ/z¨¢/O¤ëõöÎ7³¿©&V.o¯IWîÚdX?¹q×ôIsÎ"‘lÇVÏ½âR©ñYV‡=’ãiÚÜÏh2“î;fæ±ışÚ‘‘«Ù5fªm3İİ¿uHş¿¬Í¸ËKÚCŠ¦ª{šì¸£®_|)‡ÑıLS®©9ÆæıëŞÜ7i;´I›†Ê¡šŞuÜ}ëXæ¥iäê‘»9ş3"ÜiúğÿqßK>Iâõ‰'‹|].Ú–úR ä2àôÈisìù»uÏÁÇ:c[¸4(Øs.|„="ÎÙé!*üŸ-œlï†Öæû÷mVï4äöôîÙMwÙ{;›-5¾ş»í¹;«oš'OÍßÁ§ßÿğsoîÅâíG:ÿşÛû·ÿúKWyïóvúô¡\-½üÓ¿<´÷µ¿ÿş¼¨UoÌìÅŞòŠ·L>üõk*I;6'‡gÿûÇg]:öØU/ê\&vdÜîøO¯/~ÚÅ§Ú´ÉÖãÒÍ¿ğå“¾ÿÑ¾~xölÈíWß¾$‡S&Òql}Ş´íğuh3ó
+/»–>øæ·ïŸI†!LN=~mFÛ_wûç,Å¾ 4Gmßmv­ÓWıäœsÎ>®i[dáyUŸLÙLM´´ªıĞSk"qUB?„ùz½³q»·×['sÌlî–öØÙì}Ãşı™­u²ŸÌŞ7X9ãÔm³7MØ<:¾>91L¹ıºÛ’÷‡qì‘#ò oÒ—^êƒV&.ú"Ú•ÉëãøğÿÉ0d×´)Ù¹ÇäŸõÆñ½Û·Û~ûÛ×ŸÏ¾,×oîø|ùä›¶†];†áÕ¤í›oCŒKÇ.%m‡‡şÙùııo~\ÆòJ;ÛsÃ‡ÙÙÄÒÎß¾ÉoßŒ/ä†á¡‰üĞTOÓAÕœøÅ˜¯eŸäÉ‡Í}r>ö9§?ÀZş %=ë¯i!6ÇêªT­ÍBzlçÌ,f/öøã&/>_šß<Å±ËŠqiÑ,Ù±c×,dm“«Œ“Ë:±N×#ëñåp|óÒÍÎdìŠhÓæ˜ÇOÆqÌ®Û[;&VD‡W˜<şHÆSW³ü„{ÜÊÙŒÆNìÒ©G&{ÌÄyù.n{Ììì°¼CG/²ZCÇÉ­6ï/éš~d4=¾•Ü0Of¶	Ûc21fv;Çe;+:Yš¡c:xœ‚"Ñë"³Â4+9Õÿ%rÍíJe%×ÚIÆRÌÇ÷Wÿ6òªmı¸Ê¼ÅtÛ°a®zôp]Àz¾™>Ø÷áíóŞ·t”œfdã¬y3
+Ú4õ’²yñèãüWåÃ½÷æOLï¯ßF¯¯o:½¥8Òg#…í¶øhÊÙ×Wİë—–îVí^Ê›¶åY¡e©¬®+›²¹¢†e5"|‘õC‡‡Onf/xáæÕ·Ï½Òùf}K³¶æãìÍ.œæ°ÔØëùº¿İ&ZKÃ±ë¡=¯†Ùlj>¹Îä´]KûK·×W³;›mó<#MuXZÑóÏÍéÚí2um,M“¥š4ór•¦ªãºaÎ¦ßù!—&44Y9Fz™fzØ>w?sÂ·‡dëaé˜¨cv§åŠal,Ï¸ú¸své¨!½jxÄŞº{´1vgÚÕa²|ô0G6ÉrMbŠÆw®sËa$ÚIòh;8<¯†¶I¤ƒ ¨\adÒº²iÿR¦‘Í	ÑCT•ø³^Oñu  É­ŞiÊâù0p¸ŸÅ›íø÷[ ¤ÅÂ¿6û}]÷Æ{cì¨äŸóûıÂ›…ËELèŞ@«!Êçï9$TEÆ"Ï°S‰Xi»l…àr"Ë‘maEÆ†¨´vP”{7Š·3úÎïXõè[¿Ë¶˜=ÿè0¾û?9ÜLŒ&‡_Ÿ™MuõË»b½µäÖÍÙiOÜ½´=Ìf?Òí w#kS6g63»?çîp‘CF§gmè˜¶5lYnùôÍ"‰¥›’4zôÚ‘:¿ö;Q‰y92ÛfÔådşjÔÎH±6s6mš6m÷s¤­h^yåÁ!é0öšvÈûíq£vS¸$ZiÏé‰\ÚôÒÆf+Åıf·³17'3’&™2ûœk2ší˜0ÖŒR >ˆ¼ÙP›Ç°¸<ÄDâÈuÄñ‡ÜoóLgñöİëzd€{£¬Å9Íi¡›·ã¯ÄV_ùnîŸ~ß¿˜mÊÎ^ÏwÔ¦Ã#rˆêHX–ÒhÄc6"BG‡›)ıq~Ö‰·tRÎ±œ—CCšÃÂñÔùNdvÛítE'·.È(İœŞ¶»ps¶[4™¯_\Õq®›¢—¬»Ş‹JÓ˜—Ò8õôj(SŒvy
+#f_ÓYÁsÚJ§|è´>7s4Í\Ú¦M¦¬£M£çGŸ«^MÒÆ>œ>Ò”æ:33GÓ›k÷Û›x£GÚ-½ÖJ÷q¿õëÖÒOßÍèì^;E=/ XÜb”ÎµÉÅ2æDã¶Pu„*§‹fx~¬xõC:ßxÏÄUG§'‹ÏÅé kqÀàìÌºLĞ˜+J;˜µÿ¿£«¶Ò–«qË_9‹L¶ÃŠÜYÿËà’…‰†_·h-·½)	xåÈƒPçFyŒ:ƒ3c,!FZ2ñ€#7›[_õ¬ÙßÏÖºãüØf“šØºåüÊš¦óvÆWhÀêig§uß’¦“C—’&…\Û(Ú'ñRDŒ|ÎNp‚û­Í˜é¥©Œ<ìsš "Û£Oÿş¿Î‘q2Û'ÎdHşŞ÷!¢Ò4Ñ¤º/=¹‘=ÒÓ¶íy÷º&m
+ Öœ` Š	"F<Xœ šÈ”ƒ„^ p5VŒ7æ?ˆÇÇwn>W¡IÀ¹SPxôØæüî€8ÛÆÉÎîSÀÍ¸æ‰óë+Ó.“…öĞ+¼Úö8Ô3ÛÙõ«K— í†*#'zxCÑ’_ÿ	’å¤ØÇfÏy]¾ái³wÙ×·Ì+şÖÇ¥ı¹û¼G^ìâ±fæåÎîyóëÃÇ\·—G&Î·™Ù¹çlåÄóÛÃ¾n½rÔ®·Ÿ¿ÎwCÏxæÙÚf>ñúÏ–)«ÉX‰(&±o‡Øö;¿’j:Úd®™§_âö•®£9¤i$_Ç›óãsÊvŒú#@Ûc—·¯æå1å«mNNÙÛ(é\R:ŠVÈ5Ú~,uøµáqóµû?ä02 ,I'?Msït",¼ Óé÷9¨:9–ÕO“Ù¶²^^;ÄÆ­ÔÍÚ!İ%%µóx*4'ñIsc'^PiÇnÚak¦³Ã8}Òê]‡iÓ†qbÚŠ‰V’d$µK¦ëÄ²	¦6Í8Î®Cj41‹1†YVŒÇÉqr5«=.c»Ôñ%0„$ãô©•H’aÅÄ´‰21$[Ã`HÄX.Ë±%cc$ $KS\5ÍµÜ}Ù ñ ²(/eê‚Î\]è!6µëáëŸğ"/^–ƒï¶‰i{šŠ‚STµD#	cÅKrËJ*­¸"E !ëâù4=wÅz1eÔ¦¥§ÃçXgè¼ÃrUÙË=míNt†“ã¹‘É!ÛÁ0mÌ¥h®‰HçR£’¢±İÓ˜‹¤Aj2ÇÌ4ÕfÒäŠŒ†¤Ù$´Šsğ›$ÒJ‰¬â$¦ëù¤ùÏŸ_ÕgùX¬IQ”°¦ÍšùŒİt°c9Çjã•¾£ß3Š§ÿ/•æG3ÖvWpè%8útı´¾ôüqèóuÿãq·ÈşìTó)39z´™O»ØvN6“Ù(§×ˆÑ”ln,	‚æ!eÍvßö<EL¦
+lº³&¦r®,¿Ğl5ÒFŞüw§µ ÏØGdI+ %v¬ƒR«®25€p yŸÀo7İ˜IaçÇn¨9Õ!¬£ÒtzÇ›x)¦[.ä’œ÷[ñ”2İ<@/"§¬?ÉÊ§<İ#×AÛ¹fY½ìÆ”©ÃŠ%Ë"ËØSÍï/*À² à˜É³#ëÏç'®öÍğÂìÛOÓÇcÇ¹Úté¬¨n,%‹aî}í^OëJ•J29e{å¡ÏŠïhQ¤gW
+ĞY	 È:mµ%©Ò¡¨ƒ•DŠe!ÒM^tæ¹ä l&—qı¢úaT”é@ì÷²oŞ·³ àê¤¡û|¢2õ®<ëf:Í¼  :XWkZº…9Ç”€ÚekÉ]t±.	»5l^¶Yıp£cı…èèX:lœåÓLÚvdªä´İ—µ_½<}¶­SÒmÙ¬·'ÆáØ)İN‰Ç6»Ÿ6/Í„FÛ= 9ŠEÄÆ4C 4¸°  æêÊ¤ÙE>c  8jsïšû ¸ŞˆÑr9  şGÃÊSœºNâğ9}:l¤ıõ^Î‰®ææØ«äéS7Ö¬Ş À»Zr¦TÇ&Ï%ÓÖû×Ô<  àwwÇİ>Ÿ~âöwuñaÅ‰ç¥Mß–dÔn·4Í9q÷ôtî.|Ûm{ÊAmÏ‘³Ó¦Ûõë¶‘û†´Ğ È4q£Åò˜ºŠ¡( Và9  ÀX  °´"ÃÒyƒJXª›u|  şG#Â;‹éå%Æ§çõwSÈ;bz½F¥fòeë¹·ì´ÔRó2 GšV2 ”î}ÃÍ×>å›ní]ÊËÖï¾ÅÒƒÅ‘Ó“+V¼õğÇUÎ7ZäËz6İH×½OÚŸÏGş¾¥½íEØ9Ü$Oİ‘Ü$óív°ÿï¡n ã!313iÔFÛy˜“ğ;°
+ p8Ği*€ß/èŞ8?Q]”P e,Ë’I«d(
+ ş7s¨ærù*4—ñù³ğQæ¸¾Èqîı`úa’u¨ËR¦Mıõ2cTM&mi’çÓUüş¬›«×:ú9ö¤ôÑîÎ‰nî°ó2Ë P¾  Àıïäñ^«Ûçzu5¿şÁŞÿÿ{¿»ô{—ÂqyºOûİºr•aQ ûK‰¯í÷Ì)‘N¬:[ğ„) @Ç^"°bü°'=ÊÓ5/İAÏş·rÄÒ·¿¢(5ğ‰×3ÂwşBr“Ö?Èv$Äz¶m¦[*^`ŒfÉ™­íè¼^>¬o;«B»šlµwé“¬¼…  €ÍQ¹šàÃ›ııù1¯üó³3OÏ¥¹|ú	l×‡?5‰äßkÚm-)ÉÑß.$ €^Ô\ñÈ–t·¾‡¯,x%  @ x²§G†YJı· OggS  €x      {     BÇN¨§©«§­¯·°¹ºÅ¿¬¨¥±Å‚Š’ä¶Íş—R&ªpÃk‘ãôı¹”Jš¯ˆ§>øË{=KÛ\¨%zÑÑ¬Ì¢ØY,yñéï¬£¹ÆB·D  xòı§wÚµÜ><ùğÒæÄİŸ6{^ûìÉì“wûg=½«rß“Gêõİ•Ì^"!»>İ¼şÿíí°Í‡ş8%WíçÓ  °ÌÉÿnÍ<ÏtÇÊ9&ÕÊ ö`àf+Õ…ªPB:Còü şgRÂuëéÁ½÷§bÂOÉÕ…h—»ÄŞàuoyÏ]éÔO/z€1*,)£WÈÛ/¿.|8¥mÛd  º‘  N0nfódé¡»Ï¾ãÂc³pĞ¥“Ÿê“¹&OÓ>j_9İÿÔ{~­‰ü´}yBûèmêM0ÔU òòsû‹ãvï:u$³( 2 F*ëŞb,F«ı«j^Ş* ş‡bÂÏıö‹S^ëæõ©„ğ!o<ø	nóÁÆ»Gò´À¡g·D/:€1eõÈ×ÚêO;•S§X¹» `£‹   ^˜N>4ëÂË¶ßúm=ì¿>í¶ñôÓìÏ?ò¦>š¼òŸë4ûßJÇÿı|[Égoİõéµ&’¡ ò)åÌÇÓ÷„ÿÓÉRõÈ  ‡n `_z?†¼±gï$Ü4›ıÚ6½ Ş‡"Æ2n¸¢öDxİĞ·c7^À¼´àåîÃìÄŞ{@°½nÁ‹Ñé2p”šU[çÎÿjz`@¸3È   Ë¶:SnÊù‡/ääÿŸaây“Í—íÍIyš›ómôÇŸnÙ¶»ÓÇw·ëmnò¦¯ó¹ùÔÓ/”|½  y¡’{D{‡q¾sRõí,ÖÑ)	¹õ  °/¸€¡t¨@€X›ávØÿ½^¾ş—(RÔéE*¾Ó½>•ÀnS¤¾„êã÷Ãdc"ä©*ŸïØüéBè‹ŒÑ\†ªBL·é·óİGE%Cu{¦Û%ÿóß–ã³OE ˆ&h…—  @Ÿ&û›ÜÈí	ORâ©ı_†Ä¢¿zr0?Òû$äw^\ğĞş3 Àü¨¤÷iR‰Ü;sª7Ó¹úxşó8 @	· ã°õO‘·Œ¬Ó'ş‡BÊ®Ö×ÎäàîşR
+yD#|'É¥f>øšÈõ¶ùg‡è‹Œ)/C…Üç5xíÕâbÃ¥ı¹d  €“+ÏeéÛùÔ;g¯ğèé|ÇÇóúMó¦?{¾Io|hã¾™½Z$yé›´Ò±É‘Öô¥7rŞ×=OùÑå»NŞ¤‡ ÷9•ÜçÏÎ„B´â>µeK6­ÏĞwï] H&" îµë1H°hHÏçzs'›¿¨? ş·2Ä©\/á¾0÷µ˜°ryMÈ+Ö­ñƒé' ¨öàài:Õ½À˜œË@‘³²¶…×ë½óÛÏYgİ|éşş§·e§  €eœN§yéÍ~›ÇİcgZruä|¤¼ôşêÎUÇ'Ûôº¯guHr'û·ˆ?òí‰—šu Ğñ_ãyÂñ~|®óì¨ßuÖWg‘„s+X¶~CÇ<¸; Zl4¸\ÑßôÍÆa…7ıáş§2ÄO+¡ÏMhÆ;ıc1åÄ¨ã’$x|ñ{{öĞúìî‹ò
+y¤q¾L%ÚÌ¾LÛëõà»]Á¶ ğúÚw¼0óë¯>Ùúáá»é{OœyÜäFÿû|Ş*¶IÚÃóåíÛxó¬ùl×Gr~óşú1?å)Ò:Ÿê20@^ÔŞzû1ê|¬jKšã”¹ ˆú ’„9¦ wÏ3îİ‚ mŒŞ¬ŠĞ”WİÏ%´mjŞÈÈ şwÄÈt„²}ı[	1a>”5u*ş 2ê{<´:E/p,W&B·0.+É÷%›CƒW£~«  0|³n\¸î^öüşÉÿ›Şœnw¯_6Ÿ~~Ã£Vöyş7šî?ŸˆlIÓÈe|nl5íÇŒ¸;îö©ÍY ¾yûÕG×>©Ó!)	İ'bÅºP1¼ô= *\¹Ş€–¬ˆW£°DÇÚõcsd¬ã³'øı ş—R¦ÀÄi–†ïøøo%T]‹Øn8Cü}ãzv–8`}·sg½LÀY™`ÄßzÎÒşÂ?¹ºÏyî<Åşiî¬CoÈ’1æ¾ŸG_§»ó§¾î]Éµ×ùõªÎæ_Ú4æm¯¤q–ı…¥›×—÷%ş- àäL´g© 
+ş$™ïi’Vqë«?OÑ^'¬T²ûß´0'!ê–V¨Vûş\	I«?j.Ævö®÷+w5¾Å ˆ""±ô©K«;!ªòSuRéÓKáûUÖÇvØœõ" ³*3H¡q{Wj÷ÿY¤œ¦èÈc>n–¼YêÖ‘İğêTons;Şôt¿óç›r$gëq¶ğ!ÊúàÍÓ’y\ïiß{/­Ó¦Ì\öúT:  ù›ÇfŸ[÷q¼¿$yn#Ä(¥‡¹(¶æ3Árõ¥(¡ú<ËÓosÒï¦¹ÌC=´ÒÆí´æçÆîƒı ş§
+Ì0Ñ§©{¢
+>(ı±ŒÓ0óq‰ù->Øÿ ú3²-\gî<ËT°dy]~3ñÕÆ 8;1d+Ë&÷8òë_ûÍ‡N¼a“³¬äë~¹êşÁ½êæƒSºvxv¾íßôÿ}EæíÇáÌM›œ*†´²§k5´ $ë¯f;§ãäı#F=ûvûg'hœn)Ÿ$7¾«Q´„‰ÒA½îÕo*÷Şk6ÓÕK ‘ä[±hùi(-JĞq5^«vó¯ëá%”W)¢ÆyØØe> ş×rÄVaIÃaşÁŒÒ‚Òç—Èš¹h}ÓÉu´5›û¬\–AçNŸÜû©œæ0™œ›ìö´å3pr1ÛewŞuçy37‹¬e~wûªë[“çÏ²sM»­¡Ü}Ê=¹yÊ_@Î.òŠ?€¦4ç@>Æxü•û˜×:AhzØg‰³p;k.ûµ ¢şÉ~ÀNŒã]:
+ë.S‘Äæ@*TÈWÉï¢ñkeÍí7ıîèÿz¦ƒâ¸éFµNUÏ>Ø
+Ì(YŒFŒ9å6Ñ;ÑİHÓ={)Ïê¬ÓU1ıK€Yƒ&§»<¶ÓŞ÷4.ÔÄ¤õÓÿÙõáÜútºmıäsúäDÓfæôtÅëKiDÚõºÎİŞ¯7"8¡)“=ó³ıáß›?}ñ£¯¾ğˆ É*%#Ämm9ù	Í¹GYÕjÀmèŒ›³¢US.¶úé*[{âÃó}sá°uõ7W>Ø2Î_RUªóğªpÄÂñGò¬¡ß`Üdß¶r³fU™dì¢Fgâ,±ığ¿ñúå¨gykÉG–±|´İ:ÍÓ´;U¡Û<½YÒäî«"íUÏÄ'b¿MÄN]iÔª›sœ*Ñ¯w54®¹Õ1Jv~åÎ#C¤ ×«ØMg
+s)”nf2÷º\!$ZÉ·í/aíÜ`z2uWŞ…R[)£ºµ¤N3|/=şç2àÄõ¨|RU÷á_,pKå£è ~z¬}[Ó4sVU„i¦§wSO‡.“±™²†uëüñ;Û·òÙ`$í×mm'M¦§_MëòcCº~pzöt}Ö»ú|}£¡0o¿ØŠ]Ø õw:wzLç»+ô<NØDHh  >–Ä\ZÉÎŞ–q¥NA¯õÈhP”qw¹(1[ÂğGOLã×^—óv1–~Y)>sà#BSZÎ†¦ƒ3†}Ì¥.á:ü £˜ÜÃÁi5sV•“;M¼er•.’§Â!‚eÑC½U5‰µéSí¶ò7ÙUõ4·Ÿs{!{±<·]ÿëÚ¯¬zy™i`áÃ¼ÿ÷kæm­¡w
+ùc¬÷”—æuP©dh¸¢İŒRJ¤ùWnçîÃ]‡ñÊl4¶o§í‡Ú±/)„4Ônã©7¯t§_úåN·ò‰ :óÚÈ* ögJ°¿†Ò.V1ÚïUj·zòğ|qé~?¬³Í!Ûr¬ë «iš³
+dœ•–Zÿ—TÃ*k¯ä7Ÿ–£­ûëâ?Íìùôxúé.÷jÁÖéÛ/í§gí§@ÚOŸ_ìî¿yáñÍB/rp`ÿúéû=ÍoÛãÁ‘‚¦;Ë;9ÁK.´?–¹“ÙûXÀó«Ğ¼!1„œıŸ‹ªSp§A©:ú. «ŒäÌ
+³øÕ!w‚Şø9”wÇÛÉ;}òd+{;JÁ"ÈrÕOßs<[—#—K.û­ùÔÃôqòˆöúÓ«4ÌÎ¾rìØ‘åòüü¼MòúõO——ûÁú¡]—û’Ø5şù¬î½¶Ùè_«c$ëu$IÛŒå2’Ë²‘h³?rÌa*Ñ¶çÎmo¿¼T2ò¯{÷ş¢½»îŞsşNİ³7 $QÓ4UÓœ™™*<9šÜ}^æ·o[Z¹{÷ö0m†=Íä"»vÌSæéù<í®İíG×ë¹d{Y–e$ ‰¹nnn®óz•hIt½^g+¹,’$cÜÑ¹^ç«/YÆqt¶¯^'g;FZI’t>a£­É¸Œ1’1Ë˜LÎßvÎÃÃ£ëÚ dUMAwÕ˜°™Cb÷s&UnÉºmİR/ËĞæ±íiÜ?fûlûÕ£³+^5ûyé83×s¸Î#Çµë‘nçÜ^M†rĞ†¶I¯ÁÜ”¢f»rÌ†‹Zj¤ZZ#2gÚŞud6Ì$açÒ”Œ·ŒÑŞ6çGÆŒİ›©’$EË¾%Š"öİèÚÑÑ?îeLZ-8¯ÊXÙ|VÊk]¹TWhœŸìŠ2=ë@ÌifŞÂ3®@[wG|Ì?ÆJ;wğV«z‰ÑÎùê'uJWªı@EtÅÔ7\ö¼œw}15·š¸=ÌONNÚ}«™=Øš×£‘\ú´ŞŞoœ·Ëf‡İÍç™w[v#§£=Ìó5Í9 AG—ÎdÍgØ¸¦!MjÏŸ•b+·×ıŒ­Ì^(‚É‰’WÓc.´Ÿ‰¯±³­£{iJI¹îŞ>³H=¦yÆÜ];iµì_u87c˜_o»÷}äd ¾è<¤HT´®©Ì
+"£+È;­ª×k¦{¯¶<<Ì?ËÍ¹÷îæE}™Æ=Ş»µ¼q°ÑWøùÿõ<óñ4—]zıeÛmÓÚ	÷9ÕJ’qÜmúÆQ”hÎ@×»=DA…y	eúŞá2[bw<ú\½p&D“f×QĞ´ î”lğşÒ£‡Ãw®ç=AvpÏı
+¥É1ãJº!
+¤iÒT@²zË-e{½Ñ)+ 6iœ*E9´+ñ¬s©ì3¦4ëÚJa½ø~°ß¦tÿİÏzw[ÍcgeÎ“í}Å¿8îõnF/?uÖ7Nşı/„Dxü;:l:»ãG‡í`<şä‘›>ZÎËú”cÍaGmç`×D–³›í¸åíÉœmJÆÓ¶a›öB’‰ÇZê0¶PTIv½¼ÓÚšAúŠc÷>~F‡¯@;ìe‹T’VÚh5W®i Q±ï)}Î‡uJ
+	 ºİW*Ä‚æ8^†ßPªûrz{CÜ6OggS  €­      {     rùGÿ#b~zÌÁoj«flcWYW”{‚ƒ~šLc^NXYšu~zry€z4Is„OÓAÂsÁ*X€šŠ¼·È p¤n0È‚ngXqë,mf/;šM¿øé¼ÃÙÒq!{§kY[ì2T5ÌÆ7Iæ:-ËPœò‚KzD^2DÔ­¬>´$Úp?¡âgº7E×"!Êš ½;Zè‚Å²<0Mó¯o6]ë¢ñïşşZ]Ä²<·³â ‚z
+`l:cp0aİÍf?›Ck¿]ÆİóeÑEVó£íXAmÕtÊô™gH¢ó`Î¶ĞÎf¿™„™±,Ë²,I´U2ìÂ¯"™­1’±,ÿïöÖÊÿ&,U‡&6Y‡îş
+˜äd0RH{]qPhX2Di”¦G¡(K½iYkÓôÆ'¾9|<<IsèÉö6É‘}ç2my›nU5‘½ØëVÇ y ÑfÆ¡Ò K+Z)•d¶±Z«= ÒÂI+>m[åèa2Çæhê¯ì‘ùJZH¼@„RHUj”HLfj1Ş•ÕÜ´~°3Çnr÷úÌé_4çK ‰2±<Di¡zè¸º·d27‰³Yşıÿål¸ò) @€jYÉî´´G‡%M×ë‘uvj9Ól7ÇÌñl{JÓ^wt3±²•Å|œ§ƒA3î/*6Ñl&¶Gço@$E·éÃ—ás«ıçÖ±,šÎÙÌhšæZèOdd;µcsÌ€ü­áĞ¼¤4è%$«©)Íûh˜Ö¯Ym>}ÜÇ	 ö÷;PZt\¦aƒ	q
+‡+D¹(6éER=rÄ÷:  ®ê¶¸÷@p3ÍŸ¸@Koqïp|¸÷Îø¤˜)‚sÓ‡ÈA Ğ»(Ø:è¼å'V»ÙQMÖrõŠ]ïß˜a©‰‰ÍbklN9çzé9r¿?5:xZvd>¼©—Ë;v‘İvfÌ%R„‚pLJpXÍdÛ)"êŞéúnÛ‡ç½B‘m;]o¨è~î|/…0·6 @0õ‘UZ—0yŞ{CáuXób£Ó 4KŒŒ¨y¢@x‰Ñï‰^ÉU<)¼”<LzÔ~ás.<o7á\&†);–(•$i;%[«,SHµ+	ˆŒe\’($¹,#2;ç¼Ÿ­4	w~·uËótÎÙÎ‚993Û«I÷îÙ«„†0O#ÿŸÏœpÂ2õAÒÃ—ÀH›'Kµ7½uÿ(TBÍŒ­yÌn7ÖÍî;†-Ÿ<ÙßÄ8-v5ÊîŞw6’P¹˜ÃLÓ4‚LO3ÍŒ[×W5êôfÚ™wÅÈÙØÏ©2^…æ82SiÓi)²9ÚÒ7ÜÒZèÉ3ëÕu€7ˆÜ¦PÕ{–YéÙ£ş ‘¥O¶¢çjí…—qÍ—@Ed‚ÒØò÷ãÎ ÷ï5ÎÛ'ôlıîÍ—å·˜œíìÔ­VÇûñS¢ØœØd!ÒaÜš(é%ã‰„F±“¦ÖcÆ¾sÒ”VDjßSvÏãmSy¼¼¦­³!‡È,Æ}dßôxók µ.Ñ­Ùhjª…ÅØ–ñ#$?sËÜÊ~!ç˜$Æ*Ñ1aE—úÖi€Tºµqn&ã0»«{F§Ç$Å	ö®–ˆ·Ò£Vê-ßèHöN"½\G	XLÍä[¥®ìY} $ éÊq@[ZùFcÏÙ09ÿ·DäŠ Åœ8Hú,á™ÌÒzó,M<òı÷W×õ8›Né¤å]1ÆÙ¤Fcs?j»vÒ8çí=^+W]%“C;T+º<Í”Ûz¤Yæa¯£RK¯Ç$¤D¡SgÈ(\GŞñàÒ9Ò9ÓÜbgÊu\gÄ€z$À8›w!€rÕ¸»ØŸ¤¦öN”uk>Àñj]=€(· €Ï±ºW¸åÌtEˆbX¹¬HQ)Éä
+4&F¨¦d¦9è‘G¯ãE ğVÏ¹ÎÌa±{G9Œ~Cìuç;° ‹ÂÓC$çãŸE¿ü_ˆd;¢¨vì¶/S±ŠéØF.TÈ†f'È˜€NåÎå«¬ q   àp?  ¤+€áF	›ù 7ŞæN¹ó u›óÑ:‹¼“Wÿ›c'Lfû £C¦înÎuû®ù{L0Ã~ «¦ªTU$—g­µÖsopw'MâÀ7- È\z ¨ÙZÕ÷?5üºP'OĞKpdş…o­‡p—ôw¾îTu@‚›MGO·Ïkçå<v»ó1º‹Š¬:ƒPìäWùuÒãmŠ¤˜³:š:
+ØW	à™ €1«]€Q^"¤Y#
+Z8Òİ;}	—MOÜÁÅÚT•×/sêÒ-äz‡<¶ß6ó[¢ñN3¯çÇ%ÿşùs~içC¯˜Ìÿ6¹Õ­nu.É\/ó2ƒKßwNkj;_Î§#õ;q~Ûíú|?¤!v5  €¬ÜÇj®Êñ`ÚÆ¦6s?ÃŠ Hs(8}%   Œ¦‰47q¶§íS >ğÁõ—oN—ôÂ¤Q§E}Õ7òªs¿îP.‡¶™³„Ç¨(“…ùnêÓ±Z;öºÿpÃùÏ®_w¿ÙÓÙiÆ\gŸòN©§¾Pmg\ØkÜY~Ÿ¥¦•|Á  €.0Dúì¬H  ö7`Ø]  PÆÆ
+V2Ä7>CX#òË52Ûô4”q Råñ•¸§ò½}­™1Rq<R&Õl²óÆ×{ñè#ÇLqº¼Ş¿6Ë~¹\2Úî½MNïÏq=Gº;ª6uÎ¿šÏÁ<z  è5nş~—?ÿıòÚtÜ¹*5!P|¸ãÌ  ­f5`Y(¸¦3M	~ÃÚ¡uTUŸ|Ò¤u*ºjòn}ÏÈy#ô8¦š³È}1'óï{)3yÕl&6Iw'2w²´’nÛ>rˆ˜&¯û"‡D%*µÉ€ìö¯y¬JãU¹ÅíLÃùœß‹-}+
+¸Y  (º¿ãöÃü‡ğĞÿ³kãªj.N>ØRŞ&Zb0=Ô=èéÑ½‡Rçïû}Ïrhsº¥c;TdÑÙ=ì9ãæ3wÚ>s¹äëÁ…6GNm%IvóywÛíåºÚ?fæø·Ë`ãEóİGfC-ÿiªS æaóª7$(À2¥X	vM<  «ß¹…À²Ô¯VÈr:‰¦ãLƒŞ¶x£p}í,£<Ïº\gYFŒÇT!=œï<áûÕØ\?·¿ú*çVêcövÿìÕóf|“ói—§7¶Õ#»>ûjër}v®ñ9ûÊÑ›mÓD¿İ!í:œVÏ”P¢¦¿Ú|G5 @cßú×ÿyXJ‹ä”}# Rp	T`gq¼ €"+x×"uïˆ ü4ÂˆıãX“föÑ hv˜\$ûu*™}äÉûİòÖçÌÙşË›È—ØV¥mDJŞÿğĞs®..qŒÇÿ¥¨|€Ló âÿüHŒ4y«–{Rã$ÑÙ¥qe§Ó&æíAD§lÛóZû±Os6#´•èù0_®$±Ù“ï}1ÒVÆĞ9¯sİ<:%´ıŒM²«Ûuçã7»Êiıß<Ÿ“›?½ıÁokì-; üJpl`ôLDç0Î/&·ºpnâb¬«YÚ‘:f,gÇ9L®hÔ†êª3Œ¹vu»é\¨Ç_ĞhˆÎ®:A³êb‡“ÙÍxM;ÓyÂ#Éá~Å»x½Ì1@æ¾ ü8œ•‰üyx‚%Ù÷%àØõîÓ±±ü]ÌíH†	wÓ»iÛVÁrÚ&Ò)=øÚ ’L¤˜{¶€°w_òW`äc²ÑÑ ¤Çá ü°D—	óËWJ;|"Z¸ïöäjóøv8r,É‘ŒM’îfû,¾Qï”³:›‘HtSÆæ:sİ|Ÿ5äˆ9Nïûù£û %Pı¦¸©kÈ Np(	µÊŠrµ4&Îà\[çqµËÃË¹w#zšóÁÎFíÎnr\8çp®öØ9{¬˜aÙ°Dg“¨®hFÒÚÏ‘µgnÄtÕ÷‚ª§óİùÚbbmŠ|½ØìÀ zør½LUåí—jp(½REåÅÛ‰tÀÏp8«ôè´
+låÄW|hÿ‡iãú¸íûìX³óÏysä.Z=qo‡]‡§¨ëğtÇÃµ×îöÅ»KJš¹L¼¼C¸Ÿï‘WrcŒ‘;³âVoî~şœ›‡şÈ8^'c"º2 Áˆ£¾tà:xw¬èØ=ï
+	È¬ŠQ×CÒ§Â”ºêÔüÊOØGß³ğµU†Æv´4û™–§¿ÿĞäxÌæpqòŞ¢·?¹a¼áöDEc—´÷ZGß¯Fï3å»Wùw˜%Ò|ß Àš3¿×ÆŠ2ümqYŸÜËƒ ¾v.FGç.^¨JP¦•ùë’ß]ëŠQ)1˜®_MÇÂí`áĞ6Ë=…0_L<½Õ¥£ëÅÉƒŸÎÛÎ×É§''7é~ro=ÜïkÃÖ{Ë?·áÇ¬ÈbCü32H¾¹.  ÷ƒa­«Î…¹_[ÿË
+ XSo  $äûBÄÕ*Sã\; ^xJ°¿ÖâõhÍ<óÛU!J1Óâô>-rš{†ËÑ,OˆãA“›Ãs;¦ÆÁîùÁØ®{Ÿ¿\z¨é·×ûîİÖ¶ÉF«îØû£GqF†ú6ñn€~§y  Œú'¨që\ü©ì ?X¸+R  HèGà”€hÒŸ~ˆ
+ÄO‚0wÕ™^;Ã!Ê „ûE¾­‡˜g9´Êy‚ñ%ŞON}³zy%ÙÌ›³íó†÷¯Üås«ÚÏ·.ËÖlß{ôo£øS3«qáv3zÀJ7}N+®TLĞSŠ}xÁz8‚ ô9ğVjöå	~h
+¸>b;tƒÊ‡¦@2´:]åšé8s‡Ö,':QÚÖòío¿ô,†Ícï»svß9ŸéoÑÕßœšİÚ>}}Nj Ì§Í3_jå¥›7G¢ç  À¿†ôµfMğ’úÚr¸?× )ù7¡O ›Ò\ ^x2$CÑ—iG¦s…%C"&Wùß±êm3·zT´ ›.æç6÷ğ¦Çn›Ÿ®Íouñzëp¿·£G¾ŸóªjëŸR=¢¶9Y¢7LCşà‘lö Às*7ÿT&“E
+}6×g 8˜Âøô! ë!K%eü¦· ~XJpŠA=æ–ËCTCYêü²gĞ
+Õg8´¹ZcT„.³yÅ‡^İû¡y—½¾:èmó®~ŸƒW/{µM¿‡-©ÙÚ{şš}À
+Í¾Í¹Y\n· èùêùu_…ˆ8ó7Ã(9ry¯ ĞÉŞß¢( €ÒgĞ†•³%~ ~XJUò(¾Äâ!Óã›CSÂüUÅåÚUa8‡™gèk¹r‚ã»•ıl¯ÿqùÄÁùıc®Ö±î\,ïxâ¦.~R¯®6“İkÛÿ³¿ë‹½Ãö¶WÏ×D
+ ˜åzè4ÉŠù9Û‹İ€f9Ğ#ÏXÏ_" €Ò¿ EÂZcÊ OggS  €ã      {     RÅªózwr}{uƒˆŒ™”Œ•‘—ÂÀÃÁ¹¼¶¸~hJ˜Ÿ‰Ë{²¨Çá”¢Ô•ğòR8ëhiÍr‚£¢"ˆÜı¾tóz|ûºçÖS{ÒgœÖüäÃëvÉoŞ÷N’HÒäı,°Wm¥´xíÃªKäèİ‹¼  ó9nÜœsq.•ñì†ÓF–ÿ ‚VW 1Ç§°ê¶¾f~h*Iò¨¿ö'“ÃU¡)A>“é/G"ÉœBŸåĞ6k¢G;JhÍ—Îxä¡>´¿yiÜŞ’»ù-:»Ï×¨´ÛäŞ9išæÉêçÌºfL{L0ƒ^x,  Ğ»‰f	Á™İ&ë½ê­±àş9 h$ñĞ+ z5ô ~˜2.Sîxí!×->%Ø§£Ï5*Öë³§¤Ë9¡GeL¡¥ÇöV¿>ØÊfÙë³dÑO?¯Ÿç‘1’rW´HÜó"xIn )»4¹ç¼Y¹– ^Ä’+V¡Ì^ì|3¬(‹YÄÎŸO€Ã# şŠ¥~HŸ„kwƒÃÅá¨¤Õ¹/Õ§ŸãósÚ\.¡GEE°É¸¿}°úÑgOŒËb?ŸO<¨ÍúlÑŒ½ºìÁ—}ºêëóêeÒÇ
+—™f¹ffj¹ïÜü+ pŞ	–¾‡BCB¬!î"«±ã÷~B‹õ.¸®Õ ^*q”:GQøÔw
+¸¢®U< ]”ŸíksÙ§Ç1vİvní}îCOİ¼>åäl7»7ëfNéO_D4•V³ı.İd›âœ¶¯-Kr:?³ÿM€·Öù·y¡à=C#? UDÅšşI ¤/HüÖ»; ~*¡Pèòœ¾ÂP@)ƒ|íáÊõúÚfÎ	qSAÍ·í7N¸Åıéà&İŞîp{}N«Ïµÿß¬ivg­Lç –Ş¾w—
+~wàr  ~Mü4³qõ‹xÿt¦üA Pß'T¬İ³Lg/>øIYæÊå%±Dë¡ĞÓÑROôK—8¼¸`¹´Íì³¥Ëƒ–LÒ‰Şˆ¼»V„Zœx³5Cä©Ñ|n>{›3sMkÇ-»Ï‰"åŸß3Û„•`yëØ;=   ½”†—°=Õ‘ÜÈsÿÀ\‡[tvƒõÒ)¢  ri@_ÛöM·*>Ø)QAPØ¤8RÕ)ô4ğ×ºÄ+"­p(}öPp¹)Üé¨z  @Æ­İ]–»¬/lïëÖ³óİSÎ>>ùp•K¶;mı>iŸ”§hú.ÅùÿD c½¦EyşV ûÎjÇÖ‘p4SVÌñP!¹› èŒwbŠ½ßû[5i"à6 c,bç„¥(•MšŞ:º>ÈIqæ‘ªús‚åøèü”¨T³’^Qç7ëÒ§5kŠæZĞÇkåaßWWNÕ^î\¼Û½Ç“{#Iä)w}j™*çëıİšg \Ê7m£ûi"¹Û×û§  wŞı=Çj?ÙÍ teùm™òAcşª†€@Ñã!B*HDuÇ‡²n>èéx5Fı01|Šô$¦§è«”¯3ÏphsÍCÓxRaè|±"'Ÿm&|>­Û>û…8:eÈíş‰ßÏO»Rß›ş×7Ï!Í–½®…mÑuù]æ @ÏÏmhÜ9ÆÁ	´_ \ç~P FM1ƒûÊJVQµ´@ 42ïÂ;X÷Ã6Í èIDF /!¨ók“ˆ"ÅØ×sKÀ3´¹¦3ÇBE¯;2ñLÍ”åXCÏM·_Ç.Û<Ş¶ ë³/wuØ¦Ì%­ÓBvµÁ˜w™cä¯e}8{é Àøç{Ìîf#dªùBÀß¬üÊsØöåcÎzÈßßÿš4)€&æÅ‚?.ÒüíÓÇ% >Øi¨ª#uQâ¬ä¤¢¥÷…äĞ>Û‡ÁÙ<E/k€S«‘7¸ƒºĞ›¯òœÓÃ•3–#W7î~ë×³íËzš·‰ÿ¹¹İµyª7OòòÑªÜ·ç7õU´sØ òÖ×2
+  Í¥¹¯ÿ
+[Ä£ …‚+ / Øİ 
+ñî@Òá¿¶+‚•¨ŞAz´Öôg% >¸é LÿR~Ğƒ‡˜ÁMƒ2¹¨Â6äSè³}m³¹Íâ£…J'ä‘÷8š“nœxì…›ÆóvÌ~X~ÍmôY¾òzGÙò&ùö»å¸{?û¼½t.SÅ¸zíwçÌŸ €¬˜ş@M)š4Áİß@‰j¡‡Š´}M`N@Öç} Q`5¿ÏA*JHÈñs #Ÿ^² >¸pU´z‘ç·yƒœT´<MÍÑê¹‡ƒ3çÕ9¦‚ZoNŞàäñ[ë¥É“/ÆRÜxâÔıÛ3yÿŒìkùÚAÓ$Ñ4ï=íé¡hş;Àô şË£•#   ûˆæ·ÎâDjµé?zğ@¼	}¨¾=ÜÑÊ÷$4 ¼ËœwĞÀB¬R°œ·Îé˜PµFõ¢ƒ:¸Ölà¦$uSôaAhÇ<{h›gÇ¨d±âlåpmvûşÜ+9û-±¾ÅO>»$Wã®SNOç½ £ÔO?Ÿİ<"¾?d¯wÔì÷UÚÄküô…1  ÈË}Ô»1©w$¨-JüL_¬:L[ÛãíHø}¶) İ<X×Øèn]©˜i¨nA¸jnôÚÑnF¨M¿(Ÿ?7ñ\†¶Ù¹¨9*¦Î»a·‡óèóùbÿÍxğo~¼Ÿ?¨5Hı¡ÏOO]éßp«¿¿!ŸäGƒ_Ú'/ÉÛÒ €ñ€_[QíB¾¤ KBŞš è‹Åß½Ïn"Œİ÷EI È
+&ë!–²Œ„âS¨épSĞ¯ğ†§y™š¸xQïÕŒWóì½gî®ñ‘
+Ôi¼“ñê~|zÃxp5¹¿ë>¿>&Û'û\U?õ“¨†™'ŸwÏm£¡©Ü(ùŸš ù ğü}Ôg  ®ªÕ0ıˆ‚Ä7cEä· Ôtèù{0ëø‚&  m±š–wş®ÃÏ5w{ ˜q]kñÿ·x™]‹“–ÜufİÃA×\Ôø¨4»ƒ^oo†™dq¶ß<øÇk†e7ÙÜînûCùô“ÿoCsIü}OéçßÿT”íı5Û|6kï x2=—s À›³LÇƒ8âŠyÈß6 F}€ùv@vê÷Ü´¢öÃmÃİÿ… *ıßàÂ>áÊ	 [ë£\ÈéXS´~À›ıeFÒŒ“p	,'o½‡ƒ‡¹]s,*´ºlÚåæ#ç_Í'İÙë'›N|ë*ÃşúÌ³|½ºı@2WšYÿú+’ÇšıÖ>¼øÛ‹jåm ÓÿıK² €|2BŞ{Fqkw2©u^¢qX«Ì¿£ @ª´Ši»ÇA‰b=üùc Ò. %o’«¥Õª¿†z´=Nş—D½¸xPØ®‡‚˜ÁTqMïA?¬ó·®ú3ÿmõ²œU±ÿÉjÈÍùİ¿¿ğ".=¥¸ß5€…€d	=JàIºO÷óôëšğ™?Ÿ=İ´°–oötHrIb[¹•SÛ³äÏî*M¯HŸ¾ûÇ+$ ø:Äî=ï“ûlé¦òÚàVH¿!ŸıØh ğ=
+y¾–‘ Tµış¥)œî>­ˆaÈğÓ[có~RLF3›µ•4<…6ƒg˜ëüò8›ùŞ—™qÕE=¯ÕCï/3ªº2ÇEíÚÜõYÔÓÍ™u¹âÓ¢–º  ÀYš¦§îÿcÇÍ'üÏf}õÎâ?õÓrÛĞd³nôíî7ñ,}b¾îë•\öÜ¼æ“ï7©ô²é½6òAÚn	  ôò»ÆîqÃ¾"Ò&+5ÔD+.K°OóéğâıúQ:!Ò(z÷y“Ašiâ>E-!éşrà~µZr›ZÓ‘U[Ü©(1ô4»©l]?˜×nO-İ,ş—DG¹)Ç¢Zï/3‹B”x•Šj¨ç~ok¦ó¬i®­÷îzzñcë©wS.8ÆñŸ/,¼Y\Ífÿñxk=ëRÚ÷æÍÖmõS®Ò|ÔÎ¯Òlx?	W§­ÍÚŸµ¨|¸ùó¦  Ğ|‚Š´Í}ïğœĞŞUšßEiZ¿Rèì)XSby^:îs–ïv¹†ÉK*MÓ¦‘V*ió9í,Ş±”˜_s‡ülüö?LÙ\œrcóÑîwÂş§’¦ÓıRÊ×‚¿ÌBêÚÕ”ã	ñYWùÄwhœ-¼:ÏªŞÎ>   éÒf=eåÒİìÏ÷&/ÿçÜ~6õ´n^în~ì§Ÿ?ÿÿ}ºùi‡ìËÒYOÿÎ~ó_ë¦;ÿúú¶<ué 9kóá­@ßOrkãN:¯FÊ·=—?+¢Ç–Çy?t-å3K(÷†öqvsùøŞÓĞ$‘Êˆo€´>ş44‚TD/1ßScö­!ûo®õªû ş—™MòìÚè@ÿeFÑê®‚×}±-r§Íšg´Ò×k~Û¾|ÊÕÒ¼İõÉ“ÿ¸R¼İŒşİ|>êõ¹©mäÑËÛ¿5ÉÒåYøxğV¥‰÷oÿûÕîWU|öõ?:½^  ôh¡¿ÇÜÖÉ(wÛå7b·G9,ıïmh\óA@‹ äK§¹Ó‹¶¡ ÏkÓHÓ´Eh$Ğjòé’~¬Ù•óŒÍ±RïoRjğ'£Ì[#læ:}›’~ş—Ù±Rñ~ø<˜Á´0áÅ¸ÀaæzÂk<KÛlncæK UUöÜÖ–ÅÖçF7Ÿzƒ °Hz0awNÎNíõ»aóàîî§äHïksÚ“×n;ËWK›4?}İ&êÍÓ9ŸótkÙ¿ºôóò®c®Ó=®÷ù  zd´Ò=ò*<2¼ü½È}gˆ 2ğÃo	 q—¢-I	ÙûËÏ¼Òb¤ßÿQíÌL+4ûZWª<Öî÷Æúò¶©cØ¨Â§[^Êş—Ù2ÍtXaÿÔSõŸf#štúZ¸bur¾¸÷ànÆ³jÑóº±SÔÔÜÇCØA;ûv·ø°©««¿ò`#}Ê#iGï^Ş\Ãmwñùûö©Ÿo>×ë7¯w ù­Oõïàûó¾è  ğö]€”$õÓ5LªÓµ0Ÿ
+ãma8ö \L7j;¶NËC­ìêìÔg¿AšTZ¬QA©Ş­÷•¸„Š`Iª¦Rfkö;w|+#óş§Ù±ªŠêì\PóëËÌªîĞ/Îñ¡f½G¾`áæ¶r³juÛÑ¸   Ğ^®v®ÙãÆÈ„—¼ú}¦ÿ­GÇ´û§_¾qİÏ6ßo>ryzä<üôkç{Óklóúı³J¨.¯j€¼Âî,ÇÉİRld˜ò½HîgzG&ñÕ @ØgBg»"M›[Ó¼:ı8¾§…s'ƒf”VóçRñ^A±L&·Î/Ë2Q}¾®µ§'-OggS  €     {     u¶¯º¼»¼ÜØâÖÖáÖÕÒÒÚÕÓÕÖÚş—9ŠRõj~1>\üe6¬Q_…¯²Áú,G³Å]sVAÅ!.òq>úJ.<˜Ò“[»tº?{ô,ÖgêÉÉMrùTÖ÷Msdßëƒ×ß$ûş¿iK>ÿìÿwßîŸÈ|¼ÌØıáÁÿ7})  zt`.÷·˜M±97iT?@Jïq¢ïßU ˜¯´´I¬v·ıàås,wº¹u—PM)æ|ƒPiÏ!Ş”O
+§4×—1=½ëÍ†w²2¹%Ÿ:!ş—Ù:Z2_ÍEü§Ùˆº)áË9yÑõ²ÏÎmš³
+´‡SôîÕ˜rtb1îßÏß¹øóÉW—-çÌxzèàÚÛ/Ü^\ió¼×¿ûıÙûÏÛû¶­öS4‰ÛüİÕç¿’úÔ@ÿì_^¤c  à†Xõ½Ïm“Ğr?–Òä“Ò/N¥®ı‚J¨L¿GSæLGx?DâôÛÌ¶Î=éUìé¡¥ÚhÒhD¼u÷Šüù£®nN½_µ•o¦nómş§]ÓS¿8øÓìHU”xI®J4ÔzoÛ¢¹¨9«€ÆŸï“«d8Xï¸ŸºÌåò_ŸïİKgKœ¾şúÂë$}ŒÃÎnœ?‹öÓİú$Û~’Øõ_ó»9G>¶íçFs|Üüúj	  |LòF=”ÔQî!_/¢jÏ÷LmµPó>#çÌ«Ã¡ıºüíì9½§mÛ´’æá½KR!ms4Í(ëº‡şmæÕ5êø¹™Øs¿Y©“mV,ş§ÙÒ‚0çm„â?ÍQTQÂ‹sröÖ½ğœ¹Ã:Ï*•%ND  ˆôšÛ—WNÛå34ƒsûæìÚcÊö6—]}şóôÓã›ğ¹bû+ß.İÖÓ§ÇnOºõs{ûóÿö}{IıÓ›† `¸¹-“ïÛç:nã¥İä¼k×Î%ùQ›
+ÅøBÛÈlœÿm±oœåœúÙ‰4i$yŞ¯R¢èé®;ä_jn7½›é±e­¿ÕÕè¾«íÃ¹¾‡Y³jAœ=¿Xh³vÕäÕù€éóÜj»Ã7
+;]ÕciyŸ¨ö ^k—…0ßt¾µ2oõ¼O‡N9yúù¯ŸÊÃg~}|½¿Îã?|ÊÃÉ“ñnŞæ¥§[¯n¿]§ıálqe¡WáÀOùù_ut{“ôG¿Sû÷  è››¢8·çÃS’Ûd³ZŠ?àõŸ¿‰jSgçQeè|iÓ$ÿjİĞşyØ•GÄF¼|úèwÁ¿'m¯µ¤êvÛ›/¹“{¾Í¶\›Ùšª¾G÷ñØ£v«™zbºÒKZŞ‡Ù³*Z¯ìŠ,Ğ‡Ù¹ª)á¯Òã~İÜ¦s–)9”y¢p_NÆ ìŸrÌÆËc³L÷÷úòÃ×-ÙÉ¥şĞWÎ_Q_¿\>‹»k³Mï›Œ<«nzõ#ñ&$éÿyù«nß €|şù¨’´Ûÿêu5ûøĞoíùM}*}~IPõzö;Éæ½¤šT¸ï5Eó—Ü8zX›ùh†nö¥‘Ç}zÓ¤=½¦»Ch„P•ìÓ>„¹7†f=aêıĞ8û}[:’ÉÖ|eV«ÿĞŸ¿uÒ: Ş—Ù„z"ÎOTöe.y1E:6¿×¨Èú¯’g@°çKp7]U¡§ôª8ß~Œ<îÿ,"¿­@ ´Y€AĞ¶·í/O×ËöâIæGæ¼çıÇÌ=ËëäïÁCç÷Óã3Û|:ßÏFuŞË¯»ñşÖÉ¸ÜßÿrJO³#	|:-"ÌsóûµT“‹ hú\áñC\Ÿˆ\ûÑĞ$Ñéò°¨~Gzxİ#‡s<çİı¸éÔ–Æû¾j’>ñø¯N{®Ìí4ı5%óñC³ójæÃ×x5ß[›msù°}ò¯Ñf[ıüº¾‡9ªRp¼ÈQ÷i¨D˜‡_;F¼~ğÂrpÙùFŒsgUÄÑv0hdNËL²Ùè=H,Äõ”y~=·»w/&í_Ÿ¸›y¾dÿ`ëìTr¶ìıµgçN$O¹í[òIæënwÿíĞÿãÓî×¦ï’i_Şâ	  äßš[˜õ´ø^Úm“pòÏ;(Úî‰=[Iò6š~Ïš>læNí['ãQffŒ®õ«áõ3cüÎcÎ´ IèØlùöøwêãyM¿ç¾=šËÖV{Ü#÷åôCé4Ïé”yŞ—9²ªñ(~ÉêËìCU"ı¿|<ëepÔb›æYb±xèÁ
+;Ö‹É]¶ÎwbıÖØ#ûû›Ëç¿ÛëO×ŸnŞ|KÈxlŸ??81ûgO÷?ˆ‹ÚÄ×‡ÿÿ’ßkƒ LÙóÕF  `ß¯jÔsšGäUîh‰¦–øÛI*§Ÿ·7dü~Ñ¤3M3‡4İztôïİŞ´¹¿ÅNc[¦_Kiš²ÅöZmšÏÙÌ¦çËlåë©Ó›öìî?İNÇñ”É/Ş¿¾oşš ¾‡Ù›Ò/’ß¬÷2GUz^òñ`­éÖç¼{‰Mó°
+‡RjßºÎ¯ğğò1ÖËÎG^×«ÊÙşõ¿-õÃx—Ë°Î×Ì/ø"§?wuzw—¼zuÚä®qš÷oNi>ı{;¡K°>YÍ²Í|©  èó]ûQ…oiÕëx÷§¹¿ï#}â¿Şü U„Œ3İ3ïŒ£çf8÷ßéô'v=¯§ßrß´¼údlJÒ¤M:¾Tw´Çûí}‚ú¿wóèøT{óì¹ÛÚ›“áßîÑÔ-wrª#ö ¾‡Ù»2^%¿çiv¡È@_2W[ª½ÁõP\|½Ò‚òÏª<>:À2  ÛUl pnš×ÁİıP=XëµÛ?mŸ»ËÛ9ã×ßÿúÓOç³H÷¾~úÍÕÑW¯º>ØÏli•˜¸c½˜?\ú$^ß_ƒà@º™òêûæY(ËévvJD}åííÇè“Ñ¯¨9YqÛtí™4*§·ŒÏéédoÆI‘ÆG“DU$¤îŒvn®#¾šßÓ¼aêôë¹æ¼Ç+6_~{zÿVFø[è| ¾‡9©R_„%ª÷0'V€pµúUdğyÖeçaŞY„ß;|´=;nòæ0+¿|yÿI³õù¦Ë×û³g?½~ääâìhÏ*²ıì©gvê¬yéÍşº§ú³9÷uî‰Äå•>=µø’4Z¡š=?øQÇû5  ²,çÀ{Kúç½1ÿgîIĞüÇs’jã¿ÿ'[ıÿ~Òõ1µ'“›?w˜?ëº';	›çë?‘Úøg¯Ë‰»#­Ó»mÛ×ç‹úíôùÃ·ötøŒ›#“4æÅ­ ¾—9™R´ğjyáš¬qö4{V%ÅkãD´ĞúAAñ.}ç›gÕ³GÓí%ó¹ÕÅ€Îôd¶^=¨.—æï¾=¦¢q—ù¿]İíŸ\ÜO<§W§‚×¿ô ½¾©ƒ««õç›áìß„iHvÿ•-=	  6³İ‚¥öjyM0f\Ó¤PÚÎN;Š/ù¶@i?î‚´É¦ãù~ÎuO8©2bMiv>AÖ¤)*‘Ş{şFDKıŞƒöĞ?2rZÏÇãdøöhóÄ)íO™NÉì“+™îOù¾—¹ªÂ´ú"ùqìiÎ¨T"ÆÆÕ”XŸu½tø”›U 'm²+ªÙ´§ó³óúĞ”>1^øşÎÃéNeñDçKç¾ìç²û]¾w÷²Í§ô/¯ßoçºsV›x&§'¯¥r?ó?åt(  zëca³ú÷úùi³ïÌèi(ä†	$}:²WÒšdh“4Ñx5MıĞ]ûLûôo'¾şúÜÓÛ}õşü×!ÿ’=a[¨¶jßWû+¶>Ö;io6ºÍMÇÇNéH¾›zÊÖ†ÿß×¾§¹e™õâœÊÓM‘Z–«Áç\ú>åf@¸î³UE×}×‰Ù¹}~‹>zöÍ»š‡Î‡t>ß,7şzÿ¤oåÆ§g×Î*I’ÓÿtwşÜŸéM>mºı7¼ÙAşÀgï €şÛ‰7ëİ÷ìŠw›€æ7w§qû“g$IÛ{¿ÛUÓ/¨¡C$”¡†4‘rÏ_zBvnë¼;Íï}şÆŞ¸/ıÃ/AÛÈü—JG²İÛéaºRÃëÏaeo~üÖĞ?çNšë¿gşÊ¾§¹ºRaz…{³—Ù'¥}oG`õƒ»Á½^:×rUeİCÒác¸Î×ê+AEOñØöv®cí~Ş9q_NfÿIŸ÷ş .Ÿ3?µÎşÁgo—§ŸÚÓsôÓëş
+ÔŸßÒïÚ   G+Å\´î-aŞ‰ëÏ8AZ}ıÇYÑ4öwŞªşLJÛ¨hÛ#­&_Û‡†÷·åOø0³yşoùîgJãV§—Ìë¿oÖüñjË«:¥á‡×{·ÍÛv¿öÔé‰¡#gÛß¾¥­»¾—¹ª3}	_ŠìeN¡¨~ü†Ï³ïæ]ûth–g‡í|wp={Ÿ+ã4w«œ‹÷ıÎƒ­l®*‹õÇç9rKÎÒd¼Öœ}§æ—æ§¿f¸6VîN³J_R‚Âë£‡ÿÚ  €õù7 ñ¾½U}4Zïş	öÆøûÑJÔ8rª•?|ú1i…’ÌYmò‡|ò—oMÙvbï”ñá™ë¶¦ïDÛ!ZÍ{5‰D¡H>ÕÚ²½7ÕÇj×Ëş=ïLmo¦N^íz6§>şıp÷v[Oğ§#=¾§9«BLM> —¹ºÌ+a}„Y?Pğ<àÒù˜æ¬"WÄ®ŸÃ|ÒË½ù?A	  Ğd<¯»æR›vqöjÖw‰³ËõÁ°™Xïp°Ù_»}Ã“ìÓœáòÏŞÜµÎ‰ÖøÍ¢§¸Wh à'W?3/Ş£Ûïm¶åã÷cÓhóí_{K“×ïí0Fš¦Aft2­6}6?«n_×sã—'h7ŸŞ/©¤š´¶N×¹H$M3s§3¥­ÓÙãŞ¯õáïÙğòqÒ>ÕnHsûÌNÂñs’¾§9%EqÓ+ymÀ{™«+2ˆ^¬Ï=ğ,¥YÜ^nV-:|c   ªï¸YZP¢[_ûĞ‘.ííÃµí!·ŸÈÒµÛgMŸŸÌ¢çıŞå_mquw–S[Áşµù—§ÇäLr›oÿ~¾iÒÛú p ¯Ü³á’×\¯¹ùy“•·Çëj´ı›6Ò†_æİyÚ%šJ“i¢³­¸ÅˆÓ›{c²#ÿá¯çt&uú[kœNsµ[•²´öíw~µ­şmèİºíOÙÚ±5û¡áHÏë““¹¯çqêˆÍm¾—¹5™+}"/	íi.Cæšà‡íŠïÁĞıÀí»x£¦fÕÄİu«‹çÏsÁ³ys2äñ.  Xùµ,[²ÜŞ×Y1N°p7f‘w¯›ın-­söÛ_|Y“~ºû|N*úù­İÓùÓûÛ_Ñ4ooâoşa ¢ùíÕÍi$æmşIØñµÅÀ{ÿÊd¤#ûÉÌÛS;úy’¯¦¼§×´ïµ®Çæñ–Í1÷=wò÷¨}úÈH$•¨ŞWúŞıÚÙ3e[ïÔF'ØÚ,Û[ï|vÿx~;Õš®ûø…ÓOggS  €9     {     Š§´Z²É©Í«ĞªÄ¥¼À§À¾¾´À¸°Æ¡ÈŸş·¹7I´>)®&4`ßæÖd©N—È].ë™w—sUlöm³Üûl¬—^õÜé‰$ù?¿ïí9÷ÙFmÅ:q–ùó~î5˜zØGĞBëêüßû¬S  dü­&í‡ny‡òá[t–9²ŞóÌıßÄğ’IĞBÒ=ï?÷üß”Ô>]§–)ßï—qwM?Äş;"ôŸÿW÷w4;ïèmÇÓ©[~ÅöÚPç6=ÙnJ¾§¹†ÂİÜáO`Os§2×B‡7‹>ëàé{îª*€¶œkc8…\æ ŸÚiiñàì\¶;=ùn®rØö`¸œçß/¿uàtÑ%_mz“ğÓçO×³è·µëäòIîóÈ Ïò»mó  ½á“^54œxâ¯“e™­'ûGªéøâ´%½Óç6_#%­´/	ÒÑ8ùt÷zLŸø-ü&[Ş¦Ìxüµ?ûP22©óÑæñj¾ÔÖæÑô|Oğ¨;;ç5ÜóÇ¿r_ıÏOŞ·¹4™fázèÛ\]VDUp‚Ö½´ÍÜ¬ª²Œë³JëÜ'ç¹,÷Íüó³‡k‘~¤òxîç·nM²u‘ÏÛ¼¾ûúŒdş;a?~ì×  @Ò?âÑm¼ï–l™šéygw÷?"ÎÑÿ5z"”îcŞú?9®ç¾5l;’³GNÖ¯Ÿl<YÚÜvÃ>º3wİÔói­ï‡XıSm2?Í±»Êù¾¾—9»¢˜„Ó,xOó4É4^àªˆÑ³®¯€Bó°ª
+ Øí¿Ø Ç¶Ÿ©&ñzÿtvuät‡É«\İÿèÙöA{×²¸?ñêàG;8 Ë<İ qNoûçëûşrNÆ$îŞKªzÃw¤yrLš™{T‡Ö§¹Òp5&wû$iÛGÛcHôÿ“$MË­¯ÓçŒC§O<¿ıéù0Ù5ş:ü}wÖñm·çõ\+óUÿm;uÂıNş¾¶|b·=ó·ÖÜ·ïº±µÓáßáÙ.İlÈş·¹E*U«üĞÀœWehò
+_äm;kVUñŞÅÄ«~»#‡N×ôKï\-®4óæÕoöÖæóçÖcF)?ßµ·ÏÍMåSéç}Æn~õj“œ  /6|?„†o><{ëüõiÇõÿW£ãû%Ñ¶¤~ü|>¼_—ì·‡FêÜ'j£q¤vjt^İÇŸè6§ó{ªL|´¦w™®Y¶óaÍÙ¢”Í¦}$şI¾§¹wŠ¾ÂBïin“,E¼ÀPÀZoŸk¾Ñ€L¦JA…d$‰wİ‘>Š—§ÙßInvçëı{8íWßgëÅµñììoOÌo¿~’×yÿ¾­Ô]ŸVîºÿşÜ~êëÃÏO¿¯û†=ûéä1Ùÿ  š>Xs˜Ít~ÒV¼41cæëıw¢©}æ>Õ4i›èGœğõé¯öŸîøııÑ{Ï=³›ùèùø“S³ÇûÚı{g÷å¼í#›:µŞ)“Y'Ì=Cwòj½eë'²ùı:Oş·ù’(JïŠ¯ÇğoótŠ¼ÂG…¬{d¹YUÅ½%ƒnzŠûÓï“ÎõWoÒfûããöïç×İÿõ}wöî“ßõTŸ$7ß’šËëƒÓá  'mkøü½7ô§®Îÿw…<{²çşıÍÑ™4iËáÃ>ÿş½µ¶w<uÊ–¿ò¡cÛ¹õ7Ãnôvg÷qš<»¿LÏîùĞiF9º™ÛK¿çÎşÕ›n¶¶Ş§ùP	„ŞB`Oóª„¢¾àF%dîgğÎ[drUÌbÑõtİ<Õ8«¿Õ‡Û“Oôuì3>¶?ıúû7=ÿô ‹³.Ö¤OlŸ|şÕ%ûm®·õö^Bzíb–z°X @¦åôu“øñjòïüé>Ç¾&÷u¶kÇÈù¤é¿ıHÛÙš½‘³:zO}ßÇ×¶Í§ësÏÇÓµ³9óÓë¯¿?Úõ<ôª5f½kTÿ÷?Ñí8rÔ'ÿ|Û~ş0Mó§gGs.¿¥ÿ\2‡ şÇyºäššà'ÊßæuW8¹{48ó\¦ªk±çJ,d3påGré	7ÍÏù_îæşgúó·­m¯¯´½‘hÛ¾ÛW71œ  =Şö×Lj<õUŸNlÔú1ªGİùÖÏèè·çÓ‡üıÕynnû–Ã·íÓ¦Q{?néÙ›ûH=»l§Î“×™|ö™ëN)óûv£ë¡6§–‘½ñÀ¶çêwŞ§ù²DG‡·%°§ù²ˆ¨¸*²îgpi—©
+“Üå´/9¯ùOöÇƒ»Èç7‡lwû›>îÂØatãOÓz¢×sú$k‹³ƒ³ı­›¡Y?½åõ-  ùã¿Œ^Ó{ş¤ÿuô˜ÜĞFó;~‡qÇˆçéYöÍ®5êÿ;?g~«ck[ÚÿFÇd÷5]wónÌï¾§OÛ=ûûœÎ×|k®ÿíeK+»Ïø0å¡™ñ¿jäy\Óš> ¾§y†"¬œÀŞæ5	^á’Ûëà2ï4ÎUÅX¾ˆ<6~øÈçŸ=>YóùÏï»óëİİ¯íùé¿O?·ù<{³ûüôS’«û¯¹ÌYÇæî_öÙ6bšW<é¾k  <=|fÓşUŸé6´vÇï¿åîùÆˆ©"¦§ïˆ$³Ç97DÒÿ÷‘Ï·Öş0î/NÖì1Î³f×½ÛçÍ·Óô·<œÏ_m<lıí¦Äøµ·ı:Šo;Çşåc3Ş÷aO<ŞÇyU4Ñ+¼œÀßæQ$L˜á—å€˜9³¨ªÈ¿ÌDe €S“´9«ş wáõœgÿíıûOÉÍõõ'ylÓæMùÛÓøfo€€ËŸµŞáÓg&nß3¯Ïü¬8§·ã[y?Ş3½½±uI¿ªÕ&iå?NÔ<¤î';}ò°ç¯Ûÿø±ÖìÔíıW›Úo|*µw£ñüõu3kë³{³µ)nÿvºÿ=v»¥¾§yT‘¢Nğ/T½Íë)ÌğQ!	ŸuğbœÍ«ªv!%‘á ozÓ»»W9½\¤÷_>L´NÛ›´Ÿ¸÷ÓYo5wÿÖ˜ãôj¾¿>÷§‹ù‡©œ øûã²™û­ŸÙÈ¾c2qî3‹Z?=ÁÇ¿º¯§Ê8æãõ&n§ıê©±wç;ã~şÄ·‡ı6Ûşm¹G;şút×¨æºŸœ¥×»Óıéò§§Ñ×Í}¬‡ø‰ÿeıüË¶‘r¾§ù¡+Ü`ö4*bâ‡€µŸÁ‹µXÌrÆT"x~ŒÈö–·n_ºÛ¿ûuw~~ŠÇ‰zpªiœé{³èõ^ş®‘ùÜ]îA<ÖŞ$  È÷‘Ék½¾~ZóûsM4Ôï$Mf%mUò»ÆdÜß­‰$5h“·ãÛ[kìHóAFc´}nßzüéÇÏ{¦ö4ê9wşdİ>Ú½âÒÃç:İ“;a8éöÄ†}fÎ¾î¬ìæ”G›Çÿï¬\ÃoWŞ§ù	H„Jöi~*İáÃ>«ínáœ«\!Ú®Ñh9¿Ùïıúd®Nåz6OòÛí¦›ÒÄOÒ¾ÉÇ~œ}³~²ñEÏ®®òù|Ş²î/úáÌCÒH W›ÿ@¥‘Äû¯ğWçW[¦tîÙšÈ/m’´Óñ{o½1=¯ºõïío•;Î|Çãã·°çÒí³eË£Su:Á	Ìûô_ö<¯OŞ›ü¼—oÍN?§]½›ÿ8SRömz:‡O_ZÏÓŞ·ùŠ"ğfú4_•Ğl†Ÿ b}FËœ?Ï«
+ç:Õ™~<Scóı‘‡–_uî²¤éíÜU²È"Î¾üIëéıÇ{][óºæõxŸ³}¢‰œüÿ&ÊÒ½ïhÎÍHcÕÛû¿§¾ê=c^cŞçG¯ê÷Ü¾=u4­L7çmİz''sgóúîÆ¿Ø¨õ|rrs7ÇÜÑ|5ÊŸãßŞÙ»oóÈüÛéCk:·z­4µÛw[e´RÎ~¾§ù²ˆ¦5¼ĞæCDŸáû¼˜…çUUÙ2¯)Õì|z“¯sû¦m¶oÒÇÃó9ıºşCïšlö‹îŸŞôïî¿hÿŞÔsõ–yİÛËzö?/Ww¢ ÉúÑ'ßûûYyZõëñÖGt=òq“ÑïmisOÆ+üÇïë®9vœ¾u’§§õÙÕ½#Ç£îùN¥·}rìoŞ‡Gë}ı'ß:åñîĞ/ßÆñ«çÉ“™\fîCjú¥=Ù2w0İğz[¾§ù§.*Ô§ùŠÊ‹Á½/Î-rÎ˜*}µ¿È9ú÷îï´Û÷IÌ³>æ§¡!¯Koó9=ó^šD~ıœ~ÎîS>GCr+úİûŞ›K¨"g¢Ï¯½›¿kPi÷öìTÿ±mïé×;Fís^ûvü-mòn&e¦Ù§ëßxUë>vÍlêcs«qdÛëIñØümşœ·ÌzóÙåõtú–Ë÷dÇè»éÜÊzşoõ—O®¿¶Ov[~™~y¾·ù²ˆ‡PŸæG" Ñr½x)gª0Â2ÈRı1^KÛÏv¿|Òºı9?uwÓn?ßôÓkùWşßvÍŸî¢Õ4Ê5¿[Ú?ıº‰¸KÙGD;Y_÷øÓl½ZQ_gœGí[¤x“=ÊıGÇ}Ùçdëôu"¢Ïï¸ÛßøÄ]íôª;ÿá“sÛ]§'4~´ùV§™›înGİÉm–¸ïKIÍ)ıl7ì¿óczX7Ös—ù ğ—ù€	×{p¹ô{Æ›Un0ğ§Æc´4Ÿwˆxê“¬÷ìÇ§µhÂi.Gù¢TzÙvÓ{ÏâµûÃ?}Ñùcî¸¤)êÜìnnïÿû)ivX­Ï¤}İ›8¿ùãöæ«cµGkµüßsúû5Mf´ûübœZwŒÙÓ>÷ätê¸µcgwŒqë_Ş~×Ûg¯¦IÑ»àèäÏS>|ıíÿnOç—´åÔ©Nûˆ§şe:ïoØ~ç½Ê¤\~ì¦ßF§-İŞ§ùƒ ú4(€1†¹ªª(Øşk¿g¤÷­ínåİ>ï½×¶å>ZúşªïEÛ/øöøÇMÓS¢1’æû{oİÛ†úµ¯lÛr¹VÏ	¿Ÿ »şn­û6úëNİÇÑ‡¹ÉŸN'ÿÏ%ÿéÇ±oããÌ_á„Ï‡rî´g:<ü)ÛÎ/µ×ŞÌêÜs4¿NßN{â§åÈÇyeÎi^£Nì—ù ğ—ù1 ˆÀh8¸Üşí-y¯…³İÇY#ÙşpÛ—ß7ÿR«Iúü¼¶ıKêû®ÿ6«”×±Ël}¹ºˆ³:Í™¼ç÷ö±I›¦>¶Ÿşõ³{×vŠ6©¯Ï9=¹-Õ¤õOÒ³Ó˜é6ÉK´mF#.­Všh¥æ>ÿ’;î³sïkŒÛ=ÉÑÊGfÓÔó¨5§9šj2ä#©uzjŸ»ÏŞæÉvç½}÷şÏæøîk»n+ÿ~ôÌ}Ìe']Ó/ïN›WÍr4ßŞ§ù‘ ú4(T†~oV•«¨a1FªmaÖˆmáœÆÛ§úüD­6w‘|úrMĞØx5´¦mà­½Z›~¬#O«ÙÒJßéïfºûŒ:µ‘êG"éÔÓátfßOÿu÷ùí[¿Ñ¶OûÏN¹uòş}K.æ:Í5úÛùáù:û^ç-ßN0õ÷Ğ¸ùhîñK<Œj°NØZ“Ã»¡=Ë OggS ­X     {  	   Y9qÆÁºÎ˜½³®ÀÀ½­À´ãW—ù ğ—ùªˆ xƒÃÁápayÛ²ªFıéÖ*—ÉğáéAiı·çµy—ñöÏóıïg^kÖøûö^LÿJ<xòDW2à}ùñc¿¶ŸÙ>üñ=˜m¯ÿ\{õÕ×gÅv®©C´©6íøîÙ1~§~ıíä—™´ÍAÚÔö<NšgâŞsÛçÎ¤£‰Dï«©;šÖÿ¯¿Ïå¥iz¯M«­­ûˆmó·élBtçõfí[gÏÎ™Û¶ßmSç½›u.ÓGæ…M—ù ğ‡ù ğ †ËÁåö¼œ©Êo?„Ÿm}÷şÌşï÷åÕíK~nãî¬=g¿õ·¸ºñ}óômmOÏı¶xòÌ)ö³©F“|Ò¼_êC­:·'^No>êöFäıõë?·%IgÒş¼FŸ×Ù;¯1©µë½ùvëÎG¿ÙÎ‘ÿôè·ùÌ¸}Ç¾şíÒ>Oôäİ³gû_ºæuÎÌÿÄÔş'O~›w˜·ıaŸ¯Níö÷kø¯£ôÛ)Sú=—ù ğ—ù ğ FËÁåháç\¹hQË«°¦}L›~½ì¾¶åæë–´É›7Á^ÿ¼eß¾ŸÓ(mïœÛøêô¬Ñ+=xRU×_=MÓ~ç5ı¶5½l%ÍÎM¢ı=Ú4)H¿+ß¤~}ï9fcµ¼Ñ#c®gÏÔ§Îût×|ôøm¾?ñèajİİÓó÷¿íùô:wä™ß¹™£½G:¾¿Úû»N­ûflŒïÏ÷:=~™îÔ˜—ù„<äe~Ä!b´ÜË½°¼Œ«Š¼!ÙÆ?>=}çuË¿|zıt“Oî©óS“´ş^¯í»sv]c_~şôıúSÕ§Ûyû·ç6q{j>iFR¿~N–×o×ª÷û¯¿öòøÙÇ=Eò·y¼Ş¼9¥MîÓo3•oF«÷Gùöî»åó+:¢¢îQÔ¯öÆÙÓ¯?oö¹mÏë“ßo<œ{G–{Î?îÇıáÛ·Ï'÷7ÎÕmî·ã¿ç¶N87õÏŸó÷)İo)|Ş§ùC <ôişP ,‡rÃ¼ªªÚ€&I>Şlƒö™o¨”ÙgZ+ÍükKÍ}ÜµÓÓ?ì·úğ÷oÖæœêãY¼Ş’=LşÙrô‰uœsò|è¼-?™Ş6õhÏùÔásÃó9/¿çû¿oÿÜz4ı?~âè‘_Ïæè	³Ó÷¹ìÔ‡¿^?×ÚşÕñ±a®¡µ+§’‡U—ù1 ğ—ù„ b¸–·È¸*+·ş­c¯™¡}?9K%¯›$^êı}½Ÿ’öûÛçå¿Ö›Ç67iõõkó)gõòôú©Ïyªöœ÷$~ÎÓmÛÏ¿"s­îÙkK¾’Df†4û¯1n=ÿ˜uZ?ïí|'¾gÚ4&[v[OÇ–-ÏÃŞÇ½ßŸŸ÷Ì;o\Ålö	›™Ö‡)uJ=ÁardŸC÷·]ï3¶Ã¬;yù4ÿgúeş—ùcş à!/ócş àA4×Ûßb–qYÌó5ÿ„­vì¥Oğİ¾æµ°4Vv¥ß'³qkÿ~ß±6›­WóêõTÍÿÙc·3Ã¶Şåurƒ¦‰ºlëv?¤šš~l¤ÿÚ|w¦m2«uüê8£/MiÓ¤>¿g¾mÿøXšşmÛ”Ñ[ou"f’$­Õûñãé¿B÷cÇ{JÌ÷tŞİ)çÿÊŸŒ°½ñÙ(¾+ö¼ÔfóNçNÙ'—ù1 B^æÇü Bn8îm<cªDqğnşmºÀ¢2ŸÚ¶áÕ¦®mçk«¦ÿÔÌ°O>ê{»ücŞY¶\ÑPúÍ~í¶¦µ^ŸµcU%ÚJ3“ÑoúÄÈw2š´mÓ”¾«™ÙèßmæÃ–¯g­¿1Æ˜†±uŞ±Qs»Ï‡Æ7övïtß¿½ìcOØÚpê÷q{lœ²µcêŞÕ{âÇyåz?1¾g¿´—ùŠˆ1à!/ócş„ïr´÷¶M/W.‘eŒ\âtj(­&ı[.é£)½ÅŞËÏ>ûnS½çÔJ“›<~²}Ô$™¶?óµÛ÷1çS%©7í§ïJß<¥í©Ùê‰ôo¦¶¿§Îé¯$$MòÑ™ÎñqŸæwl“$|I›1+Ú1üYé”ŞÙÇÏ­õŒÇaüıÃŞM~KÇ>6;3'ÅËş±wÛfşËßàÃú÷ñô”ïßû¯<z7ÿÔ“a[(á¯~—ùcş à!/óUcÀƒ›£uxŞÆËå¢ò÷C1ËÚÖU}jú®h+¹{¶>±Ÿ·­½şõ[T}E“Üº‘×r+Í¿cqĞ´Móµ‹dó^Ñœşş{OÚk}Ú‘¿¼Ñ˜±Åõ ´¹Ë{F:ÈĞAÉG™×›ßüµÏ5•tğ¥iÛ‘ŒşNd„)¯Ox‚:Îãîé‘_q¢ç{o—vÿìowú{fmëZcçg{~‡S§n›r‚ı#³ó–æ=·—)§[Gº=ï—ùŠˆà!/óÇüÀƒ[×áŞfæ\=¡ß}Ú›–µïÏ’àÍ)ím§KŸ§Í3ïù~Y:d[úşøşí¯ö¤E4½~Ğd?û‰¢^?ûİk},ŸÅ_ã]m%ÏI´¤é¯¶mó<[ßéL:Ú4í/3é~Úó×8£NÂ˜ı•FÛ¤I5úû_Û¿õóëmûX¹÷Ö3·¿ç¯yL"ã~ø¸»ï“=­=6'Øÿ5uÏô‡Oë‘=u—ùcş à!/ócş àßÑp¸Üçœ«"ŠnÛ¯×›­»©ï Ë|¶I£ï4­ıVûê÷ım?ÒŞ±mxÿ´zÖ~«¾êÓïTëó^\4IœnĞ~_U“­$³ÉsÒ¦ÉKöi“ª¢z”ï&Ï*vDÖnõşü¦CÔ³wº¹§_M¾q¼FŞıÍŞÙ,OÌñøü×	vò½'xÊ~h´ö=RêÔï›S7û{8ÙMBç1 —ù	 ğ—ù1ÀrËÑ½÷b:·0™ê}t—½Mk,ÎwiĞ¨ÌŞ«¯m>ıfßÆxs’]Ÿ=5y”Ï'‡6œµù"M{ëœÛ×oú˜¼>?Íï_c[¹£q•ô±ã%£‰N}îì4“™ç2+’v´É]ÚFÔµüÕlµ‰¶}ÿŞÛùîcD_Í)ÇŸSÿud=ÕÛ°OÕ´!á®ÿqëİ¬[æ÷{ÆˆuîxzJçFÏ}æ6[fÏ{;6şêiõz —ù1 ğ—ù1Àƒ.—Û3gªœÅ;÷Éé˜SÖÛß§ÍXi_¯ßyÉö®f?7qÓ[ÉïÔmû!lÅìxV?Çç“tÛ¿©×ïc½Iòæu›ïŸÚJóÚcúxÛ´~w6òŒ×,Æù}şN6ÌÛs³ûî™·’Ğ÷Öøî¹yÇ8_ß»ó¦t;ïÉî[GÙ7NÏızÿİúäcßÓ”ØÛ3¶5¼_F4ŞoŸíî\^O²îµ	SZ~‡ù <Üa~""8Ã½÷½Ş‹½·grƒ^Võ1ñ÷÷§¾}ÎÙ†O§›qûApJÜ$ŞôWrK>sö;^Ü6ç›¿yı·2%Mëvëï)n|jŞôo^ë9S^k?e}z¤Mz¿Ã÷õÉMóé×›sçµR™{ùh3ú¡}Ş£hã‘Ğ¦·Ó|Ñ´¿ÆHÓş3Éı—ÙŒÑï4=6úßmLšçæ÷H5#‰–Ñ´¡C’şk›Œ¢iÓ¤&•¾§M¾Ó4MÕÆÿg¸³ÈÑÆy5Û„Şxö¤ösË¹õÒÓÿS\vü½çß~‡ù… î0¿Àšæë¯‰Â1}8eùì ÏÚı|¾­­Õrœı|êcŒ×Ç{Ó4MÓ4‘•[‡“½_¹¶ësÇçÏÂçp8×I÷s‚cn                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          from _compat_pickle import (IMPORT_MAPPING, REVERSE_IMPORT_MAPPING,
+                            NAME_MAPPING, REVERSE_NAME_MAPPING)
+import builtins
+import pickle
+import io
+import collections
+import struct
+import sys
+import weakref
+
+import unittest
+from test import support
+
+from test.pickletester import AbstractUnpickleTests
+from test.pickletester import AbstractPickleTests
+from test.pickletester import AbstractPickleModuleTests
+from test.pickletester import AbstractPersistentPicklerTests
+from test.pickletester import AbstractIdentityPersistentPicklerTests
+from test.pickletester import AbstractPicklerUnpicklerObjectTests
+from test.pickletester import AbstractDispatchTableTests
+from test.pickletester import BigmemPickleTests
+
+try:
+    import _pickle
+    has_c_implementation = True
+except ImportError:
+    has_c_implementation = False
+
+
+class PyPickleTests(AbstractPickleModuleTests):
+    dump = staticmethod(pickle._dump)
+    dumps = staticmethod(pickle._dumps)
+    load = staticmethod(pickle._load)
+    loads = staticmethod(pickle._loads)
+    Pickler = pickle._Pickler
+    Unpickler = pickle._Unpickler
+
+
+class PyUnpicklerTests(AbstractUnpickleTests):
+
+    unpickler = pickle._Unpickler
+    bad_stack_errors = (IndexError,)
+    truncated_errors = (pickle.UnpicklingError, EOFError,
+                        AttributeError, ValueError,
+                        struct.error, IndexError, ImportError)
+
+    def loads(self, buf, **kwds):
+        f = io.BytesIO(buf)
+        u = self.unpickler(f, **kwds)
+        return u.load()
+
+
+class PyPicklerTests(AbstractPickleTests):
+
+    pickler = pickle._Pickler
+    unpickler = pickle._Unpickler
+
+    def dumps(self, arg, proto=None):
+        f = io.BytesIO()
+        p = self.pickler(f, proto)
+        p.dump(arg)
+        f.seek(0)
+        return bytes(f.read())
+
+    def loads(self, buf, **kwds):
+        f = io.BytesIO(buf)
+        u = self.unpickler(f, **kwds)
+        return u.load()
+
+
+class InMemoryPickleTests(AbstractPickleTests, AbstractUnpickleTests,
+                          BigmemPickleTests):
+
+    bad_stack_errors = (pickle.UnpicklingError, IndexError)
+    truncated_errors = (pickle.UnpicklingError, EOFError,
+                        AttributeError, ValueError,
+                        struct.error, IndexError, ImportError)
+
+    def dumps(self, arg, protocol=None):
+        return pickle.dumps(arg, protocol)
+
+    def loads(self, buf, **kwds):
+        return pickle.loads(buf, **kwds)
+
+    test_framed_write_sizes_with_delayed_writer = None
+
+
+class PersistentPicklerUnpicklerMixin(object):
+
+    def dumps(self, arg, proto=None):
+        class PersPickler(self.pickler):
+            def persistent_id(subself, obj):
+                return self.persistent_id(obj)
+        f = io.BytesIO()
+        p = PersPickler(f, proto)
+        p.dump(arg)
+        return f.getvalue()
+
+    def loads(self, buf, **kwds):
+        class PersUnpickler(self.unpickler):
+            def persistent_load(subself, obj):
+                return self.persistent_load(obj)
+        f = io.BytesIO(buf)
+        u = PersUnpickler(f, **kwds)
+        return u.load()
+
+
+class PyPersPicklerTests(AbstractPersistentPicklerTests,
+                         PersistentPicklerUnpicklerMixin):
+
+    pickler = pickle._Pickler
+    unpickler = pickle._Unpickler
+
+
+class PyIdPersPicklerTests(AbstractIdentityPersistentPicklerTests,
+                           PersistentPicklerUnpicklerMixin):
+
+    pickler = pickle._Pickler
+    unpickler = pickle._Unpickler
+
+    @support.cpython_only
+    def test_pickler_reference_cycle(self):
+        def check(Pickler):
+            for proto in range(pickle.HIGHEST_PROTOCOL + 1):
+                f = io.BytesIO()
+                pickler = Pickler(f, proto)
+                pickler.dump('abc')
+                self.assertEqual(self.loads(f.getvalue()), 'abc')
+            pickler = Pickler(io.BytesIO())
+            self.assertEqual(pickler.persistent_id('def'), 'def')
+            r = weakref.ref(pickler)
+            del pickler
+            self.assertIsNone(r())
+
+        class PersPickler(self.pickler):
+            def persistent_id(subself, obj):
+                return obj
+        check(PersPickler)
+
+        class PersPickler(self.pickler):
+            @classmethod
+            def persistent_id(cls, obj):
+                return obj
+        check(PersPickler)
+
+        class PersPickler(self.pickler):
+            @staticmethod
+            def persistent_id(obj):
+                return obj
+        check(PersPickler)
+
+    @support.cpython_only
+    def test_unpickler_reference_cycle(self):
+        def check(Unpickler):
+            for proto in range(pickle.HIGHEST_PROTOCOL + 1):
+                unpickler = Unpickler(io.BytesIO(self.dumps('abc', proto)))
+                self.assertEqual(unpickler.load(), 'abc')
+            unpickler = Unpickler(io.BytesIO())
+            self.assertEqual(unpickler.persistent_load('def'), 'def')
+            r = weakref.ref(unpickler)
+            del unpickler
+            self.assertIsNone(r())
+
+        class PersUnpickler(self.unpickler):
+            def persistent_load(subself, pid):
+                return pid
+        check(PersUnpickler)
+
+        class PersUnpickler(self.unpickler):
+            @classmethod
+            def persistent_load(cls, pid):
+                return pid
+        check(PersUnpickler)
+
+        class PersUnpickler(self.unpickler):
+            @staticmethod
+            def persistent_load(pid):
+                return pid
+        check(PersUnpickler)
+
+
+class PyPicklerUnpicklerObjectTests(AbstractPicklerUnpicklerObjectTests):
+
+    pickler_class = pickle._Pickler
+    unpickler_class = pickle._Unpickler
+
+
+class PyDispatchTableTests(AbstractDispatchTableTests):
+
+    pickler_class = pickle._Pickler
+
+    def get_dispatch_table(self):
+        return pickle.dispatch_table.copy()
+
+
+class PyChainDispatchTableTests(AbstractDispatchTableTests):
+
+    pickler_class = pickle._Pickler
+
+    def get_dispatch_table(self):
+        return collections.ChainMap({}, pickle.dispatch_table)
+
+
+if has_c_implementation:
+    class CPickleTests(AbstractPickleModuleTests):
+        from _pickle import dump, dumps, load, loads, Pickler, Unpickler
+
+    class CUnpicklerTests(PyUnpicklerTests):
+        unpickler = _pickle.Unpickler
+        bad_stack_errors = (pickle.UnpicklingError,)
+        truncated_errors = (pickle.UnpicklingError,)
+
+    class CPicklerTests(PyPicklerTests):
+        pickler = _pickle.Pickler
+        unpickler = _pickle.Unpickler
+
+    class CPersPicklerTests(PyPersPicklerTests):
+        pickler = _pickle.Pickler
+        unpickler = _pickle.Unpickler
+
+    class CIdPersPicklerTests(PyIdPersPicklerTests):
+        pickler = _pickle.Pickler
+        unpickler = _pickle.Unpickler
+
+    class CDumpPickle_LoadPickle(PyPicklerTests):
+        pickler = _pickle.Pickler
+        unpickler = pickle._Unpickler
+
+    class DumpPickle_CLoadPickle(PyPicklerTests):
+        pickler = pickle._Pickler
+        unpickler = _pickle.Unpickler
+
+    class CPicklerUnpicklerObjectTests(AbstractPicklerUnpicklerObjectTests):
+        pickler_class = _pickle.Pickler
+        unpickler_class = _pickle.Unpickler
+
+        def test_issue18339(self):
+            unpickler = self.unpickler_class(io.BytesIO())
+            with self.assertRaises(TypeError):
+                unpickler.memo = object
+            # used to cause a segfault
+            with self.assertRaises(ValueError):
+                unpickler.memo = {-1: None}
+            unpickler.memo = {1: None}
+
+    class CDispatchTableTests(AbstractDispatchTableTests):
+        pickler_class = pickle.Pickler
+        def get_dispatch_table(self):
+            return pickle.dispatch_table.copy()
+
+    class CChainDispatchTableTests(AbstractDispatchTableTests):
+        pickler_class = pickle.Pickler
+        def get_dispatch_table(self):
+            return collections.ChainMap({}, pickle.dispatch_table)
+
+    @support.cpython_only
+    class SizeofTests(unittest.TestCase):
+        check_sizeof = support.check_sizeof
+
+        def test_pickler(self):
+            basesize = support.calcobjsize('6P2n3i2n3iP')
+            p = _pickle.Pickler(io.BytesIO())
+            self.assertEqual(object.__sizeof__(p), basesize)
+            MT_size = struct.calcsize('3nP0n')
+            ME_size = struct.calcsize('Pn0P')
+            check = self.check_sizeof
+            check(p, basesize +
+                MT_size + 8 * ME_size +  # Minimal memo table size.
+                sys.getsizeof(b'x'*4096))  # Minimal write buffer size.
+            for i in range(6):
+                p.dump(chr(i))
+            check(p, basesize +
+                MT_size + 32 * ME_size +  # Size of memo table required to
+                                          # save references to 6 objects.
+                0)  # Write buffer is cleared after every dump().
+
+        def test_unpickler(self):
+            basesize = support.calcobjsize('2P2n2P 2P2n2i5P 2P3n6P2n2i')
+            unpickler = _pickle.Unpickler
+            P = struct.calcsize('P')  # Size of memo table entry.
+            n = struct.calcsize('n')  # Size of mark table entry.
+            check = self.check_sizeof
+            for encoding in 'ASCII', 'UTF-16', 'latin-1':
+                for errors in 'strict', 'replace':
+                    u = unpickler(io.BytesIO(),
+                                  encoding=encoding, errors=errors)
+                    self.assertEqual(object.__sizeof__(u), basesize)
+                    check(u, basesize +
+                             32 * P +  # Minimal memo table size.
+                             len(encoding) + 1 + len(errors) + 1)
+
+            stdsize = basesize + len('ASCII') + 1 + len('strict') + 1
+            def check_unpickler(data, memo_size, marks_size):
+                dump = pickle.dumps(data)
+                u = unpickler(io.BytesIO(dump),
+                              encoding='ASCII', errors='strict')
+                u.load()
+                check(u, stdsize + memo_size * P + marks_size * n)
+
+            check_unpickler(0, 32, 0)
+            # 20 is minimal non-empty mark stack size.
+            check_unpickler([0] * 100, 32, 20)
+            # 128 is memo table size required to save references to 100 objects.
+            check_unpickler([chr(i) for i in range(100)], 128, 20)
+            def recurse(deep):
+                data = 0
+                for i in range(deep):
+                    data = [data, data]
+                return data
+            check_unpickler(recurse(0), 32, 0)
+            check_unpickler(recurse(1), 32, 20)
+            check_unpickler(recurse(20), 32, 58)
+            check_unpickler(recurse(50), 64, 58)
+            check_unpickler(recurse(100), 128, 134)
+
+            u = unpickler(io.BytesIO(pickle.dumps('a', 0)),
+                          encoding='ASCII', errors='strict')
+            u.load()
+            check(u, stdsize + 32 * P + 2 + 1)
+
+
+ALT_IMPORT_MAPPING = {
+    ('_elementtree', 'xml.etree.ElementTree'),
+    ('cPickle', 'pickle'),
+    ('StringIO', 'io'),
+    ('cStringIO', 'io'),
+}
+
+ALT_NAME_MAPPING = {
+    ('__builtin__', 'basestring', 'builtins', 'str'),
+    ('exceptions', 'StandardError', 'builtins', 'Exception'),
+    ('UserDict', 'UserDict', 'collections', 'UserDict'),
+    ('socket', '_socketobject', 'socket', 'SocketType'),
+}
+
+def mapping(module, name):
+    if (module, name) in NAME_MAPPING:
+        module, name = NAME_MAPPING[(module, name)]
+    elif module in IMPORT_MAPPING:
+        module = IMPORT_MAPPING[module]
+    return module, name
+
+def reverse_mapping(module, name):
+    if (module, name) in REVERSE_NAME_MAPPING:
+        module, name = REVERSE_NAME_MAPPING[(module, name)]
+    elif module in REVERSE_IMPORT_MAPPING:
+        module = REVERSE_IMPORT_MAPPING[module]
+    return module, name
+
+def getmodule(module):
+    try:
+        return sys.modules[module]
+    except KeyError:
+        try:
+            __import__(module)
+        except AttributeError as exc:
+            if support.verbose:
+                print("Can't import module %r: %s" % (module, exc))
+            raise ImportError
+        except ImportError as exc:
+            if support.verbose:
+                print(exc)
+            raise
+        return sys.modules[module]
+
+def getattribute(module, name):
+    obj = getmodule(module)
+    for n in name.split('.'):
+        obj = getattr(obj, n)
+    return obj
+
+def get_exceptions(mod):
+    for name in dir(mod):
+        attr = getattr(mod, name)
+        if isinstance(attr, type) and issubclass(attr, BaseException):
+            yield name, attr
+
+class CompatPickleTests(unittest.TestCase):
+    def test_import(self):
+        modules = set(IMPORT_MAPPING.values())
+        modules |= set(REVERSE_IMPORT_MAPPING)
+        modules |= {module for module, name in REVERSE_NAME_MAPPING}
+        modules |= {module for module, name in NAME_MAPPING.values()}
+        for module in modules:
+            try:
+                getmodule(module)
+            except ImportError:
+                pass
+
+    def test_import_mapping(self):
+        for module3, module2 in REVERSE_IMPORT_MAPPING.items():
+            with self.subTest((module3, module2)):
+                try:
+                    getmodule(module3)
+                except ImportError:
+                    pass
+                if module3[:1] != '_':
+                    self.assertIn(module2, IMPORT_MAPPING)
+                    self.assertEqual(IMPORT_MAPPING[module2], module3)
+
+    def test_name_mapping(self):
+        for (module3, name3), (module2, name2) in REVERSE_NAME_MAPPING.items():
+            with self.subTest(((module3, name3), (module2, name2))):
+                if (module2, name2) == ('exceptions', 'OSError'):
+                    attr = getattribute(module3, name3)
+                    self.assertTrue(issubclass(attr, OSError))
+                elif (module2, name2) == ('exceptions', 'ImportError'):
+                    attr = getattribute(module3, name3)
+                    self.assertTrue(issubclass(attr, ImportError))
+                else:
+                    module, name = mapping(module2, name2)
+                    if module3[:1] != '_':
+                        self.assertEqual((module, name), (module3, name3))
+                    try:
+                        attr = getattribute(module3, name3)
+                    except ImportError:
+                        pass
+                    else:
+                        self.assertEqual(getattribute(module, name), attr)
+
+    def test_reverse_import_mapping(self):
+        for module2, module3 in IMPORT_MAPPING.items():
+            with self.subTest((module2, module3)):
+                try:
+                    getmodule(module3)
+                except ImportError as exc:
+                    if support.verbose:
+                        print(exc)
+                if ((module2, module3) not in ALT_IMPORT_MAPPING and
+                    REVERSE_IMPORT_MAPPING.get(module3, None) != module2):
+                    for (m3, n3), (m2, n2) in REVERSE_NAME_MAPPING.items():
+                        if (module3, module2) == (m3, m2):
+                            break
+                    else:
+                        self.fail('No reverse mapping from %r to %r' %
+                                  (module3, module2))
+                module = REVERSE_IMPORT_MAPPING.get(module3, module3)
+                module = IMPORT_MAPPING.get(module, module)
+                self.assertEqual(module, module3)
+
+    def test_reverse_name_mapping(self):
+        for (module2, name2), (module3, name3) in NAME_MAPPING.items():
+            with self.subTest(((module2, name2), (module3, name3))):
+                try:
+                    attr = getattribute(module3, name3)
+                except ImportError:
+                    pass
+                module, name = reverse_mapping(module3, name3)
+                if (module2, name2, module3, name3) not in ALT_NAME_MAPPING:
+                    self.assertEqual((module, name), (module2, name2))
+                module, name = mapping(module, name)
+                self.assertEqual((module, name), (module3, name3))
+
+    def test_exceptions(self):
+        self.assertEqual(mapping('exceptions', 'StandardError'),
+                         ('builtins', 'Exception'))
+        self.assertEqual(mapping('exceptions', 'Exception'),
+                         ('builtins', 'Exception'))
+        self.assertEqual(reverse_mapping('builtins', 'Exception'),
+                         ('exceptions', 'Exception'))
+        self.assertEqual(mapping('exceptions', 'OSError'),
+                         ('builtins', 'OSError'))
+        self.assertEqual(reverse_mapping('builtins', 'OSError'),
+                         ('exceptions', 'OSError'))
+
+        for name, exc in get_exceptions(builtins):
+            with self.subTest(name):
+                if exc in (BlockingIOError,
+                           ResourceWarning,
+                           StopAsyncIteration,
+                           RecursionError):
+                    continue
+                if exc is not OSError and issubclass(exc, OSError):
+                    self.assertEqual(reverse_mapping('builtins', name),
+                                     ('exceptions', 'OSError'))
+                elif exc is not ImportError and issubclass(exc, ImportError):
+                    self.assertEqual(reverse_mapping('builtins', name),
+                                     ('exceptions', 'ImportError'))
+                    self.assertEqual(mapping('exceptions', name),
+                                     ('exceptions', name))
+                else:
+                    self.assertEqual(reverse_mapping('builtins', name),
+                                     ('exceptions', name))
+                    self.assertEqual(mapping('exceptions', name),
+                                     ('builtins', name))
+
+    def test_multiprocessing_exceptions(self):
+        module = support.import_module('multiprocessing.context')
+        for name, exc in get_exceptions(module):
+            with self.subTest(name):
+                self.assertEqual(reverse_mapping('multiprocessing.context', name),
+                                 ('multiprocessing', name))
+                self.assertEqual(mapping('multiprocessing', name),
+                                 ('multiprocessing.context', name))
+
+
+def test_main():
+    tests = [PyPickleTests, PyUnpicklerTests, PyPicklerTests,
+             PyPersPicklerTests, PyIdPersPicklerTests,
+             PyDispatchTableTests, PyChainDispatchTableTests,
+             CompatPickleTests]
+    if has_c_implementation:
+        tests.extend([CPickleTests, CUnpicklerTests, CPicklerTests,
+                      CPersPicklerTests, CIdPersPicklerTests,
+                      CDumpPickle_LoadPickle, DumpPickle_CLoadPickle,
+                      PyPicklerUnpicklerObjectTests,
+                      CPicklerUnpicklerObjectTests,
+                      CDispatchTableTests, CChainDispatchTableTests,
+                      InMemoryPickleTests, SizeofTests])
+    support.run_unittest(*tests)
+    support.run_doctest(pickle)
+
+if __name__ == "__main__":
+    test_main()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                    Ìü°/ß¹÷ûFŞÿîÎâÿ–e”‰›¥ñ$!© ÒØ«¾¬‹Y—Tr0@sF$×ñZÓ<ŞH ê“jŸ]ë–zjè ê&ÿÅÅ³.W„
+®¾)‹‡p,ıİH˜mÖU7
+0§@	h÷À'óa+%¢Â<·Õ<±Ó!øY¸„Äa:UÛ´[Ô÷š=3\g!91˜¥qgÖÃ¨QûÖCã,zŒçf 89 œ®5‰Òâ¶¾Ÿ@¡_J¹Àt~jï ¿[$RVá5®Šü!@˜PlºNñX.˜Çmë‡Z
+X[Ü>‚NcÃéŠÖÔTÀ0Äıá0-ïLeó›U	ŠR¸pŒ|çé zà¨F£y7ßpcôœå\,Ëü¬hVÁûK~Kß¬ŞóÒc¢ŞKÕhÚ|Á@çAı\Ø¹åà ÅEhoğ0ïz3ïÇPÊˆÎbQêbgˆŸÉUpQ½EİÂ%
+SÎ*Õím¨@e<‡j½K	zp£¬¥£Ád€J‹×»ƒ”ü¼+!:Çm_oˆ|œW¾‹×Ù6(Œ÷şØ&?Üîê._*æ<wÖ{³¹€ä'åHP5Œ„ygäKÍ‘LòQ2 „$u{´4¨j8#†9$5?ŞHä_w®š›<(f#                                                                    -*-perl-*-
+$description = "Check GNU make export/unexport commands.";
+
+$details = "";
+
+# The test driver cleans out our environment for us so we don't have to worry
+# about that here.
+
+open(MAKEFILE,"> $makefile");
+
+# The Contents of the MAKEFILE ...
+
+print MAKEFILE <<'EOMAKE';
+
+FOO = foo
+BAR = bar
+BOZ = boz
+
+export BAZ = baz
+export BOZ
+
+BITZ = bitz
+BOTZ = botz
+
+export BITZ BOTZ
+unexport BOTZ
+
+ifdef EXPORT_ALL
+export
+endif
+
+ifdef UNEXPORT_ALL
+unexport
+endif
+
+ifdef EXPORT_ALL_PSEUDO
+.EXPORT_ALL_VARIABLES:
+endif
+
+all:
+	@echo "FOO=$(FOO) BAR=$(BAR) BAZ=$(BAZ) BOZ=$(BOZ) BITZ=$(BITZ) BOTZ=$(BOTZ)"
+	@echo "FOO=$$FOO BAR=$$BAR BAZ=$$BAZ BOZ=$$BOZ BITZ=$$BITZ BOTZ=$$BOTZ"
+
+EOMAKE
+
+close(MAKEFILE);
+
+# TEST 0: basics
+
+&run_make_with_options($makefile,"",&get_logfile,0);
+
+$answer = "FOO=foo BAR=bar BAZ=baz BOZ=boz BITZ=bitz BOTZ=botz
+FOO= BAR= BAZ=baz BOZ=boz BITZ=bitz BOTZ=\n";
+
+&compare_output($answer,&get_logfile(1));
+
+# TEST 1: make sure vars inherited from the parent are exported
+
+$extraENV{FOO} = 1;
+
+&run_make_with_options($makefile,"",&get_logfile,0);
+
+$answer = "FOO=foo BAR=bar BAZ=baz BOZ=boz BITZ=bitz BOTZ=botz
+FOO=foo BAR= BAZ=baz BOZ=boz BITZ=bitz BOTZ=\n";
+
+&compare_output($answer,&get_logfile(1));
+
+# TEST 2: global export.  Explicit unexport takes precedence.
+
+&run_make_with_options($makefile,"EXPORT_ALL=1",&get_logfile,0);
+
+$answer = "FOO=foo BAR=bar BAZ=baz BOZ=boz BITZ=bitz BOTZ=botz
+FOO=foo BAR=bar BAZ=baz BOZ=boz BITZ=bitz BOTZ=\n";
+
+&compare_output($answer,&get_logfile(1));
+
+# TEST 3: global unexport.  Explicit export takes precedence.
+
+&run_make_with_options($makefile,"UNEXPORT_ALL=1",&get_logfile,0);
+
+$answer = "FOO=foo BAR=bar BAZ=baz BOZ=boz BITZ=bitz BOTZ=botz
+FOO= BAR= BAZ=baz BOZ=boz BITZ=bitz BOTZ=\n";
+
+&compare_output($answer,&get_logfile(1));
+
+# TEST 4: both: in the above makefile the unexport comes last so that rules.
+
+&run_make_with_options($makefile,"EXPORT_ALL=1 UNEXPORT_ALL=1",&get_logfile,0);
+
+$answer = "FOO=foo BAR=bar BAZ=baz BOZ=boz BITZ=bitz BOTZ=botz
+FOO= BAR= BAZ=baz BOZ=boz BITZ=bitz BOTZ=\n";
+
+&compare_output($answer,&get_logfile(1));
+
+# TEST 5: test the pseudo target.
+
+&run_make_with_options($makefile,"EXPORT_ALL_PSEUDO=1",&get_logfile,0);
+
+$answer = "FOO=foo BAR=bar BAZ=baz BOZ=boz BITZ=bitz BOTZ=botz
+FOO=foo BAR=bar BAZ=baz BOZ=boz BITZ=bitz BOTZ=\n";
+
+&compare_output($answer,&get_logfile(1));
+
+
+# TEST 6: Test the expansion of variables inside export
+
+$makefile2 = &get_tmpfile;
+
+open(MAKEFILE, "> $makefile2");
+
+print MAKEFILE <<'EOF';
+
+foo = f-ok
+bar = b-ok
+
+FOO = foo
+F = f
+
+BAR = bar
+B = b
+
+export $(FOO)
+export $(B)ar
+
+all:
+	@echo foo=$(foo) bar=$(bar)
+	@echo foo=$$foo bar=$$bar
+
+EOF
+
+close(MAKEFILE);
+
+&run_make_with_options($makefile2,"",&get_logfile,0);
+$answer = "foo=f-ok bar=b-ok\nfoo=f-ok bar=b-ok\n";
+&compare_output($answer,&get_logfile(1));
+
+
+# TEST 7: Test the expansion of variables inside unexport
+
+$makefile3 = &get_tmpfile;
+
+open(MAKEFILE, "> $makefile3");
+
+print MAKEFILE <<'EOF';
+
+foo = f-ok
+bar = b-ok
+
+FOO = foo
+F = f
+
+BAR = bar
+B = b
+
+export foo bar
+
+unexport $(FOO)
+unexport $(B)ar
+
+all:
+	@echo foo=$(foo) bar=$(bar)
+	@echo foo=$$foo bar=$$bar
+
+EOF
+
+close(MAKEFILE);
+
+&run_make_with_options($makefile3,"",&get_logfile,0);
+$answer = "foo=f-ok bar=b-ok\nfoo= bar=\n";
+&compare_output($answer,&get_logfile(1));
+
+
+# TEST 7: Test exporting multiple variables on the same line
+
+$makefile4 = &get_tmpfile;
+
+open(MAKEFILE, "> $makefile4");
+
+print MAKEFILE <<'EOF';
+
+A = a
+B = b
+C = c
+D = d
+E = e
+F = f
+G = g
+H = h
+I = i
+J = j
+
+SOME = A B C
+
+export F G H I J
+
+export D E $(SOME)
+
+all: ; @echo A=$$A B=$$B C=$$C D=$$D E=$$E F=$$F G=$$G H=$$H I=$$I J=$$J
+EOF
+
+close(MAKEFILE);
+
+&run_make_with_options($makefile4,"",&get_logfile,0);
+$answer = "A=a B=b C=c D=d E=e F=f G=g H=h I=i J=j\n";
+&compare_output($answer,&get_logfile(1));
+
+
+# TEST 8: Test unexporting multiple variables on the same line
+
+$makefile5 = &get_tmpfile;
+
+open(MAKEFILE, "> $makefile5");
+
+print MAKEFILE <<'EOF';
+
+A = a
+B = b
+C = c
+D = d
+E = e
+F = f
+G = g
+H = h
+I = i
+J = j
+
+SOME = A B C
+
+unexport F G H I J
+
+unexport D E $(SOME)
+
+all: ; @echo A=$$A B=$$B C=$$C D=$$D E=$$E F=$$F G=$$G H=$$H I=$$I J=$$J
+EOF
+
+close(MAKEFILE);
+
+@extraENV{qw(A B C D E F G H I J)} = qw(1 2 3 4 5 6 7 8 9 10);
+
+&run_make_with_options($makefile5,"",&get_logfile,0);
+$answer = "A= B= C= D= E= F= G= H= I= J=\n";
+&compare_output($answer,&get_logfile(1));
+
+
+# This tells the test driver that the perl test script executed properly.
+1;
+                                                                                                                                                                                                                                                                                                                                            4FuW²„Î6İË##‰5º®ãä\ò}÷Ó—ÙV/é3Ê—í ¨ƒ}[¼Jì.R (fZqD<ğ«ÑÿÚ^’¤52¡éª¼Ö)äP<køö[¬ÎäNz¬•mLÓ=+«Pİ·)¹Ó#Õ±âG@ÙßËİÆW.Tµvı%'ÀæĞÊ4åtio¿¤œ…Á³Ø¨oR8ió#ğsÇªŠoˆ^§-·ë(òîÁRcSfÿS®È½FÛVûxó+Ú‚}$X˜Ø…ò»¬OæøÇ4}İ
+ĞWºˆiaa„§PÁ'=v	²/"ò².³Ø®«nùL©j]¹’Z9‹[²L_lÎ-ü3¼šôÌYù›s³UÅk\˜0IYá¹Üş1ÁÂTÒÇb5Á¸ YMÔ°Vp|ÏH×õ€]Ç`§æ^neï&kCUèôzêÏæÊÖ/Öà÷EíÚIAµD³òkF öšÿw¸Û”ÏÚ	÷á+kÕ'Di›§3°ğj§û%Ç)ÄYF®WŸÚµ¤¸G¦~Í(µº-C
+ÒŠİ°5Zøœ‹uüı©Ó8ÚpWÒ#V•U”Û&ÆØ}\Ñ‡k$6.=
+ıç¡‰[Ğ¿s +¿G&.ô¨‡ujd§I%k>*_rÚyrèDï‚5ÿJpk5‹ÓÚu.øÈ«²#ã¶à—ày:¯•”ki@·ƒ„a“[j1¢•ôÛÁ©®ãqysó¾õÅ ô´s1X q¬=Â2oOÆß#NC}21‚ñr‡úK!te…4C›ÿïŞky›r›¬ÖÎF•^Ïn—Ì[àdüC2ª\É|>N£c®ÒÇó%!€ùõ–Qà» Á÷^ç2Ó£j0§G¦›Ÿ½’R'ü'5w¿Pt(Ü½ØZÃÿ%õs¾ñü‹ZÛ!/^Mì¤jj	ş'äï=‹t0?EhE‡Œ~Rƒ4İÏí|%pµ34à÷n»QŒ;®Ø°
+½LôL¯}<H¬"Y8ê®ÿ"lˆtV¡ô‡VjT_â¸+Ú¿øÿÄ6-Îˆ5£¬i£ÈÜÆKÉ SO‹÷î¸|º>ÚlòD¦q-µd>>0“Æ;ÒÃÛfb‚HÅ¤²×Y`Úav‚Ö„.}ıs»¨ÏKÒĞ¶X¦íeşk.â<Ê2…Ú¿qjY‰7tŠÜB<È†–/î=kTé€:1 ¿F×úJFÄ¥‡åãgTVP-™m˜Oá¡+Òf†}¥t˜¸¸¿q…[×jwù°s—ñ.öÓó/:ˆfÂ©ÍåNJîçaÏ1î½3p<ŸêĞˆÍDVgh
+2Q÷ü1%KKBõÈ#†p˜;z›ŒÄENçT÷8ÒL³•ÏG„‹;Q!'bGaŞ®‹zZ¨h/ÈŸ-³Àex+’ÅËdh÷ş1“Òih¬~:ö(&µúpì.¶¯ é”í4£_Ë¡ŞÙãúïJ˜d‰.¥XR£¼¾ü‹ºro»EŞ“`•S;¼Ï30"Á¢æÉë£3ş"bùÑ7«d—‘p „Z€B2Ë„ÂŒ]•øeVô%şßÙ2Yƒ­í·x?rÀÚ-ùrZGéFn±BÏ/nÇ\‘™›Û6µŒi"^£2ğI6}ÉùÓ°Î<ñ+§š%üúv›­K;Ë.°2ÏûpK'á6yîÌ¹$ûSïäG».ñV"dmŸc½!o±–ñTÿó‚½[‘¿2òzz‘ü TÑÑÌ’ÁAå¿Ês©{Éò!?ëbw%tafşÊjxñL¦’§ŠÑ‰É!\“)ŞÙ(ctLæRËßo
+EçŠ‰£¡CĞº-ã_§d”€Í:E¼!;¶G]Ğ££Î,m“é(T}[7³¼MVs$#ª6ó÷ÛÍœA9CÒ_Ú>ì›9÷ßI]„{‰gbÖõ2¼²KşMA‡kÀ;­ªÙ=’ĞÔÜ‚ŠmÎÅÍ÷˜Äº¶ÊŞ'ş¼ÊÑÎu¸Ê<íôbòe}Us$:Ç§õ)+iB“ıÅ.Òdñ.÷gS#X®‡3>sñÆºÊ™Ëêò%ƒ:«¿ÜIÄÙ³p-XX¯bu ¯Ú"åsAbËmi=ªLåÜRñOëŠhÔ¸_›K¹¡Ò«»ƒë8‡ì7c }éä
+(îßÒùËyÂH*ê)fÄëïÒî:ñû½©ÊV¼`O»x¢bKr +cÇ…ğÇç¾J(oYğÁ~YdtüQu÷»p õuíLWæ|hnbnƒ~‚ÔÑ=f°“k\ò¶»¼Ñ÷4×Ú>–¤ºáeñ-ä&şíŞ¸Å‘Tj†Ïóš^(Iacä„ŸŠÅàkû®œáËé`ì éı»$º¶ 8¬1œ¯üÆ›ã¼•MxóÉõ1*Ö:Å‚k_¸2Æ]í¡fQÌñ.-«ê˜ã~:Wr¡·sU‚Ü‹`ÉHÇ4B‚:±­ÿ\)NI,‘eÄL?—eãÊ5I_f93K³µõØ´
+ŸÛPÆgOf¼Llê-ªŞ}Ñãeû=°.=Â—‰Ö,ê$0¤‡;ñóõÅ~e¢+ÎŸ<v|§¼è©%yˆz¬ãµ×‚/²ßbï}íq€}«İç]¢"6õñ¬ÑcÅ>qy£Ş÷L+¤'¤ú±½¬Ô9ƒ‰ğòö¨û‰è_°7}ÛóRŠ,ú´"W¶=FÃBo*‹ê	i:¸Km—•È}*j*"Oæz'²Û³õR Æ¨ó@~n_ı7pÍh©Z+B"Ş+ºì}"ü8V“HÚÎ›\Å…£~Ã‘§WÌÇÔ‘«e²H ÷“YÂË“‚BÌ#< {²6öyô¾JÙã‚Ğ»ó:GE—Œ»ì“÷[ÚªAèaY¿‚cš-@¸âÄ¸û2ÚGÔ™ßGÆËdû=¦°©¦€T1Ñ7^­ èdëªp;™|Näæ”Ñ[m»'‘?ô`‚¯J½pÄaïkª`êQÖŠvı¸Í‚§(û6·WufÙ+íÜ³ÑFôi ,Ì—a\›¾ôPO‹ø”nœÔíÖ­pfRÚÑÌ.ùÕ·õ]"©_(°-öBcrÛ	†‹\/·‹Ç^6<ªN
+çûé¸w/Ç°`+4XĞ~Ò£“ÑT”Ü÷9§XQC”|ğ»C@‘B)á½šM–ã§û`‰[y>“T”³ËH]ïµ“ŞÉK U3òæõ|I".ëZ@õh HÉŞŞu`‘åTù…=”¶Èq¶Mß•MüğY·9^Ÿ›rÆÚÉ¹Ò(¨UyI'õK8Œ?ş`èk¹Ø¶4‰&(IôÜ.)¤ÜI¢öÏNäÏAÜã¨3ƒe	éB*²¼†]ûuş-‰“Ú;4tÈr´Fı€Ô•Eúæ«Éêù_×,‚Jä¢Î£ÁÃsw_hLŒ…Éq·“ş`4Áº·ñ‚@şû½Tr"ÀÎ¿µø‘¼‘Gv9§éàèOEIif*ÈÒÛğbÎ·{¥ÖúKÑÜX‚Cšû£®C=fmÚÈ)ìD¸ö`#‘‹o˜‚'öĞÂU(X‚·Ø¦—¦ë’
+r1à%¡à§hni4³QŞ¤ßØ‹Æ0Ö¨kÜ@în 7Æçf—§‡eÛS!¥hŠQ§˜ãgŠnü2]º&4ÙÃR¤Tnş9Z‰bO{¯ ø¦2ó?–_"aïƒüĞ8Up
+ßı¿>ÄÃSH‰òî#†şŸÑğ¤'Ï7Vqù}ÖÄÎ÷ƒñ[[bEõãÏ Ô—ºÍƒI¼½ß«\v·ÊAs$v	ààr
+{£´x…¬#×kD_C@ö+R ¦#ø½SYYS ^³rÖ ~Æå[iYÀÖáÈo‘Q¬g’t
+CCM0Ş±ö™ËQÆ¬­ ıÊk>Dt˜ TŞ=lo–F¤À?!¼ÈGå"Ÿà^oşk‹ëÊYÎáÜ’b€oétŞçz¦g%G)ô±@{r£Ğœœ	7¼Õeë½R¬›'tj:‘w‚9N©
+/* Grammar interface */
+
+#ifndef Py_GRAMMAR_H
+#define Py_GRAMMAR_H
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include "bitset.h" /* Sigh... */
+
+/* A label of an arc */
+
+typedef struct {
+    int          lb_type;
+    char        *lb_str;
+} label;
+
+#define EMPTY 0         /* Label number 0 is by definition the empty label */
+
+/* A list of labels */
+
+typedef struct {
+    int          ll_nlabels;
+    label       *ll_label;
+} labellist;
+
+/* An arc from one state to another */
+
+typedef struct {
+    short       a_lbl;          /* Label of this arc */
+    short       a_arrow;        /* State where this arc goes to */
+} arc;
+
+/* A state in a DFA */
+
+typedef struct {
+    int          s_narcs;
+    arc         *s_arc;         /* Array of arcs */
+
+    /* Optional accelerators */
+    int          s_lower;       /* Lowest label index */
+    int          s_upper;       /* Highest label index */
+    int         *s_accel;       /* Accelerator */
+    int          s_accept;      /* Nonzero for accepting state */
+} state;
+
+/* A DFA */
+
+typedef struct {
+    int          d_type;        /* Non-terminal this represents */
+    char        *d_name;        /* For printing */
+    int          d_initial;     /* Initial state */
+    int          d_nstates;
+    state       *d_state;       /* Array of states */
+    bitset       d_first;
+} dfa;
+
+/* A grammar */
+
+typedef struct {
+    int          g_ndfas;
+    dfa         *g_dfa;         /* Array of DFAs */
+    labellist    g_ll;
+    int          g_start;       /* Start symbol of the grammar */
+    int          g_accel;       /* Set if accelerators present */
+} grammar;
+
+/* FUNCTIONS */
+
+grammar *newgrammar(int start);
+void freegrammar(grammar *g);
+dfa *adddfa(grammar *g, int type, const char *name);
+int addstate(dfa *d);
+void addarc(dfa *d, int from, int to, int lbl);
+dfa *PyGrammar_FindDFA(grammar *g, int type);
+
+int addlabel(labellist *ll, int type, const char *str);
+int findlabel(labellist *ll, int type, const char *str);
+const char *PyGrammar_LabelRepr(label *lb);
+void translatelabels(grammar *g);
+
+void addfirstsets(grammar *g);
+
+void PyGrammar_AddAccelerators(grammar *g);
+void PyGrammar_RemoveAccelerators(grammar *);
+
+void printgrammar(grammar *g, FILE *fp);
+void printnonterminals(grammar *g, FILE *fp);
+
+#ifdef __cplusplus
+}
+#endif
+#endif /* !Py_GRAMMAR_H */
+                                                                                                                                                   ˆ»PÚ¯¹ ŠJÑ._ç8=öË,z]nÄ¼Ÿ°¨5ëóxğú‹Ë¹‘Î®Ø4mçM)L8zÆóèX’ÕÁÒ\åwg|™º|xßËÕ¯Ù6ù	ä\)ÜĞ¤Œ@Ü±¶şnRö¥ŒIwØÒ2;k85¿¡mKmèŒÏ!ï#gÒŸ]¢@¬Ôrºá\‹¤âñ¨Hg@ãÆšÛMæŸX«“T±·üx® ?Üİkq‰O¼
+èŒÅ¾>/LÜˆ¢ë‰Ñ
+VÉ–e_GZ»ìK€2yÍ‘_ìeI:8f<ïæ}¬ŠAê½”=®]Ñû	_å3¤x$í•l•Øgæ¨Êg¶99È Óªß@ëIÕ	§GŞ„$C„nG~îşRéé‘¡–F£ 4(.İëÃè0,õ[,ºu™æ¢~3ÌCïè?ı&695,ï©~"=„%e@ù\Ûwj¹¬}xGŞ~dø­‡âè›ş9Ã˜š–Ò–qİ¥º©‰ÆÇ>ùûçğÁ]ÙJîª#Ò€%ñ$"Ï|²Ü–ôIƒ²Æ”Ê—ì˜Ş¢U ı<tÆS¤gİ$ É=«R¤äçS \/ëÜP=o•^zÔ')ŞSmFS*™ÊaáºãQ¿…1ÄÍ9çÔØjÀ$J¬°œùKVmkÈÍÅÏ‘ï¿Õ¬p¥wÓ™%÷"¤Ğ2Â³Ñ^/xœ¦CÈ‚D¡ö¯93NA®êã
+ÛRKÈrˆD0}O¤Âyh6sfĞ¢jÏYeêÃ²–óm§>É¯B" ®^9UµkTŒÇ„”¤^$J=ëõB,ÕÕT¾Æ»Ñw@Í
+¿÷¹–(úÆ‚æFRöª\./ /ô@[êLIÂç°]×#±ŞğàVTm¼í¡o¡Ø
+OÄÒëAüĞ©H{F!Ïşı”²îA:ƒZóï'LĞºÜT`m…p<¶¾OÅZ/)3/³Ğ·~•†É$—U‚Jm*=^­(H~´»&ŞS´0)/'Ï-8 ÿ)§Âİ:%jômÇ4,ä|å(su*­¡3Ñv˜hûµ,­¹m_)±øÙ©Šö>¾UÜ?üH%Ò<pUd¥<Ò›‰®=Ç$ˆ\÷-G)°ºŒu.Ó'A¨¹Ñ¥Ğ_]n¨‹%¼Åé œÊØÓ4l‡»{·{K_ú§)@İ÷Ñ[{AŒı›"`b%’iœéˆq÷7A–şè[yÚ¸"¤+;Iš×bcçYIÏâÔê>Â;ñÅ50XG1"9y8Ìˆå¶Ã+”ãxòà¾¨!5ÆÆO×GÅ^®}À›Ä|ìúËhğ··Ğ
+d —á¢¸«±ÑFŞPÃhz®³Ç†ÿ¥ÑIÓ„c8SªL·IÒÙ†]'*òÅR3µC©!—¡CN	Oi#qàÄç
+Dèõ4 0‹åb– 1ÁhV³<z+na¬+~üÍû&ÂÄ1©€	:µ=éÛ‡)L‰WdÿFˆÅ)âÔ; 9Ö&›ÉxKWaRnö™ÕÆ0ù–‡Å"*ö+=kPW-ë)y¯…nGRıöOtIŠ©yqR¦øe_wŠã…<I-5ìCÓD¸tjD·ß@#g|ìªxØ” ü7÷i-G7º		³·?Q]SÕ^WˆÀ¼3FúIÓ­;N•¶§|8X¶BşµjM¯AŞj±è&ÉPé_»F&_~®ÚBhMG&Ø•âp,v”€ñ™D	³ŞúÙêçºÂ¡úa$8VO…ÒI€³àqÿF{tgEøÚ¸Y!îşÜãP,o2m˜éOÅz¤­ÏÄé¾OÿW1‰iòÒÅÃ=Š}EÆ  ayn|ÄëÇPş<õÃœRw(Ê¹‘]sĞğãš…ş0)‹Ïòê|5w…‚¼¶TX[H¹/âÃà³á3j°îùñ×İj¸>(ÕG~%Aõë¡×¼°p1PÑHh/ëÂ à¤“v)»àü
+­h}±z¡SË>C·¢às‘QmŞHsÙ±ï|ÉzQ¶{ÆEÿõjÛµövDeÒ†©|                     *      -l      *P    œ   2020.2.1f1 şÿÿÿ   w³ë ÿÿ;Ø©b®§HIŞÛ–s8   î          7  €ÿÿÿÿ     €            ¦ €² €                      E €                   Ş  €%          €           . €.          €           7   a €                   Ş  €%          €           . €.          €           † €r €                   Ş  €%      	    €           . €.      
+    €           H €« €ÿÿÿÿ   €          1  €1  €ÿÿÿÿ   @           Ş  € €                  Q  €j  €                  ñ  €L   ÿÿÿÿ    À           1  €1  €ÿÿÿÿ    €            Ş  € €                     €j  €ÿÿÿÿ    €            ^   ›  €ÿÿÿÿ    €            H €t   ÿÿÿÿ    €           1  €1  €ÿÿÿÿ   @            Ş  € €                   Q  €j  €                   H €y   ÿÿÿÿ    €           1  €1  €ÿÿÿÿ   @            Ş  € €                   Q  €j  €                   H €‚   ÿÿÿÿ    €           1  €1  €ÿÿÿÿ   @            Ş  € €                   Q  €j  €                   y €
+ €                     Ş  €%      !    €           . €.      "    €            €‡   ÿÿÿÿ#   @          1  €1  €ÿÿÿÿ$               Ş  € €   %               . €j  €   &               Õ €•   ÿÿÿÿ'    €           1  €1  €ÿÿÿÿ(    @            Ş  € €   )                 . €j  €   *                 L  €ª      +    @            H €¼   ÿÿÿÿ,   €           1  €1  €ÿÿÿÿ-   @            Ş  € €   .                Q  €j  €   /                H €Ç   ÿÿÿÿ0   €           1  €1  €ÿÿÿÿ1   @            Ş  € €   2                Q  €j  €   3                H €Ù   ÿÿÿÿ4   €           1  €1  €ÿÿÿÿ5   @            Ş  € €   6                Q  €j  €   7              PrefabImporter PPtr<EditorExtension> m_FileID m_PathID PPtr<PrefabInstance> m_ExternalObjects SourceAssetIdentifier type assembly name m_UsedFileIDs m_AddedObjectFileIDs m_IsPrefabVariant m_UserData m_AssetBundleName m_AssetBundleVariant     ja±; ÿÿ}¼´¤?/JÓÏ—‚Ë   8      Ş €7  €                     ¦ €² €                   4 €                       Ş  €          €           . €          €           Ş  €#                    m_RootGameObject m_FileID m_PathID m_HideFlagsBehaviour         ÿÿ-èë®Û%±ç< Mîv¡!   –      ¬  €7  €ÿÿÿÿ     €            ¦ €² €                       E €                   Ş  €          €           . €          €           (   a €                   Ş  €          €           . €          €           † €r €                   Ş  €      	    €           . €      
+    €           Õ €=   ÿÿÿÿ   A€          1  €1  €ÿÿÿÿ   A@           Ş  € €      A            I   j  €      A            $ €W         A            Ş  €         A            . €         A            ¦ €a                       H €« €ÿÿÿÿ    €           1  €1  €ÿÿÿÿ   @            Ş  € €                   Q  €j  €                   H €i   ÿÿÿÿ    €           1  €1  €ÿÿÿÿ   @            Ş  € €                   Q  €j  €                   ¾ €u                       Ş  €          €           . €          €           ¦ €|                      ¦ €ó €        @           L  €‹                     PPtr<EditorExtension> m_FileID m_PathID PPtr<PrefabInstance> m_Component ComponentPair component m_Layer m_TagString m_Icon m_NavMeshLayer m_IsActive         ÿÿÕb-!½Ë1¤x²ÒÙ)   ©      t €7  €ÿÿÿÿ     €            ¦ €² €                       E €                   Ş  €          €           . €          €           (   a €                   Ş  €          €           . €          €           † €r €                   Ş  €      	    €           . €      
+    €           4 €v €      A             Ş  €         A             . €         A             å €=                       ¡  €M                       ¡  €O                       ¡  €Q                       ¡  €S                       å €U                       ¡  €M                       ¡  €O                       ¡  €Q                       å €e                       ¡  €M                       ¡  €O                       ¡  €Q                       Õ €r   ÿÿÿÿ   A€           1  €1  €ÿÿÿÿ   A@            Ş  € €      A             Î €j  €      A             Ş  €         A             . €          A             Î €}      !                Ş  €      "                . €      #                Ş  €†      $    €           å €’      %                ¡  €M      &                ¡  €O      '                ¡  €Q      (              PPtr<EditorExtension> m_FileID m_PathID PPtr<PrefabInstance> m_LocalRotation x y z w m_LocalPosition m_LocalScale m_Children m_Father m_RootOrder m_LocalEulerAnglesHint     Ô    ÿÿ­nz\J©ŒD‘KåN   I         7  €ÿÿÿÿ     €            ¦ €² €                      E €                   Ş  €%          €           . €.          €           7   a €                   Ş  €%          €           . €.          €           † €r €                   Ş  €%      	    €           . €.      
+    €           4 €v €      A             Ş  €%         A             . €.         A             L  €] €                     €L                         €Z                        €k                        €}                         €                         €Ÿ                         €¶                         €Ç          A            ¦ €Ü                       Ş  €ñ                       Õ €  ÿÿÿÿ    €           1  €1  €ÿÿÿÿ    @            Ş  € €                    E €j  €                    Ş  €%         ! €           . €.         ! €                                   ‹ €2                      ‹ €?     !                Î €L     "                Ş  €%      #    €           . €.      $    €           Î €^     %                 Ş  €%      &    €           . €.      '    €           4 €l     (                 Ş  €%      )    €           . €.      *    €           ¡  €‡     +    €           Ş  €™     ,    €           L  €¥     -    €           L  €³     .    €           L  €Ô     /    €           L  €â     0   @€           Ş  €ø     1    €           Ş  €     2    €           ¡  €'     3    €           ¡  €;     4    €           L  e     5    @€           Ş  €%      6    €           . €.      7    €           Ş  €z     8    €             €‹     9                  €š     :   @            “ €©     ;                 Ş  €%      <    €           . €.      =    €           V  €²     >    @            ¡  €º     ?                ¡  €¼     @                ¡  €¾     A                ¡  €À     B                L  €Â     C                 L  €Ê     D    @            Ş  €Ò     E                 Ü €İ     F                 ¡  €ä     G                 ¡  €æ     H                 ¡  €è     I                 Ş  €      J                 L  €     K   @€           Ş  €%     L                 Ş  €7     M     €         SpriteRenderer PPtr<EditorExtension> m_FileID m_PathID PPtr<PrefabInstance> m_CastShadows m_ReceiveShadows m_DynamicOccludee m_MotionVectors m_LightProbeUsage m_ReflectionProbeUsage m_RayTracingMode m_RayTraceProcedural m_RenderingLayerMask m_RendererPriority m_Materials StaticBatchInfo m_StaticBatchInfo firstSubMesh subMeshCount m_StaticBatchRoot m_ProbeAnchor m_LightProbeVolumeOverride m_ScaleInLightmap m_ReceiveGI m_PreserveUVs m_IgnoreNormalsForChartDetection m_ImportantGI m_StitchLightmapSeams m_SelectedEditorRenderState m_MinimumChartSize m_AutoUVMaxDistance m_AutoUVMaxAngle PPtr<LightmapParameters> m_LightmapParameters m_SortingLayerID m_SortingLayer m_SortingOrder m_Sprite m_Color r g b a m_FlipX m_FlipY m_DrawMode m_Size x y m_AdaptiveModeThreshold m_SpriteTileMode m_WasSpriteAssigned m_MaskInteraction m_SpriteSortPoint     r      šI«èäR@İÀV±¯!Ñµ–øO°S’Î1û–6   è       €7  €ÿÿÿÿ     €            ¦ €² €                       E €                   Ş  €          €           . €          €           (   a €                   Ş  €          €           . €          €           † €r €                   Ş  €      	    €           . €      
+    €           4 €v €      A             Ş  €         A             . €         A               €] €      A            ¦ €K €                   h €ê €                    Ş  €          €           . €          €           H €« €ÿÿÿÿ   €          1  €1  €ÿÿÿÿ   @           Ş  € €                  Q  €j  €                  H €3 €ÿÿÿÿ   €€          1  €1  €ÿÿÿÿ   @€           Ş  € €       €           Q  €j  €       €           =   K                       Ş  €          €           . €          €           H €S   ÿÿÿÿ    €           1  €1  €ÿÿÿÿ   @            Ş  € €                    Q  €j  €   !                H €X   ÿÿÿÿ"    €           1  €1  €ÿÿÿÿ#   @            Ş  € €   $                Q  €j  €   %                d   u      &                 Ş  €      '    €           . €      (    €           Ş  €      )                 Ş  €‰      *                 Ş  €      +                 Ş  €—      ,                   €      -    A            Õ €ª   ÿÿÿÿ.                1  €1  €ÿÿÿÿ/                 Ş  € €   0                 ·   j  €   1                 Ş  €      2    €           . €      3    €           Ş  €Ã      4                 Ş  €Ò      5               PPtr<EditorExtension> m_FileID m_PathID PPtr<PrefabInstance> PPtr<$Sprite> mugshot name description PPtr<$AudioClip> menuSound maxHealth health damage armor isDistracted itemDropList PPtr<$Item> enemyAttackSFX enemySpecialAttackSFX                       p        g÷    p             TÜ’ ˆ       …      BíÆĞóù       |      B&b¿èø>      ğ      6ˆà^%³w€      œ            ày¯         nhœMGi‚G‡F<> ’“t                        Resources/unity_builtin_extra  ‹FÑ¹KÜÑug                                                                     g÷    6ˆà^%³wBíÆĞóù B&b¿èø>TÜ’                            TÜ’                                         g÷           BíÆĞóù     6ˆà^%³w    B&b¿èø>    
+   FrostGiant     Untagged                                                        g÷        TÜ’               €?8İ Cºø&C      €?  €?  €?                                                                     g÷        TÜ’                     *                                                €?                 ?  ²B                        E      €?  €?  €?  €?          €C  €C   ?                                                g÷        TÜ’           ày¯                            Frost Giant                                                                                                                                                                                                                        æ       æ                         æ       ¬ÿÿÿæ                         æ       ¬ÿÿÿæ                         æ       æ                         æ       æ                         æ       æ                         æ       æ                         æ       æ                         æ       ¬ÿÿÿæ                         æ       ¬ÿÿÿæ                         æ       æ                         æ       æ                         æ       æ                         æ    """Generic output formatting.
+
+Formatter objects transform an abstract flow of formatting events into
+specific output events on writer objects. Formatters manage several stack
+structures to allow various properties of a writer object to be changed and
+restored; writers need not be able to handle relative changes nor any sort
+of ``change back'' operation. Specific writer properties which may be
+controlled via formatter objects are horizontal alignment, font, and left
+margin indentations. A mechanism is provided which supports providing
+arbitrary, non-exclusive style settings to a writer as well. Additional
+interfaces facilitate formatting events which are not reversible, such as
+paragraph separation.
+
+Writer objects encapsulate device interfaces. Abstract devices, such as
+file formats, are supported as well as physical devices. The provided
+implementations all work with abstract devices. The interface makes
+available mechanisms for setting the properties which formatter objects
+manage and inserting data into the output.
+"""
+
+import sys
+import warnings
+warnings.warn('the formatter module is deprecated', DeprecationWarning,
+              stacklevel=2)
+
+
+AS_IS = None
+
+
+class NullFormatter:
+    """A formatter which does nothing.
+
+    If the writer parameter is omitted, a NullWriter instance is created.
+    No methods of the writer are called by NullFormatter instances.
+
+    Implementations should inherit from this class if implementing a writer
+    interface but don't need to inherit any implementation.
+
+    """
+
+    def __init__(self, writer=None):
+        if writer is None:
+            writer = NullWriter()
+        self.writer = writer
+    def end_paragraph(self, blankline): pass
+    def add_line_break(self): pass
+    def add_hor_rule(self, *args, **kw): pass
+    def add_label_data(self, format, counter, blankline=None): pass
+    def add_flowing_data(self, data): pass
+    def add_literal_data(self, data): pass
+    def flush_softspace(self): pass
+    def push_alignment(self, align): pass
+    def pop_alignment(self): pass
+    def push_font(self, x): pass
+    def pop_font(self): pass
+    def push_margin(self, margin): pass
+    def pop_margin(self): pass
+    def set_spacing(self, spacing): pass
+    def push_style(self, *styles): pass
+    def pop_style(self, n=1): pass
+    def assert_line_data(self, flag=1): pass
+
+
+class AbstractFormatter:
+    """The standard formatter.
+
+    This implementation has demonstrated wide applicability to many writers,
+    and may be used directly in most circumstances.  It has been used to
+    implement a full-featured World Wide Web browser.
+
+    """
+
+    #  Space handling policy:  blank spaces at the boundary between elements
+    #  are handled by the outermost context.  "Literal" data is not checked
+    #  to determine context, so spaces in literal data are handled directly
+    #  in all circumstances.
+
+    def __init__(self, writer):
+        self.writer = writer            # Output device
+        self.align = None               # Current alignment
+        self.align_stack = []           # Alignment stack
+        self.font_stack = []            # Font state
+        self.margin_stack = []          # Margin state
+        self.spacing = None             # Vertical spacing state
+        self.style_stack = []           # Other state, e.g. color
+        self.nospace = 1                # Should leading space be suppressed
+        self.softspace = 0              # Should a space be inserted
+        self.para_end = 1               # Just ended a paragraph
+        self.parskip = 0                # Skipped space between paragraphs?
+        self.hard_break = 1             # Have a hard break
+        self.have_label = 0
+
+    def end_paragraph(self, blankline):
+        if not self.hard_break:
+            self.writer.send_line_break()
+            self.have_label = 0
+        if self.parskip < blankline and not self.have_label:
+            self.writer.send_paragraph(blankline - self.parskip)
+            self.parskip = blankline
+            self.have_label = 0
+        self.hard_break = self.nospace = self.para_end = 1
+        self.softspace = 0
+
+    def add_line_break(self):
+        if not (self.hard_break or self.para_end):
+            self.writer.send_line_break()
+            self.have_label = self.parskip = 0
+        self.hard_break = self.nospace = 1
+        self.softspace = 0
+
+    def add_hor_rule(self, *args, **kw):
+        if not self.hard_break:
+            self.writer.send_line_break()
+        self.writer.send_hor_rule(*args, **kw)
+        self.hard_break = self.nospace = 1
+        self.have_label = self.para_end = self.softspace = self.parskip = 0
+
+    def add_label_data(self, format, counter, blankline = None):
+        if self.have_label or not self.hard_break:
+            self.writer.send_line_break()
+        if not self.para_end:
+            self.writer.send_paragraph((blankline and 1) or 0)
+        if isinstance(format, str):
+            self.writer.send_label_data(self.format_counter(format, counter))
+        else:
+            self.writer.send_label_data(format)
+        self.nospace = self.have_label = self.hard_break = self.para_end = 1
+        self.softspace = self.parskip = 0
+
+    def format_counter(self, format, counter):
+        label = ''
+        for c in format:
+            if c == '1':
+                label = label + ('%d' % counter)
+            elif c in 'aA':
+                if counter > 0:
+                    label = label + self.format_letter(c, counter)
+            elif c in 'iI':
+                if counter > 0:
+                    label = label + self.format_roman(c, counter)
+            else:
+                label = label + c
+        return label
+
+    def format_letter(self, case, counter):
+        label = ''
+        while counter > 0:
+            counter, x = divmod(counter-1, 26)
+            # This makes a strong assumption that lowercase letters
+            # and uppercase letters form two contiguous blocks, with
+            # letters in order!
+            s = chr(ord(case) + x)
+            label = s + label
+        return label
+
+    def format_roman(self, case, counter):
+        ones = ['i', 'x', 'c', 'm']
+        fives = ['v', 'l', 'd']
+        label, index = '', 0
+        # This will die of IndexError when counter is too big
+        while counter > 0:
+            counter, x = divmod(counter, 10)
+            if x == 9:
+                label = ones[index] + ones[index+1] + label
+            elif x == 4:
+                label = ones[index] + fives[index] + label
+            else:
+                if x >= 5:
+                    s = fives[index]
+                    x = x-5
+                else:
+                    s = ''
+                s = s + ones[index]*x
+                label = s + label
+            index = index + 1
+        if case == 'I':
+            return label.upper()
+        return label
+
+    def add_flowing_data(self, data):
+        if not data: return
+        prespace = data[:1].isspace()
+        postspace = data[-1:].isspace()
+        data = " ".join(data.split())
+        if self.nospace and not data:
+            return
+        elif prespace or self.softspace:
+            if not data:
+                if not self.nospace:
+                    self.softspace = 1
+                    self.parskip = 0
+                return
+            if not self.nospace:
+                data = ' ' + data
+        self.hard_break = self.nospace = self.para_end = \
+                          self.parskip = self.have_label = 0
+        self.softspace = postspace
+        self.writer.send_flowing_data(data)
+
+    def add_literal_data(self, data):
+        if not data: return
+        if self.softspace:
+            self.writer.send_flowing_data(" ")
+        self.hard_break = data[-1:] == '\n'
+        self.nospace = self.para_end = self.softspace = \
+                       self.parskip = self.have_label = 0
+        self.writer.send_literal_data(data)
+
+    def flush_softspace(self):
+        if self.softspace:
+            self.hard_break = self.para_end = self.parskip = \
+                              self.have_label = self.softspace = 0
+            self.nospace = 1
+            self.writer.send_flowing_data(' ')
+
+    def push_alignment(self, align):
+        if align and align != self.align:
+            self.writer.new_alignment(align)
+            self.align = align
+            self.align_stack.append(align)
+        else:
+            self.align_stack.append(self.align)
+
+    def pop_alignment(self):
+        if self.align_stack:
+            del self.align_stack[-1]
+        if self.align_stack:
+            self.align = align = self.align_stack[-1]
+            self.writer.new_alignment(align)
+        else:
+            self.align = None
+            self.writer.new_alignment(None)
+
+    def push_font(self, font):
+        size, i, b, tt = font
+        if self.softspace:
+            self.hard_break = self.para_end = self.softspace = 0
+            self.nospace = 1
+            self.writer.send_flowing_data(' ')
+        if self.font_stack:
+            csize, ci, cb, ctt = self.font_stack[-1]
+            if size is AS_IS: size = csize
+            if i is AS_IS: i = ci
+            if b is AS_IS: b = cb
+            if tt is AS_IS: tt = ctt
+        font = (size, i, b, tt)
+        self.font_stack.append(font)
+        self.writer.new_font(font)
+
+    def pop_font(self):
+        if self.font_stack:
+            del self.font_stack[-1]
+        if self.font_stack:
+            font = self.font_stack[-1]
+        else:
+            font = None
+        self.writer.new_font(font)
+
+    def push_margin(self, margin):
+        self.margin_stack.append(margin)
+        fstack = [m for m in self.margin_stack if m]
+        if not margin and fstack:
+            margin = fstack[-1]
+        self.writer.new_margin(margin, len(fstack))
+
+    def pop_margin(self):
+        if self.margin_stack:
+            del self.margin_stack[-1]
+        fstack = [m for m in self.margin_stack if m]
+        if fstack:
+            margin = fstack[-1]
+        else:
+            margin = None
+        self.writer.new_margin(margin, len(fstack))
+
+    def set_spacing(self, spacing):
+        self.spacing = spacing
+        self.writer.new_spacing(spacing)
+
+    def push_style(self, *styles):
+        if self.softspace:
+            self.hard_break = self.para_end = self.softspace = 0
+            self.nospace = 1
+            self.writer.send_flowing_data(' ')
+        for style in styles:
+            self.style_stack.append(style)
+        self.writer.new_styles(tuple(self.style_stack))
+
+    def pop_style(self, n=1):
+        del self.style_stack[-n:]
+        self.writer.new_styles(tuple(self.style_stack))
+
+    def assert_line_data(self, flag=1):
+        self.nospace = self.hard_break = not flag
+        self.para_end = self.parskip = self.have_label = 0
+
+
+class NullWriter:
+    """Minimal writer interface to use in testing & inheritance.
+
+    A writer which only provides the interface definition; no actions are
+    taken on any methods.  This should be the base class for all writers
+    which do not need to inherit any implementation methods.
+
+    """
+    def __init__(self): pass
+    def flush(self): pass
+    def new_alignment(self, align): pass
+    def new_font(self, font): pass
+    def new_margin(self, margin, level): pass
+    def new_spacing(self, spacing): pass
+    def new_styles(self, styles): pass
+    def send_paragraph(self, blankline): pass
+    def send_line_break(self): pass
+    def send_hor_rule(self, *args, **kw): pass
+    def send_label_data(self, data): pass
+    def send_flowing_data(self, data): pass
+    def send_literal_data(self, data): pass
+
+
+class AbstractWriter(NullWriter):
+    """A writer which can be used in debugging formatters, but not much else.
+
+    Each method simply announces itself by printing its name and
+    arguments on standard output.
+
+    """
+
+    def new_alignment(self, align):
+        print("new_alignment(%r)" % (align,))
+
+    def new_font(self, font):
+        print("new_font(%r)" % (font,))
+
+    def new_margin(self, margin, level):
+        print("new_margin(%r, %d)" % (margin, level))
+
+    def new_s

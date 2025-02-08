@@ -1,0 +1,78 @@
+/**
+ * \file
+ * Support for the portable PDB symbol
+ * file format
+ *
+ *
+ * Author:
+ *	Mono Project (http://www.mono-project.com)
+ *
+ * Copyright 2015 Xamarin Inc (http://www.xamarin.com)
+ * Licensed under the MIT license. See LICENSE file in the project root for full license information.
+ */
+
+#include <config.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <errno.h>
+#include <string.h>
+#include <mono/metadata/metadata.h>
+#include <mono/metadata/tabledefs.h>
+#include <mono/metadata/tokentype.h>
+#include <mono/metadata/debug-helpers.h>
+#include <mono/metadata/mono-debug.h>
+#include <mono/metadata/debug-internals.h>
+#include <mono/metadata/mono-endian.h>
+#include <mono/metadata/metadata-internals.h>
+#include <mono/metadata/class-internals.h>
+#include <mono/metadata/cil-coff.h>
+#include <mono/utils/bsearch.h>
+#include <mono/utils/mono-logger-internals.h>
+
+#if HOST_WIN32
+#include "../zlib/zlib.h"
+#elif HAVE_SYS_ZLIB
+#include <zlib.h>
+#endif
+
+#include "debug-mono-ppdb.h"
+
+struct _MonoPPDBFile {
+	MonoImage *image;
+	GHashTable *doc_hash;
+	GHashTable *method_hash;
+};
+
+/* IMAGE_DEBUG_DIRECTORY structure */
+typedef struct
+{
+	gint32 characteristics;
+	gint32 time_date_stamp;
+	gint16 major_version;
+	gint16 minor_version;
+	gint32 type;
+	gint32 size_of_data;
+	gint32 address;
+	gint32 pointer;
+}  ImageDebugDirectory;
+
+typedef struct {
+	gint32 signature;
+	guint8 guid [16];
+	gint32 age;
+} CodeviewDebugDirectory;
+
+typedef struct {
+	guint8 guid [20];
+	guint32 entry_point;
+	guint64 referenced_tables;
+} PdbStreamHeader;
+
+typedef enum {
+	DEBUG_DIR_ENTRY_CODEVIEW = 2,
+	DEBUG_DIR_ENTRY_PPDB = 17
+} DebugDirectoryEntryType;
+
+#define EMBEDDED_PPDB_MAGIC 0x4244504d
+
+enum {

@@ -1,0 +1,201 @@
+# -*- coding: utf-8 -*-
+
+"""
+requests.models
+~~~~~~~~~~~~~~~
+
+This module contains the primary objects that power Requests.
+"""
+
+import datetime
+import sys
+
+# Import encoding now, to avoid implicit import later.
+# Implicit import within threads may cause LookupError when standard library is in a ZIP,
+# such as in Embedded Python. See https://github.com/requests/requests/issues/3578.
+import encodings.idna
+
+from pip._vendor.urllib3.fields import RequestField
+from pip._vendor.urllib3.filepost import encode_multipart_formdata
+from pip._vendor.urllib3.util import parse_url
+from pip._vendor.urllib3.exceptions import (
+    DecodeError, ReadTimeoutError, ProtocolError, LocationParseError)
+
+from io import UnsupportedOperation
+from .hooks import default_hooks
+from .structures import CaseInsensitiveDict
+
+from .auth import HTTPBasicAuth
+from .cookies import cookiejar_from_dict, get_cookie_header, _copy_cookie_jar
+from .exceptions import (
+    HTTPError, MissingSchema, InvalidURL, ChunkedEncodingError,
+    ContentDecodingError, ConnectionError, StreamConsumedError)
+from ._internal_utils import to_native_string, unicode_is_ascii
+from .utils import (
+    guess_filename, get_auth_from_url, requote_uri,
+    stream_decode_response_unicode, to_key_val_list, parse_header_links,
+    iter_slices, guess_json_utf, super_len, check_header_validity)
+from .compat import (
+    Callable, Mapping,
+    cookielib, urlunparse, urlsplit, urlencode, str, bytes,
+    is_py2, chardet, builtin_str, basestring)
+from .compat import json as complexjson
+from .status_codes import codes
+
+#: The set of HTTP status codes that indicate an automatically
+#: processable redirect.
+REDIRECT_STATI = (
+    codes.moved,               # 301
+    codes.found,               # 302
+    codes.other,               # 303
+    codes.temporary_redirect,  # 307
+    codes.permanent_redirect,  # 308
+)
+
+DEFAULT_REDIRECT_LIMIT = 30
+CONTENT_CHUNK_SIZE = 10 * 1024
+ITER_CHUNK_SIZE = 512
+
+
+class RequestEncodingMixin(object):
+    @property
+    def path_url(self):
+        """Build the path URL to use."""
+
+        url = []
+
+        p = urlsplit(self.url)
+
+        path = p.path
+        if not path:
+            path = '/'
+
+        url.append(path)
+
+        query = p.query
+        if query:
+            url.append('?')
+            url.append(query)
+
+        return ''.join(url)
+
+    @staticmethod
+    def _encode_params(data):
+        """Encode parameters in a piece of data.
+
+        Will successfully encode parameters when passed as a dict or a list of
+        2-tuples. Order is retained if data is a list of 2-tuples but arbitrary
+        if parameters are supplied as a dict.
+        """
+
+        if isinstance(data, (str, bytes)):
+            return data
+        elif hasattr(data, 'read'):
+            return data
+        elif hasattr(data, '__iter__'):
+            result = []
+            for k, vs in to_key_val_list(data):
+                if isinstance(vs, basestring) or not hasattr(vs, '__iter__'):
+                    vs = [vs]
+                for v in vs:
+                    if v is not None:
+                        result.append(
+                            (k.encode('utf-8') if isinstance(k, str) else k,
+                             v.encode('utf-8') if isinstance(v, str) else v))
+            return urlencode(result, doseq=True)
+        else:
+            return data
+
+    @staticmethod
+    def _encode_files(files, data):
+        """Build the body for a multipart/form-data request.
+
+        Will successfully encode files when passed as a dict or a list of
+        tuples. Order is retained if data is a list of tuples but arbitrary
+        if parameters are supplied as a dict.
+        The tuples may be 2-tuples (filename, fileobj), 3-tuples (filename, fileobj, contentype)
+        or 4-tuples (filename, fileobj, contentype, custom_headers).
+        """
+        if (not files):
+            raise ValueError("Files must be provided.")
+        elif isinstance(data, basestring):
+            raise ValueError("Data must not be a string.")
+
+        new_fields = []
+        fields = to_key_val_list(data or {})
+        files = to_key_val_list(files or {})
+
+        for field, val in fields:
+            if isinstance(val, basestring) or not hasattr(val, '__iter__'):
+                val = [val]
+            for v in val:
+                if v is not None:
+                    # Don't call str() on bytestrings: in Py3 it all goes wrong.
+                    if not isinstance(v, bytes):
+                        v = str(v)
+
+                    new_fields.append(
+                        (field.decode('utf-8') if isinstance(field, bytes) else field,
+                         v.encode('utf-8') if isinstance(v, str) else v))
+
+        for (k, v) in files:
+            # support for explicit filename
+            ft = None
+            fh = None
+            if isinstance(v, (tuple, list)):
+                if len(v) == 2:
+                    fn, fp = v
+                elif len(v) == 3:
+                    fn, fp, ft = v
+                else:
+                    fn, fp, ft, fh = v
+            else:
+                fn = guess_filename(v) or k
+                fp = v
+
+            if isinstance(fp, (str, bytes, bytearray)):
+                fdata = fp
+            elif hasattr(fp, 'read'):
+                fdata = fp.read()
+            elif fp is None:
+                continue
+            else:
+                fdata = fp
+
+            rf = RequestField(name=k, data=fdata, filename=fn, headers=fh)
+            rf.make_multipart(content_type=ft)
+            new_fields.append(rf)
+
+        body, content_type = encode_multipart_formdata(new_fields)
+
+        return body, content_type
+
+
+class RequestHooksMixin(object):
+    def register_hook(self, event, hook):
+        """Properly register a hook."""
+
+        if event not in self.hooks:
+            raise ValueError('Unsupported event specified, with event name "%s"' % (event))
+
+        if isinstance(hook, Callable):
+            self.hooks[event].append(hook)
+        elif hasattr(hook, '__iter__'):
+            self.hooks[event].extend(h for h in hook if isinstance(h, Callable))
+
+    def deregister_hook(self, event, hook):
+        """Deregister a previously registered hook.
+        Returns True if the hook existed, False if not.
+        """
+
+        try:
+            self.hooks[event].remove(hook)
+            return True
+        except ValueError:
+            return False
+
+
+class Request(RequestHooksMixin):
+    """A user-created :class:`Request <Request>` object.
+
+    Used to prepare a :class:`Prepare

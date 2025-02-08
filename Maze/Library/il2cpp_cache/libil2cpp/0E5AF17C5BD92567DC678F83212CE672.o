@@ -1,0 +1,174 @@
+oup;
+	int dim;
+	int i, j;
+
+	if (!context || !bset)
+		return isl_basic_set_free(context);
+
+	group = alloc_groups(context);
+
+	if (!group)
+		return isl_basic_set_free(context);
+
+	dim = isl_basic_set_dim(bset, isl_dim_set);
+	for (i = 0; i < dim; ++i) {
+		for (j = 0; j < bset->n_eq; ++j)
+			if (!isl_int_is_zero(bset->eq[j][1 + i]))
+				break;
+		if (j < bset->n_eq) {
+			group[i] = -1;
+			continue;
+		}
+		for (j = 0; j < bset->n_ineq; ++j)
+			if (!isl_int_is_zero(bset->ineq[j][1 + i]))
+				break;
+		if (j < bset->n_ineq)
+			group[i] = -1;
+	}
+
+	return isl_basic_map_drop_unrelated_constraints(context, group);
+}
+
+/* Drop constraints from "context" that are irrelevant for computing
+ * the gist of the inequalities "ineq".
+ * Inequalities in "ineq" for which the corresponding element of row
+ * is set to -1 have already been marked for removal and should be ignored.
+ *
+ * In particular, drop constraints in variables that are not related
+ * to any of the variables involved in "ineq"
+ * in the sense that there is no sequence of constraints that connects them.
+ *
+ * We first mark all variables that appear in "bset" as belonging
+ * to a "-1" group and then continue with group_and_drop_irrelevant_constraints.
+ */
+static __isl_give isl_basic_set *drop_irrelevant_constraints_marked(
+	__isl_take isl_basic_set *context, __isl_keep isl_mat *ineq, int *row)
+{
+	int *group;
+	int dim;
+	int i, j, n;
+
+	if (!context || !ineq)
+		return isl_basic_set_free(context);
+
+	group = alloc_groups(context);
+
+	if (!group)
+		return isl_basic_set_free(context);
+
+	dim = isl_basic_set_dim(context, isl_dim_set);
+	n = isl_mat_rows(ineq);
+	for (i = 0; i < dim; ++i) {
+		for (j = 0; j < n; ++j) {
+			if (row[j] < 0)
+				continue;
+			if (!isl_int_is_zero(ineq->row[j][1 + i]))
+				break;
+		}
+		if (j < n)
+			group[i] = -1;
+	}
+
+	return isl_basic_map_drop_unrelated_constraints(context, group);
+}
+
+/* Do all "n" entries of "row" contain a negative value?
+ */
+static int all_neg(int *row, int n)
+{
+	int i;
+
+	for (i = 0; i < n; ++i)
+		if (row[i] >= 0)
+			return 0;
+
+	return 1;
+}
+
+/* Update the inequalities in "bset" based on the information in "row"
+ * and "tab".
+ *
+ * In particular, the array "row" contains either -1, meaning that
+ * the corresponding inequality of "bset" is redundant, or the index
+ * of an inequality in "tab".
+ *
+ * If the row entry is -1, then drop the inequality.
+ * Otherwise, if the constraint is marked redundant in the tableau,
+ * then drop the inequality.  Similarly, if it is marked as an equality
+ * in the tableau, then turn the inequality into an equality and
+ * perform Gaussian elimination.
+ */
+static __isl_give isl_basic_set *update_ineq(__isl_take isl_basic_set *bset,
+	__isl_keep int *row, struct isl_tab *tab)
+{
+	int i;
+	unsigned n_ineq;
+	unsigned n_eq;
+	int found_equality = 0;
+
+	if (!bset)
+		return NULL;
+	if (tab && tab->empty)
+		return isl_basic_set_set_to_empty(bset);
+
+	n_ineq = bset->n_ineq;
+	for (i = n_ineq - 1; i >= 0; --i) {
+		if (row[i] < 0) {
+			if (isl_basic_set_drop_inequality(bset, i) < 0)
+				return isl_basic_set_free(bset);
+			continue;
+		}
+		if (!tab)
+			continue;
+		n_eq = tab->n_eq;
+		if (isl_tab_is_equality(tab, n_eq + row[i])) {
+			isl_basic_map_inequality_to_equality(bset, i);
+			found_equality = 1;
+		} else if (isl_tab_is_redundant(tab, n_eq + row[i])) {
+			if (isl_basic_set_drop_inequality(bset, i) < 0)
+				return isl_basic_set_free(bset);
+		}
+	}
+
+	if (found_equality)
+		bset = isl_basic_set_gauss(bset, NULL);
+	bset = isl_basic_set_finalize(bset);
+	return bset;
+}
+
+/* Update the inequalities in "bset" based on the information in "row"
+ * and "tab" and free all arguments (other than "bset").
+ */
+static __isl_give isl_basic_set *update_ineq_free(
+	__isl_take isl_basic_set *bset, __isl_take isl_mat *ineq,
+	__isl_take isl_basic_set *context, __isl_take int *row,
+	struct isl_tab *tab)
+{
+	isl_mat_free(ineq);
+	isl_basic_set_free(context);
+
+	bset = update_ineq(bset, row, tab);
+
+	free(row);
+	isl_tab_free(tab);
+	return bset;
+}
+
+/* Remove all information from bset that is redundant in the context
+ * of context.
+ * "ineq" contains the (possibly transformed) inequalities of "bset",
+ * in the same order.
+ * The (explicit) equalities of "bset" are assumed to have been taken
+ * into account by the transformation such that only the inequalities
+ * are relevant.
+ * "context" is assumed not to be empty.
+ *
+ * "row" keeps track of the constraint index of a "bset" inequality in "tab".
+ * A value of -1 means that the inequality is obviously redundant and may
+ * not even appear in  "tab".
+ *
+ * We first mark the inequalities of "bset"
+ * that are obviously redundant with respect to some inequality in "context".
+ * Then we remove those constraints from "context" that have become
+ * irrelevant for computing the gist of "bset".
+ * Note that this removal of constraints cannot be replaced 

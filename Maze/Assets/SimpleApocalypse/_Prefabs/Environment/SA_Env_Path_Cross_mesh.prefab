@@ -1,0 +1,65 @@
+/*
+ * Copyright (c) 2008-2017, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * NVIDIA CORPORATION and its licensors retain all intellectual property
+ * and proprietary rights in and to this software, related documentation
+ * and any modifications thereto.  Any use, reproduction, disclosure or
+ * distribution of this software and related documentation without an express
+ * license agreement from NVIDIA CORPORATION is strictly prohibited.
+ */
+
+
+#include "ApexAssetTracker.h"
+#include "Apex.h"
+#include "ApexSDKIntl.h"
+#include "ApexResource.h"
+#include "ApexSDKHelpers.h"
+#include "AuthorableObjectIntl.h"
+
+namespace nvidia
+{
+namespace apex
+{
+
+/******************************************************************************
+ * ApexAssetTracker class
+ * Intended to be a base class for asset classes that have named sub-assets.
+ * - Allows their actors to easily get asset pointers
+ * - Uses the NRP in an appropriate fashion
+ *   - calls to checkResource(), createResource(), and getResource()
+ *   - handles that tricky IOS asset double call mechanism
+ * - Sub class must implement initializeAssetNameTable()
+ *
+ */
+ApexAssetTracker::~ApexAssetTracker()
+{
+	/* Get the NRP */
+	if (mSdk)
+	{
+		ResourceProviderIntl* nrp = mSdk->getInternalResourceProvider();
+
+		/* release references to rendermesh assets */
+		for (uint32_t j = 0 ; j < mNameIdList.size() ; j++)
+		{
+			AssetNameIDMapping *nameId = mNameIdList[j];
+			if (nameId->resID != INVALID_RESOURCE_ID)
+			{
+				if ( nameId->isOpaqueMesh )
+				{
+					ResID opaqueMeshId = nrp->createResource(mSdk->getOpaqueMeshNameSpace(),nameId->assetName.c_str(),false);
+					PX_ASSERT( opaqueMeshId != INVALID_RESOURCE_ID );
+					if (nrp->checkResource(opaqueMeshId))
+					{
+						nrp->releaseResource(opaqueMeshId);
+					}
+					uint32_t refCount;
+					bool found =nrp->findRefCount(RENDER_MESH_AUTHORING_TYPE_NAME,nameId->assetName.c_str(),refCount);
+					PX_ASSERT(found);
+					PX_UNUSED(found);
+					if (nrp->checkResource(nameId->resID))
+					{
+						if ( refCount == 1 )
+						{
+							void *asset = nrp->getResource(nameId->resID);
+							PX_ASSERT(asset);
+							

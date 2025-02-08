@@ -1,0 +1,56 @@
+   step2[2] = idct_calc_wraplow_sse2(cp_8_24, cp_24_n8, lo_2);  // step2 3&2
+    step2[4] = _mm_add_epi16(step1[4], step1[5]);                // step2 4&7
+    step2[5] = _mm_sub_epi16(step1[4], step1[5]);                // step2 5&6
+    step2[6] = _mm_unpackhi_epi64(step2[5], zero);               // step2 6
+  }
+
+  // stage 3
+  {
+    const __m128i lo_65 = _mm_unpacklo_epi16(step2[6], step2[5]);
+    tmp[0] = _mm_add_epi16(step2[0], step2[2]);                     // step1 0&1
+    tmp[1] = _mm_sub_epi16(step2[0], step2[2]);                     // step1 3&2
+    step1[2] = _mm_unpackhi_epi64(tmp[1], tmp[0]);                  // step1 2&1
+    step1[3] = _mm_unpacklo_epi64(tmp[1], tmp[0]);                  // step1 3&0
+    step1[5] = idct_calc_wraplow_sse2(cp_16_n16, cp_16_16, lo_65);  // step1 5&6
+  }
+
+  // stage 4
+  tmp[0] = _mm_add_epi16(step1[3], step2[4]);  // output 3&0
+  tmp[1] = _mm_add_epi16(step1[2], step1[5]);  // output 2&1
+  tmp[2] = _mm_sub_epi16(step1[3], step2[4]);  // output 4&7
+  tmp[3] = _mm_sub_epi16(step1[2], step1[5]);  // output 5&6
+
+  idct8x8_12_transpose_16bit_4x8(tmp, io);
+  io[4] = io[5] = io[6] = io[7] = zero;
+
+  idct8(io, io);
+}
+
+static INLINE void idct16_8col(const __m128i *const in /*in[16]*/,
+                               __m128i *const out /*out[16]*/) {
+  __m128i step1[16], step2[16];
+
+  // stage 2
+  butterfly(in[1], in[15], cospi_30_64, cospi_2_64, &step2[8], &step2[15]);
+  butterfly(in[9], in[7], cospi_14_64, cospi_18_64, &step2[9], &step2[14]);
+  butterfly(in[5], in[11], cospi_22_64, cospi_10_64, &step2[10], &step2[13]);
+  butterfly(in[13], in[3], cospi_6_64, cospi_26_64, &step2[11], &step2[12]);
+
+  // stage 3
+  butterfly(in[2], in[14], cospi_28_64, cospi_4_64, &step1[4], &step1[7]);
+  butterfly(in[10], in[6], cospi_12_64, cospi_20_64, &step1[5], &step1[6]);
+  step1[8] = _mm_add_epi16(step2[8], step2[9]);
+  step1[9] = _mm_sub_epi16(step2[8], step2[9]);
+  step1[10] = _mm_sub_epi16(step2[11], step2[10]);
+  step1[11] = _mm_add_epi16(step2[10], step2[11]);
+  step1[12] = _mm_add_epi16(step2[12], step2[13]);
+  step1[13] = _mm_sub_epi16(step2[12], step2[13]);
+  step1[14] = _mm_sub_epi16(step2[15], step2[14]);
+  step1[15] = _mm_add_epi16(step2[14], step2[15]);
+
+  // stage 4
+  butterfly(in[0], in[8], cospi_16_64, cospi_16_64, &step2[1], &step2[0]);
+  butterfly(in[4], in[12], cospi_24_64, cospi_8_64, &step2[2], &step2[3]);
+  butterfly(step1[14], step1[9], cospi_24_64, cospi_8_64, &step2[9],
+            &step2[14]);
+  butterfly(step1[10], step1[13], -cospi_8_64, -cospi_24_64, &step2[13],

@@ -1,0 +1,89 @@
+    Type = MachO::N_INDR;
+  else if (Symbol->isUndefined())
+    Type = MachO::N_UNDF;
+  else if (Symbol->isAbsolute())
+    Type = MachO::N_ABS;
+  else
+    Type = MachO::N_SECT;
+
+  // FIXME: Set STAB bits.
+
+  if (Data.isPrivateExtern())
+    Type |= MachO::N_PEXT;
+
+  // Set external bit.
+  if (Data.isExternal() || (!IsAlias && Symbol->isUndefined()))
+    Type |= MachO::N_EXT;
+
+  // Compute the symbol address.
+  if (IsAlias && Symbol->isUndefined())
+    Address = AliaseeInfo->StringIndex;
+  else if (Symbol->isDefined())
+    Address = getSymbolAddress(OrigSymbol, Layout);
+  else if (Symbol->isCommon()) {
+    // Common symbols are encoded with the size in the address
+    // field, and their alignment in the flags.
+    Address = Symbol->getCommonSize();
+  }
+
+  // struct nlist (12 bytes)
+
+  write32(MSD.StringIndex);
+  write8(Type);
+  write8(SectionIndex);
+
+  // The Mach-O streamer uses the lowest 16-bits of the flags for the 'desc'
+  // value.
+  bool EncodeAsAltEntry =
+    IsAlias && cast<MCSymbolMachO>(OrigSymbol).isAltEntry();
+  write16(cast<MCSymbolMachO>(Symbol)->getEncodedFlags(EncodeAsAltEntry));
+  if (is64Bit())
+    write64(Address);
+  else
+    write32(Address);
+}
+
+void MachObjectWriter::writeLinkeditLoadCommand(uint32_t Type,
+                                                uint32_t DataOffset,
+                                                uint32_t DataSize) {
+  uint64_t Start = getStream().tell();
+  (void) Start;
+
+  write32(Type);
+  write32(sizeof(MachO::linkedit_data_command));
+  write32(DataOffset);
+  write32(DataSize);
+
+  assert(getStream().tell() - Start == sizeof(MachO::linkedit_data_command));
+}
+
+static unsigned ComputeLinkerOptionsLoadCommandSize(
+  const std::vector<std::string> &Options, bool is64Bit)
+{
+  unsigned Size = sizeof(MachO::linker_option_command);
+  for (const std::string &Option : Options)
+    Size += Option.size() + 1;
+  return alignTo(Size, is64Bit ? 8 : 4);
+}
+
+void MachObjectWriter::writeLinkerOptionsLoadCommand(
+  const std::vector<std::string> &Options)
+{
+  unsigned Size = ComputeLinkerOptionsLoadCommandSize(Options, is64Bit());
+  uint64_t Start = getStream().tell();
+  (void) Start;
+
+  write32(MachO::LC_LINKER_OPTION);
+  write32(Size);
+  write32(Options.size());
+  uint64_t BytesWritten = sizeof(MachO::linker_option_command);
+  for (const std::string &Option : Options) {
+    // Write each string, including the null byte.
+    writeBytes(Option, Option.size() + 1);
+    BytesWritten += Option.size() + 1;
+  }
+
+  // Pad to a multiple of the pointer size.
+  writeBytes("", OffsetToAlignment(BytesWritten, is64Bit() ? 8 : 4));
+
+  assert(getStream().tell()

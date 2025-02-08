@@ -1,0 +1,301 @@
+ameterInfo, ParameterIds);
+					ParameterInfo.Append(LocalParameterInfo);
+				}
+				{
+					TArray<FMaterialParameterInfo> LocalParameterInfo;
+					TArray<FGuid> ParameterIds;
+					Material->GetAllVectorParameterInfo(LocalParameterInfo, ParameterIds);
+					ParameterInfo.Append(LocalParameterInfo);
+				}
+			}
+
+			for (const FMaterialParameterInfo& Var : ParameterInfo)
+			{
+				Names.AddUnique(Var.Name);
+			}
+		}
+	}
+
+	return Names;
+}
+
+void FNiagaraMaterialAttributeBindingCustomization::CollectAllMaterialActions(FGraphActionListBuilderBase& OutAllActions)
+{
+	TArray<FName> ParamNames = GetMaterialNames();
+	for (FName ParamName : ParamNames)
+	{
+		FText CategoryName = FText();
+		FString DisplayNameString = FName::NameToDisplayString(ParamName.ToString(), false);
+		const FText NameText = FText::FromString(DisplayNameString);
+		const FText TooltipDesc = FText::Format(LOCTEXT("BindToMaterialParameter", "Bind to the Material Variable \"{0}\" "), FText::FromString(DisplayNameString));
+		TSharedPtr<FNiagaraStackAssetAction_VarBind> NewNodeAction(new FNiagaraStackAssetAction_VarBind(ParamName, CategoryName, NameText,
+			TooltipDesc, 0, FText()));
+		OutAllActions.AddAction(NewNodeAction);
+	}
+}
+
+TSharedRef<SWidget> FNiagaraMaterialAttributeBindingCustomization::OnCreateWidgetForMaterialAction(struct FCreateWidgetForActionData* const InCreateData)
+{
+	return SNew(SVerticalBox)
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		[
+			SNew(STextBlock)
+			.Text(InCreateData->Action->GetMenuDescription())
+		.ToolTipText(InCreateData->Action->GetTooltipDescription())
+		];
+}
+
+
+void FNiagaraMaterialAttributeBindingCustomization::OnMaterialActionSelected(const TArray< TSharedPtr<FEdGraphSchemaAction> >& SelectedActions, ESelectInfo::Type InSelectionType)
+{
+	if (InSelectionType == ESelectInfo::OnMouseClick || InSelectionType == ESelectInfo::OnKeyPress || SelectedActions.Num() == 0)
+	{
+		for (int32 ActionIndex = 0; ActionIndex < SelectedActions.Num(); ActionIndex++)
+		{
+			TSharedPtr<FEdGraphSchemaAction> CurrentAction = SelectedActions[ActionIndex];
+
+			if (CurrentAction.IsValid())
+			{
+				FSlateApplication::Get().DismissAllMenus();
+				FNiagaraStackAssetAction_VarBind* EventSourceAction = (FNiagaraStackAssetAction_VarBind*)CurrentAction.Get();
+				ChangeMaterialSource(EventSourceAction->VarName);
+			}
+		}
+	}
+}
+
+void FNiagaraMaterialAttributeBindingCustomization::ChangeMaterialSource(FName InVarName)
+{
+	FScopedTransaction Transaction(FText::Format(LOCTEXT("ChangeParameterSource", " Change Parameter Source to \"{0}\" "), FText::FromName(InVarName)));
+	TArray<UObject*> Objects;
+	PropertyHandle->GetOuterObjects(Objects);
+	for (UObject* Obj : Objects)
+	{
+		Obj->Modify();
+	}
+
+	PropertyHandle->NotifyPreChange();
+	TargetParameterBinding->MaterialParameterName = InVarName;
+	//TargetParameterBinding->Parameter.SetType(FMaterialTypeDefinition::GetUObjectDef()); Do not override the type here!
+	//TargetVariableBinding->DataSetVariable = FMaterialConstants::GetAttributeAsDataSetKey(TargetVariableBinding->BoundVariable);
+	PropertyHandle->NotifyPostChange();
+	PropertyHandle->NotifyFinishedChangingProperties();
+}
+
+void FNiagaraMaterialAttributeBindingCustomization::CustomizeHeader(TSharedRef<IPropertyHandle> InPropertyHandle, FDetailWidgetRow& HeaderRow, IPropertyTypeCustomizationUtils& CustomizationUtils)
+{
+	PropertyHandle = InPropertyHandle;
+	bool bAddDefault = true;
+	
+
+	if (bAddDefault)
+	{
+		HeaderRow
+			.NameContent()
+			[
+				PropertyHandle->CreatePropertyNameWidget()
+			]
+		.ValueContent()
+			.MaxDesiredWidth(200.f)
+			[
+				SNew(STextBlock)
+				.Text(LOCTEXT("ParamHeaderValue", "Binding"))
+				.Font(IDetailLayoutBuilder::GetDetailFont())
+			];
+	}
+}
+
+
+void FNiagaraMaterialAttributeBindingCustomization::CustomizeChildren(TSharedRef<IPropertyHandle> StructPropertyHandle, class IDetailChildrenBuilder& ChildBuilder, IPropertyTypeCustomizationUtils& StructCustomizationUtils)
+{
+	RenderProps = nullptr;
+	BaseSystem =  nullptr;
+	BaseEmitter = nullptr;
+	  
+	TArray<UObject*> Objects;
+	PropertyHandle->GetOuterObjects(Objects);
+	if (Objects.Num() == 1)
+	{
+		RenderProps = Cast<UNiagaraRendererProperties>(Objects[0]);
+		BaseSystem = Objects[0]->GetTypedOuter<UNiagaraSystem>();
+		BaseEmitter = Objects[0]->GetTypedOuter<UNiagaraEmitter>();
+		if (BaseSystem)
+		{
+			TargetParameterBinding = (FNiagaraMaterialAttributeBinding*)PropertyHandle->GetValueBaseAddress((uint8*)Objects[0]);
+
+			TSharedPtr<IPropertyHandle> ChildPropertyHandle = StructPropertyHandle->GetChildHandle(0);
+			FDetailWidgetRow& RowMaterial = ChildBuilder.AddCustomRow(FText::GetEmpty());
+			RowMaterial
+				.NameContent()
+				[
+					ChildPropertyHandle->CreatePropertyNameWidget()
+				]
+			.ValueContent()
+				.MaxDesiredWidth(200.f)
+				[
+					SNew(SComboButton)
+					.OnGetMenuContent(this, &FNiagaraMaterialAttributeBindingCustomization::OnGetMaterialMenuContent)
+					.ContentPadding(1)
+					.ToolTipText(this, &FNiagaraMaterialAttributeBindingCustomization::GetMaterialTooltipText)
+					.ButtonStyle(FEditorStyle::Get(), "PropertyEditor.AssetComboStyle")
+					.ForegroundColor(FEditorStyle::GetColor("PropertyEditor.AssetName.ColorAndOpacity"))
+					.ButtonContent()
+					[
+						SNew(STextBlock)
+						.Text(this, &FNiagaraMaterialAttributeBindingCustomization::GetMaterialCurrentText)
+						.Font(IDetailLayoutBuilder::GetDetailFont())
+					]
+				];
+
+			ChildPropertyHandle = StructPropertyHandle->GetChildHandle(1);
+			FDetailWidgetRow& RowNiagara = ChildBuilder.AddCustomRow(FText::GetEmpty());
+			RowNiagara
+				.NameContent()
+				[
+					ChildPropertyHandle->CreatePropertyNameWidget()
+				]
+			.ValueContent()
+				.MaxDesiredWidth(200.f)
+				[
+					SNew(SComboButton)
+					.OnGetMenuContent(this, &FNiagaraMaterialAttributeBindingCustomization::OnGetNiagaraMenuContent)
+					.ContentPadding(1)
+					.ToolTipText(this, &FNiagaraMaterialAttributeBindingCustomization::GetNiagaraTooltipText)
+					.ButtonStyle(FEditorStyle::Get(), "PropertyEditor.AssetComboStyle")
+					.ForegroundColor(FEditorStyle::GetColor("PropertyEditor.AssetName.ColorAndOpacity"))
+					.ButtonContent()
+					[
+						SNew(SHorizontalBox)
+						+ SHorizontalBox::Slot()
+						.VAlign(VAlign_Center)
+						.Padding(5, 0)
+						[
+							SNew(SNiagaraParameterName)
+							.ParameterName(this, &FNiagaraMaterialAttributeBindingCustomization::GetNiagaraVariableName)
+							.IsReadOnly(true)
+						]
+						+ SHorizontalBox::Slot()
+						.VAlign(VAlign_Center)
+						.Padding(5, 0)
+						[
+							SNew(STextBlock)
+							.Visibility(this, &FNiagaraMaterialAttributeBindingCustomization::GetNiagaraChildVariableVisibility)
+							.Text(this, &FNiagaraMaterialAttributeBindingCustomization::GetNiagaraChildVariableText)
+						]
+					]
+				];
+		}
+	}
+}
+
+//////////////////////////////////////////////////////////////////////////
+
+FName FNiagaraDataInterfaceBindingCustomization::GetVariableName() const
+{
+	if (BaseStage && TargetDataInterfaceBinding)
+	{
+		return (TargetDataInterfaceBinding->BoundVariable.GetName());
+	}
+	return FName();
+}
+
+FText FNiagaraDataInterfaceBindingCustomization::GetCurrentText() const
+{
+	if (BaseStage && TargetDataInterfaceBinding)
+	{
+		return FText::FromName(TargetDataInterfaceBinding->BoundVariable.GetName());
+	}
+	return FText::FromString(TEXT("Missing"));
+}
+
+FText FNiagaraDataInterfaceBindingCustomization::GetTooltipText() const
+{
+	if (BaseStage && TargetDataInterfaceBinding && TargetDataInterfaceBinding->BoundVariable.IsValid())
+	{
+		FText TooltipDesc = FText::Format(LOCTEXT("DataInterfaceBindingTooltip", "Bound to the user parameter \"{0}\""), FText::FromName(TargetDataInterfaceBinding->BoundVariable.GetName()));
+		return TooltipDesc;
+	}
+	return FText::FromString(TEXT("Missing"));
+}
+
+TSharedRef<SWidget> FNiagaraDataInterfaceBindingCustomization::OnGetMenuContent() const
+{
+	FGraphActionMenuBuilder MenuBuilder;
+
+	return SNew(SBorder)
+		.BorderImage(FEditorStyle::GetBrush("Menu.Background"))
+		.Padding(5)
+		[
+			SNew(SBox)
+			[
+				SNew(SGraphActionMenu)
+				.OnActionSelected(const_cast<FNiagaraDataInterfaceBindingCustomization*>(this), &FNiagaraDataInterfaceBindingCustomization::OnActionSelected)
+		.OnCreateWidgetForAction(SGraphActionMenu::FOnCreateWidgetForAction::CreateSP(const_cast<FNiagaraDataInterfaceBindingCustomization*>(this), &FNiagaraDataInterfaceBindingCustomization::OnCreateWidgetForAction))
+		.OnCollectAllActions(const_cast<FNiagaraDataInterfaceBindingCustomization*>(this), &FNiagaraDataInterfaceBindingCustomization::CollectAllActions)
+		.AutoExpandActionMenu(false)
+		.ShowFilterTextBox(true)
+			]
+		];
+}
+
+TArray<FName> FNiagaraDataInterfaceBindingCustomization::GetNames() const
+{
+	TArray<FName> Names;
+
+	if (BaseStage && TargetDataInterfaceBinding)
+	{
+		UNiagaraEmitter* Emitter = BaseStage->GetTypedOuter<UNiagaraEmitter>();
+
+		if (Emitter)
+		{
+			// Find all used emitter and particle data interface variables that can be iterated upon.
+			TArray<UNiagaraScript*> AllScripts;
+			Emitter->GetScripts(AllScripts, false);
+
+			TArray<UNiagaraGraph*> Graphs;
+			for (const UNiagaraScript* Script : AllScripts)
+			{
+				const UNiagaraScriptSource* Source = Cast<UNiagaraScriptSource>(Script->GetSource());
+				if (Source)
+				{
+					Graphs.AddUnique(Source->NodeGraph);
+				}
+			}
+
+			for (const UNiagaraGraph* Graph : Graphs)
+			{
+				const TMap<FNiagaraVariable, FNiagaraGraphParameterReferenceCollection>& ParameterReferenceMap = Graph->GetParameterReferenceMap();
+				for (const auto& ParameterToReferences : ParameterReferenceMap)
+				{
+					const FNiagaraVariable& ParameterVariable = ParameterToReferences.Key;
+					if (ParameterVariable.IsDataInterface())
+					{
+						const UClass* Class = ParameterVariable.GetType().GetClass();
+						if (Class)
+						{
+							const UObject* DefaultObjDI = Class->GetDefaultObject();
+							if (DefaultObjDI != nullptr && DefaultObjDI->IsA<UNiagaraDataInterfaceRWBase>())
+							{
+								Names.AddUnique(ParameterVariable.GetName());
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return Names;
+}
+
+void FNiagaraDataInterfaceBindingCustomization::CollectAllActions(FGraphActionListBuilderBase& OutAllActions)
+{
+	TArray<FName> UserParamNames = GetNames();
+	for (FName UserParamName : UserParamNames)
+	{
+		FText CategoryName = FText();
+		FString DisplayNameString = FName::NameToDisplayString(UserParamName.ToString(), false);
+		const FText NameText = FText::FromString(DisplayNameString);
+		const FText TooltipDesc = FText::Format(LOCTEXT("BindToDataInterface", "Bind to the User Parameter \"{0}\" "), FText::FromString(DisplayNameString));
+		TSharedPtr<FNiagaraStackAssetAction_VarBind> NewNodeAction(new FNiagaraStackAssetAction_VarBind(UserParamName, Catego

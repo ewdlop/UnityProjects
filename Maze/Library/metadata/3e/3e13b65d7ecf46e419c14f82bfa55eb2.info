@@ -1,0 +1,138 @@
+ut you can call Marshal.ReleaseComObject if you want explicit release it as early as possible
+        /// </summary>
+        [DebuggerBrowsable(DebuggerBrowsableState.Never)]
+        int m_refCount;
+
+        /// <summary>
+        /// Flags of this __ComObject. See ComObjectFlags for the possible value
+        /// </summary>
+        [DebuggerBrowsable(DebuggerBrowsableState.Never)]
+        ComObjectFlags m_flags;
+
+        /// <summary>
+        /// A reference to CCW
+        /// This makes sure the lifetime of the CCW and this RCW is tied together in aggregation scenario
+        /// </summary>
+        [DebuggerBrowsable(DebuggerBrowsableState.Never)]
+        ComCallableObject m_outer;
+
+        /// <summary>
+        /// Saved identity IUnknown vtbl at creation time
+        /// This is mostly used as a way to diagnose what the underlying COM object really is (if the vtbl
+        /// is still there, of course) in case the COM object was destroyed due to an extra release
+        /// </summary>
+        [DebuggerBrowsable(DebuggerBrowsableState.Never)]
+        IntPtr m_savedIUnknownVtbl;
+
+        [DebuggerBrowsable(DebuggerBrowsableState.Never)]
+        internal IntPtr SavedIUnknownVtbl { get { return m_savedIUnknownVtbl; } }
+
+        /// <summary>
+        /// Fixed array of cached interfaces that are lock-free
+        /// @TODO: Make this a struct instead of an array object
+        /// NOTE: Managed Debugger depends on field name "m_cachedInterfaces" and field type:SimpleComInterfaceCacheItem
+        /// Update managed debugger whenever field name/field type is changed.
+        /// See CordbObjectValue::GetInterfaceData in debug\dbi\values.cpp
+        /// </summary>
+        [DebuggerBrowsable(DebuggerBrowsableState.Never)]
+        internal SimpleComInterfaceCacheItem[] m_cachedInterfaces;
+        internal const int FIXED_CACHE_SIZE = 8;
+
+        /// <summary>
+        /// Growable additional cached interfaces.  Access this via AcquireAdditionalCacheExclusive/ForRead
+        /// NOTE: Managed Debugger depends on field name: "m_additionalCachedInterfaces_dontAccessDirectly" and field type: AdditionalComInterfaceCacheContext
+        /// Update managed debugger whenever field name/field type is changed.
+        /// See CordbObjectValue::GetInterfaceData in debug\dbi\values.cpp
+        /// </summary>
+        [DebuggerBrowsable(DebuggerBrowsableState.Never)]
+        private AdditionalComInterfaceCacheContext[] m_additionalCachedInterfaces_dontAccessDirectly;
+
+        // if m_additionalCachedInterfaces_dontAccessDirectly == CacheLocked, the cache is being updated and
+        // cannot be read or written from another thread.  We do this instead of using a "real" lock, to save space.
+        [DebuggerBrowsable(DebuggerBrowsableState.Never)]
+        private static readonly AdditionalComInterfaceCacheContext[] CacheLocked = new AdditionalComInterfaceCacheContext[0];
+
+        /// <summary>
+        /// Finalizer helper object that does cleanup.
+        /// See RCWFinalizer class for more details.
+        /// </summary>
+        [DebuggerBrowsable(DebuggerBrowsableState.Never)]
+        private RCWFinalizer m_finalizer;
+
+#if !RHTESTCL && PROJECTN && ENABLE_WINRT
+        [DebuggerBrowsable(DebuggerBrowsableState.Never)]
+        private static readonly System.Collections.Generic.Dictionary<RuntimeTypeHandle, RuntimeTypeHandle> s_DynamicRCWAdapters = 
+            new System.Collections.Generic.Dictionary<RuntimeTypeHandle, RuntimeTypeHandle>();
+#endif
+
+        #endregion
+
+        #region Debugging Private Variables
+
+#if DEBUG
+        /// <summary>
+        /// Runtime class name of this WinRT __ComObject. This is helpful when you want to understand why
+        /// you get back a __ComObject instead of a strongly-typed RCW
+        /// </summary>
+        [DebuggerBrowsable(DebuggerBrowsableState.Never)]
+        internal string m_runtimeClassName;
+
+        /// <summary>
+        /// sequential allocation ID of this COM object
+        /// useful when you are debugging bugs where the program's behavior is deterministic
+        /// </summary>
+        [DebuggerBrowsable(DebuggerBrowsableState.Never)]
+        internal uint m_allocationId;
+
+        /// <summary>
+        /// Next allocation ID
+        /// Typed as int to make sure InterlockedExchange.Add is happy
+        /// </summary>
+        [DebuggerBrowsable(DebuggerBrowsableState.Never)]
+        internal static int s_nextAllocationId;
+#endif
+
+        /// <summary>
+        /// Return allocation ID in debug build
+        /// INTERNAL only - not in public contract
+        /// </summary>
+        [DebuggerBrowsable(DebuggerBrowsableState.Never)]
+        public uint AllocationId
+        {
+            get
+            {
+#if DEBUG
+                return m_allocationId;
+#else
+                return 0xffffffff;
+#endif
+            }
+        }
+
+        #endregion
+
+        /// <summary>
+        /// Gets/sets the outer CCW
+        /// Only used in aggregation scenarios
+        /// We only set the outer CCW during creation of managed object that derives from native
+        /// </summary>
+        [DebuggerBrowsable(DebuggerBrowsableState.Never)]
+        internal ComCallableObject Outer
+        {
+            get
+            {
+                return m_outer;
+            }
+            set
+            {
+                m_outer = value;
+            }
+        }
+
+        private AdditionalComInterfaceCacheContext[] AcquireAdditionalCacheExclusive()
+        {
+            AdditionalComInterfaceCacheContext[] additionalCache;
+
+            SpinWait spin = new SpinWait();
+
+            while ((additionalCache = Interlocked.Exchange(ref m_additional

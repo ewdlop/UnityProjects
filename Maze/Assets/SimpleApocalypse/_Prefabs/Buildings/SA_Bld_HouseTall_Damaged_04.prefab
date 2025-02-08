@@ -1,0 +1,194 @@
+
+                    obs.OnCompleted);
+            });
+#endif
+        }
+
+        public virtual IObservable<TSource> Do<TSource>(IObservable<TSource> source, Action<TSource> onNext, Action<Exception> onError, Action onCompleted)
+        {
+            return Do_(source, onNext, onError, onCompleted);
+        }
+
+        public virtual IObservable<TSource> Do<TSource>(IObservable<TSource> source, IObserver<TSource> observer)
+        {
+            return Do_(source, observer.OnNext, observer.OnError, observer.OnCompleted);
+        }
+
+        private static IObservable<TSource> Do_<TSource>(IObservable<TSource> source, Action<TSource> onNext, Action<Exception> onError, Action onCompleted)
+        {
+#if !NO_PERF
+            return new Do<TSource>(source, onNext, onError, onCompleted);
+#else
+            return new AnonymousObservable<TSource>(obs =>
+            {
+                return source.Subscribe(
+                    x =>
+                    {
+                        try
+                        {
+                            onNext(x);
+                        }
+                        catch (Exception ex)
+                        {
+                            obs.OnError(ex);
+                        }
+                        obs.OnNext(x);
+                    },
+                    ex =>
+                    {
+                        try
+                        {
+                            onError(ex);
+                        }
+                        catch (Exception ex2)
+                        {
+                            obs.OnError(ex2);
+                        }
+                        obs.OnError(ex);
+                    },
+                    () =>
+                    {
+                        try
+                        {
+                            onCompleted();
+                        }
+                        catch (Exception ex)
+                        {
+                            obs.OnError(ex);
+                        }
+                        obs.OnCompleted();
+                    });
+            });
+#endif
+        }
+
+        #endregion
+
+        #region + Finally +
+
+        public virtual IObservable<TSource> Finally<TSource>(IObservable<TSource> source, Action finallyAction)
+        {
+#if !NO_PERF
+            return new Finally<TSource>(source, finallyAction);
+#else
+            return new AnonymousObservable<TSource>(observer =>
+            {
+                var subscription = source.Subscribe(observer);
+
+                return Disposable.Create(() =>
+                    {
+                        try
+                        {
+                            subscription.Dispose();
+                        }
+                        finally
+                        {
+                            finallyAction();
+                        }
+                    });
+            });
+#endif
+        }
+
+        #endregion
+
+        #region + IgnoreElements +
+
+        public virtual IObservable<TSource> IgnoreElements<TSource>(IObservable<TSource> source)
+        {
+#if !NO_PERF
+            var ignoreElements = source as IgnoreElements<TSource>;
+            if (ignoreElements != null)
+                return ignoreElements.Omega();
+
+            return new IgnoreElements<TSource>(source);
+#else
+            return new AnonymousObservable<TSource>(observer => source.Subscribe(_ => { }, observer.OnError, observer.OnCompleted));
+#endif
+        }
+
+        #endregion
+
+        #region + Materialize +
+
+        public virtual IObservable<Notification<TSource>> Materialize<TSource>(IObservable<TSource> source)
+        {
+#if !NO_PERF
+            //
+            // NOTE: Peephole optimization of xs.Dematerialize().Materialize() should not be performed. It's possible for xs to
+            //       contain multiple terminal notifications, which won't survive a Dematerialize().Materialize() chain. In case
+            //       a reduction to xs.AsObservable() would be performed, those notification elements would survive.
+            //
+
+            return new Materialize<TSource>(source);
+#else
+            return new AnonymousObservable<Notification<TSource>>(observer =>
+                source.Subscribe(
+                    value => observer.OnNext(Notification.CreateOnNext<TSource>(value)),
+                    exception =>
+                    {
+                        observer.OnNext(Notification.CreateOnError<TSource>(exception));
+                        observer.OnCompleted();
+                    },
+                    () =>
+                    {
+                        observer.OnNext(Notification.CreateOnCompleted<TSource>());
+                        observer.OnCompleted();
+                    }));
+#endif
+        }
+
+        #endregion
+
+        #region - Repeat -
+
+        public virtual IObservable<TSource> Repeat<TSource>(IObservable<TSource> source)
+        {
+            return RepeatInfinite(source).Concat();
+        }
+
+        private static IEnumerable<T> RepeatInfinite<T>(T value)
+        {
+            while (true)
+                yield return value;
+        }
+
+        public virtual IObservable<TSource> Repeat<TSource>(IObservable<TSource> source, int repeatCount)
+        {
+            return Enumerable.Repeat(source, repeatCount).Concat();
+        }
+
+        #endregion
+
+        #region - Retry -
+
+        public virtual IObservable<TSource> Retry<TSource>(IObservable<TSource> source)
+        {
+            return RepeatInfinite(source).Catch();
+        }
+
+        public virtual IObservable<TSource> Retry<TSource>(IObservable<TSource> source, int retryCount)
+        {
+            return Enumerable.Repeat(source, retryCount).Catch();
+        }
+
+        #endregion
+
+        #region + Scan +
+
+        public virtual IObservable<TAccumulate> Scan<TSource, TAccumulate>(IObservable<TSource> source, TAccumulate seed, Func<TAccumulate, TSource, TAccumulate> accumulator)
+        {
+#if !NO_PERF
+            return new Scan<TSource, TAccumulate>(source, seed, accumulator);
+#else
+            return Defer(() =>
+            {
+                var accumulation = default(TAccumulate);
+                var hasAccumulation = false;
+                return source.Select(x =>
+                {
+                    if (hasAccumulation)
+                        accumulation = accumulator(accumulation, x);
+                    else
+                    {
+   

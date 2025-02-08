@@ -1,0 +1,241 @@
+terop.Errors.ERROR_SUCCESS)
+            {
+                Debug.Assert(false, string.Format(CultureInfo.InvariantCulture, "Win32.CreateWellKnownSid returned unrecognized error {0}", Error));
+                throw new Win32Exception(Error);
+            }
+
+            CreateFromBinaryForm(resultSid, 0);
+        }
+
+        internal SecurityIdentifier(SecurityIdentifier domainSid, uint rid)
+        {
+            int i;
+            int[] SubAuthorities = new int[domainSid.SubAuthorityCount + 1];
+
+            for (i = 0; i < domainSid.SubAuthorityCount; i++)
+            {
+                SubAuthorities[i] = domainSid.GetSubAuthority(i);
+            }
+
+            SubAuthorities[i] = (int)rid;
+
+            CreateFromParts(domainSid.IdentifierAuthority, SubAuthorities);
+        }
+
+        internal SecurityIdentifier(IdentifierAuthority identifierAuthority, int[] subAuthorities)
+        {
+            CreateFromParts(identifierAuthority, subAuthorities);
+        }
+
+        #endregion
+
+        #region Static Properties
+
+        //
+        // Revision is always '1'
+        //
+
+        internal static byte Revision
+        {
+            get
+            {
+                return 1;
+            }
+        }
+
+        #endregion
+
+        #region Non-static Properties
+
+        //
+        // This is for internal consumption only, hence it is marked 'internal'
+        // Making this call public would require a deep copy of the data to
+        // prevent the caller from messing with the internal representation.
+        //
+
+        internal byte[] BinaryForm
+        {
+            get
+            {
+                return _binaryForm;
+            }
+        }
+
+        internal IdentifierAuthority IdentifierAuthority
+        {
+            get
+            {
+                return _identifierAuthority;
+            }
+        }
+
+        internal int SubAuthorityCount
+        {
+            get
+            {
+                return _subAuthorities.Length;
+            }
+        }
+
+        public int BinaryLength
+        {
+            get
+            {
+                return _binaryForm.Length;
+            }
+        }
+
+        //
+        // Returns the domain portion of a SID or null if the specified
+        // SID is not an account SID
+        // NOTE: although there is a P/Invoke call involved in the implementation of this method,
+        //       there is no security risk involved, so no security demand is being made.
+        //
+
+        public SecurityIdentifier AccountDomainSid
+        {
+            get
+            {
+                if (!_accountDomainSidInitialized)
+                {
+                    _accountDomainSid = GetAccountDomainSid();
+                    _accountDomainSidInitialized = true;
+                }
+
+                return _accountDomainSid;
+            }
+        }
+
+        #endregion
+
+        #region Inherited properties and methods
+
+        public override bool Equals(object o)
+        {
+            return (this == o as SecurityIdentifier); // invokes operator==
+        }
+
+        public bool Equals(SecurityIdentifier sid)
+        {
+            return (this == sid); // invokes operator==
+        }
+
+        public override int GetHashCode()
+        {
+            int hashCode = ((long)this.IdentifierAuthority).GetHashCode();
+            for (int i = 0; i < SubAuthorityCount; i++)
+            {
+                hashCode ^= this.GetSubAuthority(i);
+            }
+            return hashCode;
+        }
+
+        public override string ToString()
+        {
+            if (_sddlForm == null)
+            {
+                StringBuilder result = new StringBuilder();
+
+                //
+                // Typecasting of _IdentifierAuthority to a long below is important, since
+                // otherwise you would see this: "S-1-NTAuthority-32-544"
+                //
+
+                result.AppendFormat("S-1-{0}", (long)_identifierAuthority);
+
+                for (int i = 0; i < SubAuthorityCount; i++)
+                {
+                    result.AppendFormat("-{0}", (uint)(_subAuthorities[i]));
+                }
+
+                _sddlForm = result.ToString();
+            }
+
+            return _sddlForm;
+        }
+
+        public override string Value
+        {
+            get
+            {
+                return ToString().ToUpperInvariant();
+            }
+        }
+
+        internal static bool IsValidTargetTypeStatic(Type targetType)
+        {
+            if (targetType == typeof(NTAccount))
+            {
+                return true;
+            }
+            else if (targetType == typeof(SecurityIdentifier))
+            {
+                return true;
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+        public override bool IsValidTargetType(Type targetType)
+        {
+            return IsValidTargetTypeStatic(targetType);
+        }
+        
+
+        internal SecurityIdentifier GetAccountDomainSid()
+        {
+            SecurityIdentifier ResultSid;
+            int Error;
+
+            Error = Win32.GetWindowsAccountDomainSid(this, out ResultSid);
+
+            if (Error == Interop.Errors.ERROR_INSUFFICIENT_BUFFER)
+            {
+                throw new OutOfMemoryException();
+            }
+            else if (Error == Interop.Errors.ERROR_NON_ACCOUNT_SID)
+            {
+                ResultSid = null;
+            }
+            else if (Error != Interop.Errors.ERROR_SUCCESS)
+            {
+                Debug.Assert(false, string.Format(CultureInfo.InvariantCulture, "Win32.GetWindowsAccountDomainSid returned unrecognized error {0}", Error));
+                throw new Win32Exception(Error);
+            }
+            return ResultSid;
+        }
+
+
+        public bool IsAccountSid()
+        {
+            if (!_accountDomainSidInitialized)
+            {
+                _accountDomainSid = GetAccountDomainSid();
+                _accountDomainSidInitialized = true;
+            }
+
+            if (_accountDomainSid == null)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+
+        public override IdentityReference Translate(Type targetType)
+        {
+            if (targetType == null)
+            {
+                throw new ArgumentNullException(nameof(targetType));
+            }
+
+            if (targetType == typeof(SecurityIdentifier))
+            {
+                return this; // assumes SecurityIdentifier objects are immutable
+            }
+            else if (targetType == typeof(NTAccount))
+            {
+                IdentityRe

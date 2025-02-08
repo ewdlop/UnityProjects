@@ -1,0 +1,127 @@
+// DirectoryObjectSecurityTest.cs - NUnit Test Cases for DirectoryObjectSecurity
+//
+// Authors:
+//	James Bellinger  <jfb@zer7.com>
+//
+// Copyright (C) 2012 James Bellinger
+
+using System;
+using System.Collections.Generic;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using NUnit.Framework;
+
+namespace MonoTests.System.Security.AccessControl
+{
+	[TestFixture]
+	public class DirectoryObjectSecurityTest
+	{
+		[Test]
+		public void Defaults ()
+		{
+			TestSecurity security = new TestSecurity ();
+			Assert.IsTrue (security.IsContainerTest);
+			Assert.IsTrue (security.IsDSTest);
+		}
+
+		[Test, ExpectedExceptionAttribute (typeof (ArgumentOutOfRangeException))]
+		public void ChecksAccessControlModificationRange ()
+		{
+			bool modifiedRet, modifiedOut;
+			TestSecurity security = new TestSecurity ();
+
+			SecurityIdentifier sid = new SecurityIdentifier ("WD");
+			TestAccessRule rule = new TestAccessRule
+				(sid, 1, false, InheritanceFlags.None, PropagationFlags.None,
+				 Guid.Empty, Guid.Empty, AccessControlType.Allow);
+
+			modifiedRet = security.ModifyAccessRule ((AccessControlModification)43210,
+			                           		 rule, out modifiedOut);
+		}
+
+		[Test]
+		public void IgnoresResetOnAuditAndReturnsTrue ()
+		{
+			bool modifiedRet, modifiedOut;
+			TestSecurity security = new TestSecurity ();
+
+			SecurityIdentifier sid = new SecurityIdentifier ("WD");
+			TestAuditRule rule = new TestAuditRule
+				(sid, 1, false, InheritanceFlags.None, PropagationFlags.None,
+				 Guid.Empty, Guid.Empty, AuditFlags.Success);
+
+			modifiedRet = security.ModifyAuditRule (AccessControlModification.Reset,
+			                           		rule, out modifiedOut);
+			Assert.IsTrue (modifiedRet);
+		}
+
+		[Test, ExpectedException (typeof (ArgumentNullException))]
+		public void ConstructorFailsOnNullDescriptor ()
+		{
+			new TestSecurity (null);
+		}
+
+		[Test]
+		public void ConstructorLetsFalseDSThrough ()
+		{
+			CommonSecurityDescriptor descriptor = new CommonSecurityDescriptor
+				(false, false, ControlFlags.None, null, null, null, null);
+
+			TestSecurity security = new TestSecurity (descriptor);
+			Assert.IsFalse (security.IsContainerTest);
+			Assert.IsFalse (security.IsDSTest);
+		}
+
+		[Test]
+		public void ObjectSecurityJustWrapsCommonSecurityDescriptor ()
+		{
+			CommonSecurityDescriptor descriptor = new CommonSecurityDescriptor
+				(false, false, ControlFlags.None, null, null, null, null);
+
+			TestSecurity security = new TestSecurity (descriptor);
+			Assert.IsNull (security.GetOwner (typeof(SecurityIdentifier)));
+			SecurityIdentifier sid = new SecurityIdentifier ("WD");
+
+			descriptor.Owner = sid; // Not virtual, so the conclusion in the test's title.
+			Assert.IsFalse (security.OwnerModifiedTest);
+			Assert.AreSame (sid, security.GetOwner (typeof(SecurityIdentifier)));
+
+			security.SetOwner (sid);
+			Assert.IsTrue (security.OwnerModifiedTest);
+			Assert.AreSame (sid, security.GetOwner (typeof(SecurityIdentifier)));
+		}
+
+		[Test, ExpectedExceptionAttribute (typeof (InvalidOperationException))]
+		public void LocksAreEnforced ()
+		{
+			TestSecurity security = new TestSecurity ();
+			bool value = security.OwnerModifiedTestWithoutLock;
+		}
+
+		[Test]
+		[Category ("NotWorking")] // Mono does not have a working CustomAce implementation yet.
+		public void ObjectSecurityRemovesWhatItCannotCreate ()
+		{
+			RawAcl acl = new RawAcl (GenericAcl.AclRevision, 1);
+			acl.InsertAce (0, new CustomAce ((AceType)255, AceFlags.None, new byte[4]));
+
+			DiscretionaryAcl dacl = new DiscretionaryAcl (true, true, acl);
+			Assert.AreEqual (1, dacl.Count);
+
+			CommonSecurityDescriptor descriptor = new CommonSecurityDescriptor
+				(true, true, ControlFlags.None, null, null, null, dacl);
+
+			TestSecurity security = new TestSecurity (descriptor);
+			AuthorizationRuleCollection rules = security.GetAccessRules (true, true, typeof (SecurityIdentifier));
+			Assert.AreEqual (0, rules.Count);
+		}
+
+		[Test]
+		public void FactoryWithoutGuidsCalledWhenNotObjectAce ()
+		{
+			TestSecurity security = FactoryCallTest (false);
+			Assert.IsTrue (security.access_factory_called);
+		}
+
+		[Test, ExpectedExceptionAttribute (typeof (NotImplementedException))]
+		public void FactoryWi

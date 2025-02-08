@@ -1,0 +1,67 @@
+//===------ omptarget.cpp - Target independent OpenMP target RTL -- C++ -*-===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is dual licensed under the MIT and the University of Illinois Open
+// Source Licenses. See LICENSE.txt for details.
+//
+//===----------------------------------------------------------------------===//
+//
+// Implementation of the interface to be used by Clang during the codegen of a
+// target region.
+//
+//===----------------------------------------------------------------------===//
+
+#include <omptarget.h>
+
+#include "device.h"
+#include "private.h"
+#include "rtl.h"
+
+#include <cassert>
+#include <vector>
+
+#ifdef OMPTARGET_DEBUG
+int DebugLevel = 0;
+#endif // OMPTARGET_DEBUG
+
+/// Map global data and execute pending ctors
+static int InitLibrary(DeviceTy& Device) {
+  /*
+   * Map global data
+   */
+  int32_t device_id = Device.DeviceID;
+  int rc = OFFLOAD_SUCCESS;
+
+  Device.PendingGlobalsMtx.lock();
+  TrlTblMtx.lock();
+  for (HostEntriesBeginToTransTableTy::iterator
+      ii = HostEntriesBeginToTransTable.begin();
+      ii != HostEntriesBeginToTransTable.end(); ++ii) {
+    TranslationTable *TransTable = &ii->second;
+    if (TransTable->TargetsTable[device_id] != 0) {
+      // Library entries have already been processed
+      continue;
+    }
+
+    // 1) get image.
+    assert(TransTable->TargetsImages.size() > (size_t)device_id &&
+           "Not expecting a device ID outside the table's bounds!");
+    __tgt_device_image *img = TransTable->TargetsImages[device_id];
+    if (!img) {
+      DP("No image loaded for device id %d.\n", device_id);
+      rc = OFFLOAD_FAIL;
+      break;
+    }
+    // 2) load image into the target table.
+    __tgt_target_table *TargetTable =
+        TransTable->TargetsTable[device_id] = Device.load_binary(img);
+    // Unable to get table for this image: invalidate image and fail.
+    if (!TargetTable) {
+      DP("Unable to generate entries table for device id %d.\n", device_id);
+      TransTable->TargetsImages[device_id] = 0;
+      rc = OFFLOAD_FAIL;
+      break;
+    }
+
+    // Verify whether the two table

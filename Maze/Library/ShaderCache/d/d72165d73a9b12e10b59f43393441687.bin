@@ -1,0 +1,69 @@
+0;
+    }
+}
+
+static void
+ucnv_MBCSUnload(UConverterSharedData *sharedData) {
+    UConverterMBCSTable *mbcsTable=&sharedData->mbcs;
+
+    if(mbcsTable->swapLFNLStateTable!=NULL) {
+        uprv_free(mbcsTable->swapLFNLStateTable);
+    }
+    if(mbcsTable->stateTableOwned) {
+        uprv_free((void *)mbcsTable->stateTable);
+    }
+    if(mbcsTable->baseSharedData!=NULL) {
+        ucnv_unload(mbcsTable->baseSharedData);
+    }
+    if(mbcsTable->reconstitutedData!=NULL) {
+        uprv_free(mbcsTable->reconstitutedData);
+    }
+}
+
+static void
+ucnv_MBCSOpen(UConverter *cnv,
+              UConverterLoadArgs *pArgs,
+              UErrorCode *pErrorCode) {
+    UConverterMBCSTable *mbcsTable;
+    const int32_t *extIndexes;
+    uint8_t outputType;
+    int8_t maxBytesPerUChar;
+
+    if(pArgs->onlyTestIsLoadable) {
+        return;
+    }
+
+    mbcsTable=&cnv->sharedData->mbcs;
+    outputType=mbcsTable->outputType;
+
+    if(outputType==MBCS_OUTPUT_DBCS_ONLY) {
+        /* the swaplfnl option does not apply, remove it */
+        cnv->options=pArgs->options&=~UCNV_OPTION_SWAP_LFNL;
+    }
+
+    if((pArgs->options&UCNV_OPTION_SWAP_LFNL)!=0) {
+        /* do this because double-checked locking is broken */
+        UBool isCached;
+
+        umtx_lock(NULL);
+        isCached=mbcsTable->swapLFNLStateTable!=NULL;
+        umtx_unlock(NULL);
+
+        if(!isCached) {
+            if(!_EBCDICSwapLFNL(cnv->sharedData, pErrorCode)) {
+                if(U_FAILURE(*pErrorCode)) {
+                    return; /* something went wrong */
+                }
+
+                /* the option does not apply, remove it */
+                cnv->options=pArgs->options&=~UCNV_OPTION_SWAP_LFNL;
+            }
+        }
+    }
+
+    if(uprv_strstr(pArgs->name, "18030")!=NULL) {
+        if(uprv_strstr(pArgs->name, "gb18030")!=NULL || uprv_strstr(pArgs->name, "GB18030")!=NULL) {
+            /* set a flag for GB 18030 mode, which changes the callback behavior */
+            cnv->options|=_MBCS_OPTION_GB18030;
+        }
+    } else if((uprv_strstr(pArgs->name, "KEIS")!=NULL) || (uprv_strstr(pArgs->na

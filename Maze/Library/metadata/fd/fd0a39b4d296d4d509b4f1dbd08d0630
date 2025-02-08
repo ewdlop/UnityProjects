@@ -1,0 +1,129 @@
+setBy(0, 0,  LEAF_DIM);
+        for (int x = 0; x < LEAF_DIM; ++x ) {
+            for (int y = 0, n = (x << LEAF_LOG2DIM); y < LEAF_DIM; ++y, ++n) {
+                if (const Word w = oldMask.template getWord<Word>(n)) {
+                    {
+                        cache.mask = Word(w | (w>>1) | (w<<1));
+                        cache.setOrigin(cache[0]->origin());
+                        cache.scatter(0, n);
+                        cache.scatterFacesXY(x, y, 0, n, 3);
+                        cache.scatterEdgesXY(x, y, 0, n, 3);
+                    }
+                    if ( (cache.mask = Word(w<<(LEAF_DIM-1))) ) {
+                        cache.setOrigin(cache[0]->origin());
+                        cache.template scatter< 0, 0,-1>(1, n);
+                        cache.setOrigin(orig_mz);
+                        cache.scatterFacesXY(x, y, 1, n, 11);
+                        cache.scatterEdgesXY(x, y, 1, n, 11);
+                    }
+                    if ( (cache.mask = Word(w>>(LEAF_DIM-1))) ) {
+                        cache.setOrigin(cache[0]->origin());
+                        cache.template scatter< 0, 0, 1>(2, n);
+                        cache.setOrigin(orig_pz);
+                        cache.scatterFacesXY(x, y, 2, n, 19);
+                        cache.scatterEdgesXY(x, y, 2, n, 19);
+                    }
+                }
+            }// loop over y
+        }//loop over x
+        cache.clear();
+    }//loop over leafs
+
+    mManager->rebuildLeafArray();
+}// dilateVoxels26
+
+
+template<typename TreeType>
+inline void
+Morphology<TreeType>::LeafCache::scatterFacesXY(int x, int y, int i1, int n, int i2)
+{
+    // dilate current leaf or neighbor in the -x direction
+    if (x > 0) {
+        this->scatter(i1, n-LEAF_DIM);
+    } else {
+        this->template scatter<-1, 0, 0>(i2, n);
+    }
+    // dilate current leaf or neighbor in the +x direction
+    if (x < LEAF_DIM-1) {
+        this->scatter(i1, n+LEAF_DIM);
+    } else {
+        this->template scatter< 1, 0, 0>(i2+1, n);
+    }
+    // dilate current leaf or neighbor in the -y direction
+    if (y > 0) {
+        this->scatter(i1, n-1);
+    } else {
+        this->template scatter< 0,-1, 0>(i2+2, n);
+    }
+    // dilate current leaf or neighbor in the +y direction
+    if (y < LEAF_DIM-1) {
+        this->scatter(i1, n+1);
+    } else {
+        this->template scatter< 0, 1, 0>(i2+3, n);
+    }
+}
+
+
+template<typename TreeType>
+inline void
+Morphology<TreeType>::LeafCache::scatterEdgesXY(int x, int y, int i1, int n, int i2)
+{
+    if (x > 0) {
+        if (y > 0) {
+            this->scatter(i1, n-LEAF_DIM-1);
+        } else {
+            this->template scatter< 0,-1, 0>(i2+2, n-LEAF_DIM);
+        }
+        if (y < LEAF_DIM-1) {
+            this->scatter(i1, n-LEAF_DIM+1);
+        } else {
+            this->template scatter< 0, 1, 0>(i2+3, n-LEAF_DIM);
+        }
+    } else {
+        if (y < LEAF_DIM-1) {
+            this->template scatter<-1, 0, 0>(i2  , n+1);
+        } else {
+            this->template scatter<-1, 1, 0>(i2+7, n  );
+        }
+        if (y > 0) {
+            this->template scatter<-1, 0, 0>(i2  , n-1);
+        } else {
+            this->template scatter<-1,-1, 0>(i2+4, n  );
+        }
+    }
+    if (x < LEAF_DIM-1) {
+        if (y > 0) {
+            this->scatter(i1, n+LEAF_DIM-1);
+        } else {
+            this->template scatter< 0,-1, 0>(i2+2, n+LEAF_DIM);
+        }
+        if (y < LEAF_DIM-1) {
+            this->scatter(i1, n+LEAF_DIM+1);
+        } else {
+            this->template scatter< 0, 1, 0>(i2+3, n+LEAF_DIM);
+        }
+    } else {
+        if (y > 0) {
+            this->template scatter< 1, 0, 0>(i2+1, n-1);
+        } else {
+            this->template scatter< 1,-1, 0>(i2+6, n  );
+        }
+        if (y < LEAF_DIM-1) {
+            this->template scatter< 1, 0, 0>(i2+1, n+1);
+        } else {
+            this->template scatter< 1, 1, 0>(i2+5, n  );
+        }
+    }
+}
+
+
+template<typename TreeType>
+inline void
+Morphology<TreeType>::ErodeVoxelsOp::runParallel(NearestNeighbors nn)
+{
+    switch (nn) {
+    case NN_FACE_EDGE:
+        mTask = boost::bind(&ErodeVoxelsOp::erode18, _1, _2);
+        break;
+    case NN_FACE_EDGE_VERTEX:
+        mTask = boost::bin

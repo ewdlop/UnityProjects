@@ -1,0 +1,660 @@
+lexType>\n" +
+                                                              "</xs:schema>")));
+            val = CreateValidator(schemas);
+            val.XmlResolver = new XmlUrlResolver();
+            val.ValidationEventHandler += new ValidationEventHandler(holder.CallbackA);
+
+            val.Initialize();
+            val.ValidateElement("root", "", info, "rootType", null, null, Path.Combine(TestData, "__NonExistingFile__.xsd"));
+
+            Assert.True(holder.IsCalledA);
+            Assert.Equal(holder.lastSeverity, XmlSeverityType.Warning);
+            _exVerifier.IsExceptionOk(holder.lastException, "Sch_CannotLoadSchema", new string[] { "", null });
+
+            return;
+        }
+
+        [Fact]
+        public void CheckThatWarningOccursWhenUndefinedElementIsValidatedWithLaxValidation()
+        {
+            XmlSchemaValidator val;
+            CValidationEventHolder holder = new CValidationEventHolder();
+
+            val = CreateValidator(XSDFILE_VALIDATE_END_ELEMENT);
+            val.ValidationEventHandler += new ValidationEventHandler(holder.CallbackA);
+
+            val.Initialize();
+            val.ValidateElement("LaxElement", "", null);
+            val.ValidateEndOfAttributes(null);
+            val.ValidateElement("undefined", "", null);
+
+            Assert.True(holder.IsCalledA);
+            Assert.Equal(holder.lastSeverity, XmlSeverityType.Warning);
+            _exVerifier.IsExceptionOk(holder.lastException, "Sch_NoElementSchemaFound", new string[] { "undefined" });
+
+            return;
+        }
+
+        [Fact]
+        public void CheckThatWarningsDontOccurWhenIgnoreValidationWarningsIsSet()
+        {
+            XmlSchemaValidator val;
+            CValidationEventHolder holder = new CValidationEventHolder();
+
+            val = CreateValidator(XSDFILE_VALIDATE_END_ELEMENT, "", XmlSchemaValidationFlags.ProcessIdentityConstraints | XmlSchemaValidationFlags.ProcessInlineSchema | XmlSchemaValidationFlags.ProcessSchemaLocation);
+            val.ValidationEventHandler += new ValidationEventHandler(holder.CallbackA);
+
+            val.Initialize();
+            val.ValidateElement("LaxElement", "", null);
+            val.ValidateEndOfAttributes(null);
+            val.ValidateElement("undefined", "", null);
+
+            Assert.True(!holder.IsCalledA);
+
+            return;
+        }
+
+        //342447
+        [Fact]
+        public void VerifyThatSubstitutionGroupMembersAreResolvedAndAddedToTheList()
+        {
+            XmlSchemaValidator val;
+            XmlSchemaSet schemas = new XmlSchemaSet();
+            XmlSchemaParticle[] actualParticles;
+            string[] expectedParticles = { "eleA", "eleB", "eleC" };
+
+            schemas.Add("", Path.Combine(TestData, "Bug342447.xsd"));
+            schemas.Compile();
+            val = CreateValidator(schemas);
+            val.Initialize();
+            val.ValidateElement("eleSeq", "", null);
+
+            actualParticles = val.GetExpectedParticles();
+
+            Assert.Equal(actualParticles.GetLength(0), expectedParticles.GetLength(0));
+
+            int count = 0;
+            foreach (XmlSchemaElement element in actualParticles)
+            {
+                Assert.Equal(element.QualifiedName.ToString(), expectedParticles[count++]);
+            }
+            return;
+        }
+
+        [SkipOnTargetFramework(TargetFrameworkMonikers.NetFramework, "This checks a quirked behavior and Full Framework always gets old behavior as Xunit runner always targets 4.5.2 TFM ")]
+        [Fact]
+        public void StringPassedToValidateEndElementDoesNotSatisfyIdentityConstraints()
+        {
+            Initialize();
+            string xsd =
+                "<xs:schema targetNamespace='http://tempuri.org/XMLSchema.xsd' elementFormDefault='qualified' xmlns='http://tempuri.org/XMLSchema.xsd' xmlns:mstns='http://tempuri.org/XMLSchema.xsd' xmlns:xs='http://www.w3.org/2001/XMLSchema'>" +
+                    "<xs:element name='root'>" +
+                        "<xs:complexType> <xs:sequence> <xs:element name='B' type='mstns:B'/> </xs:sequence> </xs:complexType>" +
+                        "<xs:unique name='pNumKey'><xs:selector xpath='mstns:B/mstns:part'/><xs:field xpath='.'/></xs:unique>" +
+                    "</xs:element>" +
+                    "<xs:complexType name='B'><xs:sequence><xs:element name='part' maxOccurs='unbounded' type='xs:string'></xs:element></xs:sequence></xs:complexType>" +
+                "</xs:schema>";
+
+            XmlSchemaSet ss = new XmlSchemaSet();
+            ss.Add(XmlSchema.Read(new StringReader(xsd), ValidationCallback));
+            ss.Compile();
+
+            string ns = "http://tempuri.org/XMLSchema.xsd";
+            XmlNamespaceManager nsmgr = new XmlNamespaceManager(ss.NameTable);
+            XmlSchemaValidator val = new XmlSchemaValidator(ss.NameTable, ss, nsmgr, XmlSchemaValidationFlags.ProcessIdentityConstraints);
+            val.ValidationEventHandler += new ValidationEventHandler(ValidationCallback);
+            val.Initialize();
+            XmlSchemaInfo si = new XmlSchemaInfo();
+            val.ValidateElement("root", ns, si);
+            val.ValidateEndOfAttributes(si);
+            val.ValidateElement("B", ns, si);
+            val.ValidateEndOfAttributes(si);
+
+            val.ValidateElement("part", ns, si);
+            val.ValidateEndOfAttributes(si);
+            val.ValidateText("1");
+            val.ValidateEndElement(si);
+
+            val.ValidateElement("part", ns, si);
+            val.ValidateEndOfAttributes(si);
+            val.ValidateEndElement(si, "1");
+
+            val.ValidateElement("part", ns, si);
+            val.ValidateEndOfAttributes(si);
+            val.ValidateText("1");
+            val.ValidateEndElement(si);
+
+            val.ValidateEndElement(si);
+            val.ValidateEndElement(si);
+
+            Assert.Equal(warningCount, 0);
+            Assert.Equal(errorCount, 2);
+            return;
+        }
+
+        //TFS_469834
+        [Fact]
+        public void XmlSchemaValidatorDoesNotEnforceIdentityConstraintsOnDefaultAttributesInSomeCases()
+        {
+            Initialize();
+            string xml = @"<?xml version='1.0'?>
+<root xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:noNamespaceSchemaLocation='idF016.xsd'>
+	<uid val='test'/>	<uid/></root>";
+
+            string xsd = @"<?xml version='1.0'?>
+<xsd:schema xmlns:xsd='http://www.w3.org/2001/XMLSchema' elementFormDefault='qualified'>
+	<xsd:element name='root'>
+		<xsd:complexType>
+			<xsd:sequence>
+				<xsd:element ref='uid' maxOccurs='unbounded'/>
+			</xsd:sequence>
+		</xsd:complexType>
+		<xsd:unique id='foo123' name='uuid'>
+			<xsd:selector xpath='.//uid'/>
+			<xsd:field xpath='@val'/>
+		</xsd:unique>
+	</xsd:element>
+	<xsd:element name='uid' nillable='true'>
+		<xsd:complexType>
+			<xsd:attribute name='val' type='xsd:string' default='test'/>
+		</xsd:complexType>
+	</xsd:element>
+</xsd:schema>";
+
+            XmlNamespaceManager namespaceManager = new XmlNamespaceManager(new NameTable());
+            XmlSchemaSet schemas = new XmlSchemaSet();
+            schemas.Add(null, XmlReader.Create(new StringReader(xsd)));
+            schemas.Compile();
+            XmlSchemaValidationFlags validationFlags = XmlSchemaValidationFlags.ProcessIdentityConstraints |
+            XmlSchemaValidationFlags.AllowXmlAttributes;
+            XmlSchemaValidator validator = new XmlSchemaValidator(namespaceManager.NameTable, schemas, namespaceManager, validationFlags);
+            validator.Initialize();
+            using (XmlReader r = XmlReader.Create(new StringReader(xsd)))
+            {
+                while (r.Read())
+                {
+                    switch (r.NodeType)
+                    {
+                        case XmlNodeType.Element:
+                            namespaceManager.PushScope();
+                            if (r.MoveToFirstAttribute())
+                            {
+                                do
+                                {
+                                    if (r.NamespaceURI == "http://www.w3.org/2000/xmlns/")
+                                    {
+                                        namespaceManager.AddNamespace(r.LocalName, r.Value);
+                                    }
+                                } while (r.MoveToNextAttribute());
+                                r.MoveToElement();
+                            }
+                            validator.ValidateElement(r.LocalName, r.NamespaceURI, null, null, null, null, null);
+                            if (r.MoveToFirstAttribute())
+                            {
+                                do
+                                {
+                                    if (r.NamespaceURI != "http://www.w3.org/2000/xmlns/")
+                                    {
+                                        validator.ValidateAttribute(r.LocalName, r.NamespaceURI, r.Value, null);
+                                    }
+                                } while (r.MoveToNextAttribute());
+                                r.MoveToElement();
+                            }
+                            validator.ValidateEndOfAttributes(null);
+                            if (r.IsEmptyElement) goto case XmlNodeType.EndElement;
+                            break;
+
+                        case XmlNodeType.EndElement:
+                            validator.ValidateEndElement(null);
+                            namespaceManager.PopScope();
+                            break;
+
+                        case XmlNodeType.Text:
+                            validator.ValidateText(r.Value);
+                            break;
+
+                        case XmlNodeType.SignificantWhitespace:
+                        case XmlNodeType.Whitespace:
+                            validator.ValidateWhitespace(r.Value);
+                            break;
+
+                        default:
+                            break;
+                    }
+                }
+                validator.EndValidation();
+            }
+            XmlReaderSettings rs = new XmlReaderSettings();
+            rs.ValidationType = ValidationType.Schema;
+            rs.Schemas.Add(null, XmlReader.Create(new StringReader(xsd)));
+
+            using (XmlReader r = XmlReader.Create(new StringReader(xml), rs))
+            {
+                try
+                {
+                    while (r.Read()) ;
+                }
+                catch (XmlSchemaValidationException e) { _output.WriteLine(e.Message); return; }
+            }
+            Assert.True(false);
+        }
+
+        public void RunTest(ArrayList schemaList, string xml)
+        {
+            XmlReaderSettings settings = new XmlReaderSettings();
+            settings.ValidationType = ValidationType.Schema;
+            settings.ValidationFlags = XmlSchemaValidationFlags.ReportValidationWarnings;
+            settings.Schemas.XmlResolver = new XmlUrlResolver();
+
+            for (int i = 0; i < schemaList.Count; ++i)
+            {
+                XmlSchema schema = XmlSchema.Read(new StringReader((string)schemaList[i]), new ValidationEventHandler(ValidationCallback));
+                settings.Schemas.Add(schema);
+            }
+            settings.ValidationEventHandler += new ValidationEventHandler(ValidationCallback);
+            using (XmlReader reader = XmlReader.Create(new StringReader(xml), settings))
+                while (reader.Read()) ;
+        }
+    }
+}
+                                                                                                                                                      ø•YXûu[fš€\T·jCè·7¨_fˆ‚ˆó‡MzúÏv›¬¤;­Ğr#f´u†¦*—wZ¯‡ ¬8n
+f"ˆF²Z—æ¢Ôˆh¦lkÑ'gO"6£mh0dq                                
+   Ô?uCÀ…Çúƒ:Ÿug½Áê^º²1Ú¯”-Ã‘¥d6€õ0=ˆ™ÎAçZ¼uü0Yd>Âš_[Bo¢CğX¿ÁºP„ŠDB<uËfS¶äEánƒmI†]S²mÅy7'RàEwVs"ç®k=\p-ZŒÜ‚w+Sõ˜CZ”})¡êÑHìtçm`§h@â‘/lv“ôwI‹Jns™7ˆ=¦ş–ŠZƒÏèjÈp—ŠGb”İ…f“‡˜b»÷q›“r‘mƒpV£ee'z¶*tM:ôPÉ*.~                                
+   å/·
+—‰‰È4jnŒÌ3:µ‰,(Í¤4âzLY…#7Ögú.D~
+9bë=‹J/Áv@G <OP#Eè„ÏUØ¡7Ö…/.cwí`tcv/c¥qÀeOÅºuO"ˆ>åPhïXc²w1ac%Í«%Jn~P/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+ * Copyright by The HDF Group.                                               *
+ * Copyright by the Board of Trustees of the University of Illinois.         *
+ * All rights reserved.                                                      *
+ *                                                                           *
+ * This file is part of HDF5.  The full HDF5 copyright notice, including     *
+ * terms governing use, modification, and redistribution, is contained in    *
+ * the files COPYING and Copyright.html.  COPYING can be found at the root   *
+ * of the source code distribution tree; Copyright.html can be found at the  *
+ * root level of an installed copy of the electronic HDF5 document set and   *
+ * is linked from the top-level documents page.  It can also be found at     *
+ * http://hdfgroup.org/HDF5/doc/Copyright.html.  If you do not have          *
+ * access to either file, you may request a copy from help@hdfgroup.org.     *
+ * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+/*-------------------------------------------------------------------------
+ *
+ * Created:		H5FDint.c
+ *			Jan 17 2008
+ *			Quincey Koziol <koziol@hdfgroup.org>
+ *
+ * Purpose:		Internal routine for VFD operations
+ *
+ *-------------------------------------------------------------------------
+ */
+
+/****************/
+/* Module Setup */
+/****************/
+
+#define H5FD_PACKAGE		/*suppress error about including H5FDpkg  */
+
+/* Interface initialization */
+#define H5_INTERFACE_INIT_FUNC	H5FD_int_init_interface
+
+
+/***********/
+/* Headers */
+/***********/
+#include "H5private.h"		/* Generic Functions			*/
+#include "H5Eprivate.h"		/* Error handling		  	*/
+#include "H5Fprivate.h"         /* File access				*/
+#include "H5FDpkg.h"		/* File Drivers				*/
+#include "H5Iprivate.h"		/* IDs			  		*/
+
+
+/****************/
+/* Local Macros */
+/****************/
+
+
+/******************/
+/* Local Typedefs */
+/******************/
+
+
+/********************/
+/* Package Typedefs */
+/********************/
+
+
+/********************/
+/* Local Prototypes */
+/********************/
+
+
+/*********************/
+/* Package Variables */
+/*********************/
+
+
+/*****************************/
+/* Library Private Variables */
+/*****************************/
+
+
+/*******************/
+/* Local Variables */
+/*******************/
+
+
+
+/*--------------------------------------------------------------------------
+NAME
+   H5FD_int_init_interface -- Initialize interface-specific information
+USAGE
+    herr_t H5FD_int_init_interface()
+
+RETURNS
+    Non-negative on success/Negative on failure
+DESCRIPTION
+    Initializes any interface-specific data or routines.  (Just calls
+    H5FD_init_iterface currently).
+
+--------------------------------------------------------------------------*/
+static herr_t
+H5FD_int_init_interface(void)
+{
+    FUNC_ENTER_NOAPI_NOINIT_NOERR
+
+    FUNC_LEAVE_NOAPI(H5FD_init())
+} /* H5FD_int_init_interface() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:    H5FD_locate_signature
+ *
+ * Purpose:     Finds the HDF5 superblock signature in a file.  The
+ *              signature can appear at address 0, or any power of two
+ *              beginning with 512.
+ *
+ * Return:      Success:        SUCCEED
+ *              Failure:        FAIL
+ *
+ * Programmer:  Robb Matzke
+ *              Friday, November  7, 1997
+ *
+ *-------------------------------------------------------------------------
+ */
+herr_t
+H5FD_locate_signature(H5FD_t *file, const H5P_genplist_t *dxpl, haddr_t *sig_addr)
+{
+    haddr_t         addr, eoa;
+    uint8_t         buf[H5F_SIGNATURE_LEN];
+    unsigned        n, maxpow;
+    herr_t          ret_value = SUCCEED; /* Return value */
+
+    FUNC_ENTER_NOAPI_NOINIT
+
+    /* Find the least N such that 2^N is larger than the file size */
+    if(HADDR_UNDEF == (addr = H5FD_get_eof(file)) || HADDR_UNDEF == (eoa = H5FD_get_eoa(file, H5FD_MEM_SUPER)))
+        HGOTO_ERROR(H5E_IO, H5E_CANTINIT, FAIL, "unable to obtain EOF/EOA value")
+    for(maxpow = 0; addr; maxpow++)
+        addr >>= 1;
+    maxpow = MAX(maxpow, 9);
+
+    /*
+     * Search for the file signature at format address zero followed by
+     * powers of two larger than 9.
+     */
+    for(n = 8; n < maxpow; n++) {
+        addr = (8 == n) ? 0 : (haddr_t)1 << n;
+        if(H5FD_set_eoa(file, H5FD_MEM_SUPER, addr + H5F_SIGNATURE_LEN) < 0)
+            HGOTO_ERROR(H5E_IO, H5E_CANTINIT, FAIL, "unable to set EOA value for file signature")
+        if(H5FD_read(file, dxpl, H5FD_MEM_SUPER, addr, (size_t)H5F_SIGNATURE_LEN, buf) < 0)
+            HGOTO_ERROR(H5E_IO, H5E_CANTINIT, FAIL, "unable to read file signature")
+        if(!HDmemcmp(buf, H5F_SIGNATURE, (size_t)H5F_SIGNATURE_LEN))
+            break;
+    } /* end for */
+
+    /*
+     * If the signature was not found then reset the EOA value and return
+     * HADDR_UNDEF.
+     */
+    if(n >= maxpow) {
+        if(H5FD_set_eoa(file, H5FD_MEM_SUPER, eoa) < 0)
+            HGOTO_ERROR(H5E_IO, H5E_CANTINIT, FAIL, "unable to reset EOA value")
+        *sig_addr = HADDR_UNDEF;
+    } /* end if */
+    else
+        /* Set return value */
+        *sig_addr = addr;
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* end H5FD_locate_signature() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:	H5FD_read
+ *
+ * Purpose:	Private version of H5FDread()
+ *
+ * Return:	Success:	Non-negative
+ *		Failure:	Negative
+ *
+ * Programmer:	Robb Matzke
+ *              Wednesday, August  4, 1999
+ *
+ *-------------------------------------------------------------------------
+ */
+herr_t
+H5FD_read(H5FD_t *file, const H5P_genplist_t *dxpl, H5FD_mem_t type, haddr_t addr,
+    size_t size, void *buf/*out*/)
+{
+    haddr_t     eoa = HADDR_UNDEF;
+    herr_t      ret_value = SUCCEED;       /* Return value */
+
+    FUNC_ENTER_NOAPI(FAIL)
+
+    HDassert(file && file->cls);
+    HDassert(TRUE == H5P_class_isa(H5P_CLASS(dxpl), H5P_CLS_DATASET_XFER_g));
+    HDassert(buf);
+
+#ifndef H5_HAVE_PARALLEL
+    /* Do not return early for Parallel mode since the I/O could be a */
+    /* collective transfer. */
+    /* The no-op case */
+    if(0 == size)
+        HGOTO_DONE(SUCCEED)
+#endif /* H5_HAVE_PARALLEL */
+
+    if(HADDR_UNDEF == (eoa = (file->cls->get_eoa)(file, type)))
+	HGOTO_ERROR(H5E_VFL, H5E_CANTINIT, FAIL, "driver get_eoa request failed")
+    if((addr + file->base_addr + size) > eoa)
+        HGOTO_ERROR(H5E_ARGS, H5E_OVERFLOW, FAIL, "addr overflow, addr = %llu, size=%llu, eoa=%llu", 
+                    (unsigned long long)(addr+ file->base_addr), (unsigned long long)size, (unsigned long long)eoa)
+
+    /* Dispatch to driver */
+    if((file->cls->read)(file, type, H5P_PLIST_ID(dxpl), addr + file->base_addr, size, buf) < 0)
+        HGOTO_ERROR(H5E_VFL, H5E_READERROR, FAIL, "driver read request failed")
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* end H5FD_read() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:	H5FD_write
+ *
+ * Purpose:	Private version of H5FDwrite()
+ *
+ * Return:	Success:	Non-negative
+ *		Failure:	Negative
+ *
+ * Programmer:	Robb Matzke
+ *              Wednesday, August  4, 1999
+ *
+ *-------------------------------------------------------------------------
+ */
+herr_t
+H5FD_write(H5FD_t *file, const H5P_genplist_t *dxpl, H5FD_mem_t type, haddr_t addr,
+    size_t size, const void *buf)
+{
+    haddr_t     eoa = HADDR_UNDEF;
+    herr_t      ret_value = SUCCEED;       /* Return value */
+
+    FUNC_ENTER_NOAPI(FAIL)
+
+    HDassert(file && file->cls);
+    HDassert(TRUE == H5P_class_isa(H5P_CLASS(dxpl), H5P_CLS_DATASET_XFER_g));
+    HDassert(buf);
+
+#ifndef H5_HAVE_PARALLEL
+    /* Do not return early for Parallel mode since the I/O could be a */
+    /* collective transfer. */
+    /* The no-op case */
+    if(0 == size)
+        HGOTO_DONE(SUCCEED)
+#endif /* H5_HAVE_PARALLEL */
+
+    if(HADDR_UNDEF == (eoa = (file->cls->get_eoa)(file, type)))
+	HGOTO_ERROR(H5E_VFL, H5E_CANTINIT, FAIL, "driver get_eoa request failed")
+    if((addr + file->base_addr + size) > eoa)
+        HGOTO_ERROR(H5E_ARGS, H5E_OVERFLOW, FAIL, "addr overflow, addr = %llu, size=%llu, eoa=%llu", 
+                    (unsigned long long)(addr+ file->base_addr), (unsigned long long)size, (unsigned long long)eoa)
+
+    /* Dispatch to driver */
+    if((file->cls->write)(file, type, H5P_PLIST_ID(dxpl), addr + file->base_addr, size, buf) < 0)
+        HGOTO_ERROR(H5E_VFL, H5E_WRITEERROR, FAIL, "driver write request failed")
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* end H5FD_write() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:	H5FD_set_eoa
+ *
+ * Purpose:	Private version of H5FDset_eoa()
+ *
+ *              This function expects the EOA is a RELATIVE address, i.e.
+ *              relative to the base address.  This is NOT the same as the
+ *              EOA stored in the superblock, which is an absolute
+ *              address.  Object addresses are relative.
+ *
+ * Return:	Success:	Non-negative
+ *		Failure:	Negative, no side effect
+ *
+ * Programmer:	Robb Matzke
+ *              Wednesday, August  4, 1999
+ *
+ *-------------------------------------------------------------------------
+ */
+herr_t
+H5FD_set_eoa(H5FD_t *file, H5FD_mem_t type, haddr_t addr)
+{
+    herr_t      ret_value = SUCCEED;    /* Return value */
+
+    FUNC_ENTER_NOAPI(FAIL)
+
+    HDassert(file && file->cls);
+    HDassert(H5F_addr_defined(addr) && addr <= file->maxaddr);
+
+    /* Dispatch to driver, convert to absolute address */
+    if((file->cls->set_eoa)(file, type, addr + file->base_addr) < 0)
+	HGOTO_ERROR(H5E_VFL, H5E_CANTINIT, FAIL, "driver set_eoa request failed")
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* end H5FD_set_eoa() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:	H5FD_get_eoa
+ *
+ * Purpose:	Private version of H5FDget_eoa()
+ *
+ *              This function returns the EOA as a RELATIVE address, i.e.
+ *              relative to the base address.  This is NOT the same as the
+ *              EOA stored in the superblock, which is an absolute
+ *              address.  Object addresses are relative.
+ *
+ * Return:	Success:	First byte after allocated memory.
+ *		Failure:	HADDR_UNDEF
+ *
+ * Programmer:	Robb Matzke
+ *              Wednesday, August  4, 1999
+ *
+ *-------------------------------------------------------------------------
+ */
+haddr_t
+H5FD_get_eoa(const H5FD_t *file, H5FD_mem_t type)
+{
+    haddr_t	ret_value;
+
+    FUNC_ENTER_NOAPI(HADDR_UNDEF)
+
+    HDassert(file && file->cls);
+
+    /* Dispatch to driver */
+    if(HADDR_UNDEF == (ret_value = (file->cls->get_eoa)(file, type)))
+	HGOTO_ERROR(H5E_VFL, H5E_CANTINIT, HADDR_UNDEF, "driver get_eoa request failed")
+
+    /* Adjust for base address in file (convert to relative address) */
+    ret_value -= file->base_addr;
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* end H5FD_get_eoa() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:	H5FD_get_eof
+ *
+ * Purpose:	Private version of H5FDget_eof()
+ *
+ *              This function returns the EOF as a RELATIVE address, i.e.
+ *              relative to the base address.  This will be different
+ *              from  the end of the physical file if there is a user
+ *              block.
+ *
+ * Return:	Success:	The EOF address.
+ *
+ *		Failure:	HADDR_UNDEF
+ *
+ * Programmer:	Robb Matzke
+ *              Wednesday, August  4, 1999
+ *
+ * Modifications:
+ *
+ *-------------------------------------------------------------------------
+ */
+haddr_t
+H5FD_get_eof(const H5FD_t *file)
+{
+    haddr_t	ret_value;
+
+    FUNC_ENTER_NOAPI(HADDR_UNDEF)
+
+    HDassert(file && file->cls);
+
+    /* Dispatch to driver */
+    if(file->cls->get_eof) {
+	if(HADDR_UNDEF == (ret_value = (file->cls->get_eof)(file)))
+	    HGOTO_ERROR(H5E_VFL, H5E_CANTGET, HADDR_UNDEF, "driver get_eof request failed")
+    } /* end if */
+    else
+	ret_value = file->maxaddr;
+
+    /* Adjust for base address in file (convert to relative address)  */
+    ret_value -= file->base_addr;
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* end H5FD_get_eof() */
+
+                                                                                                                                                                                                                                                    Øã¢uÒ¾,R€ş²r>ã~<d“Æ¬JÀ«N~¢›Ç7äY‹$Ah$ß•,}*7Éµ:½SB0ësj•³ÓSüêb‘¼ª¬)bäJªoî±DtGˆ%,t€aôDånAá„îêMS$h¥øj><åÇj/VÓ¢í¨Š(Æ}ÏmD,‡›Ô¥oïZÉMÈÓM`A1æVãóÊÛ 4ÛÖ¨õvU…¦»9I+?oå5Ññ%Î,ÇtèdW›m¢{ *füv¡qHùx]-®%~>ÌJxySNpÚ ”Û’Ó©ÎZ LEÂmĞPæşè~=Ó»HÆ–v>OóÈX%?nëŠM+ôğ@ğjE:wŸ”5ÓAÁÜõ 1wÀ ê„«²0ô;œ¯õ·ß–§víÖ(ÿŠƒk÷õÖ¨ì©°>KŠ€¦Ñé3è‡!–D6Û¶øJU2ä	cJ¥VëÑ%hG™fáª¸…ÔŞÁÛ:@—îpñQí•…Óc®£eÿÙ˜ÿõX&0€7|ò>LuñÄ{Q(œílp#â5_ù¢“ılo¬WWŞ(Û¢Ï²N7]JL
+[CYáÑTB (7­}èâK!âç‹×î<šŸsšÌø ±Å3²Ñ¼BìªÀ2¤ÅTš4¡ño¢jîœûvt£vŒ»äû2j$1ÿÀŸı³ÂºĞ°qÛ@º%x¨6eÊ‚• Öìú«ºM®¬l„z£iòİøoiAß–]“!æÀ=Äû’ò@v>İñ8’ç°_9¨EôÅˆ¾©SWÄá½òÑîº)‚QEx6½ãéªxÊÑ§à
+¦q]3Ëşq¿¡\ğ[QâYÄiöÚ@UªECí¢ãéDƒÑbõ’57{‡‰¾¸oÂ/ş¼ú	èR­FË}şß¦ù£–¢»,°¯{9JJh÷Ÿ»`4»«uÛBœ´C…È:ö®¯0H#´96`t¤%ùäÒåhÎâÅÀœFÉkJÍŞª=Ç©ir§Ï=å~0%¤ÎT5b[îŒ²ä‰ƒÉ¼Œ1;|×š»Lı­3ìø1*T¹×:J@´dâbTÆåàZ×’ázäVßÉ7ğOÚÑÑ„†“¿Œê`ÀÜí«‘/'E‡öEzù¾’ğ†/°2Ú.Ü”8¦Ğ*Øu/ágÎUÂi©0\äÿñu¹í³î|H¡Vóİ‡;Ø+F Õl,f¹lû#!	Á{˜{’”?ÿú)ÉÖëŞ}'z›^ªî g·‡Z#×4¹ÍàìML);v‘{›€Uh’ıe×Ú_GúF3n{OˆÆÛNG¬®»î__ãËÖªé@_—YU‡úe»¡×IîxÁëám¢yş]>-Š2
+²RÇåÎzds‘qœCÆğŞxm«u§°›6BózF÷ş¯äoY mÓÉ)*grÃøÓôP6Çd
+:õˆ†îlF!Ø²ŞA}ÇIèŞ3¹àålàN'ƒ!G+)ÏºÊËs·#\Ùf_¦®P€ÉÖ¡dTC|B?¯ö÷¢«Ş‘Ü|ù–i$bG ¬şh^±Äœ/€Î†øÁYPä²QŸdaI½òäÆ“íB‘ENÜ›øwZŠÆağ‡u°4¨Ÿ „Šéª“‚á“ãpëE·Ó_}›ÚR±	ß{_Ãó‘g¼÷:×I;1İÃˆò‚^„%ëwK˜O8ì÷µÃ"So•µõ¿AÒ§’ùœ<C˜ÌzÖçµÖ({³¹;ñEƒ}ğm"+Ba0O	É^M4ØZ;¾(®‡å\Ù&ğS˜¢¼ıîŠt?W;'TÏ2W{Gó%Ğ#`}LgÈíÊ‚³ªôDh>;¤\}­BOUQÚ$/tƒ½jİ[<G&`éR)«Ís{÷t+Èõú¢(ıÄÕš¼â:Ñ>¥”*¨ ·³¦\ê|_ûGS¸.M	°3Œ»'#ÌŒiÃ—Y–7ĞƒQâF 9U„9ÃJ5æ+Fz-ŒNº¸¦3pŠ×‹Z&ÎÈvdd¯])°ã ›¹"6¨-‚¨[¥ ì°È”U„M< ëgŠƒ¹qÄ6’;‘;ŸÚV½$Ó¥ã‘ƒ{©³äş†<{¿Š‚¥9ís"æÅğÊ,ï§•›8ë‚Ğ'KØyx4İIˆÇÍÿş½+Í¬ Rf¿Ğx•0ıHÈõ,ì Ã¯LÀ2<¨f„ Ÿ¹ß4Óá¢Î6`»êºl@¯9(&u[÷Ùû[-¥0`ã±‰ØÌØ©ÌÁ‚Âd§Á
+c8i3-ìÏ²¿Cô)#œ€$QfP9b5O6ÚÍíÆºNàÁl#áS¢òæ¬m@[dëñº£›£çÜ_S´÷Ææ c§3»‚TT÷´'w´_Ğ¾7˜g'	ç`†Ü„abÅD°‘ºD>~¿ÏçíPrìöİc2¬¨³}C¹Õä¬ÆgE ³gˆˆP;ù+Îö^ pEà +ƒÉøhµ™Ó{OI°¾i˜`YYÑÉĞ–¦f)tŸWVúx°LSôıñ|€3¶XYèCo#°ìøbÃ¼Ä,n:¤ì³®·±éÕ·¨ô(Êeé—MèÑ%¾WyŸÖï1"ñ—jS¶ÑçşYÒâz¥ËTiHñ«´¯NqÙ˜óNfªïÛAæÙ@Çˆª&Ö[1p[vÇÍèîÊ·Nbì„k‰Rw+FÍğİÏ™C¼[2¬t­Ég ‰×İÙ[Sºš+t‡Tà¼nÜŒG6ì”øé¹‚Á!ãe©i†V¥0dz(Z™IÖ˜xYx’ö©Ü-óš“¾ªUäÓş%¾¡ãM»7ÂPïË¤_'n7mWRøaF¢©562ş*ÔP ÷Á6m]T¦G–`œÜ»ÅÊ)`ƒ¤ì:ì‡æàznbô>·M¨¶ˆ:@.êÙVp<ô8ÑäqI“/m¶Ès±nÏ—ÌÙ{$¿WÚ^œtRAu"Ó‹ã¹Cs—Ü „Zi#Òåøiè|eÑµ1Œ×AøyTHRÏxóÁ³"À%»U Ê71Ğ°©ü>ÁnÆ6XñëÜ$`huÎÕ«Ñ0©«S¯Å[	°×V®Õ'%´DX›ô§3Â˜Ç«¨¨«!j„³‰–­}ı¨¬—l İë~\:Eï¼ù÷.*ÄÁçé×u*$}%åƒlÆvúpODÂìa”íl@P˜I‡’Ÿ ßÓFK7O‰ôÔª¼‹yW÷ª9‹d»®ç|g“z’ò³ĞKÕ@ g^”÷ï™„Áj‰
+:4(@ƒILß­$Ê¬—½†Ö¾Ë¨(æœâÕİ½÷Ò¸
+|ÏŞÖÇÎ¨^ß3JSúÂ2ÊW·êjb!­ÓWC+xŞ6–øê6õòËİÂà?ŸB|.2Õ‡ƒ,ˆ8].D8©Ï}k»Éôy ëÒ¿ºÁ7n6?i4€Œ Œ-Z‰ÊW8néßµlÒs{ÕB‡[bÔ³›ãT´›ƒ®ÀR¥£¾şbZW‡†²Y§Õé²Û5elÇÙHUËË?uŞ±
+A<¨¤u2)]h\´ÄĞ“Göª{	>Á¯1,{yÆø|Eä=’¾E·×A‘cşˆĞ­%•âÕÄÚ6œ4fñ’kîvü%•êO‘ã8œ¨p&ÎËL“lèø2,£K¨¿‡ÚNº×^‡»5£Ã‰mSœiÓt0làW€X×š¢ŒD[ïş¼nù:•B@5nÍ‰ŸëÁ>Ãw&?j$@¨k!Í*ì½M]’M”!"Ÿ^¹ÑÍû…¤B »ÊI:3°åü0·oä½Ê€8T=§õ×è™NğrœİÉ¼„¼–ˆf/O¸´ O^Ü×)è¾eøPZ¤v°°L!"ñÒ º $©9‹>&´ò2f¬K„»=k"©l(èÎ¥r-ÈRºón«æCw:ŠşÌ,Ç’¥i¢ÕçËvÇ”5×]Ğd±öº nNĞûÏño?»]’&9íY(%Ä÷k†sy«8&3š¯´fÈ{ûóå¿¦Ë^}ğH»VÔX°Wö#½(­¶öxI£JÖb,_„›6ê stxåg¢JK­ÑzşîlvRÁí~bË?ùÜÍ.rdJ%Pæé%í¿¨u½gì%À—Æù3få(ÎÅu‚u$EÑíì3Û§V7šWºÂèVF%ïúso°œ¯{ÀÉ¨üN0;¨C[ıÈäkI}s}ÜD,˜Î._ô¾ğjên#r§6æŸFó§niÙ…€s‡¦@}¶íŸMJIj[ ­RÓLÇÎ\<$å&´À6¢¬ÏqO`7½Qcˆ}¼«š¯Ì3Zº~!Y!^Â‹­£mñè2·Æ›ñËE”~ğæ^Ïåš|¡1vLÈŠñ«È¨ÿ†u®,¬Ë×jö^{Ù_í?/ÍËKÙ±0]ÅaOèddPWYW¯šò¾ãŒSÀhæ‚ÚN…Gè&I•Pë¬¥i_iW«¨4¾åû_”Î?¯\à®Ëé¼$zŒ‘Ï¡úc¡eZ!å0F³1 ÔK¨y¨¤P¸[Õ5±¦1ÕÁ!0±[c¡Y=–0$£•·ƒšj_»h<Lë¸Èc¤ZĞgÆ,TN¤†‘Vâˆ–Rg—<ª(T‘©$Ö¯$lºñb¡/ä

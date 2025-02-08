@@ -1,0 +1,42 @@
+///////////////////////////////////////////////////////////////////////////////
+//                                                                           //
+// DxilPreserveAllOutputs.cpp                                                //
+// Copyright (C) Microsoft Corporation. All rights reserved.                 //
+// This file is distributed under the University of Illinois Open Source     //
+// License. See LICENSE.TXT for details.                                     //
+//                                                                           //
+// Ensure we store to all elements in the output signature.                  //
+//                                                                           //
+///////////////////////////////////////////////////////////////////////////////
+
+#include "dxc/HLSL/DxilGenerationPass.h"
+#include "dxc/DXIL/DxilOperations.h"
+#include "dxc/DXIL/DxilSignatureElement.h"
+#include "dxc/DXIL/DxilModule.h"
+#include "dxc/Support/Global.h"
+#include "dxc/DXIL/DxilInstructions.h"
+
+#include "llvm/IR/Module.h"
+#include "llvm/IR/InstIterator.h"
+#include "llvm/Pass.h"
+#include "llvm/IR/IRBuilder.h"
+#include <llvm/ADT/DenseSet.h>
+
+using namespace llvm;
+using namespace hlsl;
+
+namespace {
+class OutputWrite {
+public:
+  explicit OutputWrite(CallInst *call)
+    : m_Call(call)
+  {
+    assert(DxilInst_StoreOutput(call) ||
+           DxilInst_StoreVertexOutput(call) ||
+           DxilInst_StorePrimitiveOutput(call) ||
+           DxilInst_StorePatchConstant(call));
+  }
+
+  unsigned GetSignatureID() const {
+    Value *id = m_Call->getOperand(SignatureIndex);
+    return cast<ConstantInt>(id

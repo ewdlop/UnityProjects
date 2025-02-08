@@ -1,0 +1,183 @@
+// Copyright (c) Microsoft Corp., 2004. All rights reserved.
+#region Using directives
+
+using System;
+using System.IO;
+using System.Xml;
+using System.Text;
+using System.Threading;
+using System.Reflection;
+using System.Collections;
+using System.Diagnostics;
+using System.Runtime.Remoting;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Runtime.Serialization;
+using System.Workflow.Runtime;
+using System.Workflow.Runtime.Hosting;
+using System.Runtime.InteropServices;
+using System.Runtime.Remoting.Channels;
+using System.Workflow.ComponentModel;
+using System.Workflow.ComponentModel.Compiler;
+using System.Workflow.ComponentModel.Design;
+using System.Workflow.ComponentModel.Serialization;
+using System.Runtime.Serialization.Formatters;
+using System.Runtime.Remoting.Channels.Ipc;
+using System.Configuration;
+using System.Security.Permissions;
+using System.Globalization;
+using Microsoft.Win32;
+using System.Security.AccessControl;
+using System.Security.Principal;
+#endregion
+
+namespace System.Workflow.Runtime.DebugEngine
+{
+    internal static class RegistryKeys
+    {
+        internal static readonly string ProductRootRegKey = @"SOFTWARE\Microsoft\Net Framework Setup\NDP\v3.0\Setup\Windows Workflow Foundation";
+        internal static readonly string DebuggerSubKey = ProductRootRegKey + @"\Debugger";
+    }
+
+    [Obsolete("The System.Workflow.* types are deprecated.  Instead, please use the new types from System.Activities.*")]
+    public sealed class DebugController : MarshalByRefObject
+    {
+        #region Data members
+
+        private Guid programId;
+        private string hostName;
+        private int attachTimeout;
+        private ProgramPublisher programPublisher;
+        private DebugControllerThread debugControllerThread;
+        private Timer attachTimer;
+        private WorkflowRuntime serviceContainer;
+        private IpcChannel channel;
+        private IWorkflowDebugger controllerConduit;
+        private bool isZombie;
+        private bool isAttached;
+        private ManualResetEvent eventConduitAttached;
+        private InstanceTable instanceTable;
+        private Dictionary<Type, Guid> typeToGuid;
+        private Dictionary<byte[], Guid> xomlHashToGuid;
+        bool isServiceContainerStarting;
+        private const string rootExecutorGuid = "98fcdc7a-8ab4-4fb7-92d4-20f437285729";
+        private object eventLock;
+        private object syncRoot = new object();
+        private static readonly string ControllerConduitTypeName = "ControllerConduitTypeName";
+
+        #endregion
+
+        #region Security related methods
+        private delegate void ExceptionNotification(Exception e);
+
+        internal static void InitializeProcessSecurity()
+        {
+            // Spawn off a separate thread to that does RevertToSelf and adjusts DACLs.
+            // This is because RevertToSelf terminates client impersonation on the thread
+            // that calls it. We do not want to change that on the current thread when 
+            // the runtime is hosted inside ASP.net for example.
+            Exception workerThreadException = null;
+            ProcessSecurity processSecurity = new ProcessSecurity();
+            Thread workerThread = new Thread(new ThreadStart(processSecurity.Initialize));
+
+            processSecurity.exceptionNotification += delegate(Exception e)
+            {
+                workerThreadException = e;
+            };
+
+            workerThread.Start(); workerThread.Join();
+            if (workerThreadException != null)
+                throw workerThreadException;
+        }
+
+        private class ProcessSecurity
+        {
+            internal ExceptionNotification exceptionNotification;
+
+            internal void Initialize()
+            {
+                try
+                {
+                    // This is needed if the thread calling the method is impersonating
+                    // a client call (ASP.net hosting scenarios).
+                    if (!NativeMethods.RevertToSelf())
+                        Marshal.ThrowExceptionForHR(Marshal.GetHRForLastWin32Error());
+
+                    // Get the DACL for process token. Add TOKEN_QUERY permissions for the Administrators group.
+                    // Set the updated DACL for process token.
+                    RawAcl tokenDacl = GetCurrentProcessTokenDacl();
+                    CommonAce adminsGroupAceForToken = new CommonAce(AceFlags.None, AceQualifier.AccessAllowed, NativeMethods.TOKEN_QUERY, new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null), false, null);
+                    int i = FindIndexInDacl(adminsGroupAceForToken, tokenDacl);
+                    if (i != -1)
+                        tokenDacl.InsertAce(i, adminsGroupAceForToken);
+                    SetCurrentProcessTokenDacl(tokenDacl);
+                }
+                catch (Exception e)
+                {
+                    // Communicate any exceptions from this thread back to the thread
+                    // that spawned it.
+                    if (exceptionNotification != null)
+                        exceptionNotification(e);
+                }
+            }
+
+            private RawAcl GetCurrentProcessTokenDacl()
+            {
+                IntPtr hProcess = IntPtr.Zero;
+                IntPtr hProcessToken = IntPtr.Zero;
+                IntPtr securityDescriptorPtr = IntPtr.Zero;
+
+                try
+                {
+                    hProcess = NativeMethods.GetCurrentProcess();
+
+                    if (!NativeMethods.OpenProcessToken(hProcess, NativeMethods.TOKEN_ALL_ACCESS, out hProcessToken))
+                        Marshal.ThrowExceptionForHR(Marshal.GetHRForLastWin32Error());
+
+                    // Get security descriptor associated with the kernel object, read the DACL and return
+                    // that to the caller.
+                    uint returnLength;
+
+                    NativeMethods.GetKernelObjectSecurity(hProcessToken, NativeMethods.SECURITY_INFORMATION.DACL_SECURITY_INFORMATION, IntPtr.Zero, 0, out returnLength);
+                    int lasterror = Marshal.GetLastWin32Error(); //#pragma warning disable 56523 doesnt recognize 56523
+
+                    securityDescriptorPtr = Marshal.AllocCoTaskMem((int)returnLength);
+
+                    if (!NativeMethods.GetKernelObjectSecurity(hProcessToken, NativeMethods.SECURITY_INFORMATION.DACL_SECURITY_INFORMATION, securityDescriptorPtr, returnLength, out returnLength))
+                        Marshal.ThrowExceptionForHR(Marshal.GetHRForLastWin32Error());
+
+                    byte[] sdBytes = new byte[returnLength];
+                    Marshal.Copy(securityDescriptorPtr, sdBytes, 0, (int)returnLength);
+
+                    RawSecurityDescriptor rawSecurityDescriptor = new RawSecurityDescriptor(sdBytes, 0);
+
+                    return rawSecurityDescriptor.DiscretionaryAcl;
+                }
+                finally
+                {
+                    if (hProcess != IntPtr.Zero && hProcess != (IntPtr)(-1))
+                        if (!NativeMethods.CloseHandle(hProcess))
+                            Marshal.ThrowExceptionForHR(Marshal.GetHRForLastWin32Error());
+
+                    if (hProcessToken != IntPtr.Zero)
+                        if (!NativeMethods.CloseHandle(hProcessToken))
+                            Marshal.ThrowExceptionForHR(Marshal.GetHRForLastWin32Error());
+
+                    if (securityDescriptorPtr != IntPtr.Zero)
+                        Marshal.FreeCoTaskMem(securityDescriptorPtr);
+                }
+            }
+            private void SetCurrentProcessTokenDacl(RawAcl dacl)
+            {
+                IntPtr hProcess = IntPtr.Zero;
+                IntPtr hProcessToken = IntPtr.Zero;
+                IntPtr securityDescriptorPtr = IntPtr.Zero;
+                try
+                {
+                    hProcess = NativeMethods.GetCurrentProcess();
+
+                    if (!NativeMethods.OpenProcessToken(hProcess, NativeMethods.TOKEN_ALL_ACCESS, out hProcessToken))
+                        Marshal.ThrowExceptionForHR(Marshal.GetHRForLastWin32Error());
+
+                    // Get security descriptor associated with the kernel object and modify it.
+                    u

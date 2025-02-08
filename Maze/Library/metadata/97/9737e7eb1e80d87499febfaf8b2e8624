@@ -1,0 +1,189 @@
+ we want to insert NewBB).
+  water_iterator IP =
+    std::lower_bound(WaterList.begin(), WaterList.end(), OrigBB,
+                     CompareMBBNumbers);
+  MachineBasicBlock* WaterBB = *IP;
+  if (WaterBB == OrigBB)
+    WaterList.insert(std::next(IP), NewBB);
+  else
+    WaterList.insert(IP, OrigBB);
+  NewWaterList.insert(OrigBB);
+
+  // Figure out how large the OrigBB is.  As the first half of the original
+  // block, it cannot contain a tablejump.  The size includes
+  // the new jump we added.  (It should be possible to do this without
+  // recounting everything, but it's very confusing, and this is rarely
+  // executed.)
+  computeBlockSize(MF, OrigBB, BBInfo[OrigBB->getNumber()]);
+
+  // Figure out how large the NewMBB is.  As the second half of the original
+  // block, it may contain a tablejump.
+  computeBlockSize(MF, NewBB, BBInfo[NewBB->getNumber()]);
+
+  // All BBOffsets following these blocks must be modified.
+  adjustBBOffsetsAfter(OrigBB);
+
+  return NewBB;
+}
+
+/// getUserOffset - Compute the offset of U.MI as seen by the hardware
+/// displacement computation.  Update U.KnownAlignment to match its current
+/// basic block location.
+unsigned ARMConstantIslands::getUserOffset(CPUser &U) const {
+  unsigned UserOffset = getOffsetOf(U.MI);
+  const BasicBlockInfo &BBI = BBInfo[U.MI->getParent()->getNumber()];
+  unsigned KnownBits = BBI.internalKnownBits();
+
+  // The value read from PC is offset from the actual instruction address.
+  UserOffset += (isThumb ? 4 : 8);
+
+  // Because of inline assembly, we may not know the alignment (mod 4) of U.MI.
+  // Make sure U.getMaxDisp() returns a constrained range.
+  U.KnownAlignment = (KnownBits >= 2);
+
+  // On Thumb, offsets==2 mod 4 are rounded down by the hardware for
+  // purposes of the displacement computation; compensate for that here.
+  // For unknown alignments, getMaxDisp() constrains the range instead.
+  if (isThumb && U.KnownAlignment)
+    UserOffset &= ~3u;
+
+  return UserOffset;
+}
+
+/// isOffsetInRange - Checks whether UserOffset (the location of a constant pool
+/// reference) is within MaxDisp of TrialOffset (a proposed location of a
+/// constant pool entry).
+/// UserOffset is computed by getUserOffset above to include PC adjustments. If
+/// the mod 4 alignment of UserOffset is not known, the uncertainty must be
+/// subtracted from MaxDisp instead. CPUser::getMaxDisp() does that.
+bool ARMConstantIslands::isOffsetInRange(unsigned UserOffset,
+                                         unsigned TrialOffset, unsigned MaxDisp,
+                                         bool NegativeOK, bool IsSoImm) {
+  if (UserOffset <= TrialOffset) {
+    // User before the Trial.
+    if (TrialOffset - UserOffset <= MaxDisp)
+      return true;
+    // FIXME: Make use full range of soimm values.
+  } else if (NegativeOK) {
+    if (UserOffset - TrialOffset <= MaxDisp)
+      return true;
+    // FIXME: Make use full range of soimm values.
+  }
+  return false;
+}
+
+/// isWaterInRange - Returns true if a CPE placed after the specified
+/// Water (a basic block) will be in range for the specific MI.
+///
+/// Compute how much the function will grow by inserting a CPE after Water.
+bool ARMConstantIslands::isWaterInRange(unsigned UserOffset,
+                                        MachineBasicBlock* Water, CPUser &U,
+                                        unsigned &Growth) {
+  unsigned CPELogAlign = getCPELogAlign(U.CPEMI);
+  unsigned CPEOffset = BBInfo[Water->getNumber()].postOffset(CPELogAlign);
+  unsigned NextBlockOffset, NextBlockAlignment;
+  MachineFunction::const_iterator NextBlock = Water->getIterator();
+  if (++NextBlock == MF->end()) {
+    NextBlockOffset = BBInfo[Water->getNumber()].postOffset();
+    NextBlockAlignment = 0;
+  } else {
+    NextBlockOffset = BBInfo[NextBlock->getNumber()].Offset;
+    NextBlockAlignment = NextBlock->getAlignment();
+  }
+  unsigned Size = U.CPEMI->getOperand(2).getImm();
+  unsigned CPEEnd = CPEOffset + Size;
+
+  // The CPE may be able to hide in the alignment padding before the next
+  // block. It may also cause more padding to be required if it is more aligned
+  // that the next block.
+  if (CPEEnd > NextBlockOffset) {
+    Growth = CPEEnd - NextBlockOffset;
+    // Compute the padding that would go at the end of the CPE to align the next
+    // block.
+    Growth += OffsetToAlignment(CPEEnd, 1ULL << NextBlockAlignment);
+
+    // If the CPE is to be inserted before the instruction, that will raise
+    // the offset of the instruction. Also account for unknown alignment padding
+    // in blocks between CPE and the user.
+    if (CPEOffset < UserOffset)
+      UserOffset += Growth + UnknownPadding(MF->getAlignment(), CPELogAlign);
+  } else
+    // CPE fits in existing padding.
+    Growth = 0;
+
+  return isOffsetInRange(UserOffset, CPEOffset, U);
+}
+
+/// isCPEntryInRange - Returns true if the distance between specific MI and
+/// specific ConstPool entry instruction can fit in MI's displacement field.
+bool ARMConstantIslands::isCPEntryInRange(MachineInstr *MI, unsigned UserOffset,
+                                      MachineInstr *CPEMI, unsigned MaxDisp,
+                                      bool NegOk, bool DoDump) {
+  unsigned CPEOffset  = getOffsetOf(CPEMI);
+
+  if (DoDump) {
+    DEBUG({
+      unsigned Block = MI->getParent()->getNumber();
+      const BasicBlockInfo &BBI = BBInfo[Block];
+      dbgs() << "User of CPE#" << CPEMI->getOperand(0).getImm()
+             << " max delta=" << MaxDisp
+             << format(" insn address=%#x", UserOffset) << " in "
+             << printMBBReference(*MI->getParent()) << ": "
+             << format("%#x-%x\t", BBI.Offset, BBI.postOffset()) << *MI
+             << format("CPE address=%#x offset=%+d: ", CPEOffset,
+                       int(CPEOffset - UserOffset));
+    });
+  }
+
+  return isOffsetInRange(UserOffset, CPEOffset, MaxDisp, NegOk);
+}
+
+#ifndef NDEBUG
+/// BBIsJumpedOver - Return true of the specified basic block's only predecessor
+/// unconditionally branches to its only successor.
+static bool BBIsJumpedOver(MachineBasicBlock *MBB) {
+  if (MBB->pred_size() != 1 || MBB->succ_size() != 1)
+    return false;
+
+  MachineBasicBlock *Succ = *MBB->succ_begin();
+  MachineBasicBlock *Pred = *MBB->pred_begin();
+  MachineInstr *PredMI = &Pred->back();
+  if (PredMI->getOpcode() == ARM::B || PredMI->getOpcode() == ARM::tB
+      || PredMI->getOpcode() == ARM::t2B)
+    return PredMI->getOperand(0).getMBB() == Succ;
+  return false;
+}
+#endif // NDEBUG
+
+void ARMConstantIslands::adjustBBOffsetsAfter(MachineBasicBlock *BB) {
+  unsigned BBNum = BB->getNumber();
+  for(unsigned i = BBNum + 1, e = MF->getNumBlockIDs(); i < e; ++i) {
+    // Get the offset and known bits at the end of the layout predecessor.
+    // Include the alignment of the current block.
+    unsigned LogAlign = MF->getBlockNumbered(i)->getAlignment();
+    unsigned Offset = BBInfo[i - 1].postOffset(LogAlign);
+    unsigned KnownBits = BBInfo[i - 1].postKnownBits(LogAlign);
+
+    // This is where block i begins.  Stop if the offset is already correct,
+    // and we have updated 2 blocks.  This is the maximum number of blocks
+    // changed before calling this function.
+    if (i > BBNum + 2 &&
+        BBInfo[i].Offset == Offset &&
+        BBInfo[i].KnownBits == KnownBits)
+      break;
+
+    BBInfo[i].Offset = Offset;
+    BBInfo[i].KnownBits = KnownBits;
+  }
+}
+
+/// decrementCPEReferenceCount - find the constant pool entry with index CPI
+/// and instruction CPEMI, and decrement its refcount.  If the refcount
+/// becomes 0 remove the entry and instruction.  Returns true if we removed
+/// the entry, false if we didn't.
+bool ARMConstantIslands::decrementCPEReferenceCount(unsigned CPI,
+                                                    MachineInstr *CPEMI) {
+  // Find the old entry. Eliminate it if it is no longer used.
+  CPEntry *CPE = findConstPoolEntry(CPI, CPEMI);
+  assert(CPE && "Unexpected!");
+  if (--CPE

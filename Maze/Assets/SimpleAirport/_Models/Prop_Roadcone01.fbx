@@ -1,0 +1,658 @@
+es, id, ec);
+    result = ures_getStringByIndex(names, idx, NULL, &ec);
+    if (U_FAILURE(ec)) {
+        result = NULL;
+    }
+    ures_close(names);
+    ures_close(rb);
+    return result;
+}
+
+
+const UChar*
+TimeZone::dereferOlsonLink(const UnicodeString& id) {
+    const UChar *result = NULL;
+    UErrorCode ec = U_ZERO_ERROR;
+    UResourceBundle *rb = ures_openDirect(NULL, kZONEINFO, &ec);
+
+    // resolve zone index by name
+    UResourceBundle *names = ures_getByKey(rb, kNAMES, NULL, &ec);
+    int32_t idx = findInStringArray(names, id, ec);
+    result = ures_getStringByIndex(names, idx, NULL, &ec);
+
+    // open the zone bundle by index
+    ures_getByKey(rb, kZONES, rb, &ec);
+    ures_getByIndex(rb, idx, rb, &ec); 
+
+    if (U_SUCCESS(ec)) {
+        if (ures_getType(rb) == URES_INT) {
+            // this is a link - dereference the link
+            int32_t deref = ures_getInt(rb, &ec);
+            const UChar* tmp = ures_getStringByIndex(names, deref, NULL, &ec);
+            if (U_SUCCESS(ec)) {
+                result = tmp;
+            }
+        }
+    }
+
+    ures_close(names);
+    ures_close(rb);
+
+    return result;
+}
+
+const UChar*
+TimeZone::getRegion(const UnicodeString& id) {
+    UErrorCode status = U_ZERO_ERROR;
+    return getRegion(id, status);
+}
+
+const UChar*
+TimeZone::getRegion(const UnicodeString& id, UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return NULL;
+    }
+    const UChar *result = NULL;
+    UResourceBundle *rb = ures_openDirect(NULL, kZONEINFO, &status);
+
+    // resolve zone index by name
+    UResourceBundle *res = ures_getByKey(rb, kNAMES, NULL, &status);
+    int32_t idx = findInStringArray(res, id, status);
+
+    // get region mapping
+    ures_getByKey(rb, kREGIONS, res, &status);
+    const UChar *tmp = ures_getStringByIndex(res, idx, NULL, &status);
+    if (U_SUCCESS(status)) {
+        result = tmp;
+    }
+
+    ures_close(res);
+    ures_close(rb);
+
+    return result;
+}
+
+
+// ---------------------------------------
+int32_t
+TimeZone::getRegion(const UnicodeString& id, char *region, int32_t capacity, UErrorCode& status)
+{
+    int32_t resultLen = 0;
+    *region = 0;
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+
+    const UChar *uregion = NULL;
+    // "Etc/Unknown" is not a system zone ID,
+    // but in the zone data
+    if (id.compare(UNKNOWN_ZONE_ID, UNKNOWN_ZONE_ID_LENGTH) != 0) {
+        uregion = getRegion(id);
+    }
+    if (uregion == NULL) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return 0;
+    }
+    resultLen = u_strlen(uregion);
+    // A region code is represented by invariant characters
+    u_UCharsToChars(uregion, region, uprv_min(resultLen, capacity));
+
+    if (capacity < resultLen) {
+        status = U_BUFFER_OVERFLOW_ERROR;
+        return resultLen;
+    }
+
+    return u_terminateChars(region, capacity, resultLen, &status);
+}
+
+// ---------------------------------------
+
+
+UnicodeString&
+TimeZone::getDisplayName(UnicodeString& result) const
+{
+    return getDisplayName(FALSE,LONG,Locale::getDefault(), result);
+}
+
+UnicodeString&
+TimeZone::getDisplayName(const Locale& locale, UnicodeString& result) const
+{
+    return getDisplayName(FALSE, LONG, locale, result);
+}
+
+UnicodeString&
+TimeZone::getDisplayName(UBool daylight, EDisplayType style, UnicodeString& result)  const
+{
+    return getDisplayName(daylight,style, Locale::getDefault(), result);
+}
+//--------------------------------------
+int32_t
+TimeZone::getDSTSavings()const {
+    if (useDaylightTime()) {
+        return 3600000;
+    }
+    return 0;
+}
+//---------------------------------------
+UnicodeString&
+TimeZone::getDisplayName(UBool daylight, EDisplayType style, const Locale& locale, UnicodeString& result) const
+{
+    UErrorCode status = U_ZERO_ERROR;
+    UDate date = Calendar::getNow();
+    UTimeZoneFormatTimeType timeType;
+    int32_t offset;
+
+    if (style == GENERIC_LOCATION || style == LONG_GENERIC || style == SHORT_GENERIC) {
+        LocalPointer<TimeZoneFormat> tzfmt(TimeZoneFormat::createInstance(locale, status));
+        if (U_FAILURE(status)) {
+            result.remove();
+            return result;
+        }
+        // Generic format
+        switch (style) {
+        case GENERIC_LOCATION:
+            tzfmt->format(UTZFMT_STYLE_GENERIC_LOCATION, *this, date, result, &timeType);
+            break;
+        case LONG_GENERIC:
+            tzfmt->format(UTZFMT_STYLE_GENERIC_LONG, *this, date, result, &timeType);
+            break;
+        case SHORT_GENERIC:
+            tzfmt->format(UTZFMT_STYLE_GENERIC_SHORT, *this, date, result, &timeType);
+            break;
+        default:
+            U_ASSERT(FALSE);
+        }
+        // Generic format many use Localized GMT as the final fallback.
+        // When Localized GMT format is used, the result might not be
+        // appropriate for the requested daylight value.
+        if ((daylight && timeType == UTZFMT_TIME_TYPE_STANDARD) || (!daylight && timeType == UTZFMT_TIME_TYPE_DAYLIGHT)) {
+            offset = daylight ? getRawOffset() + getDSTSavings() : getRawOffset();
+            if (style == SHORT_GENERIC) {
+                tzfmt->formatOffsetShortLocalizedGMT(offset, result, status);
+            } else {
+                tzfmt->formatOffsetLocalizedGMT(offset, result, status);
+            }
+        }
+    } else if (style == LONG_GMT || style == SHORT_GMT) {
+        LocalPointer<TimeZoneFormat> tzfmt(TimeZoneFormat::createInstance(locale, status));
+        if (U_FAILURE(status)) {
+            result.remove();
+            return result;
+        }
+        offset = daylight && useDaylightTime() ? getRawOffset() + getDSTSavings() : getRawOffset();
+        switch (style) {
+        case LONG_GMT:
+            tzfmt->formatOffsetLocalizedGMT(offset, result, status);
+            break;
+        case SHORT_GMT:
+            tzfmt->formatOffsetISO8601Basic(offset, FALSE, FALSE, FALSE, result, status);
+            break;
+        default:
+            U_ASSERT(FALSE);
+        }
+
+    } else {
+        U_ASSERT(style == LONG || style == SHORT || style == SHORT_COMMONLY_USED);
+        UTimeZoneNameType nameType = UTZNM_UNKNOWN;
+        switch (style) {
+        case LONG:
+            nameType = daylight ? UTZNM_LONG_DAYLIGHT : UTZNM_LONG_STANDARD;
+            break;
+        case SHORT:
+        case SHORT_COMMONLY_USED:
+            nameType = daylight ? UTZNM_SHORT_DAYLIGHT : UTZNM_SHORT_STANDARD;
+            break;
+        default:
+            U_ASSERT(FALSE);
+        }
+        LocalPointer<TimeZoneNames> tznames(TimeZoneNames::createInstance(locale, status));
+        if (U_FAILURE(status)) {
+            result.remove();
+            return result;
+        }
+        UnicodeString canonicalID(ZoneMeta::getCanonicalCLDRID(*this));
+        tznames->getDisplayName(canonicalID, nameType, date, result);
+        if (result.isEmpty()) {
+            // Fallback to localized GMT
+            LocalPointer<TimeZoneFormat> tzfmt(TimeZoneFormat::createInstance(locale, status));
+            offset = daylight && useDaylightTime() ? getRawOffset() + getDSTSavings() : getRawOffset();
+            if (style == LONG) {
+                tzfmt->formatOffsetLocalizedGMT(offset, result, status);
+            } else {
+                tzfmt->formatOffsetShortLocalizedGMT(offset, result, status);
+            }
+        }
+    }
+    if (U_FAILURE(status)) {
+        result.remove();
+    }
+    return  result;
+}
+
+/**
+ * Parse a custom time zone identifier and return a corresponding zone.
+ * @param id a string of the form GMT[+-]hh:mm, GMT[+-]hhmm, or
+ * GMT[+-]hh.
+ * @return a newly created SimpleTimeZone with the given offset and
+ * no Daylight Savings Time, or null if the id cannot be parsed.
+*/
+TimeZone*
+TimeZone::createCustomTimeZone(const UnicodeString& id)
+{
+    int32_t sign, hour, min, sec;
+    if (parseCustomID(id, sign, hour, min, sec)) {
+        UnicodeString customID;
+        formatCustomID(hour, min, sec, (sign < 0), customID);
+        int32_t offset = sign * ((hour * 60 + min) * 60 + sec) * 1000;
+        return new SimpleTimeZone(offset, customID);
+    }
+    return NULL;
+}
+
+UnicodeString&
+TimeZone::getCustomID(const UnicodeString& id, UnicodeString& normalized, UErrorCode& status) {
+    normalized.remove();
+    if (U_FAILURE(status)) {
+        return normalized;
+    }
+    int32_t sign, hour, min, sec;
+    if (parseCustomID(id, sign, hour, min, sec)) {
+        formatCustomID(hour, min, sec, (sign < 0), normalized);
+    } else {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+    }
+    return normalized;
+}
+
+UBool
+TimeZone::parseCustomID(const UnicodeString& id, int32_t& sign,
+                        int32_t& hour, int32_t& min, int32_t& sec) {
+    static const int32_t         kParseFailed = -99999;
+
+    NumberFormat* numberFormat = 0;
+    UnicodeString idUppercase = id;
+    idUppercase.toUpper("");
+
+    if (id.length() > GMT_ID_LENGTH &&
+        idUppercase.startsWith(GMT_ID, GMT_ID_LENGTH))
+    {
+        ParsePosition pos(GMT_ID_LENGTH);
+        sign = 1;
+        hour = 0;
+        min = 0;
+        sec = 0;
+
+        if (id[pos.getIndex()] == MINUS /*'-'*/) {
+            sign = -1;
+        } else if (id[pos.getIndex()] != PLUS /*'+'*/) {
+            return FALSE;
+        }
+        pos.setIndex(pos.getIndex() + 1);
+
+        UErrorCode success = U_ZERO_ERROR;
+        numberFormat = NumberFormat::createInstance(success);
+        if(U_FAILURE(success)){
+            return FALSE;
+        }
+        numberFormat->setParseIntegerOnly(TRUE);
+        //numberFormat->setLenient(TRUE); // TODO: May need to set this, depends on latest timezone parsing
+
+        // Look for either hh:mm, hhmm, or hh
+        int32_t start = pos.getIndex();
+        Formattable n(kParseFailed);
+        numberFormat->parse(id, n, pos);
+        if (pos.getIndex() == start) {
+            delete numberFormat;
+            return FALSE;
+        }
+        hour = n.getLong();
+
+        if (pos.getIndex() < id.length()) {
+            if (pos.getIndex() - start > 2
+                || id[pos.getIndex()] != COLON) {
+                delete numberFormat;
+                return FALSE;
+            }
+            // hh:mm
+            pos.setIndex(pos.getIndex() + 1);
+            int32_t oldPos = pos.getIndex();
+            n.setLong(kParseFailed);
+            numberFormat->parse(id, n, pos);
+            if ((pos.getIndex() - oldPos) != 2) {
+                // must be 2 digits
+                delete numberFormat;
+                return FALSE;
+            }
+            min = n.getLong();
+            if (pos.getIndex() < id.length()) {
+                if (id[pos.getIndex()] != COLON) {
+                    delete numberFormat;
+                    return FALSE;
+                }
+                // [:ss]
+                pos.setIndex(pos.getIndex() + 1);
+                oldPos = pos.getIndex();
+                n.setLong(kParseFailed);
+                numberFormat->parse(id, n, pos);
+                if (pos.getIndex() != id.length()
+                        || (pos.getIndex() - oldPos) != 2) {
+                    delete numberFormat;
+                    return FALSE;
+                }
+                sec = n.getLong();
+            }
+        } else {
+            // Supported formats are below -
+            //
+            // HHmmss
+            // Hmmss
+            // HHmm
+            // Hmm
+            // HH
+            // H
+
+            int32_t length = pos.getIndex() - start;
+            if (length <= 0 || 6 < length) {
+                // invalid length
+                delete numberFormat;
+                return FALSE;
+            }
+            switch (length) {
+                case 1:
+                case 2:
+                    // already set to hour
+                    break;
+                case 3:
+                case 4:
+                    min = hour % 100;
+                    hour /= 100;
+                    break;
+                case 5:
+                case 6:
+                    sec = hour % 100;
+                    min = (hour/100) % 100;
+                    hour /= 10000;
+                    break;
+            }
+        }
+
+        delete numberFormat;
+
+        if (hour > kMAX_CUSTOM_HOUR || min > kMAX_CUSTOM_MIN || sec > kMAX_CUSTOM_SEC) {
+            return FALSE;
+        }
+        return TRUE;
+    }
+    return FALSE;
+}
+
+UnicodeString&
+TimeZone::formatCustomID(int32_t hour, int32_t min, int32_t sec,
+                         UBool negative, UnicodeString& id) {
+    // Create time zone ID - GMT[+|-]hhmm[ss]
+    id.setTo(GMT_ID, GMT_ID_LENGTH);
+    if (hour | min | sec) {
+        if (negative) {
+            id += (UChar)MINUS;
+        } else {
+            id += (UChar)PLUS;
+        }
+
+        if (hour < 10) {
+            id += (UChar)ZERO_DIGIT;
+        } else {
+            id += (UChar)(ZERO_DIGIT + hour/10);
+        }
+        id += (UChar)(ZERO_DIGIT + hour%10);
+        id += (UChar)COLON;
+        if (min < 10) {
+            id += (UChar)ZERO_DIGIT;
+        } else {
+            id += (UChar)(ZERO_DIGIT + min/10);
+        }
+        id += (UChar)(ZERO_DIGIT + min%10);
+
+        if (sec) {
+            id += (UChar)COLON;
+            if (sec < 10) {
+                id += (UChar)ZERO_DIGIT;
+            } else {
+                id += (UChar)(ZERO_DIGIT + sec/10);
+            }
+            id += (UChar)(ZERO_DIGIT + sec%10);
+        }
+    }
+    return id;
+}
+
+
+UBool
+TimeZone::hasSameRules(const TimeZone& other) const
+{
+    return (getRawOffset() == other.getRawOffset() &&
+            useDaylightTime() == other.useDaylightTime());
+}
+
+static void U_CALLCONV initTZDataVersion(UErrorCode &status) {
+    ucln_i18n_registerCleanup(UCLN_I18N_TIMEZONE, timeZone_cleanup);
+    int32_t len = 0;
+    UResourceBundle *bundle = ures_openDirect(NULL, kZONEINFO, &status);
+    const UChar *tzver = ures_getStringByKey(bundle, kTZVERSION, &len, &status);
+
+    if (U_SUCCESS(status)) {
+        if (len >= (int32_t)sizeof(TZDATA_VERSION)) {
+            // Ensure that there is always space for a trailing nul in TZDATA_VERSION
+            len = sizeof(TZDATA_VERSION) - 1;
+        }
+        u_UCharsToChars(tzver, TZDATA_VERSION, len);
+    }
+    ures_close(bundle);
+
+}
+
+const char*
+TimeZone::getTZDataVersion(UErrorCode& status)
+{
+    umtx_initOnce(gTZDataVersionInitOnce, &initTZDataVersion, status);
+    return (const char*)TZDATA_VERSION;
+}
+
+UnicodeString&
+TimeZone::getCanonicalID(const UnicodeString& id, UnicodeString& canonicalID, UErrorCode& status)
+{
+    UBool isSystemID = FALSE;
+    return getCanonicalID(id, canonicalID, isSystemID, status);
+}
+
+UnicodeString&
+TimeZone::getCanonicalID(const UnicodeString& id, UnicodeString& canonicalID, UBool& isSystemID,
+                         UErrorCode& status)
+{
+    canonicalID.remove();
+    isSystemID = FALSE;
+    if (U_FAILURE(status)) {
+        return canonicalID;
+    }
+    if (id.compare(UNKNOWN_ZONE_ID, UNKNOWN_ZONE_ID_LENGTH) == 0) {
+        // special case - Etc/Unknown is a canonical ID, but not system ID
+        canonicalID.fastCopyFrom(id);
+        isSystemID = FALSE;
+    } else {
+        ZoneMeta::getCanonicalCLDRID(id, canonicalID, status);
+        if (U_SUCCESS(status)) {
+            isSystemID = TRUE;
+        } else {
+            // Not a system ID
+            status = U_ZERO_ERROR;
+            getCustomID(id, canonicalID, status);
+        }
+    }
+    return canonicalID;
+}
+
+#ifndef U_HIDE_DRAFT_API
+UnicodeString&
+TimeZone::getWindowsID(const UnicodeString& id, UnicodeString& winid, UErrorCode& status) {
+    winid.remove();
+    if (U_FAILURE(status)) {
+        return winid;
+    }
+
+    // canonicalize the input ID
+    UnicodeString canonicalID;
+    UBool isSystemID = FALSE;
+
+    getCanonicalID(id, canonicalID, isSystemID, status);
+    if (U_FAILURE(status) || !isSystemID) {
+        // mapping data is only applicable to tz database IDs
+        if (status == U_ILLEGAL_ARGUMENT_ERROR) {
+            // getWindowsID() sets an empty string where
+            // getCanonicalID() sets a U_ILLEGAL_ARGUMENT_ERROR.
+            status = U_ZERO_ERROR;
+        }
+        return winid;
+    }
+
+    UResourceBundle *mapTimezones = ures_openDirect(NULL, "windowsZones", &status);
+    ures_getByKey(mapTimezones, "mapTimezones", mapTimezones, &status);
+
+    if (U_FAILURE(status)) {
+        return winid;
+    }
+
+    UResourceBundle *winzone = NULL;
+    UBool found = FALSE;
+    while (ures_hasNext(mapTimezones) && !found) {
+        winzone = ures_getNextResource(mapTimezones, winzone, &status);
+        if (U_FAILURE(status)) {
+            break;
+        }
+        if (ures_getType(winzone) != URES_TABLE) {
+            continue;
+        }
+        UResourceBundle *regionalData = NULL;
+        while (ures_hasNext(winzone) && !found) {
+            regionalData = ures_getNextResource(winzone, regionalData, &status);
+            if (U_FAILURE(status)) {
+                break;
+            }
+            if (ures_getType(regionalData) != URES_STRING) {
+                continue;
+            }
+            int32_t len;
+            const UChar *tzids = ures_getString(regionalData, &len, &status);
+            if (U_FAILURE(status)) {
+                break;
+            }
+
+            const UChar *start = tzids;
+            UBool hasNext = TRUE;
+            while (hasNext) {
+                const UChar *end = u_strchr(start, (UChar)0x20);
+                if (end == NULL) {
+                    end = tzids + len;
+                    hasNext = FALSE;
+                }
+                if (canonicalID.compare(start, end - start) == 0) {
+                    winid = UnicodeString(ures_getKey(winzone), -1 , US_INV);
+                    found = TRUE;
+                    break;
+                }
+                start = end + 1;
+            }
+        }
+        ures_close(regionalData);
+    }
+    ures_close(winzone);
+    ures_close(mapTimezones);
+
+    return winid;
+}
+
+#define MAX_WINDOWS_ID_SIZE 128
+
+UnicodeString&
+TimeZone::getIDForWindowsID(const UnicodeString& winid, const char* region, UnicodeString& id, UErrorCode& status) {
+    id.remove();
+    if (U_FAILURE(status)) {
+        return id;
+    }
+
+    UResourceBundle *zones = ures_openDirect(NULL, "windowsZones", &status);
+    ures_getByKey(zones, "mapTimezones", zones, &status);
+    if (U_FAILURE(status)) {
+        ures_close(zones);
+        return id;
+    }
+
+    UErrorCode tmperr = U_ZERO_ERROR;
+    char winidKey[MAX_WINDOWS_ID_SIZE];
+    int32_t winKeyLen = winid.extract(0, winid.length(), winidKey, sizeof(winidKey) - 1, US_INV);
+
+    if (winKeyLen == 0 || winKeyLen >= (int32_t)sizeof(winidKey)) {
+        ures_close(zones);
+        return id;
+    }
+    winidKey[winKeyLen] = 0;
+
+    ures_getByKey(zones, winidKey, zones, &tmperr); // use tmperr, because windows mapping might not
+                                                    // be avaiable by design
+    if (U_FAILURE(tmperr)) {
+        ures_close(zones);
+        return id;
+    }
+
+    const UChar *tzid = NULL;
+    int32_t len = 0;
+    UBool gotID = FALSE;
+    if (region) {
+        const UChar *tzids = ures_getStringByKey(zones, region, &len, &tmperr); // use tmperr, because
+                                                                                // regional mapping is optional
+        if (U_SUCCESS(tmperr)) {
+            // first ID delimited by space is the defasult one
+            const UChar *end = u_strchr(tzids, (UChar)0x20);
+            if (end == NULL) {
+                id.setTo(tzids, -1);
+            } else {
+                id.setTo(tzids, end - tzids);
+            }
+            gotID = TRUE;
+        }
+    }
+
+    if (!gotID) {
+        tzid = ures_getStringByKey(zones, "001", &len, &status);    // using status, because "001" must be
+                                                                // available at this point
+        if (U_SUCCESS(status)) {
+            id.setTo(tzid, len);
+        }
+    }
+
+    ures_close(zones);
+    return id;
+}
+#endif /* U_HIDE_DRAFT_API */
+
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+//eof
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    Â[ô’7ãu;úpà<ÀŠaš[†hEDçCıüšü½XşÊßµ[Øl"ïÚÉ‹•|™Ü$‡]9
+çaã5
+D^Tå„“Ù´é®¡áô3ğwÍLá¸±oÁÇã½™(’1*°>ğ{¾ŒÄmfTÔÚp¥¯g}*®£…¼(MsI`ÒG)èWëÀBŠ_3-F
+JÜSœæNêY  qX	R@U$©+$¦DgœMzlfÊwgKŒÖfÁ…Ã×$x˜â=AUÖ:g¸P*•ıdÀ…Y@Ü‚”NÕd×ÅeæÛ_V×<IĞ0ÿî­ÌY¼t1à:¦Ùâ:şéóBÉ!åZğIù5XÕ¦.¥Y÷¡WâhñB»í³q*.GVD¥TZ¥ ÿ†~7¥mãT‘ğ–Z\–²ş‰»PÅ|c
+ÚGkù6ôš¬¸•ºüVæ9Cœš“°
+©‰ë†Éåı©cá%›p9ûŸw÷Ş‰‘äüøöÔğ2JH•²Ïª¬“©_`=L‡Ø×4EÚíÙf% )×µ—ÄŒœÊ–•$¡Ş2@S]MİOä™bºnZ†x.:TÀeî]ÊMÈ@|	¸6Yîzn±•’Öó´ë?«q9).PûHq½¨¾*‘¼¯^TŸYÿ™„np#¦ŞÃ¸Æ6æÛ/ãi@ÎÇkø~ë2Œ.ãÜ¯ª©ÍWI¨ŒÜÌ+n4C¨œ“83ÿl5™:nºÑÿø*SAI<oõªnÂq]ÎZ¢ÜUMá}‘ú™°mUO>–-›ùYş&É>·ÜĞQî’ƒôâ%•}*³Ôó½…3À\çUÏ‡(Òá‘Î|÷ÔK“1>™šô/75Ğ~0»ıw¨×ÅŒÄ
+‡hg­ñ_+ë;Ú´î¿Óú‹%m–Â:±×š6Ö´Áe+ ‘£FÍJìáªx5İ]3`ô:Z©¢X‘m_t/;æÿŒÛFÓkõnbÁh2—Ú8À#J@®©«M®ïè–{Ç’àŞ`&»Ï²Áiæibì.‚dZ–ùŞ™‚£À.²) õÒj“‹âªı#ë¨8ò‰kZ4¡Ø°É<iî²¨K[èH}`JqÈu–Ø”›S¼qúænŸŠ¬à6Ûö´'[,<õV?”¨Wn*s"ô£Ä2boq=7¾òÜ3£( œzª{õzÚÛ«Æ¼Ãvg¢-®Zâÿì6Öª.èÂs42Æ1Œ ¬@juyu(ÌœI.P¨2/õrE’ğo3à{rC¯‚´CaçYáÉ“È˜à^y¤¢§¶6¡tù÷5uæäÑ‡ƒÏ`·Ø3°}š;eúâ€X ã*§ç¶/,^Ú¶!Ÿÿ5w£LgCÅ d<–vhë®‚ŒZ>!e;’P»îZ|R à×rSS4ñY‹´sgR¸~¼iê#%Œ¡)üÜ
+ÎGı9¬=Ï-$â?’î¨š€b‡o&qº?ªx÷Ş¹àB‰p@‚ÁËJ÷¬%É*-OåõYş`®à;QÜŞş _ÙÙ@éÙMzS²é›H{†Ú í£¤[L¼ÈÒu‡¯«6[Ä!Ü®âoPè#q"jê{{Áò
+ÓĞé6kZ{Nì4¤#wÌ&¾”œ< Û™"hcáp,ß=ï4,÷õDµ†f¿j(^eJraÇYìÅy3!·<çú~àÌäÏR#‘fõæâ¨¾"EX°	 „>R0Õ¨{Ö¥©’rDÜ#!è-æ!!K&º]‰¦OSWÛö­V8çzĞĞ[§C:Mâbsww=y#w~då+e-}hæª–‘Şr+).½‹m’Á"
+yÑh ü@”ë¾p™íd…r$QxæGvF“™DWÛE!g™0| ¯‰˜Bwa‰QªZ/Zz>ş´©c¾e¸Úeg…u´G##ÙDèünHõêáËÑ	…ËÁŒO–uÉc&;ôò‹‚-»YOhÑR_Á€6îş‰t¨… GõàÀá®bÃV‰4Ğnä•s#•Foh2ÉÁ)lÍ²†|‹R*ûxg¤Æ‰¥ı¶òv¸kšÓ&m¶ùãQµ0‰ò++L)ˆ©5¼†Ãî.ğêÚªÈŒ6Î‡ZşÈŸÉÀ)Ù#,°62xâ~FM*½.ËóØÄ‡sL7³2ÏµCİöT,EvæØÏô¶*	~ø`·şÔ”s±ôWqP[ìÅŞfú%˜€XÇ
+6Ø½8Ğ×ÀÈ&°aL–‰»¦:1ªwÕj¯0r‡ù.ŸòÿEp½IóŸwTiV¸¸2¢äÖA©wiñ)x~y`DéhÛ
+¶ÖÇ¶À Ôû6Ë-­šc)ë‹«è¾Y]à$J6€PƒùKLë¼`
+sÒŠã%øÇÏt¹şÃzy	sÑ[Éú|ëüY=¹«¡Û]³SØú³6şÇûÖ09 JØ˜A¬÷¾©!„šK¶[âá–Z±ölO“6\-mãuiÒ*±I ,4Ü¿ÊË„Ò©
+ÁïÀè"”îiĞò9õ¡^´ÑÕw‘—ÅÃ›Ìf#Á}>¬9FE»?{všÒK¤z îøh[±y¶®gßSU¨7½ìb”c2AÏLÊ+Ğ!j=6ÓWä_s‚~¼v—}
+@¦ÿLâ£rg_¶Dp\JuĞÖõ981=üÍ-ë õHL SF=)›õŒM]k>iŠ^X}š|«àF=ĞÁŠ°Fïè¤zwu>¨ş£¾, u›'õiÄjcÛC×Ø2´u­·˜¾Èz-EÑÃ]÷)ÓoK’ÜB%8¶v%ÏM1¾	ä,;E:}·Ë¾`*ÅHÖGÎ±]!ß$W«¯ü9Kkš2@³Üôu ¼IAp´Œ`×’Ÿ°Ö¶ì›³÷4[‡dêeŸ²le*ü7Ì$
+¤şßo-3îªŒ.\< Ü€Éä‡Û·'›y¿}ÁiÓz#Î"³8U
+Ü›sšUg@^ä¸œ1w›ƒ9½-„ëº|†},	›éàŠÑôÛyßÍ‘¬ÕhŠòÔ.Z}ÉŒ¶‘¥L?úUáÔçÅJ};Y”ˆƒX7œ©„f¿˜¶Äm%FäØgR0ë‘qJfÙ€Ÿ³i‰] }ğµ ¶>5÷©áVb³éTÔ…ØåÍ>ĞÃ²ìÿ°/‡q¬Q¤…bòô˜V¥ydvŞª*eQĞÙüÊGƒ¸Ær„¸fÁñ¦ğ<k&JB‘V·úÖ‡=Bz+[Z$¸,¥ş€Ü$ı+û‹—-÷lÕpêpù0É†|ÉQŸÅ©š®i ¤KùVH	 =úDõ™¹×àmÙå”O!jk»¤WO‡›XÙ U$©³²B\œk:¡ù‡{ÄTù\Q‘<½¿®]?J.„u—:®Œ>¸¿®Ë‡o§gATŞ‡	+z7–ğÓ2²_äç™‡-!­ˆ‹?PÎñÆõÊ^mjŠÔ*~«‡ASÏÛªúÌ¬˜§\'Œ¹ÛgY€¥„©7iã	Ê¡æ‚=›lŠš7AÉgs£/,~gì?!¿™ÿÄÂ´•:î!t“5­ŒAû{­ŒhÆP»=p–ÖÎ‰ ç ‚ÒVå•)´à{ÄX¥D~îc-æKÇY0şÏ#Tş%[C™ ÑVx1¬¢Rf°Uö2\«ìGd¢ïMŒy*êÂka™©êpçêDX…Òq4ÉÕÃ&ãéğ­Ò²:}U‡a?/2òİ2È¸bÊ ¬%ÎË&y6+\ø

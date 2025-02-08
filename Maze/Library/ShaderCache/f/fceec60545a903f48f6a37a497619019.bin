@@ -1,0 +1,83 @@
+riority), shdfnd::Time::getCurrentCounterValue() );
+		}
+
+		PX_FORCE_INLINE void startEvent(uint16_t inId, uint64_t contextId, uint32_t threadId)
+		{
+			startEvent( inId, threadId, contextId, 0, 0, shdfnd::Time::getCurrentCounterValue() );
+		}
+
+		PX_FORCE_INLINE void stopEvent(uint16_t inId, uint32_t threadId, uint64_t contextId, uint8_t cpuId, uint8_t threadPriority, uint64_t inTimestamp)
+		{			
+			TScopedLockType lock(TBaseType::mBufferMutex);
+			if ( mEventFilter.isEventEnabled( inId ) )
+			{
+				StopEvent theEvent;
+				theEvent.init( threadId, contextId, cpuId, threadPriority, inTimestamp );
+				doAddProfileEvent( inId, theEvent );
+			}
+		}
+
+		PX_FORCE_INLINE void stopEvent(uint16_t inId, uint64_t contextId)
+		{
+			PxProfileEventExecutionContext ctx( mContextProvider.getExecutionContext() );
+			stopEvent( inId, ctx.mThreadId, contextId, ctx.mCpuId, static_cast<uint8_t>(ctx.mThreadPriority), shdfnd::Time::getCurrentCounterValue() );
+		}
+
+		PX_FORCE_INLINE void stopEvent(uint16_t inId, uint64_t contextId, uint32_t threadId)
+		{
+			stopEvent( inId, threadId, contextId, 0, 0, shdfnd::Time::getCurrentCounterValue() );
+		}
+
+		inline void eventValue( uint16_t inId, uint64_t contextId, int64_t inValue )
+		{
+			eventValue( inId, mContextProvider.getThreadId(), contextId, inValue );
+		}
+
+		inline void eventValue( uint16_t inId, uint32_t threadId, uint64_t contextId, int64_t inValue )
+		{
+			TScopedLockType lock( TBaseType::mBufferMutex );
+			EventValue theEvent;
+			theEvent.init( inValue, contextId, threadId );
+			EventHeader theHeader( static_cast<uint8_t>( getEventType<EventValue>() ), inId );
+			//set the header relative timestamp;
+			EventValue& theType( theEvent );
+			theType.setupHeader( theHeader );
+			sendEvent( theHeader, theType );
+		}
+
+		void flushProfileEvents()
+		{				
+			TBaseType::flushEvents();
+		}
+
+		void release()
+		{
+			PX_PROFILE_DELETE( TBaseType::mWrapper.mUserFoundation, this );
+		}
+	protected:
+		//Clears the cache meaning event compression
+		//starts over again.
+		//only called when the buffer mutex is held
+		void clearCachedData()
+		{
+			mEventContextInformation.setToDefault();
+			mLastTimestamp = 0;
+		}
+
+		template<typename TProfileEventType>
+		PX_FORCE_INLINE void doAddProfileEvent(uint16_t eventId, const TProfileEventType& inType)
+		{
+			TScopedLockType lock(TBaseType::mBufferMutex);
+			if (mEventContextInformation == inType.mContextInformation)
+				doAddEvent(static_cast<uint8_t>(inType.getRelativeEventType()), eventId, inType.getRelativeEvent());
+			else
+			{
+				mEventContextInformation = inType.mContextInformation;
+				doAddEvent( static_cast<uint8_t>( getEventType<TProfileEventType>() ), eventId, inType );
+			}
+		}
+
+		template<typename TDataType>
+		PX_FORCE_INLINE void doAddEvent(uint8_t inEventType, uint16_t eventId, const TDataType& inType)
+		{
+			EventHeader theHeader( inEventType, eventId 

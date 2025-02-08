@@ -1,0 +1,82 @@
+  get { return _enabled; }
+        }
+
+        internal HealthMonitoringSection HealthMonitoringSection {
+            get { return _section; }
+        }
+
+        [FileIOPermission(SecurityAction.Assert, Unrestricted = true)]
+        void BasicSanityCheck() {
+            Type type;
+
+            foreach (ProviderSettings providerSettings in _section.Providers) {
+                // Make sure the type is valid.
+                type = ConfigUtil.GetType(providerSettings.Type, "type", providerSettings);
+
+                // Make sure the type support WebEventProvider
+                HandlerBase.CheckAssignableType(providerSettings.ElementInformation.Properties["type"].Source,
+                        providerSettings.ElementInformation.Properties["type"].LineNumber,
+                        typeof(WebEventProvider), type);
+
+            }
+
+            foreach (EventMappingSettings eventMappingSettings in _section.EventMappings) {
+                // Make sure the type is valid.
+                type = ConfigUtil.GetType(eventMappingSettings.Type, "type", eventMappingSettings);
+
+                // Make sure startEventCode <= endEventCode
+                if (!(eventMappingSettings.StartEventCode <= eventMappingSettings.EndEventCode)) {
+                    string attribute;
+
+                    // We don't know which one was specified unless we test it
+                    attribute = "startEventCode";
+                    if (eventMappingSettings.ElementInformation.Properties[attribute].LineNumber == 0) {
+                        attribute = "endEventCode";
+                        Debug.Assert(eventMappingSettings.ElementInformation.Properties[attribute].LineNumber != 0,
+                                    "eventMappingSettings.ElementInformation.Properties[attribute].LineNumber != 0");
+                    }
+
+                    throw new ConfigurationErrorsException(
+                        SR.GetString(SR.Event_name_invalid_code_range),
+                        eventMappingSettings.ElementInformation.Properties[attribute].Source, eventMappingSettings.ElementInformation.Properties[attribute].LineNumber);
+                }
+
+                // Make sure the type support WebBaseEvent
+                HandlerBase.CheckAssignableType(eventMappingSettings.ElementInformation.Properties["type"].Source,
+                            eventMappingSettings.ElementInformation.Properties["type"].LineNumber,
+                            typeof(System.Web.Management.WebBaseEvent), type);
+
+                // It's a valid type.  Might as well save it.
+                eventMappingSettings.RealType = type;
+            }
+
+            foreach (RuleSettings rule in _section.Rules) {
+
+                // Go thru all the Rules, and make sure all referenced provider, eventName
+                // and profile exist.
+
+                string provider = rule.Provider;
+                if (!String.IsNullOrEmpty(provider)) {
+                    ProviderSettings providerSettings = _section.Providers[provider];
+                    if (providerSettings == null) {
+                        throw new ConfigurationErrorsException(
+                            SR.GetString(SR.Health_mon_provider_not_found, provider),
+                                rule.ElementInformation.Properties["provider"].Source,
+                                rule.ElementInformation.Properties["provider"].LineNumber);
+                    }
+                }
+
+                string profile = rule.Profile;
+                if (!String.IsNullOrEmpty(profile)) {
+                    if (_section.Profiles[profile] == null) {
+                        throw new ConfigurationErrorsException(
+                            SR.GetString(SR.Health_mon_profile_not_found, profile),
+                                rule.ElementInformation.Properties["profile"].Source,
+                                rule.ElementInformation.Properties["profile"].LineNumber);
+                    }
+                }
+
+                if (_section.EventMappings[rule.EventName] == null) {
+                    throw new ConfigurationErrorsException(
+                        SR.GetString(SR.Event_name_not_found, rule.EventName),
+                            rule.ElementInformation.Properties["even

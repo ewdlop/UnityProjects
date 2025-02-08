@@ -1,0 +1,147 @@
+elf):
+        # Issue #16411: decompressor accesses input to last decompress() call
+        # in flush(), even if this object has been freed in the meanwhile.
+        input1 = b'abcdefghijklmnopqrstuvwxyz'
+        input2 = b'QWERTYUIOPASDFGHJKLZXCVBNM'
+        data = zlib.compress(input1)
+        dco = zlib.decompressobj()
+        dco.decompress(data, 1)
+        del data
+        data = zlib.compress(input2)
+        self.assertEqual(dco.flush(), input1[1:])
+
+    @bigmemtest(size=_4G, memuse=1)
+    def test_flush_large_length(self, size):
+        # Test flush(length) parameter greater than internal limit UINT_MAX
+        input = HAMLET_SCENE * 10
+        data = zlib.compress(input, 1)
+        dco = zlib.decompressobj()
+        dco.decompress(data, 1)
+        self.assertEqual(dco.flush(size), input[1:])
+
+    def test_flush_custom_length(self):
+        input = HAMLET_SCENE * 10
+        data = zlib.compress(input, 1)
+        dco = zlib.decompressobj()
+        dco.decompress(data, 1)
+        self.assertEqual(dco.flush(CustomInt()), input[1:])
+
+    @requires_Compress_copy
+    def test_compresscopy(self):
+        # Test copying a compression object
+        data0 = HAMLET_SCENE
+        data1 = bytes(str(HAMLET_SCENE, "ascii").swapcase(), "ascii")
+        c0 = zlib.compressobj(zlib.Z_BEST_COMPRESSION)
+        bufs0 = []
+        bufs0.append(c0.compress(data0))
+
+        c1 = c0.copy()
+        bufs1 = bufs0[:]
+
+        bufs0.append(c0.compress(data0))
+        bufs0.append(c0.flush())
+        s0 = b''.join(bufs0)
+
+        bufs1.append(c1.compress(data1))
+        bufs1.append(c1.flush())
+        s1 = b''.join(bufs1)
+
+        self.assertEqual(zlib.decompress(s0),data0+data0)
+        self.assertEqual(zlib.decompress(s1),data0+data1)
+
+    @requires_Compress_copy
+    def test_badcompresscopy(self):
+        # Test copying a compression object in an inconsistent state
+        c = zlib.compressobj()
+        c.compress(HAMLET_SCENE)
+        c.flush()
+        self.assertRaises(ValueError, c.copy)
+
+    @requires_Decompress_copy
+    def test_decompresscopy(self):
+        # Test copying a decompression object
+        data = HAMLET_SCENE
+        comp = zlib.compress(data)
+        # Test type of return value
+        self.assertIsInstance(comp, bytes)
+
+        d0 = zlib.decompressobj()
+        bufs0 = []
+        bufs0.append(d0.decompress(comp[:32]))
+
+        d1 = d0.copy()
+        bufs1 = bufs0[:]
+
+        bufs0.append(d0.decompress(comp[32:]))
+        s0 = b''.join(bufs0)
+
+        bufs1.append(d1.decompress(comp[32:]))
+        s1 = b''.join(bufs1)
+
+        self.assertEqual(s0,s1)
+        self.assertEqual(s0,data)
+
+    @requires_Decompress_copy
+    def test_baddecompresscopy(self):
+        # Test copying a compression object in an inconsistent state
+        data = zlib.compress(HAMLET_SCENE)
+        d = zlib.decompressobj()
+        d.decompress(data)
+        d.flush()
+        self.assertRaises(ValueError, d.copy)
+
+    def test_compresspickle(self):
+        for proto in range(pickle.HIGHEST_PROTOCOL + 1):
+            with self.assertRaises((TypeError, pickle.PicklingError)):
+                pickle.dumps(zlib.compressobj(zlib.Z_BEST_COMPRESSION), proto)
+
+    def test_decompresspickle(self):
+        for proto in range(pickle.HIGHEST_PROTOCOL + 1):
+            with self.assertRaises((TypeError, pickle.PicklingError)):
+                pickle.dumps(zlib.decompressobj(), proto)
+
+    # Memory use of the following functions takes into account overallocation
+
+    @bigmemtest(size=_1G + 1024 * 1024, memuse=3)
+    def test_big_compress_buffer(self, size):
+        c = zlib.compressobj(1)
+        compress = lambda s: c.compress(s) + c.flush()
+        self.check_big_compress_buffer(size, compress)
+
+    @bigmemtest(size=_1G + 1024 * 1024, memuse=2)
+    def test_big_decompress_buffer(self, size):
+        d = zlib.decompressobj()
+        decompress = lambda s: d.decompress(s) + d.flush()
+        self.check_big_decompress_buffer(size, decompress)
+
+    @unittest.skipUnless(sys.maxsize > 2**32, 'requires 64bit platform')
+    @bigmemtest(size=_4G + 100, memuse=4)
+    def test_64bit_compress(self, size):
+        data = b'x' * size
+        co = zlib.compressobj(0)
+        do = zlib.decompressobj()
+        try:
+            comp = co.compress(data) + co.flush()
+            uncomp = do.decompress(comp) + do.flush()
+            self.assertEqual(uncomp, data)
+        finally:
+            comp = uncomp = data = None
+
+    @unittest.skipUnless(sys.maxsize > 2**32, 'requires 64bit platform')
+    @bigmemtest(size=_4G + 100, memuse=3)
+    def test_large_unused_data(self, size):
+        data = b'abcdefghijklmnop'
+        unused = b'x' * size
+        comp = zlib.compress(data) + unused
+        do = zlib.decompressobj()
+        try:
+            uncomp = do.decompress(comp) + do.flush()
+            self.assertEqual(unused, do.unused_data)
+            self.assertEqual(uncomp, data)
+        finally:
+            unused = comp = do = None
+
+    @unittest.skipUnless(sys.maxsize > 2**32, 'requires 64bit platform')
+    @bigmemtest(size=_4G + 100, memuse=5)
+    def test_large_unconsumed_tail(self, size):
+    

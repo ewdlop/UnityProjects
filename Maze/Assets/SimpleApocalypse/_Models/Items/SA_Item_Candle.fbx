@@ -1,0 +1,529 @@
+"""TestCases for multi-threaded access to a DB.
+"""
+
+import os
+import sys
+import time
+import errno
+from random import random
+
+DASH = '-'
+
+try:
+    WindowsError
+except NameError:
+    class WindowsError(Exception):
+        pass
+
+import unittest
+from test_all import db, dbutils, test_support, verbose, have_threads, \
+        get_new_environment_path, get_new_database_path
+
+if have_threads :
+    from threading import Thread
+    if sys.version_info[0] < 3 :
+        from threading import currentThread
+    else :
+        from threading import current_thread as currentThread
+
+
+#----------------------------------------------------------------------
+
+class BaseThreadedTestCase(unittest.TestCase):
+    dbtype       = db.DB_UNKNOWN  # must be set in derived class
+    dbopenflags  = 0
+    dbsetflags   = 0
+    envflags     = 0
+
+    def setUp(self):
+        if verbose:
+            dbutils._deadlock_VerboseFile = sys.stdout
+
+        self.homeDir = get_new_environment_path()
+        self.env = db.DBEnv()
+        self.setEnvOpts()
+        self.env.open(self.homeDir, self.envflags | db.DB_CREATE)
+
+        self.filename = self.__class__.__name__ + '.db'
+        self.d = db.DB(self.env)
+        if self.dbsetflags:
+            self.d.set_flags(self.dbsetflags)
+        self.d.open(self.filename, self.dbtype, self.dbopenflags|db.DB_CREATE)
+
+    def tearDown(self):
+        self.d.close()
+        self.env.close()
+        test_support.rmtree(self.homeDir)
+
+    def setEnvOpts(self):
+        pass
+
+    def makeData(self, key):
+        return DASH.join([key] * 5)
+
+
+#----------------------------------------------------------------------
+
+
+class ConcurrentDataStoreBase(BaseThreadedTestCase):
+    dbopenflags = db.DB_THREAD
+    envflags    = db.DB_THREAD | db.DB_INIT_CDB | db.DB_INIT_MPOOL
+    readers     = 0 # derived class should set
+    writers     = 0
+    records     = 1000
+
+    def test01_1WriterMultiReaders(self):
+        if verbose:
+            print '\n', '-=' * 30
+            print "Running %s.test01_1WriterMultiReaders..." % \
+                  self.__class__.__name__
+
+        keys=range(self.records)
+        import random
+        random.shuffle(keys)
+        records_per_writer=self.records//self.writers
+        readers_per_writer=self.readers//self.writers
+        self.assertEqual(self.records,self.writers*records_per_writer)
+        self.assertEqual(self.readers,self.writers*readers_per_writer)
+        self.assertEqual(records_per_writer%readers_per_writer, 0)
+        readers = []
+
+        for x in xrange(self.readers):
+            rt = Thread(target = self.readerThread,
+                        args = (self.d, x),
+                        name = 'reader %d' % x,
+                        )#verbose = verbose)
+            if sys.version_info[0] < 3 :
+                rt.setDaemon(True)
+            else :
+                rt.daemon = True
+            readers.append(rt)
+
+        writers=[]
+        for x in xrange(self.writers):
+            a=keys[records_per_writer*x:records_per_writer*(x+1)]
+            a.sort()  # Generate conflicts
+            b=readers[readers_per_writer*x:readers_per_writer*(x+1)]
+            wt = Thread(target = self.writerThread,
+                        args = (self.d, a, b),
+                        name = 'writer %d' % x,
+                        )#verbose = verbose)
+            writers.append(wt)
+
+        for t in writers:
+            if sys.version_info[0] < 3 :
+                t.setDaemon(True)
+            else :
+                t.daemon = True
+            t.start()
+
+        for t in writers:
+            t.join()
+        for t in readers:
+            t.join()
+
+    def writerThread(self, d, keys, readers):
+        if sys.version_info[0] < 3 :
+            name = currentThread().getName()
+        else :
+            name = currentThread().name
+
+        if verbose:
+            print "%s: creating records %d - %d" % (name, start, stop)
+
+        count=len(keys)//len(readers)
+        count2=count
+        for x in keys :
+            key = '%04d' % x
+            dbutils.DeadlockWrap(d.put, key, self.makeData(key),
+                                 max_retries=12)
+            if verbose and x % 100 == 0:
+                print "%s: records %d - %d finished" % (name, start, x)
+
+            count2-=1
+            if not count2 :
+                readers.pop().start()
+                count2=count
+
+        if verbose:
+            print "%s: finished creating records" % name
+
+        if verbose:
+            print "%s: thread finished" % name
+
+    def readerThread(self, d, readerNum):
+        if sys.version_info[0] < 3 :
+            name = currentThread().getName()
+        else :
+            name = currentThread().name
+
+        for i in xrange(5) :
+            c = d.cursor()
+            count = 0
+            rec = c.first()
+            while rec:
+                count += 1
+                key, data = rec
+                self.assertEqual(self.makeData(key), data)
+                rec = c.next()
+            if verbose:
+                print "%s: found %d records" % (name, count)
+            c.close()
+
+        if verbose:
+            print "%s: thread finished" % name
+
+
+class BTreeConcurrentDataStore(ConcurrentDataStoreBase):
+    dbtype  = db.DB_BTREE
+    writers = 2
+    readers = 10
+    records = 1000
+
+
+class HashConcurrentDataStore(ConcurrentDataStoreBase):
+    dbtype  = db.DB_HASH
+    writers = 2
+    readers = 10
+    records = 1000
+
+
+#----------------------------------------------------------------------
+
+class SimpleThreadedBase(BaseThreadedTestCase):
+    dbopenflags = db.DB_THREAD
+    envflags    = db.DB_THREAD | db.DB_INIT_MPOOL | db.DB_INIT_LOCK
+    readers = 10
+    writers = 2
+    records = 1000
+
+    def setEnvOpts(self):
+        self.env.set_lk_detect(db.DB_LOCK_DEFAULT)
+
+    def test02_SimpleLocks(self):
+        if verbose:
+            print '\n', '-=' * 30
+            print "Running %s.test02_SimpleLocks..." % self.__class__.__name__
+
+
+        keys=range(self.records)
+        import random
+        random.shuffle(keys)
+        records_per_writer=self.records//self.writers
+        readers_per_writer=self.readers//self.writers
+        self.assertEqual(self.records,self.writers*records_per_writer)
+        self.assertEqual(self.readers,self.writers*readers_per_writer)
+        self.assertEqual(records_per_writer%readers_per_writer, 0)
+
+        readers = []
+        for x in xrange(self.readers):
+            rt = Thread(target = self.readerThread,
+                        args = (self.d, x),
+                        name = 'reader %d' % x,
+                        )#verbose = verbose)
+            if sys.version_info[0] < 3 :
+                rt.setDaemon(True)
+            else :
+                rt.daemon = True
+            readers.append(rt)
+
+        writers = []
+        for x in xrange(self.writers):
+            a=keys[records_per_writer*x:records_per_writer*(x+1)]
+            a.sort()  # Generate conflicts
+            b=readers[readers_per_writer*x:readers_per_writer*(x+1)]
+            wt = Thread(target = self.writerThread,
+                        args = (self.d, a, b),
+                        name = 'writer %d' % x,
+                        )#verbose = verbose)
+            writers.append(wt)
+
+        for t in writers:
+            if sys.version_info[0] < 3 :
+                t.setDaemon(True)
+            else :
+                t.daemon = True
+            t.start()
+
+        for t in writers:
+            t.join()
+        for t in readers:
+            t.join()
+
+    def writerThread(self, d, keys, readers):
+        if sys.version_info[0] < 3 :
+            name = currentThread().getName()
+        else :
+            name = currentThread().name
+        if verbose:
+            print "%s: creating records %d - %d" % (name, start, stop)
+
+        count=len(keys)//len(readers)
+        count2=count
+        for x in keys :
+            key = '%04d' % x
+            dbutils.DeadlockWrap(d.put, key, self.makeData(key),
+                                 max_retries=12)
+
+            if verbose and x % 100 == 0:
+                print "%s: records %d - %d finished" % (name, start, x)
+
+            count2-=1
+            if not count2 :
+                readers.pop().start()
+                count2=count
+
+        if verbose:
+            print "%s: thread finished" % name
+
+    def readerThread(self, d, readerNum):
+        if sys.version_info[0] < 3 :
+            name = currentThread().getName()
+        else :
+            name = currentThread().name
+
+        c = d.cursor()
+        count = 0
+        rec = dbutils.DeadlockWrap(c.first, max_retries=10)
+        while rec:
+            count += 1
+            key, data = rec
+            self.assertEqual(self.makeData(key), data)
+            rec = dbutils.DeadlockWrap(c.next, max_retries=10)
+        if verbose:
+            print "%s: found %d records" % (name, count)
+        c.close()
+
+        if verbose:
+            print "%s: thread finished" % name
+
+
+class BTreeSimpleThreaded(SimpleThreadedBase):
+    dbtype = db.DB_BTREE
+
+
+class HashSimpleThreaded(SimpleThreadedBase):
+    dbtype = db.DB_HASH
+
+
+#----------------------------------------------------------------------
+
+
+class ThreadedTransactionsBase(BaseThreadedTestCase):
+    dbopenflags = db.DB_THREAD | db.DB_AUTO_COMMIT
+    envflags    = (db.DB_THREAD |
+                   db.DB_INIT_MPOOL |
+                   db.DB_INIT_LOCK |
+                   db.DB_INIT_LOG |
+                   db.DB_INIT_TXN
+                   )
+    readers = 0
+    writers = 0
+    records = 2000
+    txnFlag = 0
+
+    def setEnvOpts(self):
+        #self.env.set_lk_detect(db.DB_LOCK_DEFAULT)
+        pass
+
+    def test03_ThreadedTransactions(self):
+        if verbose:
+            print '\n', '-=' * 30
+            print "Running %s.test03_ThreadedTransactions..." % \
+                  self.__class__.__name__
+
+        keys=range(self.records)
+        import random
+        random.shuffle(keys)
+        records_per_writer=self.records//self.writers
+        readers_per_writer=self.readers//self.writers
+        self.assertEqual(self.records,self.writers*records_per_writer)
+        self.assertEqual(self.readers,self.writers*readers_per_writer)
+        self.assertEqual(records_per_writer%readers_per_writer, 0)
+
+        readers=[]
+        for x in xrange(self.readers):
+            rt = Thread(target = self.readerThread,
+                        args = (self.d, x),
+                        name = 'reader %d' % x,
+                        )#verbose = verbose)
+            if sys.version_info[0] < 3 :
+                rt.setDaemon(True)
+            else :
+                rt.daemon = True
+            readers.append(rt)
+
+        writers = []
+        for x in xrange(self.writers):
+            a=keys[records_per_writer*x:records_per_writer*(x+1)]
+            b=readers[readers_per_writer*x:readers_per_writer*(x+1)]
+            wt = Thread(target = self.writerThread,
+                        args = (self.d, a, b),
+                        name = 'writer %d' % x,
+                        )#verbose = verbose)
+            writers.append(wt)
+
+        dt = Thread(target = self.deadlockThread)
+        if sys.version_info[0] < 3 :
+            dt.setDaemon(True)
+        else :
+            dt.daemon = True
+        dt.start()
+
+        for t in writers:
+            if sys.version_info[0] < 3 :
+                t.setDaemon(True)
+            else :
+                t.daemon = True
+            t.start()
+
+        for t in writers:
+            t.join()
+        for t in readers:
+            t.join()
+
+        self.doLockDetect = False
+        dt.join()
+
+    def writerThread(self, d, keys, readers):
+        if sys.version_info[0] < 3 :
+            name = currentThread().getName()
+        else :
+            name = currentThread().name
+
+        count=len(keys)//len(readers)
+        while len(keys):
+            try:
+                txn = self.env.txn_begin(None, self.txnFlag)
+                keys2=keys[:count]
+                for x in keys2 :
+                    key = '%04d' % x
+                    d.put(key, self.makeData(key), txn)
+                    if verbose and x % 100 == 0:
+                        print "%s: records %d - %d finished" % (name, start, x)
+                txn.commit()
+                keys=keys[count:]
+                readers.pop().start()
+            except (db.DBLockDeadlockError, db.DBLockNotGrantedError), val:
+                if verbose:
+                    if sys.version_info < (2, 6) :
+                        print "%s: Aborting transaction (%s)" % (name, val[1])
+                    else :
+                        print "%s: Aborting transaction (%s)" % (name,
+                                val.args[1])
+                txn.abort()
+
+        if verbose:
+            print "%s: thread finished" % name
+
+    def readerThread(self, d, readerNum):
+        if sys.version_info[0] < 3 :
+            name = currentThread().getName()
+        else :
+            name = currentThread().name
+
+        finished = False
+        while not finished:
+            try:
+                txn = self.env.txn_begin(None, self.txnFlag)
+                c = d.cursor(txn)
+                count = 0
+                rec = c.first()
+                while rec:
+                    count += 1
+                    key, data = rec
+                    self.assertEqual(self.makeData(key), data)
+                    rec = c.next()
+                if verbose: print "%s: found %d records" % (name, count)
+                c.close()
+                txn.commit()
+                finished = True
+            except (db.DBLockDeadlockError, db.DBLockNotGrantedError), val:
+                if verbose:
+                    if sys.version_info < (2, 6) :
+                        print "%s: Aborting transaction (%s)" % (name, val[1])
+                    else :
+                        print "%s: Aborting transaction (%s)" % (name,
+                                val.args[1])
+                c.close()
+                txn.abort()
+
+        if verbose:
+            print "%s: thread finished" % name
+
+    def deadlockThread(self):
+        self.doLockDetect = True
+        while self.doLockDetect:
+            time.sleep(0.05)
+            try:
+                aborted = self.env.lock_detect(
+                    db.DB_LOCK_RANDOM, db.DB_LOCK_CONFLICT)
+                if verbose and aborted:
+                    print "deadlock: Aborted %d deadlocked transaction(s)" \
+                          % aborted
+            except db.DBError:
+                pass
+
+
+class BTreeThreadedTransactions(ThreadedTransactionsBase):
+    dbtype = db.DB_BTREE
+    writers = 2
+    readers = 10
+    records = 1000
+
+class HashThreadedTransactions(ThreadedTransactionsBase):
+    dbtype = db.DB_HASH
+    writers = 2
+    readers = 10
+    records = 1000
+
+class BTreeThreadedNoWaitTransactions(ThreadedTransactionsBase):
+    dbtype = db.DB_BTREE
+    writers = 2
+    readers = 10
+    records = 1000
+    txnFlag = db.DB_TXN_NOWAIT
+
+class HashThreadedNoWaitTransactions(ThreadedTransactionsBase):
+    dbtype = db.DB_HASH
+    writers = 2
+    readers = 10
+    records = 1000
+    txnFlag = db.DB_TXN_NOWAIT
+
+
+#----------------------------------------------------------------------
+
+def test_suite():
+    suite = unittest.TestSuite()
+
+    if have_threads:
+        suite.addTest(unittest.makeSuite(BTreeConcurrentDataStore))
+        suite.addTest(unittest.makeSuite(HashConcurrentDataStore))
+        suite.addTest(unittest.makeSuite(BTreeSimpleThreaded))
+        suite.addTest(unittest.makeSuite(HashSimpleThreaded))
+        suite.addTest(unittest.makeSuite(BTreeThreadedTransactions))
+        suite.addTest(unittest.makeSuite(HashThreadedTransactions))
+        suite.addTest(unittest.makeSuite(BTreeThreadedNoWaitTransactions))
+        suite.addTest(unittest.makeSuite(HashThreadedNoWaitTransactions))
+
+    else:
+        print "Threads not available, skipping thread tests."
+
+    return suite
+
+
+if __name__ == '__main__':
+    unittest.main(defaultTest='test_suite')
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       çÓx…ä¡ÒæãC<‹"¿¸†0ğŒL·¥ÏÃaÙ¾>ìî#àÊÄ4¤)R••şŸcç·?TjD¾Ğ£Z‡32Š.ôU&N­–Š9RÁá =5™“çjùÉÖÖªSªu!Qi¼²·ı(r—~»üäÉÿ¬hfÚ™j<ÃQöI‚JX:æ‹“­áË#×Ñ¡ÁaB°0ÑÖ,º\r>õ9oíq0›]â†¶SŒ½V°½i‘à‹ûæd™A‹²®·êí…äÒ#şéĞƒ)ÆMÉDü–È¯ü‹sWß“§oQĞœƒ>íI)û*D#|›qóŒQQ&Ïr¿VÅ3×â#œt6ÊâsRå›t½û¶¹«—ï]æğ©7²IıUĞËV‚ô‹F¦3şû_Õ“°Mƒ—·öv4IÔ‡½å”(«t{ä+µŞ€âÆ#dæĞf¹g×h—¼ë°·Üòh¬L,SœoNBĞû7öÕ©©Ò ¾ü¢Dh!djï ƒyt›0®ø„ÈK¹rí‚9x76«PŠûLÎSê–{2ƒ‡@»Œ4|,’ÁZ
+ÀŞ·bĞŸ^ĞùîSFâ!t
+m¯ç©®ãh©¶˜ÆGV_31«ÇÄÆç­zŞKëØÀ:¢Ï	ˆ‰Ê§Ôø
+ø¦~|²Ü7ß…}%)A3,–ÁüKäS—BñLÇ¹Zümyì°2ëß…D¥Î«T4H/ÊW,$ÑetAŞº¶G…ñæSÓåÏ¶nMö\2¹É9¢ÑµzÀâoÅBÈaYÁ,zëºU`Qk|ÆöŸÊo+€ OÈôöK›Ïy!øÈ€ÌD^çë8£®T@Ôõ‘ºâp•Hx@ôñ+IÃı­º0!ñg£Ş	=åZHÛ-õ²İJ~VRµKİ@KòÓ>V£ ÂåJA+Õ:—ã©Zˆ†ìë)ÉAKìõÙ¬„¼üÿ|ÜÁ¬óñ‚× ÿ¼wyø‰â>P´±ZîÙ¸›¹ZÙ Òú±fÊMp«ì—/æ£Aé%9ˆKBóÎFÄúÜ·SÖ3¡‰Š£‰(XÒÛğPîô—¸è:LƒºÁ_¦×­ı8ì€vo‰8j}œ¬c0Ï)éeá­­ŒÍ^¹	'-º‡^omr¾ıÕÇëvöö£<2|c@ºåù¡@¡8óä¡R+àÄLÛ,\™¨XĞ:YÛÎô*è™"­ma µf)LË[cÀà›éå!ú-ã9¤×íêÏX‡ğeñ‡-\öTo½‡ƒ‡ÀRÔÇ·Öİƒ†2’è­ØÊEÆÅÀ+Y¤uLä¯¢k\‚E—J$ıâ?JæíN'ˆ2ÅÓŸRŒg#æj–’¤ù+´•£¼¦¼±LÍ0b©I
+aş=~a wûÛ¦VëšÌ>"K®õ¶Mé¿+”ÑIlKIû)ê)t{ÀC—»â-ÿÔsùŞëß‡
+-%Øx:ƒ+Üà¬†¾–¬MâoEêŸjõò¾™F€ág»Œ¨(¢ù¨d6ş\z}ÇX6À$QûS„ï"NÖå'¾ª7~úB¶Ñaå2tKhc6ŒT'+M¦©HQT¢]2;®™J€}·´ì´„Ğ‡ ôwæÔÿ(ğF»Q35îEcş)­\q]¾\ª8=lè‚.ãf¬zúÉ[ƒ]®óñpsÚµÖ¿öá¡:ÛèÉ¹$6ÇĞî¨ío8â‰\ŸŸPçF£ôy®x®átú ööJ*59jÓy~bˆšèÌDGêi²ØÓs)©ìnÆôY.‡j>?ƒÃJıA,Uë‘ŸñF…[iî`Læã+ÜÊ£$¢_²ê×MÀDHél†Œ¹jÖ7Õ- é&[8¶|Hr Û#>Mjı­¡g9"g‰Ö (Ù´×SĞ‘éª´"ˆ÷P‰ß‡o¤ï.«¾Tò<­o#l¯ù«ş??²°‚dfÖ²²š¸¦(R²M|°|IäP^°À‡FÀ©X×6‰xÖ—iõH²SÑ%/ñìä/Z¤VCÔğ}6Uiáo	‰¶¦î{•{=4ÅŞyC×mo™–İ'RJTÇ…›’š”^a#QÏ	¥<;úÍb¦ î5@Õ˜¶¨Qï†¦|ºpò *d¼h«1OYİq‘Cò±ÔyJá¶¡gZ’ø0şá0!|Ä%x·yíd›ù¤ÈÀT£š¿¢À…V-O™Z®¥È*³2Ï;`<ß‹Á‹¢&X{œ¥±†I}° R^y!¥­Û×o`W´s4_o'<ßí°‚¢Jâ²*ê:İ?;—íÒw…4Éÿœªæ'ıRıÓ”ƒÙî É Z”}³®r´,õi·‡id(ÌC['"f²§ò€5è•¼dgíEå&4ô…”æÛòBÆ 2 »a·‰ÖyÉù=ø{ÎÂ¹	J#qÜÿõÙ¼ÖÜ)C‹€E/ #aÌE¿ş„o©dpv@%·”DÑñŒ¡Æ‡1ĞÓz±G´e—è^%Ú¢×ü‰Mqğ)AÅmï;9ª¥Å”Å;/ŠL 2çöİµŞ×şşûXHÍ{N%Û¡dŒÊ-”æOádüDÿÅëß!y<;êTì¦p—dŸdËçØûşIÒPsW)Ş¾xApONÜÅsdË{k
+ûëGjnFkn#G<ß^hú?›É–R
+a¶úníjôÿü™ã„”Ş®Èş¦|÷Ô5é, qà«Áèä<,õ†ò¬oF¿•)·Ï7
+õ¶`ò†ê¢‡{åƒÛg`d%kf;- Á•Ç¯ºÉ7¹-Ä‹¡Ù<[ÙfÀ,Ü=Åî¢1VŒzÓöÌñğÁó_*y¡¤f@*Š
+A%:ÉóVH,)s"àÏl\B.1‹Ã‘“§oå/¿E–Äü^<¾-¤µÿ-D(ü1hIˆ†ÿÜÔñÊmìb§£ŸRDÅW,1Bûà6âËÈ5êcûÂrp×­»3ÉÜ ÁO¼WéSPW{AÿñX1+©±Í}=ü7*ŒBKP…M×´W(¾;šï€Û¢Ş³4åSvpx?XÀ~Ãç‘E û¿	“ &wyõÍ·ÂWbÅ³hŞ_!cşk2ë™øY:t×G%5ÜJx@Ëã„êu«ÄöRæAÌ¦drºü¦Á–Å_täæc}h'—$éÚCk›)o«—ß÷wµ!!xÙîŠGİ ±q
+¢ÚHÏfVÈ)€h¡S““û7¬Š€K/š[—Ë¯óm°Š…8°Ÿ¹]ÈKÖLğÿEµÅÀĞó[Şğ:b¬#Jvğ¥áõÏ•ïhû¼^
+,[õ

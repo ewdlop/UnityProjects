@@ -1,0 +1,150 @@
+sets[dynamicWindow]=fixedOffsets[b-fixedThreshold];
+                } else {
+                    /* callback(illegal): Reserved window offset value 0xa8..0xf8 */
+                    cnv->toUBytes[1]=b;
+                    cnv->toULength=2;
+                    goto endloop;
+                }
+                state=readCommand;
+                goto fastSingle;
+            }
+        }
+    } else {
+        /* fast path for Unicode mode */
+        if(state==readCommand) {
+fastUnicode:
+            while(source+1<sourceLimit && target<targetLimit && (uint8_t)((b=*source)-UC0)>(Urs-UC0)) {
+                *target++=(UChar)((b<<8)|source[1]);
+                source+=2;
+            }
+        }
+
+        /* normal state machine for Unicode mode */
+/* unicodeByteMode: */
+        while(source<sourceLimit) {
+            if(target>=targetLimit) {
+                /* target is full */
+                *pErrorCode=U_BUFFER_OVERFLOW_ERROR;
+                break;
+            }
+            b=*source++;
+            switch(state) {
+            case readCommand:
+                if((uint8_t)(b-UC0)>(Urs-UC0)) {
+                    byteOne=b;
+                    cnv->toUBytes[0]=b;
+                    cnv->toULength=1;
+                    state=quotePairTwo;
+                } else if(/* UC0<=b && */ b<=UC7) {
+                    dynamicWindow=(int8_t)(b-UC0);
+                    isSingleByteMode=TRUE;
+                    goto fastSingle;
+                } else if(/* UD0<=b && */ b<=UD7) {
+                    dynamicWindow=(int8_t)(b-UD0);
+                    isSingleByteMode=TRUE;
+                    cnv->toUBytes[0]=b;
+                    cnv->toULength=1;
+                    state=defineOne;
+                    goto singleByteMode;
+                } else if(b==UDX) {
+                    isSingleByteMode=TRUE;
+                    cnv->toUBytes[0]=b;
+                    cnv->toULength=1;
+                    state=definePairOne;
+                    goto singleByteMode;
+                } else if(b==UQU) {
+                    cnv->toUBytes[0]=b;
+                    cnv->toULength=1;
+                    state=quotePairOne;
+                } else /* Urs */ {
+                    /* callback(illegal) */
+                    *pErrorCode=U_ILLEGAL_CHAR_FOUND;
+                    cnv->toUBytes[0]=b;
+                    cnv->toULength=1;
+                    goto endloop;
+                }
+                break;
+            case quotePairOne:
+                byteOne=b;
+                cnv->toUBytes[1]=b;
+                cnv->toULength=2;
+                state=quotePairTwo;
+                break;
+            case quotePairTwo:
+                *target++=(UChar)((byteOne<<8)|b);
+                state=readCommand;
+                goto fastUnicode;
+            }
+        }
+    }
+endloop:
+
+    /* set the converter state back into UConverter */
+    if(U_FAILURE(*pErrorCode) && *pErrorCode!=U_BUFFER_OVERFLOW_ERROR) {
+        /* reset to deal with the next character */
+        state=readCommand;
+    } else if(state==readCommand) {
+        /* not in a multi-byte sequence, reset toULength */
+        cnv->toULength=0;
+    }
+    scsu->toUIsSingleByteMode=isSingleByteMode;
+    scsu->toUState=state;
+    scsu->toUQuoteWindow=quoteWindow;
+    scsu->toUDynamicWindow=dynamicWindow;
+    scsu->toUByteOne=byteOne;
+
+    /* write back the updated pointers */
+    pArgs->source=(const char *)source;
+    pArgs->target=target;
+    return;
+}
+
+/* SCSU-from-Unicode conversion functions ----------------------------------- */
+
+/*
+ * This SCSU Encoder is fairly simple but uses all SCSU commands to achieve
+ * reasonable results. The lookahead is minimal.
+ * Many cases are simple:
+ * A character fits directly into the current mode, a dynamic or static window,
+ * or is not compressible. These cases are tested first.
+ * Real compression heuristics are applied to the rest, in code branches for
+ * single/Unicode mode and BMP/supplementary code points.
+ * The heuristics used here are extremely simple.
+ */
+
+/* get the number of the window that this character is in, or -1 */
+static int8_t
+getWindow(const uint32_t offsets[8], uint32_t c) {
+    int i;
+    for(i=0; i<8; ++i) {
+        if((uint32_t)(c-offsets[i])<=0x7f) {
+            return (int8_t)(i);
+        }
+    }
+    return -1;
+}
+
+/* is the character in the dynamic window starting at the offset, or in the direct-encoded range? */
+static UBool
+isInOffsetWindowOrDirect(uint32_t offset, uint32_t c) {
+    return (UBool)(c<=offset+0x7f &&
+          (c>=offset || (c<=0x7f &&
+                        (c>=0x20 || (1UL<<c)&0x2601))));
+                                /* binary 0010 0110 0000 0001,
+                                   check for b==0xd || b==0xa || b==9 || b==0 */
+}
+
+/*
+ * getNextDynamicWindow returns the next dynamic window to be redefined
+ */
+static int8_t
+getNextDynamicWindow(SCSUData *scsu) {
+    int8_t window=scsu->windowUse[scsu->nextWindowUseIndex];
+    if(++scsu->nextWindowUseIndex==8) {
+        scsu->nextWindowUseIndex=0;
+    }
+    return window;
+}
+
+/*
+ * use

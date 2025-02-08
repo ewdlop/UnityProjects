@@ -1,0 +1,2906 @@
+//===----- CGOpenMPRuntime.h - Interface to OpenMP Runtimes -----*- C++ -*-===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+//
+// This provides a class for OpenMP runtime code generation.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef LLVM_CLANG_LIB_CODEGEN_CGOPENMPRUNTIME_H
+#define LLVM_CLANG_LIB_CODEGEN_CGOPENMPRUNTIME_H
+
+#include "CGValue.h"
+#include "clang/AST/Type.h"
+#include "clang/Basic/OpenMPKinds.h"
+#include "clang/Basic/SourceLocation.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/ValueHandle.h"
+
+namespace llvm {
+class ArrayType;
+class Constant;
+class FunctionType;
+class GlobalVariable;
+class StructType;
+class Type;
+class Value;
+} // namespace llvm
+
+namespace clang {
+class Expr;
+class GlobalDecl;
+class OMPDependClause;
+class OMPExecutableDirective;
+class OMPLoopDirective;
+class VarDecl;
+class OMPDeclareReductionDecl;
+class IdentifierInfo;
+
+namespace CodeGen {
+class Address;
+class CodeGenFunction;
+class CodeGenModule;
+
+/// A basic class for pre|post-action for advanced codegen sequence for OpenMP
+/// region.
+class PrePostActionTy {
+public:
+  explicit PrePostActionTy() {}
+  virtual void Enter(CodeGenFunction &CGF) {}
+  virtual void Exit(CodeGenFunction &CGF) {}
+  virtual ~PrePostActionTy() {}
+};
+
+/// Class provides a way to call simple version of codegen for OpenMP region, or
+/// an advanced with possible pre|post-actions in codegen.
+class RegionCodeGenTy final {
+  intptr_t CodeGen;
+  typedef void (*CodeGenTy)(intptr_t, CodeGenFunction &, PrePostActionTy &);
+  CodeGenTy Callback;
+  mutable PrePostActionTy *PrePostAction;
+  RegionCodeGenTy() = delete;
+  RegionCodeGenTy &operator=(const RegionCodeGenTy &) = delete;
+  template <typename Callable>
+  static void CallbackFn(intptr_t CodeGen, CodeGenFunction &CGF,
+                         PrePostActionTy &Action) {
+    return (*reinterpret_cast<Callable *>(CodeGen))(CGF, Action);
+  }
+
+public:
+  template <typename Callable>
+  RegionCodeGenTy(
+      Callable &&CodeGen,
+      typename std::enable_if<
+          !std::is_same<typename std::remove_reference<Callable>::type,
+                        RegionCodeGenTy>::value>::type * = nullptr)
+      : CodeGen(reinterpret_cast<intptr_t>(&CodeGen)),
+        Callback(CallbackFn<typename std::remove_reference<Callable>::type>),
+        PrePostAction(nullptr) {}
+  void setAction(PrePostActionTy &Action) const { PrePostAction = &Action; }
+  void operator()(CodeGenFunction &CGF) const;
+};
+
+struct OMPTaskDataTy final {
+  SmallVector<const Expr *, 4> PrivateVars;
+  SmallVector<const Expr *, 4> PrivateCopies;
+  SmallVector<const Expr *, 4> FirstprivateVars;
+  SmallVector<const Expr *, 4> FirstprivateCopies;
+  SmallVector<const Expr *, 4> FirstprivateInits;
+  SmallVector<const Expr *, 4> LastprivateVars;
+  SmallVector<const Expr *, 4> LastprivateCopies;
+  SmallVector<const Expr *, 4> ReductionVars;
+  SmallVector<const Expr *, 4> ReductionCopies;
+  SmallVector<const Expr *, 4> ReductionOps;
+  SmallVector<std::pair<OpenMPDependClauseKind, const Expr *>, 4> Dependences;
+  llvm::PointerIntPair<llvm::Value *, 1, bool> Final;
+  llvm::PointerIntPair<llvm::Value *, 1, bool> Schedule;
+  llvm::PointerIntPair<llvm::Value *, 1, bool> Priority;
+  llvm::Value *Reductions = nullptr;
+  unsigned NumberOfParts = 0;
+  bool Tied = true;
+  bool Nogroup = false;
+};
+
+/// Class intended to support codegen of all kind of the reduction clauses.
+class ReductionCodeGen {
+private:
+  /// Data required for codegen of reduction clauses.
+  struct ReductionData {
+    /// Reference to the original shared item.
+    const Expr *Ref = nullptr;
+    /// Helper expression for generation of private copy.
+    const Expr *Private = nullptr;
+    /// Helper expression for generation reduction operation.
+    const Expr *ReductionOp = nullptr;
+    ReductionData(const Expr *Ref, const Expr *Private, const Expr *ReductionOp)
+        : Ref(Ref), Private(Private), ReductionOp(ReductionOp) {}
+  };
+  /// List of reduction-based clauses.
+  SmallVector<ReductionData, 4> ClausesData;
+
+  /// List of addresses of original shared variables/expressions.
+  SmallVector<std::pair<LValue, LValue>, 4> SharedAddresses;
+  /// Sizes of the reduction items in chars.
+  SmallVector<std::pair<llvm::Value *, llvm::Value *>, 4> Sizes;
+  /// Base declarations for the reduction items.
+  SmallVector<const VarDecl *, 4> BaseDecls;
+
+  /// Emits lvalue for shared expresion.
+  LValue emitSharedLValue(CodeGenFunction &CGF, const Expr *E);
+  /// Emits upper bound for shared expression (if array section).
+  LValue emitSharedLValueUB(CodeGenFunction &CGF, const Expr *E);
+  /// Performs aggregate initialization.
+  /// \param N Number of reduction item in the common list.
+  /// \param PrivateAddr Address of the corresponding private item.
+  /// \param SharedLVal Address of the original shared variable.
+  /// \param DRD Declare reduction construct used for reduction item.
+  void emitAggregateInitialization(CodeGenFunction &CGF, unsigned N,
+                                   Address PrivateAddr, LValue SharedLVal,
+                                   const OMPDeclareReductionDecl *DRD);
+
+public:
+  ReductionCodeGen(ArrayRef<const Expr *> Shareds,
+                   ArrayRef<const Expr *> Privates,
+                   ArrayRef<const Expr *> ReductionOps);
+  /// Emits lvalue for a reduction item.
+  /// \param N Number of the reduction item.
+  void emitSharedLValue(CodeGenFunction &CGF, unsigned N);
+  /// Emits the code for the variable-modified type, if required.
+  /// \param N Number of the reduction item.
+  void emitAggregateType(CodeGenFunction &CGF, unsigned N);
+  /// Emits the code for the variable-modified type, if required.
+  /// \param N Number of the reduction item.
+  /// \param Size Size of the type in chars.
+  void emitAggregateType(CodeGenFunction &CGF, unsigned N, llvm::Value *Size);
+  /// Performs initialization of the private copy for the reduction item.
+  /// \param N Number of the reduction item.
+  /// \param PrivateAddr Address of the corresponding private item.
+  /// \param DefaultInit Default initialization sequence that should be
+  /// performed if no reduction specific initialization is found.
+  /// \param SharedLVal Address of the original shared variable.
+  void
+  emitInitialization(CodeGenFunction &CGF, unsigned N, Address PrivateAddr,
+                     LValue SharedLVal,
+                     llvm::function_ref<bool(CodeGenFunction &)> DefaultInit);
+  /// Returns true if the private copy requires cleanups.
+  bool needCleanups(unsigned N);
+  /// Emits cleanup code for the reduction item.
+  /// \param N Number of the reduction item.
+  /// \param PrivateAddr Address of the corresponding private item.
+  void emitCleanups(CodeGenFunction &CGF, unsigned N, Address PrivateAddr);
+  /// Adjusts \p PrivatedAddr for using instead of the original variable
+  /// address in normal operations.
+  /// \param N Number of the reduction item.
+  /// \param PrivateAddr Address of the corresponding private item.
+  Address adjustPrivateAddress(CodeGenFunction &CGF, unsigned N,
+                               Address PrivateAddr);
+  /// Returns LValue for the reduction item.
+  LValue getSharedLValue(unsigned N) const { return SharedAddresses[N].first; }
+  /// Returns the size of the reduction item (in chars and total number of
+  /// elements in the item), or nullptr, if the size is a constant.
+  std::pair<llvm::Value *, llvm::Value *> getSizes(unsigned N) const {
+    return Sizes[N];
+  }
+  /// Returns the base declaration of the reduction item.
+  const VarDecl *getBaseDecl(unsigned N) const { return BaseDecls[N]; }
+  /// Returns true if the initialization of the reduction item uses initializer
+  /// from declare reduction construct.
+  bool usesReductionInitializer(unsigned N) const;
+};
+
+class CGOpenMPRuntime {
+protected:
+  CodeGenModule &CGM;
+
+  /// \brief Creates offloading entry for the provided entry ID \a ID,
+  /// address \a Addr, size \a Size, and flags \a Flags.
+  virtual void createOffloadEntry(llvm::Constant *ID, llvm::Constant *Addr,
+                                  uint64_t Size, int32_t Flags = 0);
+
+  /// \brief Helper to emit outlined function for 'target' directive.
+  /// \param D Directive to emit.
+  /// \param ParentName Name of the function that encloses the target region.
+  /// \param OutlinedFn Outlined function value to be defined by this call.
+  /// \param OutlinedFnID Outlined function ID value to be defined by this call.
+  /// \param IsOffloadEntry True if the outlined function is an offload entry.
+  /// \param CodeGen Lambda codegen specific to an accelerator device.
+  /// An outlined function may not be an entry if, e.g. the if clause always
+  /// evaluates to false.
+  virtual void emitTargetOutlinedFunctionHelper(const OMPExecutableDirective &D,
+                                                StringRef ParentName,
+                                                llvm::Function *&OutlinedFn,
+                                                llvm::Constant *&OutlinedFnID,
+                                                bool IsOffloadEntry,
+                                                const RegionCodeGenTy &CodeGen);
+
+  /// \brief Emits code for OpenMP 'if' clause using specified \a CodeGen
+  /// function. Here is the logic:
+  /// if (Cond) {
+  ///   ThenGen();
+  /// } else {
+  ///   ElseGen();
+  /// }
+  void emitOMPIfClause(CodeGenFunction &CGF, const Expr *Cond,
+                       const RegionCodeGenTy &ThenGen,
+                       const RegionCodeGenTy &ElseGen);
+
+  /// \brief Emits object of ident_t type with info for source location.
+  /// \param Flags Flags for OpenMP location.
+  ///
+  llvm::Value *emitUpdateLocation(CodeGenFunction &CGF, SourceLocation Loc,
+                                  unsigned Flags = 0);
+
+  /// \brief Returns pointer to ident_t type.
+  llvm::Type *getIdentTyPointerTy();
+
+  /// \brief Gets thread id value for the current thread.
+  ///
+  llvm::Value *getThreadID(CodeGenFunction &CGF, SourceLocation Loc);
+
+  /// \brief Get the function name of an outlined region.
+  //  The name can be customized depending on the target.
+  //
+  virtual StringRef getOutlinedHelperName() const { return ".omp_outlined."; }
+
+  /// Emits \p Callee function call with arguments \p Args with location \p Loc.
+  void emitCall(CodeGenFunction &CGF, llvm::Value *Callee,
+                ArrayRef<llvm::Value *> Args = llvm::None,
+                SourceLocation Loc = SourceLocation()) const;
+
+private:
+  /// \brief Default const ident_t object used for initialization of all other
+  /// ident_t objects.
+  llvm::Constant *DefaultOpenMPPSource = nullptr;
+  /// \brief Map of flags and corresponding default locations.
+  typedef llvm::DenseMap<unsigned, llvm::Value *> OpenMPDefaultLocMapTy;
+  OpenMPDefaultLocMapTy OpenMPDefaultLocMap;
+  Address getOrCreateDefaultLocation(unsigned Flags);
+
+  llvm::StructType *IdentTy = nullptr;
+  /// \brief Map for SourceLocation and OpenMP runtime library debug locations.
+  typedef llvm::DenseMap<unsigned, llvm::Value *> OpenMPDebugLocMapTy;
+  OpenMPDebugLocMapTy OpenMPDebugLocMap;
+  /// \brief The type for a microtask which gets passed to __kmpc_fork_call().
+  /// Original representation is:
+  /// typedef void (kmpc_micro)(kmp_int32 global_tid, kmp_int32 bound_tid,...);
+  llvm::FunctionType *Kmpc_MicroTy = nullptr;
+  /// \brief Stores debug location and ThreadID for the function.
+  struct DebugLocThreadIdTy {
+    llvm::Value *DebugLoc;
+    llvm::Value *ThreadID;
+  };
+  /// \brief Map of local debug location, ThreadId and functions.
+  typedef llvm::DenseMap<llvm::Function *, DebugLocThreadIdTy>
+      OpenMPLocThreadIDMapTy;
+  OpenMPLocThreadIDMapTy OpenMPLocThreadIDMap;
+  /// Map of UDRs and corresponding combiner/initializer.
+  typedef llvm::DenseMap<const OMPDeclareReductionDecl *,
+                         std::pair<llvm::Function *, llvm::Function *>>
+      UDRMapTy;
+  UDRMapTy UDRMap;
+  /// Map of functions and locally defined UDRs.
+  typedef llvm::DenseMap<llvm::Function *,
+                         SmallVector<const OMPDeclareReductionDecl *, 4>>
+      FunctionUDRMapTy;
+  FunctionUDRMapTy FunctionUDRMap;
+  IdentifierInfo *In = nullptr;
+  IdentifierInfo *Out = nullptr;
+  IdentifierInfo *Priv = nullptr;
+  IdentifierInfo *Orig = nullptr;
+  /// \brief Type kmp_critical_name, originally defined as typedef kmp_int32
+  /// kmp_critical_name[8];
+  llvm::ArrayType *KmpCriticalNameTy;
+  /// \brief An ordered map of auto-generated variables to their unique names.
+  /// It stores variables with the following names: 1) ".gomp_critical_user_" +
+  /// <critical_section_name> + ".var" for "omp critical" directives; 2)
+  /// <mangled_name_for_global_var> + ".cache." for cache for threadprivate
+  /// variables.
+  llvm::StringMap<llvm::AssertingVH<llvm::Constant>, llvm::BumpPtrAllocator>
+      InternalVars;
+  /// \brief Type typedef kmp_int32 (* kmp_routine_entry_t)(kmp_int32, void *);
+  llvm::Type *KmpRoutineEntryPtrTy = nullptr;
+  QualType KmpRoutineEntryPtrQTy;
+  /// \brief Type typedef struct kmp_task {
+  ///    void *              shareds; /**< pointer to block of pointers to
+  ///    shared vars   */
+  ///    kmp_routine_entry_t routine; /**< pointer to routine to call for
+  ///    executing task */
+  ///    kmp_int32           part_id; /**< part id for the task */
+  ///    kmp_routine_entry_t destructors; /* pointer to function to invoke
+  ///    deconstructors of firstprivate C++ objects */
+  /// } kmp_task_t;
+  QualType KmpTaskTQTy;
+  /// Saved kmp_task_t for task directive.
+  QualType SavedKmpTaskTQTy;
+  /// Saved kmp_task_t for taskloop-based directive.
+  QualType SavedKmpTaskloopTQTy;
+  /// \brief Type typedef struct kmp_depend_info {
+  ///    kmp_intptr_t               base_addr;
+  ///    size_t                     len;
+  ///    struct {
+  ///             bool                   in:1;
+  ///             bool                   out:1;
+  ///    } flags;
+  /// } kmp_depend_info_t;
+  QualType KmpDependInfoTy;
+  /// struct kmp_dim {  // loop bounds info casted to kmp_int64
+  ///  kmp_int64 lo; // lower
+  ///  kmp_int64 up; // upper
+  ///  kmp_int64 st; // stride
+  /// };
+  QualType KmpDimTy;
+  /// \brief Type struct __tgt_offload_entry{
+  ///   void      *addr;       // Pointer to the offload entry info.
+  ///                          // (function or global)
+  ///   char      *name;       // Name of the function or global.
+  ///   size_t     size;       // Size of the entry info (0 if it a function).
+  /// };
+  QualType TgtOffloadEntryQTy;
+  /// struct __tgt_device_image{
+  /// void   *ImageStart;       // Pointer to the target code start.
+  /// void   *ImageEnd;         // Pointer to the target code end.
+  /// // We also add the host entries to the device image, as it may be useful
+  /// // for the target runtime to have access to that information.
+  /// __tgt_offload_entry  *EntriesBegin;   // Begin of the table with all
+  ///                                       // the entries.
+  /// __tgt_offload_entry  *EntriesEnd;     // End of the table with all the
+  ///                                       // entries (non inclusive).
+  /// };
+  QualType TgtDeviceImageQTy;
+  /// struct __tgt_bin_desc{
+  ///   int32_t              NumDevices;      // Number of devices supported.
+  ///   __tgt_device_image   *DeviceImages;   // Arrays of device images
+  ///                                         // (one per device).
+  ///   __tgt_offload_entry  *EntriesBegin;   // Begin of the table with all the
+  ///                                         // entries.
+  ///   __tgt_offload_entry  *EntriesEnd;     // End of the table with all the
+  ///                                         // entries (non inclusive).
+  /// };
+  QualType TgtBinaryDescriptorQTy;
+  /// \brief Entity that registers the offloading constants that were emitted so
+  /// far.
+  class OffloadEntriesInfoManagerTy {
+    CodeGenModule &CGM;
+
+    /// \brief Number of entries registered so far.
+    unsigned OffloadingEntriesNum;
+
+  public:
+    /// Base class of the entries info.
+    class OffloadEntryInfo {
+    public:
+      /// Kind of a given entry. Currently, only target regions are
+      /// supported.
+      enum OffloadingEntryInfoKinds : unsigned {
+        // Entry is a target region.
+        OFFLOAD_ENTRY_INFO_TARGET_REGION = 0,
+        // Invalid entry info.
+        OFFLOAD_ENTRY_INFO_INVALID = ~0u
+      };
+
+      OffloadEntryInfo()
+          : Flags(0), Order(~0u), Kind(OFFLOAD_ENTRY_INFO_INVALID) {}
+      explicit OffloadEntryInfo(OffloadingEntryInfoKinds Kind, unsigned Order,
+                                int32_t Flags)
+          : Flags(Flags), Order(Order), Kind(Kind) {}
+
+      bool isValid() const { return Order != ~0u; }
+      unsigned getOrder() const { return Order; }
+      OffloadingEntryInfoKinds getKind() const { return Kind; }
+      int32_t getFlags() const { return Flags; }
+      void setFlags(int32_t NewFlags) { Flags = NewFlags; }
+      static bool classof(const OffloadEntryInfo *Info) { return true; }
+
+    private:
+      /// Flags associated with the device global.
+      int32_t Flags;
+
+      /// Order this entry was emitted.
+      unsigned Order;
+
+      OffloadingEntryInfoKinds Kind;
+    };
+
+    /// \brief Return true if a there are no entries defined.
+    bool empty() const;
+    /// \brief Return number of entries defined so far.
+    unsigned size() const { return OffloadingEntriesNum; }
+    OffloadEntriesInfoManagerTy(CodeGenModule &CGM)
+        : CGM(CGM), OffloadingEntriesNum(0) {}
+
+    ///
+    /// Target region entries related.
+    ///
+    /// \brief Target region entries info.
+    class OffloadEntryInfoTargetRegion : public OffloadEntryInfo {
+      // \brief Address of the entity that has to be mapped for offloading.
+      llvm::Constant *Addr;
+      // \brief Address that can be used as the ID of the entry.
+      llvm::Constant *ID;
+
+    public:
+      OffloadEntryInfoTargetRegion()
+          : OffloadEntryInfo(OFFLOAD_ENTRY_INFO_TARGET_REGION, ~0u,
+                             /*Flags=*/0),
+            Addr(nullptr), ID(nullptr) {}
+      explicit OffloadEntryInfoTargetRegion(unsigned Order,
+                                            llvm::Constant *Addr,
+                                            llvm::Constant *ID, int32_t Flags)
+          : OffloadEntryInfo(OFFLOAD_ENTRY_INFO_TARGET_REGION, Order, Flags),
+            Addr(Addr), ID(ID) {}
+
+      llvm::Constant *getAddress() const { return Addr; }
+      llvm::Constant *getID() const { return ID; }
+      void setAddress(llvm::Constant *V) {
+        assert(!Addr && "Address as been set before!");
+        Addr = V;
+      }
+      void setID(llvm::Constant *V) {
+        assert(!ID && "ID as been set before!");
+        ID = V;
+      }
+      static bool classof(const OffloadEntryInfo *Info) {
+        return Info->getKind() == OFFLOAD_ENTRY_INFO_TARGET_REGION;
+      }
+    };
+    /// \brief Initialize target region entry.
+    void initializeTargetRegionEntryInfo(unsigned DeviceID, unsigned FileID,
+                                         StringRef ParentName, unsigned LineNum,
+                                         unsigned Order);
+    /// \brief Register target region entry.
+    void registerTargetRegionEntryInfo(unsigned DeviceID, unsigned FileID,
+                                       StringRef ParentName, unsigned LineNum,
+                                       llvm::Constant *Addr, llvm::Constant *ID,
+                                       int32_t Flags);
+    /// \brief Return true if a target region entry with the provided
+    /// information exists.
+    bool hasTargetRegionEntryInfo(unsigned DeviceID, unsigned FileID,
+                                  StringRef ParentName, unsigned LineNum) const;
+    /// brief Applies action \a Action on all registered entries.
+    typedef llvm::function_ref<void(unsigned, unsigned, StringRef, unsigned,
+                                    OffloadEntryInfoTargetRegion &)>
+        OffloadTargetRegionEntryInfoActTy;
+    void actOnTargetRegionEntriesInfo(
+        const OffloadTargetRegionEntryInfoActTy &Action);
+
+  private:
+    // Storage for target region entries kind. The storage is to be indexed by
+    // file ID, device ID, parent function name and line number.
+    typedef llvm::DenseMap<unsigned, OffloadEntryInfoTargetRegion>
+        OffloadEntriesTargetRegionPerLine;
+    typedef llvm::StringMap<OffloadEntriesTargetRegionPerLine>
+        OffloadEntriesTargetRegionPerParentName;
+    typedef llvm::DenseMap<unsigned, OffloadEntriesTargetRegionPerParentName>
+        OffloadEntriesTargetRegionPerFile;
+    typedef llvm::DenseMap<unsigned, OffloadEntriesTargetRegionPerFile>
+        OffloadEntriesTargetRegionPerDevice;
+    typedef OffloadEntriesTargetRegionPerDevice OffloadEntriesTargetRegionTy;
+    OffloadEntriesTargetRegionTy OffloadEntriesTargetRegion;
+  };
+  OffloadEntriesInfoManagerTy OffloadEntriesInfoManager;
+
+  /// \brief Creates and registers offloading binary descriptor for the current
+  /// compilation unit. The function that does the registration is returned.
+  llvm::Function *createOffloadingBinaryDescriptorRegistration();
+
+  /// \brief Creates all the offload entries in the current compilation unit
+  /// along with the associated metadata.
+  void createOffloadEntriesAndInfoMetadata();
+
+  /// \brief Loads all the offload entries information from the host IR
+  /// metadata.
+  void loadOffloadInfoMetadata();
+
+  /// \brief Returns __tgt_offload_entry type.
+  QualType getTgtOffloadEntryQTy();
+
+  /// \brief Returns __tgt_device_image type.
+  QualType getTgtDeviceImageQTy();
+
+  /// \brief Returns __tgt_bin_desc type.
+  QualType getTgtBinaryDescriptorQTy();
+
+  /// \brief Start scanning from statement \a S and and emit all target regions
+  /// found along the way.
+  /// \param S Starting statement.
+  /// \param ParentName Name of the function declaration that is being scanned.
+  void scanForTargetRegionsFunctions(const Stmt *S, StringRef ParentName);
+
+  /// \brief Build type kmp_routine_entry_t (if not built yet).
+  void emitKmpRoutineEntryT(QualType KmpInt32Ty);
+
+  /// \brief Returns pointer to kmpc_micro type.
+  llvm::Type *getKmpc_MicroPointerTy();
+
+  /// \brief Returns specified OpenMP runtime function.
+  /// \param Function OpenMP runtime function.
+  /// \return Specified function.
+  llvm::Constant *createRuntimeFunction(unsigned Function);
+
+  /// \brief Returns __kmpc_for_static_init_* runtime function for the specified
+  /// size \a IVSize and sign \a IVSigned.
+  llvm::Constant *createForStaticInitFunction(unsigned IVSize, bool IVSigned);
+
+  /// \brief Returns __kmpc_dispatch_init_* runtime function for the specified
+  /// size \a IVSize and sign \a IVSigned.
+  llvm::Constant *createDispatchInitFunction(unsigned IVSize, bool IVSigned);
+
+  /// \brief Returns __kmpc_dispatch_next_* runtime function for the specified
+  /// size \a IVSize and sign \a IVSigned.
+  llvm::Constant *createDispatchNextFunction(unsigned IVSize, bool IVSigned);
+
+  /// \brief Returns __kmpc_dispatch_fini_* runtime function for the specified
+  /// size \a IVSize and sign \a IVSigned.
+  llvm::Constant *createDispatchFiniFunction(unsigned IVSize, bool IVSigned);
+
+  /// \brief If the specified mangled name is not in the module, create and
+  /// return threadprivate cache object. This object is a pointer's worth of
+  /// storage that's reserved for use by the OpenMP runtime.
+  /// \param VD Threadprivate variable.
+  /// \return Cache variable for the specified threadprivate.
+  llvm::Constant *getOrCreateThreadPrivateCache(const VarDecl *VD);
+
+  /// \brief Emits address of the word in a memory where current thread id is
+  /// stored.
+  virtual Address emitThreadIDAddress(CodeGenFunction &CGF, SourceLocation Loc);
+
+  /// \brief Gets (if variable with the given name already exist) or creates
+  /// internal global variable with the specified Name. The created variable has
+  /// linkage CommonLinkage by default and is initialized by null value.
+  /// \param Ty Type of the global variable. If it is exist already the type
+  /// must be the same.
+  /// \param Name Name of the variable.
+  llvm::Constant *getOrCreateInternalVariable(llvm::Type *Ty,
+                                              const llvm::Twine &Name);
+
+  /// \brief Set of threadprivate variables with the generated initializer.
+  llvm::SmallPtrSet<const VarDecl *, 4> ThreadPrivateWithDefinition;
+
+  /// \brief Emits initialization code for the threadprivate variables.
+  /// \param VDAddr Address of the global variable \a VD.
+  /// \param Ctor Pointer to a global init function for \a VD.
+  /// \param CopyCtor Pointer to a global copy function for \a VD.
+  /// \param Dtor Pointer to a global destructor function for \a VD.
+  /// \param Loc Location of threadprivate declaration.
+  void emitThreadPrivateVarInit(CodeGenFunction &CGF, Address VDAddr,
+                                llvm::Value *Ctor, llvm::Value *CopyCtor,
+                                llvm::Value *Dtor, SourceLocation Loc);
+
+  /// \brief Returns corresponding lock object for the specified critical region
+  /// name. If the lock object does not exist it is created, otherwise the
+  /// reference to the existing copy is returned.
+  /// \param CriticalName Name of the critical region.
+  ///
+  llvm::Value *getCriticalRegionLock(StringRef CriticalName);
+
+  struct TaskResultTy {
+    llvm::Value *NewTask = nullptr;
+    llvm::Value *TaskEntry = nullptr;
+    llvm::Value *NewTaskNewTaskTTy = nullptr;
+    LValue TDBase;
+    RecordDecl *KmpTaskTQTyRD = nullptr;
+    llvm::Value *TaskDupFn = nullptr;
+  };
+  /// Emit task region for the task directive. The task region is emitted in
+  /// several steps:
+  /// 1. Emit a call to kmp_task_t *__kmpc_omp_task_alloc(ident_t *, kmp_int32
+  /// gtid, kmp_int32 flags, size_t sizeof_kmp_task_t, size_t sizeof_shareds,
+  /// kmp_routine_entry_t *task_entry). Here task_entry is a pointer to the
+  /// function:
+  /// kmp_int32 .omp_task_entry.(kmp_int32 gtid, kmp_task_t *tt) {
+  ///   TaskFunction(gtid, tt->part_id, tt->shareds);
+  ///   return 0;
+  /// }
+  /// 2. Copy a list of shared variables to field shareds of the resulting
+  /// structure kmp_task_t returned by the previous call (if any).
+  /// 3. Copy a pointer to destructions function to field destructions of the
+  /// resulting structure kmp_task_t.
+  /// \param D Current task directive.
+  /// \param TaskFunction An LLVM function with type void (*)(i32 /*gtid*/, i32
+  /// /*part_id*/, captured_struct */*__context*/);
+  /// \param SharedsTy A type which contains references the shared variables.
+  /// \param Shareds Context with the list of shared variables from the \p
+  /// TaskFunction.
+  /// \param Data Additional data for task generation like tiednsee, final
+  /// state, list of privates etc.
+  TaskResultTy emitTaskInit(CodeGenFunction &CGF, SourceLocation Loc,
+                            const OMPExecutableDirective &D,
+                            llvm::Value *TaskFunction, QualType SharedsTy,
+                            Address Shareds, const OMPTaskDataTy &Data);
+
+public:
+  explicit CGOpenMPRuntime(CodeGenModule &CGM);
+  virtual ~CGOpenMPRuntime() {}
+  virtual void clear();
+
+  /// Emit code for the specified user defined reduction construct.
+  virtual void emitUserDefinedReduction(CodeGenFunction *CGF,
+                                        const OMPDeclareReductionDecl *D);
+  /// Get combiner/initializer for the specified user-defined reduction, if any.
+  virtual std::pair<llvm::Function *, llvm::Function *>
+  getUserDefinedReduction(const OMPDeclareReductionDecl *D);
+
+  /// \brief Emits outlined function for the specified OpenMP parallel directive
+  /// \a D. This outlined function has type void(*)(kmp_int32 *ThreadID,
+  /// kmp_int32 BoundID, struct context_vars*).
+  /// \param D OpenMP directive.
+  /// \param ThreadIDVar Variable for thread id in the current OpenMP region.
+  /// \param InnermostKind Kind of innermost directive (for simple directives it
+  /// is a directive itself, for combined - its innermost directive).
+  /// \param CodeGen Code generation sequence for the \a D directive.
+  virtual llvm::Value *emitParallelOutlinedFunction(
+      const OMPExecutableDirective &D, const VarDecl *ThreadIDVar,
+      OpenMPDirectiveKind InnermostKind, const RegionCodeGenTy &CodeGen);
+
+  /// \brief Emits outlined function for the specified OpenMP teams directive
+  /// \a D. This outlined function has type void(*)(kmp_int32 *ThreadID,
+  /// kmp_int32 BoundID, struct context_vars*).
+  /// \param D OpenMP directive.
+  /// \param ThreadIDVar Variable for thread id in the current OpenMP region.
+  /// \param InnermostKind Kind of innermost directive (for simple directives it
+  /// is a directive itself, for combined - its innermost directive).
+  /// \param CodeGen Code generation sequence for the \a D directive.
+  virtual llvm::Value *emitTeamsOutlinedFunction(
+      const OMPExecutableDirective &D, const VarDecl *ThreadIDVar,
+      OpenMPDirectiveKind InnermostKind, const RegionCodeGenTy &CodeGen);
+
+  /// \brief Emits outlined function for the OpenMP task directive \a D. This
+  /// outlined function has type void(*)(kmp_int32 ThreadID, struct task_t*
+  /// TaskT).
+  /// \param D OpenMP directive.
+  /// \param ThreadIDVar Variable for thread id in the current OpenMP region.
+  /// \param PartIDVar Variable for partition id in the current OpenMP untied
+  /// task region.
+  /// \param TaskTVar Variable for task_t argument.
+  /// \param InnermostKind Kind of innermost directive (for simple directives it
+  /// is a directive itself, for combined - its innermost directive).
+  /// \param CodeGen Code generation sequence for the \a D directive.
+  /// \param Tied true if task is generated for tied task, false otherwise.
+  /// \param NumberOfParts Number of parts in untied task. Ignored for tied
+  /// tasks.
+  ///
+  virtual llvm::Value *emitTaskOutlinedFunction(
+      const OMPExecutableDirective &D, const VarDecl *ThreadIDVar,
+      const VarDecl *PartIDVar, const VarDecl *TaskTVar,
+      OpenMPDirectiveKind InnermostKind, const RegionCodeGenTy &CodeGen,
+      bool Tied, unsigned &NumberOfParts);
+
+  /// \brief Cleans up references to the objects in finished function.
+  ///
+  void functionFinished(CodeGenFunction &CGF);
+
+  /// \brief Emits code for parallel or serial call of the \a OutlinedFn with
+  /// variables captured in a record which address is stored in \a
+  /// CapturedStruct.
+  /// \param OutlinedFn Outlined function to be run in parallel threads. Type of
+  /// this function is void(*)(kmp_int32 *, kmp_int32, struct context_vars*).
+  /// \param CapturedVars A pointer to the record with the references to
+  /// variables used in \a OutlinedFn function.
+  /// \param IfCond Condition in the associated 'if' clause, if it was
+  /// specified, nullptr otherwise.
+  ///
+  virtual void emitParallelCall(CodeGenFunction &CGF, SourceLocation Loc,
+                                llvm::Value *OutlinedFn,
+                                ArrayRef<llvm::Value *> CapturedVars,
+                                const Expr *IfCond);
+
+  /// \brief Emits a critical region.
+  /// \param CriticalName Name of the critical region.
+  /// \param CriticalOpGen Generator for the statement associated with the given
+  /// critical region.
+  /// \param Hint Value of the 'hint' clause (optional).
+  virtual void emitCriticalRegion(CodeGenFunction &CGF, StringRef CriticalName,
+                                  const RegionCodeGenTy &CriticalOpGen,
+                                  SourceLocation Loc,
+                                  const Expr *Hint = nullptr);
+
+  /// \brief Emits a master region.
+  /// \param MasterOpGen Generator for the statement associated with the given
+  /// master region.
+  virtual void emitMasterRegion(CodeGenFunction &CGF,
+                                const RegionCodeGenTy &MasterOpGen,
+                                SourceLocation Loc);
+
+  /// \brief Emits code for a taskyield directive.
+  virtual void emitTaskyieldCall(CodeGenFunction &CGF, SourceLocation Loc);
+
+  /// \brief Emit a taskgroup region.
+  /// \param TaskgroupOpGen Generator for the statement associated with the
+  /// given taskgroup region.
+  virtual void emitTaskgroupRegion(CodeGenFunction &CGF,
+                                   const RegionCodeGenTy &TaskgroupOpGen,
+                                   SourceLocation Loc);
+
+  /// \brief Emits a single region.
+  /// \param SingleOpGen Generator for the statement associated with the given
+  /// single region.
+  virtual void emitSingleRegion(CodeGenFunction &CGF,
+                                const RegionCodeGenTy &SingleOpGen,
+                                SourceLocation Loc,
+                                ArrayRef<const Expr *> CopyprivateVars,
+                                ArrayRef<const Expr *> DestExprs,
+                                ArrayRef<const Expr *> SrcExprs,
+                                ArrayRef<const Expr *> AssignmentOps);
+
+  /// \brief Emit an ordered region.
+  /// \param OrderedOpGen Generator for the statement associated with the given
+  /// ordered region.
+  virtual void emitOrderedRegion(CodeGenFunction &CGF,
+                                 const RegionCodeGenTy &OrderedOpGen,
+                                 SourceLocation Loc, bool IsThreads);
+
+  /// \brief Emit an implicit/explicit barrier for OpenMP threads.
+  /// \param Kind Directive for which this implicit barrier call must be
+  /// generated. Must be OMPD_barrier for explicit barrier generation.
+  /// \param EmitChecks true if need to emit checks for cancellation barriers.
+  /// \param ForceSimpleCall true simple barrier call must be emitted, false if
+  /// runtime class decides which one to emit (simple or with cancellation
+  /// checks).
+  ///
+  virtual void emitBarrierCall(CodeGenFunction &CGF, SourceLocation Loc,
+                               OpenMPDirectiveKind Kind,
+                               bool EmitChecks = true,
+                               bool ForceSimpleCall = false);
+
+  /// \brief Check if the specified \a ScheduleKind is static non-chunked.
+  /// This kind of worksharing directive is emitted without outer loop.
+  /// \param ScheduleKind Schedule kind specified in the 'schedule' clause.
+  /// \param Chunked True if chunk is specified in the clause.
+  ///
+  virtual bool isStaticNonchunked(OpenMPScheduleClauseKind ScheduleKind,
+                                  bool Chunked) const;
+
+  /// \brief Check if the specified \a ScheduleKind is static non-chunked.
+  /// This kind of distribute directive is emitted without outer loop.
+  /// \param ScheduleKind Schedule kind specified in the 'dist_schedule' clause.
+  /// \param Chunked True if chunk is specified in the clause.
+  ///
+  virtual bool isStaticNonchunked(OpenMPDistScheduleClauseKind ScheduleKind,
+                                  bool Chunked) const;
+
+  /// \brief Check if the specified \a ScheduleKind is dynamic.
+  /// This kind of worksharing directive is emitted without outer loop.
+  /// \param ScheduleKind Schedule Kind specified in the 'schedule' clause.
+  ///
+  virtual bool isDynamic(OpenMPScheduleClauseKind ScheduleKind) const;
+
+  /// struct with the values to be passed to the dispatch runtime function
+  struct DispatchRTInput {
+    /// Loop lower bound
+    llvm::Value *LB = nullptr;
+    /// Loop upper bound
+    llvm::Value *UB = nullptr;
+    /// Chunk size specified using 'schedule' clause (nullptr if chunk
+    /// was not specified)
+    llvm::Value *Chunk = nullptr;
+    DispatchRTInput() = default;
+    DispatchRTInput(llvm::Value *LB, llvm::Value *UB, llvm::Value *Chunk)
+        : LB(LB), UB(UB), Chunk(Chunk) {}
+  };
+
+  /// Call the appropriate runtime routine to initialize it before start
+  /// of loop.
+
+  /// This is used for non static scheduled types and when the ordered
+  /// clause is present on the loop construct.
+  /// Depending on the loop schedule, it is necessary to call some runtime
+  /// routine before start of the OpenMP loop to get the loop upper / lower
+  /// bounds \a LB and \a UB and stride \a ST.
+  ///
+  /// \param CGF Reference to current CodeGenFunction.
+  /// \param Loc Clang source location.
+  /// \param ScheduleKind Schedule kind, specified by the 'schedule' clause.
+  /// \param IVSize Size of the iteration variable in bits.
+  /// \param IVSigned Sign of the iteration variable.
+  /// \param Ordered true if loop is ordered, false otherwise.
+  /// \param DispatchValues struct containing llvm values for lower bound, upper
+  /// bound, and chunk expression.
+  /// For the default (nullptr) value, the chunk 1 will be used.
+  ///
+  virtual void emitForDispatchInit(CodeGenFunction &CGF, SourceLocation Loc,
+                                   const OpenMPScheduleTy &ScheduleKind,
+                                   unsigned IVSize, bool IVSigned, bool Ordered,
+                                   const DispatchRTInput &DispatchValues);
+
+  /// Struct with the values to be passed to the static runtime function
+  struct StaticRTInput {
+    /// Size of the iteration variable in bits.
+    unsigned IVSize = 0;
+    /// Sign of the iteration variable.
+    bool IVSigned = false;
+    /// true if loop is ordered, false otherwise.
+    bool Ordered = false;
+    /// Address of the output variable in which the flag of the last iteration
+    /// is returned.
+    Address IL = Address::invalid();
+    /// Address of the output variable in which the lower iteration number is
+    /// returned.
+    Address LB = Address::invalid();
+    /// Address of the output variable in which the upper iteration number is
+    /// returned.
+    Address UB = Address::invalid();
+    /// Address of the output variable in which the stride value is returned
+    /// necessary to generated the static_chunked scheduled loop.
+    Address ST = Address::invalid();
+    /// Value of the chunk for the static_chunked scheduled loop. For the
+    /// default (nullptr) value, the chunk 1 will be used.
+    llvm::Value *Chunk = nullptr;
+    StaticRTInput(unsigned IVSize, bool IVSigned, bool Ordered, Address IL,
+                  Address LB, Address UB, Address ST,
+                  llvm::Value *Chunk = nullptr)
+        : IVSize(IVSize), IVSigned(IVSigned), Ordered(Ordered), IL(IL), LB(LB),
+          UB(UB), ST(ST), Chunk(Chunk) {}
+  };
+  /// \brief Call the appropriate runtime routine to initialize it before start
+  /// of loop.
+  ///
+  /// This is used only in case of static schedule, when the user did not
+  /// specify a ordered clause on the loop construct.
+  /// Depending on the loop schedule, it is necessary to call some runtime
+  /// routine before start of the OpenMP loop to get the loop upper / lower
+  /// bounds LB and UB and stride ST.
+  ///
+  /// \param CGF Reference to current CodeGenFunction.
+  /// \param Loc Clang source location.
+  /// \param DKind Kind of the directive.
+  /// \param ScheduleKind Schedule kind, specified by the 'schedule' clause.
+  /// \param Values Input arguments for the construct.
+  ///
+  virtual void emitForStaticInit(CodeGenFunction &CGF, SourceLocation Loc,
+                                 OpenMPDirectiveKind DKind,
+                                 const OpenMPScheduleTy &ScheduleKind,
+                                 const StaticRTInput &Values);
+
+  ///
+  /// \param CGF Reference to current CodeGenFunction.
+  /// \param Loc Clang source location.
+  /// \param SchedKind Schedule kind, specified by the 'dist_schedule' clause.
+  /// \param Values Input arguments for the construct.
+  ///
+  virtual void emitDistributeStaticInit(CodeGenFunction &CGF,
+                                        SourceLocation Loc,
+                                        OpenMPDistScheduleClauseKind SchedKind,
+                                        const StaticRTInput &Values);
+
+  /// \brief Call the appropriate runtime routine to notify that we finished
+  /// iteration of the ordered loop with the dynamic scheduling.
+  ///
+  /// \param CGF Reference to current CodeGenFunction.
+  /// \param Loc Clang source location.
+  /// \param IVSize Size of the iteration variable in bits.
+  /// \param IVSigned Sign of the iteration variable.
+  ///
+  virtual void emitForOrderedIterationEnd(CodeGenFunction &CGF,
+                                          SourceLocation Loc, unsigned IVSize,
+                                          bool IVSigned);
+
+  /// \brief Call the appropriate runtime routine to notify that we finished
+  /// all the work with current loop.
+  ///
+  /// \param CGF Reference to current CodeGenFunction.
+  /// \param Loc Clang source location.
+  /// \param DKind Kind of the directive for which the static finish is emitted.
+  ///
+  virtual void emitForStaticFinish(CodeGenFunction &CGF, SourceLocation Loc,
+                                   OpenMPDirectiveKind DKind);
+
+  /// Call __kmpc_dispatch_next(
+  ///          ident_t *loc, kmp_int32 tid, kmp_int32 *p_lastiter,
+  ///          kmp_int[32|64] *p_lower, kmp_int[32|64] *p_upper,
+  ///          kmp_int[32|64] *p_stride);
+  /// \param IVSize Size of the iteration variable in bits.
+  /// \param IVSigned Sign of the iteration variable.
+  /// \param IL Address of the output variable in which the flag of the
+  /// last iteration is returned.
+  /// \param LB Address of the output variable in which the lower iteration
+  /// number is returned.
+  /// \param UB Address of the output variable in which the upper iteration
+  /// number is returned.
+  /// \param ST Address of the output variable in which the stride value is
+  /// returned.
+  virtual llvm::Value *emitForNext(CodeGenFunction &CGF, SourceLocation Loc,
+                                   unsigned IVSize, bool IVSigned,
+                                   Address IL, Address LB,
+                                   Address UB, Address ST);
+
+  /// \brief Emits call to void __kmpc_push_num_threads(ident_t *loc, kmp_int32
+  /// global_tid, kmp_int32 num_threads) to generate code for 'num_threads'
+  /// clause.
+  /// \param NumThreads An integer value of threads.
+  virtual void emitNumThreadsClause(CodeGenFunction &CGF,
+                                    llvm::Value *NumThreads,
+                                    SourceLocation Loc);
+
+  /// \brief Emit call to void __kmpc_push_proc_bind(ident_t *loc, kmp_int32
+  /// global_tid, int proc_bind) to generate code for 'proc_bind' clause.
+  virtual void emitProcBindClause(CodeGenFunction &CGF,
+                                  OpenMPProcBindClauseKind ProcBind,
+                                  SourceLocation Loc);
+
+  /// \brief Returns address of the threadprivate variable for the current
+  /// thread.
+  /// \param VD Threadprivate variable.
+  /// \param VDAddr Address of the global variable \a VD.
+  /// \param Loc Location of the reference to threadprivate var.
+  /// \return Address of the threadprivate variable for the current thread.
+  virtual Address getAddrOfThreadPrivate(CodeGenFunction &CGF,
+                                         const VarDecl *VD,
+                                         Address VDAddr,
+                                         SourceLocation Loc);
+
+  /// \brief Emit a code for initialization of threadprivate variable. It emits
+  /// a call to runtime library which adds initial value to the newly created
+  /// threadprivate variable (if it is not constant) and registers destructor
+  /// for the variable (if any).
+  /// \param VD Threadprivate variable.
+  /// \param VDAddr Address of the global variable \a VD.
+  /// \param Loc Location of threadprivate declaration.
+  /// \param PerformInit true if initialization expression is not constant.
+  virtual llvm::Function *
+  emitThreadPrivateVarDefinition(const VarDecl *VD, Address VDAddr,
+                                 SourceLocation Loc, bool PerformInit,
+                                 CodeGenFunction *CGF = nullptr);
+
+  /// Creates artificial threadprivate variable with name \p Name and type \p
+  /// VarType.
+  /// \param VarType Type of the artificial threadprivate variable.
+  /// \param Name Name of the artificial threadprivate variable.
+  virtual Address getAddrOfArtificialThreadPrivate(CodeGenFunction &CGF,
+                                                   QualType VarType,
+                                                   StringRef Name);
+
+  /// \brief Emit flush of the variables specified in 'omp flush' directive.
+  /// \param Vars List of variables to flush.
+  virtual void emitFlush(CodeGenFunction &CGF, ArrayRef<const Expr *> Vars,
+                         SourceLocation Loc);
+
+  /// \brief Emit task region for the task directive. The task region is
+  /// emitted in several steps:
+  /// 1. Emit a call to kmp_task_t *__kmpc_omp_task_alloc(ident_t *, kmp_int32
+  /// gtid, kmp_int32 flags, size_t sizeof_kmp_task_t, size_t sizeof_shareds,
+  /// kmp_routine_entry_t *task_entry). Here task_entry is a pointer to the
+  /// function:
+  /// kmp_int32 .omp_task_entry.(kmp_int32 gtid, kmp_task_t *tt) {
+  ///   TaskFunction(gtid, tt->part_id, tt->shareds);
+  ///   return 0;
+  /// }
+  /// 2. Copy a list of shared variables to field shareds of the resulting
+  /// structure kmp_task_t returned by the previous call (if any).
+  /// 3. Copy a pointer to destructions function to field destructions of the
+  /// resulting structure kmp_task_t.
+  /// 4. Emit a call to kmp_int32 __kmpc_omp_task(ident_t *, kmp_int32 gtid,
+  /// kmp_task_t *new_task), where new_task is a resulting structure from
+  /// previous items.
+  /// \param D Current task directive.
+  /// \param TaskFunction An LLVM function with type void (*)(i32 /*gtid*/, i32
+  /// /*part_id*/, captured_struct */*__context*/);
+  /// \param SharedsTy A type which contains references the shared variables.
+  /// \param Shareds Context with the list of shared variables from the \p
+  /// TaskFunction.
+  /// \param IfCond Not a nullptr if 'if' clause was specified, nullptr
+  /// otherwise.
+  /// \param Data Additional data for task generation like tiednsee, final
+  /// state, list of privates etc.
+  virtual void emitTaskCall(CodeGenFunction &CGF, SourceLocation Loc,
+                            const OMPExecutableDirective &D,
+                            llvm::Value *TaskFunction, QualType SharedsTy,
+                            Address Shareds, const Expr *IfCond,
+                            const OMPTaskDataTy &Data);
+
+  /// Emit task region for the taskloop directive. The taskloop region is
+  /// emitted in several steps:
+  /// 1. Emit a call to kmp_task_t *__kmpc_omp_task_alloc(ident_t *, kmp_int32
+  /// gtid, kmp_int32 flags, size_t sizeof_kmp_task_t, size_t sizeof_shareds,
+  /// kmp_routine_entry_t *task_entry). Here task_entry is a pointer to the
+  /// function:
+  /// kmp_int32 .omp_task_entry.(kmp_int32 gtid, kmp_task_t *tt) {
+  ///   TaskFunction(gtid, tt->part_id, tt->shareds);
+  ///   return 0;
+  /// }
+  /// 2. Copy a list of shared variables to field shareds of the resulting
+  /// structure kmp_task_t returned by the previous call (if any).
+  /// 3. Copy a pointer to destructions function to field destructions of the
+  /// resulting structure kmp_task_t.
+  /// 4. Emit a call to void __kmpc_taskloop(ident_t *loc, int gtid, kmp_task_t
+  /// *task, int if_val, kmp_uint64 *lb, kmp_uint64 *ub, kmp_int64 st, int
+  /// nogroup, int sched, kmp_uint64 grainsize, void *task_dup ), where new_task
+  /// is a resulting structure from
+  /// previous items.
+  /// \param D Current task directive.
+  /// \param TaskFunction An LLVM function with type void (*)(i32 /*gtid*/, i32
+  /// /*part_id*/, captured_struct */*__context*/);
+  /// \param SharedsTy A type which contains references the shared variables.
+  /// \param Shareds Context with the list of shared variables from the \p
+  /// TaskFunction.
+  /// \param IfCond Not a nullptr if 'if' clause was specified, nullptr
+  /// otherwise.
+  /// \param Data Additional data for task generation like tiednsee, final
+  /// state, list of privates etc.
+  virtual void emitTaskLoopCall(
+      CodeGenFunction &CGF, SourceLocation Loc, const OMPLoopDirective &D,
+      llvm::Value *TaskFunction, QualType SharedsTy, Address Shareds,
+      const Expr *IfCond, const OMPTaskDataTy &Data);
+
+  /// \brief Emit code for the directive that does not require outlining.
+  ///
+  /// \param InnermostKind Kind of innermost directive (for simple directives it
+  /// is a directive itself, for combined - its innermost directive).
+  /// \param CodeGen Code generation sequence for the \a D directive.
+  /// \param HasCancel true if region has inner cancel directive, false
+  /// otherwise.
+  virtual void emitInlinedDirective(CodeGenFunction &CGF,
+                                    OpenMPDirectiveKind InnermostKind,
+                                    const RegionCodeGenTy &CodeGen,
+                                    bool HasCancel = false);
+
+  /// Emits reduction function.
+  /// \param ArgsType Array type containing pointers to reduction variables.
+  /// \param Privates List of private copies for original reduction arguments.
+  /// \param LHSExprs List of LHS in \a ReductionOps reduction operations.
+  /// \param RHSExprs List of RHS in \a ReductionOps reduction operations.
+  /// \param ReductionOps List of reduction operations in form 'LHS binop RHS'
+  /// or 'operator binop(LHS, RHS)'.
+  llvm::Value *emitReductionFunction(CodeGenModule &CGM, llvm::Type *ArgsType,
+                                     ArrayRef<const Expr *> Privates,
+                                     ArrayRef<const Expr *> LHSExprs,
+                                     ArrayRef<const Expr *> RHSExprs,
+                                     ArrayRef<const Expr *> ReductionOps);
+
+  /// Emits single reduction combiner
+  void emitSingleReductionCombiner(CodeGenFunction &CGF,
+                                   const Expr *ReductionOp,
+                                   const Expr *PrivateRef,
+                                   const DeclRefExpr *LHS,
+                                   const DeclRefExpr *RHS);
+
+  struct ReductionOptionsTy {
+    bool WithNowait;
+    bool SimpleReduction;
+    OpenMPDirectiveKind ReductionKind;
+  };
+  /// \brief Emit a code for reduction clause. Next code should be emitted for
+  /// reduction:
+  /// \code
+  ///
+  /// static kmp_critical_name lock = { 0 };
+  ///
+  /// void reduce_func(void *lhs[<n>], void *rhs[<n>]) {
+  ///  ...
+  ///  *(Type<i>*)lhs[i] = RedOp<i>(*(Type<i>*)lhs[i], *(Type<i>*)rhs[i]);
+  ///  ...
+  /// }
+  ///
+  /// ...
+  /// void *RedList[<n>] = {&<RHSExprs>[0], ..., &<RHSExprs>[<n>-1]};
+  /// switch (__kmpc_reduce{_nowait}(<loc>, <gtid>, <n>, sizeof(RedList),
+  /// RedList, reduce_func, &<lock>)) {
+  /// case 1:
+  ///  ...
+  ///  <LHSExprs>[i] = RedOp<i>(*<LHSExprs>[i], *<RHSExprs>[i]);
+  ///  ...
+  /// __kmpc_end_reduce{_nowait}(<loc>, <gtid>, &<lock>);
+  /// break;
+  /// case 2:
+  ///  ...
+  ///  Atomic(<LHSExprs>[i] = RedOp<i>(*<LHSExprs>[i], *<RHSExprs>[i]));
+  ///  ...
+  /// break;
+  /// default:;
+  /// }
+  /// \endcode
+  ///
+  /// \param Privates List of private copies for original reduction arguments.
+  /// \param LHSExprs List of LHS in \a ReductionOps reduction operations.
+  /// \param RHSExprs List of RHS in \a ReductionOps reduction operations.
+  /// \param ReductionOps List of reduction operations in form 'LHS binop RHS'
+  /// or 'operator binop(LHS, RHS)'.
+  /// \param Options List of options for reduction codegen:
+  ///     WithNowait true if parent directive has also nowait clause, false
+  ///     otherwise.
+  ///     SimpleReduction Emit reduction operation only. Used for omp simd
+  ///     directive on the host.
+  ///     ReductionKind The kind of reduction to perform.
+  virtual void emitReduction(CodeGenFunction &CGF, SourceLocation Loc,
+                             ArrayRef<const Expr *> Privates,
+                             ArrayRef<const Expr *> LHSExprs,
+                             ArrayRef<const Expr *> RHSExprs,
+                             ArrayRef<const Expr *> ReductionOps,
+                             ReductionOptionsTy Options);
+
+  /// Emit a code for initialization of task reduction clause. Next code
+  /// should be emitted for reduction:
+  /// \code
+  ///
+  /// _task_red_item_t red_data[n];
+  /// ...
+  /// red_data[i].shar = &origs[i];
+  /// red_data[i].size = sizeof(origs[i]);
+  /// red_data[i].f_init = (void*)RedInit<i>;
+  /// red_data[i].f_fini = (void*)RedDest<i>;
+  /// red_data[i].f_comb = (void*)RedOp<i>;
+  /// red_data[i].flags = <Flag_i>;
+  /// ...
+  /// void* tg1 = __kmpc_task_reduction_init(gtid, n, red_data);
+  /// \endcode
+  ///
+  /// \param LHSExprs List of LHS in \a Data.ReductionOps reduction operations.
+  /// \param RHSExprs List of RHS in \a Data.ReductionOps reduction operations.
+  /// \param Data Additional data for task generation like tiedness, final
+  /// state, list of privates, reductions etc.
+  virtual llvm::Value *emitTaskReductionInit(CodeGenFunction &CGF,
+                                             SourceLocation Loc,
+                                             ArrayRef<const Expr *> LHSExprs,
+                                             ArrayRef<const Expr *> RHSExprs,
+                                             const OMPTaskDataTy &Data);
+
+  /// Required to resolve existing problems in the runtime. Emits threadprivate
+  /// variables to store the size of the VLAs/array sections for
+  /// initializer/combiner/finalizer functions + emits threadprivate variable to
+  /// store the pointer to the original reduction item for the custom
+  /// initializer defined by declare reduction construct.
+  /// \param RCG Allows to reuse an existing data for the reductions.
+  /// \param N Reduction item for which fixups must be emitted.
+  virtual void emitTaskReductionFixups(CodeGenFunction &CGF, SourceLocation Loc,
+                                       ReductionCodeGen &RCG, unsigned N);
+
+  /// Get the address of `void *` type of the privatue copy of the reduction
+  /// item specified by the \p SharedLVal.
+  /// \param ReductionsPtr Pointer to the reduction data returned by the
+  /// emitTaskReductionInit function.
+  /// \param SharedLVal Address of the original reduction item.
+  virtual Address getTaskReductionItem(CodeGenFunction &CGF, SourceLocation Loc,
+                                       llvm::Value *ReductionsPtr,
+                                       LValue SharedLVal);
+
+  /// \brief Emit code for 'taskwait' directive.
+  virtual void emitTaskwaitCall(CodeGenFunction &CGF, SourceLocation Loc);
+
+  /// \brief Emit code for 'cancellation point' construct.
+  /// \param CancelRegion Region kind for which the cancellation point must be
+  /// emitted.
+  ///
+  virtual void emitCancellationPointCall(CodeGenFunction &CGF,
+                                         SourceLocation Loc,
+                                         OpenMPDirectiveKind CancelRegion);
+
+  /// \brief Emit code for 'cancel' construct.
+  /// \param IfCond Condition in the associated 'if' clause, if it was
+  /// specified, nullptr otherwise.
+  /// \param CancelRegion Region kind for which the cancel must be emitted.
+  ///
+  virtual void emitCancelCall(CodeGenFunction &CGF, SourceLocation Loc,
+                              const Expr *IfCond,
+                              OpenMPDirectiveKind CancelRegion);
+
+  /// \brief Emit outilined function for 'target' directive.
+  /// \param D Directive to emit.
+  /// \param ParentName Name of the function that encloses the target region.
+  /// \param OutlinedFn Outlined function value to be defined by this call.
+  /// \param OutlinedFnID Outlined function ID value to be defined by this call.
+  /// \param IsOffloadEntry True if the outlined function is an offload entry.
+  /// \param CodeGen Code generation sequence for the \a D directive.
+  /// An outlined function may not be an entry if, e.g. the if clause always
+  /// evaluates to false.
+  virtual void emitTargetOutlinedFunction(const OMPExecutableDirective &D,
+                                          StringRef ParentName,
+                                          llvm::Function *&OutlinedFn,
+                                          llvm::Constant *&OutlinedFnID,
+                                          bool IsOffloadEntry,
+                                          const RegionCodeGenTy &CodeGen);
+
+  /// \brief Emit the target offloading code associated with \a D. The emitted
+  /// code attempts offloading the execution to the device, an the event of
+  /// a failure it executes the host version outlined in \a OutlinedFn.
+  /// \param D Directive to emit.
+  /// \param OutlinedFn Host version of the code to be offloaded.
+  /// \param OutlinedFnID ID of host version of the code to be offloaded.
+  /// \param IfCond Expression evaluated in if clause associated with the target
+  /// directive, or null if no if clause is used.
+  /// \param Device Expression evaluated in device clause associated with the
+  /// target directive, or null if no device clause is used.
+  /// \param CapturedVars Values captured in the current region.
+  virtual void emitTargetCall(CodeGenFunction &CGF,
+                              const OMPExecutableDirective &D,
+                              llvm::Value *OutlinedFn,
+                              llvm::Value *OutlinedFnID, const Expr *IfCond,
+                              const Expr *Device,
+                              ArrayRef<llvm::Value *> CapturedVars);
+
+  /// \brief Emit the target regions enclosed in \a GD function definition or
+  /// the function itself in case it is a valid device function. Returns true if
+  /// \a GD was dealt with successfully.
+  /// \param GD Function to scan.
+  virtual bool emitTargetFunctions(GlobalDecl GD);
+
+  /// \brief Emit the global variable if it is a valid device global variable.
+  /// Returns true if \a GD was dealt with successfully.
+  /// \param GD Variable declaration to emit.
+  virtual bool emitTargetGlobalVariable(GlobalDecl GD);
+
+  /// \brief Emit the global \a GD if it is meaningful for the target. Returns
+  /// if it was emitted successfully.
+  /// \param GD Global to scan.
+  virtual bool emitTargetGlobal(GlobalDecl GD);
+
+  /// \brief Creates the offloading descriptor in the event any target region
+  /// was emitted in the current module and return the function that registers
+  /// it.
+  virtual llvm::Function *emitRegistrationFunction();
+
+  /// \brief Emits code for teams call of the \a OutlinedFn with
+  /// variables captured in a record which address is stored in \a
+  /// CapturedStruct.
+  /// \param OutlinedFn Outlined function to be run by team masters. Type of
+  /// this function is void(*)(kmp_int32 *, kmp_int32, struct context_vars*).
+  /// \param CapturedVars A pointer to the record with the references to
+  /// variables used in \a OutlinedFn function.
+  ///
+  virtual void emitTeamsCall(CodeGenFunction &CGF,
+                             const OMPExecutableDirective &D,
+                             SourceLocation Loc, llvm::Value *OutlinedFn,
+                             ArrayRef<llvm::Value *> CapturedVars);
+
+  /// \brief Emits call to void __kmpc_push_num_teams(ident_t *loc, kmp_int32
+  /// global_tid, kmp_int32 num_teams, kmp_int32 thread_limit) to generate code
+  /// for num_teams clause.
+  /// \param NumTeams An integer expression of teams.
+  /// \param ThreadLimit An integer expression of threads.
+  virtual void emitNumTeamsClause(CodeGenFunction &CGF, const Expr *NumTeams,
+                                  const Expr *ThreadLimit, SourceLocation Loc);
+
+  /// Struct that keeps all the relevant information that should be kept
+  /// throughout a 'target data' region.
+  class TargetDataInfo {
+    /// Set to true if device pointer information have to be obtained.
+    bool RequiresDevicePointerInfo = false;
+
+  public:
+    /// The array of base pointer passed to the runtime library.
+    llvm::Value *BasePointersArray = nullptr;
+    /// The array of section pointers passed to the runtime library.
+    llvm::Value *PointersArray = nullptr;
+    /// The array of sizes passed to the runtime library.
+    llvm::Value *SizesArray = nullptr;
+    /// The array of map types passed to the runtime library.
+    llvm::Value *MapTypesArray = nullptr;
+    /// The total number of pointers passed to the runtime library.
+    unsigned NumberOfPtrs = 0u;
+    /// Map between the a declaration of a capture and the corresponding base
+    /// pointer address where the runtime returns the device pointers.
+    llvm::DenseMap<const ValueDecl *, Address> CaptureDeviceAddrMap;
+
+    explicit TargetDataInfo() {}
+    explicit TargetDataInfo(bool RequiresDevicePointerInfo)
+        : RequiresDevicePointerInfo(RequiresDevicePointerInfo) {}
+    /// Clear information about the data arrays.
+    void clearArrayInfo() {
+      BasePointersArray = nullptr;
+      PointersArray = nullptr;
+      SizesArray = nullptr;
+      MapTypesArray = nullptr;
+      NumberOfPtrs = 0u;
+    }
+    /// Return true if the current target data information has valid arrays.
+    bool isValid() {
+      return BasePointersArray && PointersArray && SizesArray &&
+             MapTypesArray && NumberOfPtrs;
+    }
+    bool requiresDevicePointerInfo() { return RequiresDevicePointerInfo; }
+  };
+
+  /// \brief Emit the target data mapping code associated with \a D.
+  /// \param D Directive to emit.
+  /// \param IfCond Expression evaluated in if clause associated with the
+  /// target directive, or null if no device clause is used.
+  /// \param Device Expression evaluated in device clause associated with the
+  /// target directive, or null if no device clause is used.
+  /// \param Info A record used to store information that needs to be preserved
+  /// until the region is closed.
+  virtual void emitTargetDataCalls(CodeGenFunction &CGF,
+                                   const OMPExecutableDirective &D,
+                                   const Expr *IfCond, const Expr *Device,
+                                   const RegionCodeGenTy &CodeGen,
+                                   TargetDataInfo &Info);
+
+  /// \brief Emit the data mapping/movement code associated with the directive
+  /// \a D that should be of the form 'target [{enter|exit} data | update]'.
+  /// \param D Directive to emit.
+  /// \param IfCond Expression evaluated in if clause associated with the target
+  /// directive, or null if no if clause is used.
+  /// \param Device Expression evaluated in device clause associated with the
+  /// target directive, or null if no device clause is used.
+  virtual void emitTargetDataStandAloneCall(CodeGenFunction &CGF,
+                                            const OMPExecutableDirective &D,
+                                            const Expr *IfCond,
+                                            const Expr *Device);
+
+  /// Marks function \a Fn with properly mangled versions of vector functions.
+  /// \param FD Function marked as 'declare simd'.
+  /// \param Fn LLVM function that must be marked with 'declare simd'
+  /// attributes.
+  virtual void emitDeclareSimdFunction(const FunctionDecl *FD,
+                                       llvm::Function *Fn);
+
+  /// Emit initialization for doacross loop nesting support.
+  /// \param D Loop-based construct used in doacross nesting construct.
+  virtual void emitDoacrossInit(CodeGenFunction &CGF,
+                                const OMPLoopDirective &D);
+
+  /// Emit code for doacross ordered directive with 'depend' clause.
+  /// \param C 'depend' clause with 'sink|source' dependency kind.
+  virtual void emitDoacrossOrdered(CodeGenFunction &CGF,
+                                   const OMPDependClause *C);
+
+  /// Translates the native parameter of outlined function if this is required
+  /// for target.
+  /// \param FD Field decl from captured record for the paramater.
+  /// \param NativeParam Parameter itself.
+  virtual const VarDecl *translateParameter(const FieldDecl *FD,
+                                            const VarDecl *NativeParam) const {
+    return NativeParam;
+  }
+
+  /// Gets the address of the native argument basing on the address of the
+  /// target-specific parameter.
+  /// \param NativeParam Parameter itself.
+  /// \param TargetParam Corresponding target-specific parameter.
+  virtual Address getParameterAddress(CodeGenFunction &CGF,
+                                      const VarDecl *NativeParam,
+                                      const VarDecl *TargetParam) const;
+
+  /// Emits call of the outlined function with the provided arguments,
+  /// translating these arguments to correct target-specific arguments.
+  virtual void
+  emitOutlinedFunctionCall(CodeGenFunction &CGF, SourceLocation Loc,
+                           llvm::Value *OutlinedFn,
+                           ArrayRef<llvm::Value *> Args = llvm::None) const;
+};
+
+/// Class supports emissionof SIMD-only code.
+class CGOpenMPSIMDRuntime final : public CGOpenMPRuntime {
+public:
+  explicit CGOpenMPSIMDRuntime(CodeGenModule &CGM) : CGOpenMPRuntime(CGM) {}
+  ~CGOpenMPSIMDRuntime() override {}
+
+  /// \brief Emits outlined function for the specified OpenMP parallel directive
+  /// \a D. This outlined function has type void(*)(kmp_int32 *ThreadID,
+  /// kmp_int32 BoundID, struct context_vars*).
+  /// \param D OpenMP directive.
+  /// \param ThreadIDVar Variable for thread id in the current OpenMP region.
+  /// \param InnermostKind Kind of innermost directive (for simple directives it
+  /// is a directive itself, for combined - its innermost directive).
+  /// \param CodeGen Code generation sequence for the \a D directive.
+  llvm::Value *
+  emitParallelOutlinedFunction(const OMPExecutableDirective &D,
+                               const VarDecl *ThreadIDVar,
+                               OpenMPDirectiveKind InnermostKind,
+                               const RegionCodeGenTy &CodeGen) override;
+
+  /// \brief Emits outlined function for the specified OpenMP teams directive
+  /// \a D. This outlined function has type void(*)(kmp_int32 *ThreadID,
+  /// kmp_int32 BoundID, struct context_vars*).
+  /// \param D OpenMP directive.
+  /// \param ThreadIDVar Variable for thread id in the current OpenMP region.
+  /// \param InnermostKind Kind of innermost directive (for simple directives it
+  /// is a directive itself, for combined - its innermost directive).
+  /// \param CodeGen Code generation sequence for the \a D directive.
+  llvm::Value *
+  emitTeamsOutlinedFunction(const OMPExecutableDirective &D,
+                            const VarDecl *ThreadIDVar,
+                            OpenMPDirectiveKind InnermostKind,
+                            const RegionCodeGenTy &CodeGen) override;
+
+  /// \brief Emits outlined function for the OpenMP task directive \a D. This
+  /// outlined function has type void(*)(kmp_int32 ThreadID, struct task_t*
+  /// TaskT).
+  /// \param D OpenMP directive.
+  /// \param ThreadIDVar Variable for thread id in the current OpenMP region.
+  /// \param PartIDVar Variable for partition id in the current OpenMP untied
+  /// task region.
+  /// \param TaskTVar Variable for task_t argument.
+  /// \param InnermostKind Kind of innermost directive (for simple directives it
+  /// is a directive itself, for combined - its innermost directive).
+  /// \param CodeGen Code generation sequence for the \a D directive.
+  /// \param Tied true if task is generated for tied task, false otherwise.
+  /// \param NumberOfParts Number of parts in untied task. Ignored for tied
+  /// tasks.
+  ///
+  llvm::Value *emitTaskOutlinedFunction(
+      const OMPExecutableDirective &D, const VarDecl *ThreadIDVar,
+      const VarDecl *PartIDVar, const VarDecl *TaskTVar,
+      OpenMPDirectiveKind InnermostKind, const RegionCodeGenTy &CodeGen,
+      bool Tied, unsigned &NumberOfParts) override;
+
+  /// \brief Emits code for parallel or serial call of the \a OutlinedFn with
+  /// variables captured in a record which address is stored in \a
+  /// CapturedStruct.
+  /// \param OutlinedFn Outlined function to be run in parallel threads. Type of
+  /// this function is void(*)(kmp_int32 *, kmp_int32, struct context_vars*).
+  /// \param CapturedVars A pointer to the record with the references to
+  /// variables used in \a OutlinedFn function.
+  /// \param IfCond Condition in the associated 'if' clause, if it was
+  /// specified, nullptr otherwise.
+  ///
+  void emitParallelCall(CodeGenFunction &CGF, SourceLocation Loc,
+                        llvm::Value *OutlinedFn,
+                        ArrayRef<llvm::Value *> CapturedVars,
+                        const Expr *IfCond) override;
+
+  /// \brief Emits a critical region.
+  /// \param CriticalName Name of the critical region.
+  /// \param CriticalOpGen Generator for the statement associated with the given
+  /// critical region.
+  /// \param Hint Value of the 'hint' clause (optional).
+  void emitCriticalRegion(CodeGenFunction &CGF, StringRef CriticalName,
+                          const RegionCodeGenTy &CriticalOpGen,
+                          SourceLocation Loc,
+                          const Expr *Hint = nullptr) override;
+
+  /// \brief Emits a master region.
+  /// \param MasterOpGen Generator for the statement associated with the given
+  /// master region.
+  void emitMasterRegion(CodeGenFunction &CGF,
+                        const RegionCodeGenTy &MasterOpGen,
+                        SourceLocation Loc) override;
+
+  /// \brief Emits code for a taskyield directive.
+  void emitTaskyieldCall(CodeGenFunction &CGF, SourceLocation Loc) override;
+
+  /// \brief Emit a taskgroup region.
+  /// \param TaskgroupOpGen Generator for the statement associated with the
+  /// given taskgroup region.
+  void emitTaskgroupRegion(CodeGenFunction &CGF,
+                           const RegionCodeGenTy &TaskgroupOpGen,
+                           SourceLocation Loc) override;
+
+  /// \brief Emits a single region.
+  /// \param SingleOpGen Generator for the statement associated with the given
+  /// single region.
+  void emitSingleRegion(CodeGenFunction &CGF,
+                        const RegionCodeGenTy &SingleOpGen, SourceLocation Loc,
+                        ArrayRef<const Expr *> CopyprivateVars,
+                        ArrayRef<const Expr *> DestExprs,
+                        ArrayRef<const Expr *> SrcExprs,
+                        ArrayRef<const Expr *> AssignmentOps) override;
+
+  /// \brief Emit an ordered region.
+  /// \param OrderedOpGen Generator for the statement associated with the given
+  /// ordered region.
+  void emitOrderedRegion(CodeGenFunction &CGF,
+                         const RegionCodeGenTy &OrderedOpGen,
+                         SourceLocation Loc, bool IsThreads) override;
+
+  /// \brief Emit an implicit/explicit barrier for OpenMP threads.
+  /// \param Kind Directive for which this implicit barrier call must be
+  /// generated. Must be OMPD_barrier for explicit barrier generation.
+  /// \param EmitChecks true if need to emit checks for cancellation barriers.
+  /// \param ForceSimpleCall true simple barrier call must be emitted, false if
+  /// runtime class decides which one to emit (simple or with cancellation
+  /// checks).
+  ///
+  void emitBarrierCall(CodeGenFunction &CGF, SourceLocation Loc,
+                       OpenMPDirectiveKind Kind, bool EmitChecks = true,
+                       bool ForceSimpleCall = false) override;
+
+  /// This is used for non static scheduled types and when the ordered
+  /// clause is present on the loop construct.
+  /// Depending on the loop schedule, it is necessary to call some runtime
+  /// routine before start of the OpenMP loop to get the loop upper / lower
+  /// bounds \a LB and \a UB and stride \a ST.
+  ///
+  /// \param CGF Reference to current CodeGenFunction.
+  /// \param Loc Clang source location.
+  /// \param ScheduleKind Schedule kind, specified by the 'schedule' clause.
+  /// \param IVSize Size of the iteration variable in bits.
+  /// \param IVSigned Sign of the iteration variable.
+  /// \param Ordered true if loop is ordered, false otherwise.
+  /// \param DispatchValues struct containing llvm values for lower bound, upper
+  /// bound, and chunk expression.
+  /// For the default (nullptr) value, the chunk 1 will be used.
+  ///
+  void emitForDispatchInit(CodeGenFunction &CGF, SourceLocation Loc,
+                           const OpenMPScheduleTy &ScheduleKind,
+                           unsigned IVSize, bool IVSigned, bool Ordered,
+                           const DispatchRTInput &DispatchValues) override;
+
+  /// \brief Call the appropriate runtime routine to initialize it before start
+  /// of loop.
+  ///
+  /// This is used only in case of static schedule, when the user did not
+  /// specify a ordered clause on the loop construct.
+  /// Depending on the loop schedule, it is necessary to call some runtime
+  /// routine before start of the OpenMP loop to get the loop upper / lower
+  /// bounds LB and UB and stride ST.
+  ///
+  /// \param CGF Reference to current CodeGenFunction.
+  /// \param Loc Clang source location.
+  /// \param DKind Kind of the directive.
+  /// \param ScheduleKind Schedule kind, specified by the 'schedule' clause.
+  /// \param Values Input arguments for the construct.
+  ///
+  void emitForStaticInit(CodeGenFunction &CGF, SourceLocation Loc,
+                         OpenMPDirectiveKind DKind,
+                         const OpenMPScheduleTy &ScheduleKind,
+                         const StaticRTInput &Values) override;
+
+  ///
+  /// \param CGF Reference to current CodeGenFunction.
+  /// \param Loc Clang source location.
+  /// \param SchedKind Schedule kind, specified by the 'dist_schedule' clause.
+  /// \param Values Input arguments for the construct.
+  ///
+  void emitDistributeStaticInit(CodeGenFunction &CGF, SourceLocation Loc,
+                                OpenMPDistScheduleClauseKind SchedKind,
+                                const StaticRTInput &Values) override;
+
+  /// \brief Call the appropriate runtime routine to notify that we finished
+  /// iteration of the ordered loop with the dynamic scheduling.
+  ///
+  /// \param CGF Reference to current CodeGenFunction.
+  /// \param Loc Clang source location.
+  /// \param IVSize Size of the iteration variable in bits.
+  /// \param IVSigned Sign of the iteration variable.
+  ///
+  void emitForOrderedIterationEnd(CodeGenFunction &CGF, SourceLocation Loc,
+                                  unsigned IVSize, bool IVSigned) override;
+
+  /// \brief Call the appropriate runtime routine to notify that we finished
+  /// all the work with current loop.
+  ///
+  /// \param CGF Reference to current CodeGenFunction.
+  /// \param Loc Clang source location.
+  /// \param DKind Kind of the directive for which the static finish is emitted.
+  ///
+  void emitForStaticFinish(CodeGenFunction &CGF, SourceLocation Loc,
+                           OpenMPDirectiveKind DKind) override;
+
+  /// Call __kmpc_dispatch_next(
+  ///          ident_t *loc, kmp_int32 tid, kmp_int32 *p_lastiter,
+  ///          kmp_int[32|64] *p_lower, kmp_int[32|64] *p_upper,
+  ///          kmp_int[32|64] *p_stride);
+  /// \param IVSize Size of the iteration variable in bits.
+  /// \param IVSigned Sign of the iteration variable.
+  /// \param IL Address of the output variable in which the flag of the
+  /// last iteration is returned.
+  /// \param LB Address of the output variable in which the lower iteration
+  /// number is returned.
+  /// \param UB Address of the output variable in which the upper iteration
+  /// number is returned.
+  /// \param ST Address of the output variable in which the stride value is
+  /// returned.
+  llvm::Value *emitForNext(CodeGenFunction &CGF, SourceLocation Loc,
+                           unsigned IVSize, bool IVSigned, Address IL,
+                           Address LB, Address UB, Address ST) override;
+
+  /// \brief Emits call to void __kmpc_push_num_threads(ident_t *loc, kmp_int32
+  /// global_tid, kmp_int32 num_threads) to generate code for 'num_threads'
+  /// clause.
+  /// \param NumThreads An integer value of threads.
+  void emitNumThreadsClause(CodeGenFunction &CGF, llvm::Value *NumThreads,
+                            SourceLocation Loc) override;
+
+  /// \brief Emit call to void __kmpc_push_proc_bind(ident_t *loc, kmp_int32
+  /// global_tid, int proc_bind) to generate code for 'proc_bind' clause.
+  void emitProcBindClause(CodeGenFunction &CGF,
+                          OpenMPProcBindClauseKind ProcBind,
+                          SourceLocation Loc) override;
+
+  /// \brief Returns address of the threadprivate variable for the current
+  /// thread.
+  /// \param VD Threadprivate variable.
+  /// \param VDAddr Address of the global variable \a VD.
+  /// \param Loc Location of the reference to threadprivate var.
+  /// \return Address of the threadprivate variable for the current thread.
+  Address getAddrOfThreadPrivate(CodeGenFunction &CGF, const VarDecl *VD,
+                                 Address VDAddr, SourceLocation Loc) override;
+
+  /// \brief Emit a code for initialization of threadprivate variable. It emits
+  /// a call to runtime library which adds initial value to the newly created
+  /// threadprivate variable (if it is not constant) and registers destructor
+  /// for the variable (if any).
+  /// \param VD Threadprivate variable.
+  /// \param VDAddr Address of the global variable \a VD.
+  /// \param Loc Location of threadprivate declaration.
+  /// \param PerformInit true if initialization expression is not constant.
+  llvm::Function *
+  emitThreadPrivateVarDefinition(const VarDecl *VD, Address VDAddr,
+                                 SourceLocation Loc, bool PerformInit,
+                                 CodeGenFunction *CGF = nullptr) override;
+
+  /// Creates artificial threadprivate variable with name \p Name and type \p
+  /// VarType.
+  /// \param VarType Type of the artificial threadprivate variable.
+  /// \param Name Name of the artificial threadprivate variable.
+  Address getAddrOfArtificialThreadPrivate(CodeGenFunction &CGF,
+                                           QualType VarType,
+                                           StringRef Name) override;
+
+  /// \brief Emit flush of the variables specified in 'omp flush' directive.
+  /// \param Vars List of variables to flush.
+  void emitFlush(CodeGenFunction &CGF, ArrayRef<const Expr *> Vars,
+                 SourceLocation Loc) override;
+
+  /// \brief Emit task region for the task directive. The task region is
+  /// emitted in several steps:
+  /// 1. Emit a call to kmp_task_t *__kmpc_omp_task_alloc(ident_t *, kmp_int32
+  /// gtid, kmp_int32 flags, size_t sizeof_kmp_task_t, size_t sizeof_shareds,
+  /// kmp_routine_entry_t *task_entry). Here task_entry is a pointer to the
+  /// function:
+  /// kmp_int32 .omp_task_entry.(kmp_int32 gtid, kmp_task_t *tt) {
+  ///   TaskFunction(gtid, tt->part_id, tt->shareds);
+  ///   return 0;
+  /// }
+  /// 2. Copy a list of shared variables to field shareds of the resulting
+  /// structure kmp_task_t returned by the previous call (if any).
+  /// 3. Copy a pointer to destructions function to field destructions of the
+  /// resulting structure kmp_task_t.
+  /// 4. Emit a call to kmp_int32 __kmpc_omp_task(ident_t *, kmp_int32 gtid,
+  /// kmp_task_t *new_task), where new_task is a resulting structure from
+  /// previous items.
+  /// \param D Current task directive.
+  /// \param TaskFunction An LLVM function with type void (*)(i32 /*gtid*/, i32
+  /// /*part_id*/, captured_struct */*__context*/);
+  /// \param SharedsTy A type which contains references the shared variables.
+  /// \param Shareds Context with the list of shared variables from the \p
+  /// TaskFunction.
+  /// \param IfCond Not a nullptr if 'if' clause was specified, nullptr
+  /// otherwise.
+  /// \param Data Additional data for task generation like tiednsee, final
+  /// state, list of privates etc.
+  void emitTaskCall(CodeGenFunction &CGF, SourceLocation Loc,
+                    const OMPExecutableDirective &D, llvm::Value *TaskFunction,
+                    QualType SharedsTy, Address Shareds, const Expr *IfCond,
+                    const OMPTaskDataTy &Data) override;
+
+  /// Emit task region for the taskloop directive. The taskloop region is
+  /// emitted in several steps:
+  /// 1. Emit a call to kmp_task_t *__kmpc_omp_task_alloc(ident_t *, kmp_int32
+  /// gtid, kmp_int32 flags, size_t sizeof_kmp_task_t, size_t sizeof_shareds,
+  /// kmp_routine_entry_t *task_entry). Here task_entry is a pointer to the
+  /// function:
+  /// kmp_int32 .omp_task_entry.(kmp_int32 gtid, kmp_task_t *tt) {
+  ///   TaskFunction(gtid, tt->part_id, tt->shareds);
+  ///   return 0;
+  /// }
+  /// 2. Copy a list of shared variables to field shareds of the resulting
+  /// structure kmp_task_t returned by the previous call (if any).
+  /// 3. Copy a pointer to destructions function to field destructions of the
+  /// resulting structure kmp_task_t.
+  /// 4. Emit a call to void __kmpc_taskloop(ident_t *loc, int gtid, kmp_task_t
+  /// *task, int if_val, kmp_uint64 *lb, kmp_uint64 *ub, kmp_int64 st, int
+  /// nogroup, int sched, kmp_uint64 grainsize, void *task_dup ), where new_task
+  /// is a resulting structure from
+  /// previous items.
+  /// \param D Current task directive.
+  /// \param TaskFunction An LLVM function with type void (*)(i32 /*gtid*/, i32
+  /// /*part_id*/, captured_struct */*__context*/);
+  /// \param SharedsTy A type which contains references the shared variables.
+  /// \param Shareds Context with the list of shared variables from the \p
+  /// TaskFunction.
+  /// \param IfCond Not a nullptr if 'if' clause was specified, nullptr
+  /// otherwise.
+  /// \param Data Additional data for task generation like tiednsee, final
+  /// state, list of privates etc.
+  void emitTaskLoopCall(CodeGenFunction &CGF, SourceLocation Loc,
+                        const OMPLoopDirective &D, llvm::Value *TaskFunction,
+                        QualType SharedsTy, Address Shareds, const Expr *IfCond,
+                        const OMPTaskDataTy &Data) override;
+
+  /// \brief Emit a code for reduction clause. Next code should be emitted for
+  /// reduction:
+  /// \code
+  ///
+  /// static kmp_critical_name lock = { 0 };
+  ///
+  /// void reduce_func(void *lhs[<n>], void *rhs[<n>]) {
+  ///  ...
+  ///  *(Type<i>*)lhs[i] = RedOp<i>(*(Type<i>*)lhs[i], *(Type<i>*)rhs[i]);
+  ///  ...
+  /// }
+  ///
+  /// ...
+  /// void *RedList[<n>] = {&<RHSExprs>[0], ..., &<RHSExprs>[<n>-1]};
+  /// switch (__kmpc_reduce{_nowait}(<loc>, <gtid>, <n>, sizeof(RedList),
+  /// RedList, reduce_func, &<lock>)) {
+  /// case 1:
+  ///  ...
+  ///  <LHSExprs>[i] = RedOp<i>(*<LHSExprs>[i], *<RHSExprs>[i]);
+  ///  ...
+  /// __kmpc_end_reduce{_nowait}(<loc>, <gtid>, &<lock>);
+  /// break;
+  /// case 2:
+  ///  ...
+  ///  Atomic(<LHSExprs>[i] = RedOp<i>(*<LHSExprs>[i], *<RHSExprs>[i]));
+  ///  ...
+  /// break;
+  /// default:;
+  /// }
+  /// \endcode
+  ///
+  /// \param Privates List of private copies for original reduction arguments.
+  /// \param LHSExprs List of LHS in \a ReductionOps reduction operations.
+  /// \param RHSExprs List of RHS in \a ReductionOps reduction operations.
+  /// \param ReductionOps List of reduction operations in form 'LHS binop RHS'
+  /// or 'operator binop(LHS, RHS)'.
+  /// \param Options List of options for reduction codegen:
+  ///     WithNowait true if parent directive has also nowait clause, false
+  ///     otherwise.
+  ///     SimpleReduction Emit reduction operation only. Used for omp simd
+  ///     directive on the host.
+  ///     ReductionKind The kind of reduction to perform.
+  void emitReduction(CodeGenFunction &CGF, SourceLocation Loc,
+                     ArrayRef<const Expr *> Privates,
+                     ArrayRef<const Expr *> LHSExprs,
+                     ArrayRef<const Expr *> RHSExprs,
+                     ArrayRef<const Expr *> ReductionOps,
+                     ReductionOptionsTy Options) override;
+
+  /// Emit a code for initialization of task reduction clause. Next code
+  /// should be emitted for reduction:
+  /// \code
+  ///
+  /// _task_red_item_t red_data[n];
+  /// ...
+  /// red_data[i].shar = &origs[i];
+  /// red_data[i].size = sizeof(origs[i]);
+  /// red_data[i].f_init = (void*)RedInit<i>;
+  /// red_data[i].f_fini = (void*)RedDest<i>;
+  /// red_data[i].f_comb = (void*)RedOp<i>;
+  /// red_data[i].flags = <Flag_i>;
+  /// ...
+  /// void* tg1 = __kmpc_task_reduction_init(gtid, n, red_data);
+  /// \endcode
+  ///
+  /// \param LHSExprs List of LHS in \a Data.ReductionOps reduction operations.
+  /// \param RHSExprs List of RHS in \a Data.ReductionOps reduction operations.
+  /// \param Data Additional data for task generation like tiedness, final
+  /// state, list of privates, reductions etc.
+  llvm::Value *emitTaskReductionInit(CodeGenFunction &CGF, SourceLocation Loc,
+                                     ArrayRef<const Expr *> LHSExprs,
+                                     ArrayRef<const Expr *> RHSExprs,
+                                     const OMPTaskDataTy &Data) override;
+
+  /// Required to resolve existing problems in the runtime. Emits threadprivate
+  /// variables to store the size of the VLAs/array sections for
+  /// initializer/combiner/finalizer functions + emits threadprivate variable to
+  /// store the pointer to the original reduction item for the custom
+  /// initializer defined by declare reduction construct.
+  /// \param RCG Allows to reuse an existing data for the reductions.
+  /// \param N Reduction item for which fixups must be emitted.
+  void emitTaskReductionFixups(CodeGenFunction &CGF, SourceLocation Loc,
+                               ReductionCodeGen &RCG, unsigned N) override;
+
+  /// Get the address of `void *` type of the privatue copy of the reduction
+  /// item specified by the \p SharedLVal.
+  /// \param ReductionsPtr Pointer to the reduction data returned by the
+  /// emitTaskReductionInit function.
+  /// \param SharedLVal Address of the original reduction item.
+  Address getTaskReductionItem(CodeGenFunction &CGF, SourceLocation Loc,
+                               llvm::Value *ReductionsPtr,
+                               LValue SharedLVal) override;
+
+  /// \brief Emit code for 'taskwait' directive.
+  void emitTaskwaitCall(CodeGenFunction &CGF, SourceLocation Loc) override;
+
+  /// \brief Emit code for 'cancellation point' construct.
+  /// \param CancelRegion Region kind for which the cancellation point must be
+  /// emitted.
+  ///
+  void emitCancellationPointCall(CodeGenFunction &CGF, SourceLocation Loc,
+                                 OpenMPDirectiveKind CancelRegion) override;
+
+  /// \brief Emit code for 'cancel' construct.
+  /// \param IfCond Condition in the associated 'if' clause, if it was
+  /// specified, nullptr otherwise.
+  /// \param CancelRegion Region kind for which the cancel must be emitted.
+  ///
+  void emitCancelCall(CodeGenFunction &CGF, SourceLocation Loc,
+                      const Expr *IfCond,
+                      OpenMPDirectiveKind CancelRegion) override;
+
+  /// \brief Emit outilined function for 'target' directive.
+  /// \param D Directive to emit.
+  /// \param ParentName Name of the function that encloses the target region.
+  /// \param OutlinedFn Outlined function value to be defined by this call.
+  /// \param OutlinedFnID Outlined function ID value to be defined by this call.
+  /// \param IsOffloadEntry True if the outlined function is an offload entry.
+  /// \param CodeGen Code generation sequence for the \a D directive.
+  /// An outlined function may not be an entry if, e.g. the if clause always
+  /// evaluates to false.
+  void emitTargetOutlinedFunction(const OMPExecutableDirective &D,
+                                  StringRef ParentName,
+                                  llvm::Function *&OutlinedFn,
+                                  llvm::Constant *&OutlinedFnID,
+                                  bool IsOffloadEntry,
+                                  const RegionCodeGenTy &CodeGen) override;
+
+  /// \brief Emit the target offloading code associated with \a D. The emitted
+  /// code attempts offloading the execution to the device, an the event of
+  /// a failure it executes the host version outlined in \a OutlinedFn.
+  /// \param D Directive to emit.
+  /// \param OutlinedFn Host version of the code to be offloaded.
+  /// \param OutlinedFnID ID of host version of the code to be offloaded.
+  /// \param IfCond Expression evaluated in if clause associated with the target
+  /// directive, or null if no if clause is used.
+  /// \param Device Expression evaluated in device clause associated with the
+  /// target directive, or null if no device clause is used.
+  /// \param CapturedVars Values captured in the current region.
+  void emitTargetCall(CodeGenFunction &CGF, const OMPExecutableDirective &D,
+                      llvm::Value *OutlinedFn, llvm::Value *OutlinedFnID,
+                      const Expr *IfCond, const Expr *Device,
+                      ArrayRef<llvm::Value *> CapturedVars) override;
+
+  /// \brief Emit the target regions enclosed in \a GD function definition or
+  /// the function itself in case it is a valid device function. Returns true if
+  /// \a GD was dealt with successfully.
+  /// \param GD Function to scan.
+  bool emitTargetFunctions(GlobalDecl GD) override;
+
+  /// \brief Emit the global variable if it is a valid device global variable.
+  /// Returns true if \a GD was dealt with successfully.
+  /// \param GD Variable declaration to emit.
+  bool emitTargetGlobalVariable(GlobalDecl GD) override;
+
+  /// \brief Emit the global \a GD if it is meaningful for the target. Returns
+  /// if it was emitted successfully.
+  /// \param GD Global to scan.
+  bool emitTargetGlobal(GlobalDecl GD) override;
+
+  /// \brief Creates the offloading descriptor in the event any target region
+  /// was emitted in the current module and return the function that registers
+  /// it.
+  llvm::Function *emitRegistrationFunction() override;
+
+  /// \brief Emits code for teams call of the \a OutlinedFn with
+  /// variables captured in a record which address is stored in \a
+  /// CapturedStruct.
+  /// \param OutlinedFn Outlined function to be run by team masters. Type of
+  /// this function is void(*)(kmp_int32 *, kmp_int32, struct context_vars*).
+  /// \param CapturedVars A pointer to the record with the references to
+  /// variables used in \a OutlinedFn function.
+  ///
+  void emitTeamsCall(CodeGenFunction &CGF, const OMPExecutableDirective &D,
+                     SourceLocation Loc, llvm::Value *OutlinedFn,
+                     ArrayRef<llvm::Value *> CapturedVars) override;
+
+  /// \brief Emits call to void __kmpc_push_num_teams(ident_t *loc, kmp_int32
+  /// global_tid, kmp_int32 num_teams, kmp_int32 thread_limit) to generate code
+  /// for num_teams clause.
+  /// \param NumTeams An integer expression of teams.
+  /// \param ThreadLimit An integer expression of threads.
+  void emitNumTeamsClause(CodeGenFunction &CGF, const Expr *NumTeams,
+                          const Expr *ThreadLimit, SourceLocation Loc) override;
+
+  /// \brief Emit the target data mapping code associated with \a D.
+  /// \param D Directive to emit.
+  /// \param IfCond Expression evaluated in if clause associated with the
+  /// target directive, or null if no device clause is used.
+  /// \param Device Expression evaluated in device clause associated with the
+  /// target directive, or null if no device clause is used.
+  /// \param Info A record used to store information that needs to be preserved
+  /// until the region is closed.
+  void emitTargetDataCalls(CodeGenFunction &CGF,
+                           const OMPExecutableDirective &D, const Expr *IfCond,
+                           const Expr *Device, const RegionCodeGenTy &CodeGen,
+                           TargetDataInfo &Info) override;
+
+  /// \brief Emit the data mapping/movement code associated with the directive
+  /// \a D that should be of the form 'target [{enter|exit} data | update]'.
+  /// \param D Directive to emit.
+  /// \param IfCond Expression evaluated in if clause associated with the target
+  /// directive, or null if no if clause is used.
+  /// \param Device Expression evaluated in device clause associated with the
+  /// target directive, or null if no device clause is used.
+  void emitTargetDataStandAloneCall(CodeGenFunction &CGF,
+                                    const OMPExecutableDirective &D,
+                                    const Expr *IfCond,
+                                    const Expr *Device) override;
+
+  /// Emit initialization for doacross loop nesting support.
+  /// \param D Loop-based construct used in doacross nesting construct.
+  void emitDoacrossInit(CodeGenFunction &CGF,
+                        const OMPLoopDirective &D) override;
+
+  /// Emit code for doacross ordered directive with 'depend' clause.
+  /// \param C 'depend' clause with 'sink|source' dependency kind.
+  void emitDoacrossOrdered(CodeGenFunction &CGF,
+                           const OMPDependClause *C) override;
+
+  /// Translates the native parameter of outlined function if this is required
+  /// for target.
+  /// \param FD Field decl from captured record for the paramater.
+  /// \param NativeParam Parameter itself.
+  const VarDecl *translateParameter(const FieldDecl *FD,
+                                    const VarDecl *NativeParam) const override;
+
+  /// Gets the address of the native argument basing on the address of the
+  /// target-specific parameter.
+  /// \param NativeParam Parameter itself.
+  /// \param TargetParam Corresponding target-specific parameter.
+  Address getParameterAddress(CodeGenFunction &CGF, const VarDecl *NativeParam,
+                              const VarDecl *TargetParam) const override;
+};
+
+} // namespace CodeGen
+} // namespace clang
+
+#endif
+                                                                                                         A]A^A_Ãf„     ÿt$PD‰úL‰æI‰èÿt$PL‰éH‰ßL‹L$PèÏĞíÿA‰ÄXZE„ä„pÿÿÿöD$@uIƒ~ …Ÿ   è:}íÿH‰ƒğ  è®síÿH‰ÇI‰Åèãıíÿèş¸íÿH‹»ğ  H‰Æè¯7íÿL‰îH‰ÇèîÿH‹»ğ  èøÇíÿH‹»ğ  E1ÉE1ÀH‰ÙHáıÿÿH5¼ è•LíÿH‹{XH‰ŞèiííÿH‰îH‰ßèîÿéÿÿÿf„     Æ  èˆ.íÿéÿÿÿ H=ı è¤=íÿH‰ƒğ  H‰Çè…ÇíÿH‹L‰öH‰ßÿ°   éyÿÿÿHƒìH‰øH‹¿ğ  1ÉPLXıÿÿE1À1Ò¾   èùDíÿHƒÄÃ@ HƒìH‰øH‹¿ğ  1ÉPL(ıÿÿE1À1Ò¾   è™7íÿHƒÄÃ@ USHƒìHƒ¿ğ   tPH‹‰õH‰ûÿ€  @8èt|H‰ßè5ØíÿèğîÿH‹»ğ  H‰Æèq6íÿ@¶õH‰Çè…îÿHƒÄH‰ß[]é7Ïíÿ€    H‹±x0 Hƒ8 t2LÄğ Hş ¾   H¡ò H=ò èm{íÿH‹X0 €8 uHƒÄ[]Ãf.„     Æ  HƒÄ[]é2-íÿfSH‰ûèËíÿH‹»ğ  H‰ÆèØ5íÿH‰Çè ÑíÿH‰ÃèôíÿH‰ß[H‰Æé¼5íÿff.„     ATUSHƒì@dH‹%(   H‰D$81ÀHƒ¿ğ   „š   H‰ãH‰ıI‰ôH‰ßèÙ´íÿHƒ|$ uIƒ|$ …  H½˜  H‰ŞèÖpíÿH‰ïèŞIíÿH½   H‰Şè¿píÿö…P  „ò   ½   H‹|$ HƒÃèçîÿH‹<$H9ßtè±„íÿH‹L$8dH3%(   ‰è…Û   HƒÄ@[]A\ÃfH‹Qw0 Hƒ8 tCLæğ H ¾¼   H	ñ H=¶ğ è½íÿH‹.W0 €8 tÆ  èé+íÿf„     1íë‹@ H‹ùv0 Hƒ8 t;L¤ğ Hqü ¾Ç   H±ğ H=^ğ èeíÿH‹ÖV0 €8 t	Æ  è‘+íÿ1íéÿÿÿf„     H‰ïèø„íÿH…Àt›L‰âH‰ÆH‰ïè%îÿéîşÿÿèZíÿH‰Åé¯ïÿfSH‰ûHƒìdH‹%(   H‰D$1ÀèSyíÿ1É1ÒH‰ßH‰ÆèTıíÿH‹T$dH3%(   u	HƒÄH‰Ø[ÃèÆYíÿfD  AVAUATUSHƒì`dH‹%(   H‰D$X1ÀHƒ¿ğ   „†  H‰ûH¿˜  H‰õH9ştèÿníÿH‰ßèHíÿH»   H9ıtH‰îèãníÿöƒP  t*H‹D$XdH3%(   …  HƒÄ`[]A\A]A^Ãf„     Ld$ H‰îHl$L‰çè[=íÿH‹Ôl0 H‰îL‰çÇD$    HƒÀH‰D$è˜XíÿH…À„o  L‹l$HL‹t$@Iƒıÿ„;  è¶şíÿH‰D$M…öt#¿   è<íÿº   Æ@ f‰PL‰0L‰hH‰D$H‹{0 H‰ïHƒÀH‰D$èĞíÿH‹D$H‹(èä‚íÿH‹»ğ  H‰Æèu2íÿH‰îH‰ÇèJ…íÿH‹l$è@şíÿH9ÅtH‹l$fƒm„“   è&şíÿ1öH‰ßèüÌíÿH‹|$@IƒÄèöîÿH‹|$ L9ç„Æşÿÿè»íÿé¼şÿÿfD  H‹qt0 Hƒ8 „¥şÿÿL€ì Hº ¾¦   H=î H=Òí è)wíÿH‹JT0 €8 „oşÿÿÆ  è)íÿébşÿÿ@ €} urH‰ïèJíÿéZÿÿÿD  E1íM…ö„¹şÿÿL‰÷èœiíÿI‰Åé©şÿÿ@ è[ıíÿ¿   H‰D$è¼:íÿH)| ¹   Æ@ f‰HH‰HÇ@    H‰D$éšşÿÿ H‹} èÿîÿëƒè0WíÿH‰ÃéŞïÿH‰ÃéîïÿH‰ÃéÄïÿH‰ÃéîïÿH‰Ãéòïÿ„     UH‰åAWAVM‰ÎAUI‰ÍATI‰üSH]HƒìxH‹EL‹} H‰u€L‰…`ÿÿÿ‰•|ÿÿÿH‰…pÿÿÿH‹EHƒÈdH‹%(   H‰MÈ1ÉH‰EˆH‹ ‚0 H‹0H‘ H…öHDğHCH‰EH‰÷H‰µhÿÿÿèÈíÿH‹µhÿÿÿH‰ßH†èeçíÿHƒìH‹u€M‰ñAWL‹…`ÿÿÿH‰ÙL‰çÿµpÿÿÿ‹•|ÿÿÿÿuˆHÇE°    èšíÿH‹}°HƒÄ A‰ÇHƒÃèãîÿH‹}H9ßtè­íÿE„ÿtMI‹E H=qóÿH‹@(H9ĞudI‹}H…ÿt0H‹H!póÿH‹@H9ĞuKI‹$L‰îL‰ç1ÒÿH  L‰öL‰çè‹ÇíÿH‹MÈdH3%(   D‰øu$HeØ[A\A]A^A_]Ãf.„     L‰ïÿĞ„ÀtÌë­è€UíÿI‰Æénïÿ„     1ÀÃf.„      ¸    Ãf.„     H‹™j0 ATL§¸  UH¯  HƒÀSH‰ûH‰D  H‹E H‰ïÿPHƒíL9åuíH‹fZ0 H‰ßHƒÀH‰[]A\éKKíÿH‰ÅH‹IZ0 H‰ßHƒÀH‰è2KíÿH‰ïè*•íÿf.„     H‹j0 ATL§¸  UH¯  HƒÀSH‰ûH‰D  H‹E H‰ïÿPHƒíL9åuíH‹æY0 H‰ßHƒÀH‰[]A\éËJíÿH‰ÅH‹ÉY0 H‰ßHƒÀH‰è²JíÿH‰ïèª”íÿf.„     H‹™i0 ATL§È  UH¯  HƒÀSH‰û//
+// MessagePack for C++ old gcc workaround for atomic operation
+//
+// Copyright (C) 2008-2013 FURUHASHI Sadayuki and KONDO Takatoshi
+//
+//    Distributed under the Boost Software License, Version 1.0.
+//    (See accompanying file LICENSE_1_0.txt or copy at
+//    http://www.boost.org/LICENSE_1_0.txt)
+//
+
+#ifndef MSGPACK_GCC_ATOMIC_HPP
+#define MSGPACK_GCC_ATOMIC_HPP
+
+#if defined(__GNUC__) && ((__GNUC__*10 + __GNUC_MINOR__) < 41)
+
+#include "rpc/msgpack/gcc_atomic.h"
+#include <bits/atomicity.h>
+
+int _msgpack_sync_decr_and_fetch(volatile _msgpack_atomic_counter_t* ptr)
+{
+    return  __gnu_cxx::__exchange_and_add(ptr, -1) - 1;
+}
+
+int _msgpack_sync_incr_and_fetch(volatile _msgpack_atomic_counter_t* ptr)
+{
+    return  __gnu_cxx::__exchange_and_add(ptr, 1) + 1;
+}
+
+#endif // old gcc workaround
+
+#endif /* gcc_atomic.hpp */
+                                                                                                                                                                       ª û‰©¬ñ7“xæğ·j¹^íırA™Gå?º49#½şºhİzŸÎ³¹‰Qéèx‘z	!¤ì7€{DÆ[›^+úëK‰[c—‚l–ç§42»İ[Y‹¶cüZ×¢Ö«øˆS¤Ôóº¸‹ÜÏ03‰eUğ8¶{EÃIœ¤èæzÓ1	D;İndi@À@²š¾W hÂßl·í‚]ï >WEÆšŸ%€hŸ^ÓrÚ\…O,»óÜ6±¡WOÄ:Ã¹ÓÆ}Çè³2á_&½SÿŒÀvGX—ldÜp~øİ¥™´ø”÷ÇH{B.†S‰˜†¡bìa¼²ªÖBohNLÎjï_'vª v…Ö78%ˆÈ…l(¶vOØQùòPÙ/<ƒÑ¼•Éò )““¼¼¦©éşC¦
+ZÇ5›x•¾üÀÁnÜÿ´ÖM
+tµÃ.™ØAİ¤ı845Àvf¹ ãÇÕØµ`$ÜbLqYİ>±bÙ³õò¶ÅÅ¥/‰¶tø Âı†,fCË‹t_ã8“Ëœ2„…$_…ö¦yö0Ñ÷eŸó=M’bÕ-à+h‡áªY›¡`}¼‚ú ½½uÔæò&1y!õ€@{ÏGõ4BúFŞ:³9ˆ’“)a~2ï¼3°µÕ£§ÿ„„¡ĞwŞjÚôÄŠıƒ'ƒš	Rêˆ= Ÿu¦d†dğXÇ]á2¤ïçÕkÃ¾É·Àª«r’Ùı“%©Çó+/‘GÅûÕaæb	¼È`å‹Ê6ÓDt}áe!ø¯rkUÇOªllĞ+3<f(ÔŞPü$È‡`4…ƒŒ€¾>àõ]r,Xãpˆ‚Á-±•ÃÃgÿâ¶_ºä(²é$ÁÎ@šµcr(Ò bŒºÕ)š_ÙÓŞ¬«ZÚàV­P¦Y[U®¾¶,ú0Ö(eKGÊ@hß	¯Õ^=Èf˜ûQŒmXª—À*ísT{så%°¿8EÙñ=Z¢¬UÛáÙ‘îĞ«¤O
+Æç6Äì_«éûàÿ¥{Á!yZïÈö“î’p8ù£ôÛÔösÎÈ¥{Ş&d¸™£…	Ji2ãö#¹Ix—æcà_é&à“ÒGkƒféËÅ“ÏBm®sWÇÛ±6]`¶·ô¢•Lgä€‡l¬*&5xhe\ ĞÒÂ}½ßè_ •~2#J	07J{¿×CÇGlà_”úı*gkR¦¢cÌ>=>…Ègà9hL´Îow	>0¼¶9¸ÒMÌC+Z]Aiò–µ	vşxdêèi¹¹†øş4ÿWéŸêÓ*Òô›Á5øI.Û¥LınZ„ªü©Îp¸½ÌJ	*¤_ú;ÑÎd…„\?õı;}Š(ÖŞRT/.-ÁÈºì6İD?Cb¼X<?Añ ÁÇô|I·=XêN¯¢0¼üy†òÂ+„š&VN«òt@åeªûëmTÕ,¿¸§®¦c,ê]şŒ`}á„°!É½A?o¯bcHò“LîÌÕƒæö¾!ü»õ\ÖÏ¦ÿ¯JÆ’÷VÀòÎn×Õ‹vwöCB[â”{ª¦‹=™_ÔÊÃV†ºË]¶32—­7ÿ³QbS®9³CV*W!,âÂcà(Q†bA<vƒaZˆ§¯e6 nÂv· Às;fŞ¹¶éĞ"×!…óó¥Áğ<„\ç’İxÕÅ «tğçn5¤ÓùkM"îÔLJà'NÕ<üÑuaE˜«Ñ ¾?ìıF¡Ñ,8¨Tª[2…Ç~k|!+ä];u`–’Â¶NÊõ}‡Ø†:&Ã§º¹éÇ¢sĞ‰ñ
+ŸMZÉwD%lê–ÓÊg™âü}â(¤éx5Ü¼ èVU¦;½k€?£+·öœ jÆê*BÎ™¿Æ7göÆ™û÷‡øøVtjPØå¬aXÑÜºSÎeã¶ü~ÀÒ9†*;åßÑbÜh¯Gùæı©ıŸ
+1u³ÌHë»ó*äŒ"¬ÕkğoÖ%6‘ßºp#¤/z6“¾špL§Ol Ç'*—!EŸ‘E¶º) ƒ³¾šÖ¦›m”çK}\¤Äİ[Z4*B²Ò‘5Ff"-ÁrG-:Z¹Ähd~@J˜w•i3Ùw¯O
+Ğaph<u¿‡½ÎgqäòÈÈO« #YHËgBÉ!„íÍù¯ ¦ïÀ¸Vº(ÜcÃMôÿ¸ÛÅåbÅ­¤¿[>|´òiŸÿì_²È§ÌŠÃÍ\ztR İ<’¸õ8•‰Îhó†$<D”¬’€½õõî-M•õ³ÏIRË¸6}›:ºªç5¨SÕÄ‡XÑ	¥î]jÚ£0I‹Ú±v±n@>!ÑÅA/Ï{‘eMàyd9œJøí ü~Hü²ÀŒX#È–í¯ë7¼Oß¸d%„eÏF®YV#Më}û+]9Ó’(Ğn5©èë•ÈsÀƒ²^AJç¡ÿ•®àÂ'k{.Û²á¡>ıL@	q¸×ñt'O2ÎŠwNŒô+1­2­P`í‰òÑ*q.6i7¾œà43ë³;ÓĞíº®“KuU±ÍU5åœæj&Ñ×Â62¹'"ÎâiÄ$ªèª«uÑ×u£|üLìèÔ®h÷à/fÀ}üˆğı1Nâ¦Ø4.‡|—Õ°Ø{ïteéæ¥Y˜ mCçóyZÇöåpÈù›İ‹9/QìšPHñ0îŠ÷s¬…:S3±R¿ƒO¹‘àMƒ4ó?T¾½à·şÅ:6\K9@y<vß:æî1ã÷6  ÷xÔmº(`)újCã¿c! 5=íĞ:¨Ö¤5åÒ¾<“§Üpw+­¤¤»¸­>#¼·‹êÕj„Ğ)H8‡‰†u‚¼`Eë÷şYÿ<‹ËÒ!O?ôV÷ú¬ü‡Fj$VñÁîX¶k»7”O™ÁÃ’€Ğ²¿Ûâ4»}‰K;ÏgWæíÏÓôi¨^-b081#=½‹;YŸ¡ÎMæí÷?w­Ä= à»qáæ×c€‹zäU rTmLÀvƒH±bîlJ>âÎ	ò/³¬›Â˜=)²õÚÙ2İQˆ^xßT=ih`²Ñ¶éŒ>`9*Ãx qEÄGx¶®ˆŠ–˜f_»"†=jê²èYú|’æÂ<ğã‰ĞŠv¾í™æş.™ÅÃñ¼@ö££s¼ÏÍyú£œ|ßÊ:`&üf£‰%È˜ÓNáŸÕ8é5ê£Æ©M|y=Œ­Øár§‡O`0(pepç•bÍy $è^]úJçÖ²4¾6ö(eæà/Õ¥y9c¹k´^XÑº×¨\2»O°to­‚@:&£ãˆ Öµ-M
+<õ.”ñ
+	Bú5û‡[tò‚)³BÀ	,ÿº¬GáÇ.s;‰™G‰=á‰E[ÿ¡” •ûÇ¶’ÖwÀ¶à¿œB!7ó¥Á
+,WPµS}¶
+\K4j9CèP¹zvÔÛúdËÁäFct« ä­IÎ˜UvÛ†ÆÑ•g-/°à[úØ;‡ÎKA©$7€»\¨ä›
+W¡àMY•¯’yíÒè,¶MPU@@Åó<÷T´‰ô73Md•¨!a¬¦Ş¶.Ãºé—ÆÂx›C$JFjƒ	íé•x)	ÀóZß¿©Îµ™ØÁ%Gİ¥XúE0á‘Ÿ¥6 Wi=Šz”½‚wŠü vmU|AÇ>;R?±ğ§:¬\^gñZyÙü$¿›½;ş²>Ûâ¡xgõ¦E¹æ/3ÅÊ#‡úÀ/wÊ/6oÎËˆTOëó”`¬îT‹ş—y˜ò»k€Fõ0HnòÆ‘¯fF-°ïWÂü­7Ò†ü ê92	-ÉTÔdYæ!ÈO´ÒC7cËP6qsŒŞò AwIÚEVô†J	ø!0còŠc¹üäNSË=íE€0Pö>¯z gø>÷úÔ¢q¡Ó¹X6ãVSÃ¶S˜è¿À¾f†õ>^İuTîã½Áƒ*ıÿÿÿ`  £          ¹1     None     "   ¸      w       ÿ        J0  "‘xÜ‹4-OŠ“&=îÈ2      "       ÛO$    ++depot+UE4-Fortnite         Xb^É        n0  é3              F   /Engine/Functions/Engine_MaterialFunctions02/ExampleContent/Greyscale    /Script/CoreUObject    /Script/Engine    BoolProperty    bPNGCompressed    ByteProperty    Class    CompressionSettings    ETextureSourceFormat    Format 
+   Greyscale    Guid    Id    IntProperty    LightingGuid 	   MetaData    None    NumMips 
+   NumSlices    Package    PackageMetaData    SizeX    SizeY    Source    SourceFilePath    SourceFileTimestamp    SRGB    StrProperty    StructProperty 	   TC_Masks 
+   Texture2D    TextureCompressionSettings    TextureSource 
+   TSF_BGRA8               ıÿÿÿ                     üÿÿÿ                                                         ÿÿÿÿ                     ¹1                                    şÿÿÿ        
+             É1                                             €   €   7,  ‰PNG
+
+   IHDR   €   €   Ã>aË    IDATxÚí}án#9Îí¥*;é`1Xìû?ßâÃà=ØUuHdQ*•8éé™uÃH'vl§DR”#¢Œ¿Èí×_ÅÓÓB7ŸGDğŞHHàÌ½aê×ÑÄúup‹ñzyÅ×Ë×Ÿöšº¿’Ü»=??ã|>ƒˆ¾Ëë33.—^^^ş.—£Ûù|Æ¯¿şz!½Åàoe )˜Næyùâáäœs €Óé„çççÿ&Èãï 9#¥æ‚ñ)%¼¼¼àz½î9j¨áÄX–ëuı|æmgœ¿œuÌa†§mÁ-ü{ïq:ôùï½¥”p½^Õ ˆHÃLó<NXâ‚ÈQÀÿàaO÷æ0ƒ _<}>Í˜Ï³.¨÷¾1 …5ç@D!`ç€s!03rÎ;ÏÏ9#qÂ”¦‚ÌH1!¸€ó|FäˆãO‹?¥ÌaÆy>ÃÏ˜Q2Ì˜§Ó<5?…iGúˆÓTGD
+ó<#¥„u]	,)”1å	ÌŒ#’O8OgÄsÄ\×ëO‹?xÂ„ÉOğÁƒæâÉÁ×{ğŞ7÷~Åû½÷ GpxĞ Á¹,rŒqg #°,‹’EÎŒ˜"Ö¸".ËuÁëë+¾~ıú?¸Åâ§0Á9ï=Â@ÊB:§??ŸÏºø#'*¿3ûŞ=rÂ’dÊÃÌBB@Ÿ%ØÏ3å	ç|¡äño ÂæC‹zzÂóó3¦iÒ?M{ˆ!èıÄ
+Iè 1!»Çîn¨`f8çÀÌ¢!ÄHœsøå—_Ô˜',ë‚eY~Gø! lş47Ï3ŸŸõ‰ô$NHİ$yä3Í wCºñÏğ@Èá.Y\–D„Óé„yõç—ËE‘Á{_~ùÏÏÏ1RÄ·×ox¹¼ü0~„çŸŸÎ8ŸÎ…Ôù	Á]ìÓé¤ĞÄò§!hˆèÀ“­²»m œÎ»]ìo<¿æş!lHfaš¦æç|òÈÈÅiş!YCø>ï¾,œäëó<ïòö{.±~*œsğî†äÌı`)2y23c]WÍ:$t½ˆçÓÁ¬aÅrZşô¬!ü/±^òøyš‹×“W/™çYYÒæó·<ı0T D‡‡ ğäwù?24;àÌ»ÏSDÎyÿóšIôˆ@®1yE‚#W
+LXÒ‚5®¥è”şbĞÇz›Ç“#•júíâ‹‡X£8òtï}yŞˆì¹;än <vÕ>É÷³Ë˜Â„ì[ñÉkXè @ƒ—ËÌÜ„­>z °.	şŠğ|~V˜›B«å_”:+ÚôlZzº«šèÃ¿[ğw`PÎœáÈ•ğ`SÁŠÎ¹¢!$ŞqËqzDåQSà*€ü	\ğr}ù‹À4ãËÓ—²è®J³§>”œÂ„§§'ÍûGĞ~šO­ôk=]<˜ÚÜ[Â¹¿o İ ‚\Ë{Ã9lHP9Â2q…¬0å	sš±†3Í@^ğ“Àó¹­ÇŸçªêUØ!À‡bÙæin<\<WS¼«îyòpäJ¬@¸'_ÁQY¼üÀÛï‹·çœA óÌ\ŒÀ”	p€‡?ä
+="xïˆŠúè"<g<==á·ß~ûô~„O5€óùŒ_¿lõøi”Åkì§Br¦yB˜Bë¹]Œy¼seáUö%ĞA‰•#÷pĞ€hÿVØ	! ¥„„—Ë÷öùoA"j²ïı.[°úÈOg âùOç§ÓCQßü\¤\Ëâ9„)`š'LaB  Rmã{·¡A^„Ùd7‹At³°3€^ê}oÉbF>D `â†0Ê{LÓ¤#ˆ jég"AøLÏŸç¹,•ØNşäAÏŸæ¦05Zı=dÏqäô"‰,ü.pw2…è…!û¹z4Brt	BX–×ë)¥OG‚ğ=<_òúiàO.Ô˜¼B?Ú”<
+šßõxx¨x¿(i¶2¨Õ?‡Û! ï7 ù†88ä°'›âµ‰ÒˆHg„–ÛŠcƒë/ËËÃ:Aø?ÏsQúæ 6 Å@»ØB©úİòxMóàtaÉoqŞ9§ê¢%yö ·Y@ÎY›CRJzwäÊâŞ@†’OjĞ#$÷“ÏOD{$x5ÙÁŸe ¢ğN8=0…’Æ„)¨Òçƒ‡Ÿªz6R7…-Æ{*^K	‚ßÊÀ}İ_»Ïÿ	zx°`‡ VWÅ_ã
+N¼+÷^+¡*ç¬ŞNÜjªpQ	1EÀ3æÒæÓöû!¹²êê€(|óÓŒé4©Ló„éiÒx,­\bñ|‰ù6¯¯º@/ûŠ7OÓ¤’±5 [’p!Ò¯zü=–ÿN°‹%©›¾CLc¨ïŸâÖ^¦°ßq	w 8Í',ë‚o¯ßÀ`
+È>#RDå÷)ÒVµ|P'x¾­æùP˜¾À{˜‚z¥~%¿	AÁäõ¾<Gà^òwñbÛ¤º¾ÍBá‡Dïƒ! ç<D ›Ë;_Ar¤šQÑÀA.qF£ˆX9Ü“/ÙAŞÊ%.H9Á±Cvsá¼Câ´¡î<?œ„G<TÍ;ŸÏ›çhøB•åSWğ©†"Æ"¯ïàvE"ÛrÄö…O<Œ Uö5ƒrbı\j˜‰´Œ,²®¡µYDŠ©ùœ!°+Y‚¤ˆrİ83–u1á4àÉã²^ñqà]BÀi:¢'Åº°¶C§¯Ş…ôy#%/ø$“èW®ĞÇúƒïû:ÁG€‰wÀÌ›ÂX3Ëä»ÍãÔ«•À!ûÊÏ[]ƒ©f	±ÖÈ	y6&C†4?®¼Ï j¾,¾@0×»/iZ§äIÑÇ*€’RŠªgó|ñ‚Mê¨:€ÿ ä};¸7—İ&ÿšŸë>¦Í  `5\ÀMWû,ÁÁ5zå>8À‹{\'ï‰ıó©z}eòâåïõ|›·K¦`™¾x¼ @ïá
+ùTrş#ø° ÷ˆ§:vêŞ{äÚ`-=„š÷çJÔ°¡°!Grm– ïXÌT4-¸ìàæ‚66ãzÂ§… eıç"î4µëuû›_q
+“fšÇÓÖ,‹kßS+1¸)şàÑÍ¢Ã½È§””ŒyïUĞô.Õ…‚Ó¿±á
+› G¶{H İÊIúmkŸf Z×7Şjc¿õ|aòö±‘¢gŸc¡¼‰í’TO&GêAV#PD0J ¤‹" x¿½Ü
+O.¹ÆÓ”Nb”Ïc,ã FáìŒ·zÖr²ƒÓ÷!AÎ’Oà²£3«Ô<M¾|ù"º»ámPëú§ÓI=ò|>ãt:µìß™9Õƒû¶Š„)k_ Ş·l¿ßì©mTDªZ!¨//ß¬d p[} ûŸŠÀ©­"Şy$W*„ºà.¨-FòX¦rEÔ!O•vwçµdlCòétÒ.+ 7 O^;zzÏW`<_Aó{ù6o–ÔÏ†]Ğ
+ß½Òg¢ñ;’ e m$Ï’ÃŒ¬)kB*Ìs£88ME¨­-@B‡ş®ÄøJ>EP“ŒÁ§Â5Øq~á¸I…¥Y8Á|šñå×/‡]ÆïÊú|¿¯ã«”ÛçñÎµéŸk¹€Õö{iÑìÀù]602 «îl»×n`¹—‚³+¤Zm¹ğ‡BñüXBƒ.9ÄËu˜J¦#¡B<?Æˆ„4Ìz¤v:ñ_ÿşú8æ€ó—²›ùÍ ¬.¬_º|l¯ša1¬\=_ÔÁ°-¸X²}- Ñ¶ÑÃ¾–ıyÿ<‰ı=éÏ'Ğc•@ÏOH;¼Şå¢Îõ;‹8bĞÖ³U¾•÷Ï&æ$àÌ›ºÈY¡¹ Š<.»‘1¤½¬YOoÂúŸÏÏ¥§ošw½ú}·­ê…)("ô£!‡ÁkÑ§ñ|cdÚ$iA¿÷¤ÔgRHº»9ÔİÖìâõEÇå1MÿêçPR×Ft±A¤-Ó°o‘@³$­ö‘£&+°×w]×g²Ú¯_@>Tƒ–‰û”<ÕfB‡_ã¾<G8H¯èİ×EvhÈŸ¦“G<àÎâ÷¹·ı¿Ï^Ã3—Ï 9»«6ã±û-ŠˆÒ(DÑ"AFÙ˜¢Şí«r˜·¬À“G¢¤E&Qµ«x*;82ø×ıä’ğ±¿Ï÷GßËÅıó=ß—Å·y~ßAl=~Ô¦¥ãèM Ğ›Ñì5ŸÛô2§­m«!ò;‰wéhƒuš"¶¼¾"xü‘>Ğ_çœ³v…‡°†yh 6öOaÒ^»xúÇ*}‚²½[b½ÜUáó]æà©Ù¨: y-Ù>VX€p ‹&o¹¹\Âˆ\°F Êq”ş¦qÄ…òş	EàÉ\²¦-^kØ¨‚´3—*£§¶¹Ï
+êk)Q‹À™‹šSÙsC<}µï4Ÿğt~Òü_¶q…)ÀOUÆ6Ã	SIÃ\<_™º4pz3ô¡ÏóMá§'JòêB’'0ôx	3 Û[Ää/ûÜ\ø¦Ã§’BIÁ8q#gd5ÚèbÓ/@©({Lead…K[£<)'ª‡}V`3šB˜R¹³†Wº€…aÑüm—n¯Ë4x›ë‹µZ@ó}êT<k ö÷;YØ}z†k/ˆ~³øïbkMŞnÂ%WŸÔê ‚*W¦/×*»­7PtƒäÒû¥¡&€8³VmV`wÙBEs]{.4&ÕŠz&úèÍjü£×@»VâùÊhÏìkK˜Ò!–…s.[À2WrU/xCİÖ‹'!C¶‡7Ÿ?‚Û<Sû,oJ•ísÛwJd—Øu³=…¶ÃèMY€ÌİvT/ª‰åJÊ¬Ûe½G:ÚR:…h·åóz·L¾z¾E]|Âáû‰HÅğcæÌ`p	fõ^ÿIHO¥\ ^ÿïŠÇJ'pŸaÈ.äŞksÑ~74e¦"=ë¾Ho¸ ÷.ˆœN§¦_ ŒêıMgm}1‰ıÓ\b»íİÛÅşúu›icõS˜Åp­şy6ÆKWQß4ªp—/ç\J¾òû¶FRR¨¶h%eZxè~‡„Ôx£ı¼ıÏmŸ€ƒC\ãmd=àGÈŞ÷„Q½?ø0^ßÆvÛs¿‹ıÆã­‡jŒ·ZU]»È–'ŒÁlš(»ìuú†‘»Ş_«|ê5"èn`nÓ@k¡GHŸzw5¤¾‹Xş®Ü¦oôºÇ-. ÜÃŞ­N`ûÂ[êıŠı•KH!é-@áİ¡)7ò¯­c³Ú@£>€ ò¬8#: ùb V°¯ßs il½‰¼5{öŸÃşş[¹Àh|^ß/l¯ŸìÕ—_–üßm¤Îİ§k½—Û,At}¹“ÛiúöbZÎÑ§w¶¾°ç/¡¶Wà½¡zn˜¼ê]¯ _FPùŠI1%Ÿï{ş$„1Õ¼©áJDóŞĞ$s.cT°Ñ€éõ³âÏ<Ïª ªŠ4[½Z†<‰±LÁ”ŠıVìÉÈÚßî¼Ûˆd¨ìĞ¾G×èa¡]¶Òó.k V–~¤3XIÑÆn4=eÚb?A¤éJÜì]¥NH¤<.=Î»¦+Y²á4Á‡İ©ÈÃ7ÕŸŸ·><òfoï¶„Ûçê=XîcºíØõö¹5zäĞ¬ Ë4Ä l'­K<¬T/–¯^':>¸é=Ğ=„àCÀåZ¡ÌEàÌÍë·ÈÈğÙkõ¹HÅ"Mg—A¼ñ®¾Fpíl6úÉ×G±Peİº±ó=pj5}™íÛkùJVjºguƒ‘JØ,¦Ûë ÚèÌã@_¨›Öpá
+T·€Ûl@>7|S{p(±^åpø]\·:ÁnÂIB³ï`ÊÓ°Fğ–l ¼µa²©¼½s³…»<Ø{x§ êcæ¾ã·°¤ğM­aG ¼Ş/S³!´Æx}Ì!ÉåòşÒ@"u&c©™„hÒxj‘3SVN 5†u§d·ÙÀ™jëù·eÄúûŸÛ.£æ‚xÚIÃ o°.|Å6sHS†>¿"NÛàÍv
+õÙ@ÆÁGZ§Eaëëg“—oiáÒ÷Œ:jôµ:NĞd• ÊØáÍçx#tåä›ìG6ŠÑVùã<D!m&uÛî!—‹§ëÿëıÏ2Éø$|Q! İ®÷[í…¥	¤3¨ı#Ämy¾,š]xışÈâ¼KYY2Eiì¨o‘Áz¾OÏ22RN?dŒ©T¬ïİf½½FïŞÙ¿öğó~›ïk•ŠÆñ¼çë'·KwdĞ¸ø²ç¯ã)²[X>dwmÔ°Ÿ[b¹ *ƒn«*&J%Ï§¼ÍdR@ç›5h¶½;4£tT£İÄ|;ÜJ~2£€6rúP<ÑDeº‡ß¤^ñè‰¦ayQFr|ËÂ{yRU>jÇ§©Ø4È4Æú}èéùBûïqñ|%t ¶MkĞ"ÆµllG<^¸§mC©Ê»5}ÓI£–`Âl­@Ê—P¢3«³W‘ˆsÙ^n>Û¥ a4˜¹±¶úvWßo·ë±·i™éŞi~ï‹ïQ ïô¡1'hfûûÇF¤OR>·yz­úÉ¦ù^¸ŒÍ¤Î/ºm¹}ÎMxÒ,İ>àRÙ£\X¿*™ï—‚XŸ1‰ÃF‡uïıÏqbˆwû<İeô‡±ßÂ`2é‘§sættLUßrwêƒuO m-àƒÎâ?ëúJ(èÂŸæÈ˜]O ûvm|µ÷hbÅ»à=¸uÔŒVê\¼‰Aêé2€]l®=Â>£Øö^9ÎOyj˜C· íĞ§ŸMè‚Û!W—9«-)h¸€ AÆßæ´İŸÔ úØo¼©ÿ~wÇÜğú;9áö^Ùéœ¿&CÀ¾·ƒô‡dş­à#æ–àsÏ¦Šïæ`«úÉÁÚ¶€ÿ1½V#ÅÏ3 m¢0ÿ®ô8íşIKö®5Û¡•·Wµıú#½>ş¿[6Ÿ[vşÊß(¨°Cª÷|^w0â®{p»;Y~ÆU'xk½fg ¾ş›0ÁÃ7cWu¶¾ı?a—Šyçõud´¦!Ş¾øGÆöF$°ñÍqã=¶ÉCFÂY#°ÕÁ·¸f?¹”r3›Eä½È&—Ìå¸Z—ËµÊØ\Ÿu›ZâÚ)tçzÑ0¾˜ÜA ‹ö÷mï]ÃßéıGu´ĞGFpô}O0UÔ è›7¡Ôk´ãƒ¿½á8v½íT×·^cÂ?øöVù;ßşÑğ¿Û?Ü ¶€ÿ“náo»¸¦ÓÖºÑÿûıÿÿ$c×Åù–ˆšıÁ6öÿ!è!~Û”™QÒpz(sqí1ü¹\D™aC¹ÖÅ¥û%ßş=ı?¶ï‡ÊkŞïÑk3¶£1/·rşæu­Q ­Êg<)«J¢ı<¦´«¿×½Vó7ç.da»¶Í½ÛÅ|ó´4óz!Æ¨;I¤›ÁXâ‚à&7•ÚrªŒÁşŸË=snî‰“¶=iœ·&	mœ<0ù=m¡F{Aì…S(ç¬0o)y÷ŒÁ^DÛë×ÿÓMfP“ø¸3xsä÷RNåÎIRæœu»WkÓY«Œ‰bŠXÓZ›æX^£Öü9qY#¾m9çäCYp©`(}ËówiSvØZËl¬ôà58³.lvy¿Èä¸—\\·pwçşÜ’uñ3·»€¹û¹ñÚÌY÷Xg°iwP¦?…´7 ‹¬£»5}ï{ ”n‘ëõ
+çÜá)İ?(˜«â¶«F}ş2…“Mã¦mwöÏ½³ó|Ş#Âèó&®“C9m#dv(˜tŒgï†Î™ïÎñk¼£J¥"*TdĞÁÆ¤kWŠ5oâÈ·=ßx?ÆÎëQûÁ™…|N{Ğ•|&°'Zö'_ö’1¹0Ú‹gdUA7-ÛïUûny¾¼¯½<İ>ïG"AÎ1F,ËRÆÄ­«^· a;PßÒ®Ôo†Ğ8tğ‡Š÷Úiš²ƒÕzpÙã¦(;$°\@³Œ:¿Ÿ‰U«ÏTÎùUr	÷	Ú¹>w¹@÷w±ßööÆÛÜàşµ,I”Ï#¤ÓF2o-§0›VdåÄrå ¯¯¯ˆ1Bö¼É¢8—ªu2¨´Û!E±t42ú­õ;­¾:ôñŒ›\@<®	3êó×z¾¹pÃ³ßl;Šı¸$,]µÛ»SL:IL˜¼¼gâ²hk\tß2F¹ÙUc"-3#$¼e“¨.Dİõ""§RÂlfØÊlã±Ùµ,Öš\j`Zúï¼MÃÎ1\.)ƒ›Z¼öÏ›ò|›‡kÈTàvÜp&Æ¾·€ıÛeq3Ó·ËÙû0"×²9\*u)"ºı‰’bæ=ÿtQ†QÈßª'š¦TBÀ[oœË”ï‚Z,1iêèÒ¶…Ë;¯­ä2g'®QwÚè„\vÖ$¤ípÙe›Û)\ö(W)‹‚¡G­÷:46z.Ò_HjlˆÌ9#rÜÄ3XRO W9Õ|½¦Õ–kÈ”?Ø†RÈl"MóD_HYÓx¦Âå–´”9„¦]xP†G„·Ä{Ë"µï=¤K9·Şo=:eÍüÑ2|¡_Xâz:¦Y49ŒI¡[.¾9ID;o»^Bå0]¿ä­WÖzP¯5¡Ï ,	l4>;¾{¥PQ"¨—+ôuİ&T¥œv‡¬£"À[=]Wpæ2ëïÓ	8eJ9 :ĞÇ\äİãÍ‰„†´Êó³«ß»¬'5ÂO?' ·ÃB8Èï­ñJ<Ö…­ˆ¦Ş‹8)7hr—µ§X¼WŒ¡òƒ¸Är¤ìZxA\ã]n GÉXößÔtz¥!2uJ©ÒmL#¶œìÛ˜&p&Ê\b·œü­3n™4ŞëÌ\C õÜ]#Ë&Ê¤]HÙÖÏmgLÓ¿g+†ù«ÎÜ„‘}Õ;»Åorÿ^¯@ŞIÈ}:ÙëŠ¶†dÊõ¶y½•ƒG#î-ˆQ„Ëå¢€(‚½•äœa÷óú˜†ŒêòCu±™}#È`w„6ôÈü!Y0‹MoÌw×±äû"TïùyŸ¦é(—<Îÿe^€=gHœ,®EÏ¿—êİÊó×uÅ²,Íé£Gˆğòò‚××W„——œÏgHQHHURJ­äÍl®+q;q¥²Ã•™Ë„ìJàä{ëåÔ+—\CV4ÛÈİNÛºèN'iØÔĞZ´é©Ãni¹Ó™sÃÒäë<¿)	70‹?Ì·¼*·BÔ(¶ë¡ëÅé®†s½^ñûï¿p¹\ ”cGß¢H6àÈ!äpÿX–7rI<<¼ó»Ù» 4ÆÛ…P#È¦<»İü>=S8.ã€³İ÷–sŞK°’ãw“ÅG±ß€"Ä[ô™µ€——¼¼¼àßÿş7Îçóİ'NˆáÙëIÖ”hƒbçšÜT=ÃmïàôÄ,í–Q*y›±ÆÖÒ,•<‡]¼&lÛÁúÒ3 Ğ×Œl&qdT¿ šçs{\œ „UG{n`c±
+C&“°k*c#0iØ1eeù;¬ÎcÔ»¼”‡µ€>6'.iŸô‘Ë(óîåMz0sFZSSÓ—AÊòú""ÉèU!sŞ{%wRBÎ¾Tï57®[§%ÿÏT÷áéçBZG#bw“¿îT­´»“hÍG‹œ6•o—R³‰ı¢˜RñN¬©®dòØšV¬\î¢IˆÑ,Ë‚××W,ËRvÇK\°Ä‘ãŞ ”Irk-Kvä84µg9¹™û'[´RQãäBd¿	ª£s	zD«ì£¯H gò©ÇË±+1–iš·0b7f`›¦qw{ƒØ®Úôbá¼QyïÍrmíuµ×ºçVMÁf ÍkU°z„Áº®X×U·†/Ë‚ëzÕì®1€ÈK\0¥	S8á²^0aÂi:rBsÈå¤obÛA\Nø°Hc,Caïâ»l zš¾Y= Ûèkˆ}È»{MHk
+_´:Ãf¿WeÓ¾V`·@¶"Wnø! YÂ²b¹,¸|»`Y–ÄˆëzÅ´N˜§¹ü‘á¼ÃœçÍ²RÔñ0Ù•Ó5åô*öä¶L@fÚÙ8ŞÏÂ³qÛÖT¦oW}@G®Úi\µûG ·9è­{oõ#ğ¾`Å—ô<ÉÏeñGß×šL íg%P!µºÀ¨SÄ².X®¾}ı6î
+«˜©œ/C¡õXf.§V›1RmÁAË†#pærJ–Ï˜Ü¤¡$Sn@öç7"$°ù¼ıö`‡»#bïœ¬éÚò³E +À(ù‹IózNÜx¾u¤#áæĞ“×ÂÖe-€×Â	–ú³eİUÿ8—÷·±h ëuÅz]qÏXN|*<µ#öìœCH¡H2¤Hu}Ã	„C8®Ó¯ê1jV”tMˆ› 4v(oãÙó6("ÓşxYÔ{3sïíŸÀ*»  òIDAT“´´gúønc³pëZÑ³ß)Gˆ 
+`2i¤ı>›Ú€A€Ş—µı7÷(àğÛ¸@ïñƒl¦ Ğ”‘Ë~÷	´!XªõT-‘£eäzRHv)\¾¿ü†Xqf×e\dÖƒ•ÒÎóµdÜ“ïhZ¶°Õ Dû—“Ç>#öß6€q•¬3%{–ı¦}ÇáßÎØsĞ9÷v¥0òä(R#ÄèH48»'ÙBri'2Y$éÚvëySÜqøğññGò¬MÕ2·4ĞÆ}-Ê¤ØI–õÑk~V!_ŒcGkZh5ù*½£ØÓ –´ 0_9`:Mz‚GÆÂrª6sË¤c¨É
+j¿€C´25•X±–>*iÍÛã’æÙéÙ¶Æ.cÔeĞ²Lép®„ˆÃ#İ}årXXˆ¯åXKEÉt§Ñ	º†&ß¯×´‰çKÖ$éÜ².¸.ÖÅ)¥ïoY\¯W¼\_†±ÿ¦¬±‰§å	iJ¥ÂG…Ù3å)SÉÕƒH1©“|ÚçŞfZ–Õømø²(y	şä{Ãvt,‹ˆGûSøEÉ§M‡O‡1Eåª÷3*v»º©Èõi_ŠÕpbÛÅÛÇw‰ëÖ ®×+^/¯¸\/ÃØÓ  ÏMµŞU	çyŞ±z èÜà	¶7êÉÂXC[­ÀĞ(¥iëù¶$'»ô¯~.ŸıÍÊØ[º—{ƒ¹x¨•ˆG\À¢”­"*Œ×ønŸ'pß¹kxxÇß’9c]Öaì¿m ©Ü9òa•P~fûl©U¿æmD¹töh¥Îcúõ{ÎC6o«‚ıÑ®úáü¸Ô‹6}zØ…´77ÒFoÀÄ©¢”@Ôûíkª¡­iûo@½U	EVlô€iÒ^´	ª}"/+)ê@
+H2iS¹@R.è¤Pg İä¢)ÖÀë,ìÛ×Øoš1…Ğ5±İê½çËëÙ¿M‘6®Ñ´·,.—‹¢Ê›«G7©şöÛoÛñoõD1‰Çbuz°²ù¹,RS†5íY>{8ïv»9omçı±ì¢ª€Ò”°]”¾Û÷Ñ±¬ÍşD´òü¾3GóôQ5O
+FçÃï[Ê5[0FbÉŸÄŞ(2€	äÅÎç3ä 	U—Eähx¸
+,9#Ğ¦XÏŸÂÔÔT/@ÒC!å"Ùù½RK¸×ñæPĞ	,Mw¯)Âìêùqû¸F]¨Şó:}$‹²lßz¾íø‘µûÈ6rA»éÀ"@L>•BÉ
+d¯mÁ¦¼æÈ!¢årFöôUĞæA¡vuÇ§é‰ŸŸ0û©/óö*›Æö<NórÊ;n :Á7Ÿ8aMÛ”’VóbŒŠb ı]<_ÊÀ¿ÿşûÇBÀ­öpéˆ1bš&œN'}óf¸"aÃÕÃ³×æĞ€ õnQüØsÃä÷µü+­âÔœP`²?Rö!ÀÇ<£"]`ıiãk\õ{Ül¹,´ğuİb¾œxzOúŞãù€¼ù²,;‚%ÛdÕ BÇ'y»V	Ô^•Â5®[ |‚¸ÑÈ“6ˆ6$Ğ•SÇ›ç¿Çà¥{zÉããíÙ³±Ü¶~K¦¡±¿6ŠH³ˆ]`[ãWd¨è°Æ—ËåMÿˆU‰ÅŸN'LÓ„”.—Ë	Ğv¹ìŠgfÒY·)n1ZDvä6D¨5›H\ïwõôl_ =ÁóÅş]hèÙ½‘†-7°5u]Òm-@¾é2VéÓûºì:}¾›ˆè¡P•Ô	Œ5HàPb|íÌ•"5cCS½£\5Óƒo³ƒ£ÓDv7Píİû µj‹ô«_%ÜFÄ©¥j‘z­á¯8ZüŞóí¢‹÷¯qÕJß-ÅïS Gï}³©t‡Ùô)4F2aÚ`-ÄGª„)¦Ò·ç¶ç[ã²çà)ï<UÂÎG8@ŸsïÀæ÷icñ½˜´,‹şÜn(ÕÔî/u©ó_×+.¯\^¿O7€Ëå¢‡KëIßD-Ô-\ À­N;†2rÛÍ#Â·»lÕpÅªĞßVu£áCç¸Çk6¦ '}©)·dÍ¶¡k- [üfóéÁâ« W\®eño)~Ÿj r{}} üòË/øå—_š¬—Kí%0a;Vr6ì^<¼ÉG¾x:;.)bu,y^eùQ¹WSÓ"À°óø¾gJ$UÉ“írµ{ºïîk £Å—Rz\âM­ÿ»À×¯_ñõëW]É
+tgaZ–×³uëßÀuß¿
+Mği3„Qìoåb1€Qã‡î0œHúÖüÿ–šÖ”µû>BÓ‰#"—pÛyå¦êg_«)ı!HR®×ëaÿO1€	D!œçÓ4!§Œõ²©ˆóK\t!¦©œuŸƒ9((ƒÔRb?ç’/Ë`	{$}o 1Ær>Ÿ÷ïF‚‘‡¿Å@„¬©ôáËé ıÖïKOİfu|)ë*ÄUÓ½¸D,×E¯ı5 A‚ıë_øòåK3 ç²5Ú\sê¦¤qÑo­b2ÚMStiûòµ_€ZDèÇÁîB'=¶ş½`…›·"€ü<¦:Ä1·?„,Æ5*ùµ.<ª1€uQ¶¹^pùvùçªé½IJ½Üî–Ø/Ş¿›HRk òz‚}ŸÀÎ ˜†:ÁGC€vüt¡Ì%“é?3k¯Ä~Yğ××Wà¡Ešç„íÿi`u™=8êÉv]W°ç¡`£UÁš ¶¿Är„[7K*B€;B’·Ü† éœÒŞÁ´¥‹²ø¶€#„Ok•C4ÿú9ÿ]`„ÏÏÏ»"1Š¾b×O‘²>Kè•Ã{-Ï“¯o–¾ÅÃNø6Ã™¤Èhò|éÛ×š@JMÿ¾l×îëøŸ‘çÿ0¸\.Z=”ş íªÿ—p Í¤¦óGç™> ;íª¯-oİ	^ïU™kZo×ÔM¦/#GÚ»§`Ë¾Fßï{û–u)^ÿ<ÿ»@ÒQdgK-ÁÎ&a#¥¤>1 u]õ÷„Ô¹\XşQÉW9BÇŞ£¬i½‰ ` ÅVékª‰•Ç¬ËÚ(·<?¥„?şøß^¾•P³€ïqû®Ğw*vó<«\ÛÔô‰Àwİ¾D¤ÕÅ{±ßfx /Duú|0ø¹¾®²úZÜ±ÓÁ­‡7Rpı¹@ŸßÿñÇøïÿ‹ï}ûSN$˜N¦yR2–/å>M'ÌanúBpì°`‹NÔöŞvúÂÃ=é€æ­h¤1?¦İ™˜bƒÂîÅ(¤,ü™ùıOe ‚_~ı‚ó—³.H\"â5âizÂóùÁWrê’*œ8ï<Œ@:‡\tkË[™W%\;¨í>åbA1O· ù½dšæ}û>±ş‡€Ü$iZÂ•®Hçra¦0µUC®[Î5}¶õ|t$º(ƒrqGBŞºø:Å³ëÂÈ†.\vò¬Æ \ÒF!yVxyy)U²ø½bıOa ²ûxwÿ•uğ4 ÌÓ\ÚÁCÙgèó¶1d´ĞGíàÌÛŒÁ‡` èÔíÄÍT²–×Í Ø•İT‘cÓ³'è!ÂÏ{:xşÒp#ÈB>ŸŠ!œfĞD@*ÏéÒ{y‡aaY'P !ÀàÜf{xÌÚô)—¨)j"½^IŞÚ»÷·6€—Ë^./úıoÿúä)' HC“±(à|™Sô!H8$š2Ò5!Çmˆäz]ÁkõpD\ó+ÖŸÆãJ8B„×ëk!„uÏçsÓw E—®Ê{¯C1Gİ-üş eŸä‡L@¾f5 éLÒ_OŒ×Ë+¾­ß~ÿK@rûÏşSÊÁwv»Hh K^…œO0 ,Ø6Óö¤7–tîÿşßÿág½ıƒH*B„Ø    IEND®B`‚   
+   Texture2D 
+   Greyscale      
+   Greyscale 
+   Texture2D       Dimensions    128x128    HasAlphaChannel    False    ResourceSize    2.68 	   AddressX    TA_Wrap 	   AddressY    TA_Wrap    LODBias    0    SRGB    False    NeverStream    False    CompressionSettings 	   TC_Masks    Filter    TF_Default 	   LODGroup    TEXTUREGROUP_World                              é                                           ôzŠcª|O›wtÙ*Ô=á                     €                        €                                                                         	                            !                                          ­Xœ‹§1WG¿îì7»g”x              6       2   C:/Users/jonathan.lindquist/Desktop/Greyscale.tga                         2014.12.08-22.37.30                                                                           ­  è                Áƒ*           ¸      ­      ¸      ­      xœ­Rï‰PNG
+
+   IHDR   €   €   Ã>aË  tIDATxÚí][r1óC÷?qãôk;*‚ ¥uí&ñx½M[€@Š"©ëårù¼ü<¾ícüÏ_îz½Ò÷ìñùùIßÿàEV®;$P®ğdĞPĞøèİ{G2Œw=‚]ß5Œˆ ïD†ñÎ +dp}fûUĞß‰ãÕG@ï A¼çÊ8zÿŠD¯:•»	ĞıûÈŒW*¿@u™½wAUŒw şv»•êÀ”Àq™óWÍ|ğãñ	ñ­P½ª/°jûÙóz½~¹ÇHñß@™é]B(&aÕt$?~½^Keø/	À€ßï$ÂNè?«À|/’àñx<=Âø4¨€+×.V}€“§ IÿÆLˆ·%@:»ÇÀá8„@R¯GJ‚ùw?Ëív;İ$Œg€__f·
+¬Îş0$ıÇu|=fyF´øïoC (zUîuˆğLDào·Û—™_Ï•!şíùşË V«\«¦A!€bà€Gà×ùú "şíÙìöÆYàg ¯¼ïàlDp"	×H D‚Yfàg8~ßK@Õì^‡®C¨.ÇO?¾ÀÏï#¢ì"Áxø
+à	º*àú îì?^UğøQv’`<üÕ§¢gP1Šı˜A:Îê{	ÆnğUÜï÷-d`1fÛÁ,ô‹¢whæw@WóçÜA‚±{ægà#ÀÕ{25Ø© 3	"¢
+ çÇÇG
+~EˆƒT»” M€l™W:¿gÿ–İ_1+
+Ğ•~öõzırù)Œ¬Ñ+Œ§ “]\uÍˆ¡*S]
+Àf&ıÙì?®İœ…¨³“é’`tg~eçU³W‡®
+8« wö+²?ßİ±ÌÈà†Gwö«_ôı~	*pìüùz~uÕ)Ş;LÁA„ÓÀöéUĞİ{]d«ÇdŞÿ
+øÕ¬wkP|Áq
+G×éSƒ<Ğè½¢è}µ,d`E ¦ ˆ_|ÌÌ„8®ßdùÈ(J0\»@ñø*!dvèÊdK¾Ûíö‡LîgÀ«Y¯”§ed¯HĞ&€â ™‹1ì0»ämıF˜Ç6›ı1¥”ÏJ‰°… ÙLwÖıê3ûy‡ ª¨â Šü;@À+ÒÏÈP™ÅŒ®ü³íŞèÄuÈÀÌs«Õ@×¨¼ÿÙöÇ™ÆQ±ùY–0ÊB:^Vmt¥?¼K„®)ˆ$èú Ñ çlûãÌïÌôûı^’"~ÎÌ0XXÙøQ¤~Œ!©S´7ál¼T ¨ læ»ïä"Î¦ ’À&@•—¯Ô™ÀcP)«g)¨€Ô™×ıÎN_T•3>
+	†¾¬Öù|¦ÙïqA×	¬œ¿ƒHú‘PÍ~üı~—Ip I€VCñş:›@ª
+(&¡
+ÍŸ—-Ñ°ZşEùŸ‰à˜œø:ƒ]³b”øùº­ YF¯r½J˜?à˜ÕPå¿?#\õ:?Ïò¹Ğd›­
+JP³Wº@)¿ )At| ıË¿,•ËÉ:>À>^ã2o9VeË@F‹ NÎb½v–†#è8€ªã§¤z1©?¾" ™‹ š}e—NY	02¸ş@E‚ˆ$èÚı:
+ğÌàWJaS‡†³ôsBYH¸¬Ô 
+1G0)ÁŸÌëWÉ…@ŸG÷˜8D€P"€Y¤­RWÙ
+å° êÆàO´ÿóìwŠM*Ï>Û|/+>A&¡úŞƒ®øø)œUK qVŠıŸsü²Mg‹ñçX’Šãçç'&€ê2ğ™iXYTKCÅT} dÿQ‚‡B*'´{€Š g$`f áúÜe Ûpj\‡ÑY8 ê ¢>UòÏ†ÀŒcÇVQ FÒÑ™ılËuUşUà‡°
+	;!`Åñ«f|´û!2"Ìù]s0ºöôÉ#
+ì"@LíZ©+œAWTA!ƒÓAí/ JÇì «
+r”¡Š	¸@ûúÕÌ3ë‚^³BäûŒ•™¯”ƒ¯ÄºI$,[¨C€JØÌëzeæ+õ–ó=×ş§
+°jr8;‰Ğ1Œ Y’ÿlæwä[gÖg8Â8 +Qr{ô±`+fÁU‚Ìd«€Ì™Rl?ZÛwlü®>‰UÊÈÊ¦VJï¿*à,¨ÁŞL‚XÄ‰9ª€"3>«}”3œGæüÅ™¯Ä_İ]Tv]3™€¨ ,p·o3éW¿ïî®h–ƒÉÿ.E`q„•rE‚,& * ó³½ûnk·¦Û7ù‹ †UëõÎz³j ­6‘ìø€Ì˜ûû1’ İ9¥TMÕUCGÒH b¸[¹ºê#ì ¢ÑŒ³:öòc;†ÙFMüNÜ‹ªç@i²_æÎü•øB•‹¸ÒŒŠ ¥ueÕ8Yyv§“Ù®ñt0MM€âTTb'ÌÜ.V>RÖr%“şwïDí\PÙ¸ªXĞÍ ·1sT»VŞ«³Çu$Èqög-ÜÕ¸ªD}å8<Ü
+C¹8T±ÿ€’jÜ½	u‡2 JÌªq·_»ß¯3®Ü`N`õ>[*f2Åúß±{™„íL]gçª‰—î¹Eİ1Q–ëj«¹/¡àêPÅŠŒiêÏf?£˜ENYò
+ÊÚ™)U*òíWgœ³¿7ÀÜ.bŠôTLEªŠlÙ€ “f¸ó{ÏËœ·ãªøn5şº|ÓGÖ?à»=¾-Pó‡ïøUkg`‘SÅjáY­ú³ôë*áì™ı¿j|”ûÙÿWÇkXªœÍ~‘J>ÛcWòëYåM<—íÄ"÷tğêóvÆ@%[5ÎÙß
+U{UùŠ°º§–SU‰—Õ©ˆ (Ø=œ}Î˜TãêL8ZÜ‘¥‘aö;ƒZeÚÆÊÙy_?FşOÔaÇç®€WÆµk2†jƒ˜-­f.“o…Ê€³0-šíÙ^ +uI€~ÆùşÎ¸º¾ÛŸâĞÊQbVÉ¶j«°YŸ,L‹¶q³ïQ5Tz¹¤P}‹,2’ŒJ.Ôb‡JîÛÍ32B ªl€²cmàTÀ»Š±k<L‡â(¨~€.ëÃ«6gÕºUßİ¹6eÅz€ù©ªû>ÕX¨$Qí†ïP×¼ê,Î~&›)+àWÕºˆœQ%XŒ€©@E„.	*28(1Œ¡,/VºÒŞ=…ƒµc¯öó•¬`d¢
+ÄWå©Á®gµ\,ğÒQuVW@£YÈNßª*vT}vD Df*ÔïÛQ7îğÅtJßI‚¬/Â¨ÖêeÉ›³d>@õ™	ªÏÚ}ÅGP2:œ8OD‚Ø“G©ØÉ€9²ŠÈ®¿P)B|Å¡j€§ô`‘
+:’~tìZ>«¥¯V2øŒçÑqUÇñ¸c½ÎÌEmÖ2ğè±>¯J{f•:«åá]%pÉ€€W~¦C†Á'5üêFíT¹W\ŒŸÕêEï¥Cˆ>‹¸f¡]Ììÿ—eàªüwŠÜ»Ç¿"ØÙ#È!ê't|„Õ]Ê¿ÀÅİãÎ›K‚˜§W®ÍSVªµ£K˜J€_¿~µ|t7ä,™ gæGÙûÕ­,ímôœÕ'°Zÿ3àW–Œ™?°B}ú¹_]æ f@W2¯ä¹£Ï—Uëîîš9w	2b(ËÈÌV6Ëª­çÁ¾|Çd5¨R°³øD¬Ö=»Wp”õ²úŠíïÊ>$€2PjFD€*¤«J>
+ödmUÏêÎü|F%„ìî'T"Í
+v²f£ˆ§eÎ¶<Ï¢zŠV¿³ÏPÂ®ì¯ÆÔÌ¤’ Ğq©ªc‡Öù2˜ubˆâVjÀş»<ìfÑº Åd}ë2%ˆÛ·
+è•ƒ:ÏşƒÏ<3}˜X‘ùªS¨Æ¤Â'å:ÆÙâkUı
+Ë™ÀéXÈşŸ}jXF€®)psVR×iZ8|šåß£½ú
+pµãvtüù?ûÜÀş€³İ\å"ZN`–+h+s€$^!„k÷™çÿÌ“C+pÈÀL€²“È¶‘¥ÚÀ,"†€wHp8ºVjüİG3ÿÙg+aå03ÒİF®¼Y²•@ux:C¯:[=ĞáÉÈñ{…ÓÃ@5	lIX%¨à—¥aÌ˜­Ú§Ä™®ÌşÊî+òŸí(ÈJÈ•~wÇp5Ù¹<\±¿Ç@Æ^ºÕ,«ºnWŸÍ|µ7ŸâsT~ Ëª²ˆ;I$Z„-P‚CÈ ĞàÑ¬g;}Y¯>¥Ÿãº¹jÆ°›W˜e«AŸ% ÒêYâ€:mW"àÌæWM™³ö«l	Xõ$p\3°ÔòÕä¶°D !cDPÉŸÙü*æ¯È¿ë°¨ J F„•DÒ®ô/ )ƒÛÌIï,û¨;ú¨òßñTdàUK½*ŸPB f
+T“PÍ~v„zvlêNùßmX	#ÛP÷œ^2ĞhÌF½w:]GPÕ
+:Bİ=ˆÁI*U*¤:uŒÙ
+€½VK>‹ ól˜7fĞTg“ûà+M(ÕJ¨3HPıŒp- "¸ÿŸÍ8”å³zÂ–³÷ Äº%oÈ«û § VÛ:²SÕfÀg/vf¿XQ¥Ãóô¥_ü<î£E äf¦ j7W¬ŒÁöü»ö¿ã8KÃNÃ	wù×y´	0;…3	˜T}ñTÙ¯–}Èû_U ´èÀ­Pê-»% 8;}"Të¯œ(²S:¦`×s'ø[)AuğÒ
+èîŠYtRY¨-í*%pÉ T¯‚¿ 
+	PsF§ò8ÖDç/Û’v‚@U0HU€"¨€ï+	ÁàÏ¶>[j1ğc·5ôÛ5PI ¾¯»[	IpôL
+|Œ.ÆÌ£
+|–r6VÚİU×Yš×ÎÇv$˜ÁAƒŸ¯gÌ'y"3Pe#9›TJj¥^E
+åu÷ãÌK&BÜä‰„ˆd˜GÍ_… n/D–Ê[ğ6˜¥E5˜ÁEgøFà¯_=ŒJY	¨ş€J µ%ÜYS	í<já>—rÇãÚÔDTwöïVµ'0}·½ÿ'ˆ~š™ˆÔÃİ•**èAíüìYÿO6"İëÚYmW³s‹²Ğğ"t2yv=®—ËåŸœ—Ö==¼3ów)@W	:eÛÿ=*"(›;]ÇÏõ:a¶yô*À¿"t$·	Øa^ø—#@Ë½ãü±ÓÃgĞ%Cö÷¾=˜"t€?‹ +Dx¹q~UD"8×øª°J‚xıŠßı ±Àäc    IEND®B`‚ğ'ÕLÁƒ*                                                                                                                                                                                                                                                                                                           ¶’¯!÷Yh‚²Ğ¤Ë3‚‡y,W,¥}—ˆ æ±¹dFÈg7Ûª\Îné]ÿ}raOÚisÕ˜¤Ä¦ïÍ6|oMZvÌóÙ81³Î}m2ö7|éæµšÍ"B=Ö)[ûşºªR‰CÙnï¬«ÂúÖÿL¯áiFúæ,(·şP!8‹¨ÑMöˆa[ÌDû*’oŒáÜ¬”9áU¾Ïå¡2¹ù"àÏÅèg‰
+•èÄbypN[ÃF˜%âqw²•Q€
+ŠF#@lì½ÂÚÚıóiºª¨+—Æro=Geuôçe)/×sŞ@| Ä"Ö`YaÍì,Â÷Q1ò;ß ß9>l}?‡©¡êqŸ7çRè"vğ\X?E4/JvÓ³^ó™Û^ìÔœ9ÚÒ¥–DCjåWûÙ>¸êŠ‰İ¦˜³´Á[‰ÛŒúƒ¨[(lúêˆğìw_ã
+w¡Œ¤¤qd“Hz}HÜ’½ÅÄ?*cÏ×¸¦ïøucm‰2 Èß\ñÇ€pY9öÌ!yt‚(Ré©'¿ÿã(ıçzüZ—KfC
+ÓÀúbWRJrMçÊ0½ÏÒˆ5.1I MìqwÒĞ€ëYn‘Ú&‹[²²•ŞÀ×'?eUÀl`†‹TZc»ş8§xU\ó‚ÄF÷{¡ö†.‹ı¾ó½#89puÔ&ÈdãYØŞwßt·Ìˆ˜ğ‰Ú–C/5Æ]€û¦1XüÁ>¶ß |xñô|ÓÇËLš¡ğ‹Nå[ÌXO°6õF=1:˜-n­\ıÒT…4Ñk}Ø^˜aŠ!õ)s3Şd(tfÆÀÆ;!FSÅÁ¼¨›–:à}ÿ=oÛêûøÄ’ÀÇÎ¿N¦	$·q/â+l6óÚÛÆ?¸§ş‰BúkÂñE&ytTÖs5ß	y„\3›~9äÒlÉZsĞVu‡§Fû‡Œ\Tq¾õJö°¤¬a“òq¸,I%”÷BL³³F|Diş×C{$¦%mæáˆˆıF4§O¸2Pt½ó?à —¯Ï5É ‰ûú /†œDË•xD{tÓl>ÀJu–1ş%³×TŠÓ0_Ş×”ÕqT{2ı['Ú‡Öè‡şQŠ¸ÒğD	7ó9BÉqmAüçëpşüÿŸ³/kíYƒÃTÔ’{<éK
+ë¼şå#Ç¯áÙ}FşñL£1·ØüO{-7M2…õ7HI+
+Ì`>KúÒ±ó³Ó<~&@dñ›Ï’÷f ¾lğ­`&¬ñš—«3Y°#,”?Ã}jãn¦„ºÑ×4ş¸ŞĞ´C{şÃ
+1%ÊŠ<Ÿá8·eõ£øéœÛ#öDcÓ¬Ã
+ô&#:c@RÔ"©¬\„|à<»Éñ1s}¡&…ğe‰F™¯Y{ï×ƒäö+;cæí¬wšEéçÈ/í¯s-"_rúÍ„ùé¸c¦°¢1¾²SÚ™Ò¿3FCej,ıt¬ä·FaìQ·˜¶£ü{aü$Ù”º¯-4ÏIŸ£Xq~¼'¸İÇ­è¶ÒqÔcìtâ¿+ğ'Õ0ñ#99.iàäÇ¤-Ÿa•q1½´¼uÁÓ8ÓXîk`á}`×òG0½‡¥UU
++	¾•²0í§÷Õ2	²tS|ÌğÙÂÔı‚dÁ*ˆ7	óĞVêÑÓ÷™ë~¹ÿ	¹C =¥9“Rn‘È0¹˜ppg÷ˆ(g{|©N"#N[k[ˆwC‹,°a8„EŠıc——a'„&N{Ï4 Æé-Î†§eÖO9¥Ü 2L|
+VDy~QÑ>NSÆöÛÏDé–ô¡|Í®>º$€äC÷X¦QÎ”‹i¾5mòÖ¹ª<"óİás2=«[+É?nSm3ÿA
+¾_÷xîoï…½^Ù(oÊLßnY±ÍeHgy7#!S0RnñB^óû7Áşš—–Ìà¾ópÆês#‘â£,á&õ$ÅõŠŒ…å×VâK†›]TU`f¬>— S-*³ZN¥ŸÊÍPâ˜ƒª%¶®ÆtLãºÀI°[n¤ŒGgtP9sWvªcü¸iôfÃ¸ª¹%‘¾Â#Dı~ó0!#,,½Xğªƒ¯ äeW’PY;ì­çìú/5zë|–“”!-;ÿf$[“ŸY$k|«æÏ¾™Ş}±Í—¼onëş¹BÀPOû«üû¯î¥t— b“_UèÉíë›n{Ó&öj¾®¨} ).*çØ@r+oò^ë(¥Å‡eX™¶ S	c¼ãß İ²âõßÉD^D¶pƒ²$È×¾),¹
+}oBÂ¾µ ll›SmÜ\k¿@6[â63ã}Ê\(­ìŒıàc!J$Èºz7â¹»Ë³ä¡ê*A}gp÷Fû-`…²æ¸vš¨S<ªî²şµI|Tƒc…|_-³²Ú€Œ¦D*¢"…8Ù©SÛrşšHi{$îÿSë«9€¥‹õ0°Û#Jg‘Îs–ğÎã$Ş>Ô—òÁlînëØAÑI)Ìì¾©“¥C{¥IxB¦¤>0ÿ{½$~j,¤Î—Ö¡ş‹ƒ„A'pªh4»§×Å¹şwİêìÎxŒåÿÇ`àè&}Lm…F°œÏ‚ZL©Bì'èkSpjC:¥gJ‰-¬&r[ÈÏie6ç¤BI<ºÉ,‹|¥#tâÙÏå±vKrÎòš`€ÖL³“aĞ ÖîRÿ"–À¾FB_õZk×Â„ÇÎô}ë¡BXKháô¦ o,EVéáÎJÀiló$¿*Añm¤˜
+}Ùæ¶«/…ÄÒËË×¾ğ)IÁèËŸ5¡9Jÿ­¶uÚcãê èä_F¯ÔØeWy/›ó,Ğñ“w<Ø¼İcÎ_NİëÓVU…ÛÅ´ë6$k^(i¯Æ°|^]‹”•µöØyúNŒçòãbÚÃCŞö®ZıH©ıëŞÕâ^wú‘&M@*%ıe‰GĞŸ:{G34èıÙ‚±”™>!öş8:&äÜvjò<…\¦/MÑuï«æ© ”aFtd³XÇƒàTĞ¸İd†6)_Ö#åœ“Å±÷Š Oÿ !èì¥Ù>.®Ó)NğrWû»uãÃûe½÷[|¹£®6¿Øñ¦f¿Ú‹ı¶W*M-,–.LÊÙÔÎÄ¢…a,`åŸÅŠ…°6²İ=¯—˜/‹„º§İ)¨o•I"›ò÷™#	c‘‚±ZŸ•ŠO>	Ó9Ix\b¥ª…ÔVŒ+QjZ7IşƒÚT'¿fºRš‡°ÂôãîÕ«&É*u¹¿•…øÆÛ…NÏÛÉùO"cÁ>Vß”tZÆŒiö{Aì¬import unittest
+import Tkinter as tkinter
+from Tkinter import TclError
+import os
+import sys
+from test.test_support import requires, run_unittest
+
+from test_ttk.support import (tcl_version, requires_tcl, get_tk_patchlevel,
+                              widget_eq)
+from widget_tests import (
+    add_standard_options, noconv, noconv_meth, int_round, pixels_round,
+    AbstractWidgetTest, StandardOptionsTests,
+    IntegerSizeTests, PixelSizeTests,
+    setUpModule)
+
+requires('gui')
+
+
+class AbstractToplevelTest(AbstractWidgetTest, PixelSizeTests):
+    _conv_pad_pixels = noconv_meth
+
+    def test_class(self):
+        widget = self.create()
+        self.assertEqual(widget['class'],
+                         widget.__class__.__name__.title())
+        self.checkInvalidParam(widget, 'class', 'Foo',
+                errmsg="can't modify -class option after widget is created")
+        widget2 = self.create(class_='Foo')
+        self.assertEqual(widget2['class'], 'Foo')
+
+    def test_colormap(self):
+        widget = self.create()
+        self.assertEqual(widget['colormap'], '')
+        self.checkInvalidParam(widget, 'colormap', 'new',
+                errmsg="can't modify -colormap option after widget is created")
+        widget2 = self.create(colormap='new')
+        self.assertEqual(widget2['colormap'], 'new')
+
+    def test_container(self):
+        widget = self.create()
+        self.assertEqual(widget['container'], 0 if self.wantobjects else '0')
+        self.checkInvalidParam(widget, 'container', 1,
+                errmsg="can't modify -container option after widget is created")
+        widget2 = self.create(container=True)
+        self.assertEqual(widget2['container'], 1 if self.wantobjects else '1')
+
+    def test_visual(self):
+        widget = self.create()
+        self.assertEqual(widget['visual'], '')
+        self.checkInvalidParam(widget, 'visual', 'default',
+                errmsg="can't modify -visual option after widget is created")
+        widget2 = self.create(visual='default')
+        self.assertEqual(widget2['visual'], 'default')
+
+
+@add_standard_options(StandardOptionsTests)
+class ToplevelTest(AbstractToplevelTest, unittest.TestCase):
+    OPTIONS = (
+        'background', 'borderwidth',
+        'class', 'colormap', 'container', 'cursor', 'height',
+        'highlightbackground', 'highlightcolor', 'highlightthickness',
+        'menu', 'padx', 'pady', 'relief', 'screen',
+        'takefocus', 'use', 'visual', 'width',
+    )
+
+    def create(self, **kwargs):
+        return tkinter.Toplevel(self.root, **kwargs)
+
+    def test_menu(self):
+        widget = self.create()
+        menu = tkinter.Menu(self.root)
+        self.checkParam(widget, 'menu', menu, eq=widget_eq)
+        self.checkParam(widget, 'menu', '')
+
+    def test_screen(self):
+        widget = self.create()
+        self.assertEqual(widget['screen'], '')
+        try:
+            display = os.environ['DISPLAY']
+        except KeyError:
+            self.skipTest('No $DISPLAY set.')
+        self.checkInvalidParam(widget, 'screen', display,
+                errmsg="can't modify -screen option after widget is created")
+        widget2 = self.create(screen=display)
+        self.assertEqual(widget2['screen'], display)
+
+    def test_use(self):
+        widget = self.create()
+        self.assertEqual(widget['use'], '')
+        parent = self.create(container=True)
+        # hex() adds the 'L' suffix for longs
+        wid = '%#x' % parent.winfo_id()
+        widget2 = self.create(use=wid)
+        self.assertEqual(widget2['use'], wid)
+
+
+@add_standard_options(StandardOptionsTests)
+class FrameTest(AbstractToplevelTest, unittest.TestCase):
+    OPTIONS = (
+        'background', 'borderwidth',
+        'class', 'colormap', 'container', 'cursor', 'height',
+        'highlightbackground', 'highlightcolor', 'highlightthickness',
+        'padx', 'pady', 'relief', 'takefocus', 'visual', 'width',
+    )
+
+    def create(self, **kwargs):
+        return tkinter.Frame(self.root, **kwargs)
+
+
+@add_standard_options(StandardOptionsTests)
+class LabelFrameTest(AbstractToplevelTest, unittest.TestCase):
+    OPTIONS = (
+        'background', 'borderwidth',
+        'class', 'colormap', 'container', 'cursor',
+        'font', 'foreground', 'height',
+        'highlightbackground', 'highlightcolor', 'highlightthickness',
+        'labelanchor', 'labelwidget', 'padx', 'pady', 'relief',
+        'takefocus', 'text', 'visual', 'width',
+    )
+
+    def create(self, **kwargs):
+        return tkinter.LabelFrame(self.root, **kwargs)
+
+    def test_labelanchor(self):
+        widget = self.create()
+        self.checkEnumParam(widget, 'labelanchor',
+                            'e', 'en', 'es', 'n', 'ne', 'nw',
+                            's', 'se', 'sw', 'w', 'wn', 'ws')
+        self.checkInvalidParam(widget, 'labelanchor', 'center')
+
+    def test_labelwidget(self):
+        widget = self.create()
+        label = tkinter.Label(self.root, text='Mupp', name='foo')
+        self.checkParam(widget, 'labelwidget', label, expected='.foo')
+        label.destroy()
+
+
+class AbstractLabelTest(AbstractWidgetTest, IntegerSizeTests):
+    _conv_pixels = noconv_meth
+
+    def test_highlightthickness(self):
+        widget = self.create()
+        self.checkPixelsParam(widget, 'highlightthickness',
+                              0, 1.3, 2.6, 6, -2, '10p')
+
+
+@add_standard_options(StandardOptionsTests)
+class LabelTest(AbstractLabelTest, unittest.TestCase):
+    OPTIONS = (
+        'activebackground', 'activeforeground', 'anchor',
+        'background', 'bitmap', 'borderwidth', 'compound', 'cursor',
+        'disabledforeground', 'font', 'foreground', 'height',
+        'highlightbackground', 'highlightcolor', 'highlightthickness',
+        'image', 'justify', 'padx', 'pady', 'relief', 'state',
+        'takefocus', 'text', 'textvariable',
+        'underline', 'width', 'wraplength',
+    )
+
+    def create(self, **kwargs):
+        return tkinter.Label(self.root, **kwargs)
+
+
+@add_standard_options(StandardOptionsTests)
+class ButtonTest(AbstractLabelTest, unittest.TestCase):
+    OPTIONS = (
+        'activebackground', 'activeforeground', 'anchor',
+        'background', 'bitmap', 'borderwidth',
+        'command', 'compound', 'cursor', 'default',
+        'disabledforeground', 'font', 'foreground', 'height',
+        'highlightbackground', 'highlightcolor', 'highlightthickness',
+        'image', 'justify', 'overrelief', 'padx', 'pady', 'relief',
+        'repeatdelay', 'repeatinterval',
+        'state', 'takefocus', 'text', 'textvariable',
+        'underline', 'width', 'wraplength')
+
+    def create(self, **kwargs):
+        return tkinter.Button(self.root, **kwargs)
+
+    def test_default(self):
+        widget = self.create()
+        self.checkEnumParam(widget, 'default', 'active', 'disabled', 'normal')
+
+
+@add_standard_options(StandardOptionsTests)
+class CheckbuttonTest(AbstractLabelTest, unittest.TestCase):
+    OPTIONS = (
+        'activebackground', 'activeforeground', 'anchor',
+        'background', 'bitmap', 'borderwidth',
+        'command', 'compound', 'cursor',
+        'disabledforeground', 'font', 'foreground', 'height',
+        'highlightbackground', 'highlightcolor', 'highlightthickness',
+        'image', 'indicatoron', 'justify',
+        'offrelief', 'offvalue', 'onvalue', 'overrelief',
+        'padx', 'pady', 'relief', 'selectcolor', 'selectimage', 'state',
+        'takefocus', 'text', 'textvariable',
+        'tristateimage', 'tristatevalue',
+        'underline', 'variable', 'width', 'wraplength',
+    )
+
+    def create(self, **kwargs):
+        return tkinter.Checkbutton(self.root, **kwargs)
+
+
+    def test_offvalue(self):
+        widget = self.create()
+        self.checkParams(widget, 'offvalue', 1, 2.3, '', 'any string')
+
+    def test_onvalue(self):
+        widget = self.create()
+        self.checkParams(widget, 'onvalue', 1, 2.3, '', 'any string')
+
+
+@add_standard_options(StandardOptionsTests)
+class RadiobuttonTest(AbstractLabelTest, unittest.TestCase):
+    OPTIONS = (
+        'activebackground', 'activeforeground', 'anchor',
+        'background', 'bitmap', 'borderwidth',
+        'command', 'compound', 'cursor',
+        'disabledforeground', 'font', 'foreground', 'height',
+        'highlightbackground', 'highlightcolor', 'highlightthickness',
+        'image', 'indicatoron', 'justify', 'offrelief', 'overrelief',
+        'padx', 'pady', 'relief', 'selectcolor', 'selectimage', 'state',
+        'takefocus', 'text', 'textvariable',
+        'tristateimage', 'tristatevalue',
+        'underline', 'value', 'variable', 'width', 'wraplength',
+    )
+
+    def create(self, **kwargs):
+        return tkinter.Radiobutton(self.root, **kwargs)
+
+    def test_value(self):
+        widget = self.create()
+        self.checkParams(widget, 'value', 1, 2.3, '', 'any string')
+
+
+@add_standard_options(StandardOptionsTests)
+class MenubuttonTest(AbstractLabelTest, unittest.TestCase):
+    OPTIONS = (
+        'activebackground', 'activeforeground', 'anchor',
+        'background', 'bitmap', 'borderwidth',
+        'compound', 'cursor', 'direction',
+        'disabledforeground', 'font', 'foreground', 'height',
+        'highlightbackground', 'highlightcolor', 'highlightthickness',
+        'image', 'indicatoron', 'justify', 'menu',
+        'padx', 'pady', 'relief', 'state',
+        'takefocus', 'text', 'textvariable',
+        'underline', 'width', 'wraplength',
+    )
+    _conv_pixels = staticmethod(pixels_round)
+
+    def create(self, **kwargs):
+        return tkinter.Menubutton(self.root, **kwargs)
+
+    def test_direction(self):
+        widget = self.create()
+        self.checkEnumParam(widget, 'direction',
+                'above', 'below', 'flush', 'left', 'right')
+
+    def test_height(self):
+        widget = self.create()
+        self.checkIntegerParam(widget, 'height', 100, -100, 0, conv=str)
+
+    test_highlightthickness = StandardOptionsTests.test_highlightthickness.im_func
+
+    @unittest.skipIf(sys.platform == 'darwin',
+                     'crashes with Cocoa Tk (issue19733)')
+    def test_image(self):
+        widget = self.create()
+        image = tkinter.PhotoImage(master=self.root, name='image1')
+        self.checkParam(widget, 'image', image, conv=str)
+        errmsg = 'image "spam" doesn\'t exist'
+        with self.assertRaises(tkinter.TclError) as cm:
+            widget['image'] = 'spam'
+        if errmsg is not None:
+            self.assertEqual(str(cm.exception), errmsg)
+        with self.assertRaises(tkinter.TclError) as cm:
+            widget.configure({'image': 'spam'})
+        if errmsg is not None:
+            self.assertEqual(str(cm.exception), errmsg)
+
+    def test_menu(self):
+        widget = self.create()
+        menu = tkinter.Menu(widget, name='menu')
+        self.checkParam(widget, 'menu', menu, eq=widget_eq)
+        menu.destroy()
+
+    def test_padx(self):
+        widget = self.create()
+        self.checkPixelsParam(widget, 'padx', 3, 4.4, 5.6, '12m')
+        self.checkParam(widget, 'padx', -2, expected=0)
+
+    def test_pady(self):
+        widget = self.create()
+        self.checkPixelsParam(widget, 'pady', 3, 4.4, 5.6, '12m')
+        self.checkParam(widget, 'pady', -2, expected=0)
+
+    def test_width(self):
+        widget = self.create()
+        self.checkIntegerParam(widget, 'width', 402, -402, 0, conv=str)
+
+
+class OptionMenuTest(MenubuttonTest, unittest.TestCase):
+
+    def create(self, default='b', values=('a', 'b', 'c'), **kwargs):
+        return tkinter.OptionMenu(self.root, None, default, *values, **kwargs)
+
+
+@add_standard_options(IntegerSizeTests, StandardOptionsTests)
+class EntryTest(AbstractWidgetTest, unittest.TestCase):
+    OPTIONS = (
+        'background', 'borderwidth', 'cursor',
+        'disabledbackground', 'disabledforeground',
+        'exportselection', 'font', 'foreground',
+        'highlightbackground', 'highlightcolor', 'highlightthickness',
+        'insertbackground', 'insertborderwidth',
+        'insertofftime', 'insertontime', 'insertwidth',
+        'invalidcommand', 'justify', 'readonlybackground', 'relief',
+        'selectbackground', 'selectborderwidth', 'selectforeground',
+        'show', 'state', 'takefocus', 'textvariable',
+        'validate', 'validatecommand', 'width', 'xscrollcommand',
+    )
+
+    def create(self, **kwargs):
+        return tkinter.Entry(self.root, **kwargs)
+
+    def test_disabledbackground(self):
+        widget = self.create()
+        self.checkColorParam(widget, 'disabledbackground')
+
+    def test_insertborderwidth(self):
+        widget = self.create(insertwidth=100)
+        self.checkPixelsParam(widget, 'insertborderwidth',
+                              0, 1.3, 2.6, 6, -2, '10p')
+        # insertborderwidth is bounded above by a half of insertwidth.
+        self.checkParam(widget, 'insertborderwidth', 60, expected=100//2)
+
+    def test_insertwidth(self):
+        widget = self.create()
+        self.checkPixelsParam(widget, 'insertwidth', 1.3, 3.6, '10p')
+        self.checkParam(widget, 'insertwidth', 0.1, expected=2)
+        self.checkParam(widget, 'insertwidth', -2, expected=2)
+        if pixels_round(0.9) <= 0:
+            self.checkParam(widget, 'insertwidth', 0.9, expected=2)
+        else:
+            self.checkParam(widget, 'insertwidth', 0.9, expected=1)
+
+    def test_invalidcommand(self):
+        widget = self.create()
+        self.checkCommandParam(widget, 'invalidcommand')
+        self.checkCommandParam(widget, 'invcmd')
+
+    def test_readonlybackground(self):
+        widget = self.create()
+        self.checkColorParam(widget, 'readonlybackground')
+
+    def test_show(self):
+        widget = self.create()
+        self.checkParam(widget, 'show', '*')
+        self.checkParam(widget, 'show', '')
+        self.checkParam(widget, 'show', ' ')
+
+    def test_state(self):
+        widget = self.create()
+        self.checkEnumParam(widget, 'state',
+                            'disabled', 'normal', 'readonly')
+
+    def test_validate(self):
+        widget = self.create()
+        self.checkEnumParam(widget, 'validate',
+                'all', 'key', 'focus', 'focusin', 'focusout', 'none')
+
+    def test_validatecommand(self):
+        widget = self.create()
+        self.checkCommandParam(widget, 'validatecommand')
+        self.checkCommandParam(widget, 'vcmd')
+
+
+@add_standard_options(StandardOptionsTests)
+class SpinboxTest(EntryTest, unittest.TestCase):
+    OPTIONS = (
+        'activebackground', 'background', 'borderwidth',
+        'buttonbackground', 'buttoncursor', 'buttondownrelief', 'buttonuprelief',
+        'command', 'cursor', 'disabledbackground', 'disabledforeground',
+        'exportselection', 'font', 'foreground', 'format', 'from',
+        'highlightbackground', 'highlightcolor', 'highlightthickness',
+        'increment',
+        'insertbackground', 'insertborderwidth',
+        'insertofftime', 'insertontime', 'insertwidth',
+        'invalidcommand', 'justify', 'relief', 'readonlybackground',
+        'repeatdelay', 'repeatinterval',
+        'selectbackground', 'selectborderwidth', 'selectforeground',
+        'state', 'takefocus', 'textvariable', 'to',
+        'validate', 'validatecommand', 'values',
+        'width', 'wrap', 'xscrollcommand',
+    )
+
+    def create(self, **kwargs):
+        return tkinter.Spinbox(self.root, **kwargs)
+
+    test_show = None
+
+    def test_buttonbackground(self):
+        widget = self.create()
+        self.checkColorParam(widget, 'buttonbackground')
+
+    def test_buttoncursor(self):
+        widget = self.create()
+        self.checkCursorParam(widget, 'buttoncursor')
+
+    def test_buttondownrelief(self):
+        widget = self.create()
+        self.checkReliefParam(widget, 'buttondownrelief')
+
+    def test_buttonuprelief(self):
+        widget = self.create()
+        self.checkReliefParam(widget, 'buttonuprelief')
+
+    def test_format(self):
+        widget = self.create()
+        self.checkParam(widget, 'format', '%2f')
+        self.checkParam(widget, 'format', '%2.2f')
+        self.checkParam(widget, 'format', '%.2f')
+        self.checkParam(widget, 'format', '%2.f')
+        self.checkInvalidParam(widget, 'format', '%2e-1f')
+        self.checkInvalidParam(widget, 'format', '2.2')
+        self.checkInvalidParam(widget, 'format', '%2.-2f')
+        self.checkParam(widget, 'format', '%-2.02f')
+        self.checkParam(widget, 'format', '% 2.02f')
+        self.checkParam(widget, 'format', '% -2.200f')
+        self.checkParam(widget, 'format', '%09.200f')
+        self.checkInvalidParam(widget, 'format', '%d')
+
+    def test_from(self):
+        widget = self.create()
+        self.checkParam(widget, 'to', 100.0)
+        self.checkFloatParam(widget, 'from', -10, 10.2, 11.7)
+        self.checkInvalidParam(widget, 'from', 200,
+                errmsg='-to value must be greater than -from value')
+
+    def test_increment(self):
+        widget = self.create()
+        self.checkFloatParam(widget, 'increment', -1, 1, 10.2, 12.8, 0)
+
+    def test_to(self):
+        widget = self.create()
+        self.checkParam(widget, 'from', -100.0)
+        self.checkFloatParam(widget, 'to', -10, 10.2, 11.7)
+        self.checkInvalidParam(widget, 'to', -200,
+                errmsg='-to value must be greater than -from value')
+
+    def test_values(self):
+        # XXX
+        widget = self.create()
+        self.assertEqual(widget['values'], '')
+        self.checkParam(widget, 'values', 'mon tue wed thur')
+        self.checkParam(widget, 'values', ('mon', 'tue', 'wed', 'thur'),
+                        expected='mon tue wed thur')
+        self.checkParam(widget, 'values', (42, 3.14, '', 'any string'),
+                        expected='42 3.14 {} {any string}')
+        self.checkParam(widget, 'values', '')
+
+    def test_wrap(self):
+        widget = self.create()
+        self.checkBooleanParam(widget, 'wrap')
+
+    def test_bbox(self):
+        widget = self.create()
+        self.assertIsBoundingBox(widget.bbox(0))
+        self.assertRaises(tkinter.TclError, widget.bbox, 'noindex')
+        self.assertRaises(tkinter.TclError, widget.bbox, None)
+        self.assertRaises(TypeError, widget.bbox)
+        self.assertRaises(TypeError, widget.bbox, 0, 1)
+
+    def test_selection_element(self):
+        widget = self.create()
+        self.assertEqual(widget.selection_element(), "none")
+        widget.selection_element("buttonup")
+        self.assertEqual(widget.selection_element(), "buttonup")
+        widget.selection_element("buttondown")
+        self.assertEqual(widget.selection_element(), "buttondown")
+
+
+@add_standard_options(StandardOptionsTests)
+class TextTest(AbstractWidgetTest, unittest.TestCase):
+    OPTIONS = (
+        'autoseparators', 'background', 'blockcursor', 'borderwidth',
+        'cursor', 'endline', 'exportselection',
+        'font', 'foreground', 'height',
+        'highlightbackground', 'highlightcolor', 'highlightthickness',
+        'inactiveselectbackground', 'insertbackground', 'insertborderwidth',
+        'insertofftime', 'insertontime', 'insertunfocussed', 'insertwidth',
+        'maxundo', 'padx', 'pady', 'relief',
+        'selectbackground', 'selectborderwidth', 'selectforeground',
+        'setgrid', 'spacing1', 'spacing2', 'spacing3', 'startline', 'state',
+        'tabs', 'tabstyle', 'takefocus', 'undo', 'width', 'wrap',
+        'xscrollcommand', 'yscrollcommand',
+    )
+    if tcl_version < (8, 5):
+        _stringify = True
+
+    def create(self, **kwargs):
+        return tkinter.Text(self.root, **kwargs)
+
+    def test_autoseparators(self):
+        widget = self.create()
+        self.checkBooleanParam(widget, 'autoseparators')
+
+    @requires_tcl(8, 5)
+    def test_blockcursor(self):
+        widget = self.create()
+        self.checkBooleanParam(widget, 'blockcursor')
+
+    @requires_tcl(8, 5)
+    def test_endline(self):
+        widget = self.create()
+        text = '\n'.join('Line %d' for i in range(100))
+        widget.insert('end', text)
+        self.checkParam(widget, 'endline', 200, expected='')
+        self.checkParam(widget, 'endline', -10, expected='')
+        self.checkInvalidParam(widget, 'endline', 'spam',
+                errmsg='expected integer but got "spam"')
+        self.checkParam(widget, 'endline', 50)
+        self.checkParam(widget, 'startline', 15)
+        self.checkInvalidParam(widget, 'endline', 10,
+                errmsg='-startline must be less than or equal to -endline')
+
+    def test_height(self):
+        widget = self.create()
+        self.checkPixelsParam(widget, 'height', 100, 101.2, 102.6, '3c')
+        self.checkParam(widget, 'height', -100, expected=1)
+        self.checkParam(widget, 'height', 0, expected=1)
+
+    def test_maxundo(self):
+        widget = self.create()
+        self.checkIntegerParam(widget, 'maxundo', 0, 5, -1)
+
+    @requires_tcl(8, 5)
+    def test_inactiveselectbackground(self):
+        widget = self.create()
+        self.checkColorParam(widget, 'inactiveselectbackground')
+
+    @requires_tcl(8, 6)
+    def test_insertunfocussed(self):
+        widget = self.create()
+        self.checkEnumParam(widget, 'insertunfocussed',
+                            'hollow', 'none', 'solid')
+
+    def test_selectborderwidth(self):
+        widget = self.create()
+        self.checkPixelsParam(widget, 'selectborderwidth',
+                              1.3, 2.6, -2, '10p', conv=noconv,
+                              keep_orig=tcl_version >= (8, 5))
+
+    def test_spacing1(self):
+        widget = self.create()
+        self.checkPixelsParam(widget, 'spacing1', 20, 21.4, 22.6, '0.5c')
+        self.checkParam(widget, 'spacing1', -5, expected=0)
+
+    def test_spacing2(self):
+        widget = self.create()
+        self.checkPixelsParam(widget, 'spacing2', 5, 6.4, 7.6, '0.1c')
+        self.checkParam(widget, 'spacing2', -1, expected=0)
+
+    def test_spacing3(self):
+        widget = self.create()
+        self.checkPixelsParam(widget, 'spacing3', 20, 21.4, 22.6, '0.5c')
+        self.checkParam(widget, 'spacing3', -10, expected=0)
+
+    @requires_tcl(8, 5)
+    def test_startline(self):
+        widget = self.create()
+        text = '\n'.join('Line %d' for i in range(100))
+        widget.insert('end', text)
+        self.checkParam(widget, 'startline', 200, expected='')
+        self.checkParam(widget, 'startline', -10, expected='')
+        self.checkInvalidParam(widget, 'startline', 'spam',
+                errmsg='expected integer but got "spam"')
+        self.checkParam(widget, 'startline', 10)
+        self.checkParam(widget, 'endline', 50)
+        self.checkInvalidParam(widget, 'startline', 70,
+                errmsg='-startline must be less than or equal to -endline')
+
+    def test_state(self):
+        widget = self.create()
+        if tcl_version < (8, 5):
+            self.checkParams(widget, 'state', 'disabled', 'normal')
+        else:
+            self.checkEnumParam(widget, 'state', 'disabled', 'normal')
+
+    def test_tabs(self):
+        widget = self.create()
+        if get_tk_patchlevel() < (8, 5, 11):
+            self.checkParam(widget, 'tabs', (10.2, 20.7, '1i', '2i'),
+                            expected=('10.2', '20.7', '1i', '2i'))
+        else:
+            self.checkParam(widget, 'tabs', (10.2, 20.7, '1i', '2i'))
+        self.checkParam(widget, 'tabs', '10.2 20.7 1i 2i',
+                        expected=('10.2', '20.7', '1i', '2i'))
+        self.checkParam(widget, 'tabs', '2c left 4c 6c center',
+                        expected=('2c', 'left', '4c', '6c', 'center'))
+        self.checkInvalidParam(widget, 'tabs', 'spam',
+                               errmsg='bad screen distance "spam"',
+                               keep_orig=tcl_version >= (8, 5))
+
+    @requires_tcl(8, 5)
+    def test_tabstyle(self):
+        widget = self.create()
+        self.checkEnumParam(widget, 'tabstyle', 'tabular', 'wordprocessor')
+
+    def test_undo(self):
+        widget = self.create()
+        self.checkBooleanParam(widget, 'undo')
+
+    def test_width(self):
+        widget = self.create()
+        self.checkIntegerParam(widget, 'width', 402)
+        self.checkParam(widget, 'width', -402, expected=1)
+        self.checkParam(widget, 'width', 0, expected=1)
+
+    def test_wrap(self):
+        widget = self.create()
+        if tcl_version < (8, 5):
+            self.checkParams(widget, 'wrap', 'char', 'none', 'word')
+        else:
+            self.checkEnumParam(widget, 'wrap', 'char', 'none', 'word')
+
+    def test_bbox(self):
+        widget = self.create()
+        self.assertIsBoundingBox(widget.bbox('1.1'))
+        self.assertIsNone(widget.bbox('end'))
+        self.assertRaises(tkinter.TclError, widget.bbox, 'noindex')
+        self.assertRaises(tkinter.TclError, widget.bbox, None)
+        self.assertRaises(tkinter.TclError, widget.bbox)
+        self.assertRaises(tkinter.TclError, widget.bbox, '1.1', 'end')
+
+
+@add_standard_options(PixelSizeTests, StandardOptionsTests)
+class CanvasTest(AbstractWidgetTest, unittest.TestCase):
+    OPTIONS = (
+        'background', 'borderwidth',
+        'closeenough', 'confine', 'cursor', 'height',
+        'highlightbackground', 'highlightcolor', 'highlightthickness',
+        'insertbackground', 'insertborderwidth',
+        'insertofftime', 'insertontime', 'insertwidth',
+        'offset', 'relief', 'scrollregion',
+        'selectbackground', 'selectborderwidth', 'selectforeground',
+        'state', 'takefocus',
+        'xscrollcommand', 'xscrollincrement',
+        'yscrollcommand', 'yscrollincrement', 'width',
+    )
+
+    _conv_pixels = staticmethod(int_round)
+    _stringify = True
+
+    def create(self, **kwargs):
+        return tkinter.Canvas(self.root, **kwargs)
+
+    def test_closeenough(self):
+        widget = self.create()
+        self.checkFloatParam(widget, 'closeenough', 24, 2.4, 3.6, -3,
+                             conv=float)
+
+    def test_confine(self):
+        widget = self.create()
+        self.checkBooleanParam(widget, 'confine')
+
+    def test_offset(self):
+        widget = self.create()
+        self.assertEqual(widget['offset'], '0,0')
+        self.checkParams(widget, 'offset',
+                'n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw', 'center')
+        self.checkParam(widget, 'offset', '10,20')
+        self.checkParam(widget, 'offset', '#5,6')
+        self.checkInvalidParam(widget, 'offset', 'spam')
+
+    def test_scrollregion(self):
+        widget = self.create()
+        self.checkParam(widget, 'scrollregion', '0 0 200 150')
+        self.checkParam(widget, 'scrollregion', (0, 0, 200, 150),
+                        expected='0 0 200 150')
+        self.checkParam(widget, 'scrollregion', '')
+        self.checkInvalidParam(widget, 'scrollregion', 'spam',
+                               errmsg='bad scrollRegion "spam"')
+        self.checkInvalidParam(widget, 'scrollregion', (0, 0, 200, 'spam'))
+        self.checkInvalidParam(widget, 'scrollregion', (0, 0, 200))
+        self.checkInvalidParam(widget, 'scrollregion', (0, 0, 200, 150, 0))
+
+    def test_state(self):
+        widget = self.create()
+        self.checkEnumParam(widget, 'state', 'disabled', 'normal',
+                errmsg='bad state value "{}": must be normal or disabled')
+
+    def test_xscrollincrement(self):
+        widget = self.create()
+        self.checkPixelsParam(widget, 'xscrollincrement',
+                              40, 0, 41.2, 43.6, -40, '0.5i')
+
+    def test_yscrollincrement(self):
+        widget = self.create()
+        self.checkPixelsParam(widget, 'yscrollincrement',
+                              10, 0, 11.2, 13.6, -10, '0.1i')
+
+
+@add_standard_options(IntegerSizeTests, StandardOptionsTests)
+class ListboxTest(AbstractWidgetTest, unittest.TestCase):
+    OPTIONS = (
+        'activestyle', 'background', 'borderwidth', 'cursor',
+        'disabledforeground', 'exportselection',
+        'font', 'foreground', 'height',
+        'highlightbackground', 'highlightcolor', 'highlightthickness',
+        'justify', 'listvariable', 'relief',
+        'selectbackground', 'selectborderwidth', 'selectforeground',
+        'selectmode', 'setgrid', 'state',
+        'takefocus', 'width', 'xscrollcommand', 'yscrollcommand',
+    )
+
+    def create(self, **kwargs):
+        return tkinter.Listbox(self.root, **kwargs)
+
+    def test_activestyle(self):
+        widget = self.create()
+        self.checkEnumParam(widget, 'activestyle',
+                            'dotbox', 'none', 'underline')
+
+    test_justify = requires_tcl(8, 6, 5)(StandardOptionsTests.test_justify.im_func)
+
+    def test_listvariable(self):
+        widget = self.create()
+        var = tkinter.DoubleVar(self.root)
+        self.checkVariableParam(widget, 'listvariable', var)
+
+    def test_selectmode(self):
+        widget = self.create()
+        self.checkParam(widget, 'selectmode', 'single')
+        self.checkParam(widget, 'selectmode', 'browse')
+        self.checkParam(widget, 'selectmode', 'multiple')
+        self.checkParam(widget, 'selectmode', 'extended')
+
+    def test_state(self):
+        widget = self.create()
+        self.checkEnumParam(widget, 'state', 'disabled', 'normal')
+
+    def test_itemconfigure(self):
+        widget = self.create()
+        with self.assertRaisesRegexp(TclError, 'item number "0" out of range'):
+            widget.itemconfigure(0)
+        colors = 'red orange yellow green blue white violet'.split()
+        widget.insert('end', *colors)
+        for i, color in enumerate(colors):
+            widget.itemconfigure(i, background=color)
+        with self.assertRaises(TypeError):
+            widget.itemconfigure()
+        with self.assertRaisesRegexp(TclError, 'bad listbox index "red"'):
+            widget.itemconfigure('red')
+        self.assertEqual(widget.itemconfigure(0, 'background'),
+                         ('background', 'background', 'Background', '', 'red'))
+        self.assertEqual(widget.itemconfigure('end', 'background'),
+                         ('background', 'background', 'Background', '', 'violet'))
+        self.assertEqual(widget.itemconfigure('@0,0', 'background'),
+                         ('background', 'background', 'Background', '', 'red'))
+
+        d = widget.itemconfigure(0)
+        self.assertIsInstance(d, dict)
+        for k, v in d.items():
+            self.assertIn(len(v), (2, 5))
+            if len(v) == 5:
+                self.assertEqual(v, widget.itemconfigure(0, k))
+                self.assertEqual(v[4], widget.itemcget(0, k))
+
+    def check_itemconfigure(self, name, value):
+        widget = self.create()
+        widget.insert('end', 'a', 'b', 'c', 'd')
+        widget.itemconfigure(0, **{name: value})
+        self.assertEqual(widget.itemconfigure(0, name)[4], value)
+        self.assertEqual(widget.itemcget(0, name), value)
+        with self.assertRaisesRegexp(TclError, 'unknown color name "spam"'):
+            widget.itemconfigure(0, **{name: 'spam'})
+
+    def test_itemconfigure_background(self):
+        self.check_itemconfigure('background', '#ff0000')
+
+    def test_itemconfigure_bg(self):
+        self.check_itemconfigure('bg', '#ff0000')
+
+    def test_itemconfigure_fg(self):
+        self.check_itemconfigure('fg', '#110022')
+
+    def test_itemconfigure_foreground(self):
+        self.check_itemconfigure('foreground', '#110022')
+
+    def test_itemconfigure_selectbackground(self):
+        self.check_itemconfigure('selectbackground', '#110022')
+
+    def test_itemconfigure_selectforeground(self):
+        self.check_itemconfigure('selectforeground', '#654321')
+
+    def test_box(self):
+        lb = self.create()
+        lb.insert(0, *('el%d' % i for i in range(8)))
+        lb.pack()
+        self.assertIsBoundingBox(lb.bbox(0))
+        self.assertIsNone(lb.bbox(-1))
+        self.assertIsNone(lb.bbox(10))
+        self.assertRaises(TclError, lb.bbox, 'noindex')
+        self.assertRaises(TclError, lb.bbox, None)
+        self.assertRaises(TypeError, lb.bbox)
+        self.assertRaises(TypeError, lb.bbox, 0, 1)
+
+    def test_curselection(self):
+        lb = self.create()
+        lb.insert(0, *('el%d' % i for i in range(8)))
+        lb.selection_clear(0, tkinter.END)
+        lb.selection_set(2, 4)
+        lb.selection_set(6)
+        self.assertEqual(lb.curselection(), (2, 3, 4, 6))
+        self.assertRaises(TypeError, lb.curselection, 0)
+
+    def test_get(self):
+        lb = self.create()
+        lb.insert(0, *('el%d' % i for i in range(8)))
+        self.assertEqual(lb.get(0), 'el0')
+        self.assertEqual(lb.get(3), 'el3')
+        self.assertEqual(lb.get('end'), 'el7')
+        self.assertEqual(lb.get(8), '')
+        self.assertEqual(lb.get(-1), '')
+        self.assertEqual(lb.get(3, 5), ('el3', 'el4', 'el5'))
+        self.assertEqual(lb.get(5, 'end'), ('el5', 'el6', 'el7'))
+        self.assertEqual(lb.get(5, 0), ())
+        self.assertEqual(lb.get(0, 0), ('el0',))
+        self.assertRaises(TclError, lb.get, 'noindex')
+        self.assertRaises(TclError, lb.get, None)
+        self.assertRaises(TypeError, lb.get)
+        self.assertRaises(TclError, lb.get, 'end', 'noindex')
+        self.assertRaises(TypeError, lb.get, 1, 2, 3)
+        self.assertRaises(TclError, lb.get, 2.4)
+
+
+@add_standard_options(PixelSizeTests, St

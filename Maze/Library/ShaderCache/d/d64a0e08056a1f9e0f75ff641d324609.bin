@@ -1,0 +1,68 @@
+               cnv->UCharErrorBuffer[0]=c;
+                cnv->UCharErrorBufferLength=1;
+                *pErrorCode=U_BUFFER_OVERFLOW_ERROR;
+
+                offset=0;
+                break;
+            }
+        } else if(action==MBCS_STATE_CHANGE_ONLY) {
+            /*
+             * This serves as a state change without any output.
+             * It is useful for reading simple stateful encodings,
+             * for example using just Shift-In/Shift-Out codes.
+             * The 21 unused bits may later be used for more sophisticated
+             * state transitions.
+             */
+            if(cnv->sharedData->mbcs.dbcsOnlyState==0) {
+                byteIndex=0;
+            } else {
+                /* SI/SO are illegal for DBCS-only conversion */
+                state=(uint8_t)(cnv->mode); /* restore the previous state */
+
+                /* callback(illegal) */
+                *pErrorCode=U_ILLEGAL_CHAR_FOUND;
+            }
+        } else if(action==MBCS_STATE_FALLBACK_DIRECT_16) {
+            if(UCNV_TO_U_USE_FALLBACK(cnv)) {
+                /* output BMP code point */
+                *target++=(UChar)MBCS_ENTRY_FINAL_VALUE_16(entry);
+                if(offsets!=NULL) {
+                    *offsets++=sourceIndex;
+                }
+                byteIndex=0;
+            }
+        } else if(action==MBCS_STATE_UNASSIGNED) {
+            /* just fall through */
+        } else if(action==MBCS_STATE_ILLEGAL) {
+            /* callback(illegal) */
+            *pErrorCode=U_ILLEGAL_CHAR_FOUND;
+        } else {
+            /* reserved, must never occur */
+            byteIndex=0;
+        }
+
+        /* end of action codes: prepare for a new character */
+        offset=0;
+
+        if(byteIndex==0) {
+            sourceIndex=nextSourceIndex;
+        } else if(U_FAILURE(*pErrorCode)) {
+            /* callback(illegal) */
+            if(byteIndex>1) {
+                /*
+                 * Ticket 5691: consistent illegal sequences:
+                 * - We include at least the first byte in the illegal sequence.
+                 * - If any of the non-initial bytes could be the start of a character,
+                 *   we stop the illegal sequence before the first one of those.
+                 */
+                UBool isDBCSOnly=(UBool)(cnv->sharedData->mbcs.dbcsOnlyState!=0);
+                int8_t i;
+                for(i=1;
+                    i<byteIndex && !isSingleOrLead(stateTable, state, isDBCSOnly, bytes[i]);
+                    ++i) {}
+                if(i<byteIndex) {
+                    /* Back out some bytes. */
+                    int8_t backOutDistance=byteIndex-i;
+                    int32_t bytesFromThisBuffer=(int32_t)(source-(const uint8_t *)pArgs->source);
+                    byteIndex=i;  /* length of reported illegal byte sequence */
+                    if(backOutDistance<

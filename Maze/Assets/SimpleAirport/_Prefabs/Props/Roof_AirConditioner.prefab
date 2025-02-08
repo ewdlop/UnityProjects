@@ -1,0 +1,96 @@
+_destroy_func = key_destroy_func;
+	hash->value_destroy_func = value_destroy_func;
+	
+	return hash;
+}
+
+#endif
+
+static void
+do_rehash (MonoValueHashTable *hash)
+{
+	int i;
+	int old_size;
+	Slot *old_table;
+
+	old_size = hash->table_size;
+	old_table = hash->table;
+
+	mono_value_hash_table_set_shift_from_size (hash, hash->in_use * 2);
+
+	/* printf ("New size: %d\n", hash->table_size); */
+	hash->table = g_new0 (Slot, hash->table_size);
+	
+	for (i = 0; i < old_size; i++){
+		Slot *s = &old_table [i];
+		Slot *new_s;
+		guint hash_val;
+		guint step = 0;
+		gpointer s_value, s_key;
+
+		if (IS_EMPTY (s) || IS_TOMBSTONE (s))
+			continue;
+
+		s_value = GET_VALUE (s);
+		s_key = hash->key_extract_func (s_value);
+		hash_val = HASH (hash, s_key) & hash->table_mask;
+		new_s = &hash->table [hash_val];
+
+		while (!IS_EMPTY (new_s)) {
+			step++;
+			hash_val += step;
+			hash_val &= hash->table_mask;
+			new_s = &hash->table [hash_val];
+		}
+
+		*new_s = *s;
+	}
+	g_free (old_table);
+	hash->n_occupied = hash->in_use;
+}
+
+static void
+rehash (MonoValueHashTable *hash)
+{
+	int n_occupied = hash->n_occupied;
+	int table_size = hash->table_size;
+
+	if ((table_size > hash->in_use * 4 && table_size > 1 << HASH_TABLE_MIN_SHIFT) ||
+	    (table_size <= n_occupied + (n_occupied / 16)))
+		do_rehash (hash);
+}
+
+static void
+mono_value_hash_table_insert_replace (MonoValueHashTable *hash, gpointer key, gpointer value, gboolean replace)
+{
+	guint hashcode;
+	Slot *s;
+	guint s_index;
+	GEqualFunc equal;
+	guint first_tombstone = 0;
+	gboolean have_tombstone = FALSE;
+	guint step = 0;
+
+	g_assert (value);
+	g_assert (hash->key_extract_func (value) == key);
+	
+	g_return_if_fail (hash != NULL);
+
+	hashcode = HASH (hash, key);
+
+	s_index = hashcode & hash->table_mask;
+	s = &hash->table [s_index];
+
+	equal = hash->key_equal_func;
+
+	while (!IS_EMPTY (s)) {
+		gpointer s_value = GET_VALUE (s);
+		gpointer s_key = hash->key_extract_func (s_value);
+		guint s_key_hash = HASH (hash, s_key);
+		if (s_key_hash == hashcode && (*equal) (s_key, key)) {
+			if (replace){
+				if (hash->key_destroy_func != NULL)
+					(*hash->key_destroy_func)(s_key);
+			}
+			if (hash->value_destroy_func != NULL)
+				(*hash->value_destroy_func) (GET_

@@ -1,0 +1,136 @@
+// -----------------------------------------------------------------------
+// Copyright (c) Microsoft Corporation.  All rights reserved.
+// -----------------------------------------------------------------------
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.ComponentModel.Composition.Primitives;
+using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
+using System.Diagnostics.Contracts;
+using System.Threading;
+using Microsoft.Internal;
+
+namespace System.ComponentModel.Composition.Hosting
+{
+    public partial class CompositionContainer : ExportProvider, ICompositionService, IDisposable
+    {
+        private CompositionOptions _compositionOptions;
+        private ImportEngine _importEngine;
+        private ComposablePartExportProvider _partExportProvider;
+        private ExportProvider _rootProvider;
+        private CatalogExportProvider _catalogExportProvider;
+
+        private AggregateExportProvider _localExportProvider;
+        private AggregateExportProvider _ancestorExportProvider;
+        
+        private readonly ReadOnlyCollection<ExportProvider> _providers;
+        private volatile bool _isDisposed = false;
+        private object _lock = new object();
+        private static ReadOnlyCollection<ExportProvider> EmptyProviders = new ReadOnlyCollection<ExportProvider>(new ExportProvider[]{});
+
+        /// <summary>
+        ///     Initializes a new instance of the <see cref="CompositionContainer"/> class.
+        /// </summary>
+        public CompositionContainer()
+            : this((ComposablePartCatalog)null)
+        {
+        }
+
+        /// <summary>
+        ///     Initializes a new instance of the <see cref="CompositionContainer"/> class 
+        ///     with the specified export providers.
+        /// </summary>
+        /// <param name="providers">
+        ///     A <see cref="Array"/> of <see cref="ExportProvider"/> objects which provide 
+        ///     the <see cref="CompositionContainer"/> access to <see cref="Export"/> objects,
+        ///     or <see langword="null"/> to set <see cref="Providers"/> to an empty
+        ///     <see cref="ReadOnlyCollection{T}"/>.
+        /// </param>
+        /// <exception cref="ArgumentException">
+        ///     <paramref name="providers"/> contains an element that is <see langword="null"/>.
+        /// </exception>
+        public CompositionContainer(params ExportProvider[] providers) : 
+            this((ComposablePartCatalog)null, providers)
+        {
+        }
+
+        /// <summary>
+        ///     Initializes a new instance of the <see cref="CompositionContainer"/> class 
+        ///     with the specified export providers.
+        /// </summary>
+        /// <param name="compositionOPtionss">
+        ///     <see cref="CompositionOptions"/> enumeration with flags controlling the composition.
+        /// </param>
+        /// <param name="providers">
+        ///     A <see cref="Array"/> of <see cref="ExportProvider"/> objects which provide 
+        ///     the <see cref="CompositionContainer"/> access to <see cref="Export"/> objects,
+        ///     or <see langword="null"/> to set <see cref="Providers"/> to an empty
+        ///     <see cref="ReadOnlyCollection{T}"/>.
+        /// </param>
+        /// <exception cref="ArgumentException">
+        ///     <paramref name="providers"/> contains an element that is <see langword="null"/>.
+        /// </exception>
+        public CompositionContainer(CompositionOptions compositionOptions, params ExportProvider[] providers) : 
+            this((ComposablePartCatalog)null, compositionOptions, providers)
+        {
+        }
+
+        /// <summary>
+        ///     Initializes a new instance of the <see cref="CompositionContainer"/> class 
+        ///     with the specified catalog and export providers.
+        /// </summary>
+        /// <param name="providers">
+        ///     A <see cref="Array"/> of <see cref="ExportProvider"/> objects which provide 
+        ///     the <see cref="CompositionContainer"/> access to <see cref="Export"/> objects,
+        ///     or <see langword="null"/> to set <see cref="Providers"/> to an empty 
+        ///     <see cref="ReadOnlyCollection{T}"/>.
+        /// </param>
+        /// <exception cref="ArgumentException">
+        ///     <paramref name="providers"/> contains an element that is <see langword="null"/>.
+        /// </exception>
+        public CompositionContainer(ComposablePartCatalog catalog, params ExportProvider[] providers): 
+            this(catalog, false, providers)
+        {
+        }
+
+        /// <summary>
+        ///     Initializes a new instance of the <see cref="CompositionContainer"/> class 
+        ///     with the specified catalog and export providers.
+        /// </summary>
+        /// <param name="isThreadSafe">
+        ///     <see cref="bool"/> indicates whether container instances are threadsafe.
+        /// </param>
+        /// <param name="providers">
+        ///     A <see cref="Array"/> of <see cref="ExportProvider"/> objects which provide 
+        ///     the <see cref="CompositionContainer"/> access to <see cref="Export"/> objects,
+        ///     or <see langword="null"/> to set <see cref="Providers"/> to an empty 
+        ///     <see cref="ReadOnlyCollection{T}"/>.
+        /// </param>
+        /// <exception cref="ArgumentException">
+        ///     <paramref name="providers"/> contains an element that is <see langword="null"/>.
+        /// </exception>
+        public CompositionContainer(ComposablePartCatalog catalog, bool isThreadSafe, params ExportProvider[] providers)
+            : this(catalog, isThreadSafe ? CompositionOptions.IsThreadSafe : CompositionOptions.Default, providers)
+        {
+        }
+
+        /// <summary>
+        ///     Initializes a new instance of the <see cref="CompositionContainer"/> class 
+        ///     with the specified catalog and export providers.
+        /// </summary>
+        /// <param name="compositionSettings">
+        ///     <see cref="CompositionOptions"/> enumeration with flags controlling the composition.
+        /// </param>
+        /// <param name="providers">
+        ///     A <see cref="Array"/> of <see cref="ExportProvider"/> objects which provide 
+        ///     the <see cref="CompositionContainer"/> access to <see cref="Export"/> objects,
+        ///     or <see langword="null"/> to set <see cref="Providers"/> to an empty 
+        ///     <see cref="ReadOnlyCollection{T}"/>.
+        /// </param>
+        /// <exception cref="ArgumentException">
+        ///     <paramref name="providers"/> contains an element that is <see langword="null"/>.
+        /// </exception>
+        public CompositionContainer(ComposablePartCatalog catalog, CompositionOptions compositionOptions, params ExportProvider[] providers)
+        {
+            if (compositionOptions > (CompositionOptions.DisableSilentRejection | CompositionOptions.IsThreadSafe | CompositionOptions.

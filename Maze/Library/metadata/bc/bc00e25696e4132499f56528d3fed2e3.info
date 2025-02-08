@@ -1,0 +1,225 @@
+			}
+#endif // PLATFORM_DESKTOP
+
+			NewFilter.DenyList.NumIDs = DenyIds.Num();
+			NewFilter.DenyList.pIDList = DenyIds.GetData();
+
+			pd3dInfoQueue->PushStorageFilter(&NewFilter);
+
+			// Break on D3D debug errors.
+			pd3dInfoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, true);
+
+			// Enable this to break on a specific id in order to quickly get a callstack
+			//pd3dInfoQueue->SetBreakOnID(D3D12_MESSAGE_ID_DEVICE_DRAW_CONSTANT_BUFFER_TOO_SMALL, true);
+
+			if (FParse::Param(FCommandLine::Get(), TEXT("d3dbreakonwarning")))
+			{
+				pd3dInfoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, true);
+			}
+
+			pd3dInfoQueue->Release();
+		}
+	}
+#endif
+
+#if WITH_MGPU
+	GNumExplicitGPUsForRendering = 1;
+	if (Desc.NumDeviceNodes > 1)
+	{
+		// Can't access GAllowMultiGPUInEditor directly as its value is cached but hasn't been set by console manager due to module loading order
+		static IConsoleVariable* AllowMultiGPUInEditor = IConsoleManager::Get().FindConsoleVariable(TEXT("r.AllowMultiGPUInEditor"));
+
+		if (GIsEditor && AllowMultiGPUInEditor->GetInt() == 0)
+		{
+			UE_LOG(LogD3D12RHI, Log, TEXT("Multi-GPU is available, but skipping due to editor mode."));
+		}
+		else
+		{
+			GNumExplicitGPUsForRendering = Desc.NumDeviceNodes;
+			UE_LOG(LogD3D12RHI, Log, TEXT("Enabling multi-GPU with %d nodes"), Desc.NumDeviceNodes);
+		}
+	}
+
+	// Viewport ignores AFR if PresentGPU is specified.
+	int32 Dummy;
+	if (!FParse::Value(FCommandLine::Get(), TEXT("PresentGPU="), Dummy))
+	{
+		bool bWantsAFR = false;
+		if (FParse::Value(FCommandLine::Get(), TEXT("NumAFRGroups="), GNumAlternateFrameRenderingGroups))
+		{
+			bWantsAFR = true;
+		}
+		else if (FParse::Param(FCommandLine::Get(), TEXT("AFR")))
+		{
+			bWantsAFR = true;
+			GNumAlternateFrameRenderingGroups = GNumExplicitGPUsForRendering;
+		}
+
+		if (bWantsAFR)
+		{
+			if (GNumAlternateFrameRenderingGroups <= 1 || GNumAlternateFrameRenderingGroups > GNumExplicitGPUsForRendering)
+			{
+				UE_LOG(LogD3D12RHI, Error, TEXT("Cannot enable alternate frame rendering because NumAFRGroups (%u) must be > 1 and <= MaxGPUCount (%u)"), GNumAlternateFrameRenderingGroups, GNumExplicitGPUsForRendering);
+				GNumAlternateFrameRenderingGroups = 1;
+			}
+			else if (GNumExplicitGPUsForRendering % GNumAlternateFrameRenderingGroups != 0)
+			{
+				UE_LOG(LogD3D12RHI, Error, TEXT("Cannot enable alternate frame rendering because MaxGPUCount (%u) must be evenly divisible by NumAFRGroups (%u)"), GNumExplicitGPUsForRendering, GNumAlternateFrameRenderingGroups);
+				GNumAlternateFrameRenderingGroups = 1;
+			}
+			else
+			{
+				UE_LOG(LogD3D12RHI, Log, TEXT("Enabling alternate frame rendering with %u AFR groups"), GNumAlternateFrameRenderingGroups);
+			}
+		}
+	}
+#endif
+}
+
+void FD3D12Adapter::InitializeDevices()
+{
+	check(IsInGameThread());
+
+	// Wait for the rendering thread to go idle.
+	SCOPED_SUSPEND_RENDERING_THREAD(false);
+
+	// If the device we were using has been removed, release it and the resources we created for it.
+	if (bDeviceRemoved)
+	{
+		check(RootDevice);
+
+		HRESULT hRes = RootDevice->GetDeviceRemovedReason();
+
+		const TCHAR* Reason = TEXT("?");
+		switch (hRes)
+		{
+		case DXGI_ERROR_DEVICE_HUNG:			Reason = TEXT("HUNG"); break;
+		case DXGI_ERROR_DEVICE_REMOVED:			Reason = TEXT("REMOVED"); break;
+		case DXGI_ERROR_DEVICE_RESET:			Reason = TEXT("RESET"); break;
+		case DXGI_ERROR_DRIVER_INTERNAL_ERROR:	Reason = TEXT("INTERNAL_ERROR"); break;
+		case DXGI_ERROR_INVALID_CALL:			Reason = TEXT("INVALID_CALL"); break;
+		}
+
+		bDeviceRemoved = false;
+
+		Cleanup();
+
+		// We currently don't support removed devices because FTexture2DResource can't recreate its RHI resources from scratch.
+		// We would also need to recreate the viewport swap chains from scratch.
+		UE_LOG(LogD3D12RHI, Fatal, TEXT("The Direct3D 12 device that was being used has been removed (Error: %d '%s').  Please restart the game."), hRes, Reason);
+	}
+
+	// Use a debug device if specified on the command line.
+	bool bWithD3DDebug = D3D12RHI_ShouldCreateWithD3DDebug();
+
+	// If we don't have a device yet, either because this is the first viewport, or the old device was removed, create a device.
+	if (!RootDevice)
+	{
+		CreateRootDevice(bWithD3DDebug);
+
+		// See if we can get any newer device interfaces (to use newer D3D12 features).
+		if (D3D12RHI_ShouldForceCompatibility())
+		{
+			UE_LOG(LogD3D12RHI, Log, TEXT("Forcing D3D12 compatibility."));
+		}
+		else
+		{
+			if (SUCCEEDED(RootDevice->QueryInterface(IID_PPV_ARGS(RootDevice1.GetInitReference()))))
+			{
+				UE_LOG(LogD3D12RHI, Log, TEXT("The system supports ID3D12Device1."));
+			}
+
+#if PLATFORM_WINDOWS || PLATFORM_HOLOLENS
+			if (SUCCEEDED(RootDevice->QueryInterface(IID_PPV_ARGS(RootDevice2.GetInitReference()))))
+			{
+				UE_LOG(LogD3D12RHI, Log, TEXT("The system supports ID3D12Device2."));
+			}
+#endif
+
+			D3D12_FEATURE_DATA_D3D12_OPTIONS D3D12Caps;
+			FMemory::Memzero(&D3D12Caps, sizeof(D3D12Caps));
+			VERIFYD3D12RESULT(RootDevice->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &D3D12Caps, sizeof(D3D12Caps)));
+			ResourceHeapTier = D3D12Caps.ResourceHeapTier;
+			ResourceBindingTier = D3D12Caps.ResourceBindingTier;
+
+#if D3D12_RHI_RAYTRACING
+			if (SUCCEEDED(RootDevice->QueryInterface(IID_PPV_ARGS(RootDevice5.GetInitReference()))))
+			{
+				UE_LOG(LogD3D12RHI, Log, TEXT("The system supports ID3D12Device5."));
+			}
+
+			if (SUCCEEDED(RootDevice->QueryInterface(IID_PPV_ARGS(RootDevice7.GetInitReference()))))
+			{
+				UE_LOG(LogD3D12RHI, Log, TEXT("The system supports ID3D12Device7."));
+			}
+
+			D3D12_FEATURE_DATA_D3D12_OPTIONS5 D3D12Caps5 = {};
+			if (SUCCEEDED(RootDevice->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &D3D12Caps5, sizeof(D3D12Caps5))))
+			{
+				if (D3D12Caps5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_0
+					&& D3D12Caps.ResourceBindingTier >= D3D12_RESOURCE_BINDING_TIER_2
+					&& RootDevice5
+					&& FDataDrivenShaderPlatformInfo::GetSupportsRayTracing(GMaxRHIShaderPlatform)
+					&& !FParse::Param(FCommandLine::Get(), TEXT("noraytracing")))
+				{
+					UE_LOG(LogD3D12RHI, Log, TEXT("D3D12 ray tracing 1.0 is supported."));
+
+					GRHISupportsRayTracing = true;
+
+					if (D3D12Caps5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_1
+						&& RootDevice7)
+					{
+						UE_LOG(LogD3D12RHI, Log, TEXT("D3D12 ray tracing 1.1 is supported."));
+
+						GRHISupportsRayTracingPSOAdditions = true;
+					}
+				}
+			}
+#endif // D3D12_RHI_RAYTRACING
+		}
+
+#if PLATFORM_WINDOWS || PLATFORM_HOLOLENS
+		D3D12_FEATURE_DATA_D3D12_OPTIONS2 D3D12Caps2 = {};
+		if (FAILED(RootDevice->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS2, &D3D12Caps2, sizeof(D3D12Caps2))))
+		{
+			D3D12Caps2.DepthBoundsTestSupported = false;
+			D3D12Caps2.ProgrammableSamplePositionsTier = D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED;
+		}
+		bDepthBoundsTestSupported = !!D3D12Caps2.DepthBoundsTestSupported;
+#endif
+
+		D3D12_FEATURE_DATA_ROOT_SIGNATURE D3D12RootSignatureCaps = {};
+		D3D12RootSignatureCaps.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;	// This is the highest version we currently support. If CheckFeatureSupport succeeds, the HighestVersion returned will not be greater than this.
+		if (FAILED(RootDevice->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &D3D12RootSignatureCaps, sizeof(D3D12RootSignatureCaps))))
+		{
+			D3D12RootSignatureCaps.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_0;
+		}
+		RootSignatureVersion = D3D12RootSignatureCaps.HighestVersion;
+
+		FrameFence = new FD3D12ManualFence(this, FRHIGPUMask::All(), L"Adapter Frame Fence");
+		FrameFence->CreateFence();
+
+		StagingFence = new FD3D12Fence(this, FRHIGPUMask::All(), L"Staging Fence");
+		StagingFence->CreateFence();
+
+		CreateSignatures();
+
+		// Context redirectors allow RHI commands to be executed on multiple GPUs at the
+		// same time in a multi-GPU system. Redirectors have a physical mask for the GPUs
+		// they can support and an active mask which restricts commands to operate on a
+		// subset of the physical GPUs. The default context redirectors used by the
+		// immediate command list can support all physical GPUs, whereas context containers
+		// used by the parallel command lists might only support a subset of GPUs in the
+		// system.
+		DefaultContextRedirector.SetPhysicalGPUMask(FRHIGPUMask::All());
+		DefaultAsyncComputeContextRedirector.SetPhysicalGPUMask(FRHIGPUMask::All());
+
+		// Create all of the FD3D12Devices.
+		for (uint32 GPUIndex : FRHIGPUMask::All())
+		{
+			Devices[GPUIndex] = new FD3D12Device(FRHIGPUMask::FromIndex(GPUIndex), this);
+			Devices[GPUIndex]->Initialize();
+
+			// The redirectors allow to broadcast to any GPU set
+			DefaultContextRedirector.SetPhysicalContext(&Devices[GPUIndex]->GetDefaultCommandContext());
+			if (GEnableAsyn

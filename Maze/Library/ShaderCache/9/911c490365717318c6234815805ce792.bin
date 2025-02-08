@@ -1,0 +1,29 @@
+thodInfo addValue = typeof(SerializationInfo).GetMethod("AddValue", new Type[] { typeof(string), typeof(object), typeof(Type) });
+                MethodInfo getValue = typeof(SerializationInfo).GetMethod("GetValue", new Type[] { typeof(string), typeof(Type) });
+
+                //
+                // Define GetObjectData method override
+                //
+                // [SecurityPermission(SecurityAction.Demand, SerializationFormatter=true)]
+                // public void GetObjectData(SerializationInfo info, StreamingContext context)
+                //
+                MethodBuilder proxyGetObjectData = typeBuilder.DefineMethod(_getObjectDataMethod.Name,
+                                                                            MethodAttributes.Public | MethodAttributes.HideBySig | MethodAttributes.Virtual,
+                                                                            null,
+                                                                            parameterTypes);
+                proxyGetObjectData.AddDeclarativeSecurity(SecurityAction.Demand, serializationFormatterPermissions);
+
+                {
+                    ILGenerator generator = proxyGetObjectData.GetILGenerator();
+
+                    // Call SerializationInfo.AddValue to serialize each field value
+                    foreach (FieldBuilder field in serializedFields)
+                    {
+                        generator.Emit(OpCodes.Ldarg_1);
+                        generator.Emit(OpCodes.Ldstr, field.Name);
+                        generator.Emit(OpCodes.Ldarg_0);
+                        generator.Emit(OpCodes.Ldfld, field);
+                        generator.Emit(OpCodes.Ldtoken, field.FieldType);
+                        generator.Emit(OpCodes.Call, getTypeFromHandle);
+                        generator.Emit(OpCodes.Callvirt, addValue);
+      

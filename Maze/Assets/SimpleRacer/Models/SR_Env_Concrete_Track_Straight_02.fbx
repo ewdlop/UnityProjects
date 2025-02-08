@@ -1,0 +1,467 @@
+);
+  Value *FalseVal = SI.getFalseValue();
+  Type *SelType = SI.getType();
+
+  // FIXME: Remove this workaround when freeze related patches are done.
+  // For select with undef operand which feeds into an equality comparison,
+  // don't simplify it so loop unswitch can know the equality comparison
+  // may have an undef operand. This is a workaround for PR31652 caused by
+  // descrepancy about branch on undef between LoopUnswitch and GVN.
+  if (isa<UndefValue>(TrueVal) || isa<UndefValue>(FalseVal)) {
+    if (llvm::any_of(SI.users(), [&](User *U) {
+          ICmpInst *CI = dyn_cast<ICmpInst>(U);
+          if (CI && CI->isEquality())
+            return true;
+          return false;
+        })) {
+      return nullptr;
+    }
+  }
+
+  if (Value *V = SimplifySelectInst(CondVal, TrueVal, FalseVal,
+                                    SQ.getWithInstruction(&SI)))
+    return replaceInstUsesWith(SI, V);
+
+  if (Instruction *I = canonicalizeSelectToShuffle(SI))
+    return I;
+
+  // Canonicalize a one-use integer compare with a non-canonical predicate by
+  // inverting the predicate and swapping the select operands. This matches a
+  // compare canonicalization for conditional branches.
+  // TODO: Should we do the same for FP compares?
+  CmpInst::Predicate Pred;
+  if (match(CondVal, m_OneUse(m_ICmp(Pred, m_Value(), m_Value()))) &&
+      !isCanonicalPredicate(Pred)) {
+    // Swap true/false values and condition.
+    CmpInst *Cond = cast<CmpInst>(CondVal);
+    Cond->setPredicate(CmpInst::getInversePredicate(Pred));
+    SI.setOperand(1, FalseVal);
+    SI.setOperand(2, TrueVal);
+    SI.swapProfMetadata();
+    Worklist.Add(Cond);
+    return &SI;
+  }
+
+  if (SelType->isIntOrIntVectorTy(1) &&
+      TrueVal->getType() == CondVal->getType()) {
+    if (match(TrueVal, m_One())) {
+      // Change: A = select B, true, C --> A = or B, C
+      return BinaryOperator::CreateOr(CondVal, FalseVal);
+    }
+    if (match(TrueVal, m_Zero())) {
+      // Change: A = select B, false, C --> A = and !B, C
+      Value *NotCond = Builder.CreateNot(CondVal, "not." + CondVal->getName());
+      return BinaryOperator::CreateAnd(NotCond, FalseVal);
+    }
+    if (match(FalseVal, m_Zero())) {
+      // Change: A = select B, C, false --> A = and B, C
+      return BinaryOperator::CreateAnd(CondVal, TrueVal);
+    }
+    if (match(FalseVal, m_One())) {
+      // Change: A = select B, C, true --> A = or !B, C
+      Value *NotCond = Builder.CreateNot(CondVal, "not." + CondVal->getName());
+      return BinaryOperator::CreateOr(NotCond, TrueVal);
+    }
+
+    // select a, a, b  -> a | b
+    // select a, b, a  -> a & b
+    if (CondVal == TrueVal)
+      return BinaryOperator::CreateOr(CondVal, FalseVal);
+    if (CondVal == FalseVal)
+      return BinaryOperator::CreateAnd(CondVal, TrueVal);
+
+    // select a, ~a, b -> (~a) & b
+    // select a, b, ~a -> (~a) | b
+    if (match(TrueVal, m_Not(m_Specific(CondVal))))
+      return BinaryOperator::CreateAnd(TrueVal, FalseVal);
+    if (match(FalseVal, m_Not(m_Specific(CondVal))))
+      return BinaryOperator::CreateOr(TrueVal, FalseVal);
+  }
+
+  // Selecting between two integer or vector splat integer constants?
+  //
+  // Note that we don't handle a scalar select of vectors:
+  // select i1 %c, <2 x i8> <1, 1>, <2 x i8> <0, 0>
+  // because that may need 3 instructions to splat the condition value:
+  // extend, insertelement, shufflevector.
+  if (SelType->isIntOrIntVectorTy() &&
+      CondVal->getType()->isVectorTy() == SelType->isVectorTy()) {
+    // select C, 1, 0 -> zext C to int
+    if (match(TrueVal, m_One()) && match(FalseVal, m_Zero()))
+      return new ZExtInst(CondVal, SelType);
+
+    // select C, -1, 0 -> sext C to int
+    if (match(TrueVal, m_AllOnes()) && match(FalseVal, m_Zero()))
+      return new SExtInst(CondVal, SelType);
+
+    // select C, 0, 1 -> zext !C to int
+    if (match(TrueVal, m_Zero()) && match(FalseVal, m_One())) {
+      Value *NotCond = Builder.CreateNot(CondVal, "not." + CondVal->getName());
+      return new ZExtInst(NotCond, SelType);
+    }
+
+    // select C, 0, -1 -> sext !C to int
+    if (match(TrueVal, m_Zero()) && match(FalseVal, m_AllOnes())) {
+      Value *NotCond = Builder.CreateNot(CondVal, "not." + CondVal->getName());
+      return new SExtInst(NotCond, SelType);
+    }
+  }
+
+  // See if we are selecting two values based on a comparison of the two values.
+  if (FCmpInst *FCI = dyn_cast<FCmpInst>(CondVal)) {
+    if (FCI->getOperand(0) == TrueVal && FCI->getOperand(1) == FalseVal) {
+      // Transform (X == Y) ? X : Y  -> Y
+      if (FCI->getPredicate() == FCmpInst::FCMP_OEQ) {
+        // This is not safe in general for floating point:
+        // consider X== -0, Y== +0.
+        // It becomes safe if either operand is a nonzero constant.
+        ConstantFP *CFPt, *CFPf;
+        if (((CFPt = dyn_cast<ConstantFP>(TrueVal)) &&
+              !CFPt->getValueAPF().isZero()) ||
+            ((CFPf = dyn_cast<ConstantFP>(FalseVal)) &&
+             !CFPf->getValueAPF().isZero()))
+        return replaceInstUsesWith(SI, FalseVal);
+      }
+      // Transform (X une Y) ? X : Y  -> X
+      if (FCI->getPredicate() == FCmpInst::FCMP_UNE) {
+        // This is not safe in general for floating point:
+        // consider X== -0, Y== +0.
+        // It becomes safe if either operand is a nonzero constant.
+        ConstantFP *CFPt, *CFPf;
+        if (((CFPt = dyn_cast<ConstantFP>(TrueVal)) &&
+              !CFPt->getValueAPF().isZero()) ||
+            ((CFPf = dyn_cast<ConstantFP>(FalseVal)) &&
+             !CFPf->getValueAPF().isZero()))
+        return replaceInstUsesWith(SI, TrueVal);
+      }
+
+      // Canonicalize to use ordered comparisons by swapping the select
+      // operands.
+      //
+      // e.g.
+      // (X ugt Y) ? X : Y -> (X ole Y) ? Y : X
+      if (FCI->hasOneUse() && FCmpInst::isUnordered(FCI->getPredicate())) {
+        FCmpInst::Predicate InvPred = FCI->getInversePredicate();
+        IRBuilder<>::FastMathFlagGuard FMFG(Builder);
+        Builder.setFastMathFlags(FCI->getFastMathFlags());
+        Value *NewCond = Builder.CreateFCmp(InvPred, TrueVal, FalseVal,
+                                            FCI->getName() + ".inv");
+
+        return SelectInst::Create(NewCond, FalseVal, TrueVal,
+                                  SI.getName() + ".p");
+      }
+
+      // NOTE: if we wanted to, this is where to detect MIN/MAX
+    } else if (FCI->getOperand(0) == FalseVal && FCI->getOperand(1) == TrueVal){
+      // Transform (X == Y) ? Y : X  -> X
+      if (FCI->getPredicate() == FCmpInst::FCMP_OEQ) {
+        // This is not safe in general for floating point:
+        // consider X== -0, Y== +0.
+        // It becomes safe if either operand is a nonzero constant.
+        ConstantFP *CFPt, *CFPf;
+        if (((CFPt = dyn_cast<ConstantFP>(TrueVal)) &&
+              !CFPt->getValueAPF().isZero()) ||
+            ((CFPf = dyn_cast<ConstantFP>(FalseVal)) &&
+             !CFPf->getValueAPF().isZero()))
+          return replaceInstUsesWith(SI, FalseVal);
+      }
+      // Transform (X une Y) ? Y : X  -> Y
+      if (FCI->getPredicate() == FCmpInst::FCMP_UNE) {
+        // This is not safe in general for floating point:
+        // consider X== -0, Y== +0.
+        // It becomes safe if either operand is a nonzero constant.
+        ConstantFP *CFPt, *CFPf;
+        if (((CFPt = dyn_cast<ConstantFP>(TrueVal)) &&
+              !CFPt->getValueAPF().isZero()) ||
+            ((CFPf = dyn_cast<ConstantFP>(FalseVal)) &&
+             !CFPf->getValueAPF().isZero()))
+          return replaceInstUsesWith(SI, TrueVal);
+      }
+
+      // Canonicalize to use ordered comparisons by swapping the select
+      // operands.
+      //
+      // e.g.
+      // (X ugt Y) ? X : Y -> (X ole Y) ? X : Y
+      if (FCI->hasOneUse() && FCmpInst::isUnordered(FCI->getPredicate())) {
+        FCmpInst::Predicate InvPred = FCI->getInversePredicate();
+        IRBuilder<>::FastMathFlagGuard FMFG(Builder);
+        Builder.setFastMathFlags(FCI->getFastMathFlags());
+        Value *NewCond = Builder.CreateFCmp(InvPred, FalseVal, TrueVal,
+                                            FCI->getName() + ".inv");
+
+        return SelectInst::Create(NewCond, FalseVal, TrueVal,
+                                  SI.getName() + ".p");
+      }
+
+      // NOTE: if we wanted to, this is where to detect MIN/MAX
+    }
+    // NOTE: if we wanted to, this is where to detect ABS
+  }
+
+  // See if we are selecting two values based on a comparison of the two values.
+  if (ICmpInst *ICI = dyn_cast<ICmpInst>(CondVal))
+    if (Instruction *Result = foldSelectInstWithICmp(SI, ICI))
+      return Result;
+
+  if (Instruction *Add = foldAddSubSelect(SI, Builder))
+    return Add;
+
+  // Turn (select C, (op X, Y), (op X, Z)) -> (op X, (select C, Y, Z))
+  auto *TI = dyn_cast<Instruction>(TrueVal);
+  auto *FI = dyn_cast<Instruction>(FalseVal);
+  if (TI && FI && TI->getOpcode() == FI->getOpcode())
+    if (Instruction *IV = foldSelectOpOp(SI, TI, FI))
+      return IV;
+
+  if (Instruction *I = foldSelectExtConst(SI))
+    return I;
+
+  // See if we can fold the select into one of our operands.
+  if (SelType->isIntOrIntVectorTy() || SelType->isFPOrFPVectorTy()) {
+    if (Instruction *FoldI = foldSelectIntoOp(SI, TrueVal, FalseVal))
+      return FoldI;
+
+    Value *LHS, *RHS, *LHS2, *RHS2;
+    Instruction::CastOps CastOp;
+    SelectPatternResult SPR = matchSelectPattern(&SI, LHS, RHS, &CastOp);
+    auto SPF = SPR.Flavor;
+
+    if (SelectPatternResult::isMinOrMax(SPF)) {
+      // Canonicalize so that
+      // - type casts are outside select patterns.
+      // - float clamp is transformed to min/max pattern
+
+      bool IsCastNeeded = LHS->getType() != SelType;
+      Value *CmpLHS = cast<CmpInst>(CondVal)->getOperand(0);
+      Value *CmpRHS = cast<CmpInst>(CondVal)->getOperand(1);
+      if (IsCastNeeded ||
+          (LHS->getType()->isFPOrFPVectorTy() &&
+           ((CmpLHS != LHS && CmpLHS != RHS) ||
+            (CmpRHS != LHS && CmpRHS != RHS)))) {
+        CmpInst::Predicate Pred = getCmpPredicateForMinMax(SPF, SPR.Ordered);
+
+        Value *Cmp;
+        if (CmpInst::isIntPredicate(Pred)) {
+          Cmp = Builder.CreateICmp(Pred, LHS, RHS);
+        } else {
+          IRBuilder<>::FastMathFlagGuard FMFG(Builder);
+          auto FMF = cast<FPMathOperator>(SI.getCondition())->getFastMathFlags();
+          Builder.setFastMathFlags(FMF);
+          Cmp = Builder.CreateFCmp(Pred, LHS, RHS);
+        }
+
+        Value *NewSI = Builder.CreateSelect(Cmp, LHS, RHS, SI.getName(), &SI);
+        if (!IsCastNeeded)
+          return replaceInstUsesWith(SI, NewSI);
+
+        Value *NewCast = Builder.CreateCast(CastOp, NewSI, SelType);
+        return replaceInstUsesWith(SI, NewCast);
+      }
+    }
+
+    if (SPF) {
+      // MAX(MAX(a, b), a) -> MAX(a, b)
+      // MIN(MIN(a, b), a) -> MIN(a, b)
+      // MAX(MIN(a, b), a) -> a
+      // MIN(MAX(a, b), a) -> a
+      // ABS(ABS(a)) -> ABS(a)
+      // NABS(NABS(a)) -> NABS(a)
+      if (SelectPatternFlavor SPF2 = matchSelectPattern(LHS, LHS2, RHS2).Flavor)
+        if (Instruction *R = foldSPFofSPF(cast<Instruction>(LHS),SPF2,LHS2,RHS2,
+                                          SI, SPF, RHS))
+          return R;
+      if (SelectPatternFlavor SPF2 = matchSelectPattern(RHS, LHS2, RHS2).Flavor)
+        if (Instruction *R = foldSPFofSPF(cast<Instruction>(RHS),SPF2,LHS2,RHS2,
+                                          SI, SPF, LHS))
+          return R;
+    }
+
+    // MAX(~a, ~b) -> ~MIN(a, b)
+    if ((SPF == SPF_SMAX || SPF == SPF_UMAX) &&
+        IsFreeToInvert(LHS, LHS->hasNUses(2)) &&
+        IsFreeToInvert(RHS, RHS->hasNUses(2))) {
+      // For this transform to be profitable, we need to eliminate at least two
+      // 'not' instructions if we're going to add one 'not' instruction.
+      int NumberOfNots =
+          (LHS->hasNUses(2) && match(LHS, m_Not(m_Value()))) +
+          (RHS->hasNUses(2) && match(RHS, m_Not(m_Value()))) +
+          (SI.hasOneUse() && match(*SI.user_begin(), m_Not(m_Value())));
+
+      if (NumberOfNots >= 2) {
+        Value *NewLHS = Builder.CreateNot(LHS);
+        Value *NewRHS = Builder.CreateNot(RHS);
+        Value *NewCmp = SPF == SPF_SMAX ? Builder.CreateICmpSLT(NewLHS, NewRHS)
+                                        : Builder.CreateICmpULT(NewLHS, NewRHS);
+        Value *NewSI =
+            Builder.CreateNot(Builder.CreateSelect(NewCmp, NewLHS, NewRHS));
+        return replaceInstUsesWith(SI, NewSI);
+      }
+    }
+
+    // TODO.
+    // ABS(-X) -> ABS(X)
+  }
+
+  // See if we can fold the select into a phi node if the condition is a select.
+  if (auto *PN = dyn_cast<PHINode>(SI.getCondition()))
+    // The true/false values have to be live in the PHI predecessor's blocks.
+    if (canSelectOperandBeMappingIntoPredBlock(TrueVal, SI) &&
+        canSelectOperandBeMappingIntoPredBlock(FalseVal, SI))
+      if (Instruction *NV = foldOpIntoPhi(SI, PN))
+        return NV;
+
+  if (SelectInst *TrueSI = dyn_cast<SelectInst>(TrueVal)) {
+    if (TrueSI->getCondition()->getType() == CondVal->getType()) {
+      // select(C, select(C, a, b), c) -> select(C, a, c)
+      if (TrueSI->getCondition() == CondVal) {
+        if (SI.getTrueValue() == TrueSI->getTrueValue())
+          return nullptr;
+        SI.setOperand(1, TrueSI->getTrueValue());
+        return &SI;
+      }
+      // select(C0, select(C1, a, b), b) -> select(C0&C1, a, b)
+      // We choose this as normal form to enable folding on the And and shortening
+      // paths for the values (this helps GetUnderlyingObjects() for example).
+      if (TrueSI->getFalseValue() == FalseVal && TrueSI->hasOneUse()) {
+        Value *And = Builder.CreateAnd(CondVal, TrueSI->getCondition());
+        SI.setOperand(0, And);
+        SI.setOperand(1, TrueSI->getTrueValue());
+        return &SI;
+      }
+    }
+  }
+  if (SelectInst *FalseSI = dyn_cast<SelectInst>(FalseVal)) {
+    if (FalseSI->getCondition()->getType() == CondVal->getType()) {
+      // select(C, a, select(C, b, c)) -> select(C, a, c)
+      if (FalseSI->getCondition() == CondVal) {
+        if (SI.getFalseValue() == FalseSI->getFalseValue())
+          return nullptr;
+        SI.setOperand(2, FalseSI->getFalseValue());
+        return &SI;
+      }
+      // select(C0, a, select(C1, a, b)) -> select(C0|C1, a, b)
+      if (FalseSI->getTrueValue() == TrueVal && FalseSI->hasOneUse()) {
+        Value *Or = Builder.CreateOr(CondVal, FalseSI->getCondition());
+        SI.setOperand(0, Or);
+        SI.setOperand(2, FalseSI->getFalseValue());
+        return &SI;
+      }
+    }
+  }
+
+  auto canMergeSelectThroughBinop = [](BinaryOperator *BO) {
+    // The select might be preventing a division by 0.
+    switch (BO->getOpcode()) {
+    default:
+      return true;
+    case Instruction::SRem:
+    case Instruction::URem:
+    case Instruction::SDiv:
+    case Instruction::UDiv:
+      return false;
+    }
+  };
+
+  // Try to simplify a binop sandwiched between 2 selects with the same
+  // condition.
+  // select(C, binop(select(C, X, Y), W), Z) -> select(C, binop(X, W), Z)
+  BinaryOperator *TrueBO;
+  if (match(TrueVal, m_OneUse(m_BinOp(TrueBO))) &&
+      canMergeSelectThroughBinop(TrueBO)) {
+    if (auto *TrueBOSI = dyn_cast<SelectInst>(TrueBO->getOperand(0))) {
+      if (TrueBOSI->getCondition() == CondVal) {
+        TrueBO->setOperand(0, TrueBOSI->getTrueValue());
+        Worklist.Add(TrueBO);
+        return &SI;
+      }
+    }
+    if (auto *TrueBOSI = dyn_cast<SelectInst>(TrueBO->getOperand(1))) {
+      if (TrueBOSI->getCondition() == CondVal) {
+        TrueBO->setOperand(1, TrueBOSI->getTrueValue());
+        Worklist.Add(TrueBO);
+        return &SI;
+      }
+    }
+  }
+
+  // select(C, Z, binop(select(C, X, Y), W)) -> select(C, Z, binop(Y, W))
+  BinaryOperator *FalseBO;
+  if (match(FalseVal, m_OneUse(m_BinOp(FalseBO))) &&
+      canMergeSelectThroughBinop(FalseBO)) {
+    if (auto *FalseBOSI = dyn_cast<SelectInst>(FalseBO->getOperand(0))) {
+      if (FalseBOSI->getCondition() == CondVal) {
+        FalseBO->setOperand(0, FalseBOSI->getFalseValue());
+        Worklist.Add(FalseBO);
+        return &SI;
+      }
+    }
+    if (auto *FalseBOSI = dyn_cast<SelectInst>(FalseBO->getOperand(1))) {
+      if (FalseBOSI->getCondition() == CondVal) {
+        FalseBO->setOperand(1, FalseBOSI->getFalseValue());
+        Worklist.Add(FalseBO);
+        return &SI;
+      }
+    }
+  }
+
+  if (BinaryOperator::isNot(CondVal)) {
+    SI.setOperand(0, BinaryOperator::getNotArgument(CondVal));
+    SI.setOperand(1, FalseVal);
+    SI.setOperand(2, TrueVal);
+    return &SI;
+  }
+
+  if (VectorType *VecTy = dyn_cast<VectorType>(SelType)) {
+    unsigned VWidth = VecTy->getNumElements();
+    APInt UndefElts(VWidth, 0);
+    APInt AllOnesEltMask(APInt::getAllOnesValue(VWidth));
+    if (Value *V = SimplifyDemandedVectorElts(&SI, AllOnesEltMask, UndefElts)) {
+      if (V != &SI)
+        return replaceInstUsesWith(SI, V);
+      return &SI;
+    }
+  }
+
+  // See if we can determine the result of this select based on a dominating
+  // condition.
+  BasicBlock *Parent = SI.getParent();
+  if (BasicBlock *Dom = Parent->getSinglePredecessor()) {
+    auto *PBI = dyn_cast_or_null<BranchInst>(Dom->getTerminator());
+    if (PBI && PBI->isConditional() &&
+        PBI->getSuccessor(0) != PBI->getSuccessor(1) &&
+        (PBI->getSuccessor(0) == Parent || PBI->getSuccessor(1) == Parent)) {
+      bool CondIsTrue = PBI->getSuccessor(0) == Parent;
+      Optional<bool> Implication = isImpliedCondition(
+          PBI->getCondition(), SI.getCondition(), DL, CondIsTrue);
+      if (Implication) {
+        Value *V = *Implication ? TrueVal : FalseVal;
+        return replaceInstUsesWith(SI, V);
+      }
+    }
+  }
+
+  // If we can compute the condition, there's no need for a select.
+  // Like the above fold, we are attempting to reduce compile-time cost by
+  // putting this fold here with limitations rather than in InstSimplify.
+  // The motivation for this call into value tracking is to take advantage of
+  // the assumption cache, so make sure that is populated.
+  if (!CondVal->getType()->isVectorTy() && !AC.assumptions().empty()) {
+    KnownBits Known(1);
+    computeKnownBits(CondVal, Known, 0, &SI);
+    if (Known.One.isOneValue())
+      return replaceInstUsesWith(SI, TrueVal);
+    if (Known.Zero.isOneValue())
+      return replaceInstUsesWith(SI, FalseVal);
+  }
+
+  if (Instruction *BitCastSel = foldSelectCmpBitcasts(SI, Builder))
+    return BitCastSel;
+
+  // Simplify selects that test the returned flag of cmpxchg instructions.
+  if (Instruction *Select = foldSelectCmpXchg(SI))
+    return Select;
+
+  return nullptr;
+}
+                            û'     °ô'            Àú'     Èô'            `ú'     àô'             ú'     øô'             ù'     õ'            @ù'     (õ'             ø'     @õ'            àö'     Xõ'            Àõ'     hõ'            õ­     põ'             ğ'     €õ'            Ë¤     ˆõ'             ğ'     ˜õ'            5”      õ'             ğ'     Àõ'            ¹”     Èõ'             ğ'     Øõ'            ¿”     àõ'             ğ'     ğõ'            Å”     øõ'             ğ'     ö'            Ë”     ö'             ğ'      ö'            Ñ”     (ö'             ğ'     8ö'            ×”     @ö'             ğ'     Pö'            İ”     Xö'             ğ'     hö'            ã”     pö'             ğ'     €ö'            é”     ˆö'             ğ'     ˜ö'            ï”      ö'             ğ'     °ö'            Ø‡     ¸ö'             ğ'     Ğö'            Àõ'     àö'            }”     èö'             ğ'     øö'            ƒ”      ÷'             ğ'     ÷'            ‰”     ÷'             ğ'     (÷'            ”     0÷'             ğ'     @÷'            •”     H÷'             ğ'     X÷'            ›”     `÷'             ğ'     p÷'            ¡”     x÷'             ğ'     ˆ÷'            §”     ÷'             ğ'      ÷'            ­”     ¨÷'             ğ'     ¸÷'            ³”     À÷'             ğ'     Ø÷'            àö'      ø'            Ì‡     ø'             ğ'     ø'            ±–      ø'             ğ'     0ø'            

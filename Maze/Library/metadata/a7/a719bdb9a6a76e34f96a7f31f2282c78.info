@@ -1,0 +1,231 @@
+utputFile, List<string> linkerArgs)
+	{
+		linkerArgs.Add ("/link");
+
+		var subsystem = GetEnv ("VCSUBSYSTEM", "windows");
+		linkerArgs.Add ("/SUBSYSTEM:" + subsystem);
+
+		if (customMain != null && customMain.Length != 0)
+			linkerArgs.Add (linker.QuoteArg (customMain));
+		else
+			linkerArgs.Add ("/ENTRY:mainCRTStartup");
+
+		// Ignore other c-runtime directives from linked libraries.
+		linkerArgs.Add ("/NODEFAULTLIB");
+
+		AddMonoLibraries (linker, staticLinkMono, staticLinkCRuntime, linkerArgs);
+		AddSystemLibraries (linker, staticLinkMono, staticLinkCRuntime, linkerArgs);
+
+		// Add library search paths.
+		List<string> libPaths = new List<string> ();
+		AddLibPaths (libPaths);
+
+		foreach (string lib in libPaths)
+			linkerArgs.Add (String.Format ("/LIBPATH:{0}", linker.QuoteArg (lib)));
+
+		// Linker output target.
+		linkerArgs.Add ("/OUT:" + linker.QuoteArg (outputFile));
+
+		return;
+	}
+
+	static void AddGCCLinkerArguments (ToolchainProgram linker, bool staticLinkMono, bool staticLinkCRuntime, string customMain, string outputFile, List<string> linkerArgs)
+	{
+		// Add library search paths.
+		List<string> libPaths = new List<string> ();
+		AddMonoLibPaths (libPaths);
+
+		foreach (string lib in libPaths)
+			linkerArgs.Add (String.Format ("-L {0}", linker.QuoteArg (lib)));
+
+		// Add libraries.
+		if (staticLinkMono)
+			linkerArgs.Add ("-Wl,-Bstatic");
+
+		AddMonoLibraries (linker, staticLinkMono, staticLinkCRuntime, linkerArgs);
+
+		if (staticLinkMono)
+			linkerArgs.Add ("-Wl,-Bdynamic");
+
+		AddSystemLibraries (linker, staticLinkMono, staticLinkCRuntime, linkerArgs);
+
+		// Linker output target.
+		linkerArgs.Add ("-o " + linker.QuoteArg (outputFile));
+	}
+
+	static void AddLinkerArguments (ToolchainProgram program, bool staticLinkMono, bool staticLinkCRuntime, string customMain, string outputFile, List<string> linkerArgs)
+	{
+		if (program.IsVSToolChain)
+			AddVCLinkerArguments (program, staticLinkMono, staticLinkCRuntime, customMain, outputFile, linkerArgs);
+		else
+			AddGCCLinkerArguments (program, staticLinkMono, staticLinkCRuntime, customMain, outputFile, linkerArgs);
+
+		return;
+	}
+
+	static void AddVCLibrarianCompilerArguments (ToolchainProgram compiler, string sourceFile, bool staticLinkMono, bool staticLinkCRuntime, List<string> compilerArgs, out string objectFile)
+	{
+		compilerArgs.Add ("/c");
+		compilerArgs.Add (compiler.QuoteArg (sourceFile));
+
+		objectFile = sourceFile + ".obj";
+		compilerArgs.Add (String.Format ("/Fo" + compiler.QuoteArg (objectFile)));
+
+		return;
+	}
+
+	static void AddGCCLibrarianCompilerArguments (ToolchainProgram compiler, string sourceFile, bool staticLinkMono, bool staticLinkCRuntime, List<string> compilerArgs, out string objectFile)
+	{
+		compilerArgs.Add ("-c");
+		compilerArgs.Add (compiler.QuoteArg (sourceFile));
+
+		objectFile = sourceFile + ".o";
+		compilerArgs.Add (String.Format ("-o " + compiler.QuoteArg (objectFile)));
+
+		return;
+	}
+
+	static void AddVCLibrarianLinkerArguments (ToolchainProgram librarian, string [] objectFiles, bool staticLinkMono, bool staticLinkCRuntime, string outputFile, List<string> librarianArgs)
+	{
+		foreach (var objectFile in objectFiles)
+			librarianArgs.Add (librarian.QuoteArg (objectFile));
+
+		// Add library search paths.
+		List<string> libPaths = new List<string> ();
+		AddLibPaths (libPaths);
+
+		foreach (string lib in libPaths) {
+			librarianArgs.Add (String.Format ("/LIBPATH:{0}", librarian.QuoteArg (lib)));
+		}
+
+		AddMonoLibraries (librarian, staticLinkMono, staticLinkCRuntime, librarianArgs);
+
+		librarianArgs.Add ("/OUT:" + librarian.QuoteArg (output));
+
+		return;
+	}
+
+	static void AddGCCLibrarianLinkerArguments (ToolchainProgram librarian, string [] objectFiles, bool staticLinkMono, bool staticLinkCRuntime, string outputFile, List<string> librarianArgs)
+	{
+		foreach (var objectFile in objectFiles)
+			librarianArgs.Add (librarian.QuoteArg (objectFile));
+
+		// Add library search paths.
+		List<string> libPaths = new List<string> ();
+		AddMonoLibPaths (libPaths);
+
+		foreach (string lib in libPaths)
+			librarianArgs.Add (String.Format ("-L {0}", librarian.QuoteArg (lib)));
+
+		AddMonoLibraries (librarian, staticLinkMono, staticLinkCRuntime, librarianArgs);
+
+		librarianArgs.Add ("-o " + librarian.QuoteArg (output));
+
+		return;
+	}
+
+	static ToolchainProgram GetAssemblerCompiler ()
+	{
+		// First check if env is set (old behavior) and use that.
+		string assembler = GetEnv ("AS", "");
+		if (assembler.Length != 0)
+			return new ToolchainProgram ("AS", assembler);
+
+		var vcClangAssembler = VisualStudioSDKToolchainHelper.GetInstance ().GetVCClangCompiler ();
+		if (vcClangAssembler == null || vcClangAssembler.Path.Length == 0) {
+			// Fallback to GNU assembler if clang for VS was not installed.
+			// Why? because mkbundle generates GNU assembler not compilable by VS tools like ml.
+			Console.WriteLine (@"Warning: Couldn't find installed Visual Studio SDK (Clang with Microsoft CodeGen), fallback to mingw as.exe and default environment.");
+			string asCompiler = Target64BitApplication () ? "x86_64-w64-mingw32-as.exe" : "i686-w64-mingw32-as.exe";
+			return new ToolchainProgram (asCompiler, asCompiler);
+		}
+
+		return vcClangAssembler;
+	}
+
+	static ToolchainProgram GetCCompiler (bool staticLinkMono, bool staticLinkCRuntime)
+	{
+		ToolchainProgram program = null;
+
+		// First check if env is set (old behavior) and use that.
+		string compiler = GetEnv ("CC", "");
+		if (compiler.Length != 0) {
+			program = new ToolchainProgram ("CC", compiler);
+		} else {
+			program = VisualStudioSDKToolchainHelper.GetInstance ().GetVCCompiler ();
+			if (program == null || program.Path.Length == 0) {
+				// Fallback to cl.exe if VC compiler was not installed.
+				Console.WriteLine (@"Warning: Couldn't find installed Visual Studio SDK, fallback to cl.exe and default environment.");
+				program = new ToolchainProgram ("cl.exe", "cl.exe");
+			}
+		}
+
+		// Check if we have needed Mono library for targeted toolchain.
+		string monoLibraryPath = GetMonoLibraryPath (program, staticLinkMono, staticLinkCRuntime);
+		if (!File.Exists (monoLibraryPath) && program.IsVSToolChain) {
+			Console.WriteLine (@"Warning: Couldn't find installed matching Mono library: {0}, fallback to mingw gcc.exe and default environment.", monoLibraryPath);
+			string gccCompiler = Target64BitApplication () ? "x86_64-w64-mingw32-gcc.exe" : "i686-w64-mingw32-gcc.exe";
+			program = new ToolchainProgram (gccCompiler, gccCompiler);
+		}
+
+		return program;
+	}
+
+	static ToolchainProgram GetLibrarian ()
+	{
+		ToolchainProgram vcLibrarian = VisualStudioSDKToolchainHelper.GetInstance ().GetVCLibrarian ();
+		if (vcLibrarian == null || vcLibrarian.Path.Length == 0) {
+			// Fallback to lib.exe if VS was not installed.
+			Console.WriteLine (@"Warning: Couldn't find installed Visual Studio SDK, fallback to lib.exe and default environment.");
+			return new ToolchainProgram ("lib.exe", "lib.exe");
+		}
+
+		return vcLibrarian;
+	}
+
+	static string GetCompileAndLinkCommand (ToolchainProgram compiler, string sourceFile, string objectFile, string customMain, bool staticLinkMono, bool staticLinkCRuntime, string outputFile)
+	{
+		var compilerArgs = new List<string> ();
+
+		AddCompilerArguments (compiler, staticLinkMono, staticLinkCRuntime, compilerArgs);
+
+		// Add source file to compile.
+		compilerArgs.Add (compiler.QuoteArg (sourceFile));
+
+		// Add assembled object file.
+		compilerArgs.Add (compiler.QuoteArg (objectFile));
+
+		// Add linker arguments.
+		AddLinkerArguments (compiler, staticLinkMono, staticLinkCRuntime, customMain, outputFile, compilerArgs);
+
+		return String.Format ("{0} {1}", compiler.QuoteArg (compiler.Path), String.Join (" ", compilerArgs));
+	}
+
+	static string GetLibrarianCompilerCommand (ToolchainProgram compiler, string sourceFile, bool staticLinkMono, bool staticLinkCRuntime, out string objectFile)
+	{
+		var compilerArgs = new List<string> ();
+
+		AddCompilerArguments (compiler, staticLinkMono, staticLinkCRuntime, compilerArgs);
+
+		if (compiler.IsVSToolChain)
+			AddVCLibrarianCompilerArguments (compiler, sourceFile, staticLinkMono, staticLinkCRuntime, compilerArgs, out objectFile);
+		else
+			AddGCCLibrarianCompilerArguments (compiler, sourceFile, staticLinkMono, staticLinkCRuntime, compilerArgs, out objectFile);
+
+		return String.Format ("{0} {1}", compiler.QuoteArg (compiler.Path), String.Join (" ", compilerArgs));
+	}
+
+	static string GetLibrarianLinkerCommand (ToolchainProgram librarian, string [] objectFiles, bool staticLinkMono, bool staticLinkCRuntime, string outputFile)
+	{
+		var librarianArgs = new List<string> ();
+
+		if (librarian.IsVSToolChain)
+			AddVCLibrarianLinkerArguments (librarian, objectFiles, staticLinkMono, staticLinkCRuntime, outputFile, librarianArgs);
+		else
+			AddGCCLibrarianLinkerArguments (librarian, objectFiles, staticLinkMono, staticLinkCRuntime, outputFile, librarianArgs);
+
+		return String.Format ("{0} {1}", librarian.QuoteArg (librarian.Path), String.Join (" ", librarianArgs));
+	}
+#endregion
+}
+                                                                                                                                                                                                                                             

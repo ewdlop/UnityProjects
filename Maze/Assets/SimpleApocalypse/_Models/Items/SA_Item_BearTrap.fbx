@@ -1,0 +1,835 @@
+ a string.
+  RE(const ::std::string& regex) { Init(regex.c_str()); }  // NOLINT
+
+#if GTEST_HAS_GLOBAL_STRING
+
+  RE(const ::string& regex) { Init(regex.c_str()); }  // NOLINT
+
+#endif  // GTEST_HAS_GLOBAL_STRING
+
+  RE(const char* regex) { Init(regex); }  // NOLINT
+  ~RE();
+
+  // Returns the string representation of the regex.
+  const char* pattern() const { return pattern_; }
+
+  // FullMatch(str, re) returns true iff regular expression re matches
+  // the entire str.
+  // PartialMatch(str, re) returns true iff regular expression re
+  // matches a substring of str (including str itself).
+  //
+  // TODO(wan@google.com): make FullMatch() and PartialMatch() work
+  // when str contains NUL characters.
+  static bool FullMatch(const ::std::string& str, const RE& re) {
+    return FullMatch(str.c_str(), re);
+  }
+  static bool PartialMatch(const ::std::string& str, const RE& re) {
+    return PartialMatch(str.c_str(), re);
+  }
+
+#if GTEST_HAS_GLOBAL_STRING
+
+  static bool FullMatch(const ::string& str, const RE& re) {
+    return FullMatch(str.c_str(), re);
+  }
+  static bool PartialMatch(const ::string& str, const RE& re) {
+    return PartialMatch(str.c_str(), re);
+  }
+
+#endif  // GTEST_HAS_GLOBAL_STRING
+
+  static bool FullMatch(const char* str, const RE& re);
+  static bool PartialMatch(const char* str, const RE& re);
+
+ private:
+  void Init(const char* regex);
+
+  // We use a const char* instead of an std::string, as Google Test used to be
+  // used where std::string is not available.  TODO(wan@google.com): change to
+  // std::string.
+  const char* pattern_;
+  bool is_valid_;
+
+#if GTEST_USES_POSIX_RE
+
+  regex_t full_regex_;     // For FullMatch().
+  regex_t partial_regex_;  // For PartialMatch().
+
+#else  // GTEST_USES_SIMPLE_RE
+
+  const char* full_pattern_;  // For FullMatch();
+
+#endif
+
+  GTEST_DISALLOW_ASSIGN_(RE);
+};
+
+// Formats a source file path and a line number as they would appear
+// in an error message from the compiler used to compile this code.
+GTEST_API_ ::std::string FormatFileLocation(const char* file, int line);
+
+// Formats a file location for compiler-independent XML output.
+// Although this function is not platform dependent, we put it next to
+// FormatFileLocation in order to contrast the two functions.
+GTEST_API_ ::std::string FormatCompilerIndependentFileLocation(const char* file,
+                                                               int line);
+
+// Defines logging utilities:
+//   GTEST_LOG_(severity) - logs messages at the specified severity level. The
+//                          message itself is streamed into the macro.
+//   LogToStderr()  - directs all log messages to stderr.
+//   FlushInfoLog() - flushes informational log messages.
+
+enum GTestLogSeverity {
+  GTEST_INFO,
+  GTEST_WARNING,
+  GTEST_ERROR,
+  GTEST_FATAL
+};
+
+// Formats log entry severity, provides a stream object for streaming the
+// log message, and terminates the message with a newline when going out of
+// scope.
+class GTEST_API_ GTestLog {
+ public:
+  GTestLog(GTestLogSeverity severity, const char* file, int line);
+
+  // Flushes the buffers and, if severity is GTEST_FATAL, aborts the program.
+  ~GTestLog();
+
+  ::std::ostream& GetStream() { return ::std::cerr; }
+
+ private:
+  const GTestLogSeverity severity_;
+
+  GTEST_DISALLOW_COPY_AND_ASSIGN_(GTestLog);
+};
+
+#if !defined(GTEST_LOG_)
+
+# define GTEST_LOG_(severity) \
+    ::testing::internal::GTestLog(::testing::internal::GTEST_##severity, \
+                                  __FILE__, __LINE__).GetStream()
+
+inline void LogToStderr() {}
+inline void FlushInfoLog() { fflush(NULL); }
+
+#endif  // !defined(GTEST_LOG_)
+
+#if !defined(GTEST_CHECK_)
+// INTERNAL IMPLEMENTATION - DO NOT USE.
+//
+// GTEST_CHECK_ is an all-mode assert. It aborts the program if the condition
+// is not satisfied.
+//  Synopsys:
+//    GTEST_CHECK_(boolean_condition);
+//     or
+//    GTEST_CHECK_(boolean_condition) << "Additional message";
+//
+//    This checks the condition and if the condition is not satisfied
+//    it prints message about the condition violation, including the
+//    condition itself, plus additional message streamed into it, if any,
+//    and then it aborts the program. It aborts the program irrespective of
+//    whether it is built in the debug mode or not.
+# define GTEST_CHECK_(condition) \
+    GTEST_AMBIGUOUS_ELSE_BLOCKER_ \
+    if (::testing::internal::IsTrue(condition)) \
+      ; \
+    else \
+      GTEST_LOG_(FATAL) << "Condition " #condition " failed. "
+#endif  // !defined(GTEST_CHECK_)
+
+// An all-mode assert to verify that the given POSIX-style function
+// call returns 0 (indicating success).  Known limitation: this
+// doesn't expand to a balanced 'if' statement, so enclose the macro
+// in {} if you need to use it as the only statement in an 'if'
+// branch.
+#define GTEST_CHECK_POSIX_SUCCESS_(posix_call) \
+  if (const int gtest_error = (posix_call)) \
+    GTEST_LOG_(FATAL) << #posix_call << "failed with error " \
+                      << gtest_error
+
+#if GTEST_HAS_STD_MOVE_
+using std::move;
+#else  // GTEST_HAS_STD_MOVE_
+template <typename T>
+const T& move(const T& t) {
+  return t;
+}
+#endif  // GTEST_HAS_STD_MOVE_
+
+// INTERNAL IMPLEMENTATION - DO NOT USE IN USER CODE.
+//
+// Use ImplicitCast_ as a safe version of static_cast for upcasting in
+// the type hierarchy (e.g. casting a Foo* to a SuperclassOfFoo* or a
+// const Foo*).  When you use ImplicitCast_, the compiler checks that
+// the cast is safe.  Such explicit ImplicitCast_s are necessary in
+// surprisingly many situations where C++ demands an exact type match
+// instead of an argument type convertable to a target type.
+//
+// The syntax for using ImplicitCast_ is the same as for static_cast:
+//
+//   ImplicitCast_<ToType>(expr)
+//
+// ImplicitCast_ would have been part of the C++ standard library,
+// but the proposal was submitted too late.  It will probably make
+// its way into the language in the future.
+//
+// This relatively ugly name is intentional. It prevents clashes with
+// similar functions users may have (e.g., implicit_cast). The internal
+// namespace alone is not enough because the function can be found by ADL.
+template<typename To>
+inline To ImplicitCast_(To x) { return x; }
+
+// When you upcast (that is, cast a pointer from type Foo to type
+// SuperclassOfFoo), it's fine to use ImplicitCast_<>, since upcasts
+// always succeed.  When you downcast (that is, cast a pointer from
+// type Foo to type SubclassOfFoo), static_cast<> isn't safe, because
+// how do you know the pointer is really of type SubclassOfFoo?  It
+// could be a bare Foo, or of type DifferentSubclassOfFoo.  Thus,
+// when you downcast, you should use this macro.  In debug mode, we
+// use dynamic_cast<> to double-check the downcast is legal (we die
+// if it's not).  In normal mode, we do the efficient static_cast<>
+// instead.  Thus, it's important to test in debug mode to make sure
+// the cast is legal!
+//    This is the only place in the code we should use dynamic_cast<>.
+// In particular, you SHOULDN'T be using dynamic_cast<> in order to
+// do RTTI (eg code like this:
+//    if (dynamic_cast<Subclass1>(foo)) HandleASubclass1Object(foo);
+//    if (dynamic_cast<Subclass2>(foo)) HandleASubclass2Object(foo);
+// You should design the code some other way not to need this.
+//
+// This relatively ugly name is intentional. It prevents clashes with
+// similar functions users may have (e.g., down_cast). The internal
+// namespace alone is not enough because the function can be found by ADL.
+template<typename To, typename From>  // use like this: DownCast_<T*>(foo);
+inline To DownCast_(From* f) {  // so we only accept pointers
+  // Ensures that To is a sub-type of From *.  This test is here only
+  // for compile-time type checking, and has no overhead in an
+  // optimized build at run-time, as it will be optimized away
+  // completely.
+  GTEST_INTENTIONAL_CONST_COND_PUSH_()
+  if (false) {
+  GTEST_INTENTIONAL_CONST_COND_POP_()
+    const To to = NULL;
+    ::testing::internal::ImplicitCast_<From*>(to);
+  }
+
+#if GTEST_HAS_RTTI
+  // RTTI: debug mode only!
+  GTEST_CHECK_(f == NULL || dynamic_cast<To>(f) != NULL);
+#endif
+  return static_cast<To>(f);
+}
+
+// Downcasts the pointer of type Base to Derived.
+// Derived must be a subclass of Base. The parameter MUST
+// point to a class of type Derived, not any subclass of it.
+// When RTTI is available, the function performs a runtime
+// check to enforce this.
+template <class Derived, class Base>
+Derived* CheckedDowncastToActualType(Base* base) {
+#if GTEST_HAS_RTTI
+  GTEST_CHECK_(typeid(*base) == typeid(Derived));
+#endif
+
+#if GTEST_HAS_DOWNCAST_
+  return ::down_cast<Derived*>(base);
+#elif GTEST_HAS_RTTI
+  return dynamic_cast<Derived*>(base);  // NOLINT
+#else
+  return static_cast<Derived*>(base);  // Poor man's downcast.
+#endif
+}
+
+#if GTEST_HAS_STREAM_REDIRECTION
+
+// Defines the stderr capturer:
+//   CaptureStdout     - starts capturing stdout.
+//   GetCapturedStdout - stops capturing stdout and returns the captured string.
+//   CaptureStderr     - starts capturing stderr.
+//   GetCapturedStderr - stops capturing stderr and returns the captured string.
+//
+GTEST_API_ void CaptureStdout();
+GTEST_API_ std::string GetCapturedStdout();
+GTEST_API_ void CaptureStderr();
+GTEST_API_ std::string GetCapturedStderr();
+
+#endif  // GTEST_HAS_STREAM_REDIRECTION
+
+// Returns a path to temporary directory.
+GTEST_API_ std::string TempDir();
+
+// Returns the size (in bytes) of a file.
+GTEST_API_ size_t GetFileSize(FILE* file);
+
+// Reads the entire content of a file as a string.
+GTEST_API_ std::string ReadEntireFile(FILE* file);
+
+// All command line arguments.
+GTEST_API_ const ::std::vector<testing::internal::string>& GetArgvs();
+
+#if GTEST_HAS_DEATH_TEST
+
+const ::std::vector<testing::internal::string>& GetInjectableArgvs();
+void SetInjectableArgvs(const ::std::vector<testing::internal::string>*
+                             new_argvs);
+
+
+#endif  // GTEST_HAS_DEATH_TEST
+
+// Defines synchronization primitives.
+#if GTEST_IS_THREADSAFE
+# if GTEST_HAS_PTHREAD
+// Sleeps for (roughly) n milliseconds.  This function is only for testing
+// Google Test's own constructs.  Don't use it in user tests, either
+// directly or indirectly.
+inline void SleepMilliseconds(int n) {
+  const timespec time = {
+    0,                  // 0 seconds.
+    n * 1000L * 1000L,  // And n ms.
+  };
+  nanosleep(&time, NULL);
+}
+# endif  // GTEST_HAS_PTHREAD
+
+# if GTEST_HAS_NOTIFICATION_
+// Notification has already been imported into the namespace.
+// Nothing to do here.
+
+# elif GTEST_HAS_PTHREAD
+// Allows a controller thread to pause execution of newly created
+// threads until notified.  Instances of this class must be created
+// and destroyed in the controller thread.
+//
+// This class is only for testing Google Test's own constructs. Do not
+// use it in user tests, either directly or indirectly.
+class Notification {
+ public:
+  Notification() : notified_(false) {
+    GTEST_CHECK_POSIX_SUCCESS_(pthread_mutex_init(&mutex_, NULL));
+  }
+  ~Notification() {
+    pthread_mutex_destroy(&mutex_);
+  }
+
+  // Notifies all threads created with this notification to start. Must
+  // be called from the controller thread.
+  void Notify() {
+    pthread_mutex_lock(&mutex_);
+    notified_ = true;
+    pthread_mutex_unlock(&mutex_);
+  }
+
+  // Blocks until the controller thread notifies. Must be called from a test
+  // thread.
+  void WaitForNotification() {
+    for (;;) {
+      pthread_mutex_lock(&mutex_);
+      const bool notified = notified_;
+      pthread_mutex_unlock(&mutex_);
+      if (notified)
+        break;
+      SleepMilliseconds(10);
+    }
+  }
+
+ private:
+  pthread_mutex_t mutex_;
+  bool notified_;
+
+  GTEST_DISALLOW_COPY_AND_ASSIGN_(Notification);
+};
+
+# elif GTEST_OS_WINDOWS && !GTEST_OS_WINDOWS_PHONE && !GTEST_OS_WINDOWS_RT
+
+GTEST_API_ void SleepMilliseconds(int n);
+
+// Provides leak-safe Windows kernel handle ownership.
+// Used in death tests and in threading support.
+class GTEST_API_ AutoHandle {
+ public:
+  // Assume that Win32 HANDLE type is equivalent to void*. Doing so allows us to
+  // avoid including <windows.h> in this header file. Including <windows.h> is
+  // undesirable because it defines a lot of symbols and macros that tend to
+  // conflict with client code. This assumption is verified by
+  // WindowsTypesTest.HANDLEIsVoidStar.
+  typedef void* Handle;
+  AutoHandle();
+  explicit AutoHandle(Handle handle);
+
+  ~AutoHandle();
+
+  Handle Get() const;
+  void Reset();
+  void Reset(Handle handle);
+
+ private:
+  // Returns true iff the handle is a valid handle object that can be closed.
+  bool IsCloseable() const;
+
+  Handle handle_;
+
+  GTEST_DISALLOW_COPY_AND_ASSIGN_(AutoHandle);
+};
+
+// Allows a controller thread to pause execution of newly created
+// threads until notified.  Instances of this class must be created
+// and destroyed in the controller thread.
+//
+// This class is only for testing Google Test's own constructs. Do not
+// use it in user tests, either directly or indirectly.
+class GTEST_API_ Notification {
+ public:
+  Notification();
+  void Notify();
+  void WaitForNotification();
+
+ private:
+  AutoHandle event_;
+
+  GTEST_DISALLOW_COPY_AND_ASSIGN_(Notification);
+};
+# endif  // GTEST_HAS_NOTIFICATION_
+
+// On MinGW, we can have both GTEST_OS_WINDOWS and GTEST_HAS_PTHREAD
+// defined, but we don't want to use MinGW's pthreads implementation, which
+// has conformance problems with some versions of the POSIX standard.
+# if GTEST_HAS_PTHREAD && !GTEST_OS_WINDOWS_MINGW
+
+// As a C-function, ThreadFuncWithCLinkage cannot be templated itself.
+// Consequently, it cannot select a correct instantiation of ThreadWithParam
+// in order to call its Run(). Introducing ThreadWithParamBase as a
+// non-templated base class for ThreadWithParam allows us to bypass this
+// problem.
+class ThreadWithParamBase {
+ public:
+  virtual ~ThreadWithParamBase() {}
+  virtual void Run() = 0;
+};
+
+// pthread_create() accepts a pointer to a function type with the C linkage.
+// According to the Standard (7.5/1), function types with different linkages
+// are different even if they are otherwise identical.  Some compilers (for
+// example, SunStudio) treat them as different types.  Since class methods
+// cannot be defined with C-linkage we need to define a free C-function to
+// pass into pthread_create().
+extern "C" inline void* ThreadFuncWithCLinkage(void* thread) {
+  static_cast<ThreadWithParamBase*>(thread)->Run();
+  return NULL;
+}
+
+// Helper class for testing Google Test's multi-threading constructs.
+// To use it, write:
+//
+//   void ThreadFunc(int param) { /* Do things with param */ }
+//   Notification thread_can_start;
+//   ...
+//   // The thread_can_start parameter is optional; you can supply NULL.
+//   ThreadWithParam<int> thread(&ThreadFunc, 5, &thread_can_start);
+//   thread_can_start.Notify();
+//
+// These classes are only for testing Google Test's own constructs. Do
+// not use them in user tests, either directly or indirectly.
+template <typename T>
+class ThreadWithParam : public ThreadWithParamBase {
+ public:
+  typedef void UserThreadFunc(T);
+
+  ThreadWithParam(UserThreadFunc* func, T param, Notification* thread_can_start)
+      : func_(func),
+        param_(param),
+        thread_can_start_(thread_can_start),
+        finished_(false) {
+    ThreadWithParamBase* const base = this;
+    // The thread can be created only after all fields except thread_
+    // have been initialized.
+    GTEST_CHECK_POSIX_SUCCESS_(
+        pthread_create(&thread_, 0, &ThreadFuncWithCLinkage, base));
+  }
+  ~ThreadWithParam() { Join(); }
+
+  void Join() {
+    if (!finished_) {
+      GTEST_CHECK_POSIX_SUCCESS_(pthread_join(thread_, 0));
+      finished_ = true;
+    }
+  }
+
+  virtual void Run() {
+    if (thread_can_start_ != NULL)
+      thread_can_start_->WaitForNotification();
+    func_(param_);
+  }
+
+ private:
+  UserThreadFunc* const func_;  // User-supplied thread function.
+  const T param_;  // User-supplied parameter to the thread function.
+  // When non-NULL, used to block execution until the controller thread
+  // notifies.
+  Notification* const thread_can_start_;
+  bool finished_;  // true iff we know that the thread function has finished.
+  pthread_t thread_;  // The native thread object.
+
+  GTEST_DISALLOW_COPY_AND_ASSIGN_(ThreadWithParam);
+};
+# endif  // !GTEST_OS_WINDOWS && GTEST_HAS_PTHREAD ||
+         // GTEST_HAS_MUTEX_AND_THREAD_LOCAL_
+
+# if GTEST_HAS_MUTEX_AND_THREAD_LOCAL_
+// Mutex and ThreadLocal have already been imported into the namespace.
+// Nothing to do here.
+
+# elif GTEST_OS_WINDOWS && !GTEST_OS_WINDOWS_PHONE && !GTEST_OS_WINDOWS_RT
+
+// Mutex implements mutex on Windows platforms.  It is used in conjunction
+// with class MutexLock:
+//
+//   Mutex mutex;
+//   ...
+//   MutexLock lock(&mutex);  // Acquires the mutex and releases it at the
+//                            // end of the current scope.
+//
+// A static Mutex *must* be defined or declared using one of the following
+// macros:
+//   GTEST_DEFINE_STATIC_MUTEX_(g_some_mutex);
+//   GTEST_DECLARE_STATIC_MUTEX_(g_some_mutex);
+//
+// (A non-static Mutex is defined/declared in the usual way).
+class GTEST_API_ Mutex {
+ public:
+  enum MutexType { kStatic = 0, kDynamic = 1 };
+  // We rely on kStaticMutex being 0 as it is to what the linker initializes
+  // type_ in static mutexes.  critical_section_ will be initialized lazily
+  // in ThreadSafeLazyInit().
+  enum StaticConstructorSelector { kStaticMutex = 0 };
+
+  // This constructor intentionally does nothing.  It relies on type_ being
+  // statically initialized to 0 (effectively setting it to kStatic) and on
+  // ThreadSafeLazyInit() to lazily initialize the rest of the members.
+  explicit Mutex(StaticConstructorSelector /*dummy*/) {}
+
+  Mutex();
+  ~Mutex();
+
+  void Lock();
+
+  void Unlock();
+
+  // Does nothing if the current thread holds the mutex. Otherwise, crashes
+  // with high probability.
+  void AssertHeld();
+
+ private:
+  // Initializes owner_thread_id_ and critical_section_ in static mutexes.
+  void ThreadSafeLazyInit();
+
+  // Per http://blogs.msdn.com/b/oldnewthing/archive/2004/02/23/78395.aspx,
+  // we assume that 0 is an invalid value for thread IDs.
+  unsigned int owner_thread_id_;
+
+  // For static mutexes, we rely on these members being initialized to zeros
+  // by the linker.
+  MutexType type_;
+  long critical_section_init_phase_;  // NOLINT
+  _RTL_CRITICAL_SECTION* critical_section_;
+
+  GTEST_DISALLOW_COPY_AND_ASSIGN_(Mutex);
+};
+
+# define GTEST_DECLARE_STATIC_MUTEX_(mutex) \
+    extern ::testing::internal::Mutex mutex
+
+# define GTEST_DEFINE_STATIC_MUTEX_(mutex) \
+    ::testing::internal::Mutex mutex(::testing::internal::Mutex::kStaticMutex)
+
+// We cannot name this class MutexLock because the ctor declaration would
+// conflict with a macro named MutexLock, which is defined on some
+// platforms. That macro is used as a defensive measure to prevent against
+// inadvertent misuses of MutexLock like "MutexLock(&mu)" rather than
+// "MutexLock l(&mu)".  Hence the typedef trick below.
+class GTestMutexLock {
+ public:
+  explicit GTestMutexLock(Mutex* mutex)
+      : mutex_(mutex) { mutex_->Lock(); }
+
+  ~GTestMutexLock() { mutex_->Unlock(); }
+
+ private:
+  Mutex* const mutex_;
+
+  GTEST_DISALLOW_COPY_AND_ASSIGN_(GTestMutexLock);
+};
+
+typedef GTestMutexLock MutexLock;
+
+// Base class for ValueHolder<T>.  Allows a caller to hold and delete a value
+// without knowing its type.
+class ThreadLocalValueHolderBase {
+ public:
+  virtual ~ThreadLocalValueHolderBase() {}
+};
+
+// Provides a way for a thread to send notifications to a ThreadLocal
+// regardless of its parameter type.
+class ThreadLocalBase {
+ public:
+  // Creates a new ValueHolder<T> object holding a default value passed to
+  // this ThreadLocal<T>'s constructor and returns it.  It is the caller's
+  // responsibility not to call this when the ThreadLocal<T> instance already
+  // has a value on the current thread.
+  virtual ThreadLocalValueHolderBase* NewValueForCurrentThread() const = 0;
+
+ protected:
+  ThreadLocalBase() {}
+  virtual ~ThreadLocalBase() {}
+
+ private:
+  GTEST_DISALLOW_COPY_AND_ASSIGN_(ThreadLocalBase);
+};
+
+// Maps a thread to a set of ThreadLocals that have values instantiated on that
+// thread and notifies them when the thread exits.  A ThreadLocal instance is
+// expected to persist until all threads it has values on have terminated.
+class GTEST_API_ ThreadLocalRegistry {
+ public:
+  // Registers thread_local_instance as having value on the current thread.
+  // Returns a value that can be used to identify the thread from other threads.
+  static ThreadLocalValueHolderBase* GetValueOnCurrentThread(
+      const ThreadLocalBase* thread_local_instance);
+
+  // Invoked when a ThreadLocal instance is destroyed.
+  static void OnThreadLocalDestroyed(
+      const ThreadLocalBase* thread_local_instance);
+};
+
+class GTEST_API_ ThreadWithParamBase {
+ public:
+  void Join();
+
+ protected:
+  class Runnable {
+   public:
+    virtual ~Runnable() {}
+    virtual void Run() = 0;
+  };
+
+  ThreadWithParamBase(Runnable *runnable, Notification* thread_can_start);
+  virtual ~ThreadWithParamBase();
+
+ private:
+  AutoHandle thread_;
+};
+
+// Helper class for testing Google Test's multi-threading constructs.
+template <typename T>
+class ThreadWithParam : public ThreadWithParamBase {
+ public:
+  typedef void UserThreadFunc(T);
+
+  ThreadWithParam(UserThreadFunc* func, T param, Notification* thread_can_start)
+      : ThreadWithParamBase(new RunnableImpl(func, param), thread_can_start) {
+  }
+  virtual ~ThreadWithParam() {}
+
+ private:
+  class RunnableImpl : public Runnable {
+   public:
+    RunnableImpl(UserThreadFunc* func, T param)
+        : func_(func),
+          param_(param) {
+    }
+    virtual ~RunnableImpl() {}
+    virtual void Run() {
+      func_(param_);
+    }
+
+   private:
+    UserThreadFunc* const func_;
+    const T param_;
+
+    GTEST_DISALLOW_COPY_AND_ASSIGN_(RunnableImpl);
+  };
+
+  GTEST_DISALLOW_COPY_AND_ASSIGN_(ThreadWithParam);
+};
+
+// Implements thread-local storage on Windows systems.
+//
+//   // Thread 1
+//   ThreadLocal<int> tl(100);  // 100 is the default value for each thread.
+//
+//   // Thread 2
+//   tl.set(150);  // Changes the value for thread 2 only.
+//   EXPECT_EQ(150, tl.get());
+//
+//   // Thread 1
+//   EXPECT_EQ(100, tl.get());  // In thread 1, tl has the original value.
+//   tl.set(200);
+//   EXPECT_EQ(200, tl.get());
+//
+// The template type argument T must have a public copy constructor.
+// In addition, the default ThreadLocal constructor requires T to have
+// a public default constructor.
+//
+// The users of a TheadLocal instance have to make sure that all but one
+// threads (including the main one) using that instance have exited before
+// destroying it. Otherwise, the per-thread objects managed for them by the
+// ThreadLocal instance are not guaranteed to be destroyed on all platforms.
+//
+// Google Test only uses global ThreadLocal objects.  That means they
+// will die after main() has returned.  Therefore, no per-thread
+// object managed by Google Test will be leaked as long as all threads
+// using Google Test have exited when main() returns.
+template <typename T>
+class ThreadLocal : public ThreadLocalBase {
+ public:
+  ThreadLocal() : default_factory_(new DefaultValueHolderFactory()) {}
+  explicit ThreadLocal(const T& value)
+      : default_factory_(new InstanceValueHolderFactory(value)) {}
+
+  ~ThreadLocal() { ThreadLocalRegistry::OnThreadLocalDestroyed(this); }
+
+  T* pointer() { return GetOrCreateValue(); }
+  const T* pointer() const { return GetOrCreateValue(); }
+  const T& get() const { return *pointer(); }
+  void set(const T& value) { *pointer() = value; }
+
+ private:
+  // Holds a value of T.  Can be deleted via its base class without the caller
+  // knowing the type of T.
+  class ValueHolder : public ThreadLocalValueHolderBase {
+   public:
+    ValueHolder() : value_() {}
+    explicit ValueHolder(const T& value) : value_(value) {}
+
+    T* pointer() { return &value_; }
+
+   private:
+    T value_;
+    GTEST_DISALLOW_COPY_AND_ASSIGN_(ValueHolder);
+  };
+
+
+  T* GetOrCreateValue() const {
+    return static_cast<ValueHolder*>(
+        ThreadLocalRegistry::GetValueOnCurrentThread(this))->pointer();
+  }
+
+  virtual ThreadLocalValueHolderBase* NewValueForCurrentThread() const {
+    return default_factory_->MakeNewHolder();
+  }
+
+  class ValueHolderFactory {
+   public:
+    ValueHolderFactory() {}
+    virtual ~ValueHolderFactory() {}
+    virtual ValueHolder* MakeNewHolder() const = 0;
+
+   private:
+    GTEST_DISALLOW_COPY_AND_ASSIGN_(ValueHolderFactory);
+  };
+
+  class DefaultValueHolderFactory : public ValueHolderFactory {
+   public:
+    DefaultValueHolderFactory() {}
+    virtual ValueHolder* MakeNewHolder() const { return new ValueHolder(); }
+
+   private:
+    GTEST_DISALLOW_COPY_AND_ASSIGN_(DefaultValueHolderFactory);
+  };
+
+  class InstanceValueHolderFactory : public ValueHolderFactory {
+   public:
+    explicit InstanceValueHolderFactory(const T& value) : value_(value) {}
+    virtual ValueHolder* MakeNewHolder() const {
+      return new ValueHolder(value_);
+    }
+
+   private:
+    const T value_;  // The value for each thread.
+
+    GTEST_DISALLOW_COPY_AND_ASSIGN_(InstanceValueHolderFactory);
+  };
+
+  scoped_ptr<ValueHolderFactory> default_factory_;
+
+  GTEST_DISALLOW_COPY_AND_ASSIGN_(ThreadLocal);
+};
+
+# elif GTEST_HAS_PTHREAD
+
+// MutexBase and Mutex implement mutex on pthreads-based platforms.
+class MutexBase {
+ public:
+  // Acquires this mutex.
+  void Lock() {
+    GTEST_CHECK_POSIX_SUCCESS_(pthread_mutex_lock(&mutex_));
+    owner_ = pthread_self();
+    has_owner_ = true;
+  }
+
+  // Releases this mutex.
+  void Unlock() {
+    // Since the lock is being released the owner_ field should no longer be
+    // considered valid. We don't protect writing to has_owner_ here, as it's
+    // the caller's responsibility to ensure that the current thread holds the
+    // mutex when this is called.
+    has_owner_ = false;
+    GTEST_CHECK_POSIX_SUCCESS_(pthread_mutex_unlock(&mutex_));
+  }
+
+  // Does nothing if the current thread holds the mutex. Otherwise, crashes
+  // with high probability.
+  void AssertHeld() const {
+    GTEST_CHECK_(has_owner_ && pthread_equal(owner_, pthread_self()))
+        << "The current thread is not holding the mutex @" << this;
+  }
+
+  // A static mutex may be used before main() is entered.  It may even
+  // be used before the dynamic initialization stage.  Therefore we
+  // must be able to initialize a static mutex object at link time.
+  // This means MutexBase has to be a POD and its member variables
+  // have to be public.
+ public:
+  pthread_mutex_t mutex_;  // The underlying pthread mutex.
+  // has_owner_ indicates whether the owner_ field below contains a valid thread
+  // ID and is therefore safe to inspect (e.g., to use in pthread_equal()). All
+  // accesses to the owner_ field should be protected by a check of this field.
+  // An alternative might be to memset() owner_ to all zeros, but there's no
+  // guarantee that a zero'd pthread_t is necessarily invalid or even different
+  // from pthread_self().
+  bool has_owner_;
+  pthread_t owner_;  // The thread holding the mutex.
+};
+
+// Forward-declares a static mutex.
+#  define GTEST_DECLARE_STATIC_MUTEX_(mutex) \
+     extern ::testing::internal::MutexBase mutex
+
+// Defines and statically (i.e. at link time) initializes a static mutex.
+#  define GTEST_DEFINE_STATIC_MUTEX_(mutex) \
+     ::testing::internal::MutexBase mutex = { PTHREAD_MUTEX_INITIALIZER, false, pthread_t() }
+
+// The Mutex class can only be used for mutexes created at runtime. It
+// shares its API with MutexBase otherwise.
+class Mutex : public MutexBase {
+ public:
+  Mutex() {
+    GTEST_CHECK_POSIX_SUCCESS_(pthread_mutex_init(&mutex_, NULL));
+    has_owner_ = false;
+  }
+  ~Mutex() {
+    GTEST_CHECK_POSIX_SUCCESS_(pthread_mutex_destroy(&mutex_));
+  }
+
+ private:
+  GTEST_DISALLOW_COPY_AND_ASSIGN_(Mutex);
+};
+
+// We cannot name this class MutexLock because the ctor declaration would
+// conflict with a macro named MutexLock, which is defined on some
+// platforms. That macro is used as a defensive measure to prevent against
+// inadvertent misuses of MutexLock like "MutexLock(&mu)" rather than
+// "MutexLock l(&mu)".  Hence the typedef trick below.
+class GT

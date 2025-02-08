@@ -1,0 +1,61 @@
+//------------------------------------------------------------
+// Copyright (c) Microsoft Corporation.  All rights reserved.
+//------------------------------------------------------------
+
+namespace System.ServiceModel.Channels
+{
+    using System.Runtime;
+    using System.ServiceModel;
+
+    abstract class LayeredChannelListener<TChannel>
+        : ChannelListenerBase<TChannel>
+        where TChannel : class, IChannel
+    {
+        IChannelListener innerChannelListener;
+        bool sharedInnerListener;
+        EventHandler onInnerListenerFaulted;
+
+        protected LayeredChannelListener(IDefaultCommunicationTimeouts timeouts, IChannelListener innerChannelListener)
+            : this(false, timeouts, innerChannelListener)
+        {
+        }
+
+        protected LayeredChannelListener(bool sharedInnerListener)
+            : this(sharedInnerListener, null, null)
+        {
+        }
+
+        protected LayeredChannelListener(bool sharedInnerListener, IDefaultCommunicationTimeouts timeouts)
+            : this(sharedInnerListener, timeouts, null)
+        {
+        }
+
+        protected LayeredChannelListener(bool sharedInnerListener, IDefaultCommunicationTimeouts timeouts, IChannelListener innerChannelListener)
+            : base(timeouts)
+        {
+            this.sharedInnerListener = sharedInnerListener;
+            this.innerChannelListener = innerChannelListener;
+            this.onInnerListenerFaulted = new EventHandler(OnInnerListenerFaulted);
+            if (this.innerChannelListener != null)
+            {
+                this.innerChannelListener.Faulted += onInnerListenerFaulted;
+            }
+        }
+
+        internal virtual IChannelListener InnerChannelListener
+        {
+            get
+            {
+                return innerChannelListener;
+            }
+            set
+            {
+                lock (ThisLock)
+                {
+                    ThrowIfDisposedOrImmutable();
+                    if (this.innerChannelListener != null)
+                    {
+                        this.innerChannelListener.Faulted -= onInnerListenerFaulted;
+                    }
+                    this.innerChannelListener = value;
+                    if

@@ -1,0 +1,248 @@
+ConstantBufferCache& CBVCache = PipelineState.Common.CBVCache;
+
+#if USE_STATIC_ROOT_SIGNATURE
+	#define CONDITIONAL_SET_CBVS(Shader) \
+		if (CurrentShaderDirtyCBVSlots[##Shader]) \
+		{ \
+			DescriptorCache.SetConstantBuffers<##Shader>(pRootSignature, CBVCache, CurrentShaderDirtyCBVSlots[##Shader], NumCBVs[##Shader], ViewHeapSlot); \
+		}
+#else
+	#define CONDITIONAL_SET_CBVS(Shader) \
+		if (CurrentShaderDirtyCBVSlots[##Shader]) \
+		{ \
+			DescriptorCache.SetConstantBuffers<##Shader>(pRootSignature, CBVCache, CurrentShaderDirtyCBVSlots[##Shader]); \
+		}
+#endif
+
+		if (PipelineType == D3D12PT_Graphics)
+		{
+			CONDITIONAL_SET_CBVS(SF_Vertex);
+			CONDITIONAL_SET_CBVS(SF_Hull);
+			CONDITIONAL_SET_CBVS(SF_Domain);
+			CONDITIONAL_SET_CBVS(SF_Geometry);
+			CONDITIONAL_SET_CBVS(SF_Pixel);
+		}
+		else
+		{
+			// Note that ray tracing pipeline shares state with compute
+			CONDITIONAL_SET_CBVS(SF_Compute);
+		}
+#undef CONDITIONAL_SET_CBVS
+	}
+
+	// Flush any needed resource barriers
+	CommandList.FlushResourceBarriers();
+
+#if ASSERT_RESOURCE_STATES
+	bool bSucceeded = AssertResourceStates(PipelineType);
+	check(bSucceeded);
+#endif
+}
+
+void FD3D12StateCacheBase::ApplySamplers(const FD3D12RootSignature* const pRootSignature, uint32 StartStage, uint32 EndStage)
+{
+	bool HighLevelCacheMiss = false;
+
+	FD3D12SamplerStateCache& Cache = PipelineState.Common.SamplerCache;
+	SamplerSlotMask CurrentShaderDirtySamplerSlots[SF_NumStandardFrequencies] = {};
+	uint32 NumSamplers[SF_NumStandardFrequencies + 1] = {};
+
+	const auto& pfnCalcSamplersNeeded = [&]()
+	{
+		NumSamplers[SF_NumStandardFrequencies] = 0;
+
+		for (uint32 Stage = StartStage; Stage < EndStage; ++Stage)
+		{
+			// Note this code assumes the starting register is index 0.
+			const SamplerSlotMask CurrentShaderSamplerRegisterMask = ((SamplerSlotMask)1 << PipelineState.Common.CurrentShaderSamplerCounts[Stage]) - (SamplerSlotMask)1;
+			CurrentShaderDirtySamplerSlots[Stage] = CurrentShaderSamplerRegisterMask & Cache.DirtySlotMask[Stage];
+			if (CurrentShaderDirtySamplerSlots[Stage])
+			{
+				if (ResourceBindingTier == D3D12_RESOURCE_BINDING_TIER_1)
+				{
+					// Tier 1 HW requires the full number of sampler descriptors defined in the root signature.
+					NumSamplers[Stage] = pRootSignature->MaxSamplerCount(Stage);
+				}
+				else
+				{
+					NumSamplers[Stage] = PipelineState.Common.CurrentShaderSamplerCounts[Stage];
+				}
+
+				check(NumSamplers[Stage] > 0 && NumSamplers[Stage] <= MAX_SAMPLERS);
+				NumSamplers[SF_NumStandardFrequencies] += NumSamplers[Stage];
+			}
+		}
+	};
+
+	pfnCalcSamplersNeeded();
+
+	if (DescriptorCache.UsingGlobalSamplerHeap())
+	{
+		auto& GlobalSamplerSet = DescriptorCache.GetLocalSamplerSet();
+		FD3D12CommandListHandle& CommandList = CmdContext->CommandListHandle;
+
+		for (uint32 Stage = StartStage; Stage < EndStage; Stage++)
+		{
+			if ((CurrentShaderDirtySamplerSlots[Stage] && NumSamplers[Stage]))
+			{
+				SamplerSlotMask& CurrentDirtySlotMask = Cache.DirtySlotMask[Stage];
+				FD3D12SamplerState** Samplers = Cache.States[Stage];
+
+				FD3D12UniqueSamplerTable Table;
+				Table.Key.Count = NumSamplers[Stage];
+
+				for (uint32 i = 0; i < NumSamplers[Stage]; i++)
+				{
+					Table.Key.SamplerID[i] = Samplers[i] ? Samplers[i]->ID : 0;
+					FD3D12SamplerStateCache::CleanSlot(CurrentDirtySlotMask, i);
+				}
+
+				FD3D12UniqueSamplerTable* CachedTable = GlobalSamplerSet.Find(Table);
+				if (CachedTable)
+				{
+					// Make sure the global sampler heap is really set on the command list before we try to find a cached descriptor table for it.
+					check(DescriptorCache.IsHeapSet(GetParentDevice()->GetGlobalSamplerHeap().GetHeap()));
+					check(CachedTable->GPUHandle.ptr);
+					if (Stage == SF_Compute)
+					{
+						const uint32 RDTIndex = pRootSignature->SamplerRDTBindSlot(EShaderFrequency(Stage));
+						CommandList->SetComputeRootDescriptorTable(RDTIndex, CachedTable->GPUHandle);
+					}
+					else
+					{
+						const uint32 RDTIndex = pRootSignature->SamplerRDTBindSlot(EShaderFrequency(Stage));
+						CommandList->SetGraphicsRootDescriptorTable(RDTIndex, CachedTable->GPUHandle);
+					}
+
+					// We changed the descriptor table, so all resources bound to slots outside of the table's range are now dirty.
+					// If a shader needs to use resources bound to these slots later, we need to set the descriptor table again to ensure those
+					// descriptors are valid.
+					const SamplerSlotMask OutsideCurrentTableRegisterMask = ~(((SamplerSlotMask)1 << Table.Key.Count) - (SamplerSlotMask)1);
+					Cache.Dirty(static_cast<EShaderFrequency>(Stage), OutsideCurrentTableRegisterMask);
+				}
+				else
+				{
+					HighLevelCacheMiss = true;
+					break;
+				}
+			}
+		}
+
+		if (!HighLevelCacheMiss)
+		{
+			// Success, all the tables were found in the high level heap
+			INC_DWORD_STAT_BY(STAT_NumReusedSamplerOnlineDescriptors, NumSamplers[SF_NumStandardFrequencies]);
+			return;
+		}
+	}
+
+	if (HighLevelCacheMiss)
+	{
+		// Move to per context heap strategy
+		const bool bDescriptorHeapsChanged = DescriptorCache.SwitchToContextLocalSamplerHeap();
+		if (bDescriptorHeapsChanged)
+		{
+			// If descriptor heaps changed, then all our tables are dirty again and we need to recalculate the number of slots we need.
+			pfnCalcSamplersNeeded();
+		}
+	}
+
+	FD3D12OnlineHeap* const SamplerHeap = DescriptorCache.GetCurrentSamplerHeap();
+	check(DescriptorCache.UsingGlobalSamplerHeap() == false);
+	check(SamplerHeap != &GetParentDevice()->GetGlobalSamplerHeap());
+	check(DescriptorCache.IsHeapSet(SamplerHeap->GetHeap()));
+	check(!DescriptorCache.IsHeapSet(GetParentDevice()->GetGlobalSamplerHeap().GetHeap()));
+
+	if (!SamplerHeap->CanReserveSlots(NumSamplers[SF_NumStandardFrequencies]))
+	{
+		const bool bDescriptorHeapsChanged = SamplerHeap->RollOver();
+		if (bDescriptorHeapsChanged)
+		{
+			// If descriptor heaps changed, then all our tables are dirty again and we need to recalculate the number of slots we need.
+			pfnCalcSamplersNeeded();
+		}
+	}
+	uint32 SamplerHeapSlot = SamplerHeap->ReserveSlots(NumSamplers[SF_NumStandardFrequencies]);
+
+#define CONDITIONAL_SET_SAMPLERS(Shader) \
+	if (CurrentShaderDirtySamplerSlots[##Shader]) \
+	{ \
+		DescriptorCache.SetSamplers<##Shader>(pRootSignature, Cache, CurrentShaderDirtySamplerSlots[##Shader], NumSamplers[##Shader], SamplerHeapSlot); \
+	}
+
+	if (StartStage == SF_Compute)
+	{
+		CONDITIONAL_SET_SAMPLERS(SF_Compute);
+	}
+	else
+	{
+		CONDITIONAL_SET_SAMPLERS(SF_Vertex);
+		CONDITIONAL_SET_SAMPLERS(SF_Hull);
+		CONDITIONAL_SET_SAMPLERS(SF_Domain);
+		CONDITIONAL_SET_SAMPLERS(SF_Geometry);
+		CONDITIONAL_SET_SAMPLERS(SF_Pixel);
+	}
+#undef CONDITIONAL_SET_SAMPLERS
+
+	SamplerHeap->SetNextSlot(SamplerHeapSlot);
+}
+
+bool FD3D12StateCacheBase::AssertResourceStates(ED3D12PipelineType PipelineType)
+{
+// This requires the debug layer
+#if !D3D12_PLATFORM_SUPPORTS_ASSERTRESOURCESTATES
+	UE_LOG(LogD3D12RHI, Log, TEXT("*** VerifyResourceStates requires the debug layer ***"), this);
+	return true;
+#else
+	// Can only verify resource states if the debug layer is used
+	static const bool bWithD3DDebug = D3D12RHI_ShouldCreateWithD3DDebug();
+	if (!bWithD3DDebug)
+	{
+		UE_LOG(LogD3D12RHI, Fatal, TEXT("*** AssertResourceStates requires the debug layer ***"));
+		return false;
+	}
+
+	// Get the debug command queue
+	ID3D12CommandList* pCommandList = CmdContext->CommandListHandle.CommandList();
+	TRefCountPtr<ID3D12DebugCommandList> pDebugCommandList;
+	VERIFYD3D12RESULT(pCommandList->QueryInterface(pDebugCommandList.GetInitReference()));
+
+	//
+	// Verify common pipeline state
+	//
+
+	// Note that ray tracing pipeline shares state with compute
+	const uint32 StartStage = PipelineType == D3D12PT_Graphics ? 0 : SF_Compute;
+	const uint32 EndStage = PipelineType == D3D12PT_Graphics ? SF_Compute : SF_NumStandardFrequencies;
+
+	bool bSRVIntersectsWithDepth = false;
+	bool bSRVIntersectsWithStencil = false;
+	for (uint32 Stage = StartStage; Stage < EndStage; Stage++)
+	{
+		// UAVs
+		{
+			const uint32 numUAVs = PipelineState.Common.CurrentShaderUAVCounts[Stage];
+			for (uint32 i = 0; i < numUAVs; i++)
+			{
+				FD3D12UnorderedAccessView *pCurrentView = PipelineState.Common.UAVCache.Views[Stage][i];
+				if (!AssertResourceState(pCommandList, pCurrentView, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+				{
+					return false;
+				}
+			}
+		}
+
+		// SRVs
+		{
+			const uint32 numSRVs = PipelineState.Common.CurrentShaderSRVCounts[Stage];
+			for (uint32 i = 0; i < numSRVs; i++)
+			{
+				FD3D12ShaderResourceView* pCurrentView = PipelineState.Common.SRVCache.Views[Stage][i];
+				D3D12_RESOURCE_STATES expectedState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+				if (pCurrentView && pCurrentView->IsDepthStencilResource())
+				{
+					expectedState = expectedState | D3D12_RESOURCE_STATE_DEPTH_READ;
+
+					// Sanity check that we don't have a read/write hazard between the DSV and SRV.
+				

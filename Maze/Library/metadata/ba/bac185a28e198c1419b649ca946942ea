@@ -1,0 +1,133 @@
+//
+// ChannelDispatcher.cs
+//
+// Author:
+//	Atsushi Enomoto <atsushi@ximian.com>
+//
+// Copyright (C) 2005,2009 Novell, Inc.  http://www.novell.com
+//
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+// 
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+//
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Linq;
+using System.Reflection;
+using System.ServiceModel.Channels;
+using System.Threading;
+using System.Transactions;
+using System.ServiceModel;
+using System.ServiceModel.Description;
+using System.Net.Sockets;
+using System.Xml;
+using System.IO;
+
+namespace System.ServiceModel.Dispatcher
+{
+	public class ChannelDispatcher : ChannelDispatcherBase
+	{
+		class EndpointDispatcherCollection : SynchronizedCollection<EndpointDispatcher>
+		{
+			public EndpointDispatcherCollection (ChannelDispatcher owner)
+			{
+				this.owner = owner;
+			}
+
+			ChannelDispatcher owner;
+
+			protected override void ClearItems ()
+			{
+				foreach (var ed in this)
+					ed.ChannelDispatcher = null;
+				base.ClearItems ();
+			}
+
+			protected override void InsertItem (int index, EndpointDispatcher item)
+			{
+				item.ChannelDispatcher = owner;
+				base.InsertItem (index, item);
+			}
+
+			protected override void RemoveItem (int index)
+			{
+				if (index < Count)
+					this [index].ChannelDispatcher = null;
+				base.RemoveItem (index);
+			}
+
+			protected override void SetItem (int index, EndpointDispatcher item)
+			{
+				item.ChannelDispatcher = owner;
+				base.SetItem (index, item);
+			}
+		}
+
+		ServiceHostBase host;
+
+		string binding_name;		
+		Collection<IErrorHandler> error_handlers
+			= new Collection<IErrorHandler> ();
+		IChannelListener listener;
+		internal IDefaultCommunicationTimeouts timeouts; // FIXME: remove internal
+		MessageVersion message_version;
+		bool receive_sync, include_exception_detail_in_faults,
+			manual_addressing, is_tx_receive;
+		int max_tx_batch_size;
+		SynchronizedCollection<IChannelInitializer> initializers
+			= new SynchronizedCollection<IChannelInitializer> ();
+		IsolationLevel tx_isolation_level;
+		TimeSpan tx_timeout;
+		ServiceThrottle throttle;
+
+		Guid identifier = Guid.NewGuid ();
+		ManualResetEvent async_event = new ManualResetEvent (false);
+
+		ListenerLoopManager loop_manager;
+		SynchronizedCollection<EndpointDispatcher> endpoints;
+
+		[MonoTODO ("get binding info from config")]
+		public ChannelDispatcher (IChannelListener listener)
+			: this (listener, null)
+		{
+		}
+
+		public ChannelDispatcher (
+			IChannelListener listener, string bindingName)
+			: this (listener, bindingName, null)
+		{
+		}
+
+		public ChannelDispatcher (
+			IChannelListener listener, string bindingName,
+			IDefaultCommunicationTimeouts timeouts)
+		{
+			if (listener == null)
+				throw new ArgumentNullException ("listener");
+			Init (listener, bindingName, timeouts);
+		}
+
+		private void Init (IChannelListener listener, string bindingName,
+			IDefaultCommunicationTimeouts timeouts)
+		{
+			this.listener = listener;
+			this.binding_name = bindingName;
+			// IChannelListener is often a ChannelListenerBase
+			// which implements IDefaultCommunicationTimeouts.
+			this.timeouts = timeouts ?? listener as IDefaultCommunicationTimeouts ?? DefaultCommun

@@ -1,0 +1,55 @@
+      }
+        }
+
+        class ObjectPathRegex
+        {
+            //No support for boolean keys
+            static Regex nsRegEx = new Regex("^(?<namespace>[^\"]*?:)(?<path>.*)");
+            static Regex classRegEx = new Regex("^(?<className>.*?)\\.(?<keys>.*)");
+            static Regex keysRegEx = new Regex("(?<key>.*?)=((?<ival>[\\d]+)|\"(?<sval>.*?)\"),?");
+
+            string className;
+            Dictionary<string, object> keys = new Dictionary<string, object>();
+
+            public ObjectPathRegex(string objectPath)
+            {
+                //WMI infrastructure will double all backslashes. We need to get back to the originals
+                objectPath = objectPath.Replace("\\\\", "\\");
+                Match match = nsRegEx.Match(objectPath);
+                if (match.Success)
+                {
+                    objectPath = match.Groups["path"].Value;
+                }
+                match = classRegEx.Match(objectPath);
+                this.className = match.Groups["className"].Value;
+                string keyValues = match.Groups["keys"].Value;
+                match = keysRegEx.Match(keyValues);
+                if (!match.Success)
+                {
+                    WbemException.Throw(WbemNative.WbemStatus.WBEM_E_INVALID_OBJECT_PATH);
+                }
+                while (match.Success)
+                {
+                    if (!String.IsNullOrEmpty(match.Groups["ival"].Value))
+                    {
+                        this.keys.Add(match.Groups["key"].Value, Int32.Parse(match.Groups["ival"].Value, CultureInfo.CurrentCulture));
+                    }
+                    else
+                    {
+                        this.keys.Add(match.Groups["key"].Value, match.Groups["sval"].Value);
+                    }
+                    match = match.NextMatch();
+                }
+            }
+
+            internal string ClassName { get { return this.className; } }
+            internal Dictionary<string, object> Keys { get { return this.keys; } }
+        }
+
+        class QueryRegex
+        {
+            static Regex regEx = new Regex("\\bfrom\\b\\s+(?<className>\\w+)", RegexOptions.IgnoreCase);
+            string className;
+
+            internal QueryRegex(string query)
+   

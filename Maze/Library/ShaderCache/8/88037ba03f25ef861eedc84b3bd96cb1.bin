@@ -1,0 +1,445 @@
+CmdContext;
+
+	// Cache the resource binding tier
+	ResourceBindingTier = GetParentDevice()->GetParentAdapter()->GetResourceBindingTier();
+
+	// Init the descriptor heaps
+	const uint32 MaxDescriptorsForTier = (ResourceBindingTier == D3D12_RESOURCE_BINDING_TIER_1) ? NUM_VIEW_DESCRIPTORS_TIER_1 :
+		NUM_VIEW_DESCRIPTORS_TIER_2;
+
+	check(GLocalViewHeapSize <= (int32)MaxDescriptorsForTier);
+	check(GGlobalViewHeapSize <= (int32)MaxDescriptorsForTier);
+
+	const uint32 NumSamplerDescriptors = NUM_SAMPLER_DESCRIPTORS;
+	DescriptorCache.Init(InParent, InCmdContext, GLocalViewHeapSize, NumSamplerDescriptors);
+
+	if (AncestralState)
+	{
+		InheritState(*AncestralState);
+	}
+	else
+	{
+		ClearState();
+	}
+}
+
+void FD3D12StateCacheBase::Clear()
+{
+	ClearState();
+
+	// Release references to cached objects
+	DescriptorCache.Clear();
+}
+
+void FD3D12StateCacheBase::ClearSRVs()
+{
+	if (bSRVSCleared)
+	{
+		return;
+	}
+
+	PipelineState.Common.SRVCache.Clear();
+
+	bSRVSCleared = true;
+}
+
+void FD3D12StateCacheBase::FlushComputeShaderCache(bool bForce)
+{
+	if (bForce)
+	{
+		FD3D12CommandListHandle& CommandList = CmdContext->CommandListHandle;
+		CommandList.AddUAVBarrier();
+	}
+}
+
+void FD3D12StateCacheBase::ClearState()
+{
+	// Shader Resource View State Cache
+	bSRVSCleared = false;
+	ClearSRVs();
+
+	PipelineState.Common.CBVCache.Clear();
+	PipelineState.Common.UAVCache.Clear();
+	PipelineState.Common.SamplerCache.Clear();
+
+	FMemory::Memzero(PipelineState.Common.CurrentShaderSamplerCounts, sizeof(PipelineState.Common.CurrentShaderSamplerCounts));
+	FMemory::Memzero(PipelineState.Common.CurrentShaderSRVCounts, sizeof(PipelineState.Common.CurrentShaderSRVCounts));
+	FMemory::Memzero(PipelineState.Common.CurrentShaderCBCounts, sizeof(PipelineState.Common.CurrentShaderCBCounts));
+	FMemory::Memzero(PipelineState.Common.CurrentShaderUAVCounts, sizeof(PipelineState.Common.CurrentShaderUAVCounts));
+	
+	PipelineState.Graphics.CurrentNumberOfStreamOutTargets = 0;
+	PipelineState.Graphics.CurrentNumberOfScissorRects = 0;
+
+	// Depth Stencil State Cache
+	PipelineState.Graphics.CurrentReferenceStencil = D3D12_DEFAULT_STENCIL_REFERENCE;
+	PipelineState.Graphics.CurrentDepthStencilTarget = nullptr;
+
+	// Blend State Cache
+	PipelineState.Graphics.CurrentBlendFactor[0] = D3D12_DEFAULT_BLEND_FACTOR_RED;
+	PipelineState.Graphics.CurrentBlendFactor[1] = D3D12_DEFAULT_BLEND_FACTOR_GREEN;
+	PipelineState.Graphics.CurrentBlendFactor[2] = D3D12_DEFAULT_BLEND_FACTOR_BLUE;
+	PipelineState.Graphics.CurrentBlendFactor[3] = D3D12_DEFAULT_BLEND_FACTOR_ALPHA;
+
+	FMemory::Memzero(PipelineState.Graphics.CurrentViewport, sizeof(PipelineState.Graphics.CurrentViewport));
+	PipelineState.Graphics.CurrentNumberOfViewports = 0;
+
+	FMemory::Memzero(PipelineState.Graphics.CurrentScissorRects, sizeof(PipelineState.Graphics.CurrentScissorRects));
+	PipelineState.Graphics.CurrentNumberOfScissorRects = 0;
+
+	PipelineState.Compute.ComputeBudget = EAsyncComputeBudget::EAll_4;
+	PipelineState.Graphics.CurrentPipelineStateObject = nullptr;
+	PipelineState.Compute.CurrentPipelineStateObject = nullptr;
+	PipelineState.Common.CurrentPipelineStateObject = nullptr;
+
+	FMemory::Memzero(PipelineState.Graphics.CurrentStreamOutTargets, sizeof(PipelineState.Graphics.CurrentStreamOutTargets));
+	FMemory::Memzero(PipelineState.Graphics.CurrentSOOffsets, sizeof(PipelineState.Graphics.CurrentSOOffsets));
+
+	PipelineState.Graphics.VBCache.Clear();
+	PipelineState.Graphics.IBCache.Clear();
+
+	FMemory::Memzero(PipelineState.Graphics.RenderTargetArray, sizeof(PipelineState.Graphics.RenderTargetArray));
+	PipelineState.Graphics.CurrentNumberOfRenderTargets = 0;
+
+	PipelineState.Graphics.CurrentPrimitiveTopology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+	PipelineState.Graphics.CurrentPrimitiveType = PT_Num;
+
+	PipelineState.Graphics.MinDepth = 0.0f;
+	PipelineState.Graphics.MaxDepth = 1.0f;
+	PipelineState.Graphics.Combiner = EVRSRateCombiner::VRSRB_Passthrough;
+	PipelineState.Graphics.DrawShadingRate = EVRSShadingRate::VRSSR_1x1;
+}
+
+void FD3D12StateCacheBase::DirtyStateForNewCommandList()
+{
+	// Dirty state that doesn't align with command list defaults.
+
+	// Always need to set PSOs and root signatures
+	PipelineState.Common.bNeedSetPSO = true;
+	PipelineState.Compute.bNeedSetRootSignature = true;
+	PipelineState.Graphics.bNeedSetRootSignature = true;
+	bNeedSetPrimitiveTopology = true;
+
+	PipelineState.Graphics.NumLines = 0;
+	PipelineState.Graphics.NumTriangles = 0;
+
+	if (PipelineState.Graphics.VBCache.BoundVBMask) { bNeedSetVB = true; }
+
+	// IndexBuffers are set in DrawIndexed*() calls, so there's no way to depend on previously set IndexBuffers without making a new DrawIndexed*() call.
+	PipelineState.Graphics.IBCache.Clear();
+
+	if (PipelineState.Graphics.CurrentNumberOfStreamOutTargets) { bNeedSetSOs = true; }
+	if (PipelineState.Graphics.CurrentNumberOfRenderTargets || PipelineState.Graphics.CurrentDepthStencilTarget) { bNeedSetRTs = true; }
+	if (PipelineState.Graphics.CurrentNumberOfViewports) { bNeedSetViewports = true; }
+	if (PipelineState.Graphics.CurrentNumberOfScissorRects) { bNeedSetScissorRects = true; }
+
+	if (PipelineState.Graphics.CurrentBlendFactor[0] != D3D12_DEFAULT_BLEND_FACTOR_RED ||
+		PipelineState.Graphics.CurrentBlendFactor[1] != D3D12_DEFAULT_BLEND_FACTOR_GREEN ||
+		PipelineState.Graphics.CurrentBlendFactor[2] != D3D12_DEFAULT_BLEND_FACTOR_BLUE ||
+		PipelineState.Graphics.CurrentBlendFactor[3] != D3D12_DEFAULT_BLEND_FACTOR_ALPHA)
+	{
+		bNeedSetBlendFactor = true;
+	}
+
+	if (PipelineState.Graphics.CurrentReferenceStencil != D3D12_DEFAULT_STENCIL_REFERENCE) { bNeedSetStencilRef = true; }
+
+	if (PipelineState.Graphics.MinDepth != 0.0 || 
+		PipelineState.Graphics.MaxDepth != 1.0)
+	{
+		bNeedSetDepthBounds = GSupportsDepthBoundsTest;
+	}
+	
+	bNeedSetShadingRate = GRHISupportsVariableRateShading;
+	
+	// Always dirty View and Sampler bindings. We detect the slots that are actually used at Draw/Dispatch time.
+	PipelineState.Common.SRVCache.DirtyAll();
+	PipelineState.Common.UAVCache.DirtyAll();
+	PipelineState.Common.CBVCache.DirtyAll();
+	PipelineState.Common.SamplerCache.DirtyAll();
+}
+
+void FD3D12StateCacheBase::DirtyState()
+{
+	// Mark bits dirty so the next call to ApplyState will set all this state again
+	PipelineState.Common.bNeedSetPSO = true;
+	PipelineState.Compute.bNeedSetRootSignature = true;
+	PipelineState.Graphics.bNeedSetRootSignature = true;
+	bNeedSetVB = true;
+	bNeedSetSOs = true;
+	bNeedSetRTs = true;
+	bNeedSetViewports = true;
+	bNeedSetScissorRects = true;
+	bNeedSetPrimitiveTopology = true;
+	bNeedSetBlendFactor = true;
+	bNeedSetStencilRef = true;
+	bNeedSetDepthBounds = GSupportsDepthBoundsTest;
+	bNeedSetShadingRate = GRHISupportsVariableRateShading;
+	PipelineState.Common.SRVCache.DirtyAll();
+	PipelineState.Common.UAVCache.DirtyAll();
+	PipelineState.Common.CBVCache.DirtyAll();
+	PipelineState.Common.SamplerCache.DirtyAll();
+}
+
+void FD3D12StateCacheBase::DirtyViewDescriptorTables()
+{
+	// Mark the CBV/SRV/UAV descriptor tables dirty for the current root signature.
+	// Note: Descriptor table state is undefined at the beginning of a command list and after descriptor heaps are changed on a command list.
+	// This will cause the next call to ApplyState to copy and set these descriptors again.
+	PipelineState.Common.SRVCache.DirtyAll();
+	PipelineState.Common.UAVCache.DirtyAll();
+	PipelineState.Common.CBVCache.DirtyAll(GDescriptorTableCBVSlotMask);	// Only mark descriptor table slots as dirty.
+}
+
+void FD3D12StateCacheBase::DirtySamplerDescriptorTables()
+{
+	// Mark the sampler descriptor tables dirty for the current root signature.
+	// Note: Descriptor table state is undefined at the beginning of a command list and after descriptor heaps are changed on a command list.
+	// This will cause the next call to ApplyState to copy and set these descriptors again.
+	PipelineState.Common.SamplerCache.DirtyAll();
+}
+
+void FD3D12StateCacheBase::SetViewport(const D3D12_VIEWPORT& Viewport)
+{
+	if ((PipelineState.Graphics.CurrentNumberOfViewports != 1 || FMemory::Memcmp(&PipelineState.Graphics.CurrentViewport[0], &Viewport, sizeof(D3D12_VIEWPORT))) || GD3D12SkipStateCaching)
+	{
+		FMemory::Memcpy(&PipelineState.Graphics.CurrentViewport[0], &Viewport, sizeof(D3D12_VIEWPORT));
+		PipelineState.Graphics.CurrentNumberOfViewports = 1;
+		bNeedSetViewports = true;
+	}
+}
+
+void FD3D12StateCacheBase::SetViewports(uint32 Count, const D3D12_VIEWPORT* const Viewports)
+{
+	check(Count < UE_ARRAY_COUNT(PipelineState.Graphics.CurrentViewport));
+	if ((PipelineState.Graphics.CurrentNumberOfViewports != Count || FMemory::Memcmp(&PipelineState.Graphics.CurrentViewport[0], Viewports, sizeof(D3D12_VIEWPORT) * Count)) || GD3D12SkipStateCaching)
+	{
+		FMemory::Memcpy(&PipelineState.Graphics.CurrentViewport[0], Viewports, sizeof(D3D12_VIEWPORT) * Count);
+		PipelineState.Graphics.CurrentNumberOfViewports = Count;
+		bNeedSetViewports = true;
+	}
+}
+
+static void ValidateScissorRect(const D3D12_VIEWPORT& Viewport, const D3D12_RECT& ScissorRect)
+{
+	ensure(ScissorRect.left   >= (LONG)Viewport.TopLeftX);
+	ensure(ScissorRect.top    >= (LONG)Viewport.TopLeftY);
+	ensure(ScissorRect.right  <= (LONG)Viewport.TopLeftX + (LONG)Viewport.Width);
+	ensure(ScissorRect.bottom <= (LONG)Viewport.TopLeftY + (LONG)Viewport.Height);
+	ensure(ScissorRect.left <= ScissorRect.right && ScissorRect.top <= ScissorRect.bottom);
+}
+
+void FD3D12StateCacheBase::SetScissorRect(const D3D12_RECT& ScissorRect)
+{
+	ValidateScissorRect(PipelineState.Graphics.CurrentViewport[0], ScissorRect);
+
+	if ((PipelineState.Graphics.CurrentNumberOfScissorRects != 1 || FMemory::Memcmp(&PipelineState.Graphics.CurrentScissorRects[0], &ScissorRect, sizeof(D3D12_RECT))) || GD3D12SkipStateCaching)
+	{
+		FMemory::Memcpy(&PipelineState.Graphics.CurrentScissorRects[0], &ScissorRect, sizeof(D3D12_RECT));
+		PipelineState.Graphics.CurrentNumberOfScissorRects = 1;
+		bNeedSetScissorRects = true;
+	}
+}
+
+void FD3D12StateCacheBase::SetScissorRects(uint32 Count, const D3D12_RECT* const ScissorRects)
+{
+	check(Count < UE_ARRAY_COUNT(PipelineState.Graphics.CurrentScissorRects));
+
+	for (uint32 Rect = 0; Rect < Count; ++Rect)
+	{
+		ValidateScissorRect(PipelineState.Graphics.CurrentViewport[Rect], ScissorRects[Rect]);
+	}
+
+	if ((PipelineState.Graphics.CurrentNumberOfScissorRects != Count || FMemory::Memcmp(&PipelineState.Graphics.CurrentScissorRects[0], ScissorRects, sizeof(D3D12_RECT) * Count)) || GD3D12SkipStateCaching)
+	{
+		FMemory::Memcpy(&PipelineState.Graphics.CurrentScissorRects[0], ScissorRects, sizeof(D3D12_RECT) * Count);
+		PipelineState.Graphics.CurrentNumberOfScissorRects = Count;
+		bNeedSetScissorRects = true;
+	}
+}
+
+template <ED3D12PipelineType PipelineType>
+void FD3D12StateCacheBase::ApplyState()
+{
+	//SCOPE_CYCLE_COUNTER(STAT_D3D12ApplyStateTime);
+	const bool bForceState = false;
+	if (bForceState)
+	{
+		// Mark all state as dirty.
+		DirtyState();
+	}
+
+#if PLATFORM_SUPPORTS_VIRTUAL_TEXTURES
+	CmdContext->FlushTextureCacheIfNeeded();
+#endif
+
+	FD3D12CommandListHandle& CommandList = CmdContext->CommandListHandle;
+	const FD3D12RootSignature* pRootSignature = nullptr;
+
+	// PSO
+	if (PipelineType == D3D12PT_Compute)
+	{
+		pRootSignature = PipelineState.Compute.CurrentPipelineStateObject->ComputeShader->pRootSignature;
+
+		// See if we need to set a compute root signature
+		if (PipelineState.Compute.bNeedSetRootSignature)
+		{
+			CommandList->SetComputeRootSignature(pRootSignature->GetRootSignature());
+			PipelineState.Compute.bNeedSetRootSignature = false;
+
+			// After setting a root signature, all root parameters are undefined and must be set again.
+			PipelineState.Common.SRVCache.DirtyCompute();
+			PipelineState.Common.UAVCache.DirtyCompute();
+			PipelineState.Common.SamplerCache.DirtyCompute();
+			PipelineState.Common.CBVCache.DirtyCompute();
+		}
+	}
+	else if (PipelineType == D3D12PT_Graphics)
+	{
+		pRootSignature = GetGraphicsRootSignature();
+
+		// See if we need to set a graphics root signature
+		if (PipelineState.Graphics.bNeedSetRootSignature)
+		{
+			CommandList->SetGraphicsRootSignature(pRootSignature->GetRootSignature());
+			PipelineState.Graphics.bNeedSetRootSignature = false;
+
+			// After setting a root signature, all root parameters are undefined and must be set again.
+			PipelineState.Common.SRVCache.DirtyGraphics();
+			PipelineState.Common.UAVCache.DirtyGraphics();
+			PipelineState.Common.SamplerCache.DirtyGraphics();
+			PipelineState.Common.CBVCache.DirtyGraphics();
+		}
+	}
+
+	// Ensure the correct graphics or compute PSO is set.
+	InternalSetPipelineState<PipelineType>();
+
+	// Need to cache compute budget, as we need to reset after PSO changes
+	if (PipelineType == D3D12PT_Compute && CommandList->GetType() == D3D12_COMMAND_LIST_TYPE_COMPUTE)
+	{
+		CmdContext->SetAsyncComputeBudgetInternal(PipelineState.Compute.ComputeBudget);
+	}
+
+	if (PipelineType == D3D12PT_Graphics)
+	{
+		// Setup non-heap bindings
+		if (bNeedSetVB)
+		{
+			bNeedSetVB = false;
+			//SCOPE_CYCLE_COUNTER(STAT_D3D12ApplyStateSetVertexBufferTime);
+			DescriptorCache.SetVertexBuffers(PipelineState.Graphics.VBCache);
+		}
+		if (bNeedSetSOs)
+		{
+			bNeedSetSOs = false;
+			DescriptorCache.SetStreamOutTargets(PipelineState.Graphics.CurrentStreamOutTargets, PipelineState.Graphics.CurrentNumberOfStreamOutTargets, PipelineState.Graphics.CurrentSOOffsets);
+		}
+		if (bNeedSetViewports)
+		{
+			bNeedSetViewports = false;
+			CommandList->RSSetViewports(PipelineState.Graphics.CurrentNumberOfViewports, PipelineState.Graphics.CurrentViewport);
+		}
+		if (bNeedSetScissorRects)
+		{
+			bNeedSetScissorRects = false;
+			CommandList->RSSetScissorRects(PipelineState.Graphics.CurrentNumberOfScissorRects, PipelineState.Graphics.CurrentScissorRects);
+		}
+		if (bNeedSetPrimitiveTopology)
+		{
+			bNeedSetPrimitiveTopology = false;
+			CommandList->IASetPrimitiveTopology(PipelineState.Graphics.CurrentPrimitiveTopology);
+		}
+		if (bNeedSetBlendFactor)
+		{
+			bNeedSetBlendFactor = false;
+			CommandList->OMSetBlendFactor(PipelineState.Graphics.CurrentBlendFactor);
+		}
+		if (bNeedSetStencilRef)
+		{
+			bNeedSetStencilRef = false;
+			CommandList->OMSetStencilRef(PipelineState.Graphics.CurrentReferenceStencil);
+		}
+		if (bNeedSetRTs)
+		{
+			bNeedSetRTs = false;
+			DescriptorCache.SetRenderTargets(PipelineState.Graphics.RenderTargetArray, PipelineState.Graphics.CurrentNumberOfRenderTargets, PipelineState.Graphics.CurrentDepthStencilTarget);
+		}
+		if (bNeedSetDepthBounds)
+		{
+			bNeedSetDepthBounds = false;
+			CmdContext->SetDepthBounds(PipelineState.Graphics.MinDepth, PipelineState.Graphics.MaxDepth);
+		}
+		
+		if (bNeedSetShadingRate)
+		{
+			bNeedSetShadingRate = false;
+			CmdContext->SetShadingRate(PipelineState.Graphics.DrawShadingRate, PipelineState.Graphics.Combiner);
+		}
+	}
+
+	// Note that ray tracing pipeline shares state with compute
+	const uint32 StartStage = PipelineType == D3D12PT_Graphics ? 0 : SF_Compute;
+	const uint32 EndStage = PipelineType == D3D12PT_Graphics ? SF_Compute : SF_NumStandardFrequencies;
+
+	const EShaderFrequency UAVStage = PipelineType == D3D12PT_Graphics ? SF_Pixel : SF_Compute;
+
+	//
+	// Reserve space in descriptor heaps
+	// Since this can cause heap rollover (which causes old bindings to become invalid), the reserve must be done atomically
+	//
+
+	// Samplers
+	ApplySamplers(pRootSignature, StartStage, EndStage);
+
+	// Determine what resource bind slots are dirty for the current shaders and how many descriptor table slots we need.
+	// We only set dirty resources that can be used for the upcoming Draw/Dispatch.
+	SRVSlotMask CurrentShaderDirtySRVSlots[SF_NumStandardFrequencies] = {};
+	CBVSlotMask CurrentShaderDirtyCBVSlots[SF_NumStandardFrequencies] = {};
+	UAVSlotMask CurrentShaderDirtyUAVSlots = 0;
+	uint32 NumUAVs = 0;
+	uint32 NumSRVs[SF_NumStandardFrequencies] = {};
+#if USE_STATIC_ROOT_SIGNATURE
+	uint32 NumCBVs[SF_NumStandardFrequencies] ={};
+#endif
+	uint32 NumViews = 0;
+	for (uint32 iTries = 0; iTries < 2; ++iTries)
+	{
+		const UAVSlotMask CurrentShaderUAVRegisterMask = ((UAVSlotMask)1 << PipelineState.Common.CurrentShaderUAVCounts[UAVStage]) - (UAVSlotMask)1;
+		CurrentShaderDirtyUAVSlots = CurrentShaderUAVRegisterMask & PipelineState.Common.UAVCache.DirtySlotMask[UAVStage];
+		if (CurrentShaderDirtyUAVSlots)
+		{
+			if (ResourceBindingTier <= D3D12_RESOURCE_BINDING_TIER_2)
+			{
+				// Tier 1 and 2 HW requires the full number of UAV descriptors defined in the root signature's descriptor table.
+				NumUAVs = pRootSignature->MaxUAVCount(UAVStage);
+			}
+			else
+			{
+				NumUAVs = PipelineState.Common.CurrentShaderUAVCounts[UAVStage];
+			}
+
+			check(NumUAVs > 0 && NumUAVs <= MAX_UAVS);
+			NumViews += NumUAVs;
+		}
+
+		for (uint32 Stage = StartStage; Stage < EndStage; ++Stage)
+		{
+			// Note this code assumes the starting register is index 0.
+			const SRVSlotMask CurrentShaderSRVRegisterMask = BitMask<SRVSlotMask>(PipelineState.Common.CurrentShaderSRVCounts[Stage]);
+			CurrentShaderDirtySRVSlots[Stage] = CurrentShaderSRVRegisterMask & PipelineState.Common.SRVCache.DirtySlotMask[Stage];
+			if (CurrentShaderDirtySRVSlots[Stage])
+			{
+				if (ResourceBindingTier == D3D12_RESOURCE_BINDING_TIER_1)
+				{
+					// Tier 1 HW requires the full number of SRV descriptors defined in the root signature's descriptor table.
+					NumSRVs[Stage] = pRootSignature->MaxSRVCount(Stage);
+				}
+				else
+				{
+					NumSRVs[Stage] = PipelineState.Common.CurrentShaderSRVCounts[Stage];
+				}
+
+				check(NumSRVs[Stage] > 0 && NumSRVs[Stage] <= MAX_SRVS);
+				NumViews += NumSRVs[Stage];
+			}
+
+			const CBVSlotMask CurrentShaderCBVRegisterMask = BitMask<C

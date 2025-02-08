@@ -1,0 +1,55 @@
+ {
+    auto I = ActiveTrampolines.find(TrampolineAddr);
+    assert(I != ActiveTrampolines.end() && "Not an active trampoline.");
+    return CompileCallbackInfo(I->first, I->second);
+  }
+
+  /// @brief Release a compile callback.
+  ///
+  ///   Note: Callbacks are auto-released after they execute. This method should
+  /// only be called to manually release a callback that is not going to
+  /// execute.
+  void releaseCompileCallback(JITTargetAddress TrampolineAddr) {
+    auto I = ActiveTrampolines.find(TrampolineAddr);
+    assert(I != ActiveTrampolines.end() && "Not an active trampoline.");
+    ActiveTrampolines.erase(I);
+    AvailableTrampolines.push_back(TrampolineAddr);
+  }
+
+protected:
+  JITTargetAddress ErrorHandlerAddress;
+
+  using TrampolineMapT = std::map<JITTargetAddress, CompileFtor>;
+  TrampolineMapT ActiveTrampolines;
+  std::vector<JITTargetAddress> AvailableTrampolines;
+
+private:
+  Expected<JITTargetAddress> getAvailableTrampolineAddr() {
+    if (this->AvailableTrampolines.empty())
+      if (auto Err = grow())
+        return std::move(Err);
+    assert(!this->AvailableTrampolines.empty() &&
+           "Failed to grow available trampolines.");
+    JITTargetAddress TrampolineAddr = this->AvailableTrampolines.back();
+    this->AvailableTrampolines.pop_back();
+    return TrampolineAddr;
+  }
+
+  // Create new trampolines - to be implemented in subclasses.
+  virtual Error grow() = 0;
+
+  virtual void anchor();
+};
+
+/// @brief Manage compile callbacks for in-process JITs.
+template <typename TargetT>
+class LocalJITCompileCallbackManager : public JITCompileCallbackManager {
+public:
+  /// @brief Construct a InProcessJITCompileCallbackManager.
+  /// @param ErrorHandlerAddress The address of an error handler in the target
+  ///                            process to be used if a compile callback fails.
+  LocalJITCompileCallbackManager(JITTargetAddress ErrorHandlerAddress)
+      : JITCompileCallbackManager(ErrorHandlerAddress) {
+    /// Set up the resolver block.
+    std::error_code EC;
+    ResolverBlock = sys

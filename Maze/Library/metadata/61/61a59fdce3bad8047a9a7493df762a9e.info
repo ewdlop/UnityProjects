@@ -1,0 +1,262 @@
+p(m, xc);
+	}
+
+	xc->info_position = virt_getvoicepos(ctx, chn);
+}
+
+/*
+ * Event injection
+ */
+
+static void inject_event(struct context_data *ctx)
+{
+	struct player_data *p = &ctx->p;
+	struct module_data *m = &ctx->m;
+	struct xmp_module *mod = &m->mod;
+	struct smix_data *smix = &ctx->smix;
+	int chn;
+	
+	for (chn = 0; chn < mod->chn + smix->chn; chn++) {
+		struct xmp_event *e = &p->inject_event[chn];
+		if (e->_flag > 0) {
+			read_event(ctx, e, chn);
+			e->_flag = 0;
+		}
+	}
+}
+
+/*
+ * Sequencing
+ */
+
+static void next_order(struct context_data *ctx)
+{
+	struct player_data *p = &ctx->p;
+	struct flow_control *f = &p->flow;
+	struct module_data *m = &ctx->m;
+	struct xmp_module *mod = &m->mod;
+
+	do {
+    		p->ord++;
+
+		/* Restart module */
+		if (p->ord >= mod->len || mod->xxo[p->ord] == 0xff) {
+			if (mod->rst > mod->len ||
+			    mod->xxo[mod->rst] >= mod->pat ||
+			    p->ord < m->seq_data[p->sequence].entry_point) {
+				p->ord = m->seq_data[p->sequence].entry_point;
+			} else {
+				if (get_sequence(ctx, mod->rst) == p->sequence) {
+					p->ord = mod->rst;
+				} else {
+					p->ord = m->seq_data[p->sequence].entry_point;
+				}
+			}
+
+			p->gvol = m->xxo_info[p->ord].gvl;
+		}
+	} while (mod->xxo[p->ord] >= mod->pat);
+
+	p->current_time = m->xxo_info[p->ord].time;
+
+	f->num_rows = mod->xxp[mod->xxo[p->ord]]->rows;
+	if (f->jumpline >= f->num_rows)
+		f->jumpline = 0;
+	p->row = f->jumpline;
+	f->jumpline = 0;
+
+	p->pos = p->ord;
+	p->frame = 0;
+
+#ifndef LIBXMP_CORE_PLAYER
+	/* Reset persistent effects at new pattern */
+	if (HAS_QUIRK(QUIRK_PERPAT)) {
+		int chn;
+		for (chn = 0; chn < mod->chn; chn++) {
+			p->xc_data[chn].per_flags = 0;
+		}
+	}
+#endif
+}
+
+static void next_row(struct context_data *ctx)
+{
+	struct player_data *p = &ctx->p;
+	struct flow_control *f = &p->flow;
+
+	/* If break during pattern delay, next row is skipped.
+	 * See corruption.mod order 1D (pattern 0D) last line:
+	 * EE2 + D31 ignores D00 in order 1C line 31
+	 * Reported by The Welder <welder@majesty.net>, Jan 14 2012
+	 */
+	if (f->delay && f->pbreak) {
+		f->skip_fetch = 1;
+	}
+
+	p->frame = 0;
+	f->delay = 0;
+
+	if (f->pbreak) {
+		f->pbreak = 0;
+
+		if (f->jump != -1) {
+			p->ord = f->jump - 1;
+			f->jump = -1;
+		}
+
+		next_order(ctx);
+	} else {
+		if (f->loop_chn) {
+			p->row = f->loop[f->loop_chn - 1].start - 1;
+			f->loop_chn = 0;
+		}
+	
+		if (f->rowdelay == 0) {
+			p->row++;
+			f->rowdelay_set = 0;
+		} else {
+			f->rowdelay--;
+		}
+	
+		/* check end of pattern */
+		if (p->row >= f->num_rows) {
+			next_order(ctx);
+		}
+	}
+}
+
+#ifndef LIBXMP_CORE_DISABLE_IT
+
+/*
+ * Set note action for virt_pastnote
+ */
+void player_set_release(struct context_data *ctx, int chn)
+{
+	struct player_data *p = &ctx->p;
+	struct channel_data *xc = &p->xc_data[chn];
+
+	SET_NOTE(NOTE_RELEASE);
+}
+
+void player_set_fadeout(struct context_data *ctx, int chn)
+{
+	struct player_data *p = &ctx->p;
+	struct channel_data *xc = &p->xc_data[chn];
+
+	SET_NOTE(NOTE_FADEOUT);
+}
+
+#endif
+
+
+int xmp_start_player(xmp_context opaque, int rate, int format)
+{
+	struct context_data *ctx = (struct context_data *)opaque;
+	struct player_data *p = &ctx->p;
+#ifndef LIBXMP_CORE_PLAYER
+	struct mixer_data *s = &ctx->s;
+#endif
+	struct smix_data *smix = &ctx->smix;
+	struct module_data *m = &ctx->m;
+	struct xmp_module *mod = &m->mod;
+	struct flow_control *f = &p->flow;
+	int i;
+	int ret = 0;
+
+	if (rate < XMP_MIN_SRATE || rate > XMP_MAX_SRATE)
+		return -XMP_ERROR_INVALID;
+
+	if (ctx->state < XMP_STATE_LOADED)
+		return -XMP_ERROR_STATE;
+
+	if (ctx->state > XMP_STATE_LOADED)
+		xmp_end_player(opaque);
+
+	if (mixer_on(ctx, rate, format, m->c4rate) < 0)
+		return -XMP_ERROR_INTERNAL;
+
+	p->master_vol = 100;
+	p->smix_vol = 100;
+	p->gvol = m->volbase;
+	p->pos = p->ord = 0;
+	p->frame = -1;
+	p->row = 0;
+	p->current_time = 0;
+	p->loop_count = 0;
+
+	/* Unmute all channels and set default volume */
+	for (i = 0; i < XMP_MAX_CHANNELS; i++) {
+		p->channel_mute[i] = 0;
+		p->channel_vol[i] = 100;
+	}
+
+	/* Skip invalid patterns at start (the seventh laboratory.it) */
+	while (p->ord < mod->len && mod->xxo[p->ord] >= mod->pat) {
+		p->ord++;
+	}
+	/* Check if all positions skipped */
+	if (p->ord >= mod->len) {
+		mod->len = 0;
+	}
+
+	if (mod->len == 0 || mod->chn == 0) {
+		/* set variables to sane state */
+		p->ord = p->scan[0].ord = 0;
+		p->row = p->scan[0].row = 0;
+		f->end_point = 0;
+		f->num_rows = 0;
+	} else {
+		f->num_rows = mod->xxp[mod->xxo[p->ord]]->rows;
+		f->end_point = p->scan[0].num;
+	}
+
+	p->gvol = m->xxo_info[p->ord].gvl;
+	p->bpm = m->xxo_info[p->ord].bpm;
+	p->speed = m->xxo_info[p->ord].speed;
+	p->frame_time = m->time_factor * m->rrate / p->bpm;
+
+	if (virt_on(ctx, mod->chn + smix->chn) != 0) {
+		ret = -XMP_ERROR_INTERNAL;
+		goto err;
+	}
+
+	f->jumpline = 0;
+	f->jump = -1;
+	f->pbreak = 0;
+	f->rowdelay_set = 0;
+
+	f->loop = calloc(p->virt.virt_channels, sizeof(struct pattern_loop));
+	if (f->loop == NULL) {
+		ret = -XMP_ERROR_SYSTEM;
+		goto err;
+	}
+
+	p->xc_data = calloc(p->virt.virt_channels, sizeof(struct channel_data));
+	if (p->xc_data == NULL) {
+		ret = -XMP_ERROR_SYSTEM;
+		goto err1;
+	}
+
+#ifndef LIBXMP_CORE_PLAYER
+	for (i = 0; i < p->virt.virt_channels; i++) {
+		struct channel_data *xc = &p->xc_data[i];
+		if (new_channel_extras(ctx, xc) < 0)
+			goto err2;
+	}
+
+	if (m->synth->init(ctx, s->freq) < 0) {
+		ret = -XMP_ERROR_INTERNAL;
+		goto err2;
+	}
+
+	m->synth->reset(ctx);
+#endif
+	reset_channels(ctx);
+
+	ctx->state = XMP_STATE_PLAYING;
+
+	return 0;
+
+#ifndef LIBXMP_CORE_PLAYER
+    err2:
+	free(p->x

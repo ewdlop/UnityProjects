@@ -1,0 +1,62 @@
+ EnumVal << ",\n";
+    ++EnumVal;
+  }
+
+  OS << "  OPERAND_TYPE_LIST_END" << "\n};\n";
+  OS << "} // end namespace OpTypes\n";
+  OS << "} // end namespace " << Namespace << "\n";
+  OS << "} // end namespace llvm\n";
+  OS << "#endif // GET_INSTRINFO_OPERAND_TYPES_ENUM\n\n";
+}
+
+//===----------------------------------------------------------------------===//
+// Main Output.
+//===----------------------------------------------------------------------===//
+
+// run - Emit the main instruction description records for the target...
+void InstrInfoEmitter::run(raw_ostream &OS) {
+  emitSourceFileHeader("Target Instruction Enum Values and Descriptors", OS);
+  emitEnums(OS);
+
+  OS << "#ifdef GET_INSTRINFO_MC_DESC\n";
+  OS << "#undef GET_INSTRINFO_MC_DESC\n";
+
+  OS << "namespace llvm {\n\n";
+
+  CodeGenTarget &Target = CDP.getTargetInfo();
+  const std::string &TargetName = Target.getName();
+  Record *InstrInfo = Target.getInstructionSet();
+
+  // Keep track of all of the def lists we have emitted already.
+  std::map<std::vector<Record*>, unsigned> EmittedLists;
+  unsigned ListNumber = 0;
+
+  // Emit all of the instruction's implicit uses and defs.
+  for (const CodeGenInstruction *II : Target.getInstructionsByEnumValue()) {
+    Record *Inst = II->TheDef;
+    std::vector<Record*> Uses = Inst->getValueAsListOfDefs("Uses");
+    if (!Uses.empty()) {
+      unsigned &IL = EmittedLists[Uses];
+      if (!IL) PrintDefList(Uses, IL = ++ListNumber, OS);
+    }
+    std::vector<Record*> Defs = Inst->getValueAsListOfDefs("Defs");
+    if (!Defs.empty()) {
+      unsigned &IL = EmittedLists[Defs];
+      if (!IL) PrintDefList(Defs, IL = ++ListNumber, OS);
+    }
+  }
+
+  OperandInfoMapTy OperandInfoIDs;
+
+  // Emit all of the operand info records.
+  EmitOperandInfo(OS, OperandInfoIDs);
+
+  // Emit all of the MCInstrDesc records in their ENUM ordering.
+  //
+  OS << "\nextern const MCInstrDesc " << TargetName << "Insts[] = {\n";
+  ArrayRef<const CodeGenInstruction*> NumberedInstructions =
+    Target.getInstructionsByEnumValue();
+
+  SequenceToOffsetTable<std::string> InstrNames;
+  unsigned Num = 0;
+  for (const CodeGenIns

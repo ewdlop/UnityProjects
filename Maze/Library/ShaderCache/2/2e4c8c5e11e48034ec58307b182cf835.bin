@@ -1,0 +1,45 @@
+erCurr.Storage = StorageDescriptor.None();
+            return ndCopy;
+        }
+
+        /// <summary>
+        /// Generate code for QilNodeType.XsltCopyOf.
+        /// </summary>
+        protected override QilNode VisitXsltCopyOf(QilUnary ndCopyOf) {
+            Debug.Assert(XmlILConstructInfo.Read(ndCopyOf).PushToWriterFirst, "XsltCopyOf should always be pushed to writer.");
+
+            this.helper.LoadQueryOutput();
+
+            // XmlQueryOutput.XsltCopyOf(navigator);
+            NestedVisitEnsureStack(ndCopyOf.Child);
+            this.helper.Call(XmlILMethods.CopyOf);
+
+            this.iterCurr.Storage = StorageDescriptor.None();
+            return ndCopyOf;
+        }
+
+        /// <summary>
+        /// Generate code for QilNodeType.XsltConvert.
+        /// </summary>
+        protected override QilNode VisitXsltConvert(QilTargetType ndConv) {
+            XmlQueryType typSrc, typDst;
+            MethodInfo meth;
+
+            typSrc = ndConv.Source.XmlType;
+            typDst = ndConv.TargetType;
+
+            if (GetXsltConvertMethod(typSrc, typDst, out meth)) {
+                NestedVisitEnsureStack(ndConv.Source);
+            }
+            else {
+                // If a conversion could not be found, then convert the source expression to item or item* and try again
+                NestedVisitEnsureStack(ndConv.Source, typeof(XPathItem), !typSrc.IsSingleton);
+                if (!GetXsltConvertMethod(typSrc.IsSingleton ? TypeFactory.Item : TypeFactory.ItemS, typDst, out meth))
+                    Debug.Fail("Conversion from " + ndConv.Source.XmlType + " to " + ndConv.TargetType + " is not supported.");
+            }
+
+            // XsltConvert.XXXToYYY(value);
+            if (meth != null)
+                this.helper.Call(meth);
+
+            this.iterCurr.Storage = StorageDescriptor.Stack(GetItemStorageType(typDst), 

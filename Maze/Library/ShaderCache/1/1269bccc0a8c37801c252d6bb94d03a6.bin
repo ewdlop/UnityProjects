@@ -1,0 +1,77 @@
+﻿// Copyright (c) Microsoft Open Technologies, Inc. All rights reserved. See License.txt in the project root for license information.
+
+#if HAS_WINRT
+using System.Reactive.Disposables;
+using System.Reactive.Linq;
+using System.Reactive.Subjects;
+using System.Threading;
+using Windows.Foundation;
+
+namespace System.Reactive.Windows.Foundation
+{
+    /// <summary>
+    /// Provides conversions from Windows Runtime asynchronous actions and operations to observable sequences.
+    /// </summary>
+    public static class AsyncInfoObservableExtensions
+    {
+        #region IAsyncAction and IAsyncActionWithProgress
+
+        /// <summary>
+        /// Converts a Windows Runtime asynchronous action to an observable sequence.
+        /// Each observer subscribed to the resulting observable sequence will be notified about the action's successful or exceptional completion.
+        /// </summary>
+        /// <param name="source">Asynchronous action to convert.</param>
+        /// <returns>An observable sequence that produces a unit value when the asynchronous action completes, or propagates the exception produced by the asynchronous action.</returns>
+        /// <exception cref="ArgumentNullException"><paramref name="source"/> is null.</exception>
+        public static IObservable<Unit> ToObservable(this IAsyncAction source)
+        {
+            if (source == null)
+                throw new ArgumentNullException("source");
+
+            return new AsyncInfoToObservableBridge<Unit, Unit>(
+                source,
+                (iai, a) => ((IAsyncAction)iai).Completed += new AsyncActionCompletedHandler((iaa, status) => a(iaa, status)),
+                iai => Unit.Default,
+                onProgress: null,
+                progress: null,
+                multiValue: false
+            );
+        }
+
+        /// <summary>
+        /// Converts a Windows Runtime asynchronous action to an observable sequence, ignoring its progress notifications.
+        /// Each observer subscribed to the resulting observable sequence will be notified about the action's successful or exceptional completion.
+        /// </summary>
+        /// <typeparam name="TProgress">The type of the reported progress objects, which get ignored by this conversion.</typeparam>
+        /// <param name="source">Asynchronous action to convert.</param>
+        /// <returns>An observable sequence that produces a unit value when the asynchronous action completes, or propagates the exception produced by the asynchronous action.</returns>
+        /// <exception cref="ArgumentNullException"><paramref name="source"/> is null.</exception>
+        public static IObservable<Unit> ToObservable<TProgress>(this IAsyncActionWithProgress<TProgress> source)
+        {
+            if (source == null)
+                throw new ArgumentNullException("source");
+
+            return source.ToObservable_(null);
+        }
+
+        /// <summary>
+        /// Converts a Windows Runtime asynchronous action to an observable sequence, reporting its progress through the supplied progress object.
+        /// Each observer subscribed to the resulting observable sequence will be notified about the action's successful or exceptional completion.
+        /// </summary>
+        /// <typeparam name="TProgress">The type of the reported progress objects.</typeparam>
+        /// <param name="source">Asynchronous action to convert.</param>
+        /// <param name="progress">Progress object to receive progress notifications on.</param>
+        /// <returns>An observable sequence that produces a unit value when the asynchronous action completes, or propagates the exception produced by the asynchronous action.</returns>
+        /// <exception cref="ArgumentNullException"><paramref name="source"/> or <paramref name="progress"/> is null.</exception>
+        public static IObservable<Unit> ToObservable<TProgress>(this IAsyncActionWithProgress<TProgress> source, IProgress<TProgress> progress)
+        {
+            if (source == null)
+                throw new ArgumentNullException("source");
+            if (progress == null)
+                throw new ArgumentNullException("progress");
+
+            return source.ToObservable_(progress);
+        }
+
+        /// <summary>
+        /// Converts a Windows 

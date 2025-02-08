@@ -1,0 +1,479 @@
+nt) result [2];
+			this.is_bound = (ProtocolType) (int) result [3] != 0;
+			this.m_Handle = new SafeSocketHandle ((IntPtr) (long) result [4], true);
+
+			InitializeSockets ();
+
+			SocketDefaults ();
+		}
+
+		/* private constructor used by Accept, which already has a socket handle to use */
+		internal Socket(AddressFamily family, SocketType type, ProtocolType proto, SafeSocketHandle safe_handle)
+		{
+			this.addressFamily = family;
+			this.socketType = type;
+			this.protocolType = proto;
+			
+			this.m_Handle = safe_handle;
+			this.is_connected = true;
+
+			InitializeSockets ();	
+		}
+
+		void SocketDefaults ()
+		{
+			try {
+				/* Need to test IPv6 further */
+				if (addressFamily == AddressFamily.InterNetwork
+					// || addressFamily == AddressFamily.InterNetworkV6
+				) {
+					/* This is the default, but it probably has nasty side
+					 * effects on Linux, as the socket option is kludged by
+					 * turning on or off PMTU discovery... */
+					this.DontFragment = false;
+					if (protocolType == ProtocolType.Tcp)
+						this.NoDelay = false;
+				} else if (addressFamily == AddressFamily.InterNetworkV6) {
+					this.DualMode = true;
+				}
+
+				/* Microsoft sets these to 8192, but we are going to keep them
+				 * both to the OS defaults as these have a big performance impact.
+				 * on WebClient performance. */
+				// this.ReceiveBufferSize = 8192;
+				// this.SendBufferSize = 8192;
+			} catch (SocketException) {
+			}
+		}
+
+		/* Creates a new system socket, returning the handle */
+		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+		extern static IntPtr Socket_icall (AddressFamily family, SocketType type, ProtocolType proto, out int error);
+
+#endregion
+
+#region Properties
+
+		public int Available {
+			get {
+				ThrowIfDisposedAndClosed ();
+
+				int ret, error;
+				ret = Available_internal (m_Handle, out error);
+
+				if (error != 0)
+					throw new SocketException (error);
+
+				return ret;
+			}
+		}
+
+		static int Available_internal (SafeSocketHandle safeHandle, out int error)
+		{
+			bool release = false;
+			try {
+				safeHandle.DangerousAddRef (ref release);
+				return Available_icall (safeHandle.DangerousGetHandle (), out error);
+			} finally {
+				if (release)
+					safeHandle.DangerousRelease ();
+			}
+		}
+
+		/* Returns the amount of data waiting to be read on socket */
+		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+		extern static int Available_icall (IntPtr socket, out int error);
+
+		// FIXME: import from referencesource
+		public bool EnableBroadcast {
+			get {
+				ThrowIfDisposedAndClosed ();
+
+				if (protocolType != ProtocolType.Udp)
+					throw new SocketException ((int) SocketError.ProtocolOption);
+
+				return ((int) GetSocketOption (SocketOptionLevel.Socket, SocketOptionName.Broadcast)) != 0;
+			}
+			set {
+				ThrowIfDisposedAndClosed ();
+
+				if (protocolType != ProtocolType.Udp)
+					throw new SocketException ((int) SocketError.ProtocolOption);
+
+				SetSocketOption (SocketOptionLevel.Socket, SocketOptionName.Broadcast, value ? 1 : 0);
+			}
+		}
+
+		public bool IsBound {
+			get {
+				return is_bound;
+			}
+		}
+
+		// FIXME: import from referencesource
+		public bool MulticastLoopback {
+			get {
+				ThrowIfDisposedAndClosed ();
+
+				/* Even though this option can be set for TCP sockets on Linux, throw
+				 * this exception anyway to be compatible (the MSDN docs say
+				 * "Setting this property on a Transmission Control Protocol (TCP)
+				 * socket will have no effect." but the MS runtime throws the
+				 * exception...) */
+				if (protocolType == ProtocolType.Tcp)
+					throw new SocketException ((int)SocketError.ProtocolOption);
+
+				switch (addressFamily) {
+				case AddressFamily.InterNetwork:
+					return ((int) GetSocketOption (SocketOptionLevel.IP, SocketOptionName.MulticastLoopback)) != 0;
+				case AddressFamily.InterNetworkV6:
+					return ((int) GetSocketOption (SocketOptionLevel.IPv6, SocketOptionName.MulticastLoopback)) != 0;
+				default:
+					throw new NotSupportedException ("This property is only valid for InterNetwork and InterNetworkV6 sockets");
+				}
+			}
+			set {
+				ThrowIfDisposedAndClosed ();
+
+				/* Even though this option can be set for TCP sockets on Linux, throw
+				 * this exception anyway to be compatible (the MSDN docs say
+				 * "Setting this property on a Transmission Control Protocol (TCP)
+				 * socket will have no effect." but the MS runtime throws the
+				 * exception...) */
+				if (protocolType == ProtocolType.Tcp)
+					throw new SocketException ((int)SocketError.ProtocolOption);
+
+				switch (addressFamily) {
+				case AddressFamily.InterNetwork:
+					SetSocketOption (SocketOptionLevel.IP, SocketOptionName.MulticastLoopback, value ? 1 : 0);
+					break;
+				case AddressFamily.InterNetworkV6:
+					SetSocketOption (SocketOptionLevel.IPv6, SocketOptionName.MulticastLoopback, value ? 1 : 0);
+					break;
+				default:
+					throw new NotSupportedException ("This property is only valid for InterNetwork and InterNetworkV6 sockets");
+				}
+			}
+		}
+
+		// Wish:  support non-IP endpoints.
+		public EndPoint LocalEndPoint {
+			get {
+				ThrowIfDisposedAndClosed ();
+
+				/* If the seed EndPoint is null, Connect, Bind, etc has not yet
+				 * been called. MS returns null in this case. */
+				if (seed_endpoint == null)
+					return null;
+
+				int error;
+				SocketAddress sa = LocalEndPoint_internal (m_Handle, (int) addressFamily, out error);
+
+				if (error != 0)
+					throw new SocketException (error);
+
+				return seed_endpoint.Create (sa);
+			}
+		}
+
+		static SocketAddress LocalEndPoint_internal (SafeSocketHandle safeHandle, int family, out int error)
+		{
+			bool release = false;
+			try {
+				safeHandle.DangerousAddRef (ref release);
+				return LocalEndPoint_icall (safeHandle.DangerousGetHandle (), family, out error);
+			} finally {
+				if (release)
+					safeHandle.DangerousRelease ();
+			}
+		}
+
+		/* Returns the local endpoint details in addr and port */
+		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+		extern static SocketAddress LocalEndPoint_icall (IntPtr socket, int family, out int error);
+
+		public bool Blocking {
+			get { return is_blocking; }
+			set {
+				ThrowIfDisposedAndClosed ();
+
+				int error;
+				Blocking_internal (m_Handle, value, out error);
+
+				if (error != 0)
+					throw new SocketException (error);
+
+				is_blocking = value;
+			}
+		}
+
+		static void Blocking_internal (SafeSocketHandle safeHandle, bool block, out int error)
+		{
+			bool release = false;
+			try {
+				safeHandle.DangerousAddRef (ref release);
+				Blocking_icall (safeHandle.DangerousGetHandle (), block, out error);
+			} finally {
+				if (release)
+					safeHandle.DangerousRelease ();
+			}
+		}
+
+		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+		internal extern static void Blocking_icall (IntPtr socket, bool block, out int error);
+
+		public bool Connected {
+			get { return is_connected; }
+			internal set { is_connected = value; }
+		}
+
+		// FIXME: import from referencesource
+		public bool NoDelay {
+			get {
+				ThrowIfDisposedAndClosed ();
+				ThrowIfUdp ();
+
+				return ((int) GetSocketOption (SocketOptionLevel.Tcp, SocketOptionName.NoDelay)) != 0;
+			}
+
+			set {
+				ThrowIfDisposedAndClosed ();
+				ThrowIfUdp ();
+				SetSocketOption (SocketOptionLevel.Tcp, SocketOptionName.NoDelay, value ? 1 : 0);
+			}
+		}
+
+		public EndPoint RemoteEndPoint {
+			get {
+				ThrowIfDisposedAndClosed ();
+
+				/* If the seed EndPoint is null, Connect, Bind, etc has
+				 * not yet been called. MS returns null in this case. */
+				if (!is_connected || seed_endpoint == null)
+					return null;
+
+				int error;
+				SocketAddress sa = RemoteEndPoint_internal (m_Handle, (int) addressFamily, out error);
+
+				if (error != 0)
+					throw new SocketException (error);
+
+				return seed_endpoint.Create (sa);
+			}
+		}
+
+		static SocketAddress RemoteEndPoint_internal (SafeSocketHandle safeHandle, int family, out int error)
+		{
+			bool release = false;
+			try {
+				safeHandle.DangerousAddRef (ref release);
+				return RemoteEndPoint_icall (safeHandle.DangerousGetHandle (), family, out error);
+			} finally {
+				if (release)
+					safeHandle.DangerousRelease ();
+			}
+		}
+
+		/* Returns the remote endpoint details in addr and port */
+		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+		extern static SocketAddress RemoteEndPoint_icall (IntPtr socket, int family, out int error);
+
+		internal SafeHandle SafeHandle
+		{
+			get { return m_Handle; }
+		}
+
+#endregion
+
+#region Select
+
+		public static void Select (IList checkRead, IList checkWrite, IList checkError, int microSeconds)
+		{
+			var list = new List<Socket> ();
+			AddSockets (list, checkRead, "checkRead");
+			AddSockets (list, checkWrite, "checkWrite");
+			AddSockets (list, checkError, "checkError");
+
+			if (list.Count == 3)
+				throw new ArgumentNullException ("checkRead, checkWrite, checkError", "All the lists are null or empty.");
+
+			/* The 'sockets' array contains:
+			 *  - READ socket 0-n, null,
+			 *  - WRITE socket 0-n, null,
+			 *  - ERROR socket 0-n, null */
+			Socket [] sockets = list.ToArray ();
+
+			int error;
+			Select_icall (ref sockets, microSeconds, out error);
+
+			if (error != 0)
+				throw new SocketException (error);
+
+			if (sockets == null) {
+				if (checkRead != null)
+					checkRead.Clear ();
+				if (checkWrite != null)
+					checkWrite.Clear ();
+				if (checkError != null)
+					checkError.Clear ();
+				return;
+			}
+
+			int mode = 0;
+			int count = sockets.Length;
+			IList currentList = checkRead;
+			int currentIdx = 0;
+			for (int i = 0; i < count; i++) {
+				Socket sock = sockets [i];
+				if (sock == null) { // separator
+					if (currentList != null) {
+						// Remove non-signaled sockets after the current one
+						int to_remove = currentList.Count - currentIdx;
+						for (int k = 0; k < to_remove; k++)
+							currentList.RemoveAt (currentIdx);
+					}
+					currentList = (mode == 0) ? checkWrite : checkError;
+					currentIdx = 0;
+					mode++;
+					continue;
+				}
+
+				if (mode == 1 && currentList == checkWrite && !sock.is_connected) {
+					if ((int) sock.GetSocketOption (SocketOptionLevel.Socket, SocketOptionName.Error) == 0)
+						sock.is_connected = true;
+				}
+
+				/* Remove non-signaled sockets before the current one */
+				while (((Socket) currentList [currentIdx]) != sock)
+					currentList.RemoveAt (currentIdx);
+
+				currentIdx++;
+			}
+		}
+
+		static void AddSockets (List<Socket> sockets, IList list, string name)
+		{
+			if (list != null) {
+				foreach (Socket sock in list) {
+					if (sock == null) // MS throws a NullRef
+						throw new ArgumentNullException (name, "Contains a null element");
+					sockets.Add (sock);
+				}
+			}
+
+			sockets.Add (null);
+		}
+
+		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+		extern static void Select_icall (ref Socket [] sockets, int microSeconds, out int error);
+
+#endregion
+
+#region Poll
+
+		public bool Poll (int microSeconds, SelectMode mode)
+		{
+			ThrowIfDisposedAndClosed ();
+
+			if (mode != SelectMode.SelectRead && mode != SelectMode.SelectWrite && mode != SelectMode.SelectError)
+				throw new NotSupportedException ("'mode' parameter is not valid.");
+
+			int error;
+			bool result = Poll_internal (m_Handle, mode, microSeconds, out error);
+
+			if (error != 0)
+				throw new SocketException (error);
+
+			if (mode == SelectMode.SelectWrite && result && !is_connected) {
+				/* Update the is_connected state; for non-blocking Connect()
+				 * this is when we can find out that the connect succeeded. */
+				if ((int) GetSocketOption (SocketOptionLevel.Socket, SocketOptionName.Error) == 0)
+					is_connected = true;
+			}
+
+			return result;
+		}
+
+		static bool Poll_internal (SafeSocketHandle safeHandle, SelectMode mode, int timeout, out int error)
+		{
+			bool release = false;
+			try {
+				safeHandle.DangerousAddRef (ref release);
+				return Poll_icall (safeHandle.DangerousGetHandle (), mode, timeout, out error);
+			} finally {
+				if (release)
+					safeHandle.DangerousRelease ();
+			}
+		}
+
+		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+		extern static bool Poll_icall (IntPtr socket, SelectMode mode, int timeout, out int error);
+
+#endregion
+
+#region Accept
+
+		public Socket Accept()
+		{
+			ThrowIfDisposedAndClosed ();
+
+			int error = 0;
+			SafeSocketHandle safe_handle = Accept_internal (this.m_Handle, out error, is_blocking);
+
+			if (error != 0) {
+				if (is_closed)
+					error = SOCKET_CLOSED_CODE;
+				throw new SocketException(error);
+			}
+
+			Socket accepted = new Socket (this.AddressFamily, this.SocketType, this.ProtocolType, safe_handle) {
+				seed_endpoint = this.seed_endpoint,
+				Blocking = this.Blocking,
+			};
+
+			return accepted;
+		}
+
+		internal void Accept (Socket acceptSocket)
+		{
+			ThrowIfDisposedAndClosed ();
+
+			int error = 0;
+			SafeSocketHandle safe_handle = Accept_internal (this.m_Handle, out error, is_blocking);
+
+			if (error != 0) {
+				if (is_closed)
+					error = SOCKET_CLOSED_CODE;
+				throw new SocketException (error);
+			}
+
+			acceptSocket.addressFamily = this.AddressFamily;
+			acceptSocket.socketType = this.SocketType;
+			acceptSocket.protocolType = this.ProtocolType;
+			acceptSocket.m_Handle = safe_handle;
+			acceptSocket.is_connected = true;
+			acceptSocket.seed_endpoint = this.seed_endpoint;
+			acceptSocket.Blocking = this.Blocking;
+
+			// FIXME: figure out what if anything else needs to be reset
+		}
+
+		public bool AcceptAsync (SocketAsyncEventArgs e)
+		{
+			// NO check is made whether e != null in MS.NET (NRE is thrown in such case)
+
+			ThrowIfDisposedAndClosed ();
+
+			if (!is_bound)
+				throw new InvalidOperationException ("You must call the Bind method before performing this operation.");
+			if (!is_listening)
+				throw new InvalidOperationException ("You must call the Listen method before performing this operation.");
+			if (e.BufferList != null)
+				throw new ArgumentException ("Multiple buffers cannot be used with this method.");
+			if (e.Count < 0)
+				throw new ArgumentOutOfRangeException ("e.Count");
+
+			Socket acceptSocket = e.AcceptSocket;
+			if (acceptSocket != null) {
+				if (acceptSocket.is_bound || acceptSocket.is_connected)
+					throw new InvalidOpe

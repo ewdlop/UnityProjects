@@ -1,0 +1,103 @@
+lisionStream::getParameterDefinitionTree(void) const
+{
+	MeshCookedCollisionStream* tmpParam = const_cast<MeshCookedCollisionStream*>(this);
+
+	if (!mBuiltFlag) // Double-checked lock
+	{
+		NvParameterized::MutexType::ScopedLock lock(mBuiltFlagMutex);
+		if (!mBuiltFlag)
+		{
+			tmpParam->buildTree();
+		}
+	}
+
+	return(&ParamDefTable[0]);
+}
+
+NvParameterized::ErrorType MeshCookedCollisionStream::getParameterHandle(const char* long_name, Handle& handle) const
+{
+	ErrorType Ret = NvParameters::getParameterHandle(long_name, handle);
+	if (Ret != ERROR_NONE)
+	{
+		return(Ret);
+	}
+
+	size_t offset;
+	void* ptr;
+
+	getVarPtr(handle, ptr, offset);
+
+	if (ptr == NULL)
+	{
+		return(ERROR_INDEX_OUT_OF_RANGE);
+	}
+
+	return(ERROR_NONE);
+}
+
+NvParameterized::ErrorType MeshCookedCollisionStream::getParameterHandle(const char* long_name, Handle& handle)
+{
+	ErrorType Ret = NvParameters::getParameterHandle(long_name, handle);
+	if (Ret != ERROR_NONE)
+	{
+		return(Ret);
+	}
+
+	size_t offset;
+	void* ptr;
+
+	getVarPtr(handle, ptr, offset);
+
+	if (ptr == NULL)
+	{
+		return(ERROR_INDEX_OUT_OF_RANGE);
+	}
+
+	return(ERROR_NONE);
+}
+
+void MeshCookedCollisionStream::getVarPtr(const Handle& handle, void*& ptr, size_t& offset) const
+{
+	ptr = getVarPtrHelper(&ParamLookupTable[0], const_cast<MeshCookedCollisionStream::ParametersStruct*>(&parameters()), handle, offset);
+}
+
+
+/* Dynamic Handle Indices */
+
+void MeshCookedCollisionStream::freeParameterDefinitionTable(NvParameterized::Traits* traits)
+{
+	if (!traits)
+	{
+		return;
+	}
+
+	if (!mBuiltFlag) // Double-checked lock
+	{
+		return;
+	}
+
+	NvParameterized::MutexType::ScopedLock lock(mBuiltFlagMutex);
+
+	if (!mBuiltFlag)
+	{
+		return;
+	}
+
+	for (uint32_t i = 0; i < NumParamDefs; ++i)
+	{
+		ParamDefTable[i].~DefinitionImpl();
+	}
+
+	traits->free(ParamDefTable);
+
+	mBuiltFlag = false;
+}
+
+#define PDEF_PTR(index) (&ParamDefTable[index])
+
+void MeshCookedCollisionStream::buildTree(void)
+{
+
+	uint32_t allocSize = sizeof(NvParameterized::DefinitionImpl) * NumParamDefs;
+	ParamDefTable = (NvParameterized::DefinitionImpl*)(mParameterizedTraits->alloc(allocSize));
+	memset(ParamDefTable, 

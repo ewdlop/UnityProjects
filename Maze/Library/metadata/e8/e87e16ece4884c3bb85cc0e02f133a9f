@@ -1,0 +1,243 @@
+e
+// performance is extremely sensitive, there are several alternatives:
+// - Comparing serialized string
+// Downside: false negatives (there are messages that are the same but their
+// serialized strings are different).
+// - Equals code generator by compiler plugin (net/proto2/contrib/equals_plugin)
+// Downside: more generated code; maintenance overhead for the additional rule
+// (must be in sync with the original proto_library).
+//
+// Note on handling of google.protobuf.Any: MessageDifferencer automatically
+// unpacks Any::value into a Message and compares its individual fields.
+// Messages encoded in a repeated Any cannot be compared using TreatAsMap.
+//
+//
+// Note on thread-safety: MessageDifferencer is *not* thread-safe. You need to
+// guard it with a lock to use the same MessageDifferencer instance from
+// multiple threads. Note that it's fine to call static comparison methods
+// (like MessageDifferencer::Equals) concurrently.
+class LIBPROTOBUF_EXPORT MessageDifferencer {
+ public:
+  // Determines whether the supplied messages are equal. Equality is defined as
+  // all fields within the two messages being set to the same value. Primitive
+  // fields and strings are compared by value while embedded messages/groups
+  // are compared as if via a recursive call. Use IgnoreField() and Compare()
+  // if some fields should be ignored in the comparison.
+  //
+  // This method REQUIRES that the two messages have the same
+  // Descriptor (message1.GetDescriptor() == message2.GetDescriptor()).
+  static bool Equals(const Message& message1, const Message& message2);
+
+  // Determines whether the supplied messages are equivalent. Equivalency is
+  // defined as all fields within the two messages having the same value. This
+  // differs from the Equals method above in that fields with default values
+  // are considered set to said value automatically. For details on how default
+  // values are defined for each field type, see http://shortn/_x2Gv6XFrWt.
+  // Also, Equivalent() ignores unknown fields. Use IgnoreField() and Compare()
+  // if some fields should be ignored in the comparison.
+  //
+  // This method REQUIRES that the two messages have the same
+  // Descriptor (message1.GetDescriptor() == message2.GetDescriptor()).
+  static bool Equivalent(const Message& message1, const Message& message2);
+
+  // Determines whether the supplied messages are approximately equal.
+  // Approximate equality is defined as all fields within the two messages
+  // being approximately equal.  Primitive (non-float) fields and strings are
+  // compared by value, floats are compared using MathUtil::AlmostEquals() and
+  // embedded messages/groups are compared as if via a recursive call. Use
+  // IgnoreField() and Compare() if some fields should be ignored in the
+  // comparison.
+  //
+  // This method REQUIRES that the two messages have the same
+  // Descriptor (message1.GetDescriptor() == message2.GetDescriptor()).
+  static bool ApproximatelyEquals(const Message& message1,
+                                  const Message& message2);
+
+  // Determines whether the supplied messages are approximately equivalent.
+  // Approximate equivalency is defined as all fields within the two messages
+  // being approximately equivalent. As in
+  // MessageDifferencer::ApproximatelyEquals, primitive (non-float) fields and
+  // strings are compared by value, floats are compared using
+  // MathUtil::AlmostEquals() and embedded messages/groups are compared as if
+  // via a recursive call. However, fields with default values are considered
+  // set to said value, as per MessageDiffencer::Equivalent. Use IgnoreField()
+  // and Compare() if some fields should be ignored in the comparison.
+  //
+  // This method REQUIRES that the two messages have the same
+  // Descriptor (message1.GetDescriptor() == message2.GetDescriptor()).
+  static bool ApproximatelyEquivalent(const Message& message1,
+                                      const Message& message2);
+
+  // Identifies an individual field in a message instance.  Used for field_path,
+  // below.
+  struct SpecificField {
+    // For known fields, "field" is filled in and "unknown_field_number" is -1.
+    // For unknown fields, "field" is NULL, "unknown_field_number" is the field
+    // number, and "unknown_field_type" is its type.
+    const FieldDescriptor* field;
+    int unknown_field_number;
+    UnknownField::Type unknown_field_type;
+
+    // If this a repeated field, "index" is the index within it.  For unknown
+    // fields, this is the index of the field among all unknown fields of the
+    // same field number and type.
+    int index;
+
+    // If "field" is a repeated field which is being treated as a map or
+    // a set (see TreatAsMap() and TreatAsSet(), below), new_index indicates
+    // the index the position to which the element has moved.  This only
+    // applies to ReportMoved() and (in the case of TreatAsMap())
+    // ReportModified().  In all other cases, "new_index" will have the same
+    // value as "index".
+    int new_index;
+
+    // For unknown fields, these are the pointers to the UnknownFieldSet
+    // containing the unknown fields. In certain cases (e.g. proto1's
+    // MessageSet, or nested groups of unknown fields), these may differ from
+    // the messages' internal UnknownFieldSets.
+    const UnknownFieldSet* unknown_field_set1;
+    const UnknownFieldSet* unknown_field_set2;
+
+    // For unknown fields, these are the index of the field within the
+    // UnknownFieldSets. One or the other will be -1 when
+    // reporting an addition or deletion.
+    int unknown_field_index1;
+    int unknown_field_index2;
+
+    SpecificField()
+        : field(NULL),
+          unknown_field_number(-1),
+          index(-1),
+          new_index(-1),
+          unknown_field_set1(NULL),
+          unknown_field_set2(NULL),
+          unknown_field_index1(-1),
+          unknown_field_index2(-1) {}
+  };
+
+  // Abstract base class from which all MessageDifferencer
+  // reporters derive. The five Report* methods below will be called when
+  // a field has been added, deleted, modified, moved, or matched. The third
+  // argument is a vector of FieldDescriptor pointers which describes the chain
+  // of fields that was taken to find the current field. For example, for a
+  // field found in an embedded message, the vector will contain two
+  // FieldDescriptors. The first will be the field of the embedded message
+  // itself and the second will be the actual field in the embedded message
+  // that was added/deleted/modified.
+  class LIBPROTOBUF_EXPORT Reporter {
+   public:
+    Reporter();
+    virtual ~Reporter();
+
+    // Reports that a field has been added into Message2.
+    virtual void ReportAdded(
+        const Message& message1, const Message& message2,
+        const std::vector<SpecificField>& field_path) = 0;
+
+    // Reports that a field has been deleted from Message1.
+    virtual void ReportDeleted(
+        const Message& message1,
+        const Message& message2,
+        const std::vector<SpecificField>& field_path) = 0;
+
+    // Reports that the value of a field has been modified.
+    virtual void ReportModified(
+        const Message& message1,
+        const Message& message2,
+        const std::vector<SpecificField>& field_path) = 0;
+
+    // Reports that a repeated field has been moved to another location.  This
+    // only applies when using TreatAsSet or TreatAsMap()  -- see below. Also
+    // note that for any given field, ReportModified and ReportMoved are
+    // mutually exclusive. If a field has been both moved and modified, then
+    // only ReportModified will be called.
+    virtual void ReportMoved(
+        const Message& /* message1 */,
+        const Message& /* message2 */,
+        const std::vector<SpecificField>& /* field_path */) { }
+
+    // Reports that two fields match. Useful for doing side-by-side diffs.
+    // This function is mutually exclusive with ReportModified and ReportMoved.
+    // Note that you must call set_report_matches(true) before calling Compare
+    // to make use of this function.
+    virtual void ReportMatched(
+        const Message& /* message1 */,
+        const Message& /* message2 */,
+        const std::vector<SpecificField>& /* field_path */) { }
+
+    // Reports that two fields would have been compared, but the
+    // comparison has been skipped because the field was marked as
+    // 'ignored' using IgnoreField().  This function is mutually
+    // exclusive with all the other Report() functions.
+    //
+    // The contract of ReportIgnored is slightly different than the
+    // other Report() functions, in that |field_path.back().index| is
+    // always equal to -1, even if the last field is repeated. This is
+    // because while the other Report() functions indicate where in a
+    // repeated field the action (Addition, Deletion, etc...)
+    // happened, when a repeated field is 'ignored', the differencer
+    // simply calls ReportIgnored on the repeated field as a whole and
+    // moves on without looking at its individual elements.
+    //
+    // Furthermore, ReportIgnored() does not indicate whether the
+    // fields were in fact equal or not, as Compare() does not inspect
+    // these fields at all. It is up to the Reporter to decide whether
+    // the fields are equal or not (perhaps with a second call to
+    // Compare()), if it cares.
+    virtual void ReportIgnored(
+        const Message& /* message1 */,
+        const Message& /* message2 */,
+        const std::vector<SpecificField>& /* field_path */) { }
+
+    // Report that an unknown field is ignored. (see comment above).
+    // Note this is a different function since the last SpecificField in field
+    // path has a null field.  This could break existing Reporter.
+    virtual void ReportUnknownFieldIgnored(
+        const Message& /* message1 */, const Message& /* message2 */,
+        const std::vector<SpecificField>& /* field_path */) {}
+
+   private:
+    GOOGLE_DISALLOW_EVIL_CONSTRUCTORS(Reporter);
+  };
+
+  // MapKeyComparator is used to determine if two elements have the same key
+  // when comparing elements of a repeated field as a map.
+  class LIBPROTOBUF_EXPORT MapKeyComparator {
+   public:
+    MapKeyComparator();
+    virtual ~MapKeyComparator();
+
+    virtual bool IsMatch(
+        const Message& /* message1 */,
+        const Message& /* message2 */,
+        const std::vector<SpecificField>& /* parent_fields */) const {
+      GOOGLE_CHECK(false) << "IsMatch() is not implemented.";
+      return false;
+    }
+
+   private:
+    GOOGLE_DISALLOW_EVIL_CONSTRUCTORS(MapKeyComparator);
+  };
+
+  // Abstract base class from which all IgnoreCriteria derive.
+  // By adding IgnoreCriteria more complex ignore logic can be implemented.
+  // IgnoreCriteria are registed with AddIgnoreCriteria. For each compared
+  // field IsIgnored is called on each added IgnoreCriteria until one returns
+  // true or all return false.
+  // IsIgnored is called for fields where at least one side has a value.
+  class LIBPROTOBUF_EXPORT IgnoreCriteria {
+   public:
+    IgnoreCriteria();
+    virtual ~IgnoreCriteria();
+
+    // Returns true if the field should be ignored.
+    virtual bool IsIgnored(
+        const Message& /* message1 */,
+        const Message& /* message2 */,
+        const FieldDescriptor* /* field */,
+        const std::vector<SpecificField>& /* parent_fields */) = 0;
+
+    // Returns true if the unknown field should be ignored.
+    // Note: This will be called for unknown fields as well in which case
+    //       field.field will be null.
+    

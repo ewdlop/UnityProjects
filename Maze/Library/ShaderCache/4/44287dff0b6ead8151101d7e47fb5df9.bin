@@ -1,0 +1,98 @@
+al void AddIgnorableSymbols(String text)
+        {
+            if (m_dateWords == null)
+            {
+                // Create the date word array.
+                m_dateWords = new List<String>();
+            }
+            // Add the ingorable symbol into the ArrayList.
+            String temp = IgnorableSymbolChar + text;
+            if (!m_dateWords.Contains(temp))
+            {
+                m_dateWords.Add(temp);
+            }
+        }
+
+
+        //
+        // Flag used to trace the date patterns (yy/yyyyy/M/MM/MMM/MMM/d/dd) that we have seen.
+        //
+        enum FoundDatePattern
+        {
+            None                  = 0x0000,
+            FoundYearPatternFlag  = 0x0001,
+            FoundMonthPatternFlag = 0x0002,
+            FoundDayPatternFlag   = 0x0004,
+            FoundYMDPatternFlag   = 0x0007, // FoundYearPatternFlag | FoundMonthPatternFlag | FoundDayPatternFlag;
+        }
+
+        // Check if we have found all of the year/month/day pattern.
+        FoundDatePattern m_ymdFlags = FoundDatePattern.None;
+
+
+        ////////////////////////////////////////////////////////////////////////////
+        //
+        // Given a date format pattern, scan for date word or postfix.
+        //
+        // A date word should be always put in a single quoted string.  And it will
+        // start from a letter, so whitespace and symbols will be ignored before
+        // the first letter.
+        //
+        // Examples of date word:
+        //  'de' in es-SP: dddd, dd' de 'MMMM' de 'yyyy
+        //  "\x0443." in bg-BG: dd.M.yyyy '\x0433.'
+        //
+        // Example of postfix:
+        //  month postfix: 
+        //      "ta" in fi-FI: d. MMMM'ta 'yyyy
+        //  Currently, only month postfix is supported.
+        //
+        // Usage:
+        //  Always call this with Framework-style pattern, instead of Windows style pattern.
+        //  Windows style pattern uses '' for single quote, while .NET uses \'
+        //
+        ////////////////////////////////////////////////////////////////////////////        
+        internal void ScanDateWord(String pattern)
+        {
+
+            // Check if we have found all of the year/month/day pattern.
+            m_ymdFlags = FoundDatePattern.None;
+            
+            int i = 0;
+            while (i < pattern.Length)
+            {
+                char ch = pattern[i];  
+                int chCount;
+                
+                switch (ch)
+                {
+                    case '\'':
+                        // Find a beginning quote.  Search until the end quote.
+                        i = AddDateWords(pattern, i+1, null);
+                        break;
+                    case 'M':
+                        i = ScanRepeatChar(pattern, 'M', i, out chCount);
+                        if (chCount >= 4)
+                        {
+                            if (i < pattern.Length && pattern[i] == '\'')
+                            {
+                                i = AddDateWords(pattern, i+1, "MMMM");
+                            }
+                        }
+                        m_ymdFlags |= FoundDatePattern.FoundMonthPatternFlag;
+                        break;
+                    case 'y':
+                        i = ScanRepeatChar(pattern, 'y', i, out chCount);
+                        m_ymdFlags |= FoundDatePattern.FoundYearPatternFlag;
+                        break;
+                    case 'd':
+                        i = ScanRepeatChar(pattern, 'd', i, out chCount);
+                        if (chCount <= 2)
+                        {
+                            // Only count "d" & "dd".
+                            // ddd, dddd are day names.  Do not count them.
+                            m_ymdFlags |= FoundDatePattern.FoundDayPatternFlag;
+                        }
+                        break;
+                    case '\\':
+                        // Found a escaped char not in a quoted string.  Skip the current backslash

@@ -1,0 +1,768 @@
+"""Unit tests for collections.py."""
+
+import collections
+import copy
+import doctest
+import keyword
+import operator
+import pickle
+from random import choice, randrange
+import re
+import string
+import sys
+from test import support
+import types
+import unittest
+
+from collections import namedtuple, Counter, OrderedDict, _count_elements
+from collections import UserDict, UserString, UserList
+from collections import ChainMap
+from collections import deque
+from collections.abc import Awaitable, Coroutine
+from collections.abc import AsyncIterator, AsyncIterable, AsyncGenerator
+from collections.abc import Hashable, Iterable, Iterator, Generator, Reversible
+from collections.abc import Sized, Container, Callable, Collection
+from collections.abc import Set, MutableSet
+from collections.abc import Mapping, MutableMapping, KeysView, ItemsView, ValuesView
+from collections.abc import Sequence, MutableSequence
+from collections.abc import ByteString
+
+
+class TestUserObjects(unittest.TestCase):
+    def _superset_test(self, a, b):
+        self.assertGreaterEqual(
+            set(dir(a)),
+            set(dir(b)),
+            '{a} should have all the methods of {b}'.format(
+                a=a.__name__,
+                b=b.__name__,
+            ),
+        )
+
+    def _copy_test(self, obj):
+        # Test internal copy
+        obj_copy = obj.copy()
+        self.assertIsNot(obj.data, obj_copy.data)
+        self.assertEqual(obj.data, obj_copy.data)
+
+        # Test copy.copy
+        obj.test = [1234]  # Make sure instance vars are also copied.
+        obj_copy = copy.copy(obj)
+        self.assertIsNot(obj.data, obj_copy.data)
+        self.assertEqual(obj.data, obj_copy.data)
+        self.assertIs(obj.test, obj_copy.test)
+
+    def test_str_protocol(self):
+        self._superset_test(UserString, str)
+
+    def test_list_protocol(self):
+        self._superset_test(UserList, list)
+
+    def test_dict_protocol(self):
+        self._superset_test(UserDict, dict)
+
+    def test_list_copy(self):
+        obj = UserList()
+        obj.append(123)
+        self._copy_test(obj)
+
+    def test_dict_copy(self):
+        obj = UserDict()
+        obj[123] = "abc"
+        self._copy_test(obj)
+
+
+################################################################################
+### ChainMap (helper class for configparser and the string module)
+################################################################################
+
+class TestChainMap(unittest.TestCase):
+
+    def test_basics(self):
+        c = ChainMap()
+        c['a'] = 1
+        c['b'] = 2
+        d = c.new_child()
+        d['b'] = 20
+        d['c'] = 30
+        self.assertEqual(d.maps, [{'b':20, 'c':30}, {'a':1, 'b':2}])  # check internal state
+        self.assertEqual(d.items(), dict(a=1, b=20, c=30).items())    # check items/iter/getitem
+        self.assertEqual(len(d), 3)                                   # check len
+        for key in 'abc':                                             # check contains
+            self.assertIn(key, d)
+        for k, v in dict(a=1, b=20, c=30, z=100).items():             # check get
+            self.assertEqual(d.get(k, 100), v)
+
+        del d['b']                                                    # unmask a value
+        self.assertEqual(d.maps, [{'c':30}, {'a':1, 'b':2}])          # check internal state
+        self.assertEqual(d.items(), dict(a=1, b=2, c=30).items())     # check items/iter/getitem
+        self.assertEqual(len(d), 3)                                   # check len
+        for key in 'abc':                                             # check contains
+            self.assertIn(key, d)
+        for k, v in dict(a=1, b=2, c=30, z=100).items():              # check get
+            self.assertEqual(d.get(k, 100), v)
+        self.assertIn(repr(d), [                                      # check repr
+            type(d).__name__ + "({'c': 30}, {'a': 1, 'b': 2})",
+            type(d).__name__ + "({'c': 30}, {'b': 2, 'a': 1})"
+        ])
+
+        for e in d.copy(), copy.copy(d):                               # check shallow copies
+            self.assertEqual(d, e)
+            self.assertEqual(d.maps, e.maps)
+            self.assertIsNot(d, e)
+            self.assertIsNot(d.maps[0], e.maps[0])
+            for m1, m2 in zip(d.maps[1:], e.maps[1:]):
+                self.assertIs(m1, m2)
+
+        # check deep copies
+        for proto in range(pickle.HIGHEST_PROTOCOL + 1):
+            e = pickle.loads(pickle.dumps(d, proto))
+            self.assertEqual(d, e)
+            self.assertEqual(d.maps, e.maps)
+            self.assertIsNot(d, e)
+            for m1, m2 in zip(d.maps, e.maps):
+                self.assertIsNot(m1, m2, e)
+        for e in [copy.deepcopy(d),
+                  eval(repr(d))
+                ]:
+            self.assertEqual(d, e)
+            self.assertEqual(d.maps, e.maps)
+            self.assertIsNot(d, e)
+            for m1, m2 in zip(d.maps, e.maps):
+                self.assertIsNot(m1, m2, e)
+
+        f = d.new_child()
+        f['b'] = 5
+        self.assertEqual(f.maps, [{'b': 5}, {'c':30}, {'a':1, 'b':2}])
+        self.assertEqual(f.parents.maps, [{'c':30}, {'a':1, 'b':2}])   # check parents
+        self.assertEqual(f['b'], 5)                                    # find first in chain
+        self.assertEqual(f.parents['b'], 2)                            # look beyond maps[0]
+
+    def test_ordering(self):
+        # Combined order matches a series of dict updates from last to first.
+        # This test relies on the ordering of the underlying dicts.
+
+        baseline = {'music': 'bach', 'art': 'rembrandt'}
+        adjustments = {'art': 'van gogh', 'opera': 'carmen'}
+
+        cm = ChainMap(adjustments, baseline)
+
+        combined = baseline.copy()
+        combined.update(adjustments)
+
+        self.assertEqual(list(combined.items()), list(cm.items()))
+
+    def test_constructor(self):
+        self.assertEqual(ChainMap().maps, [{}])                        # no-args --> one new dict
+        self.assertEqual(ChainMap({1:2}).maps, [{1:2}])                # 1 arg --> list
+
+    def test_bool(self):
+        self.assertFalse(ChainMap())
+        self.assertFalse(ChainMap({}, {}))
+        self.assertTrue(ChainMap({1:2}, {}))
+        self.assertTrue(ChainMap({}, {1:2}))
+
+    def test_missing(self):
+        class DefaultChainMap(ChainMap):
+            def __missing__(self, key):
+                return 999
+        d = DefaultChainMap(dict(a=1, b=2), dict(b=20, c=30))
+        for k, v in dict(a=1, b=2, c=30, d=999).items():
+            self.assertEqual(d[k], v)                                  # check __getitem__ w/missing
+        for k, v in dict(a=1, b=2, c=30, d=77).items():
+            self.assertEqual(d.get(k, 77), v)                          # check get() w/ missing
+        for k, v in dict(a=True, b=True, c=True, d=False).items():
+            self.assertEqual(k in d, v)                                # check __contains__ w/missing
+        self.assertEqual(d.pop('a', 1001), 1, d)
+        self.assertEqual(d.pop('a', 1002), 1002)                       # check pop() w/missing
+        self.assertEqual(d.popitem(), ('b', 2))                        # check popitem() w/missing
+        with self.assertRaises(KeyError):
+            d.popitem()
+
+    def test_order_preservation(self):
+        d = ChainMap(
+                OrderedDict(j=0, h=88888),
+                OrderedDict(),
+                OrderedDict(i=9999, d=4444, c=3333),
+                OrderedDict(f=666, b=222, g=777, c=333, h=888),
+                OrderedDict(),
+                OrderedDict(e=55, b=22),
+                OrderedDict(a=1, b=2, c=3, d=4, e=5),
+                OrderedDict(),
+            )
+        self.assertEqual(''.join(d), 'abcdefghij')
+        self.assertEqual(list(d.items()),
+            [('a', 1), ('b', 222), ('c', 3333), ('d', 4444),
+             ('e', 55), ('f', 666), ('g', 777), ('h', 88888),
+             ('i', 9999), ('j', 0)])
+
+    def test_dict_coercion(self):
+        d = ChainMap(dict(a=1, b=2), dict(b=20, c=30))
+        self.assertEqual(dict(d), dict(a=1, b=2, c=30))
+        self.assertEqual(dict(d.items()), dict(a=1, b=2, c=30))
+
+    def test_new_child(self):
+        'Tests for changes for issue #16613.'
+        c = ChainMap()
+        c['a'] = 1
+        c['b'] = 2
+        m = {'b':20, 'c': 30}
+        d = c.new_child(m)
+        self.assertEqual(d.maps, [{'b':20, 'c':30}, {'a':1, 'b':2}])  # check internal state
+        self.assertIs(m, d.maps[0])
+
+        # Use a different map than a dict
+        class lowerdict(dict):
+            def __getitem__(self, key):
+                if isinstance(key, str):
+                    key = key.lower()
+                return dict.__getitem__(self, key)
+            def __contains__(self, key):
+                if isinstance(key, str):
+                    key = key.lower()
+                return dict.__contains__(self, key)
+
+        c = ChainMap()
+        c['a'] = 1
+        c['b'] = 2
+        m = lowerdict(b=20, c=30)
+        d = c.new_child(m)
+        self.assertIs(m, d.maps[0])
+        for key in 'abc':                                             # check contains
+            self.assertIn(key, d)
+        for k, v in dict(a=1, B=20, C=30, z=100).items():             # check get
+            self.assertEqual(d.get(k, 100), v)
+
+
+################################################################################
+### Named Tuples
+################################################################################
+
+TestNT = namedtuple('TestNT', 'x y z')    # type used for pickle tests
+
+class TestNamedTuple(unittest.TestCase):
+
+    def test_factory(self):
+        Point = namedtuple('Point', 'x y')
+        self.assertEqual(Point.__name__, 'Point')
+        self.assertEqual(Point.__slots__, ())
+        self.assertEqual(Point.__module__, __name__)
+        self.assertEqual(Point.__getitem__, tuple.__getitem__)
+        self.assertEqual(Point._fields, ('x', 'y'))
+
+        self.assertRaises(ValueError, namedtuple, 'abc%', 'efg ghi')       # type has non-alpha char
+        self.assertRaises(ValueError, namedtuple, 'class', 'efg ghi')      # type has keyword
+        self.assertRaises(ValueError, namedtuple, '9abc', 'efg ghi')       # type starts with digit
+
+        self.assertRaises(ValueError, namedtuple, 'abc', 'efg g%hi')       # field with non-alpha char
+        self.assertRaises(ValueError, namedtuple, 'abc', 'abc class')      # field has keyword
+        self.assertRaises(ValueError, namedtuple, 'abc', '8efg 9ghi')      # field starts with digit
+        self.assertRaises(ValueError, namedtuple, 'abc', '_efg ghi')       # field with leading underscore
+        self.assertRaises(ValueError, namedtuple, 'abc', 'efg efg ghi')    # duplicate field
+
+        namedtuple('Point0', 'x1 y2')   # Verify that numbers are allowed in names
+        namedtuple('_', 'a b c')        # Test leading underscores in a typename
+
+        nt = namedtuple('nt', 'the quick brown fox')                       # check unicode input
+        self.assertNotIn("u'", repr(nt._fields))
+        nt = namedtuple('nt', ('the', 'quick'))                           # check unicode input
+        self.assertNotIn("u'", repr(nt._fields))
+
+        self.assertRaises(TypeError, Point._make, [11])                     # catch too few args
+        self.assertRaises(TypeError, Point._make, [11, 22, 33])             # catch too many args
+
+    def test_defaults(self):
+        Point = namedtuple('Point', 'x y', defaults=(10, 20))              # 2 defaults
+        self.assertEqual(Point._field_defaults, {'x': 10, 'y': 20})
+        self.assertEqual(Point(1, 2), (1, 2))
+        self.assertEqual(Point(1), (1, 20))
+        self.assertEqual(Point(), (10, 20))
+
+        Point = namedtuple('Point', 'x y', defaults=(20,))                 # 1 default
+        self.assertEqual(Point._field_defaults, {'y': 20})
+        self.assertEqual(Point(1, 2), (1, 2))
+        self.assertEqual(Point(1), (1, 20))
+
+        Point = namedtuple('Point', 'x y', defaults=())                     # 0 defaults
+        self.assertEqual(Point._field_defaults, {})
+        self.assertEqual(Point(1, 2), (1, 2))
+        with self.assertRaises(TypeError):
+            Point(1)
+
+        with self.assertRaises(TypeError):                                  # catch too few args
+            Point()
+        with self.assertRaises(TypeError):                                  # catch too many args
+            Point(1, 2, 3)
+        with self.assertRaises(TypeError):                                  # too many defaults
+            Point = namedtuple('Point', 'x y', defaults=(10, 20, 30))
+        with self.assertRaises(TypeError):                                  # non-iterable defaults
+            Point = namedtuple('Point', 'x y', defaults=10)
+        with self.assertRaises(TypeError):                                  # another non-iterable default
+            Point = namedtuple('Point', 'x y', defaults=False)
+
+        Point = namedtuple('Point', 'x y', defaults=None)                   # default is None
+        self.assertEqual(Point._field_defaults, {})
+        self.assertIsNone(Point.__new__.__defaults__, None)
+        self.assertEqual(Point(10, 20), (10, 20))
+        with self.assertRaises(TypeError):                                  # catch too few args
+            Point(10)
+
+        Point = namedtuple('Point', 'x y', defaults=[10, 20])               # allow non-tuple iterable
+        self.assertEqual(Point._field_defaults, {'x': 10, 'y': 20})
+        self.assertEqual(Point.__new__.__defaults__, (10, 20))
+        self.assertEqual(Point(1, 2), (1, 2))
+        self.assertEqual(Point(1), (1, 20))
+        self.assertEqual(Point(), (10, 20))
+
+        Point = namedtuple('Point', 'x y', defaults=iter([10, 20]))         # allow plain iterator
+        self.assertEqual(Point._field_defaults, {'x': 10, 'y': 20})
+        self.assertEqual(Point.__new__.__defaults__, (10, 20))
+        self.assertEqual(Point(1, 2), (1, 2))
+        self.assertEqual(Point(1), (1, 20))
+        self.assertEqual(Point(), (10, 20))
+
+
+    @unittest.skipIf(sys.flags.optimize >= 2,
+                     "Docstrings are omitted with -O2 and above")
+    def test_factory_doc_attr(self):
+        Point = namedtuple('Point', 'x y')
+        self.assertEqual(Point.__doc__, 'Point(x, y)')
+
+    @unittest.skipIf(sys.flags.optimize >= 2,
+                     "Docstrings are omitted with -O2 and above")
+    def test_doc_writable(self):
+        Point = namedtuple('Point', 'x y')
+        self.assertEqual(Point.x.__doc__, 'Alias for field number 0')
+        Point.x.__doc__ = 'docstring for Point.x'
+        self.assertEqual(Point.x.__doc__, 'docstring for Point.x')
+
+    def test_name_fixer(self):
+        for spec, renamed in [
+            [('efg', 'g%hi'),  ('efg', '_1')],                              # field with non-alpha char
+            [('abc', 'class'), ('abc', '_1')],                              # field has keyword
+            [('8efg', '9ghi'), ('_0', '_1')],                               # field starts with digit
+            [('abc', '_efg'), ('abc', '_1')],                               # field with leading underscore
+            [('abc', 'efg', 'efg', 'ghi'), ('abc', 'efg', '_2', 'ghi')],    # duplicate field
+            [('abc', '', 'x'), ('abc', '_1', 'x')],                         # fieldname is a space
+        ]:
+            self.assertEqual(namedtuple('NT', spec, rename=True)._fields, renamed)
+
+    def test_module_parameter(self):
+        NT = namedtuple('NT', ['x', 'y'], module=collections)
+        self.assertEqual(NT.__module__, collections)
+
+    def test_instance(self):
+        Point = namedtuple('Point', 'x y')
+        p = Point(11, 22)
+        self.assertEqual(p, Point(x=11, y=22))
+        self.assertEqual(p, Point(11, y=22))
+        self.assertEqual(p, Point(y=22, x=11))
+        self.assertEqual(p, Point(*(11, 22)))
+        self.assertEqual(p, Point(**dict(x=11, y=22)))
+        self.assertRaises(TypeError, Point, 1)                              # too few args
+        self.assertRaises(TypeError, Point, 1, 2, 3)                        # too many args
+        self.assertRaises(TypeError, eval, 'Point(XXX=1, y=2)', locals())   # wrong keyword argument
+        self.assertRaises(TypeError, eval, 'Point(x=1)', locals())          # missing keyword argument
+        self.assertEqual(repr(p), 'Point(x=11, y=22)')
+        self.assertNotIn('__weakref__', dir(p))
+        self.assertEqual(p, Point._make([11, 22]))                          # test _make classmethod
+        self.assertEqual(p._fields, ('x', 'y'))                             # test _fields attribute
+        self.assertEqual(p._replace(x=1), (1, 22))                          # test _replace method
+        self.assertEqual(p._asdict(), dict(x=11, y=22))                     # test _asdict method
+
+        try:
+            p._replace(x=1, error=2)
+        except ValueError:
+            pass
+        else:
+            self._fail('Did not detect an incorrect fieldname')
+
+        # verify that field string can have commas
+        Point = namedtuple('Point', 'x, y')
+        p = Point(x=11, y=22)
+        self.assertEqual(repr(p), 'Point(x=11, y=22)')
+
+        # verify that fieldspec can be a non-string sequence
+        Point = namedtuple('Point', ('x', 'y'))
+        p = Point(x=11, y=22)
+        self.assertEqual(repr(p), 'Point(x=11, y=22)')
+
+    def test_tupleness(self):
+        Point = namedtuple('Point', 'x y')
+        p = Point(11, 22)
+
+        self.assertIsInstance(p, tuple)
+        self.assertEqual(p, (11, 22))                                       # matches a real tuple
+        self.assertEqual(tuple(p), (11, 22))                                # coercable to a real tuple
+        self.assertEqual(list(p), [11, 22])                                 # coercable to a list
+        self.assertEqual(max(p), 22)                                        # iterable
+        self.assertEqual(max(*p), 22)                                       # star-able
+        x, y = p
+        self.assertEqual(p, (x, y))                                         # unpacks like a tuple
+        self.assertEqual((p[0], p[1]), (11, 22))                            # indexable like a tuple
+        self.assertRaises(IndexError, p.__getitem__, 3)
+
+        self.assertEqual(p.x, x)
+        self.assertEqual(p.y, y)
+        self.assertRaises(AttributeError, eval, 'p.z', locals())
+
+    def test_odd_sizes(self):
+        Zero = namedtuple('Zero', '')
+        self.assertEqual(Zero(), ())
+        self.assertEqual(Zero._make([]), ())
+        self.assertEqual(repr(Zero()), 'Zero()')
+        self.assertEqual(Zero()._asdict(), {})
+        self.assertEqual(Zero()._fields, ())
+
+        Dot = namedtuple('Dot', 'd')
+        self.assertEqual(Dot(1), (1,))
+        self.assertEqual(Dot._make([1]), (1,))
+        self.assertEqual(Dot(1).d, 1)
+        self.assertEqual(repr(Dot(1)), 'Dot(d=1)')
+        self.assertEqual(Dot(1)._asdict(), {'d':1})
+        self.assertEqual(Dot(1)._replace(d=999), (999,))
+        self.assertEqual(Dot(1)._fields, ('d',))
+
+        n = 5000
+        names = list(set(''.join([choice(string.ascii_letters)
+                                  for j in range(10)]) for i in range(n)))
+        n = len(names)
+        Big = namedtuple('Big', names)
+        b = Big(*range(n))
+        self.assertEqual(b, tuple(range(n)))
+        self.assertEqual(Big._make(range(n)), tuple(range(n)))
+        for pos, name in enumerate(names):
+            self.assertEqual(getattr(b, name), pos)
+        repr(b)                                 # make sure repr() doesn't blow-up
+        d = b._asdict()
+        d_expected = dict(zip(names, range(n)))
+        self.assertEqual(d, d_expected)
+        b2 = b._replace(**dict([(names[1], 999),(names[-5], 42)]))
+        b2_expected = list(range(n))
+        b2_expected[1] = 999
+        b2_expected[-5] = 42
+        self.assertEqual(b2, tuple(b2_expected))
+        self.assertEqual(b._fields, tuple(names))
+
+    def test_pickle(self):
+        p = TestNT(x=10, y=20, z=30)
+        for module in (pickle,):
+            loads = getattr(module, 'loads')
+            dumps = getattr(module, 'dumps')
+            for protocol in range(-1, module.HIGHEST_PROTOCOL + 1):
+                q = loads(dumps(p, protocol))
+                self.assertEqual(p, q)
+                self.assertEqual(p._fields, q._fields)
+                self.assertNotIn(b'OrderedDict', dumps(p, protocol))
+
+    def test_copy(self):
+        p = TestNT(x=10, y=20, z=30)
+        for copier in copy.copy, copy.deepcopy:
+            q = copier(p)
+            self.assertEqual(p, q)
+            self.assertEqual(p._fields, q._fields)
+
+    def test_name_conflicts(self):
+        # Some names like "self", "cls", "tuple", "itemgetter", and "property"
+        # failed when used as field names.  Test to make sure these now work.
+        T = namedtuple('T', 'itemgetter property self cls tuple')
+        t = T(1, 2, 3, 4, 5)
+        self.assertEqual(t, (1,2,3,4,5))
+        newt = t._replace(itemgetter=10, property=20, self=30, cls=40, tuple=50)
+        self.assertEqual(newt, (10,20,30,40,50))
+
+       # Broader test of all interesting names taken from the code, old
+       # template, and an example
+        words = {'Alias', 'At', 'AttributeError', 'Build', 'Bypass', 'Create',
+        'Encountered', 'Expected', 'Field', 'For', 'Got', 'Helper',
+        'IronPython', 'Jython', 'KeyError', 'Make', 'Modify', 'Note',
+        'OrderedDict', 'Point', 'Return', 'Returns', 'Type', 'TypeError',
+        'Used', 'Validate', 'ValueError', 'Variables', 'a', 'accessible', 'add',
+        'added', 'all', 'also', 'an', 'arg_list', 'args', 'arguments',
+        'automatically', 'be', 'build', 'builtins', 'but', 'by', 'cannot',
+        'class_namespace', 'classmethod', 'cls', 'collections', 'convert',
+        'copy', 'created', 'creation', 'd', 'debugging', 'defined', 'dict',
+        'dictionary', 'doc', 'docstring', 'docstrings', 'duplicate', 'effect',
+        'either', 'enumerate', 'environments', 'error', 'example', 'exec', 'f',
+        'f_globals', 'field', 'field_names', 'fields', 'formatted', 'frame',
+        'function', 'functions', 'generate', 'get', 'getter', 'got', 'greater',
+        'has', 'help', 'identifiers', 'index', 'indexable', 'instance',
+        'instantiate', 'interning', 'introspection', 'isidentifier',
+        'isinstance', 'itemgetter', 'iterable', 'join', 'keyword', 'keywords',
+        'kwds', 'len', 'like', 'list', 'map', 'maps', 'message', 'metadata',
+        'method', 'methods', 'module', 'module_name', 'must', 'name', 'named',
+        'namedtuple', 'namedtuple_', 'names', 'namespace', 'needs', 'new',
+        'nicely', 'num_fields', 'number', 'object', 'of', 'operator', 'option',
+        'p', 'particular', 'pickle', 'pickling', 'plain', 'pop', 'positional',
+        'property', 'r', 'regular', 'rename', 'replace', 'replacing', 'repr',
+        'repr_fmt', 'representation', 'result', 'reuse_itemgetter', 's', 'seen',
+        'self', 'sequence', 'set', 'side', 'specified', 'split', 'start',
+        'startswith', 'step', 'str', 'string', 'strings', 'subclass', 'sys',
+        'targets', 'than', 'the', 'their', 'this', 'to', 'tuple', 'tuple_new',
+        'type', 'typename', 'underscore', 'unexpected', 'unpack', 'up', 'use',
+        'used', 'user', 'valid', 'values', 'variable', 'verbose', 'where',
+        'which', 'work', 'x', 'y', 'z', 'zip'}
+        T = namedtuple('T', words)
+        # test __new__
+        values = tuple(range(len(words)))
+        t = T(*values)
+        self.assertEqual(t, values)
+        t = T(**dict(zip(T._fields, values)))
+        self.assertEqual(t, values)
+        # test _make
+        t = T._make(values)
+        self.assertEqual(t, values)
+        # exercise __repr__
+        repr(t)
+        # test _asdict
+        self.assertEqual(t._asdict(), dict(zip(T._fields, values)))
+        # test _replace
+        t = T._make(values)
+        newvalues = tuple(v*10 for v in values)
+        newt = t._replace(**dict(zip(T._fields, newvalues)))
+        self.assertEqual(newt, newvalues)
+        # test _fields
+        self.assertEqual(T._fields, tuple(words))
+        # test __getnewargs__
+        self.assertEqual(t.__getnewargs__(), values)
+
+    def test_repr(self):
+        A = namedtuple('A', 'x')
+        self.assertEqual(repr(A(1)), 'A(x=1)')
+        # repr should show the name of the subclass
+        class B(A):
+            pass
+        self.assertEqual(repr(B(1)), 'B(x=1)')
+
+    def test_keyword_only_arguments(self):
+        # See issue 25628
+        with self.assertRaises(TypeError):
+            NT = namedtuple('NT', ['x', 'y'], True)
+
+        NT = namedtuple('NT', ['abc', 'def'], rename=True)
+        self.assertEqual(NT._fields, ('abc', '_1'))
+        with self.assertRaises(TypeError):
+            NT = namedtuple('NT', ['abc', 'def'], False, True)
+
+    def test_namedtuple_subclass_issue_24931(self):
+        class Point(namedtuple('_Point', ['x', 'y'])):
+            pass
+
+        a = Point(3, 4)
+        self.assertEqual(a._asdict(), OrderedDict([('x', 3), ('y', 4)]))
+
+        a.w = 5
+        self.assertEqual(a.__dict__, {'w': 5})
+
+
+################################################################################
+### Abstract Base Classes
+################################################################################
+
+class ABCTestCase(unittest.TestCase):
+
+    def validate_abstract_methods(self, abc, *names):
+        methodstubs = dict.fromkeys(names, lambda s, *args: 0)
+
+        # everything should work will all required methods are present
+        C = type('C', (abc,), methodstubs)
+        C()
+
+        # instantiation should fail if a required method is missing
+        for name in names:
+            stubs = methodstubs.copy()
+            del stubs[name]
+            C = type('C', (abc,), stubs)
+            self.assertRaises(TypeError, C, name)
+
+    def validate_isinstance(self, abc, name):
+        stub = lambda s, *args: 0
+
+        C = type('C', (object,), {'__hash__': None})
+        setattr(C, name, stub)
+        self.assertIsInstance(C(), abc)
+        self.assertTrue(issubclass(C, abc))
+
+        C = type('C', (object,), {'__hash__': None})
+        self.assertNotIsInstance(C(), abc)
+        self.assertFalse(issubclass(C, abc))
+
+    def validate_comparison(self, instance):
+        ops = ['lt', 'gt', 'le', 'ge', 'ne', 'or', 'and', 'xor', 'sub']
+        operators = {}
+        for op in ops:
+            name = '__' + op + '__'
+            operators[name] = getattr(operator, name)
+
+        class Other:
+            def __init__(self):
+                self.right_side = False
+            def __eq__(self, other):
+                self.right_side = True
+                return True
+            __lt__ = __eq__
+            __gt__ = __eq__
+            __le__ = __eq__
+            __ge__ = __eq__
+            __ne__ = __eq__
+            __ror__ = __eq__
+            __rand__ = __eq__
+            __rxor__ = __eq__
+            __rsub__ = __eq__
+
+        for name, op in operators.items():
+            if not hasattr(instance, name):
+                continue
+            other = Other()
+            op(instance, other)
+            self.assertTrue(other.right_side,'Right side not called for %s.%s'
+                            % (type(instance), name))
+
+def _test_gen():
+    yield
+
+class TestOneTrickPonyABCs(ABCTestCase):
+
+    def test_Awaitable(self):
+        def gen():
+            yield
+
+        @types.coroutine
+        def coro():
+            yield
+
+        async def new_coro():
+            pass
+
+        class Bar:
+            def __await__(self):
+                yield
+
+        class MinimalCoro(Coroutine):
+            def send(self, value):
+                return value
+            def throw(self, typ, val=None, tb=None):
+                super().throw(typ, val, tb)
+            def __await__(self):
+                yield
+
+        non_samples = [None, int(), gen(), object()]
+        for x in non_samples:
+            self.assertNotIsInstance(x, Awaitable)
+            self.assertFalse(issubclass(type(x), Awaitable), repr(type(x)))
+
+        samples = [Bar(), MinimalCoro()]
+        for x in samples:
+            self.assertIsInstance(x, Awaitable)
+            self.assertTrue(issubclass(type(x), Awaitable))
+
+        c = coro()
+        # Iterable coroutines (generators with CO_ITERABLE_COROUTINE
+        # flag don't have '__await__' method, hence can't be instances
+        # of Awaitable. Use inspect.isawaitable to detect them.
+        self.assertNotIsInstance(c, Awaitable)
+
+        c = new_coro()
+        self.assertIsInstance(c, Awaitable)
+        c.close() # avoid RuntimeWarning that coro() was not awaited
+
+        class CoroLike: pass
+        Coroutine.register(CoroLike)
+        self.assertTrue(isinstance(CoroLike(), Awaitable))
+        self.assertTrue(issubclass(CoroLike, Awaitable))
+        CoroLike = None
+        support.gc_collect() # Kill CoroLike to clean-up ABCMeta cache
+
+    def test_Coroutine(self):
+        def gen():
+            yield
+
+        @types.coroutine
+        def coro():
+            yield
+
+        async def new_coro():
+            pass
+
+        class Bar:
+            def __await__(self):
+                yield
+
+        class MinimalCoro(Coroutine):
+            def send(self, value):
+                return value
+            def throw(self, typ, val=None, tb=None):
+                super().throw(typ, val, tb)
+            def __await__(self):
+                yield
+
+        non_samples = [None, int(), gen(), object(), Bar()]
+        for x in non_samples:
+            self.assertNotIsInstance(x, Coroutine)
+            self.assertFalse(issubclass(type(x), Coroutine), repr(type(x)))
+
+        samples = [MinimalCoro()]
+        for x in samples:
+            self.assertIsInstance(x, Awaitable)
+            self.assertTrue(issubclass(type(x), Awaitable))
+
+        c = coro()
+        # Iterable coroutines (generators with CO_ITERABLE_COROUTINE
+        # flag don't have '__await__' method, hence can't be instances
+        # of Coroutine. Use inspect.isawaitable to detect them.
+        self.assertNotIsInstance(c, Coroutine)
+
+        c = new_coro()
+        self.assertIsInstance(c, Coroutine)
+        c.close() # avoid RuntimeWarning that coro() was not awaited
+
+        class CoroLike:
+            def send(self, value):
+                pass
+            def throw(self, typ, val=None, tb=None):
+                pass
+            def close(self):
+                pass
+            def __await__(self):
+                pass
+        self.assertTrue(isinstance(CoroLike(), Coroutine))
+        self.assertTrue(issubclass(CoroLike, Coroutine))
+
+        class CoroLike:
+            def send(self, value):
+                pass
+            def close(self):
+                pass
+            def __await__(self):
+                pass
+        self.assertFalse(isinstance(CoroLike(), Coroutine))
+        self.assertFalse(issubclass(CoroLike, Coroutine))
+
+    def test_Hashable(self):
+        # Check some non-hashables
+        non_samples = [bytearray(), list(), set(), dict()]
+        for x in non_samples:
+            self.assertNotIsInstance(x, Hashable)
+            self.assertFalse(issubclass(type(x), Hashable), repr(type(x)))
+        # Check some hashables
+        samples = [None,
+                   int(), float(), complex(),
+                   str(),
+                   tuple(), frozenset(),
+                   int, list, object, type, bytes()
+                   ]
+        for x in samples:
+            self.assertIsInstance(x, Hashable)
+            self.assertTrue(issubclass(type(x), Hashable), repr(type(x)))
+        self.assertRaises(TypeError, Hashable)
+        # Check direct subclassing
+        class H(Hashable):
+            def __hash__(self):
+                return super().__hash__()
+        self.assertEqual(hash(H()), 0)
+        self.assertFalse(issubclass(int, H))
+        self.validate_abstract_methods(Hashable, '__hash__')
+        self.validate_isinstance(Hashable, '__hash__')
+
+    def test_AsyncIterable(self):
+        clas

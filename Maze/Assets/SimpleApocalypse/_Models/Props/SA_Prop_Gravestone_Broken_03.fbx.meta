@@ -1,0 +1,59 @@
+(ApiChanges modified)
+		{
+			foreach (var changes in modified) {
+				if (State.IgnoreNonbreaking && changes.Value.All (c => !c.Breaking))
+					continue;
+				Formatter.BeginMemberModification (Output, changes.Key);
+				foreach (var element in changes.Value) {
+					if (State.IgnoreNonbreaking && !element.Breaking)
+						continue;
+					Formatter.Diff (Output, element);
+				}
+				Formatter.EndMemberModification (Output);
+			}
+		}
+
+		void Remove (IEnumerable<XElement> elements)
+		{
+			bool r = false;
+			foreach (var item in elements) {
+				var memberDescription = $"{State.Namespace}.{State.Type}: Removed {GroupName}: {GetDescription (item)}";
+				State.LogDebugMessage ($"Possible -r value: {memberDescription}");
+				if (State.IgnoreRemoved.Any (re => re.IsMatch (memberDescription)))
+					continue;
+				SetContext (item);
+				if (State.IgnoreNonbreaking && !IsBreakingRemoval (item))
+					continue;
+				if (!r) {
+					Formatter.BeginMemberRemoval (Output, elements, this);
+					first = true;
+					r = true;
+				}
+				Removed (item);
+			}
+			if (r)
+				Formatter.EndMemberRemoval (Output);
+		}
+			
+		public abstract string GetDescription (XElement e);
+
+		protected StringBuilder GetObsoleteMessage (XElement e)
+		{
+			var sb = new StringBuilder ();
+			string o = e.GetObsoleteMessage ();
+			if (o != null) {
+				sb.Append ("[Obsolete");
+				if (o.Length > 0)
+					sb.Append (" (\"").Append (o).Append ("\")");
+				sb.AppendLine ("]");
+			}
+			return sb;
+		}
+
+		public override bool Equals (XElement source, XElement target, ApiChanges changes)
+		{
+			RenderAttributes (source, target, changes);
+
+			// We don't want to compare attributes.
+			RemoveAttributes (source);
+			RemoveA

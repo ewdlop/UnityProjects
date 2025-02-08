@@ -1,0 +1,201 @@
+ol isChanged, Material mat)
+        {
+            //Debug.Log("ON_MATERIAL_PROPERTY_CHANGED event received."); // Targeted Material is: " + mat.name + "  m_sharedMaterial: " + m_sharedMaterial.name + " with ID:" + m_sharedMaterial.GetInstanceID() + "  m_renderer.sharedMaterial: " + m_canvasRenderer.GetMaterial() + "  Masking Material:" + m_MaskMaterial.GetInstanceID());
+
+            ShaderUtilities.GetShaderPropertyIDs(); // Initialize ShaderUtilities and get shader property IDs.
+
+            int materialID = mat.GetInstanceID();
+            int sharedMaterialID = m_sharedMaterial.GetInstanceID();
+            int maskingMaterialID = m_MaskMaterial == null ? 0 : m_MaskMaterial.GetInstanceID();
+
+            if (m_canvasRenderer == null || m_canvasRenderer.GetMaterial() == null)
+            {
+                if (m_canvasRenderer == null) return;
+
+                if (m_fontAsset != null)
+                {
+                    m_canvasRenderer.SetMaterial(m_fontAsset.material, m_sharedMaterial.GetTexture(ShaderUtilities.ID_MainTex));
+                    //Debug.LogWarning("No Material was assigned to " + name + ". " + m_fontAsset.material.name + " was assigned.");
+                }
+                else
+                    Debug.LogWarning("No Font Asset assigned to " + name + ". Please assign a Font Asset.", this);
+            }
+
+
+            if (m_canvasRenderer.GetMaterial() != m_sharedMaterial && m_fontAsset == null) //    || m_renderer.sharedMaterials.Contains(mat))
+            {
+                //Debug.Log("ON_MATERIAL_PROPERTY_CHANGED Called on Target ID: " + GetInstanceID() + ". Previous Material:" + m_sharedMaterial + "  New Material:" + m_uiRenderer.GetMaterial()); // on Object ID:" + GetInstanceID() + ". m_sharedMaterial: " + m_sharedMaterial.name + "  m_renderer.sharedMaterial: " + m_renderer.sharedMaterial.name);         
+                m_sharedMaterial = m_canvasRenderer.GetMaterial();
+            }
+
+
+            // Make sure material properties are synchronized between the assigned material and masking material.
+            if (m_MaskMaterial != null)
+            {
+                UnityEditor.Undo.RecordObject(m_MaskMaterial, "Material Property Changes");
+                UnityEditor.Undo.RecordObject(m_sharedMaterial, "Material Property Changes");
+
+                if (materialID == sharedMaterialID)
+                {
+                    //Debug.Log("Copy base material properties to masking material if not null.");
+                    float stencilID = m_MaskMaterial.GetFloat(ShaderUtilities.ID_StencilID);
+                    float stencilComp = m_MaskMaterial.GetFloat(ShaderUtilities.ID_StencilComp);
+                    //float stencilOp = m_MaskMaterial.GetFloat(ShaderUtilities.ID_StencilOp);
+                    //float stencilRead = m_MaskMaterial.GetFloat(ShaderUtilities.ID_StencilReadMask);
+                    //float stencilWrite = m_MaskMaterial.GetFloat(ShaderUtilities.ID_StencilWriteMask);
+
+                    m_MaskMaterial.CopyPropertiesFromMaterial(mat);
+                    m_MaskMaterial.shaderKeywords = mat.shaderKeywords;
+
+                    m_MaskMaterial.SetFloat(ShaderUtilities.ID_StencilID, stencilID);
+                    m_MaskMaterial.SetFloat(ShaderUtilities.ID_StencilComp, stencilComp);
+                    //m_MaskMaterial.SetFloat(ShaderUtilities.ID_StencilOp, stencilOp);
+                    //m_MaskMaterial.SetFloat(ShaderUtilities.ID_StencilReadMask, stencilID);
+                    //m_MaskMaterial.SetFloat(ShaderUtilities.ID_StencilWriteMask, 0);
+                }
+                else if (materialID == maskingMaterialID)
+                {
+                    // Update the padding 
+                    GetPaddingForMaterial(mat);
+
+                    m_sharedMaterial.CopyPropertiesFromMaterial(mat);
+                    m_sharedMaterial.shaderKeywords = mat.shaderKeywords;
+                    m_sharedMaterial.SetFloat(ShaderUtilities.ID_StencilID, 0);
+                    m_sharedMaterial.SetFloat(ShaderUtilities.ID_StencilComp, 8);
+                    //m_sharedMaterial.SetFloat(ShaderUtilities.ID_StencilOp, 0);
+                    //m_sharedMaterial.SetFloat(ShaderUtilities.ID_StencilReadMask, 255);
+                    //m_sharedMaterial.SetFloat(ShaderUtilities.ID_StencilWriteMask, 255);
+                }
+
+            }
+
+            m_padding = GetPaddingForMaterial();
+            m_havePropertiesChanged = true;
+            SetVerticesDirty();
+            //SetMaterialDirty();
+        }
+
+
+        // Event received when font asset properties are changed in Font Inspector
+        void ON_FONT_PROPERTY_CHANGED(bool isChanged, TMP_FontAsset font)
+        {
+            if (MaterialReference.Contains(m_materialReferences, font))
+            {
+                //Debug.Log("ON_FONT_PROPERTY_CHANGED event received.");
+                m_isInputParsingRequired = true;
+                m_havePropertiesChanged = true;
+
+                SetLayoutDirty();
+                SetVerticesDirty();
+            }
+        }
+
+
+        // Event received when UNDO / REDO Event alters the properties of the object.
+        void ON_TEXTMESHPRO_UGUI_PROPERTY_CHANGED(bool isChanged, TextMeshProUGUI obj)
+        {
+            //Debug.Log("Event Received by " + obj);
+            
+            if (obj == this)
+            {
+                //Debug.Log("Undo / Redo Event Received by Object ID:" + GetInstanceID());
+                m_havePropertiesChanged = true;
+                m_isInputParsingRequired = true;
+
+                ComputeMarginSize();
+                SetVerticesDirty();
+            }
+        }
+
+
+        // Event to Track Material Changed resulting from Drag-n-drop.
+        void ON_DRAG_AND_DROP_MATERIAL(GameObject obj, Material currentMaterial, Material newMaterial)
+        {
+            //Debug.Log("Drag-n-Drop Event - Receiving Object ID " + GetInstanceID() + ". Sender ID " + obj.GetInstanceID()); // +  ". Prefab Parent is " + UnityEditor.PrefabUtility.GetPrefabParent(gameObject).GetInstanceID()); // + ". New Material is " + newMaterial.name + " with ID " + newMaterial.GetInstanceID() + ". Base Material is " + m_baseMaterial.name + " with ID " + m_baseMaterial.GetInstanceID());
+
+            // Check if event applies to this current object
+            #if UNITY_2018_2_OR_NEWER
+            if (obj == gameObject || UnityEditor.PrefabUtility.GetCorrespondingObjectFromSource(gameObject) == obj)
+            #else
+            if (obj == gameObject || UnityEditor.PrefabUtility.GetPrefabParent(gameObject) == obj)
+            #endif
+            {
+                UnityEditor.Undo.RecordObject(this, "Material Assignment");
+                UnityEditor.Undo.RecordObject(m_canvasRenderer, "Material Assignment");
+
+                m_sharedMaterial = newMaterial;
+
+                m_padding = GetPaddingForMaterial();
+
+                m_havePropertiesChanged = true;
+                SetVerticesDirty();
+                SetMaterialDirty();
+            }
+        }
+
+
+        // Event received when Text Styles are changed.
+        void ON_TEXT_STYLE_CHANGED(bool isChanged)
+        {
+            m_havePropertiesChanged = true;
+            m_isInputParsingRequired = true;
+            SetVerticesDirty();
+        }
+
+
+        /// <summary>
+        /// Event received when a Color Gradient Preset is modified.
+        /// </summary>
+        /// <param name="textObject"></param>
+        void ON_COLOR_GRADIENT_CHANGED(TMP_ColorGradient gradient)
+        {
+            if (m_fontColorGradientPreset != null && gradient.GetInstanceID() == m_fontColorGradientPreset.GetInstanceID())
+            {
+                m_havePropertiesChanged = true;
+                SetVerticesDirty();
+            }
+        }
+
+
+        /// <summary>
+        /// Event received when the TMP Settings are changed.
+        /// </summary>
+        void ON_TMP_SETTINGS_CHANGED()
+        {
+            m_defaultSpriteAsset = null;
+            m_havePropertiesChanged = true;
+            m_isInputParsingRequired = true;
+            SetAllDirty();
+        }
+        #endif
+
+
+        // Function which loads either the default font or a newly assigned font asset. This function also assigned the appropriate material to the renderer.
+        protected override void LoadFontAsset()
+        {
+            //Debug.Log("***** LoadFontAsset() *****"); //TextMeshPro LoadFontAsset() has been called."); // Current Font Asset is " + (font != null ? font.name: "Null") );
+            
+            ShaderUtilities.GetShaderPropertyIDs(); // Initialize & Get shader property IDs.
+
+            if (m_fontAsset == null)
+            {
+                if (TMP_Settings.defaultFontAsset != null)
+                    m_fontAsset = TMP_Settings.defaultFontAsset;
+                else
+                    m_fontAsset = Resources.Load<TMP_FontAsset>("Fonts & Materials/LiberationSans SDF");
+
+                if (m_fontAsset == null)
+                {
+                    Debug.LogWarning("The LiberationSans SDF Font Asset was not found. There is no Font Asset assigned to " + gameObject.name + ".", this);
+                    return;
+                }
+
+                if (m_fontAsset.characterDictionary == null)
+                {
+                    Debug.Log("Dictionary is Null!");
+                }
+
+                m_sharedMaterial = m_fontAsset.material;
+            }
+            else
+          

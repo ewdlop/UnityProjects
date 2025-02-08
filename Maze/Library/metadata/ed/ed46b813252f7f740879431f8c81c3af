@@ -1,0 +1,124 @@
+N32 = (SERVICE_WIN32_OWN_PROCESS | SERVICE_WIN32_SHARE_PROCESS),
+			SERVICE_TYPE_ALL = (SERVICE_WIN32 | SERVICE_ADAPTER | SERVICE_DRIVER | SERVICE_INTERACTIVE_PROCESS)
+		}
+
+		[UnmanagedFunctionPointerAttribute (CallingConvention.StdCall)]
+		private delegate int LPHANDLER_FUNCTION_EX(int dwControl, int dwEventType, IntPtr lpEventData, IntPtr lpContext);
+
+		[UnmanagedFunctionPointerAttribute (CallingConvention.StdCall)]
+		private delegate void LPSERVICE_MAIN_FUNCTION(int dwArgc, IntPtr lpszArgv);
+
+		[StructLayout (LayoutKind.Sequential, Pack = 1)]
+		private struct SERVICE_STATUS
+		{
+			public int dwServiceType;
+			public int dwCurrentState;
+			public int dwControlsAccepted;
+			public int dwWin32ExitCode;
+			public int dwServiceSpecificErrorCode;
+			public int dwCheckPoint;
+			public int dwWaitHint;
+		}
+
+		[StructLayout (LayoutKind.Sequential, Pack = 1)]
+		private struct SERVICE_TABLE_ENTRY
+		{
+			[MarshalAs (UnmanagedType.LPWStr)]
+			public string lpServiceName;
+			public LPSERVICE_MAIN_FUNCTION lpServiceProc;
+		}
+
+		[DllImport ("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+		private static extern IntPtr RegisterServiceCtrlHandlerEx (
+			string lpServiceName,
+			LPHANDLER_FUNCTION_EX lpHandlerProc,
+			IntPtr lpContext);
+
+		[DllImport ("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+		private static extern bool SetServiceStatus (
+			IntPtr hServiceStatus,
+			[MarshalAs (UnmanagedType.LPStruct)] SERVICE_STATUS status);
+
+		[DllImport ("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+		private static extern bool StartServiceCtrlDispatcher (
+			[MarshalAs (UnmanagedType.LPArray)] SERVICE_TABLE_ENTRY[] lpServiceTable);
+
+		private static void Win32NotifyStatus (ServiceBase service, ServiceControllerStatus status)
+		{
+			SERVICE_STATUS service_status = new SERVICE_STATUS ();
+
+			service_status.dwServiceType = share_process ? (int)SERVICE_TYPE.SERVICE_WIN32_SHARE_PROCESS : (int)SERVICE_TYPE.SERVICE_WIN32_OWN_PROCESS;
+
+			service_status.dwCurrentState = (int)status;
+
+			if (status != ServiceControllerStatus.StartPending)
+			{
+				if (service.can_stop)
+					service_status.dwControlsAccepted |= (int)SERVICE_CONTROL_ACCEPTED.SERVICE_ACCEPT_STOP;
+
+				if (service.can_pause_and_continue)
+					service_status.dwControlsAccepted |= (int)SERVICE_CONTROL_ACCEPTED.SERVICE_ACCEPT_PAUSE_CONTINUE;
+
+				if (service.can_handle_power_event)
+					service_status.dwControlsAccepted |= (int)SERVICE_CONTROL_ACCEPTED.SERVICE_ACCEPT_POWEREVENT;
+
+				if (service.can_handle_session_change_event)
+					service_status.dwControlsAccepted |= (int)SERVICE_CONTROL_ACCEPTED.SERVICE_ACCEPT_SESSIONCHANGE;
+
+				if (service.can_shutdown)
+					service_status.dwControlsAccepted |= (int)SERVICE_CONTROL_ACCEPTED.SERVICE_ACCEPT_SHUTDOWN;
+			}
+
+			service_status.dwWin32ExitCode = service.ExitCode;
+			service_status.dwWaitHint = 5000;
+
+			SetServiceStatus (service.service_handle, service_status);
+		}
+
+		private int Win32HandlerFn (int dwControl, int dwEventType, IntPtr lpEventData, IntPtr lpContext)
+		{
+			switch ((SERVICE_CONTROL_TYPE)dwControl)
+			{
+			case SERVICE_CONTROL_TYPE.SERVICE_CONTROL_STOP:
+				if (can_stop)
+				{
+					Stop ();
+					return NO_ERROR;
+				}
+				break;
+			case SERVICE_CONTROL_TYPE.SERVICE_CONTROL_PAUSE:
+				if (can_pause_and_continue)
+				{
+					SetStatus (ServiceControllerStatus.PausePending);
+					OnPause ();
+					SetStatus (ServiceControllerStatus.Paused);
+					return NO_ERROR;
+				}
+				break;
+			case SERVICE_CONTROL_TYPE.SERVICE_CONTROL_CONTINUE:
+				if (can_pause_and_continue)
+				{
+					SetStatus (ServiceControllerStatus.ContinuePending);
+					OnContinue ();
+					SetStatus (ServiceControllerStatus.Running);
+					return NO_ERROR;
+				}
+				break;
+			case SERVICE_CONTROL_TYPE.SERVICE_CONTROL_INTERROGATE:
+				return NO_ERROR;
+			case SERVICE_CONTROL_TYPE.SERVICE_CONTROL_SHUTDOWN:
+				if (can_shutdown)
+				{
+					OnShutdown ();
+					return NO_ERROR;
+				}
+				break;
+			default:
+				break;
+			}
+			return ERROR_CALL_NOT_IMPLEMENTED;
+		}
+
+		[ComVisible (false)]
+		[EditorBrowsable (EditorBrowsableState.Never)]
+		[MonoTODO ("This only makes sense on Wi

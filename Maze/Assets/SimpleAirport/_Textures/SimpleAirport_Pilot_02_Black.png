@@ -1,0 +1,202 @@
+//===- ScheduleDAGInstrs.h - MachineInstr Scheduling ------------*- C++ -*-===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+//
+/// \file Implements the ScheduleDAGInstrs class, which implements scheduling
+/// for a MachineInstr-based dependency graph.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef LLVM_CODEGEN_SCHEDULEDAGINSTRS_H
+#define LLVM_CODEGEN_SCHEDULEDAGINSTRS_H
+
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/PointerIntPair.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/SparseMultiSet.h"
+#include "llvm/ADT/SparseSet.h"
+#include "llvm/CodeGen/LivePhysRegs.h"
+#include "llvm/CodeGen/MachineBasicBlock.h"
+#include "llvm/CodeGen/ScheduleDAG.h"
+#include "llvm/CodeGen/TargetRegisterInfo.h"
+#include "llvm/CodeGen/TargetSchedule.h"
+#include "llvm/MC/LaneBitmask.h"
+#include <cassert>
+#include <cstdint>
+#include <list>
+#include <utility>
+#include <vector>
+
+namespace llvm {
+
+  class LiveIntervals;
+  class MachineFrameInfo;
+  class MachineFunction;
+  class MachineInstr;
+  class MachineLoopInfo;
+  class MachineOperand;
+  struct MCSchedClassDesc;
+  class PressureDiffs;
+  class PseudoSourceValue;
+  class RegPressureTracker;
+  class UndefValue;
+  class Value;
+
+  /// An individual mapping from virtual register number to SUnit.
+  struct VReg2SUnit {
+    unsigned VirtReg;
+    LaneBitmask LaneMask;
+    SUnit *SU;
+
+    VReg2SUnit(unsigned VReg, LaneBitmask LaneMask, SUnit *SU)
+      : VirtReg(VReg), LaneMask(LaneMask), SU(SU) {}
+
+    unsigned getSparseSetIndex() const {
+      return TargetRegisterInfo::virtReg2Index(VirtReg);
+    }
+  };
+
+  /// Mapping from virtual register to SUnit including an operand index.
+  struct VReg2SUnitOperIdx : public VReg2SUnit {
+    unsigned OperandIndex;
+
+    VReg2SUnitOperIdx(unsigned VReg, LaneBitmask LaneMask,
+                      unsigned OperandIndex, SUnit *SU)
+      : VReg2SUnit(VReg, LaneMask, SU), OperandIndex(OperandIndex) {}
+  };
+
+  /// Record a physical register access.
+  /// For non-data-dependent uses, OpIdx == -1.
+  struct PhysRegSUOper {
+    SUnit *SU;
+    int OpIdx;
+    unsigned Reg;
+
+    PhysRegSUOper(SUnit *su, int op, unsigned R): SU(su), OpIdx(op), Reg(R) {}
+
+    unsigned getSparseSetIndex() const { return Reg; }
+  };
+
+  /// Use a SparseMultiSet to track physical registers. Storage is only
+  /// allocated once for the pass. It can be cleared in constant time and reused
+  /// without any frees.
+  using Reg2SUnitsMap =
+      SparseMultiSet<PhysRegSUOper, identity<unsigned>, uint16_t>;
+
+  /// Use SparseSet as a SparseMap by relying on the fact that it never
+  /// compares ValueT's, only unsigned keys. This allows the set to be cleared
+  /// between scheduling regions in constant time as long as ValueT does not
+  /// require a destructor.
+  using VReg2SUnitMap = SparseSet<VReg2SUnit, VirtReg2IndexFunctor>;
+
+  /// Track local uses of virtual registers. These uses are gathered by the DAG
+  /// builder and may be consulted by the scheduler to avoid iterating an entire
+  /// vreg use list.
+  using VReg2SUnitMultiMap = SparseMultiSet<VReg2SUnit, VirtReg2IndexFunctor>;
+
+  using VReg2SUnitOperIdxMultiMap =
+      SparseMultiSet<VReg2SUnitOperIdx, VirtReg2IndexFunctor>;
+
+  using ValueType = PointerUnion<const Value *, const PseudoSourceValue *>;
+
+  struct UnderlyingObject : PointerIntPair<ValueType, 1, bool> {
+    UnderlyingObject(ValueType V, bool MayAlias)
+        : PointerIntPair<ValueType, 1, bool>(V, MayAlias) {}
+
+    ValueType getValue() const { return getPointer(); }
+    bool mayAlias() const { return getInt(); }
+  };
+
+  using UnderlyingObjectsVector = SmallVector<UnderlyingObject, 4>;
+
+  /// A ScheduleDAG for scheduling lists of MachineInstr.
+  class ScheduleDAGInstrs : public ScheduleDAG {
+  protected:
+    const MachineLoopInfo *MLI;
+    const MachineFrameInfo &MFI;
+
+    /// TargetSchedModel provides an interface to the machine model.
+    TargetSchedModel SchedModel;
+
+    /// True if the DAG builder should remove kill flags (in preparation for
+    /// rescheduling).
+    bool RemoveKillFlags;
+
+    /// The standard DAG builder does not normally include terminators as DAG
+    /// nodes because it does not create the necessary dependencies to prevent
+    /// reordering. A specialized scheduler can override
+    /// TargetInstrInfo::isSchedulingBoundary then enable this flag to indicate
+    /// it has taken responsibility for scheduling the terminator correctly.
+    bool CanHandleTerminators = false;
+
+    /// Whether lane masks should get tracked.
+    bool TrackLaneMasks = false;
+
+    // State specific to the current scheduling region.
+    // ------------------------------------------------
+
+    /// The block in which to insert instructions
+    MachineBasicBlock *BB;
+
+    /// The beginning of the range to be scheduled.
+    MachineBasicBlock::iterator RegionBegin;
+
+    /// The end of the range to be scheduled.
+    MachineBasicBlock::iterator RegionEnd;
+
+    /// Instructions in this region (distance(RegionBegin, RegionEnd)).
+    unsigned NumRegionInstrs;
+
+    /// After calling BuildSchedGraph, each machine instruction in the current
+    /// scheduling region is mapped to an SUnit.
+    DenseMap<MachineInstr*, SUnit*> MISUnitMap;
+
+    // State internal to DAG building.
+    // -------------------------------
+
+    /// Defs, Uses - Remember where defs and uses of each register are as we
+    /// iterate upward through the instructions. This is allocated here instead
+    /// of inside BuildSchedGraph to avoid the need for it to be initialized and
+    /// destructed for each block.
+    Reg2SUnitsMap Defs;
+    Reg2SUnitsMap Uses;
+
+    /// Tracks the last instruction(s) in this region defining each virtual
+    /// register. There may be multiple current definitions for a register with
+    /// disjunct lanemasks.
+    VReg2SUnitMultiMap CurrentVRegDefs;
+    /// Tracks the last instructions in this region using each virtual register.
+    VReg2SUnitOperIdxMultiMap CurrentVRegUses;
+
+    AliasAnalysis *AAForDep = nullptr;
+
+    /// Remember a generic side-effecting instruction as we proceed.
+    /// No other SU ever gets scheduled around it (except in the special
+    /// case of a huge region that gets reduced).
+    SUnit *BarrierChain = nullptr;
+
+  public:
+    /// A list of SUnits, used in Value2SUsMap, during DAG construction.
+    /// Note: to gain speed it might be worth investigating an optimized
+    /// implementation of this data structure, such as a singly linked list
+    /// with a memory pool (SmallVector was tried but slow and SparseSet is not
+    /// applicable).
+    using SUList = std::list<SUnit *>;
+
+  protected:
+    /// \brief A map from ValueType to SUList, used during DAG construction, as
+    /// a means of remembering which SUs depend on which memory locations.
+    class Value2SUsMap;
+
+    /// Reduces maps in FIFO order, by N SUs. This is better than turning
+    /// every Nth memory SU into BarrierChain in buildSchedGraph(), since
+    /// it avoids unnecessary edges between seen SUs above the new BarrierChain,
+    /// and those below it.
+    void reduceHugeMemNodeMaps(Value2SUsMap &stores,
+ 

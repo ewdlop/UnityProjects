@@ -1,0 +1,230 @@
+    count = sel
+                new_list = list[:count]
+        if len(list) != len(new_list):
+            msg += "   List reduced from %r to %r due to restriction <%r>\n" % (
+                len(list), len(new_list), sel)
+
+        return new_list, msg
+
+    def get_print_list(self, sel_list):
+        width = self.max_name_len
+        if self.fcn_list:
+            stat_list = self.fcn_list[:]
+            msg = "   Ordered by: " + self.sort_type + '\n'
+        else:
+            stat_list = self.stats.keys()
+            msg = "   Random listing order was used\n"
+
+        for selection in sel_list:
+            stat_list, msg = self.eval_print_amount(selection, stat_list, msg)
+
+        count = len(stat_list)
+
+        if not stat_list:
+            return 0, stat_list
+        print >> self.stream, msg
+        if count < len(self.stats):
+            width = 0
+            for func in stat_list:
+                if  len(func_std_string(func)) > width:
+                    width = len(func_std_string(func))
+        return width+2, stat_list
+
+    def print_stats(self, *amount):
+        for filename in self.files:
+            print >> self.stream, filename
+        if self.files: print >> self.stream
+        indent = ' ' * 8
+        for func in self.top_level:
+            print >> self.stream, indent, func_get_function_name(func)
+
+        print >> self.stream, indent, self.total_calls, "function calls",
+        if self.total_calls != self.prim_calls:
+            print >> self.stream, "(%d primitive calls)" % self.prim_calls,
+        print >> self.stream, "in %.3f seconds" % self.total_tt
+        print >> self.stream
+        width, list = self.get_print_list(amount)
+        if list:
+            self.print_title()
+            for func in list:
+                self.print_line(func)
+            print >> self.stream
+            print >> self.stream
+        return self
+
+    def print_callees(self, *amount):
+        width, list = self.get_print_list(amount)
+        if list:
+            self.calc_callees()
+
+            self.print_call_heading(width, "called...")
+            for func in list:
+                if func in self.all_callees:
+                    self.print_call_line(width, func, self.all_callees[func])
+                else:
+                    self.print_call_line(width, func, {})
+            print >> self.stream
+            print >> self.stream
+        return self
+
+    def print_callers(self, *amount):
+        width, list = self.get_print_list(amount)
+        if list:
+            self.print_call_heading(width, "was called by...")
+            for func in list:
+                cc, nc, tt, ct, callers = self.stats[func]
+                self.print_call_line(width, func, callers, "<-")
+            print >> self.stream
+            print >> self.stream
+        return self
+
+    def print_call_heading(self, name_size, column_title):
+        print >> self.stream, "Function ".ljust(name_size) + column_title
+        # print sub-header only if we have new-style callers
+        subheader = False
+        for cc, nc, tt, ct, callers in self.stats.itervalues():
+            if callers:
+                value = callers.itervalues().next()
+                subheader = isinstance(value, tuple)
+                break
+        if subheader:
+            print >> self.stream, " "*name_size + "    ncalls  tottime  cumtime"
+
+    def print_call_line(self, name_size, source, call_dict, arrow="->"):
+        print >> self.stream, func_std_string(source).ljust(name_size) + arrow,
+        if not call_dict:
+            print >> self.stream
+            return
+        clist = call_dict.keys()
+        clist.sort()
+        indent = ""
+        for func in clist:
+            name = func_std_string(func)
+            value = call_dict[func]
+            if isinstance(value, tuple):
+                nc, cc, tt, ct = value
+                if nc != cc:
+                    substats = '%d/%d' % (nc, cc)
+                else:
+                    substats = '%d' % (nc,)
+                substats = '%s %s %s  %s' % (substats.rjust(7+2*len(indent)),
+                                             f8(tt), f8(ct), name)
+                left_width = name_size + 1
+            else:
+                substats = '%s(%r) %s' % (name, value, f8(self.stats[func][3]))
+                left_width = name_size + 3
+            print >> self.stream, indent*left_width + substats
+            indent = " "
+
+    def print_title(self):
+        print >> self.stream, '   ncalls  tottime  percall  cumtime  percall',
+        print >> self.stream, 'filename:lineno(function)'
+
+    def print_line(self, func):  # hack : should print percentages
+        cc, nc, tt, ct, callers = self.stats[func]
+        c = str(nc)
+        if nc != cc:
+            c = c + '/' + str(cc)
+        print >> self.stream, c.rjust(9),
+        print >> self.stream, f8(tt),
+        if nc == 0:
+            print >> self.stream, ' '*8,
+        else:
+            print >> self.stream, f8(float(tt)/nc),
+        print >> self.stream, f8(ct),
+        if cc == 0:
+            print >> self.stream, ' '*8,
+        else:
+            print >> self.stream, f8(float(ct)/cc),
+        print >> self.stream, func_std_string(func)
+
+class TupleComp:
+    """This class provides a generic function for comparing any two tuples.
+    Each instance records a list of tuple-indices (from most significant
+    to least significant), and sort direction (ascending or decending) for
+    each tuple-index.  The compare functions can then be used as the function
+    argument to the system sort() function when a list of tuples need to be
+    sorted in the instances order."""
+
+    def __init__(self, comp_select_list):
+        self.comp_select_list = comp_select_list
+
+    def compare (self, left, right):
+        for index, direction in self.comp_select_list:
+            l = left[index]
+            r = right[index]
+            if l < r:
+                return -direction
+            if l > r:
+                return direction
+        return 0
+
+#**************************************************************************
+# func_name is a triple (file:string, line:int, name:string)
+
+def func_strip_path(func_name):
+    filename, line, name = func_name
+    return os.path.basename(filename), line, name
+
+def func_get_function_name(func):
+    return func[2]
+
+def func_std_string(func_name): # match what old profile produced
+    if func_name[:2] == ('~', 0):
+        # special case for built-in functions
+        name = func_name[2]
+        if name.startswith('<') and name.endswith('>'):
+            return '{%s}' % name[1:-1]
+        else:
+            return name
+    else:
+        return "%s:%d(%s)" % func_name
+
+#**************************************************************************
+# The following functions combine statists for pairs functions.
+# The bulk of the processing involves correctly handling "call" lists,
+# such as callers and callees.
+#**************************************************************************
+
+def add_func_stats(target, source):
+    """Add together all the stats for two profile entries."""
+    cc, nc, tt, ct, callers = source
+    t_cc, t_nc, t_tt, t_ct, t_callers = target
+    return (cc+t_cc, nc+t_nc, tt+t_tt, ct+t_ct,
+              add_callers(t_callers, callers))
+
+def add_callers(target, source):
+    """Combine two caller lists in a single list."""
+    new_callers = {}
+    for func, caller in target.iteritems():
+        new_callers[func] = caller
+    for func, caller in source.iteritems():
+        if func in new_callers:
+            if isinstance(caller, tuple):
+                # format used by cProfile
+                new_callers[func] = tuple([i[0] + i[1] for i in
+                                           zip(caller, new_callers[func])])
+            else:
+                # format used by profile
+                new_callers[func] += caller
+        else:
+            new_callers[func] = caller
+    return new_callers
+
+def count_calls(callers):
+    """Sum the caller statistics to get total number of calls received."""
+    nc = 0
+    for calls in callers.itervalues():
+        nc += calls
+    return nc
+
+#**************************************************************************
+# The following functions support printing of reports
+#**************************************************************************
+
+def f8(x):
+    return "%8.3f" % x
+
+#**************************************************************************
+# Statistics browser added by ESR, April 2001
+#**********

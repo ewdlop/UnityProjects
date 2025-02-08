@@ -1,0 +1,96 @@
+(d.Add (new TimeSpan(0,0,0,-1))));
+				Assert.AreEqual(baseUtcOffset, cairo.GetUtcOffset (d));
+				Assert.AreEqual(baseUtcOffset, cairo.GetUtcOffset (d.Add (new TimeSpan(0,0,0, 1))));
+			}
+
+			[Test]
+			[Category ("MobileNotWorking")]
+			public void GetUtcOffset_FromUnspecified ()
+			{
+				var d = dst1Start.Add (dstOffset);
+				Assert.AreEqual(baseUtcOffset, cairo.GetUtcOffset (d.Add (new TimeSpan(0,0,0,-1))));
+				Assert.AreEqual(dstUtcOffset, cairo.GetUtcOffset (d));
+				Assert.AreEqual(dstUtcOffset, cairo.GetUtcOffset (d.Add (new TimeSpan(0,0,0, 1))));
+
+				d = dst1End.Add (-dstOffset);
+				Assert.AreEqual(dstUtcOffset, cairo.GetUtcOffset (d.Add (new TimeSpan(0,0,0,-1))));
+				Assert.AreEqual(baseUtcOffset, cairo.GetUtcOffset (d.Add (new TimeSpan(0,1,0, 1))));
+
+				d = dst2Start.Add (dstOffset);
+				Assert.AreEqual(baseUtcOffset, cairo.GetUtcOffset (d.Add (new TimeSpan(0,0,0,-1))));
+				Assert.AreEqual(dstUtcOffset, cairo.GetUtcOffset (d));
+				Assert.AreEqual(dstUtcOffset, cairo.GetUtcOffset (d.Add (new TimeSpan(0,0,0, 1))));
+
+				d = dst2End.Add (-dstOffset);
+				Assert.AreEqual(dstUtcOffset, cairo.GetUtcOffset (d.Add (new TimeSpan(0,0,0,-1))));
+				Assert.AreEqual(baseUtcOffset, cairo.GetUtcOffset (d.Add (new TimeSpan(0,1,0, 1))));
+			}
+
+		  [Test]
+		  [Category ("MobileNotWorking")]
+		  public void  GetUtcOffset_FromDateTimeOffset ()
+		  {
+			  DateTimeOffset offset;
+
+			  offset = new DateTimeOffset(dst1Start, baseUtcOffset);
+			  Assert.AreEqual(baseUtcOffset, cairo.GetUtcOffset(offset.Add(new TimeSpan(0, 0, 0, -1))), "dst1Start_with_baseUtcOffset#before");
+			  Assert.AreEqual(dstUtcOffset, cairo.GetUtcOffset(offset), "dst1Start_with_baseUtcOffset#exact");
+			  Assert.AreEqual(dstUtcOffset, cairo.GetUtcOffset(offset.Add(new TimeSpan(0, 0, 0, 1))), "dst1Start_with_baseUtcOffset#after");
+
+			  offset = new DateTimeOffset(dst1End, dstOffset + baseUtcOffset);
+			  Assert.AreEqual(dstUtcOffset, cairo.GetUtcOffset(offset.Add(new TimeSpan(0, 0, 0, -1))), "dst1End_with_dstOffset+baseUtcOffset#before");
+			  Assert.AreEqual(baseUtcOffset, cairo.GetUtcOffset(offset), "dst1End_with_dstOffset+baseUtcOffset#exact");
+			  Assert.AreEqual(baseUtcOffset, cairo.GetUtcOffset(offset.Add(new TimeSpan(0, 0, 0, 1))), "dst1End_with_dstOffset+baseUtcOffset#after");
+
+			  offset = new DateTimeOffset(dst2Start, baseUtcOffset);
+			  Assert.AreEqual(baseUtcOffset, cairo.GetUtcOffset(offset.Add(new TimeSpan(0, 0, 0, -1))), "dst2Start_with_baseUtcOffset#before");
+			  Assert.AreEqual(dstUtcOffset, cairo.GetUtcOffset(offset), "dst2Start_with_baseUtcOffset#exact");
+			  Assert.AreEqual(dstUtcOffset, cairo.GetUtcOffset(offset.Add(new TimeSpan(0, 0, 0, 1))), "dst2Start_with_baseUtcOffset#after");
+
+			  offset = new DateTimeOffset(dst2End, baseUtcOffset + dstOffset);
+			  Assert.AreEqual(dstUtcOffset, cairo.GetUtcOffset(offset.Add(new TimeSpan(0, 0, 0, -1))), "dst2End_with_dstOffset+baseUtcOffset#before");
+			  Assert.AreEqual(baseUtcOffset, cairo.GetUtcOffset(offset), "dst2End_with_dstOffset+baseUtcOffset#exact");
+			  Assert.AreEqual(baseUtcOffset, cairo.GetUtcOffset(offset.Add(new TimeSpan(0, 0, 0, 1))), "dst2End_with_dstOffset+baseUtcOffset#after");
+		  }
+
+			[Test]
+			[Category ("MobileNotWorking")]
+			public void DTS_WithMinimalDate ()
+			{
+				TimeZoneInfo.TransitionTime startTransition, endTransition;
+				startTransition = TimeZoneInfo.TransitionTime.CreateFloatingDateRule (new DateTime (1, 1, 1, 4, 0, 0),
+																				  10, 2, DayOfWeek.Sunday);
+				endTransition = TimeZoneInfo.TransitionTime.CreateFloatingDateRule (new DateTime (1, 1, 1, 3, 0, 0),
+																				3, 2, DayOfWeek.Sunday);
+
+				var ctz = TimeZoneInfo.CreateCustomTimeZone ("test", TimeSpan.FromHours (-5), "display", "sdisplay", "dst", new [] {
+					TimeZoneInfo.AdjustmentRule.CreateAdjustmentRule (DateTime.MinValue, DateTime.MaxValue.Date, TimeSpan.FromHours (-1), startTransition, endTransition) });
+
+				var offset = ctz.GetUtcOffset (DateTime.MinValue);
+				Assert.AreEqual (TimeSpan.FromHours (-6), offset);
+			}
+    }
+
+		[TestFixture]
+		[Category ("NotWasm")]
+		public class GetDaylightChanges
+		{
+			private static void GetDaylightTime (TimeZoneInfo tz, int year, out DateTime start, out DateTime end, out TimeSpan delta)
+			{
+#if !MOBILE
+					var rule = tz.GetAdjustmentRules ().FirstOrDefault (r => r.DateStart.Year <= year && r.DateEnd.Year >= year);
+					if (rule == null) {
+						start = DateTime.MinValue;
+						end = DateTime.MinValue;
+						delta = TimeSpan.Zero;
+						return;
+					}
+					var method = typeof (TimeZoneInfo).GetMethod ("GetDaylightTime", BindingFlags.Instance | BindingFlags.NonPublic);
+					var daylightTime = method.Invoke(tz, new object[] { year, rule, null });
+					var dts = daylightTime.GetType(); // internal readonly struct DaylightTimeStruct
+					start = (DateTime) dts.GetField ("Start").GetValue (daylightTime);
+					end = (DateTime) dts.GetField ("End").GetValue (daylightTime);
+					delta = (TimeSpan) dts.GetField ("Delta").GetValue (daylightTime);
+#else
+					MethodInfo getChanges = typeof (TimeZoneInfo).GetMethod ("GetDaylightChanges", BindingFlags.Instance | BindingFlags.NonPublic);
+					var changes = (DaylightTime) getChanges.Invo

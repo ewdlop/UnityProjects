@@ -1,0 +1,47 @@
+rHostEntry->addr + CurrHostEntry->size /*HstPtrEnd*/,
+            (uintptr_t)CurrDeviceEntry->addr /*TgtPtrBegin*/,
+            INF_REF_CNT /*RefCount*/));
+      }
+    }
+    Device.DataMapMtx.unlock();
+  }
+  TrlTblMtx.unlock();
+
+  if (rc != OFFLOAD_SUCCESS) {
+    Device.PendingGlobalsMtx.unlock();
+    return rc;
+  }
+
+  /*
+   * Run ctors for static objects
+   */
+  if (!Device.PendingCtorsDtors.empty()) {
+    // Call all ctors for all libraries registered so far
+    for (auto &lib : Device.PendingCtorsDtors) {
+      if (!lib.second.PendingCtors.empty()) {
+        DP("Has pending ctors... call now\n");
+        for (auto &entry : lib.second.PendingCtors) {
+          void *ctor = entry;
+          int rc = target(device_id, ctor, 0, NULL, NULL, NULL,
+                          NULL, 1, 1, true /*team*/);
+          if (rc != OFFLOAD_SUCCESS) {
+            DP("Running ctor " DPxMOD " failed.\n", DPxPTR(ctor));
+            Device.PendingGlobalsMtx.unlock();
+            return OFFLOAD_FAIL;
+          }
+        }
+        // Clear the list to indicate that this device has been used
+        lib.second.PendingCtors.clear();
+        DP("Done with pending ctors for lib " DPxMOD "\n", DPxPTR(lib.first));
+      }
+    }
+  }
+  Device.HasPendingGlobals = false;
+  Device.PendingGlobalsMtx.unlock();
+
+  return OFFLOAD_SUCCESS;
+}
+
+// Check whether a device has been initialized, global ctors have been
+// executed and global data has been mapped; do so if not already done.
+int CheckDeviceAndCtors(int64_t device_i

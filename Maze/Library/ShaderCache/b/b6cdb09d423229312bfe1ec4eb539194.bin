@@ -1,0 +1,269 @@
+ble version.
+
+    distutils.util.get_platform() normally reports the minimum version
+    of Mac OS X that would be required to *use* extensions produced by
+    distutils.  But what we want when checking compatibility is to know the
+    version of Mac OS X that we are *running*.  To allow usage of packages that
+    explicitly require a newer version of Mac OS X, we must also know the
+    current version of the OS.
+
+    If this condition occurs for any other platform with a version in its
+    platform strings, this function should be extended accordingly.
+    """
+    plat = get_build_platform()
+    m = macosVersionString.match(plat)
+    if m is not None and sys.platform == "darwin":
+        try:
+            plat = 'macosx-%s-%s' % ('.'.join(_macosx_vers()[:2]), m.group(3))
+        except ValueError:
+            # not Mac OS X
+            pass
+    return plat
+
+
+__all__ = [
+    # Basic resource access and distribution/entry point discovery
+    'require', 'run_script', 'get_provider', 'get_distribution',
+    'load_entry_point', 'get_entry_map', 'get_entry_info',
+    'iter_entry_points',
+    'resource_string', 'resource_stream', 'resource_filename',
+    'resource_listdir', 'resource_exists', 'resource_isdir',
+
+    # Environmental control
+    'declare_namespace', 'working_set', 'add_activation_listener',
+    'find_distributions', 'set_extraction_path', 'cleanup_resources',
+    'get_default_cache',
+
+    # Primary implementation classes
+    'Environment', 'WorkingSet', 'ResourceManager',
+    'Distribution', 'Requirement', 'EntryPoint',
+
+    # Exceptions
+    'ResolutionError', 'VersionConflict', 'DistributionNotFound',
+    'UnknownExtra', 'ExtractionError',
+
+    # Warnings
+    'PEP440Warning',
+
+    # Parsing functions and string utilities
+    'parse_requirements', 'parse_version', 'safe_name', 'safe_version',
+    'get_platform', 'compatible_platforms', 'yield_lines', 'split_sections',
+    'safe_extra', 'to_filename', 'invalid_marker', 'evaluate_marker',
+
+    # filesystem utilities
+    'ensure_directory', 'normalize_path',
+
+    # Distribution "precedence" constants
+    'EGG_DIST', 'BINARY_DIST', 'SOURCE_DIST', 'CHECKOUT_DIST', 'DEVELOP_DIST',
+
+    # "Provider" interfaces, implementations, and registration/lookup APIs
+    'IMetadataProvider', 'IResourceProvider', 'FileMetadata',
+    'PathMetadata', 'EggMetadata', 'EmptyProvider', 'empty_provider',
+    'NullProvider', 'EggProvider', 'DefaultProvider', 'ZipProvider',
+    'register_finder', 'register_namespace_handler', 'register_loader_type',
+    'fixup_namespace_packages', 'get_importer',
+
+    # Warnings
+    'PkgResourcesDeprecationWarning',
+
+    # Deprecated/backward compatibility only
+    'run_main', 'AvailableDistributions',
+]
+
+
+class ResolutionError(Exception):
+    """Abstract base for dependency resolution errors"""
+
+    def __repr__(self):
+        return self.__class__.__name__ + repr(self.args)
+
+
+class VersionConflict(ResolutionError):
+    """
+    An already-installed version conflicts with the requested version.
+
+    Should be initialized with the installed Distribution and the requested
+    Requirement.
+    """
+
+    _template = "{self.dist} is installed but {self.req} is required"
+
+    @property
+    def dist(self):
+        return self.args[0]
+
+    @property
+    def req(self):
+        return self.args[1]
+
+    def report(self):
+        return self._template.format(**locals())
+
+    def with_context(self, required_by):
+        """
+        If required_by is non-empty, return a version of self that is a
+        ContextualVersionConflict.
+        """
+        if not required_by:
+            return self
+        args = self.args + (required_by,)
+        return ContextualVersionConflict(*args)
+
+
+class ContextualVersionConflict(VersionConflict):
+    """
+    A VersionConflict that accepts a third parameter, the set of the
+    requirements that required the installed Distribution.
+    """
+
+    _template = VersionConflict._template + ' by {self.required_by}'
+
+    @property
+    def required_by(self):
+        return self.args[2]
+
+
+class DistributionNotFound(ResolutionError):
+    """A requested distribution was not found"""
+
+    _template = ("The '{self.req}' distribution was not found "
+                 "and is required by {self.requirers_str}")
+
+    @property
+    def req(self):
+        return self.args[0]
+
+    @property
+    def requirers(self):
+        return self.args[1]
+
+    @property
+    def requirers_str(self):
+        if not self.requirers:
+            return 'the application'
+        return ', '.join(self.requirers)
+
+    def report(self):
+        return self._template.format(**locals())
+
+    def __str__(self):
+        return self.report()
+
+
+class UnknownExtra(ResolutionError):
+    """Distribution doesn't have an "extra feature" of the given name"""
+
+
+_provider_factories = {}
+
+PY_MAJOR = sys.version[:3]
+EGG_DIST = 3
+BINARY_DIST = 2
+SOURCE_DIST = 1
+CHECKOUT_DIST = 0
+DEVELOP_DIST = -1
+
+
+def register_loader_type(loader_type, provider_factory):
+    """Register `provider_factory` to make providers for `loader_type`
+
+    `loader_type` is the type or class of a PEP 302 ``module.__loader__``,
+    and `provider_factory` is a function that, passed a *module* object,
+    returns an ``IResourceProvider`` for that module.
+    """
+    _provider_factories[loader_type] = provider_factory
+
+
+def get_provider(moduleOrReq):
+    """Return an IResourceProvider for the named module or requirement"""
+    if isinstance(moduleOrReq, Requirement):
+        return working_set.find(moduleOrReq) or require(str(moduleOrReq))[0]
+    try:
+        module = sys.modules[moduleOrReq]
+    except KeyError:
+        __import__(moduleOrReq)
+        module = sys.modules[moduleOrReq]
+    loader = getattr(module, '__loader__', None)
+    return _find_adapter(_provider_factories, loader)(module)
+
+
+def _macosx_vers(_cache=[]):
+    if not _cache:
+        version = platform.mac_ver()[0]
+        # fallback for MacPorts
+        if version == '':
+            plist = '/System/Library/CoreServices/SystemVersion.plist'
+            if os.path.exists(plist):
+                if hasattr(plistlib, 'readPlist'):
+                    plist_content = plistlib.readPlist(plist)
+                    if 'ProductVersion' in plist_content:
+                        version = plist_content['ProductVersion']
+
+        _cache.append(version.split('.'))
+    return _cache[0]
+
+
+def _macosx_arch(machine):
+    return {'PowerPC': 'ppc', 'Power_Macintosh': 'ppc'}.get(machine, machine)
+
+
+def get_build_platform():
+    """Return this platform's string for platform-specific distributions
+
+    XXX Currently this is the same as ``distutils.util.get_platform()``, but it
+    needs some hacks for Linux and Mac OS X.
+    """
+    from sysconfig import get_platform
+
+    plat = get_platform()
+    if sys.platform == "darwin" and not plat.startswith('macosx-'):
+        try:
+            version = _macosx_vers()
+            machine = os.uname()[4].replace(" ", "_")
+            return "macosx-%d.%d-%s" % (
+                int(version[0]), int(version[1]),
+                _macosx_arch(machine),
+            )
+        except ValueError:
+            # if someone is running a non-Mac darwin system, this will fall
+            # through to the default implementation
+            pass
+    return plat
+
+
+macosVersionString = re.compile(r"macosx-(\d+)\.(\d+)-(.*)")
+darwinVersionString = re.compile(r"darwin-(\d+)\.(\d+)\.(\d+)-(.*)")
+# XXX backward compat
+get_platform = get_build_platform
+
+
+def compatible_platforms(provided, required):
+    """Can code for the `provided` platform run on the `required` platform?
+
+    Returns true if either platform is ``None``, or the platforms are equal.
+
+    XXX Needs compatibility checks for Linux and other unixy OSes.
+    """
+    if provided is None or required is None or provided == required:
+        # easy case
+        return True
+
+    # Mac OS X special cases
+    reqMac = macosVersionString.match(required)
+    if reqMac:
+        provMac = macosVersionString.match(provided)
+
+        # is this a Mac package?
+        if not provMac:
+            # this is backwards compatibility for packages built before
+            # setuptools 0.6. All packages built after this point will
+            # use the new macosx designation.
+            provDarwin = darwinVersionString.match(provided)
+            if provDarwin:
+                dversion = int(provDarwin.group(1))
+                macosversion = "%s.%s" % (reqMac.group(1), reqMac.group(2))
+                if dversion == 7 and macosversion >= "10.3" or \
+                        dversion == 8 and macosversion >= "10.4":
+                    return True
+            # egg isn't macosx or legacy darwin
+  

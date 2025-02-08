@@ -1,0 +1,391 @@
+ postWorkTask;
+        }
+        finally {
+            // call Unload events
+            ProcessRequestCleanup();
+        }
+    }
+
+    private IAsyncResult LegacyAsyncPageBeginProcessRequest(HttpContext context, AsyncCallback callback, Object extraData) {
+        SetIntrinsics(context, true /* allowAsync */);
+
+        if (_legacyAsyncInfo == null) {
+            // could be already created if AddOnPreRenderCompleteAsync called before ProcessRequest
+            _legacyAsyncInfo = new LegacyPageAsyncInfo(this);
+        }
+
+        _legacyAsyncInfo.AsyncResult = new HttpAsyncResult(callback, extraData);
+        _legacyAsyncInfo.CallerIsBlocking = (callback == null);
+
+        // process request stages before async point
+        try {
+            _context.InvokeCancellableCallback(new WaitCallback(this.AsyncPageProcessRequestBeforeAsyncPointCancellableCallback), null);
+        }
+        catch (Exception e) {
+            if (_context.SyncContext.PendingOperationsCount == 0) {
+                // if there are no pending async operations it is ok to throw
+                throw;
+            }
+
+            // can't throw yet, have to wait for pending async operations to finish
+            Debug.Trace("Async", "Exception with async pending - saving the error");
+            _legacyAsyncInfo.SetError(e);
+        }
+
+        // register handler from async manager to run async tasks (if any tasks are registered)
+        // for blocking callers async tasks were already run
+        if (_legacyAsyncTaskManager != null && !_legacyAsyncInfo.CallerIsBlocking) {
+            _legacyAsyncTaskManager.RegisterHandlersForPagePreRenderCompleteAsync();
+        }
+
+        // mark async point
+        _legacyAsyncInfo.AsyncPointReached = true;
+
+        // disable async operations after this point
+        _context.SyncContext.Disable();
+
+        // call into async subscribers
+        _legacyAsyncInfo.CallHandlers(true /*onPageThread*/);
+
+        return _legacyAsyncInfo.AsyncResult;
+    }
+
+
+    /// <internalonly/>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    protected void AsyncPageEndProcessRequest(IAsyncResult result) {
+        // This method just dispatches to either the TAP or APM implementation, depending on the synchronization mode
+        if (SynchronizationContextUtil.CurrentMode == SynchronizationContextMode.Legacy) {
+            LegacyAsyncPageEndProcessRequest(result);
+        }
+        else {
+            // EndTask() observes and throws any captured exceptions; also waits for asynchronous completion
+            TaskAsyncHelper.EndTask(result);
+        }
+    }
+
+    private void LegacyAsyncPageEndProcessRequest(IAsyncResult result) {
+        if (_legacyAsyncInfo == null)
+            return;
+
+        Debug.Assert(_legacyAsyncInfo.AsyncResult == result);
+
+        // End() observes and throws any captured exceptions
+        _legacyAsyncInfo.AsyncResult.End();
+    }
+
+    public void AddOnPreRenderCompleteAsync(BeginEventHandler beginHandler, EndEventHandler endHandler) {
+        AddOnPreRenderCompleteAsync(beginHandler, endHandler, null);
+    }
+
+    public void AddOnPreRenderCompleteAsync(BeginEventHandler beginHandler, EndEventHandler endHandler, Object state) {
+        if (beginHandler == null) {
+            throw new ArgumentNullException("beginHandler");
+        }
+
+        if (endHandler == null) {
+            throw new ArgumentNullException("endHandler");
+        }
+
+        if (SynchronizationContextUtil.CurrentMode == SynchronizationContextMode.Normal) {
+            // If using the new synchronization patterns, go against the task manager directly
+            RegisterAsyncTask(new PageAsyncTask(beginHandler, endHandler, null, state));
+            return;
+        }
+
+        if (_legacyAsyncInfo == null) {
+            if (this is IHttpAsyncHandler) {
+                // could be called from ctor before process request
+                _legacyAsyncInfo = new LegacyPageAsyncInfo(this);
+            }
+            else {
+                // synchronous pages don't support add async handler
+                throw new InvalidOperationException(SR.GetString(SR.Async_required));
+            }
+        }
+
+        if (_legacyAsyncInfo.AsyncPointReached) {
+            throw new InvalidOperationException(SR.GetString(SR.Async_addhandler_too_late));
+        }
+
+        _legacyAsyncInfo.AddHandler(beginHandler, endHandler, state);
+    }
+
+
+    /// <devdoc>
+    ///    <para>Instructs any validation controls included on the page to validate their
+    ///       assigned information for the incoming page request.</para>
+    /// </devdoc>
+    public virtual void Validate() {
+        _validated = true;
+        if (_validators != null) {
+            for (int i = 0; i < Validators.Count; i++) {
+                Validators[i].Validate();
+            }
+        }
+    }
+
+
+    public virtual void Validate(string validationGroup) {
+        _validated = true;
+        if (_validators != null) {
+            ValidatorCollection validators = GetValidators(validationGroup);
+
+            // VSWhidbey 207823: When ValidationGroup is the default empty string,
+            // we should call the V1 method which could have been overridden so
+            // the overridden method on user page wouldn't be missed.
+            if (String.IsNullOrEmpty(validationGroup) &&
+                _validators.Count == validators.Count) {
+                Validate();
+            }
+            else {
+                for (int i = 0; i < validators.Count; i++) {
+                    validators[i].Validate();
+                }
+            }
+        }
+    }
+
+    public ValidatorCollection GetValidators(string validationGroup) {
+        if (validationGroup == null) {
+            validationGroup = String.Empty;
+        }
+
+        ValidatorCollection validators = new ValidatorCollection();
+        if (_validators != null) {
+            for (int i = 0; i < Validators.Count; i++) {
+                BaseValidator baseValidator = Validators[i] as BaseValidator;
+                if (baseValidator != null) {
+                    if (0 == String.Compare(baseValidator.ValidationGroup, validationGroup,
+                                            StringComparison.Ordinal)) {
+                        validators.Add(baseValidator);
+                    }
+                }
+                else if (validationGroup.Length == 0) {
+                    validators.Add(Validators[i]);
+                }
+            }
+        }
+        return validators;
+    }
+
+
+    /// <devdoc>
+    ///    <para>Throws an exception if it is runtime and we are not currently rendering the form runat=server tag.
+    ///          Most controls that post back or that use client script require to be in this tag to function, so
+    ///          they can call this during rendering. At design time this will do nothing.</para>
+    ///    <para>Custom Control creators should call this during render if they render any sort of input tag, if they call
+    ///          GetPostBackEventReference, or if they emit client script. A composite control does not need to make this
+    ///          call.</para>
+    ///    <para>This method should not be overridden unless creating an alternative page framework.</para>
+    /// </devdoc>
+    [EditorBrowsable(EditorBrowsableState.Advanced)]
+    public virtual void VerifyRenderingInServerForm(Control control) {
+        // We only want to make this check if we are definitely at runtime
+        if (Context == null || DesignMode) {
+            return;
+        }
+
+        if (control == null) {
+            throw new ArgumentNullException("control");
+        }
+
+        if (!_inOnFormRender && !IsCallback) {
+            throw new HttpException(SR.GetString(SR.ControlRenderedOutsideServerForm, control.ClientID, control.GetType().Name));
+        }
+    }
+
+    public PageAdapter PageAdapter {
+        get {
+            if(_pageAdapter == null) {
+                ResolveAdapter();
+                _pageAdapter = (PageAdapter)AdapterInternal;
+            }
+            return _pageAdapter;
+        }
+    }
+
+    // 
+    private String _relativeFilePath;
+
+    internal String RelativeFilePath {
+        get {
+            if (_relativeFilePath == null) {
+                String s = Context.Request.CurrentExecutionFilePath;
+                String filePath = Context.Request.FilePath;
+
+                if(filePath.Equals(s)) {
+                    int slash = s.LastIndexOf('/');
+
+                    if (slash >= 0) {
+                        s = s.Substring(slash+1);
+                    }
+                    _relativeFilePath = s;
+                }
+                else {
+                    _relativeFilePath = Server.UrlDecode(UrlPath.MakeRelative(filePath, s));
+                }
+            }
+            return _relativeFilePath;
+        }
+    }
+
+    private bool _designModeChecked = false;
+    private bool _designMode = false;
+
+    internal bool GetDesignModeInternal() {
+        if(!_designModeChecked) {
+            _designMode = (Site != null) ? Site.DesignMode : false;
+            _designModeChecked = true;
+        }
+        return _designMode;
+    }
+
+    // For use by controls to store information with same lifetime as the request, for example, all radio buttons can
+    // use this to store the dictionary of radio button groups.  The key should be a type.  For the example, the value associated with
+    // the key System.Web.UI.WebControls.WmlRadioButtonAdapter is a NameValueCollection of RadioButtonGroups.
+    private IDictionary _items;
+
+    [
+    Browsable(false)
+    ]
+    public IDictionary Items {
+        get {
+            if (_items == null) {
+                _items = new HybridDictionary();
+            }
+            return _items;
+        }
+    }
+
+    // Simplified data binding context stack
+    private Stack _dataBindingContext;
+
+    /// <devdoc>
+    /// Creates a new context for databinding by pushing a new data item onto the databinding context stack.
+    /// </devdoc>
+    internal void PushDataBindingContext(object dataItem) {
+        if (_dataBindingContext == null) {
+            _dataBindingContext = new Stack();
+        }
+        _dataBindingContext.Push(dataItem);
+    }
+
+    /// <devdoc>
+    /// Exits a databinding context by removing the current data item from the databinding context stack.
+    /// </devdoc>
+    internal void PopDataBindingContext() {
+        Debug.Assert(_dataBindingContext != null);
+        Debug.Assert(_dataBindingContext.Count > 0);
+        _dataBindingContext.Pop();
+    }
+
+
+    /// <devdoc>
+    /// Gets the current data item from the top of the databinding context stack.
+    /// </devdoc>
+    public object GetDataItem() {
+        if ((_dataBindingContext == null) || (_dataBindingContext.Count == 0)) {
+            throw new InvalidOperationException(SR.GetString(SR.Page_MissingDataBindingContext));
+        }
+        return _dataBindingContext.Peek();
+    }
+
+    internal static bool IsSystemPostField(string field) {
+        return s_systemPostFields.Contains(field);
+    }
+
+    internal IScriptManager ScriptManager {
+        get {
+            return (IScriptManager)Items[typeof(IScriptManager)];
+        }
+    }
+
+    private void ValidateRawUrlIfRequired() {
+        // Only validate the RawUrl if we weren't asked to skip validation and the current validation mode says we should validate.
+        bool validationRequired = !SkipFormActionValidation && CalculateEffectiveValidateRequest();
+
+        if (validationRequired) {
+            // Simply touching the RawUrl property getter is sufficient to perform validation.
+            string unused = _request.RawUrl;
+        }
+    }
+
+    // Needed to support Validators in AJAX 1.0 (Windows OS Bugs 2015831)
+    #region Atlas ScriptManager Partial Rendering support
+    internal bool IsPartialRenderingSupported {
+        get {
+            if (!_pageFlags[isPartialRenderingSupportedSet]) {
+                Type scriptManagerType = ScriptManagerType;
+                if (scriptManagerType != null) {
+                    object scriptManager = Page.Items[scriptManagerType];
+                    if (scriptManager != null) {
+                        PropertyInfo supportsPartialRenderingProperty = scriptManagerType.GetProperty("SupportsPartialRendering");
+                        if (supportsPartialRenderingProperty != null) {
+                            object supportsPartialRenderingValue = supportsPartialRenderingProperty.GetValue(scriptManager, null);
+                            _pageFlags[isPartialRenderingSupported] = (bool)supportsPartialRenderingValue;
+                        }
+                    }
+                }
+                _pageFlags[isPartialRenderingSupportedSet] = true;
+            }
+            return _pageFlags[isPartialRenderingSupported];
+        }
+    }
+
+    internal Type ScriptManagerType {
+        get {
+            if (_scriptManagerType == null) {
+                _scriptManagerType = BuildManager.GetType("System.Web.UI.ScriptManager", false);
+            }
+            return _scriptManagerType;
+        }
+        set {
+            // Meant for unit testing
+            _scriptManagerType = value;
+        }
+    }
+    #endregion
+
+#if DBG
+    // Temporary debugging method
+
+    /// <internalonly/>
+    /// <devdoc>
+    /// </devdoc>
+    public virtual void WalkViewState(object viewState, Control control, int indentLevel) {
+        if (viewState == null) {
+            return;
+        }
+        object [] viewStateArray = (object [])viewState;
+        object controlViewState = viewStateArray[0];
+        IDictionary childViewState = (IDictionary)viewStateArray[1];
+
+        string prefix = "";
+        for (int i=0; i < indentLevel; i++) {
+            prefix = prefix + "  ";
+        }
+
+        if (controlViewState == null) {
+            System.Web.Util.Debug.Trace("tpeters", prefix + "ObjViewState: null");
+        }
+        else {
+            System.Web.Util.Debug.Trace("tpeters", prefix + "ObjViewState: " + controlViewState.ToString());
+        }
+
+        if (childViewState != null) {
+            for (IDictionaryEnumerator e = childViewState.GetEnumerator(); e.MoveNext();) {
+                int index = (int) e.Key;
+                object value = e.Value;
+
+                if (control == null) {
+                    System.Web.Util.Debug.Trace("tpeters", prefix + "Control index: " + index.ToString());
+                    WalkViewState(value, null, indentLevel + 1);
+                }
+                else {
+
+                    string s = "None";
+                    bool recurse = false;
+                    if (control.HasControls()) {
+                        if (index < control.Controls.Count) {
+               

@@ -1,0 +1,56 @@
+  // Update the parent loop for all blocks within the loop. Blocks within
+  // subloops will not change parents.
+  UnloopUpdater Updater(Unloop, this);
+  Updater.updateBlockParents();
+
+  // Remove blocks from former ancestor loops.
+  Updater.removeBlocksFromAncestors();
+
+  // Add direct subloops as children in their new parent loop.
+  Updater.updateSubloopParents();
+
+  // Remove unloop from its parent loop.
+  Loop *ParentLoop = Unloop->getParentLoop();
+  for (Loop::iterator I = ParentLoop->begin();; ++I) {
+    assert(I != ParentLoop->end() && "Couldn't find loop");
+    if (*I == Unloop) {
+      ParentLoop->removeChildLoop(I);
+      break;
+    }
+  }
+}
+
+AnalysisKey LoopAnalysis::Key;
+
+LoopInfo LoopAnalysis::run(Function &F, FunctionAnalysisManager &AM) {
+  // FIXME: Currently we create a LoopInfo from scratch for every function.
+  // This may prove to be too wasteful due to deallocating and re-allocating
+  // memory each time for the underlying map and vector datastructures. At some
+  // point it may prove worthwhile to use a freelist and recycle LoopInfo
+  // objects. I don't want to add that kind of complexity until the scope of
+  // the problem is better understood.
+  LoopInfo LI;
+  LI.analyze(AM.getResult<DominatorTreeAnalysis>(F));
+  return LI;
+}
+
+PreservedAnalyses LoopPrinterPass::run(Function &F,
+                                       FunctionAnalysisManager &AM) {
+  AM.getResult<LoopAnalysis>(F).print(OS);
+  return PreservedAnalyses::all();
+}
+
+void llvm::printLoop(Loop &L, raw_ostream &OS, const std::string &Banner) {
+
+  if (forcePrintModuleIR()) {
+    // handling -print-module-scope
+    OS << Banner << " (loop: ";
+    L.getHeader()->printAsOperand(OS, false);
+    OS << ")\n";
+
+    // printing whole module
+    OS << *L.getHeader()->getModule();
+    return;
+  }
+
+  OS << Banner;

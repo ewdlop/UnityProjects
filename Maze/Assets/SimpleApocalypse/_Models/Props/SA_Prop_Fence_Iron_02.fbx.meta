@@ -1,0 +1,48 @@
+RIPTEN_JoystickOpen(SDL_Joystick * joystick, int device_index)
+{
+    SDL_joylist_item *item = JoystickByDeviceIndex(device_index);
+
+    if (item == NULL ) {
+        return SDL_SetError("No such device");
+    }
+
+    if (item->joystick != NULL) {
+        return SDL_SetError("Joystick already opened");
+    }
+
+    joystick->instance_id = item->device_instance;
+    joystick->hwdata = (struct joystick_hwdata *) item;
+    item->joystick = joystick;
+
+    /* HTML5 Gamepad API doesn't say anything about these */
+    joystick->nhats = 0;
+    joystick->nballs = 0;
+
+    joystick->nbuttons = item->nbuttons;
+    joystick->naxes = item->naxes;
+
+    return (0);
+}
+
+/* Function to update the state of a joystick - called as a device poll.
+ * This function shouldn't update the joystick structure directly,
+ * but instead should call SDL_PrivateJoystick*() to deliver events
+ * and update joystick device state.
+ */
+static void
+EMSCRIPTEN_JoystickUpdate(SDL_Joystick * joystick)
+{
+    EmscriptenGamepadEvent gamepadState;
+    SDL_joylist_item *item = (SDL_joylist_item *) joystick->hwdata;
+    int i, result, buttonState;
+
+    emscripten_sample_gamepad_data();
+
+    if (item) {
+        result = emscripten_get_gamepad_status(item->index, &gamepadState);
+        if( result == EMSCRIPTEN_RESULT_SUCCESS) {
+            if(gamepadState.timestamp == 0 || gamepadState.timestamp != item->timestamp) {
+                for(i = 0; i < item->nbuttons; i++) {
+                    if(item->digitalButton[i] != gamepadState.digitalButton[i]) {
+                        buttonState = gamepadState.digitalButton[i]? SDL_PRESSED: SDL_RELEASED;
+            

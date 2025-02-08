@@ -1,0 +1,1993 @@
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+// 
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+//
+// Copyright (c) 2007 Novell, Inc.
+//
+
+using System.ComponentModel;
+using System.Collections;
+using System.Collections.Generic;
+using System.Reflection;
+using System.Text;
+using System.Text.RegularExpressions;
+
+namespace System.Windows.Forms {
+
+	[ComplexBindingProperties ("DataSource", "DataMember")]
+	[DefaultEvent ("CurrentChanged")]
+	[DefaultProperty ("DataSource")]
+	[Designer("System.Windows.Forms.Design.BindingSourceDesigner, " + Consts.AssemblySystem_Design, "System.ComponentModel.Design.IDesigner")]
+	public class BindingSource : Component,
+		ICancelAddNew, IDisposable, ISupportInitialize,
+		IBindingListView, IBindingList, ITypedList,
+		IList, ISupportInitializeNotification, ICollection,
+		IComponent, ICurrencyManagerProvider, IEnumerable 
+	{
+		bool is_initialized = true;
+
+		IList list;
+		CurrencyManager currency_manager;
+		Dictionary<string,CurrencyManager> related_currency_managers = new Dictionary<string,CurrencyManager> ();
+		//bool list_defaulted;
+		internal Type item_type;
+		bool item_has_default_ctor;
+		bool list_is_ibinding;
+
+		object datasource;
+		string datamember;
+
+		bool raise_list_changed_events;
+
+		bool allow_new_set;
+		bool allow_new;
+
+		bool add_pending;
+		int pending_add_index;
+
+		string filter;
+		string sort;
+
+		public BindingSource (IContainer container) : this ()
+		{
+			container.Add (this);
+		}
+
+		public BindingSource (object dataSource, string dataMember)
+		{
+			datasource = dataSource;
+			datamember = dataMember;
+
+			raise_list_changed_events = true;
+
+			ResetList ();
+			ConnectCurrencyManager ();
+		}
+
+		public BindingSource () : this (null, String.Empty)
+		{
+		}
+
+		IList GetListFromEnumerable (IEnumerable enumerable)
+		{
+			IList l = null;
+
+			IEnumerator e = enumerable.GetEnumerator();
+
+			if (enumerable is string) {
+				/* special case this.. seems to be the only one .net special cases? */
+				l = new BindingList<char> ();
+			}
+			else {
+				/* try to figure out the type based on
+				 * the first element, if there is
+				 * one */
+				object first = null;
+				if (e.MoveNext ()) {
+					first = e.Current;
+				}
+
+				if (first == null) {
+					return null;
+				}
+				else {
+					Type t = typeof (BindingList<>).MakeGenericType (new Type[] { first.GetType() });
+					l = (IList)Activator.CreateInstance (t);
+				}
+			}
+
+			e.Reset ();
+			while (e.MoveNext ()) {
+				l.Add (e.Current);
+			}
+
+			return l;
+		}
+
+		void ConnectCurrencyManager ()
+		{
+			currency_manager = new CurrencyManager (this);
+
+			currency_manager.PositionChanged += delegate (object o, EventArgs args) { OnPositionChanged (args); };
+			currency_manager.CurrentChanged += delegate (object o, EventArgs args) { OnCurrentChanged (args); };
+			currency_manager.BindingComplete += delegate (object o, BindingCompleteEventArgs args) { OnBindingComplete (args); };
+			currency_manager.DataError += delegate (object o, BindingManagerDataErrorEventArgs args) { OnDataError (args); };
+			currency_manager.CurrentChanged += delegate (object o, EventArgs args) { OnCurrentChanged (args); };
+			currency_manager.CurrentItemChanged += delegate (object o, EventArgs args) { OnCurrentItemChanged (args); };
+		}
+
+		void ResetList ()
+		{
+			if (!is_initialized)
+				return;
+
+			IList l;
+			object source = ListBindingHelper.GetList (datasource, datamember);
+
+			// 
+			// If original source is null, then create a new object list
+			// Otherwise, try to infer the list item type
+			//
+
+			if (datasource == null) {
+				l = new BindingList<object>();
+				//list_defaulted = true;
+			} else if (source == null) {
+				//Infer type based on datasource and datamember,
+				// where datasource is an empty IEnumerable
+				// and need to find out the datamember type
+
+				Type property_type = ListBindingHelper.GetListItemProperties (datasource) [datamember].PropertyType;
+				Type t = typeof (BindingList<>).MakeGenericType (new Type [] { property_type } );
+				l = (IList)Activator.CreateInstance (t);
+			} else if (source is IList) {
+				l = (IList)source;
+			} else if (source is IEnumerable) {
+				IList new_list = GetListFromEnumerable ((IEnumerable)source);
+				l = new_list == null ? list : new_list;
+			} else if (source is Type) {
+				Type t = typeof (BindingList<>).MakeGenericType (new Type [] { (Type)source });
+				l = (IList)Activator.CreateInstance (t);
+			} else {
+				Type t = typeof (BindingList<>).MakeGenericType (new Type[] { source.GetType() });
+				l = (IList)Activator.CreateInstance (t);
+				l.Add (source);
+			}
+
+			SetList (l);
+		}
+
+		void SetList (IList l)
+		{
+			if (list is IBindingList)
+				((IBindingList) list).ListChanged -= IBindingListChangedHandler;
+
+			list = l;
+			item_type = ListBindingHelper.GetListItemType (list);
+			item_has_default_ctor = item_type.GetConstructor (Type.EmptyTypes) != null;
+
+			list_is_ibinding = list is IBindingList;
+			if (list_is_ibinding) {
+				((IBindingList) list).ListChanged += IBindingListChangedHandler;
+
+				if (list is IBindingListView)
+					((IBindingListView)list).Filter = filter;
+			}
+			
+			ResetBindings (true);
+		}
+
+		private void ConnectDataSourceEvents (object dataSource)
+		{
+			if (dataSource == null)
+				return;
+			
+			ICurrencyManagerProvider currencyManagerProvider = dataSource as ICurrencyManagerProvider;
+			if (currencyManagerProvider != null && currencyManagerProvider.CurrencyManager != null) {
+				currencyManagerProvider.CurrencyManager.CurrentItemChanged += OnParentCurrencyManagerChanged;
+				currencyManagerProvider.CurrencyManager.MetaDataChanged += OnParentCurrencyManagerChanged;
+			}
+		}
+
+		private void OnParentCurrencyManagerChanged (object sender, EventArgs args)
+		{
+			// Essentially handles chained data sources (e.g. chained BindingSource)
+			ResetDataMemberIfInvalid ();
+			ResetList ();
+		}
+
+		private void DisconnectDataSourceEvents (object dataSource)
+		{
+			if (dataSource == null)
+				return;
+
+			ICurrencyManagerProvider currencyManagerProvider = dataSource as ICurrencyManagerProvider;
+			if (currencyManagerProvider != null && currencyManagerProvider.CurrencyManager != null) {
+				currencyManagerProvider.CurrencyManager.CurrentItemChanged -= OnParentCurrencyManagerChanged;
+				currencyManagerProvider.CurrencyManager.MetaDataChanged -= OnParentCurrencyManagerChanged;
+			}
+		}
+
+		void IBindingListChangedHandler (object o, ListChangedEventArgs args)
+		{
+			if (raise_list_changed_events)
+				OnListChanged (args);
+		}
+
+		[Browsable (false)]
+		public virtual bool AllowEdit {
+			get {
+				if (list == null)
+					return false;
+
+				if (list.IsReadOnly)
+					return false;
+
+				if (list is IBindingList)
+					return ((IBindingList)list).AllowEdit;
+
+				return true;
+			}
+		}
+
+		public virtual bool AllowNew {
+			get { 
+				if (allow_new_set)
+					return allow_new;
+
+				if (list is IBindingList)
+					return ((IBindingList)list).AllowNew;
+
+				if (list.IsFixedSize || list.IsReadOnly || !item_has_default_ctor)
+					return false;
+
+				return true;
+			}
+			set {
+				if (value == allow_new && allow_new_set)
+					return;
+
+				if (value && (list.IsReadOnly || list.IsFixedSize))
+					throw new InvalidOperationException ();
+
+				allow_new_set = true;
+				allow_new = value;
+
+				if (raise_list_changed_events)
+					OnListChanged (new ListChangedEventArgs (ListChangedType.Reset, -1));
+			}
+		}
+
+		bool IsAddingNewHandled {
+			get {
+				return Events [AddingNewEvent] != null;
+			}
+		}
+
+		[Browsable (false)]
+		public virtual bool AllowRemove {
+			get {
+				if (list == null)
+					return false;
+
+				if (list.IsFixedSize || list.IsReadOnly)
+					return false;
+
+				if (list is IBindingList)
+					return ((IBindingList)list).AllowRemove;
+
+				return true;
+			}
+		}
+
+		[Browsable (false)]
+		public virtual int Count {
+			get {
+				return list.Count;
+			}
+		}
+
+		[Browsable (false)]
+		public virtual CurrencyManager CurrencyManager {
+			get {
+				return currency_manager;
+			}
+		}
+
+		[Browsable (false)]
+		public object Current {
+			get {
+				if (currency_manager.Count > 0)
+					return currency_manager.Current;
+				return null;
+			}
+		}
+
+		[DefaultValue ("")]
+		[Editor("System.Windows.Forms.Design.DataMemberListEditor, " + Consts.AssemblySystem_Design, typeof(System.Drawing.Design.UITypeEditor))]
+		[RefreshProperties (RefreshProperties.Repaint)]
+		public string DataMember {
+			get { return datamember; }
+			set {
+				/* we don't allow null DataMembers */
+				if (value == null)
+					value = String.Empty;
+
+				if (datamember != value) {
+					this.datamember = value;
+
+					ResetList ();
+
+					OnDataMemberChanged (EventArgs.Empty);
+				}
+			}
+		}
+
+		[AttributeProvider (typeof(IListSource))]
+		[RefreshProperties (RefreshProperties.Repaint)]
+		[DefaultValue (null)]
+		public object DataSource {
+			get { return datasource; }
+			set {
+				if (datasource != value) {
+					if (value == null)
+						datamember = String.Empty;
+
+					DisconnectDataSourceEvents (datasource);
+					datasource = value;
+					ResetDataMemberIfInvalid ();
+					ConnectDataSourceEvents (datasource);
+					ResetList ();
+
+					OnDataSourceChanged (EventArgs.Empty);
+				}
+			}
+		}
+
+		[DefaultValue (null)]
+		public virtual string Filter {
+			get {
+				return filter;
+			}
+			set {
+				if (SupportsFiltering)
+					((IBindingListView)list).Filter = value;
+
+				filter = value;
+			}
+		}
+
+		[Browsable (false)]
+		public bool IsBindingSuspended {
+			get { return currency_manager.IsBindingSuspended; }
+		}
+
+		[Browsable (false)]
+		public virtual bool IsFixedSize {
+			get { return list.IsFixedSize; }
+		}
+
+		[Browsable (false)]
+		public virtual bool IsReadOnly {
+			get { return list.IsReadOnly; }
+		}
+
+		[Browsable (false)]
+		public virtual bool IsSorted {
+			get { return (list is IBindingList) && ((IBindingList)list).IsSorted; }
+		}
+
+		[Browsable (false)]
+		public virtual bool IsSynchronized {
+			get {
+				return list.IsSynchronized;
+			}
+		}
+
+		[Browsable (false)]
+		public virtual object this [int index] {
+			get { return list[index]; }
+			set
+			{
+				list[index] = value;
+			}
+		}
+
+		[Browsable (false)]
+		public IList List {
+			get { return list; }
+		}
+
+		[DefaultValue (-1)]
+		[Browsable (false)]
+		public int Position {
+			get {
+				return currency_manager.Position;
+			}
+			set {
+				if (value >= Count) value = Count - 1;
+				if (value < 0) value = 0;
+
+				currency_manager.Position = value;
+			}
+		}
+
+		[Browsable (false)]
+		[DefaultValue (true)]
+		public bool RaiseListChangedEvents {
+			get { return raise_list_changed_events; }
+			set { raise_list_changed_events = value; }
+		}
+
+		[DefaultValue (null)]
+		public string Sort {
+			get {
+				return sort;
+			}
+			set {
+				if (value == null || value.Length == 0) {
+					if (list_is_ibinding && SupportsSorting)
+						RemoveSort ();
+				
+					sort = value;
+					return;
+				}
+
+				if (!list_is_ibinding || !SupportsSorting)
+					throw new ArgumentException ("value");
+
+				ProcessSortString (value);
+				sort = value;
+			}
+		}
+
+		void ResetDataMemberIfInvalid ()
+		{
+			if (datamember == String.Empty)
+				return;
+
+			// if dataMember doesn't refer to a valid property of dataSource, we need to reset it
+			var property = ListBindingHelper.GetListItemProperties (datasource).Find (datamember, true);
+			if (property == null) {
+				datamember = String.Empty;
+				OnDataMemberChanged (EventArgs.Empty);
+			}
+		}
+
+		// NOTE: Probably the parsing can be improved
+		void ProcessSortString (string sort)
+		{
+			// Only keep simple whitespaces in the middle
+			sort = Regex.Replace (sort, "( )+", " ");
+
+			string [] properties = sort.Split (',');
+			PropertyDescriptorCollection prop_descs = GetItemProperties (null);
+			if (properties.Length == 1) {
+				ListSortDescription sort_desc = GetListSortDescription (prop_descs, properties [0]);
+				ApplySort (sort_desc.PropertyDescriptor, sort_desc.SortDirection);
+			} else {
+				if (!SupportsAdvancedSorting)
+					throw new ArgumentException ("value");
+
+				ListSortDescription [] sort_descs = new ListSortDescription [properties.Length];
+				for (int i = 0; i < properties.Length; i++)
+					sort_descs [i] = GetListSortDescription (prop_descs, properties [i]);
+
+				ApplySort (new ListSortDescriptionCollection (sort_descs));
+			}
+
+		}
+
+		ListSortDescription GetListSortDescription (PropertyDescriptorCollection prop_descs, string property)
+		{
+			property = property.Trim ();
+			string [] p = property.Split (new char [] {' '}, 2);
+
+			string prop_name = p [0];
+			PropertyDescriptor prop_desc = prop_descs [prop_name];
+			if (prop_desc == null)
+				throw new ArgumentException ("value");
+
+			ListSortDirection sort_direction = ListSortDirection.Ascending;
+			if (p.Length > 1) {
+				string dir_s = p [1];
+				if (String.Compare (dir_s, "ASC", true) == 0)
+					sort_direction = ListSortDirection.Ascending;
+				else if (String.Compare (dir_s, "DESC", true) == 0)
+					sort_direction = ListSortDirection.Descending;
+				else
+					throw new ArgumentException ("value");
+			}
+
+			return new ListSortDescription (prop_desc, sort_direction);
+		}
+
+		[Browsable (false)]
+		[EditorBrowsable (EditorBrowsableState.Never)]
+		public virtual ListSortDescriptionCollection SortDescriptions {
+			get {
+				if (list is IBindingListView)
+					return ((IBindingListView)list).SortDescriptions;
+
+				return null;
+			}
+		}
+
+		[Browsable (false)]
+		[EditorBrowsable (EditorBrowsableState.Never)]
+		public virtual ListSortDirection SortDirection {
+			get {
+				if (list is IBindingList)
+					return ((IBindingList)list).SortDirection;
+
+				return ListSortDirection.Ascending;
+			}
+		}
+
+		[Browsable (false)]
+		[EditorBrowsable (EditorBrowsableState.Never)]
+		public virtual PropertyDescriptor SortProperty {
+			get {
+				if (list is IBindingList)
+					return ((IBindingList)list).SortProperty;
+
+				return null;
+			}
+		}
+
+		[Browsable (false)]
+		public virtual bool SupportsAdvancedSorting {
+			get { return (list is IBindingListView) && ((IBindingListView)list).SupportsAdvancedSorting; }
+		}
+
+		[Browsable (false)]
+		public virtual bool SupportsChangeNotification {
+			get { return true; }
+		}
+
+		[Browsable (false)]
+		public virtual bool SupportsFiltering {
+			get { return (list is IBindingListView) && ((IBindingListView)list).SupportsFiltering; }
+		}
+
+		[Browsable (false)]
+		public virtual bool SupportsSearching {
+			get { 
+				return (list is IBindingList) && ((IBindingList)list).SupportsSearching;
+			}
+		}
+
+		[Browsable (false)]
+		public virtual bool SupportsSorting {
+			get { return (list is IBindingList) && ((IBindingList)list).SupportsSorting; }
+		}
+
+		[Browsable (false)]
+		public virtual object SyncRoot {
+			get { 
+				return list.SyncRoot;
+			}
+		}
+
+		static object AddingNewEvent = new object ();
+		static object BindingCompleteEvent = new object ();
+		static object CurrentChangedEvent = new object ();
+		static object CurrentItemChangedEvent = new object ();
+		static object DataErrorEvent = new object ();
+		static object DataMemberChangedEvent = new object ();
+		static object DataSourceChangedEvent = new object ();
+		static object ListChangedEvent = new object ();
+		static object PositionChangedEvent= new object ();
+
+		public event AddingNewEventHandler AddingNew {
+			add { Events.AddHandler (AddingNewEvent, value); }
+			remove { Events.RemoveHandler (AddingNewEvent, value); }
+		}
+
+		public event BindingCompleteEventHandler BindingComplete {
+			add { Events.AddHandler (BindingCompleteEvent, value); }
+			remove { Events.RemoveHandler (BindingCompleteEvent, value); }
+		}
+
+		public event EventHandler CurrentChanged {
+			add { Events.AddHandler (CurrentChangedEvent, value); }
+			remove { Events.RemoveHandler (CurrentChangedEvent, value); }
+		}
+
+		public event EventHandler CurrentItemChanged {
+			add { Events.AddHandler (CurrentItemChangedEvent, value); }
+			remove { Events.RemoveHandler (CurrentItemChangedEvent, value); }
+		}
+
+		public event BindingManagerDataErrorEventHandler DataError {
+			add { Events.AddHandler (DataErrorEvent, value); }
+			remove { Events.RemoveHandler (DataErrorEvent, value); }
+		}
+
+		public event EventHandler DataMemberChanged {
+			add { Events.AddHandler (DataMemberChangedEvent, value); }
+			remove { Events.RemoveHandler (DataMemberChangedEvent, value); }
+		}
+
+		public event EventHandler DataSourceChanged {
+			add { Events.AddHandler (DataSourceChangedEvent, value); }
+			remove { Events.RemoveHandler (DataSourceChangedEvent, value); }
+		}
+
+		public event ListChangedEventHandler ListChanged {
+			add { Events.AddHandler (ListChangedEvent, value); }
+			remove { Events.RemoveHandler (ListChangedEvent, value); }
+		}
+
+		public event EventHandler PositionChanged {
+			add { Events.AddHandler (PositionChangedEvent, value); }
+			remove { Events.RemoveHandler (PositionChangedEvent, value); }
+		}
+
+		public virtual int Add (object value)
+		{
+			// 
+			// First (re)create the BindingList<T> based on value
+			// if datasource is null and the current list is empty
+			//
+			if (datasource == null && list.Count == 0 && value != null) {
+				Type t = typeof (BindingList<>).MakeGenericType (new Type [] { value.GetType () } );
+				IList l = (IList) Activator.CreateInstance (t);
+				SetList (l);
+			}
+
+			if (value != null && !item_type.IsAssignableFrom (value.GetType ()))
+				throw new InvalidOperationException ("Objects added to the list must all be of the same type.");
+			if (list.IsReadOnly)
+				throw new NotSupportedException ("Collection is read-only.");
+			if (list.IsFixedSize)
+				throw new NotSupportedException ("Collection has a fixed size.");
+
+			int idx = list.Add (value);
+			if (raise_list_changed_events && !list_is_ibinding)
+				OnListChanged (new ListChangedEventArgs (ListChangedType.ItemAdded, idx));
+
+			return idx;
+		}
+
+		public virtual object AddNew ()
+		{
+			if (!AllowEdit)
+				throw new InvalidOperationException ("Item cannot be added to a read-only or fixed-size list.");
+			if (!AllowNew) 
+				throw new InvalidOperationException ("AddNew is set to false.");
+
+			EndEdit ();
+
+			AddingNewEventArgs args = new AddingNewEventArgs ();
+			OnAddingNew (args);
+
+			object new_object = args.NewObject;
+			if (new_object != null) {
+				if (!item_type.IsAssignableFrom (new_object.GetType ()))
+					throw new InvalidOperationException ("Objects added to the list must all be of the same type.");
+			} else if (list is IBindingList) {
+				object newObj = ((IBindingList)list).AddNew ();
+				add_pending = true;
+				pending_add_index = list.IndexOf (newObj);
+				return newObj;
+			} else if (!item_has_default_ctor)
+				throw new InvalidOperationException ("AddNew cannot be called on '" + item_type.Name +
+						", since it does not have a public default ctor. Set AllowNew to true " +
+						", handling AddingNew and creating the appropriate object.");
+			else // fallback to default .ctor
+				new_object = Activator.CreateInstance (item_type);
+
+			int idx = list.Add (new_object);
+			if (raise_list_changed_events && !list_is_ibinding)
+				OnListChanged (new ListChangedEventArgs (ListChangedType.ItemAdded, idx));
+
+			add_pending = true;
+			pending_add_index = idx;
+
+			return new_object;
+		}
+
+		[EditorBrowsable (EditorBrowsableState.Never)]
+		public virtual void ApplySort (PropertyDescriptor property, ListSortDirection sort)
+		{
+			if (!list_is_ibinding)
+				throw new NotSupportedException ("This operation requires an IBindingList.");
+
+			IBindingList iblist = (IBindingList)list;
+			iblist.ApplySort (property, sort);
+		}
+
+		[EditorBrowsable (EditorBrowsableState.Never)]
+		public virtual void ApplySort (ListSortDescriptionCollection sorts)
+		{
+			if (!(list is IBindingListView))
+				throw new NotSupportedException ("This operation requires an IBindingListView.");
+
+			IBindingListView iblist_view = (IBindingListView)list;
+			iblist_view.ApplySort (sorts);
+		}
+
+		public void CancelEdit ()
+		{
+			currency_manager.CancelCurrentEdit ();
+		}
+
+		public virtual void Clear ()
+		{
+			if (list.IsReadOnly)
+				throw new NotSupportedException ("Collection is read-only.");
+
+			list.Clear ();
+			if (raise_list_changed_events && !list_is_ibinding)
+				OnListChanged (new ListChangedEventArgs (ListChangedType.Reset, -1));
+		}
+
+		public virtual bool Contains (object value)
+		{
+			return list.Contains (value);
+		}
+
+		public virtual void CopyTo (Array arr, int index)
+		{
+			list.CopyTo (arr, index);
+		}
+
+		protected override void Dispose (bool disposing)
+		{
+			base.Dispose (disposing);
+		}
+
+		public void EndEdit ()
+		{
+			currency_manager.EndCurrentEdit ();
+		}
+
+		public int Find (string propertyName, object key)
+		{
+			PropertyDescriptor property = GetItemProperties (null).Find (propertyName, true);
+			if (property == null)
+				throw new ArgumentException ("propertyName");
+
+			return Find (property, key);
+		}
+
+		public virtual int Find (PropertyDescriptor prop, object key)
+		{
+			if (!list_is_ibinding)
+				throw new NotSupportedException ();
+
+			return ((IBindingList)list).Find (prop, key);
+		}
+
+		public virtual IEnumerator GetEnumerator ()
+		{
+			return this.List.GetEnumerator ();
+		}
+
+		public virtual PropertyDescriptorCollection GetItemProperties (PropertyDescriptor[] listAccessors)
+		{
+			return ListBindingHelper.GetListItemProperties (list, listAccessors);
+		}
+
+		public virtual string GetListName (PropertyDescriptor[] listAccessors)
+		{
+			return ListBindingHelper.GetListName (list, listAccessors);
+		}
+
+		public virtual CurrencyManager GetRelatedCurrencyManager (string dataMember)
+		{
+			if (dataMember == null || dataMember.Length == 0)
+				return currency_manager;
+
+			if (related_currency_managers.ContainsKey (dataMember))
+				return related_currency_managers [dataMember];
+
+			// FIXME - Why passing invalid dataMembers containing a . return
+			// a null value?
+			if (dataMember.IndexOf ('.') != -1)
+				return null;
+
+			BindingSource source = new BindingSource (this, dataMember);
+			related_currency_managers [dataMember] = source.CurrencyManager;
+
+			return source.CurrencyManager;
+		}
+
+		public virtual int IndexOf (object value)
+		{
+			return list.IndexOf (value);
+		}
+
+		public virtual void Insert (int index, object value)
+		{
+			if (index < 0 || index > list.Count)
+				throw new ArgumentOutOfRangeException ("index");
+			if (list.IsReadOnly || list.IsFixedSize)
+				throw new NotSupportedException ();
+			if (!item_type.IsAssignableFrom (value.GetType ()))
+				throw new ArgumentException ("value");
+
+			list.Insert (index, value);
+			if (raise_list_changed_events && !list_is_ibinding)
+				OnListChanged (new ListChangedEventArgs (ListChangedType.ItemAdded, index));
+		}
+
+		public void MoveFirst ()
+		{
+			Position = 0;
+		}
+
+		public void MoveLast ()
+		{
+			Position = Count - 1;
+		}
+
+		public void MoveNext ()
+		{
+			Position ++;
+		}
+
+		public void MovePrevious ()
+		{
+			Position --;
+		}
+
+		protected virtual void OnAddingNew (AddingNewEventArgs e)
+		{
+			AddingNewEventHandler eh = (AddingNewEventHandler)Events[AddingNewEvent];
+			if (eh != null)
+				eh (this, e);
+		}
+
+		protected virtual void OnBindingComplete (BindingCompleteEventArgs e)
+		{
+			BindingCompleteEventHandler eh = (BindingCompleteEventHandler) Events[BindingCompleteEvent];
+			if (eh != null)
+				eh (this, e);
+		}
+
+		protected virtual void OnCurrentChanged (EventArgs e)
+		{
+			EventHandler eh = (EventHandler) Events[CurrentChangedEvent];
+			if (eh != null)
+				eh (this, e);
+		}
+
+		protected virtual void OnCurrentItemChanged (EventArgs e)
+		{
+			EventHandler eh = (EventHandler) Events[CurrentItemChangedEvent];
+			if (eh != null)
+				eh (this, e);
+		}
+
+		protected virtual void OnDataError (BindingManagerDataErrorEventArgs e)
+		{
+			BindingManagerDataErrorEventHandler eh = (BindingManagerDataErrorEventHandler) Events[DataErrorEvent];
+			if (eh != null)
+				eh (this, e);
+		}
+
+		protected virtual void OnDataMemberChanged (EventArgs e)
+		{
+			EventHandler eh = (EventHandler) Events[DataMemberChangedEvent];
+			if (eh != null)
+				eh (this, e);
+		}
+
+		protected virtual void OnDataSourceChanged (EventArgs e)
+		{
+			EventHandler eh = (EventHandler) Events[DataSourceChangedEvent];
+			if (eh != null)
+				eh (this, e);
+		}
+
+		protected virtual void OnListChanged (ListChangedEventArgs e)
+		{
+			ListChangedEventHandler eh = (ListChangedEventHandler) Events[ListChangedEvent];
+			if (eh != null)
+				eh (this, e);
+		}
+
+		protected virtual void OnPositionChanged (EventArgs e)
+		{
+			EventHandler eh = (EventHandler) Events[PositionChangedEvent];
+			if (eh != null)
+				eh (this, e);
+		}
+
+		public virtual void Remove (object value)
+		{
+			if (list.IsReadOnly)
+				throw new NotSupportedException ("Collection is read-only.");
+			if (list.IsFixedSize)
+				throw new NotSupportedException ("Collection has a fixed size.");
+
+			int idx = list_is_ibinding ? - 1 : list.IndexOf (value);
+			list.Remove (value);
+
+			if (idx != -1 && raise_list_changed_events)
+				OnListChanged (new ListChangedEventArgs (ListChangedType.ItemDeleted, idx));
+		}
+
+		public virtual void RemoveAt (int index)
+		{
+			if (index < 0 || index > list.Count)
+				throw new ArgumentOutOfRangeException ("index");
+			if (list.IsReadOnly || list.IsFixedSize)
+				throw new InvalidOperationException ();
+
+			list.RemoveAt (index);
+			if (raise_list_changed_events && !list_is_ibinding)
+				OnListChanged (new ListChangedEventArgs (ListChangedType.ItemDeleted, index));
+		}
+
+		public void RemoveCurrent ()
+		{
+			if (Position < 0)
+				throw new InvalidOperationException ("Cannot remove item because there is no current item.");
+			if (!AllowRemove)
+				throw new InvalidOperationException ("Cannot remove item because list does not allow removal of items.");
+
+			RemoveAt (Position);
+		}
+
+		public virtual void RemoveFilter ()
+		{
+			Filter = null;
+		}
+
+		public virtual void RemoveSort ()
+		{
+			if (!list_is_ibinding)
+				return;
+
+			sort = null;
+			((IBindingList)list).RemoveSort ();
+		}
+
+		[EditorBrowsable (EditorBrowsableState.Advanced)]
+		public virtual void ResetAllowNew ()
+		{
+			allow_new_set = false;
+		}
+
+		public void ResetBindings (bool metadataChanged)
+		{
+			if (metadataChanged)
+				OnListChanged (new ListChangedEventArgs (ListChangedType.PropertyDescriptorChanged, null));
+
+			OnListChanged (new ListChangedEventArgs (ListChangedType.Reset, -1, -1));
+		}
+
+		public void ResetCurrentItem ()
+		{
+			OnListChanged (new ListChangedEventArgs (ListChangedType.ItemChanged, Position, -1));
+		}
+
+		public void ResetItem (int itemIndex)
+		{
+			OnListChanged (new ListChangedEventArgs (ListChangedType.ItemChanged, itemIndex, -1));
+		}
+
+		public void ResumeBinding ()
+		{
+			currency_manager.ResumeBinding ();
+		}
+
+		public void SuspendBinding ()
+		{
+			currency_manager.SuspendBinding ();
+		}
+
+		/* explicit interface implementations */
+
+		void ICancelAddNew.CancelNew (int position)
+		{
+			if (!add_pending)
+				return;
+
+			if (position != pending_add_index)
+				return;
+
+			add_pending = false;
+			list.RemoveAt (position);
+
+			if (raise_list_changed_events && !list_is_ibinding)
+				OnListChanged (new ListChangedEventArgs (ListChangedType.ItemDeleted, position));
+		}
+
+		void ICancelAddNew.EndNew (int position)
+		{
+			if (!add_pending)
+				return;
+
+			if (position != pending_add_index)
+				return;
+
+			add_pending = false;
+		}
+		
+		void ISupportInitialize.BeginInit ()
+		{
+			is_initialized = false;
+		}
+
+		void DataSourceEndInitHandler (object o, EventArgs args)
+		{
+			((ISupportInitializeNotification)datasource).Initialized -= DataSourceEndInitHandler;
+
+			ISupportInitializeNotification inotif = (ISupportInitializeNotification)this;
+			inotif.EndInit ();
+		}
+
+		void ISupportInitialize.EndInit ()
+		{
+			if (datasource != null && datasource is ISupportInitializeNotification) {
+				ISupportInitializeNotification inotif = (ISupportInitializeNotification)datasource;
+				if (!inotif.IsInitialized) {
+					inotif.Initialized += DataSourceEndInitHandler;
+					return;
+				}
+			}
+
+			is_initialized = true;
+			ResetList ();
+
+			EventHandler eh = (EventHandler) Events [InitializedEvent];
+			if (eh != null)
+				eh (this, EventArgs.Empty);
+		}
+
+		void IBindingList.AddIndex (PropertyDescriptor property)
+		{
+			if (!(list is IBindingList))
+				throw new NotSupportedException();
+
+			((IBindingList)list).AddIndex (property);
+		}
+
+		void IBindingList.RemoveIndex (PropertyDescriptor prop)
+		{
+			if (!(list is IBindingList))
+				throw new NotSupportedException();
+
+			((IBindingList)list).RemoveIndex (prop);
+		}
+
+		bool ISupportInitializeNotification.IsInitialized {
+			get { 
+				return is_initialized;
+			}
+		}
+
+		static object InitializedEvent = new object ();
+
+		event EventHandler ISupportInitializeNotification.Initialized {
+			add { Events.AddHandler (InitializedEvent, value); }
+			remove { Events.RemoveHandler (InitializedEvent, value); }
+		}
+	}
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            Ôªø//
+// EnumerableAsQueryableTest.cs
+//
+// Authors:
+//	Roei Erez (roeie@mainsoft.com)
+//
+// Copyright (C) 2007 Novell, Inc (http://www.novell.com)
+//
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+//
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+//
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using NUnit.Framework;
+using System.Linq.Expressions;
+using System.Runtime.CompilerServices;
+using System.Reflection;
+using System.Collections;
+
+namespace MonoTests.System.Linq {
+
+	[TestFixture]
+	[Category("SRE")]
+	public class EnumerableAsQueryableTest {
+
+		int [] _array;
+		IQueryable<int> _src;
+
+		[SetUp]
+		public void MyTestCleanup ()
+		{
+			_array = new int [] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+			_src = _array.AsQueryable<int> ();
+		}
+
+		[Test]
+		public void NewQueryableExpression ()
+		{
+			var queryable = _array.AsQueryable ();
+			var expression = queryable.Expression;
+
+			Assert.AreEqual (ExpressionType.Constant, expression.NodeType);
+
+			var constant = (ConstantExpression) expression;
+
+			Assert.AreEqual (queryable, constant.Value);
+		}
+
+		[Test]
+		public void Aggregate ()
+		{
+		    Assert.AreEqual (_src.Aggregate<int> ((n, m) => n + m), _array.Aggregate<int> ((n, m) => n + m));
+		}
+
+		[Test]
+		public void All ()
+		{
+		    Assert.AreEqual (_src.All<int> ((n) => n < 11), _array.All<int> ((n) => n < 11));
+		    Assert.AreEqual (_src.All<int> ((n) => n < 10), _array.All<int> ((n) => n < 10));
+		}
+
+		[Test]
+		public void Any ()
+		{
+			Assert.AreEqual (_src.Any<int> (i => i > 5), _array.Any<int> (i => i > 5));
+		}
+
+		[Test]
+		public void Average ()
+		{
+			Assert.AreEqual (_src.Average<int> ((n) => 11), _array.Average<int> ((n) => 11));
+		}
+
+		[Test]
+		public void Concat ()
+		{
+			Assert.AreEqual (_src.Concat<int> (_src).Count (), _array.Concat<int> (_src).Count ());
+		}
+
+		[Test]
+		public void Contains ()
+		{
+
+			for (int i = 1; i < 20; ++i)
+				Assert.AreEqual (_src.Contains<int> (i), _array.Contains<int> (i));
+		}
+
+		[Test]
+		public void Count ()
+		{
+			Assert.AreEqual (_src.Count<int> (), _array.Count<int> ());
+		}
+
+		[Test]
+		public void Distinct ()
+		{
+			Assert.AreEqual (_src.Distinct<int> ().Count (), _array.Distinct<int> ().Count ());
+			Assert.AreEqual (_src.Distinct<int> (new CustomEqualityComparer ()).Count (), _array.Distinct<int> (new CustomEqualityComparer ()).Count ());
+		}
+
+		[Test]
+		public void ElementAt ()
+		{
+			for (int i = 0; i < 10; ++i)
+				Assert.AreEqual (_src.ElementAt<int> (i), _array.ElementAt<int> (i));
+		}
+
+		[Test]
+		public void ElementAtOrDefault ()
+		{
+			for (int i = 0; i < 10; ++i)
+				Assert.AreEqual (_src.ElementAtOrDefault<int> (i), _array.ElementAtOrDefault<int> (i));
+			Assert.AreEqual (_src.ElementAtOrDefault<int> (100), _array.ElementAtOrDefault<int> (100));
+		}
+
+		[Test]
+		public void Except ()
+		{
+			int [] except = { 1, 2, 3 };
+			Assert.AreEqual (_src.Except<int> (except.AsQueryable ()).Count (), _array.Except<int> (except).Count ());
+		}
+
+		[Test]
+		public void First ()
+		{
+			Assert.AreEqual (_src.First<int> (), _array.First<int> ());
+		}
+
+		[Test]
+		public void FirstOrDefault ()
+		{
+			Assert.AreEqual (_src.FirstOrDefault<int> ((n) => n > 5), _array.FirstOrDefault<int> ((n) => n > 5));
+			Assert.AreEqual (_src.FirstOrDefault<int> ((n) => n > 10), _array.FirstOrDefault<int> ((n) => n > 10));
+		}
+
+		[Test]
+		public void GroupBy ()
+		{
+			IQueryable<IGrouping<bool, int>> grouping = _src.GroupBy<int, bool> ((n) => n > 5);
+			Assert.AreEqual (grouping.Count(), 2);
+			foreach (IGrouping<bool, int> group in grouping)
+			{
+				Assert.AreEqual(group.Count(), 5);
+			}
+		}
+
+		[Test]
+		public void Intersect ()
+		{
+			int [] subset = { 1, 2, 3 };
+			int[] intersection = _src.Intersect<int> (subset.AsQueryable()).ToArray();
+			Assert.AreEqual (subset, intersection);
+		}
+
+		[Test]
+		public void Last ()
+		{
+			Assert.AreEqual (_src.Last<int> ((n) => n > 1), _array.Last<int> ((n) => n > 1));
+		}
+
+		[Test]
+		public void LastOrDefault ()
+		{
+			Assert.AreEqual (_src.LastOrDefault<int> (), _array.LastOrDefault<int> ());
+		}
+
+		[Test]
+		public void LongCount ()
+		{
+			Assert.AreEqual (_src.LongCount<int> (), _array.LongCount<int> ());
+		}
+
+		[Test]
+		public void Max ()
+		{
+			Assert.AreEqual (_src.Max<int> (), _array.Max<int> ());
+		}
+
+		[Test]
+		public void Min ()
+		{
+			Assert.AreEqual (_src.Min<int> (), _array.Min<int> ());
+		}
+
+		[Test]
+		public void OfType ()
+		{
+			Assert.AreEqual (_src.OfType<int> ().Count (), _array.OfType<int> ().Count ());
+		}
+
+		[Test]
+		public void OrderBy ()
+		{
+			int [] arr1 = _array.OrderBy<int, int> ((n) => n * -1).ToArray ();
+			int [] arr2 = _src.OrderBy<int, int> ((n) => n * -1).ToArray ();
+			Assert.AreEqual (arr1, arr2);
+		}
+
+		[Test]
+		public void OrderByDescending ()
+		{
+			int [] arr1 = _array.OrderBy<int, int> ((n) => n).ToArray ();
+			int [] arr2 = _src.OrderBy<int, int> ((n) => n).ToArray ();
+			Assert.AreEqual (arr1, arr2);
+		}
+
+		[Test]
+		public void Reverse ()
+		{
+			int [] arr1 = _array.Reverse<int> ().Reverse ().ToArray ();
+			int [] arr2 = _src.Reverse<int> ().Reverse ().ToArray ();
+			Assert.AreEqual (arr1, arr2);
+		}
+
+		[Test]
+		public void Select ()
+		{
+			int [] arr1 = _array.Select<int, int> ((n) => n - 1).ToArray ();
+			int [] arr2 = _src.Select<int, int> ((n) => n - 1).ToArray ();
+			Assert.AreEqual (arr1, arr2);
+		}
+
+		[Test]
+		public void SelectMany ()
+		{
+			int [] arr1 = _array.SelectMany<int, int> ((n) => new int [] { n, n, n }).ToArray ();
+			int [] arr2 = _src.SelectMany<int, int> ((n) => new int [] { n, n, n }).ToArray ();
+			Assert.AreEqual (arr1, arr2);
+		}
+
+		[Test]
+		public void SequenceEqual ()
+		{
+			Assert.IsTrue (_src.SequenceEqual<int> (_src));
+		}
+
+		[Test]
+		public void Single ()
+		{
+			Assert.AreEqual (_src.Single (n => n == 10), 10);
+		}
+
+		[Test]
+		public void SingleOrDefault ()
+		{
+			Assert.AreEqual (_src.SingleOrDefault (n => n == 10), 10);
+			Assert.AreEqual (_src.SingleOrDefault (n => n == 11), 0);
+		}
+
+		[Test]
+		public void Skip ()
+		{
+			int [] arr1 = _array.Skip<int> (5).ToArray ();
+			int [] arr2 = _src.Skip<int> (5).ToArray ();
+			Assert.AreEqual (arr1, arr2);
+		}
+
+		[Test]
+		public void SkipWhile ()
+		{
+			int[] arr1 = _src.SkipWhile<int> ((n) => n < 6).ToArray();
+			int[] arr2 = _src.Skip<int> (5).ToArray();
+			Assert.AreEqual (arr1, arr2);
+		}
+
+		[Test]
+		public void Sum ()
+		{
+			Assert.AreEqual (_src.Sum<int> ((n) => n), _array.Sum<int> ((n) => n));
+			Assert.AreEqual (_src.Sum<int> ((n) => n + 1), _array.Sum<int> ((n) => n + 1));
+		}
+
+		[Test]
+		public void Take ()
+		{
+			int [] arr1 = _array.Take<int> (3).ToArray ();
+			int [] arr2 = _src.Take<int> (3).ToArray ();
+			Assert.AreEqual (arr1, arr2);
+		}
+
+		[Test]
+		public void TakeWhile ()
+		{
+			int [] arr1 = _array.TakeWhile<int> (n => n < 6).ToArray ();
+			int [] arr2 = _src.TakeWhile<int> (n => n < 6).ToArray ();
+			Assert.AreEqual (arr1, arr2);
+		}
+
+		[Test]
+		public void Union ()
+		{
+			int [] arr1 = _src.ToArray ();
+			int[] arr2 = _src.Union (_src).ToArray ();
+			Assert.AreEqual (arr1, arr2);
+
+			int [] arr = { 11,12,13};
+			Assert.AreEqual (_src.Union (arr).ToArray (), _array.Union (arr).ToArray ());
+		}
+
+		[Test]
+		public void Where ()
+		{
+			int[] oddArray1 = _array.Where<int> ((n) => (n % 2) == 1).ToArray();
+			int [] oddArray2 = _src.Where<int> ((n) => (n % 2) == 1).ToArray ();
+			Assert.AreEqual (oddArray1, oddArray2);
+		}
+
+		[Test]
+		[Category ("NotWorkingLinqInterpreter")]
+		public void UserExtensionMethod ()
+		{
+			BindingFlags extensionFlags = BindingFlags.Static | BindingFlags.Public;
+			MethodInfo method = (from m in typeof (Ext).GetMethods (extensionFlags)
+								 where (m.Name == "UserQueryableExt1" && m.GetParameters () [0].ParameterType.GetGenericTypeDefinition () == typeof (IQueryable<>))
+								 select m).FirstOrDefault ().MakeGenericMethod (typeof (int));
+			Expression<Func<int, int>> exp = i => i;
+			Expression e = Expression.Equal (
+									Expression.Constant ("UserEnumerableExt1"),
+									Expression.Call (method, _src.Expression, Expression.Quote (exp)));
+			Assert.AreEqual (_src.Provider.Execute<bool> (e), true, "UserQueryableExt1");
+
+			method = (from m in typeof (Ext).GetMethods (extensionFlags)
+							   where (m.Name == "UserQueryableExt2" && m.GetParameters () [0].ParameterType.GetGenericTypeDefinition () == typeof (IQueryable<>))
+							   select m).FirstOrDefault ().MakeGenericMethod (typeof (int));
+			e = Expression.Equal (
+									Expression.Constant ("UserEnumerableExt2"),
+									Expression.Call (method, _src.Expression, Expression.Quote (exp)));
+			Assert.AreEqual (_src.Provider.Execute<bool> (e), true, "UserQueryableExt2");
+		}
+
+		[Test]
+		[ExpectedException (typeof (InvalidOperationException))]
+		public void UserExtensionMethodNegative ()
+		{
+			BindingFlags extensionFlags = BindingFlags.Static | BindingFlags.Public;
+			MethodInfo method = (from m in typeof (Ext).GetMethods (extensionFlags)
+								 where (m.Name == "UserQueryableExt3" && m.GetParameters () [0].ParameterType.GetGenericTypeDefinition () == typeof (IQueryable<>))
+								 select m).FirstOrDefault ().MakeGenericMethod (typeof (int));
+			Expression<Func<int, int>> exp = i => i;
+			Expression e = Expression.Call (method, _src.Expression, Expression.Quote (exp), Expression.Constant (10));
+			_src.Provider.Execute (e);
+		}
+
+		[Test]
+		public void NonGenericMethod () {
+			BindingFlags extensionFlags = BindingFlags.Static | BindingFlags.Public;
+			MethodInfo method = (from m in typeof (Ext).GetMethods (extensionFlags)
+								 where (m.Name == "NonGenericMethod" && m.GetParameters () [0].ParameterType.GetGenericTypeDefinition () == typeof (IQueryable<>))
+								 select m).FirstOrDefault ();
+
+			Expression e = Expression.Call (method, _src.Expression);
+			Assert.AreEqual (_src.Provider.Execute (e), "EnumerableNonGenericMethod", "NonGenericMethod");
+		}
+
+		[Test]
+		[ExpectedException(typeof(InvalidOperationException))]
+		public void InstantiatedGenericMethod () {
+			BindingFlags extensionFlags = BindingFlags.Static | BindingFlags.Public;
+			MethodInfo method = (from m in typeof (Ext).GetMethods (extensionFlags)
+								 where (m.Name == "InstantiatedGenericMethod" && m.GetParameters () [0].ParameterType.GetGenericTypeDefinition () == typeof (IQueryable<>))
+								 select m).FirstOrDefault ().MakeGenericMethod (typeof (int));
+
+			Expression e = Expression.Call (method, _src.Expression, Expression.Constant(0));
+			_src.Provider.Execute (e);
+		}
+
+		[Test]
+		[ExpectedException (typeof (ArgumentNullException))]
+		public void NullEnumerable ()
+		{
+			IEnumerable<int> a = null;
+			a.AsQueryable ();
+		}
+
+		[Test]
+		[ExpectedException (typeof (ArgumentException))]
+		public void NonGenericEnumerable1 ()
+		{
+			new MyEnum ().AsQueryable ();
+		}
+
+		[Test]
+		public void NonGenericEnumerable2 ()
+		{
+			IEnumerable<int> nonGen = new int[] { 1, 2, 3 };
+			Assert.IsTrue (nonGen.AsQueryable () is IQueryable<int>);
+		}
+
+		class Bar<T1, T2> : IEnumerable<T2> {
+
+			public IEnumerator<T2> GetEnumerator ()
+			{
+				yield break;
+			}
+
+			IEnumerator IEnumerable.GetEnumerator ()
+			{
+				return GetEnumerator ();
+			}
+		}
+
+		[Test]
+		public void NonGenericAsQueryableInstantiateProperQueryable ()
+		{
+			IEnumerable bar = new Bar<int, string> ();
+			IQueryable queryable = bar.AsQueryable ();
+
+			Assert.IsTrue (queryable is IQueryable<string>);
+		}
+	}
+
+	class MyEnum : IEnumerable
+	{
+		public IEnumerator GetEnumerator ()
+		{
+			throw new NotImplementedException ();
+		}
+	}
+
+	class CustomEqualityComparer : IEqualityComparer<int> {
+
+		public bool Equals (int x, int y)
+		{
+			return true;
+		}
+
+		public int GetHashCode (int obj)
+		{
+			return 0;
+		}
+	}
+
+	public static class Ext {
+
+		public static string UserQueryableExt1<T> (this IQueryable<T> e, Expression<Func<int, int>> ex)
+		{
+			return "UserQueryableExt1";
+		}
+
+		public static string UserQueryableExt2<T> (this IQueryable<T> e, Expression<Func<int, int>> ex)
+		{
+			return "UserQueryableExt2";
+		}
+
+		public static string UserQueryableExt3<T> (this IQueryable<T> e, Expression<Func<int, int>> ex, int dummy)
+		{
+			return "UserQueryableExt3";
+		}
+
+		public static string UserQueryableExt1<T> (this IEnumerable<T> e, Expression<Func<int, int>> ex)
+		{
+			return "UserEnumerableExt1";
+		}
+
+		public static string UserQueryableExt2<T> (this IEnumerable<T> e, Func<int, int> ex)
+		{
+			return "UserEnumerableExt2";
+		}
+
+		public static string NonGenericMethod (this IQueryable<int> iq)
+		{
+			return "QueryableNonGenericMethod";
+		}
+
+		public static string NonGenericMethod (this IEnumerable<int> iq)
+		{
+			return "EnumerableNonGenericMethod";
+		}
+
+		public static string InstantiatedGenericMethod<T> (this IQueryable<int> iq, T t)
+		{
+			return "QueryableInstantiatedGenericMethod";
+		}
+
+		public static string InstantiatedGenericMethod (this IEnumerable<int> ie, int t)
+		{
+			return "EnumerableInstantiatedGenericMethod";
+		}
+	}
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            X«cTH€˘d¥ôó“NJÙ8y‹ÿ≠Î2Mîûà[Oå©öæüi©ã™◊LâÌœØ¡‰p&–¿Õ`®!¡≥(¯©y_7cø≠?ÎôE?Y5ÜÍé5 XG^yÂïƒ§ñ•›\\Œ®*™%°èeæÑ R!%ÙÒ|*˚∏Íöé{`$àïOèz0$%5.Å≥9ÁÎÊ»\/ùT{Ç”¶sñÓ¥Ô-ôù\• 6ÑZV‡+Ö2CÓÜFVÅ;vM:´®£úÀhíÕiñç!“‘∫ÀGîﬂßùÌ◊◊	‘]º{¯ub}ç–Fø1w≈ÀD)\Æ:sﬁhLâÅó\¿{¶√¥vÆ“∫mfºãç¥Èw3ﬂd¡ÚA¯øc√∂√'ﬁ£–$»eˆ¡Ó”⁄í"≈’˝¸fÚ{yGˇ«≈úU*Ÿæ˚Ô‚Óüπ^w|&±Ø™ºa˘1®‘&@wí!sES2ÃrFLCÒ√õhI‘§
+Àé;›ù`<6=·k‡iñ—î⁄áﬂZ®y4‡ŸA”$Hj¢ CûlòÌ1ﬁD MbN∏UK&úp‡áNÉkåD≤¿4¯C¡±e ÛÿZ4®-–è”—_è8Y@ 
+&¯ê¬∑/∆,’Ä˜82»ﬂX†±¸∞y◊ô`AûffƒÂrÿ∫≠Ãéﬁ•Ó∂}:ÉÓ=0QöÕ@ªHü˚ñ∞¶K:*M°ùöîê∞lÙ´†Øo3æπS€QW’ƒ: º≥ë°≥÷'∫ÃyÒ£º|bßj˘˝.û¡ÈZUœíÖµ}ª.√‚∑}J¬—[á$´πÒ¬ßM!®e˘ {ò°ëÏ«ÓUæeÎ®ﬂú‡‘Èi†°˜qˇ Ô∑MdÓ|∂PK»µ7*.ll<8ÅésçhôÖbfµw#ë$É
+5Õ^]çÃz‰v@ì[±yÓ‡aÕîíqò†ÜÑ!>C 5åŸáìY?ujf^I‡ÍñQ†¡ﬁqÄfﬁÑSeÉ˝o©ùVÙÀÿü~°Jn=âØih ∆ä[Ñ$d\v÷]â5ﬁKÿ˙MÕù%œ«UÜv?≠Yˆœaû 9)FK/ÆÇ&(∑ç˝BSÍ^è≥=_8:ådÜeæŸç|≠xÚ_ƒcât:ZNOü◊ky÷µi¨quûfäj>¯r„ehs¯®¥ã?brR® ≥zœb2èùg•3\‡xı°äWÜ¿ı~„ˆ|i¡~ØØSY
+ıUH´mæøüÁSØ!Ít,!9+˝Õfòè97ΩãfÙ$*).dãúœí≤∂◊˛Ä f€‚3ŸæîIˆ•  ’¡ıy≤&f{c›6î¨7É_<È"ìu^hœFíø◊•é∑é17Z¿{Às1bÈ¨Ns‹í∞%ç-1†¬—¯#ûÕEbä≤*öîÁæÃIÿ.vfU ¢ó√¬ñB;ƒ^?6+6‡¸å9íeccJî-[ãé¿5V»¸ÂP~38¡ “ÉZÖ54|ze‚—Q∂ƒ A"DíWò8ûÑT–‹Íÿ[‘zd,¢ÄJW%?„tq3¢D_£dÁhõ˘\u.)4åLÄ†‘D*‚"t'BE˚9D7˚ã•Ω`î˛	8iS_=^›LÈµ=›ÎbG›s Wó&Æpöh≥VØ≠[0ÇO%{b=—Ém⁄á‡ˆj\\b`l§i}cˆY∑WêO,„‡qÂ”“Qòv´∂>ç˘“Êyl3råZøÒr7Ä˘Ø•ªL®vA¡–¥9ê´ø¬^N˜âÜ∆Î Eˇ]?á/¢J∫®ëÈiehÙ∂Œµbez€§è O¸≥•˚p˚-§W¡GêÇË÷Ü¸˝Ωàåê{.I…0∂™˘d˙È;@È#¥µäN¥ÎU+Äæüdˆo…	Û˘°"CHêÄ£∞Gë≈S‹()é»∂^jXÜqÂW9P€∆!6gÙÖBQê‰ÅÊ
+d˘Õ*·Xn∆—òxƒp€¶|¯˘‡6ß$ºÿ’!ß÷ ä hkÛo…WzÜsE‹ﬁLißaÀÃ≥J˛«qMëÅd¢///////////////////////////////////////////////////////////////////////////
+//
+// Copyright (c) 2002, Industrial Light & Magic, a division of Lucas
+// Digital Ltd. LLC
+// 
+// All rights reserved.
+// 
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are
+// met:
+// *       Redistributions of source code must retain the above copyright
+// notice, this list of conditions and the following disclaimer.
+// *       Redistributions in binary form must reproduce the above
+// copyright notice, this list of conditions and the following disclaimer
+// in the documentation and/or other materials provided with the
+// distribution.
+// *       Neither the name of Industrial Light & Magic nor the names of
+// its contributors may be used to endorse or promote products derived
+// from this software without specific prior written permission. 
+// 
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//
+///////////////////////////////////////////////////////////////////////////
+
+
+#ifndef INCLUDED_IMATHRANDOM_H
+#define INCLUDED_IMATHRANDOM_H
+
+//-----------------------------------------------------------------------------
+//
+//	Generators for uniformly distributed pseudo-random numbers and
+//	functions that use those generators to generate numbers with
+//	non-uniform distributions:
+//
+//		class Rand32
+//		class Rand48
+//		solidSphereRand()
+//		hollowSphereRand()
+//		gaussRand()
+//		gaussSphereRand()
+//
+//	Note: class Rand48() calls erand48() and nrand48(), which are not
+//	available on all operating systems.  For compatibility we include
+//	our own versions of erand48() and nrand48().  Our functions have
+//	been reverse-engineered from the corresponding Unix/Linux man page.
+//
+//-----------------------------------------------------------------------------
+
+#include <stdlib.h>
+#include <math.h>
+
+namespace Imath {
+
+//-----------------------------------------------
+// Fast random-number generator that generates
+// a uniformly distributed sequence with a period
+// length of 2^32.
+//-----------------------------------------------
+
+class Rand32
+{
+  public:
+
+    //------------
+    // Constructor
+    //------------
+
+    Rand32 (unsigned long int seed = 0);
+    
+
+    //--------------------------------
+    // Re-initialize with a given seed
+    //--------------------------------
+
+    void		init (unsigned long int seed);
+
+
+    //----------------------------------------------------------
+    // Get the next value in the sequence (range: [false, true])
+    //----------------------------------------------------------
+
+    bool		nextb ();
+
+
+    //---------------------------------------------------------------
+    // Get the next value in the sequence (range: [0 ... 0xffffffff])
+    //---------------------------------------------------------------
+
+    unsigned long int	nexti ();
+
+
+    //------------------------------------------------------
+    // Get the next value in the sequence (range: [0 ... 1[)
+    //------------------------------------------------------
+
+    float		nextf ();
+
+
+    //-------------------------------------------------------------------
+    // Get the next value in the sequence (range [rangeMin ... rangeMax[)
+    //-------------------------------------------------------------------
+
+    float		nextf (float rangeMin, float rangeMax);
+
+
+  private:
+
+    void		next ();
+
+    unsigned long int	_state;
+};
+
+
+//--------------------------------------------------------
+// Random-number generator based on the C Standard Library
+// functions erand48(), nrand48() & company; generates a
+// uniformly distributed sequence.
+//--------------------------------------------------------
+
+class Rand48
+{
+  public:
+
+    //------------
+    // Constructor
+    //------------
+
+    Rand48 (unsigned long int seed = 0);
+    
+
+    //--------------------------------
+    // Re-initialize with a given seed
+    //--------------------------------
+
+    void		init (unsigned long int seed);
+
+
+    //----------------------------------------------------------
+    // Get the next value in the sequence (range: [false, true])
+    //----------------------------------------------------------
+
+    bool		nextb ();
+
+
+    //---------------------------------------------------------------
+    // Get the next value in the sequence (range: [0 ... 0x7fffffff])
+    //---------------------------------------------------------------
+
+    long int		nexti ();
+
+
+    //------------------------------------------------------
+    // Get the next value in the sequence (range: [0 ... 1[)
+    //------------------------------------------------------
+
+    double		nextf ();
+
+
+    //-------------------------------------------------------------------
+    // Get the next value in the sequence (range [rangeMin ... rangeMax[)
+    //-------------------------------------------------------------------
+
+    double		nextf (double rangeMin, double rangeMax);
+
+
+  private:
+
+    unsigned short int	_state[3];
+};
+
+
+//------------------------------------------------------------
+// Return random points uniformly distributed in a sphere with
+// radius 1 around the origin (distance from origin <= 1).
+//------------------------------------------------------------
+
+template <class Vec, class Rand>
+Vec		
+solidSphereRand (Rand &rand);
+
+
+//-------------------------------------------------------------
+// Return random points uniformly distributed on the surface of
+// a sphere with radius 1 around the origin.
+//-------------------------------------------------------------
+
+template <class Vec, class Rand>
+Vec		
+hollowSphereRand (Rand &rand);
+
+
+//-----------------------------------------------
+// Return random numbers with a normal (Gaussian)
+// distribution with zero mean and unit variance.
+//-----------------------------------------------
+
+template <class Rand>
+float
+gaussRand (Rand &rand);
+
+
+//----------------------------------------------------
+// Return random points whose distance from the origin
+// has a normal (Gaussian) distribution with zero mean
+// and unit variance.
+//----------------------------------------------------
+
+template <class Vec, class Rand>
+Vec
+gaussSphereRand (Rand &rand);
+
+
+//---------------------------------
+// erand48(), nrand48() and friends
+//---------------------------------
+
+double		erand48 (unsigned short state[3]);
+double		drand48 ();
+long int	nrand48 (unsigned short state[3]);
+long int	lrand48 ();
+void		srand48 (long int seed);
+
+
+//---------------
+// Implementation
+//---------------
+
+
+inline void
+Rand32::init (unsigned long int seed)
+{
+    _state = (seed * 0xa5a573a5L) ^ 0x5a5a5a5aL;
+}
+
+
+inline
+Rand32::Rand32 (unsigned long int seed)
+{
+    init (seed);
+}
+
+
+inline void
+Rand32::next ()
+{
+    _state = 1664525L * _state + 1013904223L;
+}
+
+
+inline bool
+Rand32::nextb ()
+{
+    next ();
+    // Return the 31st (most significant) bit, by and-ing with 2 ^ 31.
+    return !!(_state & 2147483648UL);
+}
+
+
+inline unsigned long int
+Rand32::nexti ()
+{
+    next ();
+    return _state & 0xffffffff;
+}
+
+
+inline float
+Rand32::nextf (float rangeMin, float rangeMax)
+{
+    float f = nextf();
+    return rangeMin * (1 - f) + rangeMax * f;
+}
+
+
+inline void
+Rand48::init (unsigned long int seed)
+{
+    seed = (seed * 0xa5a573a5L) ^ 0x5a5a5a5aL;
+
+    _state[0] = (unsigned short int) (seed & 0xFFFF);
+    _state[1] = (unsigned short int) ((seed >> 16) & 0xFFFF);
+    _state[2] = (unsigned short int) (seed & 0xFFFF);   
+}
+
+
+inline 
+Rand48::Rand48 (unsigned long int seed)
+{
+    init (seed);
+}
+
+
+inline bool
+Rand48::nextb ()
+{
+    return Imath::nrand48 (_state) & 1;
+}
+
+
+inline long int
+Rand48::nexti ()
+{
+    return Imath::nrand48 (_state);
+}
+
+
+inline double
+Rand48::nextf ()
+{
+    return Imath::erand48 (_state);
+}
+
+
+inline double
+Rand48::nextf (double rangeMin, double rangeMax)
+{
+    double f = nextf();
+    return rangeMin * (1 - f) + rangeMax * f;
+}
+
+
+template <class Vec, class Rand>
+Vec
+solidSphereRand (Rand &rand)
+{
+    Vec v;
+
+    do
+    {
+	for (unsigned int i = 0; i < Vec::dimensions(); i++)
+	    v[i] = (typename Vec::BaseType) rand.nextf (-1, 1);
+    }
+    while (v.length2() > 1);
+
+    return v;
+}
+
+
+template <class Vec, class Rand>
+Vec
+hollowSphereRand (Rand &rand)
+{
+    Vec v;
+    typename Vec::BaseType length;
+
+    do
+    {
+	for (unsigned int i = 0; i < Vec::dimensions(); i++)
+	    v[i] = (typename Vec::BaseType) rand.nextf (-1, 1);
+
+	length = v.length();
+    }
+    while (length > 1 || length == 0);
+
+    return v / length;
+}
+
+
+template <class Rand>
+float
+gaussRand (Rand &rand)
+{
+    float x;		// Note: to avoid numerical problems with very small
+    float y;		// numbers, we make these variables singe-precision
+    float length2;	// floats, but later we call the double-precision log()
+			// and sqrt() functions instead of logf() and sqrtf().
+    do
+    {
+	x = float (rand.nextf (-1, 1));
+	y = float (rand.nextf (-1, 1));
+	length2 = x * x + y * y;
+    }
+    while (length2 >= 1 || length2 == 0);
+
+    return x * sqrt (-2 * log (double (length2)) / length2);
+}
+
+
+template <class Vec, class Rand>
+Vec
+gaussSphereRand (Rand &rand)
+{
+    return hollowSphereRand <Vec> (rand) * gaussRand (rand);
+}
+
+} // namespace Imath
+
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  íÁ/"E‡p6≠ZÉ^ï0N˛(ÃBTruh@◊	†˚∂q´F⁄i^7°˘„≥hÅE–@u„Ò¬eëúı.M‹®‡ Q™W»éü5áNPç«¶∏Jr¿Òù Î©8††GëÒ∆H√ƒ∆∏áçk⁄Êlº¶<˙&CP\ Õ«P9πIêKuL#”·ﬂ	‹Œ,ØM¢®˚ûHüQN÷!r∑JW2çÓ™ø·‹πú^ÊÁf5ìQPjm«¯cæ©=/°"Í*Õ±‰L)<«8ÅÈkÖZaÆ^'∏‡)?{jYØ˚éus˝F…‹ã4©TX¥cÚ.NÏÊNñ	4_?§∫‡ˆÙ}ƒª>Â˚∑ù˛˛"R„yÔ•‡>Åù%D<˙ÈﬁÚÛí⁄â”O%#s§1Ä:ÑûF,T<á¨wag‰¢OÇËåùãEëÍRèÉEãΩ@u('QP^–ªB≥DH◊"K|◊2•⁄}WLSû‡x(›2dÑBíÄ≥˘kL÷7_ÈÖ^™ç,i—iÒÀ±Åˆ–îñd\ÜáH≥œtãúÖÈûl”º8∂ü"Ôb1	˝∏rãµt˘£íëT‚TR“†KË⁄é·®n~¡ªu@€jx|n%¡âG<ÎÊù€ìΩÓó:ù≥¢…JÏ_±–Nm[ﬂL|g}ΩwX-5—‚»∑L∫6
+qw◊ØÁ/÷ïV€ﬂ·µ˘ ≠-1FjéΩÆu´jS	˛´ŒΩ˙~∆ﬁ`»†&Ωt˝ßo®∂‹ï∆Æ”†ªFòñ¸Ü‹˜ôLÕÙ·EyZL®Ö˜ë´∑LØ˛â÷ö!¨òRDdˆ…[˘µqC°î≈ÀÎ›k2á’+•>Ω, RÇ£:π˜7˚ìå@€lcã~∏dÉÈøLU	 ¸JÙ¡≈há6ªGäT™¸≤Í@¿ﬁ%*$å◊A’º‹§˜z£n∆î{≠24o`}ªósﬁ Xäö†óΩIfg5.®√Ês¡‘h3F$t È	ÊÚÜ¯H¶ãg˝Ú:ò∫©yá
+mYpÊÄrÎ€Ö√–.CícÇ¯¢§⁄∞¥ëÑàñE®ëe–‰⁄jÛ
+Çä!ôf¯ÛÈ«öBΩQfÔ;g&€ L>É7àçK¸‹xhØ –¥Å≠—ÊÏ‹Œpü1∞O5qqñù3÷ÓB≠æA=¡˝‡fS§6ΩÆØ∑îUÕpˆ€K∑Ì·*»ã∫9WíÓóÛDÚ∑¥ó]©“…|Ó7?œ—íÑG\Á’ÆÒäÍ C1µ
+Òºùkn˘Â({vÈ˜“-A#Ñ¬ÂLÜ©†q5W>Ë∑°Xù~JMK aı± ≈Xÿ‚ÔÀ—æª1ÒÊÚD[É»=ó IJñ§Ω(sêŸ0ïCyK*^¿I·Ìü#πµ,‹•ZX) ˛¿ƒe-aà“†=P®ô±≤"`è‡ €Î◊…%ÏË¶e4sN—Ìxí÷ûïupÃà@∆ÿPÑíÄ*Ø9óNr€åoMâÆPW]≠ V75D∫OqÃÍ«%ëpƒd,?·ÍàK˜3≥7§∏îHËr?õñﬁπ¨Ÿï‡–@«)˜Ÿ§è_ïbsÓâaE@ûŸ[]°T¬~Ì´◊x√LÍ÷¢gÂuΩ·;#˛|E”+t¶USeØì˝Á¯(¡¸öΩsm…Áv>ëCù}»v“ú‘*PQ‚†ÃR˙π√…ju$_\ìNŒâu=÷B=ﬂ> i∏VÄ¿!†$i8v=16Î∂lD…Ë#∂È@Ó'≠ñî·Ept ◊I¸ñkÂI,eèöòBª}ÒØ0{ÂXœø|õ—ØÚéf%Ÿ¡4/ßıh¥b%a,4=ú≈ )ú Qô™µnƒôóÊÃ∑#VûQGwAÖÚÇº2õ

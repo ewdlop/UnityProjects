@@ -1,0 +1,115 @@
+e)
+            { 
+                return GetMemberList<RuntimePropertyInfo>(ref m_propertyInfoCache, listType, name, CacheType.Property);
+            }
+
+#if FEATURE_LEGACYNETCF
+            // Dev11 466969 quirk
+            internal RuntimePropertyInfo[] GetPropertyList(MemberListType listType, string name, out IReadOnlyList<RuntimePropertyInfo> ambiguousProperties)
+            { 
+                return GetMemberList<RuntimePropertyInfo>(ref m_propertyInfoCache, listType, name, CacheType.Property, out ambiguousProperties);
+            }
+#endif
+
+            internal RuntimeEventInfo[] GetEventList(MemberListType listType, string name)
+            { 
+                return GetMemberList<RuntimeEventInfo>(ref m_eventInfoCache, listType, name, CacheType.Event);
+            }
+
+            internal RuntimeFieldInfo[] GetFieldList(MemberListType listType, string name)
+            { 
+                return GetMemberList<RuntimeFieldInfo>(ref m_fieldInfoCache, listType, name, CacheType.Field);
+            }
+
+            internal RuntimeType[] GetInterfaceList(MemberListType listType, string name)
+            { 
+                return GetMemberList<RuntimeType>(ref m_interfaceCache, listType, name, CacheType.Interface);
+            }
+
+            internal RuntimeType[] GetNestedTypeList(MemberListType listType, string name)
+            { 
+                return GetMemberList<RuntimeType>(ref m_nestedClassesCache, listType, name, CacheType.NestedType);
+            }
+
+            internal MethodBase GetMethod(RuntimeType declaringType, RuntimeMethodHandleInternal method) 
+            { 
+                GetMemberCache<RuntimeMethodInfo>(ref m_methodInfoCache);
+                return m_methodInfoCache.AddMethod(declaringType, method, CacheType.Method);
+            }
+
+            internal MethodBase GetConstructor(RuntimeType declaringType, RuntimeMethodHandleInternal constructor)
+            { 
+                GetMemberCache<RuntimeConstructorInfo>(ref m_constructorInfoCache);
+                return m_constructorInfoCache.AddMethod(declaringType, constructor, CacheType.Constructor);
+            }
+
+            internal FieldInfo GetField(RuntimeFieldHandleInternal field)
+            { 
+                GetMemberCache<RuntimeFieldInfo>(ref m_fieldInfoCache);
+                return m_fieldInfoCache.AddField(field);
+            }
+
+            #endregion
+        }
+#endif
+        #endregion
+
+#if FEATURE_REMOTING && !MONO
+        #region Legacy Remoting Cache
+        // The size of CachedData is accounted for by BaseObjectWithCachedData in object.h.
+        // This member is currently being used by Remoting for caching remoting data. If you
+        // need to cache data here, talk to the Remoting team to work out a mechanism, so that
+        // both caching systems can happily work together.
+        private RemotingTypeCachedData m_cachedData;
+
+        internal RemotingTypeCachedData RemotingCache
+        {
+            get
+            {
+                // This grabs an internal copy of m_cachedData and uses
+                // that instead of looking at m_cachedData directly because
+                // the cache may get cleared asynchronously.  This prevents
+                // us from having to take a lock.
+                RemotingTypeCachedData cache = m_cachedData;
+                if (cache == null)
+                {
+                    cache = new RemotingTypeCachedData(this);
+                    RemotingTypeCachedData ret = Interlocked.CompareExchange(ref m_cachedData, cache, null);
+                    if (ret != null)
+                        cache = ret;
+                }
+                return cache;
+            }
+        }
+        #endregion
+#endif //FEATURE_REMOTING
+
+        #region Static Members
+
+        #region Internal
+
+        internal static RuntimeType GetType(String typeName, bool throwOnError, bool ignoreCase, bool reflectionOnly,
+            ref StackCrawlMark stackMark)
+        {
+            if (typeName == null)
+                throw new ArgumentNullException("typeName");
+            Contract.EndContractBlock();
+
+#if FEATURE_LEGACYNETCF
+            if (CompatibilitySwitches.IsAppEarlierThanWindowsPhone8 && typeName.Length == 0)
+                throw new TypeLoadException(Environment.GetResourceString("Arg_TypeLoadNullStr"));
+#endif
+
+            return RuntimeTypeHandle.GetTypeByName(
+                typeName, throwOnError, ignoreCase, reflectionOnly, ref stackMark, false);
+        }
+
+#if !MONO
+        internal static MethodBase GetMethodBase(RuntimeModule scope, int typeMetadataToken)
+        {
+            return GetMethodBase(ModuleHandle.ResolveMethodHandleInternal(scope, typeMetadataToken));
+        }
+
+        internal static MethodBase GetMethodBase(IRuntimeMethodInfo methodHandle)
+        {
+            return GetMe

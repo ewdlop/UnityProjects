@@ -1,0 +1,97 @@
+
+            //
+            return QueryInterface_NoAddRef_Slow(interfaceType, ref currentCookie, cacheOnly, out pComPtr);
+        }
+
+        /// <summary>
+        /// QueryInterface for the specified IID and returns a Non-AddRefed COM interface pointer for the
+        /// the interface you've specified. The returned interface pointer is always callable from current
+        /// context
+        /// NOTE: This version uses RuntimeTypeHandle and is much faster than GUID version
+        /// </summary>
+        /// <returns>A non-AddRef-ed interface pointer that is callable under current context</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal IntPtr QueryInterface_NoAddRef_Internal(
+            RuntimeTypeHandle interfaceType,
+            bool cacheOnly = false,
+            bool throwOnQueryInterfaceFailure = true)
+        {
+
+#if !RHTESTCL
+            // Throw if the underlying object is already disposed.
+            if (m_baseIUnknown.IsDisposed)
+            {
+                throw new InvalidComObjectException(SR.Excep_InvalidComObject_NoRCW_Wrapper);
+            }
+#endif
+            bool matchContext = m_baseIUnknown.IsFreeThreaded || m_baseIUnknown.ContextCookie.Equals(ContextCookie.Current);
+            if (matchContext)
+            {
+                //
+                // Search for simple fixed locking cache where context always match
+                // NOTE: it is important to use Length instead of the constant because the compiler would
+                // eliminate the range check (for the most part) when we are using Length
+                //
+                int i = 0;
+                do
+                {
+                    IntPtr cachedComPtr;
+                    if (m_cachedInterfaces[i].TryReadCachedNativeInterface(interfaceType, out cachedComPtr))
+                    {
+                        return cachedComPtr;
+                    }
+                } while (++i < m_cachedInterfaces.Length);
+            }
+
+            IntPtr pComPtr;
+            ContextCookie currentCookie = ContextCookie.Current;
+            //
+            // No match found in the simple interface cache
+            // Proceed to the slow path only if we want to do the actual cache look-up.
+            //
+            int hr = QueryInterface_NoAddRef_Slow(interfaceType, ref currentCookie, cacheOnly, out pComPtr);
+            if (throwOnQueryInterfaceFailure && pComPtr == default(IntPtr))
+            {
+                throw CreateInvalidCastExceptionForFailedQI(interfaceType, hr);
+            }
+            return pComPtr;
+        }
+
+        /// <summary>
+        /// Slow path of QueryInterface that does not look at any cache.
+        /// NOTE: MethodImpl(NoInlining) is necessary because Bartok is trying to be "helpful" by inlining
+        /// these calls while in other cases it does not inline when it should.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private int QueryInterface_NoAddRef_SlowNoCacheLookup(
+            RuntimeTypeHandle interfaceType,
+            ContextCookie currentCookie,
+            out IntPtr pComPtr)
+        {
+
+#if ENABLE_WINRT
+            // Make sure cookie is initialized
+            Debug.Assert(!currentCookie.IsDefault);
+#endif
+
+            // Before we QI, we need to make sure we always QI in the right context by retrieving
+            // the right IUnknown under current context
+            // NOTE: This IUnknown* is AddRef-ed
+            //
+            if (m_baseIUnknown.IsFreeThreaded || m_baseIUnknown.ContextCookie.Equals(currentCookie))
+            {
+                //
+                // We are in the right context - we can use the IUnknown directly
+                //
+                return QueryInterfaceAndInsertToCache_NoAddRef(
+                    m_baseIUnknown.ComPointer_UnsafeNoAddRef,
+                    interfaceType,
+                    currentCookie,
+                    out pComPtr);
+            }
+            else
+            {
+                //
+                // Not in the right context - we need to get the right IUnknown through marshalling
+                //
+                IntPtr pIUnknown = default(IntPtr);

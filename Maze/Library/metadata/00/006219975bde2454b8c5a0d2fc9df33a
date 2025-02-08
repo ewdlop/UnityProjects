@@ -1,0 +1,303 @@
+//===- HexagonLoopIdiomRecognition.cpp ------------------------------------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+
+#define DEBUG_TYPE "hexagon-lir"
+
+#include "llvm/ADT/APInt.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/Triple.h"
+#include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Analysis/InstructionSimplify.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/LoopPass.h"
+#include "llvm/Analysis/MemoryLocation.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionExpander.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/Attributes.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constant.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/DebugLoc.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstrTypes.h"
+#include "llvm/IR/Instruction.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/PatternMatch.h"
+#include "llvm/IR/Type.h"
+#include "llvm/IR/User.h"
+#include "llvm/IR/Value.h"
+#include "llvm/Pass.h"
+#include "llvm/Support/Casting.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Compiler.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/KnownBits.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Utils/Local.h"
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cstdint>
+#include <cstdlib>
+#include <deque>
+#include <functional>
+#include <iterator>
+#include <map>
+#include <set>
+#include <utility>
+#include <vector>
+
+using namespace llvm;
+
+static cl::opt<bool> DisableMemcpyIdiom("disable-memcpy-idiom",
+  cl::Hidden, cl::init(false),
+  cl::desc("Disable generation of memcpy in loop idiom recognition"));
+
+static cl::opt<bool> DisableMemmoveIdiom("disable-memmove-idiom",
+  cl::Hidden, cl::init(false),
+  cl::desc("Disable generation of memmove in loop idiom recognition"));
+
+static cl::opt<unsigned> RuntimeMemSizeThreshold("runtime-mem-idiom-threshold",
+  cl::Hidden, cl::init(0), cl::desc("Threshold (in bytes) for the runtime "
+  "check guarding the memmove."));
+
+static cl::opt<unsigned> CompileTimeMemSizeThreshold(
+  "compile-time-mem-idiom-threshold", cl::Hidden, cl::init(64),
+  cl::desc("Threshold (in bytes) to perform the transformation, if the "
+    "runtime loop count (mem transfer size) is known at compile-time."));
+
+static cl::opt<bool> OnlyNonNestedMemmove("only-nonnested-memmove-idiom",
+  cl::Hidden, cl::init(true),
+  cl::desc("Only enable generating memmove in non-nested loops"));
+
+cl::opt<bool> HexagonVolatileMemcpy("disable-hexagon-volatile-memcpy",
+  cl::Hidden, cl::init(false),
+  cl::desc("Enable Hexagon-specific memcpy for volatile destination."));
+
+static cl::opt<unsigned> SimplifyLimit("hlir-simplify-limit", cl::init(10000),
+  cl::Hidden, cl::desc("Maximum number of simplification steps in HLIR"));
+
+static const char *HexagonVolatileMemcpyName
+  = "hexagon_memcpy_forward_vp4cp4n2";
+
+
+namespace llvm {
+
+  void initializeHexagonLoopIdiomRecognizePass(PassRegistry&);
+  Pass *createHexagonLoopIdiomPass();
+
+} // end namespace llvm
+
+namespace {
+
+  class HexagonLoopIdiomRecognize : public LoopPass {
+  public:
+    static char ID;
+
+    explicit HexagonLoopIdiomRecognize() : LoopPass(ID) {
+      initializeHexagonLoopIdiomRecognizePass(*PassRegistry::getPassRegistry());
+    }
+
+    StringRef getPassName() const override {
+      return "Recognize Hexagon-specific loop idioms";
+    }
+
+   void getAnalysisUsage(AnalysisUsage &AU) const override {
+      AU.addRequired<LoopInfoWrapperPass>();
+      AU.addRequiredID(LoopSimplifyID);
+      AU.addRequiredID(LCSSAID);
+      AU.addRequired<AAResultsWrapperPass>();
+      AU.addPreserved<AAResultsWrapperPass>();
+      AU.addRequired<ScalarEvolutionWrapperPass>();
+      AU.addRequired<DominatorTreeWrapperPass>();
+      AU.addRequired<TargetLibraryInfoWrapperPass>();
+      AU.addPreserved<TargetLibraryInfoWrapperPass>();
+    }
+
+    bool runOnLoop(Loop *L, LPPassManager &LPM) override;
+
+  private:
+    int getSCEVStride(const SCEVAddRecExpr *StoreEv);
+    bool isLegalStore(Loop *CurLoop, StoreInst *SI);
+    void collectStores(Loop *CurLoop, BasicBlock *BB,
+        SmallVectorImpl<StoreInst*> &Stores);
+    bool processCopyingStore(Loop *CurLoop, StoreInst *SI, const SCEV *BECount);
+    bool coverLoop(Loop *L, SmallVectorImpl<Instruction*> &Insts) const;
+    bool runOnLoopBlock(Loop *CurLoop, BasicBlock *BB, const SCEV *BECount,
+        SmallVectorImpl<BasicBlock*> &ExitBlocks);
+    bool runOnCountableLoop(Loop *L);
+
+    AliasAnalysis *AA;
+    const DataLayout *DL;
+    DominatorTree *DT;
+    LoopInfo *LF;
+    const TargetLibraryInfo *TLI;
+    ScalarEvolution *SE;
+    bool HasMemcpy, HasMemmove;
+  };
+
+  struct Simplifier {
+    struct Rule {
+      using FuncType = std::function<Value* (Instruction*, LLVMContext&)>;
+      Rule(StringRef N, FuncType F) : Name(N), Fn(F) {}
+      StringRef Name;   // For debugging.
+      FuncType Fn;
+    };
+
+    void addRule(StringRef N, const Rule::FuncType &F) {
+      Rules.push_back(Rule(N, F));
+    }
+
+  private:
+    struct WorkListType {
+      WorkListType() = default;
+
+      void push_back(Value* V) {
+        // Do not push back duplicates.
+        if (!S.count(V)) { Q.push_back(V); S.insert(V); }
+      }
+
+      Value *pop_front_val() {
+        Value *V = Q.front(); Q.pop_front(); S.erase(V);
+        return V;
+      }
+
+      bool empty() const { return Q.empty(); }
+
+    private:
+      std::deque<Value*> Q;
+      std::set<Value*> S;
+    };
+
+    using ValueSetType = std::set<Value *>;
+
+    std::vector<Rule> Rules;
+
+  public:
+    struct Context {
+      using ValueMapType = DenseMap<Value *, Value *>;
+
+      Value *Root;
+      ValueSetType Used;    // The set of all cloned values used by Root.
+      ValueSetType Clones;  // The set of all cloned values.
+      LLVMContext &Ctx;
+
+      Context(Instruction *Exp)
+        : Ctx(Exp->getParent()->getParent()->getContext()) {
+        initialize(Exp);
+      }
+
+      ~Context() { cleanup(); }
+
+      void print(raw_ostream &OS, const Value *V) const;
+      Value *materialize(BasicBlock *B, BasicBlock::iterator At);
+
+    private:
+      friend struct Simplifier;
+
+      void initialize(Instruction *Exp);
+      void cleanup();
+
+      template <typename FuncT> void traverse(Value *V, FuncT F);
+      void record(Value *V);
+      void use(Value *V);
+      void unuse(Value *V);
+
+      bool equal(const Instruction *I, const Instruction *J) const;
+      Value *find(Value *Tree, Value *Sub) const;
+      Value *subst(Value *Tree, Value *OldV, Value *NewV);
+      void replace(Value *OldV, Value *NewV);
+      void link(Instruction *I, BasicBlock *B, BasicBlock::iterator At);
+    };
+
+    Value *simplify(Context &C);
+  };
+
+  struct PE {
+    PE(const Simplifier::Context &c, Value *v = nullptr) : C(c), V(v) {}
+
+    const Simplifier::Context &C;
+    const Value *V;
+  };
+
+  raw_ostream &operator<< (raw_ostream &OS, const PE &P) LLVM_ATTRIBUTE_USED;
+  raw_ostream &operator<< (raw_ostream &OS, const PE &P) {
+    P.C.print(OS, P.V ? P.V : P.C.Root);
+    return OS;
+  }
+
+} // end anonymous namespace
+
+char HexagonLoopIdiomRecognize::ID = 0;
+
+INITIALIZE_PASS_BEGIN(HexagonLoopIdiomRecognize, "hexagon-loop-idiom",
+    "Recognize Hexagon-specific loop idioms", false, false)
+INITIALIZE_PASS_DEPENDENCY(LoopInfoWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(LoopSimplify)
+INITIALIZE_PASS_DEPENDENCY(LCSSAWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(ScalarEvolutionWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(TargetLibraryInfoWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(AAResultsWrapperPass)
+INITIALIZE_PASS_END(HexagonLoopIdiomRecognize, "hexagon-loop-idiom",
+    "Recognize Hexagon-specific loop idioms", false, false)
+
+template <typename FuncT>
+void Simplifier::Context::traverse(Value *V, FuncT F) {
+  WorkListType Q;
+  Q.push_back(V);
+
+  while (!Q.empty()) {
+    Instruction *U = dyn_cast<Instruction>(Q.pop_front_val());
+    if (!U || U->getParent())
+      continue;
+    if (!F(U))
+      continue;
+    for (Value *Op : U->operands())
+      Q.push_back(Op);
+  }
+}
+
+void Simplifier::Context::print(raw_ostream &OS, const Value *V) const {
+  const auto *U = dyn_cast<const Instruction>(V);
+  if (!U) {
+    OS << V << '(' << *V << ')';
+    return;
+  }
+
+  if (U->getParent()) {
+    OS << U << '(';
+    U->printAsOperand(OS, true);
+    OS << ')';
+    return;
+  }
+
+  unsigned N = U->getNumOperands();
+  if (N != 0)
+    OS << U << '(';
+  OS << U->getOpcodeName();
+  for (const Value *Op : U->operands()) {
+    OS << '

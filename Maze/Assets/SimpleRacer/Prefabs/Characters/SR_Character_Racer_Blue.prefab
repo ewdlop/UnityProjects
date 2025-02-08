@@ -1,0 +1,622 @@
+
+                       int32_t      *fmtConsumed,
+                       int32_t      *argConverted)
+{
+    const UChar *source;
+    UConverter  *conv;
+    char        *arg    = (char*)(args[0].ptrValue);
+    char        *alias  = arg;
+    char        *limit;
+    UErrorCode  status  = U_ZERO_ERROR;
+    int32_t     count;
+    int32_t     skipped = 0;
+    UChar       c;
+    UBool       isNotEOF = FALSE;
+
+    /* skip all ws in the input */
+    if (info->fIsString) {
+        skipped = u_scanf_skip_leading_ws(input, info->fPadChar);
+    }
+
+    /* get the string one character at a time, truncating to the width */
+    count = 0;
+
+    /* open the default converter */
+    conv = u_getDefaultConverter(&status);
+
+    if(U_FAILURE(status))
+        return -1;
+
+    while( (info->fWidth == -1 || count < info->fWidth) 
+        && (isNotEOF = ufile_getch(input, &c))
+        && (!info->fIsString || (c != info->fPadChar && !u_isWhitespace(c))))
+    {
+
+        if (!info->fSkipArg) {
+            /* put the character from the input onto the target */
+            source = &c;
+            /* Since we do this one character at a time, do it this way. */
+            if (info->fWidth > 0) {
+                limit = alias + info->fWidth - count;
+            }
+            else {
+                limit = alias + ucnv_getMaxCharSize(conv);
+            }
+
+            /* convert the character to the default codepage */
+            ucnv_fromUnicode(conv, &alias, limit, &source, source + 1,
+                NULL, TRUE, &status);
+
+            if(U_FAILURE(status)) {
+                /* clean up */
+                u_releaseDefaultConverter(conv);
+                return -1;
+            }
+        }
+
+        /* increment the count */
+        ++count;
+    }
+
+    /* put the final character we read back on the input */
+    if (!info->fSkipArg) {
+        if ((info->fWidth == -1 || count < info->fWidth) && isNotEOF)
+            u_fungetc(c, input);
+
+        /* add the terminator */
+        if (info->fIsString) {
+            *alias = 0x00;
+        }
+    }
+
+    /* clean up */
+    u_releaseDefaultConverter(conv);
+
+    /* we converted 1 arg */
+    *argConverted = !info->fSkipArg;
+    return count + skipped;
+}
+
+static int32_t
+u_scanf_char_handler(UFILE          *input,
+                     u_scanf_spec_info *info,
+                     ufmt_args      *args,
+                     const UChar    *fmt,
+                     int32_t        *fmtConsumed,
+                     int32_t        *argConverted)
+{
+    if (info->fWidth < 0) {
+        info->fWidth = 1;
+    }
+    info->fIsString = FALSE;
+    return u_scanf_string_handler(input, info, args, fmt, fmtConsumed, argConverted);
+}
+
+static int32_t
+u_scanf_ustring_handler(UFILE       *input,
+                        u_scanf_spec_info *info,
+                        ufmt_args   *args,
+                        const UChar *fmt,
+                        int32_t     *fmtConsumed,
+                        int32_t     *argConverted)
+{
+    UChar   *arg     = (UChar*)(args[0].ptrValue);
+    UChar   *alias     = arg;
+    int32_t count;
+    int32_t skipped = 0;
+    UChar   c;
+    UBool   isNotEOF = FALSE;
+
+    /* skip all ws in the input */
+    if (info->fIsString) {
+        skipped = u_scanf_skip_leading_ws(input, info->fPadChar);
+    }
+
+    /* get the string one character at a time, truncating to the width */
+    count = 0;
+
+    while( (info->fWidth == -1 || count < info->fWidth)
+        && (isNotEOF = ufile_getch(input, &c))
+        && (!info->fIsString || (c != info->fPadChar && !u_isWhitespace(c))))
+    {
+
+        /* put the character from the input onto the target */
+        if (!info->fSkipArg) {
+            *alias++ = c;
+        }
+
+        /* increment the count */
+        ++count;
+    }
+
+    /* put the final character we read back on the input */
+    if (!info->fSkipArg) {
+        if((info->fWidth == -1 || count < info->fWidth) && isNotEOF) {
+            u_fungetc(c, input);
+        }
+
+        /* add the terminator */
+        if (info->fIsString) {
+            *alias = 0x0000;
+        }
+    }
+
+    /* we converted 1 arg */
+    *argConverted = !info->fSkipArg;
+    return count + skipped;
+}
+
+static int32_t
+u_scanf_uchar_handler(UFILE         *input,
+                      u_scanf_spec_info *info,
+                      ufmt_args     *args,
+                      const UChar   *fmt,
+                      int32_t       *fmtConsumed,
+                      int32_t       *argConverted)
+{
+    if (info->fWidth < 0) {
+        info->fWidth = 1;
+    }
+    info->fIsString = FALSE;
+    return u_scanf_ustring_handler(input, info, args, fmt, fmtConsumed, argConverted);
+}
+
+static int32_t
+u_scanf_spellout_handler(UFILE          *input,
+                         u_scanf_spec_info *info,
+                         ufmt_args      *args,
+                         const UChar    *fmt,
+                         int32_t        *fmtConsumed,
+                         int32_t        *argConverted)
+{
+    int32_t         len;
+    double          num;
+    UNumberFormat   *format;
+    int32_t         parsePos    = 0;
+    int32_t         skipped;
+    UErrorCode      status      = U_ZERO_ERROR;
+
+
+    /* skip all ws in the input */
+    skipped = u_scanf_skip_leading_ws(input, info->fPadChar);
+
+    /* fill the input's internal buffer */
+    ufile_fill_uchar_buffer(input);
+
+    /* determine the size of the input's buffer */
+    len = (int32_t)(input->str.fLimit - input->str.fPos);
+
+    /* truncate to the width, if specified */
+    if(info->fWidth != -1)
+        len = ufmt_min(len, info->fWidth);
+
+    /* get the formatter */
+    format = u_locbund_getNumberFormat(&input->str.fBundle, UNUM_SPELLOUT);
+
+    /* handle error */
+    if(format == 0)
+        return 0;
+
+    /* Skip the positive prefix. ICU normally can't handle this due to strict parsing. */
+    /* This is not applicable to RBNF. */
+    /*skipped += u_scanf_skip_leading_positive_sign(input, format, &status);*/
+
+    /* parse the number */
+    num = unum_parseDouble(format, input->str.fPos, len, &parsePos, &status);
+
+    if (!info->fSkipArg) {
+        *(double*)(args[0].ptrValue) = num;
+    }
+
+    /* mask off any necessary bits */
+    /*  if(! info->fIsLong_double)
+    num &= DBL_MAX;*/
+
+    /* update the input's position to reflect consumed data */
+    input->str.fPos += parsePos;
+
+    /* we converted 1 arg */
+    *argConverted = !info->fSkipArg;
+    return parsePos + skipped;
+}
+
+static int32_t
+u_scanf_hex_handler(UFILE       *input,
+                    u_scanf_spec_info *info,
+                    ufmt_args   *args,
+                    const UChar *fmt,
+                    int32_t     *fmtConsumed,
+                    int32_t     *argConverted)
+{
+    int32_t     len;
+    int32_t     skipped;
+    void        *num    = (void*) (args[0].ptrValue);
+    int64_t     result;
+
+    /* skip all ws in the input */
+    skipped = u_scanf_skip_leading_ws(input, info->fPadChar);
+
+    /* fill the input's internal buffer */
+    ufile_fill_uchar_buffer(input);
+
+    /* determine the size of the input's buffer */
+    len = (int32_t)(input->str.fLimit - input->str.fPos);
+
+    /* truncate to the width, if specified */
+    if(info->fWidth != -1)
+        len = ufmt_min(len, info->fWidth);
+
+    /* check for alternate form */
+    if( *(input->str.fPos) == 0x0030 &&
+        (*(input->str.fPos + 1) == 0x0078 || *(input->str.fPos + 1) == 0x0058) ) {
+
+        /* skip the '0' and 'x' or 'X' if present */
+        input->str.fPos += 2;
+        len -= 2;
+    }
+
+    /* parse the number */
+    result = ufmt_uto64(input->str.fPos, &len, 16);
+
+    /* update the input's position to reflect consumed data */
+    input->str.fPos += len;
+
+    /* mask off any necessary bits */
+    if (!info->fSkipArg) {
+        if (info->fIsShort)
+            *(int16_t*)num = (int16_t)(UINT16_MAX & result);
+        else if (info->fIsLongLong)
+            *(int64_t*)num = result;
+        else
+            *(int32_t*)num = (int32_t)(UINT32_MAX & result);
+    }
+
+    /* we converted 1 arg */
+    *argConverted = !info->fSkipArg;
+    return len + skipped;
+}
+
+static int32_t
+u_scanf_octal_handler(UFILE         *input,
+                      u_scanf_spec_info *info,
+                      ufmt_args     *args,
+                      const UChar   *fmt,
+                      int32_t       *fmtConsumed,
+                      int32_t       *argConverted)
+{
+    int32_t     len;
+    int32_t     skipped;
+    void        *num         = (void*) (args[0].ptrValue);
+    int64_t     result;
+
+    /* skip all ws in the input */
+    skipped = u_scanf_skip_leading_ws(input, info->fPadChar);
+
+    /* fill the input's internal buffer */
+    ufile_fill_uchar_buffer(input);
+
+    /* determine the size of the input's buffer */
+    len = (int32_t)(input->str.fLimit - input->str.fPos);
+
+    /* truncate to the width, if specified */
+    if(info->fWidth != -1)
+        len = ufmt_min(len, info->fWidth);
+
+    /* parse the number */
+    result = ufmt_uto64(input->str.fPos, &len, 8);
+
+    /* update the input's position to reflect consumed data */
+    input->str.fPos += len;
+
+    /* mask off any necessary bits */
+    if (!info->fSkipArg) {
+        if (info->fIsShort)
+            *(int16_t*)num = (int16_t)(UINT16_MAX & result);
+        else if (info->fIsLongLong)
+            *(int64_t*)num = result;
+        else
+            *(int32_t*)num = (int32_t)(UINT32_MAX & result);
+    }
+
+    /* we converted 1 arg */
+    *argConverted = !info->fSkipArg;
+    return len + skipped;
+}
+
+static int32_t
+u_scanf_pointer_handler(UFILE       *input,
+                        u_scanf_spec_info *info,
+                        ufmt_args   *args,
+                        const UChar *fmt,
+                        int32_t     *fmtConsumed,
+                        int32_t     *argConverted)
+{
+    int32_t len;
+    int32_t skipped;
+    void    *result;
+    void    **p     = (void**)(args[0].ptrValue);
+
+
+    /* skip all ws in the input */
+    skipped = u_scanf_skip_leading_ws(input, info->fPadChar);
+
+    /* fill the input's internal buffer */
+    ufile_fill_uchar_buffer(input);
+
+    /* determine the size of the input's buffer */
+    len = (int32_t)(input->str.fLimit - input->str.fPos);
+
+    /* truncate to the width, if specified */
+    if(info->fWidth != -1) {
+        len = ufmt_min(len, info->fWidth);
+    }
+
+    /* Make sure that we don't consume too much */
+    if (len > (int32_t)(sizeof(void*)*2)) {
+        len = (int32_t)(sizeof(void*)*2);
+    }
+
+    /* parse the pointer - assign to temporary value */
+    result = ufmt_utop(input->str.fPos, &len);
+
+    if (!info->fSkipArg) {
+        *p = result;
+    }
+
+    /* update the input's position to reflect consumed data */
+    input->str.fPos += len;
+
+    /* we converted 1 arg */
+    *argConverted = !info->fSkipArg;
+    return len + skipped;
+}
+
+static int32_t
+u_scanf_scanset_handler(UFILE       *input,
+                        u_scanf_spec_info *info,
+                        ufmt_args   *args,
+                        const UChar *fmt,
+                        int32_t     *fmtConsumed,
+                        int32_t     *argConverted)
+{
+    USet        *scanset;
+    UErrorCode  status = U_ZERO_ERROR;
+    int32_t     chLeft = INT32_MAX;
+    UChar32     c;
+    UChar       *alias = (UChar*) (args[0].ptrValue);
+    UBool       isNotEOF = FALSE;
+    UBool       readCharacter = FALSE;
+
+    /* Create an empty set */
+    scanset = uset_open(0, -1);
+
+    /* Back up one to get the [ */
+    fmt--;
+
+    /* truncate to the width, if specified and alias the target */
+    if(info->fWidth >= 0) {
+        chLeft = info->fWidth;
+    }
+
+    /* parse the scanset from the fmt string */
+    *fmtConsumed = uset_applyPattern(scanset, fmt, -1, 0, &status);
+
+    /* verify that the parse was successful */
+    if (U_SUCCESS(status)) {
+        c=0;
+
+        /* grab characters one at a time and make sure they are in the scanset */
+        while(chLeft > 0) {
+            if ((isNotEOF = ufile_getch32(input, &c)) && uset_contains(scanset, c)) {
+                readCharacter = TRUE;
+                if (!info->fSkipArg) {
+                    int32_t idx = 0;
+                    UBool isError = FALSE;
+
+                    U16_APPEND(alias, idx, chLeft, c, isError);
+                    if (isError) {
+                        break;
+                    }
+                    alias += idx;
+                }
+                chLeft -= (1 + U_IS_SUPPLEMENTARY(c));
+            }
+            else {
+                /* if the character's not in the scanset, break out */
+                break;
+            }
+        }
+
+        /* put the final character we read back on the input */
+        if(isNotEOF && chLeft > 0) {
+            u_fungetc(c, input);
+        }
+    }
+
+    uset_close(scanset);
+
+    /* if we didn't match at least 1 character, fail */
+    if(!readCharacter)
+        return -1;
+    /* otherwise, add the terminator */
+    else if (!info->fSkipArg) {
+        *alias = 0x00;
+    }
+
+    /* we converted 1 arg */
+    *argConverted = !info->fSkipArg;
+    return (info->fWidth >= 0 ? info->fWidth : INT32_MAX) - chLeft;
+}
+
+/* Use US-ASCII characters only for formatting. Most codepages have
+ characters 20-7F from Unicode. Using any other codepage specific
+ characters will make it very difficult to format the string on
+ non-Unicode machines */
+static const u_scanf_info g_u_scanf_infos[USCANF_NUM_FMT_HANDLERS] = {
+/* 0x20 */
+    UFMT_EMPTY,         UFMT_EMPTY,         UFMT_EMPTY,         UFMT_EMPTY,
+    UFMT_EMPTY,         UFMT_SIMPLE_PERCENT,UFMT_EMPTY,         UFMT_EMPTY,
+    UFMT_EMPTY,         UFMT_EMPTY,         UFMT_EMPTY,         UFMT_EMPTY,
+    UFMT_EMPTY,         UFMT_EMPTY,         UFMT_EMPTY,         UFMT_EMPTY,
+
+/* 0x30 */
+    UFMT_EMPTY,         UFMT_EMPTY,         UFMT_EMPTY,         UFMT_EMPTY,
+    UFMT_EMPTY,         UFMT_EMPTY,         UFMT_EMPTY,         UFMT_EMPTY,
+    UFMT_EMPTY,         UFMT_EMPTY,         UFMT_EMPTY,         UFMT_EMPTY,
+    UFMT_EMPTY,         UFMT_EMPTY,         UFMT_EMPTY,         UFMT_EMPTY,
+
+/* 0x40 */
+    UFMT_EMPTY,         UFMT_EMPTY,         UFMT_EMPTY,         UFMT_UCHAR,
+    UFMT_EMPTY,         UFMT_SCIENTIFIC,    UFMT_EMPTY,         UFMT_SCIDBL,
+#ifdef U_USE_OBSOLETE_IO_FORMATTING
+    UFMT_EMPTY,         UFMT_EMPTY,         UFMT_EMPTY,         UFMT_UCHAR/*deprecated*/,
+#else
+    UFMT_EMPTY,         UFMT_EMPTY,         UFMT_EMPTY,         UFMT_EMPTY,
+#endif
+    UFMT_EMPTY,         UFMT_EMPTY,         UFMT_EMPTY,         UFMT_EMPTY,
+
+/* 0x50 */
+    UFMT_PERCENT,       UFMT_EMPTY,         UFMT_EMPTY,         UFMT_USTRING,
+#ifdef U_USE_OBSOLETE_IO_FORMATTING
+    UFMT_EMPTY,         UFMT_USTRING/*deprecated*/,UFMT_SPELLOUT,      UFMT_EMPTY,
+#else
+    UFMT_EMPTY,         UFMT_EMPTY,         UFMT_SPELLOUT,      UFMT_EMPTY,
+#endif
+    UFMT_HEX,           UFMT_EMPTY,         UFMT_EMPTY,         UFMT_SCANSET,
+    UFMT_EMPTY,         UFMT_EMPTY,         UFMT_EMPTY,         UFMT_EMPTY,
+
+/* 0x60 */
+    UFMT_EMPTY,         UFMT_EMPTY,         UFMT_EMPTY,         UFMT_CHAR,
+    UFMT_INT,           UFMT_SCIENTIFIC,    UFMT_DOUBLE,        UFMT_SCIDBL,
+    UFMT_EMPTY,         UFMT_INT,           UFMT_EMPTY,         UFMT_EMPTY,
+    UFMT_EMPTY,         UFMT_EMPTY,         UFMT_COUNT,         UFMT_OCTAL,
+
+/* 0x70 */
+    UFMT_POINTER,       UFMT_EMPTY,         UFMT_EMPTY,         UFMT_STRING,
+    UFMT_EMPTY,         UFMT_UINT,          UFMT_EMPTY,         UFMT_EMPTY,
+    UFMT_HEX,           UFMT_EMPTY,         UFMT_EMPTY,         UFMT_EMPTY,
+    UFMT_EMPTY,         UFMT_EMPTY,         UFMT_EMPTY,         UFMT_EMPTY,
+};
+
+U_CFUNC int32_t
+u_scanf_parse(UFILE     *f,
+            const UChar *patternSpecification,
+            va_list     ap)
+{
+    const UChar     *alias;
+    int32_t         count, converted, argConsumed, cpConsumed;
+    uint16_t        handlerNum;
+
+    ufmt_args       args;
+    u_scanf_spec    spec;
+    ufmt_type_info  info;
+    u_scanf_handler handler;
+
+    /* alias the pattern */
+    alias = patternSpecification;
+
+    /* haven't converted anything yet */
+    argConsumed = 0;
+    converted = 0;
+    cpConsumed = 0;
+
+    /* iterate through the pattern */
+    for(;;) {
+
+        /* match any characters up to the next '%' */
+        while(*alias != UP_PERCENT && *alias != 0x0000 && u_fgetc(f) == *alias) {
+            alias++;
+        }
+
+        /* if we aren't at a '%', or if we're at end of string, break*/
+        if(*alias != UP_PERCENT || *alias == 0x0000)
+            break;
+
+        /* parse the specifier */
+        count = u_scanf_parse_spec(alias, &spec);
+
+        /* update the pointer in pattern */
+        alias += count;
+
+        handlerNum = (uint16_t)(spec.fInfo.fSpec - USCANF_BASE_FMT_HANDLERS);
+        if (handlerNum < USCANF_NUM_FMT_HANDLERS) {
+            /* skip the argument, if necessary */
+            /* query the info function for argument information */
+            info = g_u_scanf_infos[ handlerNum ].info;
+            if (info != ufmt_count && u_feof(f)) {
+                break;
+            }
+            else if(spec.fInfo.fSkipArg) {
+                args.ptrValue = NULL;
+            }
+            else {
+                switch(info) {
+                case ufmt_count:
+                    /* set the spec's width to the # of items converted */
+                    spec.fInfo.fWidth = cpConsumed;
+                    /* fall through to next case */
+                case ufmt_char:
+                case ufmt_uchar:
+                case ufmt_int:
+                case ufmt_string:
+                case ufmt_ustring:
+                case ufmt_pointer:
+                case ufmt_float:
+                case ufmt_double:
+                    args.ptrValue = va_arg(ap, void*);
+                    break;
+
+                default:
+                    /* else args is ignored */
+                    args.ptrValue = NULL;
+                    break;
+                }
+            }
+
+            /* call the handler function */
+            handler = g_u_scanf_infos[ handlerNum ].handler;
+            if(handler != 0) {
+
+                /* reset count to 1 so that += for alias works. */
+                count = 1;
+
+                cpConsumed += (*handler)(f, &spec.fInfo, &args, alias, &count, &argConsumed);
+
+                /* if the handler encountered an error condition, break */
+                if(argConsumed < 0) {
+                    converted = -1;
+                    break;
+                }
+
+                /* add to the # of items converted */
+                converted += argConsumed;
+
+                /* update the pointer in pattern */
+                alias += count-1;
+            }
+            /* else do nothing */
+        }
+        /* else do nothing */
+
+        /* just ignore unknown tags */
+    }
+
+    /* return # of items converted */
+    return converted;
+}
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+                                                                                                         çH,Ìé3N_Pe†r‡–
+º≥ì∞ô{så)m˛Vö∏iÕOzé√ªô	<X–\√ÄzÜﬂ!¡Ø
+Néâ¬⁄‘ØwT®q˝ÃiDÙ‹\)Ì–o$%u1©ÿK@EÍ‡t„√Àk‰óÎN±}i^^”ckÖzBUdµ6ÁU∂¡ü?®^p¶∂GôZü[´©+’YRR˙˜ÏÖÕy+Û~ø9≈FÃj Ÿ=Œ∞¸ê dÍŒÑ™”ö—©g1º˘≤∞	∑oìÔÀΩHÒ_˙>ùkd}7Ê˘3Z9eEƒ¬;√;`í§L¥Òü∫ﬂµólkFnW…WîM2Àq˚ÔpÛ∞O‡ Ù†9ÚpßH8á66Â.W<ò¶¢`YÒ˚ô˜àˆmªÒÆ·˙-w@tÅˇ»¨¿_J∑óÒ“#4Ä¢›4»ˇ6èÏÙ£R3≈Ukhî'2“æ»Á¿w∞ËXØWØ
+&”2¥∂`´U/mÜ˝ùûù!ª  äû¿˜R¨N8e∂‘ò≠
+?1`“˘ ùß¬ù√KÎ?[ πÛ∂fã†ìπªs Käù ∏∂8ﬁíõ-Í<<=ì≤äI‰ä°ÊbàG[ôbáûêì
+%»>z¥ÊH›âm{%u¸4\ﬁ?·“ÆàolâùfÌ[,¢î-¨±d˜5ô¥∫º
+Vàö¯¡n∑C™sπ˜ƒ
+dw´'Ñ‰ÁÉPÉµiC´âOw¢ÂÉ(ÛÀ‡ˆ∞)Û»"˘á£ãíçW÷Í$$P†Çlép‹5hﬁ >dv§Ç»·úˆìS‡óV
+îMÒú|øÈø∏æxØQ\îØêÒV¯îhˆ}ù_ë«0´¥`®Ô€¯,–~D]‡˝¢òh']¥æôz®G∂ÿˇP:‹X¶^´åDfNÉ,Jﬂt]◊˛É(Äpæ'£:,Á˘0ˆΩ”≥ÈJÛzc‡ﬂ^¯ SäÅ;oÊ°B2ÔAèfëq}gÆl4(≠£ÿ¢G"Å∑∞Ï˛@r≥ﬂg†[à∫µ√€íY÷úÿà„DﬁÛ≥¨ï!–…û ùëªëã’Æ∑o‹ÌN¸Â˚»záˆ)ƒB$oÄ˘π∞yÑØ™ï¢ÍÄ8∏$Î33bj∂`∞Èc+û≥	pØ!$§≠É'qù¿'j|ﬁ’ÿπÜH'ˆ ≈$‹∂éahGBú§y∑¿\ˇky•ßÄ2ºÚeù µKÛ!PÈ»Û*~|ˆ](ì÷ùì≈[≠≈G<¨YƒÖº‘4ÙÖt4'DÕ°ê˛j X
+üØ+G^N]√~H:ÏÌféQıÅÚ∫àYDcUc™Ó9SNN'´uIòêgc˝‡HR4©WvY¨¢Ω°â&ñMZê       ˇˇ  ∏       @                                   Ä   ∫ ¥	Õ!∏LÕ!This program cannot be run in DOS mode.
+$       PE  L ‘h%æ        ‡ " 0           í*       @                           Ä          @Ö                           @*  O    @  å                   `     $*                                                               H           .text   ò
+                           `.rsrc   å   @                    @  @.reloc      `                    @  B                t*      H     P   T	  	               §)  Ä                                   BSJB         v4.0.30319     l   |  #~  Ë    #Strings    ¯     #US ¸     #GUID     H  #Blob         T  â    ˙3                                Y      £ “    ◊Ö °Ö JÖ -Ö Œ Ö Î Ö àÖ ∑ Ö hÂ ºÂ Â vL L â °           	 Ã  Ã ! Ã ) Ã 1 Ã 9 Ã A Ã I Ã Q Ã Y Ã a Ã i Ã y Ã Å Ã ' s !.  f.  o.  Ç. # ¿. + ¿. 3 ‚. ; ‚. C Ô. K ¿. S . [ !. c &  ∆ Ä     
+      $ ó              
+                 E            E	         A E	         ±E	          E	         ı/	         Ÿ/	         Ñ/	         h/	         ∞/	         /	         ) /	         y E	         ` E	         √E	         E	         .E	    <Module> mscorlib BasicHttpSecurityMode WebSocketTransportUsage BasicHttpMessageCredentialType HttpClientCredentialType HttpBindingBase UnverifiableCodeAttribute DebuggableAttribute AssemblyTitleAttribute AssemblyFileVersionAttribute AssemblyInformationalVersionAttribute SecurityPermissionAttribute AssemblyDescriptionAttribute AssemblyDefaultAliasAttribute CompilationRelaxationsAttribute AssemblyProductAttribute AssemblyCopyrightAttribute ReferenceAssemblyAttribute AssemblyCompanyAttribute RuntimeCompatibilityAttribute BasicHttpBinding NetHttpBinding NetHttpMessageEncoding System.ServiceModel System.ServiceModel.Http.dll SecurityAction System.Reflection System.ServiceModel.Http IHttpCookieContainerManager .ctor System.Diagnostics System.Runtime.CompilerServices DebuggingModes WebSocketTransportSettings System.ServiceModel.Channels System.Security.Permissions HttpTransportBindingElement HttpsTransportBindingElement System.Security BasicHttpSecurity HttpTransportSecurity HttpResponseMessageProperty HttpRequestMessageProperty     ÑO˘ÚÚÃAãZ›°FmÒ√  	     9∑z\V4‡âÄ† $  Ä  î      $  RSA1     —˙WƒÆŸ£.Ñ™Æ˝ÈË˝jÏèá˚vlÉLôí≤;ÁöŸ’‹¡›ö“6!êr<˘Äïƒ·wè∆wO)Ë2íÍÏ‰Ë!¿•ÔËÒd\Lì¡´ô(]b,™e,˙÷=t]o-ÂÒ~^Øƒñ=&äCe m¿ì4MZ“ìÄû.ÄÑSystem.Security.Permissions.SecurityPermissionAttribute, mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089TSkipVerification       Xamarin, Inc.  = 8Copyright (c) 2013 Xamarin Inc. (http://www.xamarin.com)  ! System.ServiceModel.Http.dll   4.0.0.0  ( #Mono Common Language Infrastructure             TWrapNonExceptionThrows                                                                                                                                                              h*          Ç*                          t*            _CorDllMain mscoree.dll     ˇ%                                                                                                                                                                                                                                                                                                                                                                                               Ä                  0  Ä                   H   X@  .          .4   V S _ V E R S I O N _ I N F O     ΩÔ˛                 ?                         D    V a r F i l e I n f o     $    T r a n s l a t i o n       ∞é   S t r i n g F i l e I n f o   j   0 0 0 0 0 4 b 0   R   C o m m e n t s   S y s t e m . S e r v i c e M o d e l . H t t p . d l l     <   C o m p a n y N a m e     X a m a r i n ,   I n c .   b   F i l e D e s c r i p t i o n     S y s t e m . S e r v i c e M o d e l . H t t p . d l l     0   F i l e V e r s i o n     4 . 0 . 0 . 0   Z   I n t e r n a l N a m e   S y s t e m . S e r v i c e M o d e l . H t t p . d l l     ñ 9  L e g a l C o p y r i g h t   C o p y r i g h t   ( c )   2 0 1 3   X a m a r i n   I n c .   ( h t t p : / / w w w . x a m a r i n . c o m )     b   O r i g i n a l F i l e n a m e   S y s t e m . S e r v i c e M o d e l . H t t p . d l l     h $  P r o d u c t N a m e     M o n o   C o m m o n   L a n g u a g e   I n f r a s t r u c t u r e   4   P r o d u c t V e r s i o n   4 . 0 . 0 . 0   : 	  A s s e m b l y   V e r s i o n   4 . 0 . 1 0 . 0                                                                                                                                                                                                                                                                                                                                                                                                    î:                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      ?   ‹Ì  NÏ  ?   €Ì  5Ì  ?   ⁄Ì  2Ì  ?   ŸÌ  œÌ  =  é‰  >  ÿÌ  ?   ÿÌ  >Ï  ?   ◊Ì  %Ì  ?   ÷Ì  "Ì  ?   ’Ì  ÀÌ  =  p‰  >  ‘Ì  ?   ‘Ì  .Ï  ?   ”Ì  Ì  ?   “Ì  Ì  ?   —Ì  «Ì  =  P‰  >  –Ì  ?   –Ì  Ï  ?   œÌ  Ì  ?   ŒÌ  Ì  ?   ÕÌ  √Ì  =  2‰  >  ÃÌ  ?   ÃÌ  Ï  ?   ÀÌ  ıÏ  ?    Ì  ÚÏ  ?   …Ì  øÌ  =  ‰  >  »Ì  ?   »Ì  ˛Î  ?   «Ì  ÂÏ  ?   ∆Ì  ‚Ï  ?   ≈Ì  ªÌ  =  Ù„  >  ƒÌ  ?   ƒÌ  ÓÎ  ?   √Ì  ’Ï  ?   ¬Ì  “Ï  ?   ¡Ì  ∑Ì  =  ‘„  >  ¿Ì  ?   ¿Ì  ﬁÎ  ?   øÌ  ≈Ï  ?   æÌ  ¬Ï  ?   ΩÌ  ≥Ì  =  ∂„  >  ºÌ  ?   ºÌ  ŒÎ  ?   ªÌ  µÏ  ?   ∫Ì  ≤Ï  ?   πÌ  ØÌ  =  ñ„  >  ∏Ì  ?   ∏Ì  æÎ  ?   ∑Ì  •Ï  ?   ∂Ì  ¢Ï  ?   µÌ  ´Ì  =  x„  >  ¥Ì  ?   ¥Ì  ÆÎ  ?   ≥Ì  ïÏ  ?   ≤Ì  íÏ  ?   ±Ì  ßÌ  =  X„  >  ∞Ì  ?   ∞Ì  ûÎ  ?   ØÌ  ÖÏ  ?   ÆÌ  ÇÏ  ?   ≠Ì  £Ì  =  ¬·  >  ¨Ì  ?   ¨Ì  éÎ  ?   ´Ì  uÏ  ?   ™Ì  rÏ  ?   ©Ì  üÌ  =  &„  >  ®Ì  ?   ®Ì  ~Î  ?   ßÌ  eÏ  ?   ¶Ì  bÏ  ?   •Ì  õÌ  =  ò·  >  §Ì  ?   §Ì  nÎ  ?   £Ì  UÏ  ?   ¢Ì  RÏ  ?   °Ì  óÌ  =  Ú‚  >  †Ì  ?   †Ì  ^Î  ?   üÌ  EÏ  ?   ûÌ  BÏ  ?   ùÌ  ìÌ  =  n·  >  úÌ  ?   úÌ  NÎ  ?   õÌ  5Ï  ?   öÌ  2Ï  ?   ôÌ  èÌ  =  æ‚  >  òÌ  ?   òÌ  >Î  ?   óÌ  %Ï  ?   ñÌ  "Ï  ?   ïÌ  ãÌ  =  D·  >  îÌ  ?   îÌ  .Î  ?   ìÌ  Ï  ?   íÌ  Ï  ?   ëÌ  áÌ  =  ä‚  >  êÌ  ?   êÌ  Î  ?   èÌ  Ï  ?   éÌ  Ï  ?   çÌ  ÉÌ  =  ·  >  åÌ  ?   åÌ  Î  ?   ãÌ  ıÎ  ?   äÌ  ÚÎ  ?   âÌ  Ì  =  V‚  >  àÌ  ?   àÌ  ˛Í  ?   áÌ  ÂÎ  ?   ÜÌ  ‚Î  ?   ÖÌ  {Ì  =  ‡  >  ÑÌ  ?   ÑÌ  ÓÍ  ?   ÉÌ  ’Î  ?   ÇÌ  “Î  ?   ÅÌ  wÌ  =  "‚  >  ÄÌ  ?   ÄÌ  ﬁÍ  ?   Ì  ≈Î  ?   ~Ì  ¬Î  ?   }Ì  sÌ  =  ∆‡  >  |Ì  ?   |Ì  ŒÍ  ?   {Ì  µÎ  ?   zÌ  ≤Î  ?   yÌ  oÌ  =  Ó·  >  xÌ  ?   xÌ  æÍ  ?   wÌ  •Î  ?   vÌ  ¢Î  ?   uÌ  kÌ  =  ú‡  >  tÌ  ?   tÌ  ÆÍ  ?   sÌ  ïÎ  ?   rÌ  íÎ  ?   qÌ  gÌ  =  ∫·  >  pÌ  ?   pÌ  ûÍ  ?   oÌ  ÖÎ  ?   nÌ  ÇÎ  ?   mÌ  cÌ  =  r‡  >  lÌ  ?   lÌ  éÍ  ?   kÌ  uÎ  ?   jÌ  rÎ  ?   iÌ  _Ì  =  Ü·  >  hÌ  ?   hÌ  ~Í  ?   gÌ  eÎ  ?   fÌ  bÎ  ?   eÌ  [Ì  =  H‡  >  dÌ  ?   dÌ  nÍ  ?   cÌ  UÎ  ?   bÌ  RÎ  ?   aÌ  WÌ  =  R·  >  `Ì  ?   `Ì  ^Í  ?   _Ì  EÎ  ?   ^Ì  BÎ  ?   ]Ì  SÌ  =  ‡  >  \Ì  ?   \Ì  NÍ  ?   [Ì  5Î  ?   ZÌ  2Î  ?   YÌ  OÌ  =  ·  >  XÌ  ?   XÌ  >Í  ?   WÌ  %Î  ?   VÌ  "Î  ?   UÌ  KÌ  =  Ùﬂ  >  TÌ  ?   TÌ  .Í  ?   SÌ  Î  ?   RÌ  Î  ?   QÌ  GÌ  =  Í‡  >  PÌ  ?   PÌ  Í  ?   OÌ  Î  ?   NÌ  Î  ?   MÌ  CÌ  =   ﬂ  >  LÌ  ?   LÌ  Í  ?   KÌ  ıÍ  ?   JÌ  ÚÍ  ?   IÌ  ?Ì  =  ∂‡  >  HÌ  ?   HÌ  ˛È  ?   GÌ  ÂÍ  ?   FÌ  ‚Í  ?   EÌ  ;Ì  =  ñ‡  >  DÌ  ?   DÌ  ÓÈ  ?   CÌ  ’Í  ?   BÌ  “Í  ?   AÌ  7Ì  =  x‡  >  @Ì  ?   @Ì  ﬁÈ  ?   ?Ì  ≈Í  ?   >Ì  ¬Í  ?   =Ì  3Ì  =  Äﬂ  >

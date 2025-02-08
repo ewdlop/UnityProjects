@@ -1,0 +1,259 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "NiagaraTypeCustomizations.h"
+#include "CoreMinimal.h"
+#include "DetailLayoutBuilder.h"
+#include "DetailWidgetRow.h"
+#include "IDetailChildrenBuilder.h"
+#include "NiagaraConstants.h"
+#include "NiagaraConstants.h"
+#include "NiagaraEditorStyle.h"
+#include "NiagaraEmitter.h"
+#include "NiagaraNodeOutput.h"
+#include "NiagaraNodeParameterMapBase.h"
+#include "NiagaraParameterMapHistory.h"
+#include "NiagaraPlatformSet.h"
+#include "NiagaraRendererProperties.h"
+#include "NiagaraScriptSource.h"
+#include "NiagaraScriptVariable.h"
+#include "NiagaraSystem.h"
+#include "NiagaraTypes.h"
+#include "PlatformInfo.h"
+#include "PropertyHandle.h"
+#include "SGraphActionMenu.h"
+#include "Scalability.h"
+#include "ScopedTransaction.h"
+#include "DeviceProfiles/DeviceProfile.h"
+#include "DeviceProfiles/DeviceProfileManager.h"
+#include "Framework/Application/SlateApplication.h"
+#include "Widgets/Input/SButton.h"
+#include "Widgets/Input/SCheckBox.h"
+#include "Widgets/Input/SComboButton.h"
+#include "Widgets/Input/STextComboBox.h"
+#include "Widgets/Layout/SWrapBox.h"
+#include "NiagaraSimulationStageBase.h"
+#include "Widgets/Text/STextBlock.h"
+#include "NiagaraDataInterfaceRW.h"
+#include "NiagaraSettings.h"
+#include "Widgets/SNiagaraParameterName.h"
+
+#define LOCTEXT_NAMESPACE "FNiagaraVariableAttributeBindingCustomization"
+
+void FNiagaraNumericCustomization::CustomizeHeader(TSharedRef<IPropertyHandle> PropertyHandle, FDetailWidgetRow& HeaderRow, IPropertyTypeCustomizationUtils& CustomizationUtils)
+{
+	TSharedPtr<IPropertyHandle> ValueHandle = PropertyHandle->GetChildHandle(TEXT("Value"));
+
+	HeaderRow
+		.NameContent()
+		[
+			PropertyHandle->CreatePropertyNameWidget()
+		]
+		.ValueContent()
+		.MaxDesiredWidth(ValueHandle.IsValid() ? 125.f : 200.f)
+		[
+			// Some Niagara numeric types have no value so in that case just display their type name
+			ValueHandle.IsValid()
+			? ValueHandle->CreatePropertyValueWidget()
+			: SNew(STextBlock)
+			  .Text(FText::FromString(FName::NameToDisplayString(CastField<FStructProperty>(PropertyHandle->GetProperty())->Struct->GetName(), false)))
+			  .Font(IDetailLayoutBuilder::GetDetailFont())
+		];
+}
+
+
+void FNiagaraBoolCustomization::CustomizeHeader(TSharedRef<IPropertyHandle> PropertyHandle, FDetailWidgetRow& HeaderRow, IPropertyTypeCustomizationUtils& CustomizationUtils)
+{
+	ValueHandle = PropertyHandle->GetChildHandle(TEXT("Value"));
+
+	static const FName DefaultForegroundName("DefaultForeground");
+
+	HeaderRow
+		.NameContent()
+		[
+			PropertyHandle->CreatePropertyNameWidget()
+		]
+		.ValueContent()
+		[
+			SNew(SCheckBox)
+			.OnCheckStateChanged(this, &FNiagaraBoolCustomization::OnCheckStateChanged)
+			.IsChecked(this, &FNiagaraBoolCustomization::OnGetCheckState)
+			.ForegroundColor(FEditorStyle::GetSlateColor(DefaultForegroundName))
+			.Padding(0.0f)
+		];
+}
+
+ECheckBoxState FNiagaraBoolCustomization::OnGetCheckState() const
+{
+	ECheckBoxState CheckState = ECheckBoxState::Undetermined;
+	int32 Value;
+	FPropertyAccess::Result Result = ValueHandle->GetValue(Value);
+	if (Result == FPropertyAccess::Success)
+	{
+		CheckState = Value == FNiagaraBool::True ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+	}
+
+	return CheckState;
+}
+
+void FNiagaraBoolCustomization::OnCheckStateChanged(ECheckBoxState InNewState)
+{
+	if (InNewState == ECheckBoxState::Checked)
+	{
+		ValueHandle->SetValue(FNiagaraBool::True);
+	}
+	else
+	{
+		ValueHandle->SetValue(FNiagaraBool::False);
+	}
+}
+
+void FNiagaraMatrixCustomization::CustomizeChildren(TSharedRef<IPropertyHandle> PropertyHandle, IDetailChildrenBuilder& ChildBuilder, IPropertyTypeCustomizationUtils& CustomizationUtils)
+{
+	uint32 NumChildren = 0;
+	PropertyHandle->GetNumChildren(NumChildren);
+
+	for (uint32 ChildNum = 0; ChildNum < NumChildren; ++ChildNum)
+	{
+		ChildBuilder.AddProperty(PropertyHandle->GetChildHandle(ChildNum).ToSharedRef());
+	}
+}
+
+TArray<FNiagaraVariableBase> FNiagaraStackAssetAction_VarBind::FindVariables(UNiagaraEmitter* InEmitter, bool bSystem, bool bEmitter, bool bParticles, bool bUser)
+{
+	TArray<FNiagaraVariableBase> Bindings;
+	TArray<FNiagaraParameterMapHistory> Histories;
+
+	UNiagaraScriptSource* Source = Cast<UNiagaraScriptSource>(InEmitter->GraphSource);
+	if (Source)
+	{
+		Histories.Append(UNiagaraNodeParameterMapBase::GetParameterMaps(Source->NodeGraph));
+	}
+
+	if (bSystem || bEmitter)
+	{
+		UNiagaraSystem* Sys = InEmitter->GetTypedOuter<UNiagaraSystem>();
+		if (Sys)
+		{
+			Source = Cast<UNiagaraScriptSource>(Sys->GetSystemUpdateScript()->GetSource()); 
+			if (Source)
+			{
+				Histories.Append(UNiagaraNodeParameterMapBase::GetParameterMaps(Source->NodeGraph));
+			}
+		}
+	}
+	
+
+
+	for (const FNiagaraParameterMapHistory& History : Histories)
+	{
+		for (const FNiagaraVariable& Var : History.Variables)
+		{
+			if (FNiagaraParameterMapHistory::IsAttribute(Var) && bParticles)
+			{
+				Bindings.AddUnique(Var);
+			}
+			else if (FNiagaraParameterMapHistory::IsSystemParameter(Var) && bSystem)
+			{
+				Bindings.AddUnique(Var);
+			}
+			else if (Var.IsInNameSpace(InEmitter->GetUniqueEmitterName()) && bEmitter)
+			{
+				TMap<FString, FString> Aliases;
+				Aliases.Add(InEmitter->GetUniqueEmitterName(), FNiagaraConstants::EmitterNamespace.ToString());
+				Bindings.AddUnique(Var.ResolveAliases(Var, Aliases));
+			}
+			else if (FNiagaraParameterMapHistory::IsAliasedEmitterParameter(Var) && bEmitter)
+			{
+				Bindings.AddUnique(Var);
+			}
+			else if (Var.IsInNameSpace(FNiagaraConstants::EmitterNamespace) && bEmitter)
+			{
+				Bindings.AddUnique(Var);
+			}
+			else if (FNiagaraParameterMapHistory::IsUserParameter(Var) && bUser)
+			{
+				Bindings.AddUnique(Var);
+			}
+		}
+	}
+
+	if (bUser)
+	{
+		UNiagaraSystem* Sys = InEmitter->GetTypedOuter<UNiagaraSystem>();
+		if (Sys)
+		{
+			for (const FNiagaraVariable Var : Sys->GetExposedParameters().ReadParameterVariables())
+			{
+				Bindings.AddUnique(Var);
+			}
+		}
+	}
+	return Bindings;
+}
+
+
+FName FNiagaraVariableAttributeBindingCustomization::GetVariableName() const
+{
+	if (BaseEmitter && TargetVariableBinding)
+	{
+		return (TargetVariableBinding->GetName(RenderProps->GetCurrentSourceMode()));
+	}
+	return FName();
+}
+
+FText FNiagaraVariableAttributeBindingCustomization::GetCurrentText() const
+{
+	if (BaseEmitter && TargetVariableBinding)
+	{
+		return FText::FromName(TargetVariableBinding->GetName(RenderProps->GetCurrentSourceMode()));
+	}
+	return FText::FromString(TEXT("Missing"));
+}
+
+FText FNiagaraVariableAttributeBindingCustomization::GetTooltipText() const
+{
+	if (BaseEmitter && TargetVariableBinding)
+	{
+		FString DefaultValueStr = TargetVariableBinding->GetDefaultValueString();
+
+		FText TooltipDesc = FText::Format(LOCTEXT("AttributeBindingTooltip", "Use the variable \"{0}\" if it exists, otherwise use the default \"{1}\" "), FText::FromName(TargetVariableBinding->GetName(RenderProps->GetCurrentSourceMode())),
+			FText::FromString(DefaultValueStr));
+		return TooltipDesc;
+	}
+	return FText::FromString(TEXT("Missing"));
+}
+
+TSharedRef<SWidget> FNiagaraVariableAttributeBindingCustomization::OnGetMenuContent() const
+{
+	FGraphActionMenuBuilder MenuBuilder;
+
+	return SNew(SBorder)
+		.BorderImage(FEditorStyle::GetBrush("Menu.Background"))
+		.Padding(5)
+		[
+			SNew(SBox)
+			[
+				SNew(SGraphActionMenu)
+				.OnActionSelected(const_cast<FNiagaraVariableAttributeBindingCustomization*>(this), &FNiagaraVariableAttributeBindingCustomization::OnActionSelected)
+				.OnCreateWidgetForAction(SGraphActionMenu::FOnCreateWidgetForAction::CreateSP(const_cast<FNiagaraVariableAttributeBindingCustomization*>(this), &FNiagaraVariableAttributeBindingCustomization::OnCreateWidgetForAction))
+				.OnCollectAllActions(const_cast<FNiagaraVariableAttributeBindingCustomization*>(this), &FNiagaraVariableAttributeBindingCustomization::CollectAllActions)
+				.AutoExpandActionMenu(false)
+				.ShowFilterTextBox(true)
+			]
+		];
+}
+
+TArray<FName> FNiagaraVariableAttributeBindingCustomization::GetNames(UNiagaraEmitter* InEmitter) const
+{
+	TArray<FName> Names;
+
+	bool bSystem = true;
+	bool bEmitter = true;
+	bool bParticles = true;
+	bool bUser = true;
+	TArray<FNiagaraVariableBase> Vars = FNiagaraStackAssetAction_VarBind::FindVariables(InEmitter, bSystem, bEmitter, bParticles, bUser);
+	for (const FNiagaraVariableBase& Var : Vars)
+	{
+		if (RenderProps && PropertyHandle.IsValid() && PropertyHandle->GetProperty() && RenderProps->IsSupportedVariableForBinding(Var, *PropertyHandle->GetProperty()->GetName()))
+		{
+			if (Var.GetType() == TargetVariableBinding->GetTyp

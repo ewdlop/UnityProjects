@@ -1,0 +1,845 @@
+//
+// TaskLoggingHelper.cs: Wrapper aroudn IBuildEngine.
+//
+// Author:
+//   Marek Sieradzki (marek.sieradzki@gmail.com)
+//
+// (C) 2005 Marek Sieradzki
+//
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+//
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+using System;
+using System.IO;
+using System.Resources;
+using System.Text;
+using Microsoft.Build.Framework;
+
+namespace Microsoft.Build.Utilities
+{
+	public class TaskLoggingHelper : MarshalByRefObject
+	{
+		IBuildEngine	buildEngine;
+		bool		hasLoggedErrors;
+		string		helpKeywordPrefix;
+		string		taskName;
+		ResourceManager	taskResources;
+		ITask		taskInstance;
+	
+		public TaskLoggingHelper (ITask taskInstance)
+		{
+			if (taskInstance == null)
+				throw new ArgumentNullException ("taskInstance");
+
+			this.taskInstance = taskInstance;
+			taskName = null;
+		}
+
+		[MonoTODO]
+		public string ExtractMessageCode (string message,
+						  out string messageWithoutCodePrefix)
+		{
+			if (message == null)
+				throw new ArgumentNullException ("message");
+				
+			messageWithoutCodePrefix = String.Empty;
+			return String.Empty;
+		}
+
+		[MonoTODO]
+		public virtual string FormatResourceString (string resourceName,
+							    params object[] args)
+		{
+			if (resourceName == null)
+				throw new ArgumentNullException ("resourceName");
+
+			if (taskResources == null)
+				throw new InvalidOperationException ("Task did not register any task resources");
+
+			string resourceString = taskResources.GetString (resourceName);
+			if (resourceString == null)
+				throw new ArgumentException ($"No resource string found for resource named {resourceName}");
+
+			return FormatString (resourceString, args);
+		}
+
+		[MonoTODO]
+		public virtual string FormatString (string unformatted,
+						   params object[] args)
+		{
+			if (unformatted == null)
+				throw new ArgumentNullException ("unformatted");
+		
+			if (args == null || args.Length == 0)
+				return unformatted;
+			else
+				return String.Format (unformatted, args);
+		}
+		
+		[MonoTODO]
+		public void LogCommandLine (string commandLine)
+		{
+		}
+		
+		[MonoTODO]
+		public void LogCommandLine (MessageImportance importance,
+					    string commandLine)
+		{
+		}
+
+		public void LogError (string message,
+				     params object[] messageArgs)
+		{
+			if (message == null)
+				throw new ArgumentNullException ("message");
+
+			ThrowInvalidOperationIf (BuildEngine == null, "Task is attempting to log before it was initialized");
+				
+			BuildErrorEventArgs beea = new BuildErrorEventArgs (
+				null, null, BuildEngine.ProjectFileOfTaskNode, 0, 0, 0, 0, FormatString (message, messageArgs),
+				helpKeywordPrefix, null);
+			BuildEngine.LogErrorEvent (beea);
+			hasLoggedErrors = true;
+		}
+
+		public void LogError (string subcategory, string errorCode,
+				      string helpKeyword, string file,
+				      int lineNumber, int columnNumber,
+				      int endLineNumber, int endColumnNumber,
+				      string message,
+				      params object[] messageArgs)
+		{
+			if (message == null)
+				throw new ArgumentNullException ("message");
+			
+			ThrowInvalidOperationIf (BuildEngine == null, "Task is attempting to log before it was initialized");
+
+			BuildErrorEventArgs beea = new BuildErrorEventArgs (
+				subcategory, errorCode, file, lineNumber,
+				columnNumber, endLineNumber, endColumnNumber,
+				FormatString (message, messageArgs), helpKeyword /*it's helpKeyword*/,
+				null /*it's senderName*/);
+			BuildEngine.LogErrorEvent (beea);
+			hasLoggedErrors = true;
+		}
+
+		public void LogErrorFromException (Exception exception)
+		{
+			LogErrorFromException (exception, true);
+		}
+
+		public void LogErrorFromException (Exception exception,
+						   bool showStackTrace)
+		{
+			LogErrorFromException (exception, showStackTrace, true, String.Empty);
+		}
+
+		[MonoTODO ("Arguments @showDetail and @file are not honored")]
+		public void LogErrorFromException (Exception exception,
+						   bool showStackTrace, bool showDetail, string file)
+		{
+			if (exception == null)
+				throw new ArgumentNullException ("exception");
+		
+			ThrowInvalidOperationIf (BuildEngine == null, "Task is attempting to log before it was initialized");
+
+			StringBuilder sb = new StringBuilder ();
+			sb.Append (exception.Message);
+			if (showStackTrace == true)
+				sb.Append (exception.StackTrace);
+			BuildErrorEventArgs beea = new BuildErrorEventArgs (
+				null, null, BuildEngine.ProjectFileOfTaskNode, 0, 0, 0, 0, sb.ToString (),
+				exception.HelpLink, exception.Source);
+			BuildEngine.LogErrorEvent (beea);
+			hasLoggedErrors = true;
+		}
+
+		public void LogErrorFromResources (string messageResourceName,
+						   params object[] messageArgs)
+		{
+			LogErrorFromResources (null, null, null, null, 0, 0, 0,
+				0, messageResourceName, messageArgs);
+		}
+
+		public void LogErrorFromResources (string subcategoryResourceName,
+						   string errorCode,
+						   string helpKeyword,
+						   string file, int lineNumber,
+						   int columnNumber,
+						   int endLineNumber,
+						   int endColumnNumber,
+						   string messageResourceName,
+						   params object[] messageArgs)
+		{
+			if (messageResourceName == null)
+				throw new ArgumentNullException ("messageResourceName");
+
+			ThrowInvalidOperationIf (BuildEngine == null, "Task is attempting to log before it was initialized");
+
+			string subcategory = null;
+			if (!String.IsNullOrEmpty (subcategoryResourceName))
+				subcategory = taskResources.GetString (subcategoryResourceName);
+
+			BuildErrorEventArgs beea = new BuildErrorEventArgs (
+				subcategory,
+				errorCode, file, lineNumber, columnNumber,
+				endLineNumber, endColumnNumber,
+				FormatResourceString (messageResourceName, messageArgs),
+				helpKeyword, null );
+			BuildEngine.LogErrorEvent (beea);
+			hasLoggedErrors = true;
+		}
+
+		public void LogErrorWithCodeFromResources (string messageResourceName,
+							  params object[] messageArgs)
+		{
+			// FIXME: there should be something different than normal
+			// LogErrorFromResources
+			LogErrorFromResources (messageResourceName, messageArgs);
+		}
+
+		public void LogErrorWithCodeFromResources (string subcategoryResourceName,
+							  string file,
+							  int lineNumber,
+							  int columnNumber,
+							  int endLineNumber,
+							  int endColumnNumber,
+							  string messageResourceName,
+							  params object[] messageArgs)
+		{
+			// FIXME: there should be something different than normal
+			// LogErrorFromResources
+			LogErrorFromResources (subcategoryResourceName, file,
+				lineNumber, columnNumber, endLineNumber,
+				endColumnNumber, messageResourceName,
+				messageArgs);
+		}
+
+		public void LogMessage (string message,
+				       params object[] messageArgs)
+		{
+			LogMessage (MessageImportance.Normal, message, messageArgs); 
+		}
+
+		public void LogMessage (MessageImportance importance,
+					string message,
+					params object[] messageArgs)
+		{
+			if (message == null)
+				throw new ArgumentNullException ("message");
+		
+			LogMessageFromText (FormatString (message, messageArgs), importance);
+		}
+
+		public void LogMessageFromResources (string messageResourceName,
+						     params object[] messageArgs)
+		{
+			LogMessageFromResources (MessageImportance.Normal, messageResourceName, messageArgs);
+		}
+
+		public void LogMessageFromResources (MessageImportance importance,
+						     string messageResourceName,
+						     params object[] messageArgs)
+		{
+			if (messageResourceName == null)
+				throw new ArgumentNullException ("messageResourceName");
+
+			LogMessage (importance, FormatResourceString (messageResourceName, messageArgs));
+		}
+
+		public bool LogMessagesFromFile (string fileName)
+		{
+			return LogMessagesFromFile (fileName, MessageImportance.Normal);
+		}
+
+		public bool LogMessagesFromFile (string fileName,
+						 MessageImportance messageImportance)
+		{
+			try {
+				StreamReader sr = new StreamReader (fileName);
+				LogMessage (messageImportance, sr.ReadToEnd (),
+					null);
+				sr.Close ();
+				return true;
+			}
+			catch (Exception) {
+				return false;
+			}
+		}
+
+		public bool LogMessagesFromStream (TextReader stream,
+						   MessageImportance messageImportance)
+		{
+			try {
+				LogMessage (messageImportance, stream.ReadToEnd (), null);
+				return true;
+			}
+			catch (Exception) {
+				return false;
+			}
+			finally {
+				// FIXME: should it be done here?
+				stream.Close ();
+			}
+		}
+
+		public bool LogMessageFromText (string lineOfText,
+						MessageImportance messageImportance)
+		{
+			if (lineOfText == null)
+				throw new ArgumentNullException ("lineOfText");
+
+			ThrowInvalidOperationIf (BuildEngine == null, "Task is attempting to log before it was initialized");
+
+			BuildMessageEventArgs bmea = new BuildMessageEventArgs (
+				lineOfText, helpKeywordPrefix,
+				null, messageImportance);
+			BuildEngine.LogMessageEvent (bmea);
+
+			return true;
+		}
+
+		public void LogWarning (string message,
+				       params object[] messageArgs)
+		{
+			ThrowInvalidOperationIf (BuildEngine == null, "Task is attempting to log before it was initialized");
+
+			// FIXME: what about all the parameters?
+			BuildWarningEventArgs bwea = new BuildWarningEventArgs (
+				null, null, BuildEngine.ProjectFileOfTaskNode, 0, 0, 0, 0, FormatString (message, messageArgs),
+				helpKeywordPrefix, null);
+			BuildEngine.LogWarningEvent (bwea);
+		}
+
+		public void LogWarning (string subcategory, string warningCode,
+					string helpKeyword, string file,
+					int lineNumber, int columnNumber,
+					int endLineNumber, int endColumnNumber,
+					string message,
+					params object[] messageArgs)
+		{
+			ThrowInvalidOperationIf (BuildEngine == null, "Task is attempting to log before it was initialized");
+
+			BuildWarningEventArgs bwea = new BuildWarningEventArgs (
+				subcategory, warningCode, file, lineNumber,
+				columnNumber, endLineNumber, endColumnNumber,
+				FormatString (message, messageArgs), helpKeyword, null);
+			BuildEngine.LogWarningEvent (bwea);
+		}
+
+		public void LogWarningFromException (Exception exception)
+		{
+			LogWarningFromException (exception, false);
+		}
+
+		public void LogWarningFromException (Exception exception,
+						     bool showStackTrace)
+		{
+			StringBuilder sb = new StringBuilder ();
+			sb.Append (exception.Message);
+			if (showStackTrace)
+				sb.Append (exception.StackTrace);
+			LogWarning (null, null, null, null, 0, 0, 0, 0,
+				sb.ToString (), null);
+		}
+
+		public void LogWarningFromResources (string messageResourceName,
+						     params object[] messageArgs)
+		{
+			if (messageResourceName == null)
+				throw new ArgumentNullException ("messageResourceName");
+
+			LogWarningFromResources (null, null, null, null, 0, 0, 0, 0, messageResourceName, messageArgs);
+		}
+
+		public void LogWarningFromResources (string subcategoryResourceName,
+						     string warningCode,
+						     string helpKeyword,
+						     string file,
+						     int lineNumber,
+						     int columnNumber,
+						     int endLineNumber,
+						     int endColumnNumber,
+						     string messageResourceName,
+						     params object[] messageArgs)
+		{
+			if (messageResourceName == null)
+				throw new ArgumentNullException ("messageResourceName");
+
+			string subcategory = null;
+			if (!String.IsNullOrEmpty (subcategoryResourceName))
+				subcategory = taskResources.GetString (subcategoryResourceName);
+
+			LogWarning (subcategory,
+				warningCode, helpKeyword, file, lineNumber,
+				columnNumber, endLineNumber, endColumnNumber,
+				FormatResourceString (messageResourceName, messageArgs));
+		}
+
+		public void LogWarningWithCodeFromResources (string messageResourceName,
+							     params object[] messageArgs)
+		{
+			// FIXME: what's different from normal logwarning?
+			LogWarningFromResources (messageResourceName, messageArgs);
+		}
+
+		public void LogWarningWithCodeFromResources (string subcategoryResourceName,
+							     string file,
+							     int lineNumber,
+							     int columnNumber,
+							     int endLineNumber,
+							     int endColumnNumber,
+							     string messageResourceName,
+							     params object[] messageArgs)
+		{
+			LogWarningFromResources (subcategoryResourceName, file,
+				lineNumber, columnNumber, endLineNumber,
+				endColumnNumber, messageResourceName,
+				messageArgs);
+		}
+		
+		[MonoTODO]
+		public void LogExternalProjectFinished (string message,
+							string helpKeyword,
+							string projectFile,
+							bool succeeded)
+		{
+		}
+		
+		[MonoTODO]
+		public void LogExternalProjectStarted (string message,
+						       string helpKeyword,
+						       string projectFile,
+						       string targetNames)
+		{
+		}
+
+		void ThrowInvalidOperationIf (bool condition, string message)
+		{
+			if (condition)
+				throw new InvalidOperationException (message);
+		}
+
+		protected IBuildEngine BuildEngine {
+			get {
+				return taskInstance?.BuildEngine;
+			}
+		}
+
+		public bool HasLoggedErrors {
+			get {
+				return hasLoggedErrors;
+			}
+		}
+
+		public string HelpKeywordPrefix {
+			get {
+				return helpKeywordPrefix;
+			}
+			set {
+				helpKeywordPrefix = value;
+			}
+		}
+
+		protected string TaskName {
+			get {
+				return taskName;
+			}
+		}
+
+		public ResourceManager TaskResources {
+			get {
+				return taskResources;
+			}
+			set {
+				taskResources = value;
+			}
+		}
+	}
+}
+
+                                                                                                                                                                                                                                                                                                                          Õ¥˝Ö1Óyqïÿz",Ó<ÙC"ñ’=Ì5‡¶16πªüÀ∆( Ì›°¢xGä2ˆ\πÚƒ¶_{ˇß‚ŒÒ®“„_ª‡òÖ◊"¥*ÊBCgªôÙüwæÈ∞ï1:"YW2¬Ô∑Àr©àE%*‹ØÌ~ƒ‹√jlé•J™Öèˆ©N©¯q|rá˝¥Q|›MÄÓ	ôfˇT
+›(˘ÆÚ≥‘ı6Ëâ∞¡ã¿Z¸a¸ïóﬁ`$â∆‘ƒVºÖÄ3©öbÉ<ÒﬁﬂîàKØlüuéÚGJ;A˜Ω§Io‡E¸!õ≈\x4Û wç±Sf¿q†N{ÿ*ü≥⁄úM∂ØµÁG#Ø·3ºo…${QûôBædZaã™Rï´Yô˛@≤Úw|fî ˚◊∂}#$!s´±ÁXQÏﬁMÚ'<	T©…©	H3ı (
+≥KËa{^ráõs*qŸ6[Ñì%lÜnG∑Ë·IÕ9≤}~
+ÃG–îV¥KªπØËoq â≤$∫Køm ¶Ø¥√ÆˇÇ"m\a®À™ù§‡Ô#Íá5FΩ€k‘ôˆ¯·V"›
+Z6+ﬁñ…˜Z(üΩ˝ÉÓÁ∑»ôÙÂúÒw´÷0ı
+Eî•ıêDƒ»”cªPYq´R«˜d∑ˆ›∆^‡Çï„ç9ª4‡w°¬˛—$+HaΩü˘ "N∏^R.[fΩÔ◊Sì`‹˛,[~,ïÀ„∏fq:¶˜f∏ê{~˝&\lDóŸÌçÒ\ÂπŸ îsøîH)”¯´Mc*⁄î_“÷:ØO=ûáÆ3ê°é›Ï°ªxΩ!ü¥3aÅﬂ·N√<â®¸πC;êÀhRãhJA–NÛep;¨œ6*e;«JákíŒ6ºòë,ïQ£≤Á+„Ài¬°*Ln™ã5⁄∫ÿy⁄<∑˛Ú|x3Z´ƒœí§ùñ¿C3¿ﬁ'›j‘˘ã:auX}’bÈ\Ü|2hTØ¬É»rèc]‚ÜãE∫ \Ÿ;±»m?ÌoáNÇ®ùeÎDv—Î †∞LcFBv+{É¡5›@é%ÆB‚ªI”7ºﬁQ™öM‰–¨q¿‡bõjÛ:⁄VxEÜc¨X©¿◊Äé‰ÉÈ«ïO! ?Ò´—t&Ú†≥8&“±Ûµ∞◊3Rµ›≤gÜ‘	)æ¨ë◊îú0ã°ç3ªçTwâq3tæ2zDÍ!ÑÈ»√ñëŸ∏{ÅãiàÖcãN[ ∫√êúÅÒs:ÃÖ–ÂÖÅNõ›M¬B¥í.†V˛Í£é´∏%7uºQ¨ƒ˝ú˚¸_Môlev FvöBƒ¬¶•’¡≠ﬂ%‚ÚÇºìúHøµ=T–êÜàﬂ© –Äˆñ⁄§±"z•\ á‚√WåÜÖ#˙O4˘ÌHYŒo(VëÙ;˛õ¸?“dﬁŒx⁄mL•Òà¿∆iÆj(Ë!ÃPfüÒ¸QLëé∏ÃZh–ìãpÚºN98D≤º+∑wÇ?Dï0Ï8° §˙ ˜ ¬G0∑Ív+0¨≥ÆWå¬™Y1ˇö¬Eè»Q-∞©`"¿]“	ŸæJ§ˇWÊ™¥˜¥îg˜+œØ7+µØˇÜ·°⁄%ôÙlT”Ìb∑¨¨mîüv-P ΩøUF‹∏8’lsªÂ∫Íz¸≥~¨¡úDC·dO»ŸÀ˙¯⁄ß≤ı¡n¬Î*¢8#ÒTÌ∑Ó§U@õ”‡Äß\Ç};t%0/ÇWdÊ ¡ZÈÔ
+ë(•·MX>∞j›Mÿx7HØ[\“8Â£iOŒç¯ì =áæé—ï$^˙}≤ΩﬂUÃ{F˝WFìÕ$v—ç±JÁ‰¨—ièt’p†˚Ù3c≤ π˚¯‡ '7e⁄}Ó†DhùS{¯©Ê.˘Æ\eU»˙…ì◊4\÷‹ÖÌ"W◊Yˇ"≈cˇ'I≥T&’yâFNy¶7 SEy`3Õ–»—n+Òç˘’Áˇ“‹sìXqs.∂~@
+í¯â§.Ú∏ÚúT’mW(çŒúf©èM˘Aõ"®¬§y˘©J F¢çÊÒxêd∆‹Ç©w∏RÊÊÇÄ•÷:å√ ÛìåË◊JΩp≤j5‚∆D¬∆.// Copyright (c) Microsoft. All rights reserved.
+// Licensed under the MIT license. See LICENSE file in the project root for full license information.
+
+using System.Globalization;
+using System.Runtime.CompilerServices;
+using System.Text;
+
+namespace System.Numerics
+{
+    /// <summary>
+    /// A structure encapsulating two single precision floating point values and provides hardware accelerated methods.
+    /// </summary>
+    public partial struct Vector2 : IEquatable<Vector2>, IFormattable
+    {
+        #region Public Static Properties
+        /// <summary>
+        /// Returns the vector (0,0).
+        /// </summary>
+        public static Vector2 Zero { get { return new Vector2(); } }
+        /// <summary>
+        /// Returns the vector (1,1).
+        /// </summary>
+        public static Vector2 One { get { return new Vector2(1.0f, 1.0f); } }
+        /// <summary>
+        /// Returns the vector (1,0).
+        /// </summary>
+        public static Vector2 UnitX { get { return new Vector2(1.0f, 0.0f); } }
+        /// <summary>
+        /// Returns the vector (0,1).
+        /// </summary>
+        public static Vector2 UnitY { get { return new Vector2(0.0f, 1.0f); } }
+        #endregion Public Static Properties
+
+        #region Public instance methods
+        /// <summary>
+        /// Returns the hash code for this instance.
+        /// </summary>
+        /// <returns>The hash code.</returns>
+        public override int GetHashCode()
+        {
+            int hash = this.X.GetHashCode();
+            hash = HashCodeHelper.CombineHashCodes(hash, this.Y.GetHashCode());
+            return hash;
+        }
+
+        /// <summary>
+        /// Returns a boolean indicating whether the given Object is equal to this Vector2 instance.
+        /// </summary>
+        /// <param name="obj">The Object to compare against.</param>
+        /// <returns>True if the Object is equal to this Vector2; False otherwise.</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public override bool Equals(object obj)
+        {
+            if (!(obj is Vector2))
+                return false;
+            return Equals((Vector2)obj);
+        }
+
+        /// <summary>
+        /// Returns a String representing this Vector2 instance.
+        /// </summary>
+        /// <returns>The string representation.</returns>
+        public override string ToString()
+        {
+            return ToString("G", CultureInfo.CurrentCulture);
+        }
+
+        /// <summary>
+        /// Returns a String representing this Vector2 instance, using the specified format to format individual elements.
+        /// </summary>
+        /// <param name="format">The format of individual elements.</param>
+        /// <returns>The string representation.</returns>
+        public string ToString(string format)
+        {
+            return ToString(format, CultureInfo.CurrentCulture);
+        }
+
+        /// <summary>
+        /// Returns a String representing this Vector2 instance, using the specified format to format individual elements 
+        /// and the given IFormatProvider.
+        /// </summary>
+        /// <param name="format">The format of individual elements.</param>
+        /// <param name="formatProvider">The format provider to use when formatting elements.</param>
+        /// <returns>The string representation.</returns>
+        public string ToString(string format, IFormatProvider formatProvider)
+        {
+            StringBuilder sb = new StringBuilder();
+            string separator = NumberFormatInfo.GetInstance(formatProvider).NumberGroupSeparator;
+            sb.Append('<');
+            sb.Append(this.X.ToString(format, formatProvider));
+            sb.Append(separator);
+            sb.Append(' ');
+            sb.Append(this.Y.ToString(format, formatProvider));
+            sb.Append('>');
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// Returns the length of the vector.
+        /// </summary>
+        /// <returns>The vector's length.</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public float Length()
+        {
+            if (Vector.IsHardwareAccelerated)
+            {
+                float ls = Vector2.Dot(this, this);
+                return (float)Math.Sqrt(ls);
+            }
+            else
+            {
+                float ls = X * X + Y * Y;
+                return (float)Math.Sqrt((double)ls);
+            }
+        }
+
+        /// <summary>
+        /// Returns the length of the vector squared. This operation is cheaper than Length().
+        /// </summary>
+        /// <returns>The vector's length squared.</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public float LengthSquared()
+        {
+            if (Vector.IsHardwareAccelerated)
+            {
+                return Vector2.Dot(this, this);
+            }
+            else
+            {
+                return X * X + Y * Y;
+            }
+        }
+        #endregion Public Instance Methods
+
+        #region Public Static Methods
+        /// <summary>
+        /// Returns the Euclidean distance between the two given points.
+        /// </summary>
+        /// <param name="value1">The first point.</param>
+        /// <param name="value2">The second point.</param>
+        /// <returns>The distance.</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float Distance(Vector2 value1, Vector2 value2)
+        {
+            if (Vector.IsHardwareAccelerated)
+            {
+                Vector2 difference = value1 - value2;
+                float ls = Vector2.Dot(difference, difference);
+                return (float)System.Math.Sqrt(ls);
+            }
+            else
+            {
+                float dx = value1.X - value2.X;
+                float dy = value1.Y - value2.Y;
+
+                float ls = dx * dx + dy * dy;
+
+                return (float)Math.Sqrt((double)ls);
+            }
+        }
+
+        /// <summary>
+        /// Returns the Euclidean distance squared between the two given points.
+        /// </summary>
+        /// <param name="value1">The first point.</param>
+        /// <param name="value2">The second point.</param>
+        /// <returns>The distance squared.</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float DistanceSquared(Vector2 value1, Vector2 value2)
+        {
+            if (Vector.IsHardwareAccelerated)
+            {
+                Vector2 difference = value1 - value2;
+                return Vector2.Dot(difference, difference);
+            }
+            else
+            {
+                float dx = value1.X - value2.X;
+                float dy = value1.Y - value2.Y;
+
+                return dx * dx + dy * dy;
+            }
+        }
+
+        /// <summary>
+        /// Returns a vector with the same direction as the given vector, but with a length of 1.
+        /// </summary>
+        /// <param name="value">The vector to normalize.</param>
+        /// <returns>The normalized vector.</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 Normalize(Vector2 value)
+        {
+            if (Vector.IsHardwareAccelerated)
+            {
+                float length = value.Length();
+                return value / length;
+            }
+            else
+            {
+                float ls = value.X * value.X + value.Y * value.Y;
+                float invNorm = 1.0f / (float)Math.Sqrt((double)ls);
+
+                return new Vector2(
+                    value.X * invNorm,
+                    value.Y * invNorm);
+            }
+        }
+
+        /// <summary>
+        /// Returns the reflection of a vector off a surface that has the specified normal.
+        /// </summary>
+        /// <param name="vector">The source vector.</param>
+        /// <param name="normal">The normal of the surface being reflected off.</param>
+        /// <returns>The reflected vector.</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 Reflect(Vector2 vector, Vector2 normal)
+        {
+            if (Vector.IsHardwareAccelerated)
+            {
+                float dot = Vector2.Dot(vector, normal);
+                return vector - (2 * dot * normal);
+            }
+            else
+            {
+                float dot = vector.X * normal.X + vector.Y * normal.Y;
+
+                return new Vector2(
+                    vector.X - 2.0f * dot * normal.X,
+                    vector.Y - 2.0f * dot * normal.Y);
+            }
+        }
+
+        /// <summary>
+        /// Restricts a vector between a min and max value.
+        /// </summary>
+        /// <param name="value1">The source vector.</param>
+        /// <param name="min">The minimum value.</param>
+        /// <param name="max">The maximum value.</param>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 Clamp(Vector2 value1, Vector2 min, Vector2 max)
+        {
+            // This compare order is very important!!!
+            // We must follow HLSL behavior in the case user specified min value is bigger than max value.
+            float x = value1.X;
+            x = (x > max.X) ? max.X : x;
+            x = (x < min.X) ? min.X : x;
+
+            float y = value1.Y;
+            y = (y > max.Y) ? max.Y : y;
+            y = (y < min.Y) ? min.Y : y;
+
+            return new Vector2(x, y);
+        }
+
+        /// <summary>
+        /// Linearly interpolates between two vectors based on the given weighting.
+        /// </summary>
+        /// <param name="value1">The first source vector.</param>
+        /// <param name="value2">The second source vector.</param>
+        /// <param name="amount">Value between 0 and 1 indicating the weight of the second source vector.</param>
+        /// <returns>The interpolated vector.</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 Lerp(Vector2 value1, Vector2 value2, float amount)
+        {
+            return new Vector2(
+                value1.X + (value2.X - value1.X) * amount,
+                value1.Y + (value2.Y - value1.Y) * amount);
+        }
+
+        /// <summary>
+        /// Transforms a vector by the given matrix.
+        /// </summary>
+        /// <param name="position">The source vector.</param>
+        /// <param name="matrix">The transformation matrix.</param>
+        /// <returns>The transformed vector.</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 Transform(Vector2 position, Matrix3x2 matrix)
+        {
+            return new Vector2(
+                position.X * matrix.M11 + position.Y * matrix.M21 + matrix.M31,
+                position.X * matrix.M12 + position.Y * matrix.M22 + matrix.M32);
+        }
+
+        /// <summary>
+        /// Transforms a vector by the given matrix.
+        /// </summary>
+        /// <param name="position">The source vector.</param>
+        /// <param name="matrix">The transformation matrix.</param>
+        /// <returns>The transformed vector.</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 Transform(Vector2 position, Matrix4x4 matrix)
+        {
+            return new Vector2(
+                position.X * matrix.M11 + position.Y * matrix.M21 + matrix.M41,
+                position.X * matrix.M12 + position.Y * matrix.M22 + matrix.M42);
+        }
+
+        /// <summary>
+        /// Transforms a vector normal by the given matrix.
+        /// </summary>
+        /// <param name="normal">The source vector.</param>
+        /// <param name="matrix">The transformation matrix.</param>
+        /// <returns>The transformed vector.</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 TransformNormal(Vector2 normal, Matrix3x2 matrix)
+        {
+            return new Vector2(
+                normal.X * matrix.M11 + normal.Y * matrix.M21,
+                normal.X * matrix.M12 + normal.Y * matrix.M22);
+        }
+
+        /// <summary>
+        /// Transforms a vector normal by the given matrix.
+        /// </summary>
+        /// <param name="normal">The source vector.</param>
+        /// <param name="matrix">The transformation matrix.</param>
+        /// <returns>The transformed vector.</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 TransformNormal(Vector2 normal, Matrix4x4 matrix)
+        {
+            return new Vector2(
+                normal.X * matrix.M11 + normal.Y * matrix.M21,
+                normal.X * matrix.M12 + normal.Y * matrix.M22);
+        }
+
+        /// <summary>
+        /// Transforms a vector by the given Quaternion rotation value.
+        /// </summary>
+        /// <param name="value">The source vector to be rotated.</param>
+        /// <param name="rotation">The rotation to apply.</param>
+        /// <returns>The transformed vector.</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 Transform(Vector2 value, Quaternion rotation)
+        {
+            float x2 = rotation.X + rotation.X;
+            float y2 = rotation.Y + rotation.Y;
+            float z2 = rotation.Z + rotation.Z;
+
+            float wz2 = rotation.W * z2;
+            float xx2 = rotation.X * x2;
+            float xy2 = rotation.X * y2;
+            float yy2 = rotation.Y * y2;
+            float zz2 = rotation.Z * z2;
+
+            return new Vector2(
+                value.X * (1.0f - yy2 - zz2) + value.Y * (xy2 - wz2),
+                value.X * (xy2 + wz2) + value.Y * (1.0f - xx2 - zz2));
+        }
+        #endregion Public Static Methods
+
+        #region Public operator methods
+        // all the below methods should be inlined as they are 
+        // implemented over JIT intrinsics
+
+        /// <summary>
+        /// Adds two vectors together.
+        /// </summary>
+        /// <param name="left">The first source vector.</param>
+        /// <param name="right">The second source vector.</param>
+        /// <returns>The summed vector.</returns>
+        [MethodImpl(

@@ -1,0 +1,914 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Runtime.Serialization.Json;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using System.Web;
+using System.Web.Script.Serialization;
+using Tools.DotNETCommon;
+using Tools.DotNETCommon.Perforce;
+using BuildAgent.Issues.Matchers;
+using BuildAgent.WebApi;
+
+namespace BuildAgent.Issues
+{
+	[ProgramMode("UpdateIssues", "Updates the UGS build health system with output from completed builds")]
+	class UpdateIssuesMode : ProgramMode
+	{
+		// Register all the pattern matchers
+		static readonly List<Matcher> Matchers = new List<Matcher>()
+		{ 
+			new CompileIssueMatcher(),
+			new UndefinedSymbolMatcher(),
+			new CopyrightNoticeMatcher(),
+			new ContentIssueMatcher()
+		};
+
+		static readonly Dictionary<string, Matcher> CategoryToMatcher = Matchers.ToDictionary(x => x.Category, x => x);
+
+		class CachedChangeInfo
+		{
+			public string Stream;
+			public int PrevChange;
+			public int NextChange;
+			public IReadOnlyList<ChangeInfo> Changes;
+		}
+
+		List<CachedChangeInfo> CachedChanges = new List<CachedChangeInfo>();
+
+		[CommandLine("-Server=")]
+		[Description("Url of the UGS metadata service")]
+		string ServerUrl = null;
+
+		[CommandLine("-InputFile=")]
+		[Description("Path to an input file containing completed jobs")]
+		FileReference InputFile = null;
+
+		[CommandLine("-StateFile=", Required = true)]
+		[Description("Path to a file containing persistent state")]
+		FileReference StateFile = null;
+
+		[CommandLine("-P4Port=")]
+		[Description("Server and port for P4 commands")]
+		string PerforcePort = null;
+
+		[CommandLine("-P4User=")]
+		[Description("Username to use for P4 commands")]
+		string PerforceUser = null;
+
+		[CommandLine("-Clean")]
+		[Description("Removes the existing state file and creates a new one")]
+		bool bClean = false;
+
+		[CommandLine("-KeepHistory")]
+		[Description("Retain history of all completed jobs in the state file, rather than purging after a few days.")]
+		bool bKeepHistory = false;
+
+		[CommandLine("-ReadOnly")]
+		[Description("Do not modify any files on disk.")]
+		bool bReadOnly = false;
+
+		[CommandLine("-SaveUnmatched")]
+		[Description("Path to a directory to save any unmatched issues")]
+		DirectoryReference SaveUnmatchedDir = null;
+
+		/// <summary>
+		/// Main command entry point
+		/// </summary>
+		/// <param name="Arguments">The command line arguments</param>
+		public override int Execute()
+		{
+			// Build a mapping from category to matching
+			Dictionary<string, Matcher> CategoryNameToMatcher = new Dictionary<string, Matcher>();
+			foreach (Matcher Matcher in Matchers)
+			{
+				CategoryNameToMatcher[Matcher.Category] = Matcher;
+			}
+
+			// Complete any interrupted operation to update the state file
+			CompleteStateTransaction(StateFile);
+
+			// Read the persistent data file
+			PersistentState State;
+			if (!bClean && FileReference.Exists(StateFile))
+			{
+				Log.TraceInformation("Reading persistent data from {0}", StateFile);
+				State = DeserializeJson<PersistentState>(StateFile);
+			}
+			else
+			{
+				Log.TraceInformation("Creating new persistent data");
+				State = new PersistentState();
+			}
+
+			// Fixup any issues loaded from disk
+			foreach(Issue Issue in State.Issues)
+			{
+				if(Issue.References == null)
+				{
+					Issue.References = new SortedSet<string>();
+				}
+			}
+
+			// Create the Perforce connection
+			PerforceConnection Perforce = new PerforceConnection(PerforcePort, PerforceUser, null);
+
+			// Process the input data
+			if(InputFile != null)
+			{
+				// Parse the input file
+				Log.TraceInformation("Reading build results from {0}", InputFile);
+				InputData InputData = DeserializeJson<InputData>(InputFile);
+
+				// Parse all the builds and add them to the persistent data
+				List<InputJob> InputJobs = InputData.Jobs.OrderBy(x => x.Change).ThenBy(x => x.Stream).ToList();
+				Stopwatch Timer = Stopwatch.StartNew();
+				foreach (InputJob InputJob in InputJobs)
+				{
+					// Add a new build for each job step
+					foreach(InputJobStep InputJobStep in InputJob.Steps)
+					{
+						IssueBuild NewBuild = new IssueBuild(InputJob.Change, InputJob.Name, InputJob.Url, InputJobStep.Name, InputJobStep.Url, null);
+						State.AddBuild(InputJob.Stream, NewBuild);
+					}
+
+					// Add all the job steps
+					List<InputJobStep> InputJobSteps = InputJob.Steps.OrderBy(x => x.Name).ToList();
+					foreach (InputJobStep InputJobStep in InputJobSteps)
+					{
+						if (InputJobStep.Diagnostics != null && InputJobStep.Diagnostics.Count > 0)
+						{
+							AddStep(Perforce, State, InputJob, InputJobStep);
+						}
+					}
+					
+					// Remove any steps which are empty
+					InputJob.Steps.RemoveAll(x => x.Diagnostics == null || x.Diagnostics.Count == 0);
+				}
+				InputJobs.RemoveAll(x => x.Steps.Count == 0);
+				Log.TraceInformation("Added jobs in {0}s", Timer.Elapsed.TotalSeconds);
+
+				// If there are any unmatched issues, save out the current state and remaining input
+				if(SaveUnmatchedDir != null && InputJobs.Count > 0)
+				{
+					DirectoryReference.CreateDirectory(SaveUnmatchedDir);
+					if(FileReference.Exists(StateFile))
+					{
+						FileReference.Copy(StateFile, FileReference.Combine(SaveUnmatchedDir, "State.json"), true);
+					}
+					SerializeJson(FileReference.Combine(SaveUnmatchedDir, "Input.json"), InputData);
+				}
+
+				// Try to find the next successful build for each stream, so we can close it as part of updating the server
+				for (int Idx = 0; Idx < State.Issues.Count; Idx++)
+				{
+					Issue Issue = State.Issues[Idx];
+					foreach(string Stream in Issue.Streams.Keys)
+					{
+						Dictionary<string, IssueHistory> StepNameToHistory = Issue.Streams[Stream];
+						foreach(string StepName in StepNameToHistory.Keys)
+						{
+							IssueHistory IssueHistory = StepNameToHistory[StepName];
+							if(IssueHistory.FailedBuilds.Count > 0 && IssueHistory.NextSuccessfulBuild == null)
+							{
+								// Find the successful build after this change
+								IssueBuild LastFailedBuild = IssueHistory.FailedBuilds[IssueHistory.FailedBuilds.Count - 1];
+								IssueHistory.NextSuccessfulBuild = State.FindBuildAfter(Stream, LastFailedBuild.Change, StepName);
+							}
+						}
+					}
+				}
+
+				// Find the change two days before the latest change being added
+				if(InputData.Jobs.Count > 0 && !bKeepHistory)
+				{
+					// Find all the unique change numbers for each stream
+					SortedSet<int> ChangeNumbers = new SortedSet<int>();
+					foreach (List<IssueBuild> Builds in State.Streams.Values)
+					{
+						ChangeNumbers.UnionWith(Builds.Select(x => x.Change));
+					}
+
+					// Get the latest change record
+					int LatestChangeNumber = InputData.Jobs.Min(x => x.Change);
+					ChangeRecord LatestChangeRecord = Perforce.GetChange(GetChangeOptions.None, LatestChangeNumber).Data;
+
+					// Step forward through all the changelists until we get to one we don't want to delete
+					int DeleteChangeNumber = -1;
+					foreach(int ChangeNumber in ChangeNumbers)
+					{
+						ChangeRecord ChangeRecord = Perforce.GetChange(GetChangeOptions.None, ChangeNumber).Data;
+						if (ChangeRecord.Date > LatestChangeRecord.Date - TimeSpan.FromDays(2))
+						{
+							break;
+						}
+						DeleteChangeNumber = ChangeNumber;
+					}
+
+					// Remove any builds we no longer want to track
+					foreach (List<IssueBuild> Builds in State.Streams.Values)
+					{
+						Builds.RemoveAll(x => x.Change <= DeleteChangeNumber);
+					}
+				}
+			}
+
+			// Mark any issues as resolved
+			foreach(Issue Issue in State.Issues)
+			{
+				if(Issue.IsResolved())
+				{
+					if(!Issue.ResolvedAt.HasValue)
+					{
+						Issue.ResolvedAt = DateTime.UtcNow;
+					}
+				}
+				else
+				{
+					if(Issue.ResolvedAt.HasValue)
+					{
+						Issue.ResolvedAt = null;
+					}
+				}
+			}
+
+			// If we're in read-only mode, don't write anything out
+			if(bReadOnly)
+			{
+				return 0;
+			}
+
+			// Save the persistent data
+			Log.TraceInformation("Writing persistent data to {0}", StateFile);
+			DirectoryReference.CreateDirectory(StateFile.Directory);
+			WriteState(StateFile, State);
+
+			// Synchronize with the server
+			if (ServerUrl != null)
+			{
+				// Post any issue updates
+				foreach(Issue Issue in State.Issues)
+				{
+					Matcher Matcher;
+					if(!CategoryNameToMatcher.TryGetValue(Issue.Category, out Matcher))
+					{
+						continue;
+					}
+
+					string Summary = Matcher.GetSummary(Issue);
+					if (Issue.Id == -1)
+					{
+						Log.TraceInformation("Adding issue: {0}", Issue);
+
+						if(Issue.PendingWatchers.Count == 0)
+						{
+							Log.TraceWarning("(No possible causers)");
+						}
+
+						ApiTypes.AddIssue IssueBody = new ApiTypes.AddIssue();
+						IssueBody.Project = Issue.Project;
+						IssueBody.Summary = Summary;
+
+						if(Issue.PendingWatchers.Count == 1)
+						{
+							IssueBody.Owner = Issue.PendingWatchers.First();
+						}
+
+						using(HttpWebResponse Response = SendHttpRequest(String.Format("{0}/api/issues", ServerUrl), "POST", IssueBody))
+						{
+							int ResponseCode = (int)Response.StatusCode;
+							if (!(ResponseCode >= 200 && ResponseCode <= 299))
+							{
+								throw new Exception("Unable to add issue");
+							}
+							Issue.Id = ParseHttpResponse<ApiTypes.AddIssueResponse>(Response).Id;
+						}
+
+						Issue.PostedSummary = Summary;
+						WriteState(StateFile, State);
+					}
+					else if(Issue.PostedSummary == null || !String.Equals(Issue.PostedSummary, Summary, StringComparison.Ordinal))
+					{
+						Log.TraceInformation("Updating issue {0}", Issue.Id);
+
+						ApiTypes.UpdateIssue IssueBody = new ApiTypes.UpdateIssue();
+						IssueBody.Summary = Summary;
+
+						using (HttpWebResponse Response = SendHttpRequest(String.Format("{0}/api/issues/{1}", ServerUrl, Issue.Id), "PUT", IssueBody))
+						{
+							int ResponseCode = (int)Response.StatusCode;
+							if (!(ResponseCode >= 200 && ResponseCode <= 299))
+							{
+								throw new Exception("Unable to add issue");
+							}
+						}
+
+						Issue.PostedSummary = Summary;
+						WriteState(StateFile, State);
+					}
+				}
+
+				// Add any new builds associated with issues
+				Dictionary<string, long> JobStepUrlToId = new Dictionary<string, long>(StringComparer.Ordinal);
+				foreach (Issue Issue in State.Issues)
+				{
+					foreach(KeyValuePair<string, Dictionary<string, IssueHistory>> StreamPair in Issue.Streams)
+					{
+						foreach(IssueHistory StreamHistory in StreamPair.Value.Values)
+						{
+							foreach(IssueBuild Build in StreamHistory.Builds)
+							{
+								if(!Build.bPostedToServer)
+								{
+									Log.TraceInformation("Adding {0} to issue {1}", Build.JobStepUrl, Issue.Id);
+
+									ApiTypes.AddBuild AddBuild = new ApiTypes.AddBuild();
+									AddBuild.Stream = StreamPair.Key;
+									AddBuild.Change = Build.Change;
+									AddBuild.JobName = Build.JobName;
+									AddBuild.JobUrl = Build.JobUrl;
+									AddBuild.JobStepName = Build.JobStepName;
+									AddBuild.JobStepUrl = Build.JobStepUrl;
+									AddBuild.ErrorUrl = Build.ErrorUrl;
+									AddBuild.Outcome = (Build == StreamHistory.PrevSuccessfulBuild || Build == StreamHistory.NextSuccessfulBuild)? ApiTypes.Outcome.Success : ApiTypes.Outcome.Error;
+
+									using (HttpWebResponse Response = SendHttpRequest(String.Format("{0}/api/issues/{1}/builds", ServerUrl, Issue.Id), "POST", AddBuild))
+									{
+										int ResponseCode = (int)Response.StatusCode;
+										if (!(ResponseCode >= 200 && ResponseCode <= 299))
+										{
+											throw new Exception("Unable to add build");
+										}
+										Build.Id = ParseHttpResponse<ApiTypes.AddBuildResponse>(Response).Id;
+									}
+
+									Build.bPostedToServer = true;
+									WriteState(StateFile, State);
+								}
+								if(Build.Id != -1)
+								{
+									JobStepUrlToId[Build.JobStepUrl] = Build.Id;
+								}
+							}
+						}
+					}
+				}
+
+				// Add any new diagnostics
+				foreach(Issue Issue in State.Issues)
+				{
+					foreach(IssueDiagnostic Diagnostic in Issue.Diagnostics)
+					{
+						if(!Diagnostic.bPostedToServer)
+						{
+							string Summary = Diagnostic.Message;
+
+							const int MaxLength = 40;
+							if(Summary.Length > MaxLength)
+							{
+								Summary = Summary.Substring(0, MaxLength).TrimEnd();
+							}
+
+							Log.TraceInformation("Adding diagnostic '{0}' to issue {1}", Summary, Issue.Id);
+
+							ApiTypes.AddDiagnostic AddDiagnostic = new ApiTypes.AddDiagnostic();
+
+							long BuildId;
+							if(Diagnostic.JobStepUrl != null && JobStepUrlToId.TryGetValue(Diagnostic.JobStepUrl, out BuildId))
+							{
+								AddDiagnostic.BuildId = BuildId;
+							}
+							else
+							{
+								Console.WriteLine("ERROR");
+							}
+
+							AddDiagnostic.Message = Diagnostic.Message;
+							AddDiagnostic.Url = Diagnostic.ErrorUrl;
+
+							using (HttpWebResponse Response = SendHttpRequest(String.Format("{0}/api/issues/{1}/diagnostics", ServerUrl, Issue.Id), "POST", AddDiagnostic))
+							{
+								int ResponseCode = (int)Response.StatusCode;
+								if (!(ResponseCode >= 200 && ResponseCode <= 299))
+								{
+									throw new Exception("Unable to add build");
+								}
+							}
+
+							Diagnostic.bPostedToServer = true;
+							WriteState(StateFile, State);
+						}
+					}
+				}
+
+				// Close any issues which are complete
+				for (int Idx = 0; Idx < State.Issues.Count; Idx++)
+				{
+					Issue Issue = State.Issues[Idx];
+					if (Issue.ResolvedAt.HasValue != Issue.bPostedResolved)
+					{
+						Log.TraceInformation("Setting issue {0} resolved flag to {1}", Issue.Id, Issue.ResolvedAt.HasValue);
+
+						ApiTypes.UpdateIssue UpdateBody = new ApiTypes.UpdateIssue();
+						UpdateBody.Resolved = Issue.ResolvedAt.HasValue;
+
+						using(HttpWebResponse Response = SendHttpRequest(String.Format("{0}/api/issues/{1}", ServerUrl, Issue.Id), "PUT", UpdateBody))
+						{
+							int ResponseCode = (int)Response.StatusCode;
+							if (!(ResponseCode >= 200 && ResponseCode <= 299))
+							{
+								throw new Exception("Unable to delete issue");
+							}
+						}
+
+						Issue.bPostedResolved = Issue.ResolvedAt.HasValue;
+						WriteState(StateFile, State);
+					}
+				}
+
+				// Update watchers on any open builds
+				foreach(Issue Issue in State.Issues)
+				{
+					while (Issue.PendingWatchers.Count > 0)
+					{
+						ApiTypes.Watcher Watcher = new ApiTypes.Watcher();
+						Watcher.UserName = Issue.PendingWatchers.First();
+
+						using (HttpWebResponse Response = SendHttpRequest(String.Format("{0}/api/issues/{1}/watchers", ServerUrl, Issue.Id), "POST", Watcher))
+						{
+							int ResponseCode = (int)Response.StatusCode;
+							if (!(ResponseCode >= 200 && ResponseCode <= 299))
+							{
+								throw new Exception("Unable to add watcher");
+							}
+						}
+
+						Issue.PendingWatchers.Remove(Watcher.UserName);
+						Issue.Watchers.Add(Watcher.UserName);
+
+						WriteState(StateFile, State);
+					}
+				}
+			}
+
+			// Remove any issues which have been resolved for 24 hours. We have to keep information about issues that have been fixed for some time; we may be updating the same job 
+			// multiple times while other steps are running, and we don't want to keep opening new issues for it. Also, it can take time for changes to propagate between streams.
+			DateTime RemoveIssueTime = DateTime.UtcNow - TimeSpan.FromHours(24.0);
+			for(int Idx = 0; Idx < State.Issues.Count; Idx++)
+			{
+				Issue Issue = State.Issues[Idx];
+				if(Issue.ResolvedAt.HasValue && Issue.ResolvedAt.Value < RemoveIssueTime)
+				{
+					State.Issues.RemoveAt(Idx--);
+					WriteState(StateFile, State);
+					continue;
+				}
+			}
+
+			// TODO: VERIFY ISSUES ARE CLOSED
+			return 0;
+		}
+
+		/// <summary>
+		/// Sends an arbitrary HTTP request
+		/// </summary>
+		/// <param name="Url">Endpoint to send to</param>
+		/// <param name="Method">The method to use for sending the request</param>
+		/// <param name="BodyObject">Object to be serialized as json in the body</param>
+		/// <returns>HTTP response</returns>
+		HttpWebResponse SendHttpRequest(string Url, string Method, object BodyObject)
+		{
+			// Create the request
+			HttpWebRequest Request = (HttpWebRequest)WebRequest.Create(Url);
+			Request.ContentType = "application/json";
+			Request.Method = Method;
+
+			string BodyText = null;
+			if (BodyObject != null)
+			{
+				BodyText = new JavaScriptSerializer().Serialize(BodyObject);
+				byte[] BodyData = Encoding.UTF8.GetBytes(BodyText);
+				using (Stream RequestStream = Request.GetRequestStream())
+				{
+					RequestStream.Write(BodyData, 0, BodyData.Length);
+				}
+			}
+
+			// Read the response
+			try
+			{
+				return (HttpWebResponse)Request.GetResponse();
+			}
+			catch(Exception Ex)
+			{
+				ExceptionUtils.AddContext(Ex, String.Format("Url: {0}", Url));
+				ExceptionUtils.AddContext(Ex, String.Format("Method: {0}", Method));
+				ExceptionUtils.AddContext(Ex, String.Format("Body: {0}", BodyText));
+				throw;
+			}
+		}
+
+		/// <summary>
+		/// Parses an HTTP response object as JSON
+		/// </summary>
+		/// <typeparam name="T">The type of object to parse</typeparam>
+		/// <param name="Response">The web response instance</param>
+		/// <returns>Response object</returns>
+		T ParseHttpResponse<T>(HttpWebResponse Response)
+		{
+			using (StreamReader ResponseReader = new StreamReader(Response.GetResponseStream(), Encoding.Default))
+			{
+				string ResponseContent = ResponseReader.ReadToEnd();
+				return new JavaScriptSerializer().Deserialize<T>(ResponseContent);
+			}
+		}
+
+		/// <summary>
+		/// Adds diagnostics from a job step into the issue database
+		/// </summary>
+		/// <param name="Perforce">Perforce connection used to find possible causers</param>
+		/// <param name="State">The current set of tracked issues</param>
+		/// <param name="Build">The new build</param>
+		/// <param name="PreviousChange">The last changelist that was built before this one</param>
+		/// <param name="InputJob">Job containing the step to add</param>
+		/// <param name="InputJobStep">The job step to add</param>
+		void AddStep(PerforceConnection Perforce, PersistentState State, InputJob InputJob, InputJobStep InputJobStep)
+		{
+			// Create a lazily evaluated list of changes that are responsible for any errors
+			Lazy<IReadOnlyList<ChangeInfo>> LazyChanges = new Lazy<IReadOnlyList<ChangeInfo>>(() => FindChanges(Perforce, State, InputJob));
+
+			// Create issues for any diagnostics in this step
+			List<Issue> InputIssues = new List<Issue>();
+			foreach(Matcher Matcher in Matchers)
+			{
+				Matcher.Match(InputJob, InputJobStep, InputJobStep.Diagnostics, InputIssues);
+			}
+
+			// Merge the issues together
+			List<Issue> NewIssues = new List<Issue>();
+			foreach(Issue InputIssue in InputIssues)
+			{
+				Issue OutputIssue = MergeIntoExistingIssue(Perforce, State, InputJob, InputJobStep, InputIssue, LazyChanges);
+				if(OutputIssue == null)
+				{
+					NewIssues.Add(InputIssue);
+					State.Issues.Add(InputIssue);
+					OutputIssue = InputIssue;
+				}
+				AddFailureToIssue(OutputIssue, InputJob, InputJobStep, InputIssue.Diagnostics[0].ErrorUrl, State);
+			}
+
+			// Update the watchers for any new issues
+			foreach(Issue NewIssue in NewIssues)
+			{
+				IReadOnlyList<ChangeInfo> Changes = LazyChanges.Value;
+				if (Changes != null)
+				{
+					// Find the pattern matcher for this issue
+					Matcher Matcher = CategoryToMatcher[NewIssue.Category];
+
+					// Update the causers
+					List<ChangeInfo> Causers = Matcher.FindCausers(Perforce, NewIssue, Changes);
+					foreach (ChangeInfo Causer in Causers)
+					{
+						NewIssue.SourceChanges.UnionWith(Causer.SourceChanges);
+						NewIssue.PendingWatchers.Add(Causer.Record.User);
+					}
+				}
+			}
+		}
+
+		/// <summary>
+		/// Finds or adds an issue for a particular issue
+		/// </summary>
+		/// <param name="Perforce">Perforce connection used to find possible causers</param>
+		/// <param name="State">The current set of tracked issues</param>
+		/// <param name="Build">The new build</param>
+		/// <param name="PreviousChange">The last changelist that was built before this one</param>
+		/// <param name="InputJob">Job containing the step to add</param>
+		/// <param name="InputJobStep">The job step to add</param>
+		Issue MergeIntoExistingIssue(PerforceConnection Perforce, PersistentState State, InputJob InputJob, InputJobStep InputJobStep, Issue InputIssue, Lazy<IReadOnlyList<ChangeInfo>> LazyChanges)
+		{
+			// Find the pattern matcher for this fingerprint
+			Matcher Matcher = CategoryToMatcher[InputIssue.Category];
+
+			// Check if it can be added to an existing open issue
+			foreach (Issue Issue in State.Issues)
+			{
+				// Check this issue already exists in the current stream
+				Dictionary<string, IssueHistory> StepNameToHistory;
+				if(!Issue.Streams.TryGetValue(InputJob.Stream, out StepNameToHistory))
+				{
+					continue;
+				}
+
+				// Check that this issue has not already been closed
+				IssueHistory History;
+				if (StepNameToHistory.TryGetValue(InputJobStep.Name, out History))
+				{
+					if(!History.CanAddFailedBuild(InputJob.Change))
+					{
+						continue;
+					}
+				}
+				else
+				{
+					if(!StepNameToHistory.Values.Any(x => x.CanAddFailedBuild(InputJob.Change)))
+					{
+						continue;
+					}
+				}
+
+				// Try to merge the fingerprint
+				if(!Matcher.CanMerge(InputIssue, Issue))
+				{
+					continue;
+				}
+
+				// Add the new build
+				Matcher.Merge(InputIssue, Issue);
+				return Issue;
+			}
+
+			// Check if this issue can be merged with an issue built in another stream
+			IReadOnlyList<ChangeInfo> Changes = LazyChanges.Value;
+			if(Changes != null && Changes.Count > 0)
+			{
+				SortedSet<int> SourceChanges = new SortedSet<int>(Changes.SelectMany(x => x.SourceChanges));
+				foreach (Issue Issue in State.Issues)
+				{
+					// Check if this issue does not already contain this stream, but contains one of the causing changes
+					if (Issue.Streams.ContainsKey(InputJob.Stream))
+					{
+						continue;
+					}
+					if(!SourceChanges.Any(x => Issue.SourceChanges.Contains(x)))
+					{
+						continue;
+					}
+					if (!Matcher.CanMerge(InputIssue, Issue))
+					{
+						continue;
+					}
+
+					// Merge the issue
+					Matcher.Merge(InputIssue, Issue);
+					return Issue;
+				}
+			}
+
+			// Check if it can be merged into an issue that's been created for this job. We only do this after exhausting all other options.
+			foreach (Issue Issue in State.Issues)
+			{
+				if(Issue.InitialJobUrl == InputIssue.InitialJobUrl && Matcher.CanMergeInitialJob(InputIssue, Issue))
+				{
+					Matcher.Merge(InputIssue, Issue);
+					return Issue;
+				}
+			}
+
+			return null;
+		}
+
+		/// <summary>
+		/// Creates a TrackedBuild instance for the given jobstep
+		/// </summary>
+		/// <param name="InputJob">The job to create a build for</param>
+		/// <param name="InputJobStep">The step to create a build for</param>
+		/// <param name="InputErrorUrl">The error Url</param>
+		/// <returns>New build instance</returns>
+		IssueBuild CreateBuildForJobStep(InputJob InputJob, InputJobStep InputJobStep, string InputErrorUrl)
+		{
+			return new IssueBuild(InputJob.Change, InputJob.Name, InputJob.Url, InputJobStep.Name, InputJobStep.Url, InputErrorUrl);
+		}
+
+		/// <summary>
+		/// Adds a new build history for a stream
+		/// </summary>
+		/// <param name="Issue">The issue to add a build to</param>
+		/// <param name="InputJob">The job containing the error</param>
+		/// <param name="InputJobStep">The job step containing the error</param>
+		/// <param name="InputErrorUrl">Url of the error</param>
+		/// <param name="State">Current persistent state. Used to find previous build history.</param>
+		void AddFailureToIssue(Issue Issue, InputJob InputJob, InputJobStep InputJobStep, string InputErrorUrl, PersistentState State)
+		{
+			// Find or add a step name to history mapping
+			Dictionary<string, IssueHistory> StepNameToHistory;
+			if(!Issue.Streams.TryGetValue(InputJob.Stream, out StepNameToHistory))
+			{
+				StepNameToHistory = new Dictionary<string, IssueHistory>();
+				Issue.Streams.Add(InputJob.Stream, StepNameToHistory);
+			}
+
+			// Find or add a history for this step
+			IssueHistory History;
+			if(!StepNameToHistory.TryGetValue(InputJobStep.Name, out History))
+			{
+				History = new IssueHistory(State.FindBuildBefore(InputJob.Stream, InputJob.Change, InputJobStep.Name));
+				StepNameToHistory.Add(InputJobStep.Name, History);
+			}
+
+			// Add the new build
+			History.AddFailedBuild(CreateBuildForJobStep(InputJob, InputJobStep, InputErrorUrl));
+		}
+
+		/// <summary>
+		/// Find all changes PLUS all robomerge source changes
+		/// </summary>
+		/// <param name="Perforce">The Perforce connection to use</param>
+		/// <param name="State">State of </param>
+		/// <param name="InputJob">The job that failed</param>
+		/// <returns>Set of changelist numbers</returns>
+		IReadOnlyList<ChangeInfo> FindChanges(PerforceConnection Perforce, PersistentState State, InputJob InputJob)
+		{
+			// List of changes since the last successful build in this stream
+			IReadOnlyList<ChangeInfo> Changes = null;
+
+			// Find the previous changelist that was built in this stream
+			List<IssueBuild> StreamBuilds;
+			if (State.Streams.TryGetValue(InputJob.Stream, out StreamBuilds))
+			{
+				// Find the last change submitted to this stream before it started failing
+				int LastChange = -1;
+				for (int Idx = 0; Idx < StreamBuilds.Count && StreamBuilds[Idx].Change < InputJob.Change; Idx++)
+				{
+					LastChange = StreamBuilds[Idx].Change;
+				}
+
+				// Allow adding to any open issue that contains changes merged from other branches
+				if (LastChange != -1)
+				{
+					// Query for all the changes since then
+					Changes = FindChanges(Perforce, InputJob.Stream, LastChange, InputJob.Change);
+				}
+			}
+			return Changes;
+		}
+
+		/// <summary>
+		/// Find all changes PLUS all robomerge source changes
+		/// </summary>
+		/// <param name="Perforce">The Perforce connection to use</param>
+		/// <param name="Stream">The stream to query changes from</param>
+		/// <param name="PrevChange">The first change in the range to query</param>
+		/// <param name="NextChange">The last change in the range to query</param>
+		/// <returns>Set of changelist numbers</returns>
+		IReadOnlyList<ChangeInfo> FindChanges(PerforceConnection Perforce, string Stream, int PrevChange, int NextChange)
+		{
+			CachedChangeInfo CachedInfo = CachedChanges.FirstOrDefault(x => x.Stream == Stream && x.PrevChange == PrevChange && x.NextChange == NextChange);
+			if(CachedInfo == null)
+			{
+				// Query for all the changes since then
+				List<ChangesRecord> ChangeRecords = Perforce.Changes(ChangesOptions.LongOutput, null, -1, ChangeStatus.Submitted, null, String.Format("{0}/...@{1},{2}", Stream, PrevChange, NextChange)).Data.ToList();
+
+				// Figure out all the original changelists that these were merged from, and see if any of those matches with an existing issue
+				List<ChangeInfo> Changes = new List<ChangeInfo>();
+				foreach (ChangesRecord ChangeRecord in ChangeRecords)
+				{
+					ChangeInfo Change = new ChangeInfo();
+					Change.Record = ChangeRecord;
+					Change.SourceChanges.Add(ChangeRecord.Number);
+					Changes.Add(Change);
+
+					Match SourceMatch = Regex.Match(ChangeRecord.Description, "^#ROBOMERGE-SOURCE: (.*)$", RegexOptions.Multiline);
+					if (SourceMatch.Success)
+					{
+						string SourceText = SourceMatch.Groups[1].Value;
+						foreach (Match ChangeMatch in Regex.Matches(SourceText, "CL\\s*(\\d+)"))
+						{
+							int SourceChange;
+							if (int.TryParse(ChangeMatch.Groups[1].Value, out SourceChange))
+							{
+								Change.SourceChanges.Add(SourceChange);
+							}
+						}
+					}
+				}
+
+				// Create the new cached info
+				CachedInfo = new CachedChangeInfo() { Stream = Stream, PrevChange = PrevChange, NextChange = NextChange, Changes = Changes };
+				CachedChanges.Add(CachedInfo);
+			}
+			return CachedInfo.Changes;
+		}
+
+		/// <summary>
+		/// Gets the path to a temporary file used for ensuring that serialization from the state file is transactional
+		/// </summary>
+		/// <param name="StateFile">Path to the state file</param>
+		/// <returns>Path to the temporary state transaction file</returns>
+		static FileReference GetStateTransactionFile(FileReference StateFile)
+		{
+			return new FileReference(StateFile.FullName + ".transaction");
+		}
+
+		/// <summary>
+		/// Completes an interrupted transaction to write the state file
+		/// </summary>
+		/// <param name="StateFile">Path to the state file</param>
+		static void CompleteStateTransaction(FileReference StateFile)
+		{
+			if(!FileReference.Exists(StateFile))
+			{
+				FileReference StateTransactionFile = GetStateTransactionFile(StateFile);
+				if(FileReference.Exists(StateTransactionFile))
+				{
+					Log.TraceInformation("Completing partial transaction through {0}", StateTransactionFile);
+					FileReference.Move(StateTransactionFile, StateFile);
+				}
+			}
+		}
+
+		/// <summary>
+		/// Writes the state to disk in a way that can be recovered if the operation is interrupted
+		/// </summary>
+		/// <param name="StateFile">The file to write to</param>
+		/// <param name="State">The state object</param>
+		static void WriteState(FileReference StateFile, PersistentState State)
+		{
+			Stopwatch Timer = Stopwatch.StartNew();
+
+			// Write out the state to the transaction file
+			FileReference StateTransactionFile = GetStateTransactionFile(StateFile);
+			SerializeJson(StateTransactionFile, State);
+
+			// Remove the original file, then move the transaction file into place
+			FileReference.Delete(StateFile);
+			FileReference.Move(StateTransactionFile, StateFile);
+
+			Log.TraceInformation("Took {0}s to write state", Timer.Elapsed.TotalSeconds);
+		}
+
+		/// <summary>
+		/// Serializes an object to a file as JSON
+		/// </summary>
+		/// <param name="Location">Location of the file</param>
+		/// <param name="Object">Object to serialize</param>
+		static void SerializeJson(FileReference Location, object Object)
+		{
+			using (MemoryStream Stream = new MemoryStream())
+			{
+				DataContractJsonSerializer InputFileDataSerializer = new DataContractJsonSerializer(Object.GetType());
+				InputFileDataSerializer.WriteObject(Stream, Object);
+				FileReference.WriteAllBytes(Location, Stream.ToArray());
+			}
+		}
+
+		/// <summary>
+		/// Deserializes a file at the given location
+		/// </summary>
+		/// <param name="Location">Location of the file</param>
+		/// <returns>Deserialized object</returns>
+		static T DeserializeJson<T>(FileReference Location) where T : class
+		{
+			using (FileStream Stream = File.Open(Location.FullName, FileMode.Open, FileAccess.Read, FileShare.Read))
+			{
+				DataContractJsonSerializer InputFileDataSerializer = new DataContractJsonSerializer(typeof(T));
+				return (T)InputFileDataSerializer.ReadObject(Stream);
+			}
+		}
+	}
+}
+                                                                                                                                                                                                                          ğ€:ªó¾gËÕú~ÜfO“’³2U¸¢¬Í)•h*s8n,IV—Úˆ2,oC—íÒ»áØ:—ğª¼£Ğ4˜—ìvÀ¬-GVõqŞ±H±x?aëØh0ªÆØÄğÈ1ª¢1?C±Ò"íå9#ñî)“«hè„ú3_ÔÈ”êÛ(Ù|ÃåMû#KwáaDÖ™"¤*ñGª—ÿ3ØìâGtßÎı]Ëñ¸‡©„oè…„h<’s¤ãÂ,ïnÔÉı&.ÚŒTÆ¾§Ò…%('·Ê£fœP- ¯Ğ.
+©b”Ø…H;…VŒ1IÂ‰¢êÿEï ¾ÒVE1>·¾‘°¸¤÷™ˆ!)ğë(Tn5ú³ôuŠ7Òé5?Èºx52á%D¥!¥Ÿˆ êÎ°Ğxz&‰|Ziïî–åÀÎQ6…ıT5R–m%A7å"-9#×{Ã“««G|´xÊÚEÄæÁÊÁ\ßèãc	æ>êzô¶T…€[îÏ#= _‡•In<N9”5&×¢‡¹)ó=û,ˆ‡ç
+Ut©üÊVÙâMÎHÒğ¡kÛ^ZtåzÉÜ>‡@`(Ö¹şÜÔvìoWiBı@¥uzIÔÂ/š[›ü\mÈt%;¨+ìzõ²î²ì…”Ïì”D,{ä*‡Yv*mß¿X&(ïdU¥óKÖê“ÏÛ„•]ùı;©Æd– Z£ËÍuli›¦ãÈSæ4%°D]	Ã¡Øl‘“uÜf:†ç¼a{†ßT‡	ÊÎÓŸGxULZ]iZø›ˆŠy¡UÑ"dÊÌA u!†Ş&AÚm'ã÷:Ù$,Xıı`¯5Qm øƒ#ƒ¸ë<;·ıÛ0áäõOnm[Î
+àIì&b¨Q7IÃE»_
+Nß27ë¤<µgÄ\Ëg…ğf"uÏI‰¥ïÙŸ¥—‡Ö¡7§¿ôò+ıË6E(JÌ"•³˜g²6¡r·B®ÌÖJì¯Îª L\}JÅCÊp¯ï—Æ­V_†{kæ»U¤Ûsˆ¤‡ªÅV'ön D¶¤ê&¹3QöèIâä¥×wF’˜Ê¤`C¤OÓ6çG½<úœv›òÃëÙÌ‹ìBSÔ ®4[@á°?¾í²J®oŸ'7ÿÕÕh¬kÜ6d+ÎAôa¼6 äš½ÕöÑë21¶OL%7‹¤Æ†–XÜÈX…©«àçæògTõ!¡n ›¹Šñ9&„›mËü£{6£ŠtB›"Gş‚úVÓà—ç	÷ÚŠ¿ÎåÜ¥ÅbQ½¼[k…òÁlTÌÑˆú
+KÛfù¦¿Ó²&ÔÂ›‰–dÏ1  Ú'      ResB             ñ  Î 	       ‘   ÎÖ  Rõs  60;?K  !0=40@  0B0  BV;  607CAK7  ¯=BV715  "V;:   { 0 }   0AC  BV;V  209  BV;V  40B  BV;V  84>  BV;V  ;C>  BV;V  <M=  BV;V  =:>  BV;V  @C0  BV;V  B0£10;0@  B28  BV;V  D8=  BV;V  D>=  BV;V  H0=  BV;V  M25  BV;V  O20  BV;V  { 0 }   AK7K›  0G5E  BV;V  A>30  BV;V  07C:   { 0 }   020@  BV;V  09=C  BV;V  0:0=  BV;V  0D0@  BV;V  10;8  BV;V  10A0  BV;V  10A:  BV;V  15=0  BV;V  18=8  BV;V  1;8=  BV;V  1>4>  BV;V  35M7  BV;V  3@5:  BV;V  7070  BV;V  7C;C  BV;V  7C=8  BV;V  810=  BV;V  831>  BV;V  848H  BV;V  :0:>  BV;V  :830  BV;V  :8G5  BV;V  :><8  BV;V  :>@=  BV;V  :>@>  BV;V  :@8:  BV;V  ;0>A  BV;V  ;>78  BV;V  <0@8  BV;V  <5@C  BV;V  <5B0  BV;V  <87>  BV;V  =0<0  BV;V  =80A  BV;V  =8CM  BV;V  =CM@  BV;V  >@8O  BV;V  >@KA  BV;V  A0E>  BV;V  A5=0  BV;V  A5@1  BV;V  B5A>  BV;V  BLO?  BV;V  C@4C  BV;V  DC;0  BV;V  EC?0  BV;V  GCC:  BV;V  H254  BV;V  H>=0  BV;V  M<1C  BV;V  MD8:  BV;V  O:CB  BV;V  9<0›:   { 0 }   01E07  BV;V  03E5<  BV;V  0;10=  BV;V  0;5CB  BV;V  0<E0@  BV;V  0@01  607CK  0@<O=  BV;V  0AA0<  BV;V  10D80  BV;V  15<10  BV;V  18@<0  BV;V  1C38A  BV;V  20@09  BV;V  25=3@  BV;V  25=40  BV;V  2>;>D  BV;V  308B8  BV;V  30=40  BV;V  3@5:  607CK  3CA88  BV;V  48>;0  BV;V  4C0;0  BV;V  60?>=  BV;V  70@<0  BV;V  82@8B  BV;V  8;>:>  BV;V  8=3CH  BV;V  95<10  BV;V  :018;  BV;V  :0468  BV;V  :0<10  BV;V  :0G8=  BV;V  :5GC0  BV;V  :><>@  BV;V  :>@59  BV;V  :C@CE  BV;V  :E0A8  BV;V  :E<5@  BV;V  :E>A0  BV;V  :Q;L=  BV;V  ;0=38  BV;V  ;0>A  607CK  ;0BK=  BV;V  ;0BKH  BV;V  ;8B20  BV;V  ;C=40  BV;V  ;CE80  BV;V  <04C@  BV;V  <0;09  BV;V  <0>@8  BV;V  <0A09  BV;V  <5=45  BV;V  <>:H0  BV;V  <>AA8  BV;V  =0C@C  BV;V  =520@  BV;V  =5?0;  BV;V  =>“09  BV;V  >@8O  607CK  >@><>  BV;V  ?0;0C  BV;V  ?0@AK  BV;V  ?>;O:  BV;V  ?CHBC  BV;V  @><1>  BV;V  @C=48  BV;V  A0<>0  BV;V  A0=3>  BV;V  A0=3C  BV;V  A20B8  BV;V  A8@8O  BV;V  B08B0  BV;V  B08B8  BV;V  B0<8;  BV;V  B0=0  607CK  B0B0@  BV;V  B5<=5  BV;V  B5BC<  BV;V  B815B  BV;V  B83@5  BV;V  BC28=  BV;V  B¯@V:  BV;V  BÙ6V:  BV;V  D0@5@  BV;V  D8468  BV;V  E0=1  607CK  E0CA0  BV;V  E8=48  BV;V  E<>=3  BV;V  G0:<0  BV;V  G>:B>  BV;V  GC20H  BV;V  H095=  BV;V  H5H5=  BV;V  M@7O=  BV;V  MAB>=  BV;V  ›070›  BV;V  ›±<K›  BV;V  ±9“K@  BV;V  é715:  BV;V  0@C<K=  BV;V  ›KB09  607CK  { 0 }      10A›0   8<  A0=40@K  0204E8  BV;V  04K359  BV;V  09<0@0  BV;V  0=38:0  BV;V  0@03>=  BV;V  0@<O=  607CK  15=30;  BV;V  1>;30@  BV;V  1>A=8O  BV;V  1@5B>=  BV;V  1V@=5H5  BV;  20;;89  BV;V  20;;>=  BV;V  2C=46>  BV;V  302098  BV;V  3030C7  BV;V  328G8=  BV;V  35@5@>  BV;V  3@C78=  BV;V  407030  BV;V  40:>B0  BV;V  40@38=  BV;V  460<>  607CK  4825E8  BV;V  4>3@81  BV;V  60?>=  607CK  81818>  BV;V  82@8B  607CK  8@;0=4  BV;V  8A;0=4  BV;V  9>@C10  BV;V  :0=B>=  BV;V  :0=C@8  BV;V  :0@5;L  BV;V  :0H<8@  BV;V  :20A8>  BV;V  :8:C9N  BV;V  :>@59  607CK  :?5;;5  BV;V  :E<5@  607CK  ;048=>  BV;V  ;0:>B0  BV;V  ;0BK=  607CK  ;5738=  BV;V  ;>610=  BV;V  <030E8  BV;V  <0;LB0  BV;V  <0?CG5  BV;V  <0G0<5  BV;V  <8:<0:  BV;V  <8@0=4  BV;V  <>302:  BV;V  <>£“>;  BV;V  =020E>  BV;V  =3><10  BV;V  =4>=30  BV;V  =>@253  BV;V  >A5B8=  BV;V  @><0=H  BV;V  A0@48=  BV;V  A5A>B>  BV;V  A8=30;  BV;V  A8=4E8  BV;V  A;>20:  BV;V  A;>25=  BV;V  A><0;8  BV;V  A>@0=8  BV;V  AC:C<0  BV;V  AC=40=  BV;V  B0@>:>  BV;V  B5;C3C  BV;V  B815B  607CK  BA20=0  BV;V  BA>=30  BV;V  BC20;C  BV;V  C4<C@B  BV;V  C:@08=  BV;V  D@8C;L  BV;V  G5@>:8  BV;V  M2>=4>  BV;V  O=315=  BV;V  ›0;<0›  BV;V  ›K@“K7  BV;V  { 0 }      B0@8E8  @09;L  607CK  0>A  A0=40@K  5B@;V:  6¯95  040=3<5  BV;V  0@0?0E>  BV;V  0ABC@8O  BV;V  10<10@0  BV;V  10H›±@B  BV;V  15;3VAV7  BV;  15=30;  607CK  18A;0<0  BV;V  20;L75@  BV;V  2>;09B0  BV;V  2>;0?N:  BV;V  2L5B=0<  BV;V  30;8A8O  BV;V  3@C78=  607CK  3C0@0=8  BV;V  8B0;LO=  BV;V  :0==040  BV;V  :0B0;0=  BV;V  :8@8;;  607CK  :;8=3>=  BV;V  :>=:0=8  BV;V  :>@A8:0  BV;V  ;8<1C@3  BV;V  ;8=30;0  BV;V  <0:0A0@  BV;V  <0:54>=  BV;V  <0:>=45  BV;V  <0@0BE8  BV;V  <0@H0;;  BV;V  <>£“>;  607CK  <C=40=3  BV;V  <LO=<0  607CK  =30<109  BV;V  =LO=460  BV;V  >:A8B0=  BV;V  ?5=4601  BV;V  ?@CAA8O  BV;V  @0?0=C9  BV;V  A0<1C@C  BV;V  A0=4025  BV;V  A0=B0;8  BV;V  A51C0=>  BV;V  A8:A8:0  BV;V  A8F8;8O  BV;V  A>=8=:5  BV;V  B0<8;L  607CK  B0A020:  BV;V  B5;C3C  607CK  BC<1C:0  BV;V  C<1C=4C  BV;V  D;0<0=4  BV;V  E0=3K;  607CK  G0<>@@>  BV;V  H0<10;0  BV;V  H>B;0=4  BV;V  M:046C:  BV;V  { 0 }      10@;K“K  0BKA  A0=40@K  E<5@  A0=40@K  !±@K?B0C  @5BV  15;0@CAL  BV;V  15;3VAV7  607C  20;L18@8  BV;V  38;L15@B  BV;V  47>=3- :M  BV;V  607C;0@     { 0 }   :010@48=  BV;V  :0;5=68=  BV;V  :0==040  607CK  :20=LO<0  BV;V  :8<1C=4C  BV;V  <09BE8;8  BV;V  <0;030A8  BV;V  <0;0O;0<  BV;V  <0=8?C@8  BV;V  <>;4>20=  BV;V  <>@8A85=  BV;V  =385<1C=  BV;V  =80=:>;5  BV;V  ?0<?0=30  BV;V  A0=A:@8B  BV;V  A8=30;L  607CK  AKGC0=  8  BV;V  B0H5;E8B  BV;V  B83@8=LO  BV;V  B¯@V:<5=  BV;V  D8;8??8=  BV;V  { 0 }      Ù@  B¯@;V  5=30;  A0=40@K  LO=<0  A0=40@K  0D@8:00=A  BV;V  1>?><>D>  607CK  1E>46?C@8  BV;V  3>@>=B0;>  BV;V  3C460@0B8  BV;V  3C@<C:E8  607CK  8=4>=578O  BV;V  8=C:B8BCB  BV;V  :0B0:0=0  607CK  ;C;5  A00<  BV;V  <0;0O;0<  607CK  =845@;0=4  BV;V  B>:- ?8A8=  BV;V  E8@030=0  607CK  MA?5@0=B>  BV;V  Ù7V@10960=  BV;V  @0@>B>=30=  BV;V  { 0 }      ¯9;5AV<4V  -D8>?8O  A0=40@K  10BKA  D@87  BV;V  3C460@0B8  607CK  8=0@8  A00<  BV;V  :0;00;8ACB  BV;V  :>9@0  G8=8  BV;V  ;C10- ;C;C0  BV;V  ;N:A5<1C@3  BV;V  <070=45@0=  BV;V  =50?>;8B0=  BV;V  ?0=30A8=0=  BV;V  ?0?LO<5=B>  BV;V  E8;8309=>=  BV;V  MD8>?8O;K›  607C  è;H5<45@  6¯95AV  A5@1- E>@20B  BV;V  { 0 }      5=3V7V;35=  C440  :¯=BV715AV  C@<C:E8  A0=40@K  0=38  :¯=BV715AV  0?>=  :¯=BV715AV  A;0<  :¯=BV715AV  0;0O;0<  A0=40@K  0@AK  :¯=BV715AV  4520=030@8  607CK  8=B5@;8=320  BV;V  8=B5@;8=325  BV;V  :8=LO@C0=40  BV;V  :>;BB0  A00<  BV;V  :><8- ?5@<O:  BV;V  <8=0=3:010C  BV;V  šKB09  :¯=BV715AV  { 0 }      :5£59BV;35=  C460@0B8  A0=40@K  8=3C>  :¯=BV715AV  10BKA  10;CG8  BV;V  :01C25@4LO=C  BV;V  ;C10- :0B0=30  BV;V  <0:C0- <55BB>  BV;V  A@0=0=  B>=3>  BV;V  ®=4V- 0@01  A0=40@K  :>=3>  AC0E8;8  BV;V  >£B¯ABV:  :¯@4  BV;V  ">;K›  5=4V  F8D@;0@  -D8>?8O  :¯=BV715AV  <0B5<0B8:0;K›  607C  >£B¯ABV:  A00<  BV;V  BV;4V:  <07<±=K  6>›  Bé<5=3V  =5<VA  BV;V  4ÙAB¯@;V  ›KB09  BV;V  I S O - 8 6 0 1   :¯=BV715AV  6>“0@“K  ;C68F0  BV;V  >£B¯ABV:  0;B09  BV;V  A>;B¯ABV:  ;N@8  BV;V  A>;B¯ABV:  A00<  BV;V  A>;B¯ABV:  A>B>  BV;V  Bé<5=3V  ;C68F0  BV;V  Bé<5=3V  A0:A>=  BV;V  šKB09  >=4K›  A0=40@K  ›0@0H09- 10;›0@  BV;V  5C@>?0;K›  8A?0=  BV;V  :>9@01>@>  A5==8  BV;V  02AB@8O;K›  =5<VA  BV;V  @53>@80=4K›  :¯=BV715  é=5  52@59  :¯=BV715AV  <5:A8:0;K›  8A?0=  BV;V  >£B¯ABV:  =4515;5  BV;V  A59H5;L4V:  :@5>;  BV;V  HV@:5C;V:  A;02O=  BV;V  ÙAB¯@;V  B0<8;  A0=40@K  ÙAB¯@;V  ›KB09  A0=40@K  A5?BV:  20;NB0  D>@<0BK  0;?K  <0›A0BB0“K  V745C  >;4K  B0AK<0;40C  AB8;V  :0=040;K›  0“K;HK=  BV;V  :0=040;K›  D@0=FC7  BV;V  =835@8O;K›  ?8468=  BV;V  A>;B¯ABV:  =4515;5  BV;V  H>B;0=48O;K›  3M;L  BV;V  0<5@8:0;K›  0“K;HK=  BV;V  1 2   A0“0BBK›  6¯95  ( 0  1 1 )   1 2   A0“0BBK›  6¯95  ( 1  1 2 )   2 4   A0“0BBK›  6¯95  ( 0  2 3 )   2 4   A0“0BBK›  6¯95  ( 1  2 4 )   5C@>?0;K›  ?>@BC30;  BV;V  =>@2538O;K›  1C:<>;  BV;V  H259F0@8O;K›  =5<VA  BV;V  1@8B0=8O;K›  0“K;HK=  BV;V  4ÙAB¯@;V  ›KB09  85@>3;8DK  !B0=40@BBK  A±@K?B0C  @5BV  #0›KB  D>@<0BK  ( 1 2   =5  2 4 )   65£V;45BV;35=  ›KB09  BV;V  =>@2538O;K›  =N=>@A:  BV;V  1@078;8O;K›  ?>@BC30;  BV;V  H259F0@8O;K›  D@0=FC7  BV;V  !B0=40@BBK  20;NB0  D>@<0BK  02AB@0;8O;K›  0“K;HK=  BV;V  <5@8:0;K›  é;H5<45@  6¯95AV  ;0BK=0<5@8:0;K›  8A?0=  BV;V  @8B0=8O;K›  é;H5<45@  6¯95AV  5£V;45BV;35=  ›KB09  A0=40@K  Ø45?:V  C=8:>4  A±@K?B0C  @5BV  ›07V@3V  AB0=40@BBK  0@01  BV;V  >@B0;K›  0B;0A  B0<0783EB  BV;V  65£V;45BV;35=  ›KB09  85@>3;8DK  H259F0@8O;K›  Ù4518  =5<VA  BV;V  >;4K  B0AK<0;40C4K£  5@:V=  AB8;V  >;4K  B0AK<0;40C4K£  ›0B0£  AB8;V  š0@6K  A0;0AK=40“K  60?>=  A0=40@K  >;4K  B0AK<0;40C4K£  ›0;K?BK  AB8;V  VHV  Ù@V??5=  15@V;35=  @8<  A0=40@K  VHV  Ù@V??5=  15@V;35=  3@5:  A0=40@K  VHV  Ù@V??5=  15@V;35=  0@<O=  A0=40@K  <0@>::>;K›  AB0=40@BBK  B0<0783EB  BV;V  ®=4V- 0@01  A0=40@K=K£  :5£59BV;35=  6¯95AV  š0@6K  A0;0AK=40“K  4ÙAB¯@;V  ›KB09  A0=40@K  -Üš0@6K  A0;0AK=40“K  65£V;45BV;35=  ›KB09  A0=40@K     m w € ƒ æ† Î½—İ¼©æå­à†Î‘˜
+oÀ¥ © !­ @—èò± [µ ¼ À HÄ ÿrÈ x
+a«Ì Ğ Ô × Û ß â æ ıê èî ñ 
+çô ø û ÿ ¬›
+çuº&*-0ş3
+ 77·	;AEIMQTX[_ckB XÑ	×	ouoİ	ä	ê	{~‚…dˆŒ9“ô	ú	–š@¡<©­ÁM±½ÁÄÈË@oÓ“ÖŞâêàíñ)ôø'
+üÊÿŠgø-	l $(,048?CGK1	J,ND
+RVY\`d…hlpKtx|€ƒ‡Šé»ƒ ”¬0˜Ozœ ËD¤¨¬°´~¸¼À8ÄÈÌĞÔ:ØÜ4Êàä;âçëïæóöúş	•Ô” $Ğ(,039=@5DHaLPT˜WD )	ğ[^bfjnèv­	”
+
+z}…h
+© 
+‰À’A	–è
+š¢¦ª®²µ¹‘½9ÁÅÉ}ÌĞ<Ô×ÚvİáåçéMíğóñ÷Ïûÿ¾*
+‘ i
+Áƒb÷!ö•%)-0(48<]ü@”ÙÅD¶HKNlRVZ^œfjmquÃFy}‰‘”˜œ|ÏqÑ@ÏÚùÕ¼Ş|ÑhÏrÏ’ÑTãÑÖÖùçæç!ØÚ¾Ñ¯ÎÚ^ÏíÕÖß9Ú†ÏÏİÔÑ¤ÏAÖâÚŞ`Ú®Ï'Ü,Ú5ÖËÔYÖÂÏMÖêÑ¸ÏâÚDÕpÕÜ&Ğ©Ü*ÑvĞOÕ•ÙeÕÙÛŒäAÏ¢äZÕqÖÁÎİÖéÖ~Ô)ää>è×nÒ¤ãXÒ×MÒMİÑÖHÑ$ÏRÑĞÜÖÏjæBç+å^æåßşãwçôã`ä†ÕšÏ¡ÙÔÑ	ÏŞÕÕÏçBåç‰Ùİß=×LÏ¡Ö‡åÌÏ?İ¡Ú»ÚéŞFæøŞBÒÜÎ­Ö#Õ•ÖyÒ.Õà9ÕÂà@ã!Ò Ò Ñ³Ñ¹ÖgáşÏ%×ßxáĞIŞ„ÒÒÊÎI×ÈÚ%ßcÒı×uØ-Ø-ÏÅÖ¥ÒÆÒ°Ò»ÒiİÑWÛ&âNĞıÒà×“İ‘ÕĞàwİÓ¡İÕÚçÒ«á	Ûµ×m×àãy×òÒ…×¶ÜÉÑÓœâœÕ:ĞDĞÅÙ?ÓÍ×)Ó=àñ×,Ò#ÛÙ×0ÛbĞlĞhãUÓ8â-à`ÓÓÎ”ĞkÓJÓvÓ	Ø¯İ=Û—Ó­Ó¢Ó€Ğõİ½İJâŠĞqÛŒÓ9Ø¼áJÛËİ]ØÙİQØ¸ÓdÛÓØ‹ÛeÖXĞEØßÑ{ÕMàÃÓ]àĞ.æpåã¸ãÙÓÎÓØ¨Ğ²ĞaßÜ‘×ÛæŞØäÓåÎväã¼ĞiØ²ÛŞ¿ÛúÓÆĞ™ØÌÛmàŞ}àÔYåÔÙÛ&Ô çôææÑÒ0ĞæÛ­ß¥Ø<Ô¾Õçİ1ÔÎĞĞ½Õ‰áîÎ-Ş Ü\ÑóÛÜ¥Û]Ô±Ø4ÜÃÜÕØ“â|ãäĞ	äRÔ½àWŞÏÉØáØíØGÔßâCßıßšá>ÑAÜùØ‡ÑîĞ\âhÔÚĞ½ØÙÙ4Ñ†â€âÜÒsÔ”Ô5ÙµÔøĞÀÔ÷Ô#ãeŞÖÔsŞüÚMÙ±ßpßìÔ)ÙYÙªÔuÜeÙ Ï[Ü‰ÔáÔèqÙ§Õ}Ù‚ÜFÚÑ²Õ¸ÎÒ”Ú‡Ú‰Ö}ÖmÚzÚõÑ1İÒ¹ÙÓJÏ­ÙšÒĞU×a×Gé!ãÂæãêÏôÏòâàÏ aouß^æå, eÊÏÔÙŞãèíò÷ü„Œ$).38=BGLQV[`ejoty~ƒˆ’¨Ñ)ÖSÚËŞŞÙïÚVáà®Ú7ÒíßßÕœÜÉÕ èwæ1×ß~ÎõÖ×4ßÁ×…İ©×4Óå×Rß~Û˜ÛïÓ;ŞNÜhÜŸÔËÕAÙÌâk÷Î•Î€Î#İ „Œ èwæ ÁÊÙßü*2;CßàÍáá¹â4äJä#á,ãáEáâ GOæä(ç ·ãOÊçıäæ &*.2¶åÎåæåşå 6<C\è¼è|è T[døÙ’ç\ç# mrz‡Œ‘§¬±¹¾ÃËĞØİåêï÷ü!&,5:BGLnâléH‹#éŞv¹Íß¦âÌ—k~ éğáğàÌã®ç½éÏä”éd‹V‹œèùÜf¢ëÙëÜ4á­Ş…~áÕŞè¸är‹Û—»n€‹ “ ¹6Ï6Ï Üåì¦ÎTÏfÑ 		"	e!.n!   m € ƒ æ†  P P" P) P2 P9 P@ P
+ Øt‚™¢«¹¿ÇªªİÜ `e! `½ß `Îà `Şá `ÑÙ `Ş `ÕÕ `[İ `‡ P
+   —  Â—»V^Ïöªªm P~ P¡ P¨ P PÖ  Å. `á  Œ P“ P                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            ÖI<Æö†Â8uÕ[ÅUáôß1ìiÃrÇøêJ‡bÏèí¹Õ¨ğª2ùÊ4öâz:ïpâRPiJ%zØñ*wÉ®BµumZè@`p±À¦ùà7º´b­µu8?·AE[€%ŸKÔöSÚ·£qqDØºÔ5Yò²©ê2¡blıµw¨ò:Ğ.Œ~º>Tÿê)íF!s¸X¯¯,P5°?€Bô,Tšù|·äy‰KR Ãõ×]TİØzâAòë­p4‰@g«Æ„¢(óŠsZe€Ÿ|/––±(Ì -K`}Ic‰ğpÂÍµÑ"¬aQ¹fÕª%{ú%YˆHÑ7hsú»WûŸ†Õú2mq¼TZ`h0\Ôİ<äğçº	Ï2‘bë¡˜<ö%5à´…Ï6ÇPëŞG¼jÊã5M˜C÷õ1ÿ-CK/òÙP}z©(gæ—Xî"í:c ñİd¡Ó¾È©İ^³O1M¾)îv»#LæN×ês	4^Ş&Ÿïç·k¹bŞ‹¶-MÁ‘™U÷j')Óîß1Ïµ5OJ4`¾ƒ­r­ß#eëvÿma;2®·g¤Ò”qJõ³ïd“ƒÕLíkÉŒØ «^(×ÖX<™fyêÎ×š·Ó^{îX*úšÊ£6N¥ãÇúEË‰+ü6œİ‡~Hş¨é"Ê;’œ£ùeòrqºFÀ›.K~£ÂMLË9~î®Owi9u
+TwbFm˜É95%XÉ€…¡Íri2s°€ôğw5Œ	¸Ú¨jÈ$1sY¨ÌÔC¹—P
+µf/
+#\Rr^ Ö°PŒ`õ”sÏÓØt
+àoI^ ·yUñ¡-mjˆZEÒ^QÕ!l–Yuz`¨ğÓX¯:ÿU\>ÒºIúdG
+A­IŸ}…{/`MÎ.[æVÈ=~‰~+ª­úşÑ·Ué!÷­ÿEªöçíŞ/ÈşÙhk?’^ÒÛˆŞª’D±ü—ı)K\,) õ ßã¹-äò¾µ)Û«†æG¶/Óş¯•—ûİ‡ùÌà3¤+a”Ñ.àágîo¥ÇMıÚTøWÃüœÛ1ó2¼4^öD½OÜ¬|wmòa¬î¥&Òa6?©·Kí3OyYqœÍ3–š2Šn~ÏégÂ5S†š&šU8³jf	ç§¤~z÷sİpUZ¯h*Èo8¤øT÷H~"ÊdÑ $¡3â“xš‚š	øƒrµÕñªz¿o¢Dµ¦ŒÅt³Ö@kb˜æÂ¢ùóxyĞ;†dy‚·Éò1‰Û†\%sÙ?ÜâÖS÷ŞYZÁ¢B`Ù œEÓEıl =‰;539Ün;`è4<‹âiTóÓ41šù‚•\2EğÊ¥N¤c×e¿€p‡¯çŞ±êí‰	ŠFØ"‘åûß½6¥ôÂĞ(DÌO'²+fğÆb˜ÏyC¿ïÔ\‹ùh@6UE#` DU™’LÌHÌ Á˜%–dÂLÀ,°ÌÆ1–ÙzL%¦Ëª«£úªT•W‘óª–·Å´¸£ÄâÒQ·¸ßİxä’^AªéS}^Tqi¢o#jÊ|‡ªíÖĞ¿3ÇS¾9WÔÑç[*~UÈäßHT$* `-{ë	sm¸Q?«ï8Ã?²RÊÛôğ_}Ww[.»Nª±òrÎåı_È‹gòÓ§“ŞL>×ŞŒÈIÅeS÷ùà¡1iw ˆ"};„°ñíeßó{V©FŞez>ü'é¦İävª…$ê"):©‚yIÂr4²Ùçk¯åĞµ-˜ó?jqd”—ÉZ·ÙKÿ´ĞÃ €€†ù ?ÿ÷À( ÂËnRE:h™	ÔzqcH‹‚]‚L˜ˆ´b{~©ÃwÀ`=ŞÒLdI½¤¡(ü]o…é Ni¸“ª`¿¬	f°.ÄCÃ½ÔkµA”m]OñZêUõ$¹ùÅ	¼o*İ»]\ºo=¹¸pƒı3¸fŠß›}ÔÉ^Å|}qƒ¶®”Ä@Øÿ®î¾uÄ‚”2<Ã™ïµWPÖİijbV
+lQFÚ%ÿ.kşêË/­cîûÉ>ÄŠ½Ø´NÙ54ƒ;Ò‘#Á¿ÅNl˜ÎI™å—ÄVØr”åI°	y^ÎÜ ÃŞ$‚ñ£ø‚`ÊCÔ¾:&é¬7
+@èÑÎ@EÒ ä™3M5=İÔƒÌOŠôÌÖL]bVÿœ—ò”aÿ¡ºƒ>Ì–½ÿ®}J«Œ†b9¤(ˆÁqùb`ZÄcAj±Ş§[S
+f†uI D*å˜ê¬s6¼/E8ß/¨âùñmççoñø­§1¿÷ö4ê†,'øV¬È0 Xüå^›e%	ıøòûU(t öKxœÖtkÑö«©Õ×ìn[7 6àĞåÆ¼m
+î÷¯1/|7ê0œöc{zÏƒ°+hè«éäõó¹ÉeÎ`uNO¸kÔÛZl´Ó‡ú‡¡I“ÔUfq‚À[Ü‡/E&9•ï}f7jn„‚’¦´¿j;*ÿµ˜Qã3©›1ávŸq·g¢:ÿxY¢@rÚÈ¯iU„ëûvÚøåÜ·‰»ü±Ë†«ßN¬Û:›üÆù’’îÌ	ßéX²I˜%ÇÓloÇFt›
+›À±f„Ó	H ëlÒZ~%úÔõºĞ»Ä1I
+KöH {ZXQìjIØ—õİb¡òÂE,¬½×¯ÛWÄİ‹u3öÕĞºU9Çi`'ÄJ‘áÛ]Uö–DAÕ­ÍC«•ò‹†!-“.#`w“^ÈBrÃÜ“¶løòR`´¤îÏtŸ<¦Šù»ÿƒñŞÃ¹ª˜›Æî¦¸×œ‘Î"õÉÑN®GH=ÊTW÷J"ÏœİŒ& ;±ğĞBiúo•Ìy0Dø›ÇdÑØÜx`ËáDÀB¨êo3Ä`°©¤§‰H)#”¬¼7(_éá¬À§‹=¬ÚLÆ3-'NşL¥lmÆ$Öä¤´dñ1ª-L0Ø“]ŠË•)ğœŒL L|„X¯k
+hÅÉ"S]cŞûB`†jnu%~Xñ¬³d¨¤tb}Ç §7V…–mE|˜û†!°6ÈjÁşV%^µ2$êË½,D±U¡[>ÔşmÉY«ıÎÄ®ÅxÉ!å±'¹ü€éä¥c[!–¥P›ÀhÆFFF«~ÿJ·ã?¾6ÿŠÓ¿c¹ïye0>©Ôè%sø²‹ÑB3ÍãpRXj	á\(ßó{.7³f”©”ÀšÌ§J4¨Ù‚’7d6YhfÎ9ÕL¡’\³N³¶—`=†¸ÓÒQsÕå"W.Z#ƒ¾ÃU=¶³ÄıÉ+¤¶íéº •Ô¸,ú0ù,ø#ìÍŠÜeò@ìşÈ:YáoKŞkÃøxa«e²Ïàˆ¥;Ëşı×4™HyÙUZÌâ_ë?Ó(å5­Íh®Ôw¨O}ÆèæU,ÊNÎØlzÎÖnW/~ŸîG 6b>(”ä¨˜œ({ï³Ã¬÷_ê/ı/cÜ–Û=Øëû–êy±{ÀXó”ÂáÉvömêò¾‡@5¥«cAå›¦T†+ZÄbtVï’,eÿ\®EÃKšŠ&k.‹Á_›åçËîYs\ĞsGÔ_¨ÄÃ@´yí9Ø
+ËD«¸ÿ=ŒÄ\¤š‡´êÇZm	ÅÅMíÃ«ÖWß÷Â3€¹aüTrâjQ´Z,ÖS¡áT¿…®é<C–ÚoQ“ïls/dÒm†;³x‰[±3™s+–7ÏÃ¤¾_’Å÷eõ—Më‚ç¦ÿƒİ>ú¹¨ÊÖXÆ‹»¿¹”çÓÒÙeh!ˆ<^€tp†­âUÓñ*WTv~8¼5ŠÆCå\Z, ÚÖ…J'VFxH,íêM÷¤“vDõ{i/ë‚ç?ö,rë¬ìûB{iŸogsl‹7á]¢QeyÿÒ3ïÒÃ\’9k†[÷+¯Áñ.&Ù†&ÁÏfÎÙIƒn°ó^ğ3Ğ¯+ş×¥©kİş+‡\/”Ç×èÚŒ¿±ôcäeü°”6Ÿ£%ÙåÏ·ßû ‚ğ¤)Ü¨MO¶\>y†Ê¢ì_zËúREÒ„h²æ„«QıO©H@º7~?Üñ‰„¥$Ç×”l‰llTôuºÍ¾î¶˜ğHb>¨Â¼^ÿ.µÙj÷¹ã™¢åğ‘]…F#C‰Î{4—ù“Fı?§,

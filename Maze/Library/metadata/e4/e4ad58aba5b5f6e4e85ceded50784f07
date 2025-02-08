@@ -1,0 +1,100 @@
+, iterType);
+
+            // iter.Create(navCtxt, filter [, orSelf], [, navEnd]);
+            this.helper.Emit(OpCodes.Ldloca, locIter);
+            NestedVisitEnsureStack(ndCtxt);
+            LoadSelectFilter(kinds, ndName);
+            if (orSelf != TriState.Unknown)
+                this.helper.LoadBoolean(orSelf == TriState.True);
+            if (ndEnd != null)
+                NestedVisitEnsureStack(ndEnd);
+            this.helper.Call(methCreate);
+
+            GenerateSimpleIterator(typeof(XPathNavigator), locIter, methNext);
+        }
+
+        /// <summary>
+        /// Generate boiler-plate code to create an Xml iterator that controls a nested iterator.
+        /// </summary>
+        /// <remarks>
+        ///     Iterator iter;
+        ///     iter.Create(filter [, orSelf]);
+        ///         ...nested iterator...
+        ///     navInput = nestedNested;
+        ///     goto LabelCall;
+        /// LabelNext:
+        ///     navInput = null;
+        /// LabelCall:
+        ///     switch (iter.MoveNext(navInput)) {
+        ///         case IteratorState.NoMoreNodes: goto LabelNextCtxt;
+        ///         case IteratorState.NextInputNode: goto LabelNextNested;
+        ///     }
+        /// </remarks>
+        private void CreateContainerIterator(QilUnary ndDod, string iterName, Type iterType, MethodInfo methCreate, MethodInfo methNext,
+                                                   XmlNodeKindFlags kinds, QilName ndName, TriState orSelf) {
+            // Iterator iter;
+            LocalBuilder locIter = this.helper.DeclareLocal(iterName, iterType);
+            Label lblOnEndNested;
+            QilLoop ndLoop = (QilLoop) ndDod.Child;
+            Debug.Assert(ndDod.NodeType == QilNodeType.DocOrderDistinct && ndLoop != null);
+
+            // iter.Create(filter [, orSelf]);
+            this.helper.Emit(OpCodes.Ldloca, locIter);
+            LoadSelectFilter(kinds, ndName);
+            if (orSelf != TriState.Unknown)
+                this.helper.LoadBoolean(orSelf == TriState.True);
+            this.helper.Call(methCreate);
+
+            // Generate nested iterator (branch to lblOnEndNested when iteration is complete)
+            lblOnEndNested = this.helper.DefineLabel();
+            StartNestedIterator(ndLoop, lblOnEndNested);
+            StartBinding(ndLoop.Variable);
+            EndBinding(ndLoop.Variable);
+            EndNestedIterator(ndLoop.Variable);
+            this.iterCurr.Storage = this.iterNested.Storage;
+
+            GenerateContainerIterator(ndDod, locIter, lblOnEndNested, methNext, typeof(XPathNavigator));
+        }
+
+        /// <summary>
+        /// Generate boiler-plate code that calls MoveNext on a simple Xml iterator.  Iterator should have already been
+        /// created by calling code.
+        /// </summary>
+        /// <remarks>
+        ///     ...
+        /// LabelNext:
+        ///     if (!iter.MoveNext())
+        ///         goto LabelNextCtxt;
+        /// </remarks>
+        private void GenerateSimpleIterator(Type itemStorageType, LocalBuilder locIter, MethodInfo methNext) {
+            Label lblNext;
+
+            // LabelNext:
+            lblNext = this.helper.DefineLabel();
+            this.helper.MarkLabel(lblNext);
+
+            // if (!iter.MoveNext()) goto LabelNextCtxt;
+            this.helper.Emit(OpCodes.Ldloca, locIter);
+            this.helper.Call(methNext);
+            this.helper.Emit(OpCodes.Brfalse, this.iterCurr.GetLabelNext());
+
+            this.iterCurr.SetIterator(lblNext, StorageDescriptor.Current(locIter, itemStorageType));
+        }
+
+        /// <summary>
+        /// Generate boiler-plate code that calls MoveNext on an Xml iterator that controls a nested iterator.  Iterator should
+        /// have already been created by calling code.
+        /// </summary>
+        /// <remarks>
+        ///     ...
+        ///     goto LabelCall;
+        /// LabelNext:
+        ///     navCtxt = null;
+        /// LabelCall:
+        ///     switch (iter.MoveNext(navCtxt)) {
+        ///         case IteratorState.NoMoreNodes: goto LabelNextCtxt;
+        ///         case IteratorState.NextInputNode: goto LabelNextNested;
+        ///     }
+        /// </remarks>
+        private void GenerateContainerIterator(QilNode nd, LocalBuilder locIter, Label lblOnEndNested,
+              

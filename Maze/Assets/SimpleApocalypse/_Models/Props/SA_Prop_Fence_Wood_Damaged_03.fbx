@@ -1,0 +1,533 @@
+ï»¿/********************************************************
+ * ADO.NET 2.0 Data Provider for SQLite Version 3.X
+ * Written by Robert Simpson (robert@blackcastlesoft.com)
+ * 
+ * Released to the public domain, use at your own risk!
+ ********************************************************/
+
+namespace Mono.Data.Sqlite
+{
+  using System;
+  using System.Data;
+  using System.Data.Common;
+  using System.Collections.Generic;
+  using System.Globalization;
+  using System.ComponentModel;
+  using System.Reflection;
+
+  /// <summary>
+  /// SQLite implementation of DbParameterCollection.
+  /// </summary>
+#if !PLATFORM_COMPACTFRAMEWORK
+  [Editor("Microsoft.VSDesigner.Data.Design.DBParametersEditor, Microsoft.VSDesigner, Version=8.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a", "System.Drawing.Design.UITypeEditor, System.Drawing, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"), ListBindable(false)]
+#endif
+  public sealed class SqliteParameterCollection : DbParameterCollection
+  {
+    /// <summary>
+    /// The underlying command to which this collection belongs
+    /// </summary>
+    private SqliteCommand         _command;
+    /// <summary>
+    /// The internal array of parameters in this collection
+    /// </summary>
+    private List<SqliteParameter> _parameterList;
+    /// <summary>
+    /// Determines whether or not all parameters have been bound to their statement(s)
+    /// </summary>
+    private bool                  _unboundFlag;
+
+    /// <summary>
+    /// Initializes the collection
+    /// </summary>
+    /// <param name="cmd">The command to which the collection belongs</param>
+    internal SqliteParameterCollection(SqliteCommand cmd)
+    {
+      _command = cmd;
+      _parameterList = new List<SqliteParameter>();
+      _unboundFlag = true;
+    }
+
+    /// <summary>
+    /// Returns true
+    /// </summary>
+    public override bool IsSynchronized
+    {
+      get { return true; }
+    }
+
+    /// <summary>
+    /// Returns false
+    /// </summary>
+    public override bool IsFixedSize
+    {
+      get { return false; }
+    }
+
+    /// <summary>
+    /// Returns false
+    /// </summary>
+    public override bool IsReadOnly
+    {
+      get { return false; }
+    }
+
+    /// <summary>
+    /// Returns null
+    /// </summary>
+    public override object SyncRoot
+    {
+      get { return null; }
+    }
+
+    /// <summary>
+    /// Retrieves an enumerator for the collection
+    /// </summary>
+    /// <returns>An enumerator for the underlying array</returns>
+    public override System.Collections.IEnumerator GetEnumerator()
+    {
+      return _parameterList.GetEnumerator();
+    }
+
+    /// <summary>
+    /// Adds a parameter to the collection
+    /// </summary>
+    /// <param name="parameterName">The parameter name</param>
+    /// <param name="parameterType">The data type</param>
+    /// <param name="parameterSize">The size of the value</param>
+    /// <param name="sourceColumn">The source column</param>
+    /// <returns>A SqliteParameter object</returns>
+    public SqliteParameter Add(string parameterName, DbType parameterType, int parameterSize, string sourceColumn)
+    {
+      SqliteParameter param = new SqliteParameter(parameterName, parameterType, parameterSize, sourceColumn);
+      Add(param);
+
+      return param;
+    }
+
+    /// <summary>
+    /// Adds a parameter to the collection
+    /// </summary>
+    /// <param name="parameterName">The parameter name</param>
+    /// <param name="parameterType">The data type</param>
+    /// <param name="parameterSize">The size of the value</param>
+    /// <returns>A SqliteParameter object</returns>
+    public SqliteParameter Add(string parameterName, DbType parameterType, int parameterSize)
+    {
+      SqliteParameter param = new SqliteParameter(parameterName, parameterType, parameterSize);
+      Add(param);
+
+      return param;
+    }
+
+    /// <summary>
+    /// Adds a parameter to the collection
+    /// </summary>
+    /// <param name="parameterName">The parameter name</param>
+    /// <param name="parameterType">The data type</param>
+    /// <returns>A SqliteParameter object</returns>
+    public SqliteParameter Add(string parameterName, DbType parameterType)
+    {
+      SqliteParameter param = new SqliteParameter(parameterName, parameterType);
+      Add(param);
+
+      return param;
+    }
+
+    /// <summary>
+    /// Adds a parameter to the collection
+    /// </summary>
+    /// <param name="parameter">The parameter to add</param>
+    /// <returns>A zero-based index of where the parameter is located in the array</returns>
+    public int Add(SqliteParameter parameter)
+    {
+      int n = -1;
+
+      if (String.IsNullOrEmpty(parameter.ParameterName) == false)
+      {
+        n = IndexOf(parameter.ParameterName);
+      }
+
+      if (n == -1)
+      {
+        n = _parameterList.Count;
+        _parameterList.Add((SqliteParameter)parameter);
+      }
+
+      SetParameter(n, parameter);
+
+      return n;
+    }
+
+    /// <summary>
+    /// Adds a parameter to the collection
+    /// </summary>
+    /// <param name="value">The parameter to add</param>
+    /// <returns>A zero-based index of where the parameter is located in the array</returns>
+#if !PLATFORM_COMPACTFRAMEWORK
+    [EditorBrowsable(EditorBrowsableState.Never)]
+#endif
+    public override int Add(object value)
+    {
+      return Add((SqliteParameter)value);
+    }
+
+    /// <summary>
+    /// Adds a named/unnamed parameter and its value to the parameter collection.
+    /// </summary>
+    /// <param name="parameterName">Name of the parameter, or null to indicate an unnamed parameter</param>
+    /// <param name="value">The initial value of the parameter</param>
+    /// <returns>Returns the SqliteParameter object created during the call.</returns>
+    public SqliteParameter AddWithValue(string parameterName, object value)
+    {
+      SqliteParameter param = new SqliteParameter(parameterName, value);
+      Add(param);
+
+      return param;
+    }
+
+    /// <summary>
+    /// Adds an array of parameters to the collection
+    /// </summary>
+    /// <param name="values">The array of parameters to add</param>
+    public void AddRange(SqliteParameter[] values)
+    {
+      int x = values.Length;
+      for (int n = 0; n < x; n++)
+        Add(values[n]);
+    }
+
+    /// <summary>
+    /// Adds an array of parameters to the collection
+    /// </summary>
+    /// <param name="values">The array of parameters to add</param>
+    public override void AddRange(Array values)
+    {
+      int x = values.Length;
+      for (int n = 0; n < x; n++)
+        Add((SqliteParameter)(values.GetValue(n)));
+    }
+
+    /// <summary>
+    /// Clears the array and resets the collection
+    /// </summary>
+    public override void Clear()
+    {
+      _unboundFlag = true;
+      _parameterList.Clear();
+    }
+
+    /// <summary>
+    /// Determines if the named parameter exists in the collection
+    /// </summary>
+    /// <param name="parameterName">The name of the parameter to check</param>
+    /// <returns>True if the parameter is in the collection</returns>
+    public override bool Contains(string parameterName)
+    {
+      return (IndexOf(parameterName) != -1);
+    }
+
+    /// <summary>
+    /// Determines if the parameter exists in the collection
+    /// </summary>
+    /// <param name="value">The SqliteParameter to check</param>
+    /// <returns>True if the parameter is in the collection</returns>
+    public override bool Contains(object value)
+    {
+      return _parameterList.Contains((SqliteParameter)value);
+    }
+
+    /// <summary>
+    /// Not implemented
+    /// </summary>
+    /// <param name="array"></param>
+    /// <param name="index"></param>
+    public override void CopyTo(Array array, int index)
+    {
+      throw new NotImplementedException();
+    }
+
+    /// <summary>
+    /// Returns a count of parameters in the collection
+    /// </summary>
+    public override int Count
+    {
+      get { return _parameterList.Count; }
+    }
+
+    /// <summary>
+    /// Overloaded to specialize the return value of the default indexer
+    /// </summary>
+    /// <param name="parameterName">Name of the parameter to get/set</param>
+    /// <returns>The specified named SQLite parameter</returns>
+    public new SqliteParameter this[string parameterName]
+    {
+      get
+      {
+        return (SqliteParameter)GetParameter(parameterName);
+      }
+      set
+      {
+        SetParameter(parameterName, value);
+      }
+    }
+
+    /// <summary>
+    /// Overloaded to specialize the return value of the default indexer
+    /// </summary>
+    /// <param name="index">The index of the parameter to get/set</param>
+    /// <returns>The specified SQLite parameter</returns>
+    public new SqliteParameter this[int index]
+    {
+      get
+      {
+        return (SqliteParameter)GetParameter(index);
+      }
+      set
+      {
+        SetParameter(index, value);
+      }
+    }
+    /// <summary>
+    /// Retrieve a parameter by name from the collection
+    /// </summary>
+    /// <param name="parameterName">The name of the parameter to fetch</param>
+    /// <returns>A DbParameter object</returns>
+    protected override DbParameter GetParameter(string parameterName)
+    {
+      return GetParameter(IndexOf(parameterName));
+    }
+
+    /// <summary>
+    /// Retrieves a parameter by its index in the collection
+    /// </summary>
+    /// <param name="index">The index of the parameter to retrieve</param>
+    /// <returns>A DbParameter object</returns>
+    protected override DbParameter GetParameter(int index)
+    {
+      return _parameterList[index];
+    }
+
+    /// <summary>
+    /// Returns the index of a parameter given its name
+    /// </summary>
+    /// <param name="parameterName">The name of the parameter to find</param>
+    /// <returns>-1 if not found, otherwise a zero-based index of the parameter</returns>
+    public override int IndexOf(string parameterName)
+    {
+      int x = _parameterList.Count;
+      for (int n = 0; n < x; n++)
+      {
+        if (String.Compare(parameterName, _parameterList[n].ParameterName, true, CultureInfo.InvariantCulture) == 0)
+          return n;
+      }
+      return -1;
+    }
+
+    /// <summary>
+    /// Returns the index of a parameter
+    /// </summary>
+    /// <param name="value">The parameter to find</param>
+    /// <returns>-1 if not found, otherwise a zero-based index of the parameter</returns>
+    public override int IndexOf(object value)
+    {
+      return _parameterList.IndexOf((SqliteParameter)value);
+    }
+
+    /// <summary>
+    /// Inserts a parameter into the array at the specified location
+    /// </summary>
+    /// <param name="index">The zero-based index to insert the parameter at</param>
+    /// <param name="value">The parameter to insert</param>
+    public override void Insert(int index, object value)
+    {
+      _unboundFlag = true;
+      _parameterList.Insert(index, (SqliteParameter)value);
+    }
+
+    /// <summary>
+    /// Removes a parameter from the collection
+    /// </summary>
+    /// <param name="value">The parameter to remove</param>
+    public override void Remove(object value)
+    {
+      _unboundFlag = true;
+      _parameterList.Remove((SqliteParameter)value);
+    }
+
+    /// <summary>
+    /// Removes a parameter from the collection given its name
+    /// </summary>
+    /// <param name="parameterName">The name of the parameter to remove</param>
+    public override void RemoveAt(string parameterName)
+    {
+      RemoveAt(IndexOf(parameterName));
+    }
+
+    /// <summary>
+    /// Removes a parameter from the collection given its index
+    /// </summary>
+    /// <param name="index">The zero-based parameter index to remove</param>
+    public override void RemoveAt(int index)
+    {
+      _unboundFlag = true;
+      _parameterList.RemoveAt(index);
+    }
+
+    /// <summary>
+    /// Re-assign the named parameter to a new parameter object
+    /// </summary>
+    /// <param name="parameterName">The name of the parameter to replace</param>
+    /// <param name="value">The new parameter</param>
+    protected override void SetParameter(string parameterName, DbParameter value)
+    {
+      SetParameter(IndexOf(parameterName), value);
+    }
+
+    /// <summary>
+    /// Re-assign a parameter at the specified index
+    /// </summary>
+    /// <param name="index">The zero-based index of the parameter to replace</param>
+    /// <param name="value">The new parameter</param>
+    protected override void SetParameter(int index, DbParameter value)
+    {
+      _unboundFlag = true;
+      _parameterList[index] = (SqliteParameter)value;
+    }
+
+    /// <summary>
+    /// Un-binds all parameters from their statements
+    /// </summary>
+    internal void Unbind()
+    {
+      _unboundFlag = true;
+    }
+
+    /// <summary>
+    /// This function attempts to map all parameters in the collection to all statements in a Command.
+    /// Since named parameters may span multiple statements, this function makes sure all statements are bound
+    /// to the same named parameter.  Unnamed parameters are bound in sequence.
+    /// </summary>
+    internal void MapParameters(SqliteStatement activeStatement)
+    {
+      if (_unboundFlag == false || _parameterList.Count == 0 || _command._statementList == null) return;
+
+      int nUnnamed = 0;
+      string s;
+      int n;
+      int y = -1;
+      SqliteStatement stmt;
+
+      foreach(SqliteParameter p in _parameterList)
+      {
+        y ++;
+        s = p.ParameterName;
+        if (s == null)
+        {
+          s = String.Format(CultureInfo.InvariantCulture, ";{0}", nUnnamed);
+          nUnnamed++;
+        }
+
+        int x;
+        bool isMapped = false;
+
+        if (activeStatement == null)
+          x = _command._statementList.Count;
+        else
+          x = 1;
+
+        stmt = activeStatement;
+        for (n = 0; n < x; n++)
+        {
+          isMapped = false;
+          if (stmt == null) stmt = _command._statementList[n];
+          if (stmt._paramNames != null)
+          {
+            if (stmt.MapParameter(s, p) == true)
+              isMapped = true;
+          }
+          stmt = null;
+        }
+
+        // If the parameter has a name, but the SQL statement uses unnamed references, this can happen -- attempt to map
+        // the parameter by its index in the collection
+        if (isMapped == false)
+        {
+          s = String.Format(CultureInfo.InvariantCulture, ";{0}", y);
+
+          stmt = activeStatement;
+          for (n = 0; n < x; n++)
+          {
+            if (stmt == null) stmt = _command._statementList[n];
+            if (stmt._paramNames != null)
+            {
+              if (stmt.MapParameter(s, p) == true)
+                isMapped = true;
+            }
+            stmt = null;
+          }
+        }
+      }
+      if (activeStatement == null) _unboundFlag = false;
+    }
+  }
+}
+                                                                                                                                                                                       ñŞAó…ƒFoÀœ3Rë»)VÅğ€–>ñßwMK<½Lßæ¨ÁK]À©óS½’ÒçØ?Æ3%r÷™oËbAı¾M=÷õ$ÙBV?™±Ú€ğ /Ó£šØLnäxè…ß„ûÂO#6	–ğn°3:X¯Ş²ğ>Ê’îŸH¯
+Å{u^0èp÷°Æ@
+5Áª„‹LÆ^·˜²bı.­^…6«Á5˜G¶=x$X7¾Ìja/S˜3”^´»±'ù6™f&à˜Õÿ|ºô1uórÀR‰|²µ—4ãÓ¨†(»7 µç¾¤wV³dg#(>8¨İ*£-rv$Ôé ­ıs7P\Ë†Û€hîÀ‡^üv,Y¼2±Ê¢MÊ-¢kH¤[ ïš(ÕL>GäKøÆãc-×¢QÄ+­ØÔwwöNs÷ëÁ_ÔLó&"ğ9Êı¥¨Â£µ^âsä'˜e°jêÌbå™T“–>Ëcc4z+5ş¨yŠ­Ğ†€0°#|P› Ş¢áÔ ‘)Ò&¯*ÜûÈM2Ë¬ÄÓìâ%Â´bÙ™ln‚ÖAf—$PL‰û”JfLPbtiN½JÏ©…©mÁ<#T…FÄ"Ó^lâó~9•ˆE,ßut„ñaS‰
+NFãÜ°:ù@cVÚMDtÄ€fùÿÀõ6ï8Wm¸ÃMËˆj£ë1ËUPy°ôV»Úù°êzº/ ã…‡°bX5…+R %¢è•x…¦-¥ujyüöïIÿ¤s›»{ÄI<z‘¼¯¯o&N™;åYu?‡Ö•TèÄæ6t•WŒ¯ñÕ$øRÕ¬>ÆDa¨)¤&öó4õ›Û­ã[«·ôZ·Ji#.h¦Í÷gNL5¹Xƒå™u:ğxÆh¼´ˆ¼ì;!Â}¯¾öå­ Ëü/3qğíBY—ò›ßö´sŠ¥ÜL¯É}BtóÜo
+È“JôÉNæB†1&Âß«	 •äY#!;Ûoñ2?ùO:#Q£¹ËjFo9åÂÔ®ÓÔÑõıCøÓ–«ÈM÷ñâaâ¤M„¯I3!bŞt–¤ÛhOš•¨¨ú$Óïu#£A?Dì=ísÖ×şøéLùa1ßäH5ù´¼¿¬³CÇ<Ì\r²ÌŠwª”ó×Ğæ¬
+ĞXÚ²şÕíiíı»êªh›ÎêlÒ,˜Ñ XI9fÇ3±÷›XÓ«S˜Ş#£›¡1YXŠµ¡¿œ³o´>¹ûCKÄh÷HÀE)_á(ã®¤2şm4DØ“Ï+ùøæ ô¦3¤“ájßïB¬•S]<%@ Page Language="C#" %>
+
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<%@ Register TagPrefix="Samples" 
+    TagName="AjaxLogin" Src="LoginControl.ascx" %>
+
+
+<html xmlns="http://www.w3.org/1999/xhtml" >
+<head runat="server">
+    <style type="text/css">
+        body {  font: 11pt Trebuchet MS;
+                font-color: #000000;
+                padding-top: 72px;
+                text-align: center }
+        .text { font: 8pt Trebuchet MS }
+    </style>
+    <title>Login User Control</title>
+  
+</head>
+<body>
+    <h2>Login User Control</h2>
+    
+    <form id="form1" runat="server">
+        <div>
+            <asp:ScriptManager runat="server" ID="ScriptManagerId"/>
+            
+            <Samples:AjaxLogin ID="LoginId" runat="server" />
+      
+            <span style="font-weight:normal; font-size:medium; color:Black">
+                Please, use one of the following [username, password] 
+                combinations:<br />
+                [user1, u$er1] <br/>
+                [user2, u$er2] <br/> 
+                [user3, u$er3]   
+            </span>   
+        </div>
+       
+    </form>
+    <div>
+        <a href="secured/Default.aspx" target="_top2" >Attempt to access a page 
+         that requires authenticated users.</a>
+    </div>
+</body>
+</html>
+                                                                                                                                                 á¸º"™´+F`“Æ‘]Úo“ÃöşÙ±q!4Jşc6j½—UÜrjg%yÅéHXÈÉm•êcàPÁ†úHb» W&JÉ¯ôCNú+î4*„ Ó“A´}²­v¢Œyª™%mÅÃLë#vcÊ‘<ğıc™KWqTÓM	/fúÛj®å$|õõ>–r+ŸS7lªGÁÛ2A4“š>=‡Ûû©QÏh%/üúÓ”ÎÜ Ë¸©wä[>Îàô'†ş6\„¾*šüH¡T,‰ômx4WÏv¬Ïæã˜j)ğå=Ä¿ÊŠ¨Â×ôlŞ•U†hG Ëğ‚n§ƒq0ÇK·
+¸Û|#3J}aÖ¾²ã$j‰ÉAĞ„æ‰;ŠàµƒÁÂ¹ã
++•¶s7ğ$ìúm­õWüxA].WaFEù%l^P_R¡Î-g
+€WÌVÌ¦ç[Q*)¯xî™‹nú¹îÆ—åL‘NXæğD©°†ª<È¶0‘¥qmtj:Ÿø†vØ€¨X
+6øª¾´|êØûG 2šˆóÈ‚¾Î²=ÎíqØí^)XÅoõ;P¬´ôàcX>#dıø‡»*|=·¬	2ÊB;Ö6"ÔCî[Ï¤İ%Äg³~dXw)(@£¿°k¯l/øOGœñT(˜mEİ°+	2½òx>!bÏÑ‚_&rHÆòÿséšÅû#\Ú1×I×·P÷ËQ¢¾ÍÊó÷M)‹’3g“íÌ¸õŸ÷ŸO‡kZ_1ËğW_¡,õ\Qú«Ë%bô_BÖ’Kô·“M¶Ê@N8&Oí¬²Ûamb [J°Õ…®¾îôF–M É"P>|§NZ 
+lı‚/&]Û9Å¥Äî·ò…¶‹F³áõC\e¨s¥gÈõ_¿ïÏòÊŸÚ¢KC­Z£Ş.çsû•.ª¥ÛâfMšÊÄ1\Ş9Y¦ÜãŠÜ÷S³¥w¶ù¯Šô"ï-]İ)D¤¾ıVóâ,6’ŒOá¡B'šOÇòJÑèfvÙV‰å„%ä¸ôd7û9r–5	•¯u?‚Ç¬:tŞ“‡5?ˆ	w±ÎÓ³ (µkÒè–!÷ş•sTD>Ùæhb(¶KºˆnÌãŒ¡«†ßeÊœ¸ˆtVI­‚#\{ƒ¬"İØ²ËÜäªC§²rŞ%±bçâ:Ş8yPõ1‡éK{Ç,U(ıû±¿à®_¸2ıACÛ¯• ¢®dò¬Ó'ÀÁÂ3Ş=A«Q?[Y°AÖ%e%tğQSE’³“Ø%£ÍšcÜ3Bã„½Ó^´©Tˆ¨÷brğúèÅäŞyô¹O•–ËÌšÑ&§Îx÷+çµã¿ºı–œ»B°ûtLEŠ6FZ½à4è
+ík³w¥[¹'k}µ‡m
+æÛ8sØ“àöW³êÌà<–ça«pÔ8[á]ÓŞñ«\iğĞÊü¿ÿg“jğŒbt­·õêŒ±,â².ç®ÏŸ6(îbŒÄ˜Ÿ(¡}­ärísâ´)n`×%É:÷œşZ¤¥R9jl(Jò3ˆß1§R’¡^²GlsSè¦8 {ÄOk• v(hpÈê,lÖ_Ì~–ï•§P˜ë2QËRj½–1Øäœ†B–¤Úÿ´+{_Q®³4~‹0¥ÑîY—{Í1gˆø¦=ö=]¯Áæ×Àúôîdï8ï˜@êy)Àh}Ø†GÓÏªcÕDÑx÷!kLE²4ùÍ;5¢-¼FW›éÆ5sæ8¼LÍá—ÍXD’¶Ñ²ãˆÄ[æ T#ÅóN+]}dT!¶[k_£Áz‡y@/ì2ğ§e|q«Q©>S½ù©±":—® -×p¯Ü}cnçr½©Û)ïV=(¿@Vv¦ÈêşÜÒ/£uƒyİyÃß†cùs£ûb¿\Ğ³¶yV”ˆÙ~8}#­w˜9@´¦*«ë~¬’_†‡B™¡u<ÀÖ`ã7Ñ‰˜Ï¬¬ª#±õ÷¤¦TùƒõJbM ¹œGü 2÷v’õóØ¿X0ùì¥ÛUm«ÚQS#jËº@7Z!~~a>Kd8éõBï İUEğTeÇ‹—VŞ»›¦%:“H²Û»Å*”:h%T÷%Şü÷"Oø³ñSz(¿@Ş3r›æ5'?¿ú2ŠÒhğ„CXò¡¾s…ZH
+Î†æÏT‹0üTùÙ&!¦²åèFJ¹½ûHŠİ—\‡H‰aU´íÍrí¸®š.¤şGX­Æ<]…DEÇ@¸"Xjğ®¹Ñ	jHcÚ° …éóq
+aCËší!F*)„ş £2ªµRÑê"âh&(ke_"ËHBîÌB ƒşĞ—,÷Øg¡ï‰`¢JĞ›½İ1şé85@,IŠ·”|ş«c¦|ÜèÅGšÎ?€¶)°£â{&dˆÚ~%fÁ ¡%`qâ÷”×SıÂâÂ0Oæ?
+„+İKO“¥3 ¼Ş³6”ÂëqÚß­İ`è [ãrşnàD+³Œ¾†C”=µ]nÜ‡b"^¬İ“Ó‰*¬±ŠîÖò{|Ëôdù|çşk`œó”%XÉ_(8¨#®,ù}npF	ş7Ù”îÎ.­+ÎÆñE‚˜r}Áº+œ

@@ -1,0 +1,179 @@
+#include <isl/schedule.h>
+#include <isl/stream.h>
+#include <isl_schedule_private.h>
+#include <isl_schedule_tree.h>
+
+/* An enumeration of the various keys that may appear in a YAML mapping
+ * of a schedule.
+ */
+enum isl_schedule_key {
+	isl_schedule_key_error = -1,
+	isl_schedule_key_child,
+	isl_schedule_key_coincident,
+	isl_schedule_key_context,
+	isl_schedule_key_contraction,
+	isl_schedule_key_domain,
+	isl_schedule_key_expansion,
+	isl_schedule_key_extension,
+	isl_schedule_key_filter,
+	isl_schedule_key_guard,
+	isl_schedule_key_leaf,
+	isl_schedule_key_mark,
+	isl_schedule_key_options,
+	isl_schedule_key_permutable,
+	isl_schedule_key_schedule,
+	isl_schedule_key_sequence,
+	isl_schedule_key_set,
+	isl_schedule_key_end
+};
+
+/* Textual representations of the YAML keys for an isl_schedule object.
+ */
+static char *key_str[] = {
+	[isl_schedule_key_child] = "child",
+	[isl_schedule_key_coincident] = "coincident",
+	[isl_schedule_key_context] = "context",
+	[isl_schedule_key_contraction] = "contraction",
+	[isl_schedule_key_domain] = "domain",
+	[isl_schedule_key_expansion] = "expansion",
+	[isl_schedule_key_extension] = "extension",
+	[isl_schedule_key_filter] = "filter",
+	[isl_schedule_key_guard] = "guard",
+	[isl_schedule_key_leaf] = "leaf",
+	[isl_schedule_key_mark] = "mark",
+	[isl_schedule_key_options] = "options",
+	[isl_schedule_key_permutable] = "permutable",
+	[isl_schedule_key_schedule] = "schedule",
+	[isl_schedule_key_sequence] = "sequence",
+	[isl_schedule_key_set] = "set",
+};
+
+#undef KEY
+#define KEY enum isl_schedule_key
+#undef KEY_ERROR
+#define KEY_ERROR isl_schedule_key_error
+#undef KEY_END
+#define KEY_END isl_schedule_key_end
+#include "extract_key.c"
+
+static __isl_give isl_schedule_tree *isl_stream_read_schedule_tree(
+	__isl_keep isl_stream *s);
+
+/* Read a subtree with context root node from "s".
+ */
+static __isl_give isl_schedule_tree *read_context(__isl_keep isl_stream *s)
+{
+	isl_set *context = NULL;
+	isl_schedule_tree *tree;
+	isl_ctx *ctx;
+	struct isl_token *tok;
+	enum isl_schedule_key key;
+	char *str;
+	int more;
+
+	ctx = isl_stream_get_ctx(s);
+
+	key = get_key(s);
+
+	if (isl_stream_yaml_next(s) < 0)
+		return NULL;
+
+	tok = isl_stream_next_token(s);
+	if (!tok) {
+		isl_stream_error(s, NULL, "unexpected EOF");
+		return NULL;
+	}
+	str = isl_token_get_str(ctx, tok);
+	context = isl_set_read_from_str(ctx, str);
+	free(str);
+	isl_token_free(tok);
+
+	more = isl_stream_yaml_next(s);
+	if (more < 0)
+		goto error;
+	if (!more) {
+		tree = isl_schedule_tree_from_context(context);
+	} else {
+		key = get_key(s);
+		if (key != isl_schedule_key_child)
+			isl_die(ctx, isl_error_invalid, "expecting child",
+				goto error);
+		if (isl_stream_yaml_next(s) < 0)
+			goto error;
+		tree = isl_stream_read_schedule_tree(s);
+		tree = isl_schedule_tree_insert_context(tree, context);
+	}
+
+	return tree;
+error:
+	isl_set_free(context);
+	return NULL;
+}
+
+/* Read a subtree with domain root node from "s".
+ */
+static __isl_give isl_schedule_tree *read_domain(__isl_keep isl_stream *s)
+{
+	isl_union_set *domain = NULL;
+	isl_schedule_tree *tree;
+	isl_ctx *ctx;
+	struct isl_token *tok;
+	enum isl_schedule_key key;
+	char *str;
+	int more;
+
+	ctx = isl_stream_get_ctx(s);
+
+	key = get_key(s);
+
+	if (isl_stream_yaml_next(s) < 0)
+		return NULL;
+
+	tok = isl_stream_next_token(s);
+	if (!tok) {
+		isl_stream_error(s, NULL, "unexpected EOF");
+		return NULL;
+	}
+	str = isl_token_get_str(ctx, tok);
+	domain = isl_union_set_read_from_str(ctx, str);
+	free(str);
+	isl_token_free(tok);
+
+	more = isl_stream_yaml_next(s);
+	if (more < 0)
+		goto error;
+	if (!more) {
+		tree = isl_schedule_tree_from_domain(domain);
+	} else {
+		key = get_key(s);
+		if (key != isl_schedule_key_child)
+			isl_die(ctx, isl_error_invalid, "expecting child",
+				goto error);
+		if (isl_stream_yaml_next(s) < 0)
+			goto error;
+		tree = isl_stream_read_schedule_tree(s);
+		tree = isl_schedule_tree_insert_domain(tree, domain);
+	}
+
+	return tree;
+error:
+	isl_union_set_free(domain);
+	return NULL;
+}
+
+/* Read a subtree with expansion root node from "s".
+ */
+static __isl_give isl_schedule_tree *read_expansion(isl_stream *s)
+{
+	isl_ctx *ctx;
+	isl_union_pw_multi_aff *contraction = NULL;
+	isl_union_map *expansion = NULL;
+	isl_schedule_tree *tree = NULL;
+	int more;
+
+	ctx = isl_stream_get_ctx(s);
+
+	do {
+		struct isl_token *tok;
+		enum isl_schedule_key key;
+		char *s

@@ -1,0 +1,46 @@
+; RUN: opt < %s -rewrite-statepoints-for-gc -S | FileCheck %s
+; RUN: opt < %s -passes=rewrite-statepoints-for-gc -S | FileCheck %s
+
+
+declare void @use_obj16(i16 addrspace(1)*) "gc-leaf-function"
+declare void @use_obj32(i32 addrspace(1)*) "gc-leaf-function"
+declare void @use_obj64(i64 addrspace(1)*) "gc-leaf-function"
+
+declare void @do_safepoint()
+
+define void @test_gep_const(i32 addrspace(1)* %base) gc "statepoint-example" {
+; CHECK-LABEL: test_gep_const
+entry:
+  %ptr = getelementptr i32, i32 addrspace(1)* %base, i32 15
+; CHECK: getelementptr i32, i32 addrspace(1)* %base, i32 15
+  call void @do_safepoint() [ "deopt"() ]
+; CHECK: %base.relocated = call coldcc i8 addrspace(1)* @llvm.experimental.gc.relocate.p1i8(token %statepoint_token, i32 7, i32 7)
+; CHECK: bitcast i8 addrspace(1)* %base.relocated to i32 addrspace(1)*
+; CHECK: getelementptr i32, i32 addrspace(1)* %base.relocated.casted, i32 15
+  call void @use_obj32(i32 addrspace(1)* %base)
+  call void @use_obj32(i32 addrspace(1)* %ptr)
+  ret void
+}
+
+define void @test_gep_idx(i32 addrspace(1)* %base, i32 %idx) gc "statepoint-example" {
+; CHECK-LABEL: test_gep_idx
+entry:
+  %ptr = getelementptr i32, i32 addrspace(1)* %base, i32 %idx
+; CHECK: getelementptr
+  call void @do_safepoint() [ "deopt"() ]
+; CHECK: %base.relocated = call coldcc i8 addrspace(1)* @llvm.experimental.gc.relocate.p1i8(token %statepoint_token, i32 7, i32 7)
+; CHECK: %base.relocated.casted = bitcast i8 addrspace(1)* %base.relocated to i32 addrspace(1)*
+; CHECK: getelementptr i32, i32 addrspace(1)* %base.relocated.casted, i32 %idx
+  call void @use_obj32(i32 addrspace(1)* %base)
+  call void @use_obj32(i32 addrspace(1)* %ptr)
+  ret void
+}
+
+define void @test_bitcast(i32 addrspace(1)* %base) gc "statepoint-example" {
+; CHECK-LABEL: test_bitcast
+entry:
+  %ptr = bitcast i32 addrspace(1)* %base to i64 addrspace(1)*
+; CHECK: bitcast i32 addrspace(1)* %base to i64 addrspace(1)*
+  call void @do_safepoint() [ "deopt"() ]
+; CHECK: %base.relocated = call coldcc i8 addrspace(1)* @llvm.experimental.gc.relocate.p1i8(token %statepoint_token, i32 7, i32 7)
+; CHECK: %base.relocated.casted = bit

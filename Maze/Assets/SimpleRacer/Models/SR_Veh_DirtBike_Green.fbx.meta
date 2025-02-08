@@ -1,0 +1,87 @@
+ProcessSubPacket ();
+				switch (subType) {
+				case TdsPacketSubType.Row:
+					result = true;
+					done = true;
+					break;
+				case TdsPacketSubType.Done:
+				case TdsPacketSubType.DoneProc:
+				case TdsPacketSubType.DoneInProc:
+					result = false;
+					done = true;
+					break;
+				}
+			} while (!done);
+
+			return result;
+		}
+
+		public virtual string Prepare (string sql, TdsMetaParameterCollection parameters)
+		{
+			throw new NotSupportedException ();
+		}
+
+		public void SkipToEnd ()
+		{
+			try {
+				while (NextResult ()) { /* DO NOTHING */ }
+			} catch (IOException ex) {
+				connected = false;
+				throw new TdsInternalException ("Server closed the connection.", ex);
+			}
+		}
+
+		public virtual void Unprepare (string statementId) 
+		{
+			throw new NotSupportedException ();
+		}
+
+		#endregion // Public Methods
+
+		#region // Private Methods
+
+		[MonoTODO ("Is cancel enough, or do we need to drop the connection?")]
+		protected void CheckForData (int timeout) 
+		{
+			if (timeout > 0 && !comm.Poll (timeout, SelectMode.SelectRead)) {
+				Cancel ();
+				throw CreateTimeoutException (dataSource, "CheckForData()");
+			}
+		}
+	
+		protected TdsInternalInfoMessageEventArgs CreateTdsInfoMessageEvent (TdsInternalErrorCollection errors)
+		{
+			return new TdsInternalInfoMessageEventArgs (errors);
+		}
+
+		protected TdsInternalErrorMessageEventArgs CreateTdsErrorMessageEvent (byte theClass, int lineNumber, string message, int number, string procedure, string server, string source, byte state)
+		{
+			return new TdsInternalErrorMessageEventArgs (new TdsInternalError (theClass, lineNumber, message, number, procedure, server, source, state));
+		}
+
+		private Encoding GetEncodingFromColumnCollation (int lcid, int sortId)
+		{
+			if (sortId != 0) 
+				return TdsCharset.GetEncodingFromSortOrder (sortId);
+			else
+				return TdsCharset.GetEncodingFromLCID (lcid);
+		}
+		
+		protected object GetColumnValue (
+			TdsColumnType? colType,
+			bool outParam)
+		{
+			return GetColumnValue (colType, outParam, -1);
+		}
+
+		private object GetColumnValue (
+			TdsColumnType? colType,
+			bool outParam, int ordinal)
+		{
+			int len;
+			object element = null;
+			Encoding enc = null;
+			int lcid = 0, sortId = 0;
+
+			if (colType == null)
+				throw ne

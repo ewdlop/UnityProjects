@@ -1,0 +1,395 @@
+				int rows = items_area.Height / ItemHeight;
+				if (index >= (top_index + rows))
+					top_index = index - rows + 1;
+
+				UpdateTopItem ();
+			} else {
+				int rows = Math.Max (1, items_area.Height / ItemHeight);
+				int cols = Math.Max (1, items_area.Width / ColumnWidthInternal);
+				
+				if (index >= (top_index + (rows * cols))) {
+					int incolumn = index / rows;
+					top_index = (incolumn - (cols - 1)) * rows;
+
+					UpdateTopItem ();
+					Invalidate ();
+				}
+			}
+		}
+
+		private void UpdateListBoxBounds ()
+		{
+			if (IsHandleCreated)
+				SetBoundsCore (bounds.X, bounds.Y, bounds.Width, IntegralHeight ? SnapHeightToIntegral (requested_height) : requested_height, BoundsSpecified.None);
+		}
+
+		private void UpdateScrollBars ()
+		{
+			items_area = ClientRectangle;
+			if (UpdateHorizontalScrollBar ()) {
+				items_area.Height -= hscrollbar.Height;
+				if (UpdateVerticalScrollBar ()) {
+					items_area.Width -= vscrollbar.Width;
+					UpdateHorizontalScrollBar ();
+				}
+			} else if (UpdateVerticalScrollBar ()) {
+				items_area.Width -= vscrollbar.Width;
+				if (UpdateHorizontalScrollBar ()) {
+					items_area.Height -= hscrollbar.Height;
+					UpdateVerticalScrollBar ();
+				}
+			}
+
+			RepositionScrollBars ();
+		}
+
+		/* Determines if the horizontal scrollbar has to be displyed */
+		private bool UpdateHorizontalScrollBar ()
+		{
+			bool show = false;
+			bool enabled = true;
+
+			if (MultiColumn) {
+				if (canvas_size.Width > items_area.Width) {
+					show = true;
+					hscrollbar.Maximum  = canvas_size.Width / ColumnWidthInternal - 1;
+				} else if (ScrollAlwaysVisible == true) {
+					enabled = false;
+					show = true;
+					hscrollbar.Maximum  = 0;
+				}
+			} else if (canvas_size.Width > ClientRectangle.Width && HorizontalScrollbar) {
+				show = true;
+				hscrollbar.Maximum = canvas_size.Width;
+				hscrollbar.LargeChange = Math.Max (0, items_area.Width);
+			} else if (scroll_always_visible && horizontal_scrollbar) {
+				show = true;
+				enabled = false;
+				hscrollbar.Maximum = 0;
+			}
+
+			hbar_offset = hscrollbar.Value;
+			hscrollbar.Enabled = enabled;
+			hscrollbar.Visible = show;
+
+			return show;
+		}
+
+		/* Determines if the vertical scrollbar has to be displyed */
+		private bool UpdateVerticalScrollBar ()
+		{
+			if (MultiColumn || (Items.Count == 0 && !scroll_always_visible)) {
+				vscrollbar.Visible = false;
+				return false;
+			} else if (Items.Count == 0) {
+				vscrollbar.Visible = true;
+				vscrollbar.Enabled = false;
+				vscrollbar.Maximum = 0;
+				return true;
+			}
+
+			bool show = false;
+			bool enabled = true;
+			if (canvas_size.Height > items_area.Height) {
+				show = true;
+				vscrollbar.Maximum = Items.Count - 1;
+				vscrollbar.LargeChange = Math.Max (items_area.Height / ItemHeight, 0);
+			} else if (ScrollAlwaysVisible) {
+				show = true;
+				enabled = false;
+				vscrollbar.Maximum = 0;
+			}
+
+			vscrollbar.Enabled = enabled;
+			vscrollbar.Visible = show;
+
+			return show;
+		}
+
+		// Value Changed
+		private void VerticalScrollEvent (object sender, EventArgs e)
+		{
+			int top_item = top_index;
+
+			top_index = /*row_count + */ vscrollbar.Value;
+			last_visible_index = LastVisibleItem ();
+
+			int delta = (top_item - top_index) * ItemHeight;
+			if (DrawMode == DrawMode.OwnerDrawVariable) {
+				delta = 0;
+
+				if (top_index < top_item)
+					for (int i = top_index; i < top_item; i++)
+						delta += GetItemHeight (i);
+				else 
+					for (int i = top_item; i < top_index; i++)
+						delta -= GetItemHeight (i);
+			}
+
+			if (IsHandleCreated)
+				XplatUI.ScrollWindow (Handle, items_area, 0, delta, false);
+		}
+
+		#endregion Private Methods
+
+		public class IntegerCollection : IList, ICollection, IEnumerable
+		{
+			private ListBox owner;
+			private List<int> list;
+			
+			#region Public Constructor
+			public IntegerCollection (ListBox owner)
+			{
+				this.owner = owner;
+				list = new List<int> ();
+			}
+			#endregion
+
+			#region Public Properties
+			[Browsable (false)]
+			public int Count {
+				get { return list.Count; }
+			}
+			
+			public int this [int index] {
+				get { return list[index]; }
+				set { list[index] = value; owner.CalculateTabStops (); }
+			}
+			#endregion
+
+			#region Public Methods
+			public int Add (int item)
+			{
+				// This collection does not allow duplicates
+				if (!list.Contains (item)) {
+					list.Add (item);
+					list.Sort ();
+					owner.CalculateTabStops ();
+				}
+				
+				return list.IndexOf (item);
+			}
+			
+			public void AddRange (int[] items)
+			{
+				AddItems (items);
+			}
+			
+			public void AddRange (IntegerCollection value)
+			{
+				AddItems (value);
+			}
+
+			void AddItems (IList items)
+			{
+				if (items == null)
+					throw new ArgumentNullException ("items");
+
+				foreach (int i in items)
+					if (!list.Contains (i))
+						list.Add (i);
+
+				list.Sort ();
+			}
+
+			public void Clear ()
+			{
+				list.Clear ();
+				owner.CalculateTabStops ();
+			}
+			
+			public bool Contains (int item)
+			{
+				return list.Contains (item);
+			}
+			
+			public void CopyTo (Array destination, int index)
+			{
+				for (int i = 0; i < list.Count; i++)
+					destination.SetValue (list[i], index++);
+			}
+			
+			public int IndexOf (int item)
+			{
+				return list.IndexOf (item);
+			}
+			
+			public void Remove (int item)
+			{
+				list.Remove (item);
+				list.Sort ();
+				owner.CalculateTabStops ();
+			}
+			
+			public void RemoveAt (int index)
+			{
+				if (index < 0)
+					throw new IndexOutOfRangeException ();
+
+				list.RemoveAt (index);
+				list.Sort ();
+				owner.CalculateTabStops ();
+			}
+			#endregion
+
+			#region IEnumerable Members
+			IEnumerator IEnumerable.GetEnumerator ()
+			{
+				return list.GetEnumerator ();
+			}
+			#endregion
+
+			#region IList Members
+			int IList.Add (object item)
+			{
+				int? intValue = item as int?;
+				if (!intValue.HasValue)
+					throw new ArgumentException ("item");
+				return Add (intValue.Value);
+			}
+
+			void IList.Clear ()
+			{
+				Clear ();
+			}
+
+			bool IList.Contains (object item)
+			{
+				int? intValue = item as int?;
+				if (!intValue.HasValue)
+					return false;
+				return Contains (intValue.Value);
+			}
+
+			int IList.IndexOf (object item)
+			{
+				int? intValue = item as int?;
+				if (!intValue.HasValue)
+					return -1;
+				return IndexOf (intValue.Value);
+			}
+
+			void IList.Insert (int index, object value)
+			{
+				throw new NotSupportedException (string.Format (
+					CultureInfo.InvariantCulture, "No items "
+					+ "can be inserted into {0}, since it is"
+					+ " a sorted collection.", this.GetType ()));
+			}
+
+			bool IList.IsFixedSize
+			{
+				get { return false; }
+			}
+
+			bool IList.IsReadOnly
+			{
+				get { return false; }
+			}
+
+			void IList.Remove (object value)
+			{
+				int? intValue = value as int?;
+				if (!intValue.HasValue)
+					throw new ArgumentException ("value");
+
+				Remove (intValue.Value);
+			}
+
+			void IList.RemoveAt (int index)
+			{
+				RemoveAt (index);
+			}
+
+			object IList.this[int index] {
+				get { return this[index]; }
+				set { this[index] = (int)value; }
+			}
+			#endregion
+
+			#region ICollection Members
+			bool ICollection.IsSynchronized {
+				get { return true; }
+			}
+
+			object ICollection.SyncRoot {
+				get { return this; }
+			}
+			#endregion
+		}
+
+		[ListBindable (false)]
+		public class ObjectCollection : IList, ICollection, IEnumerable
+		{
+			internal class ListObjectComparer : IComparer
+			{
+				public int Compare (object a, object b)
+				{
+					string str1 = a.ToString ();
+					string str2 = b.ToString ();
+					return str1.CompareTo (str2);
+				}
+			}
+
+			private ListBox owner;
+			internal ArrayList object_items = new ArrayList ();
+			
+			#region UIA Framework Events 
+			//NOTE:
+			//	We are using Reflection to add/remove internal events.
+			//	Class ListProvider uses the events.
+			//
+			//Event used to generate UIA StructureChangedEvent
+			static object UIACollectionChangedEvent = new object ();
+
+			internal event CollectionChangeEventHandler UIACollectionChanged {
+				add { owner.Events.AddHandler (UIACollectionChangedEvent, value); }
+				remove { owner.Events.RemoveHandler (UIACollectionChangedEvent, value); }
+			}
+
+			internal void OnUIACollectionChangedEvent (CollectionChangeEventArgs args)
+			{
+				CollectionChangeEventHandler eh
+					= (CollectionChangeEventHandler) owner.Events [UIACollectionChangedEvent];
+				if (eh != null)
+					eh (owner, args);
+			}
+			#endregion UIA Framework Events 
+
+			public ObjectCollection (ListBox owner)
+			{
+				this.owner = owner;
+			}
+
+			public ObjectCollection (ListBox owner, object[] value)
+			{
+				this.owner = owner;
+				AddRange (value);
+			}
+
+			public ObjectCollection (ListBox owner,  ObjectCollection value)
+			{
+				this.owner = owner;
+				AddRange (value);
+			}
+
+			#region Public Properties
+			public int Count {
+				get { return object_items.Count; }
+			}
+
+			public bool IsReadOnly {
+				get { return false; }
+			}
+
+			[Browsable(false)]
+			[DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+			public virtual object this [int index] {
+				get {
+					if (index < 0 || index >= Count)
+						throw new ArgumentOutOfRangeException ("Index of out range");
+
+					return object_items[index];
+				}
+				set {
+					if (i

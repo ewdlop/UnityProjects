@@ -1,0 +1,22 @@
+[
+{
+  "directory": "/Users/joao/Dev/mono3/mono/utils",
+  "command": "gcc -DHAVE_CONFIG_H -I. -I../.. -I../.. -I../../mono -I../../libgc/include -I../../eglib/src -I../../eglib/src -no-cpp-precomp -D_THREAD_SAFE -DGC_MACOSX_THREADS -DPLATFORM_MACOSX -DUSE_MMAP -DUSE_MUNMAP -g -Wall -Wunused -Wmissing-prototypes -Wmissing-declarations -Wstrict-prototypes -Wmissing-prototypes -Wnested-externs -Wpointer-arith -Wno-cast-qual -Wwrite-strings -Wno-switch -Wno-switch-enum -Wno-unused-value -Qunused-arguments -Wno-unused-function -Wno-tautological-compare -Wno-parentheses-equality -Wno-self-assign -g -O2 -std=gnu99 -fno-strict-aliasing -fwrapv -DMONO_DLL_EXPORT -g -Wall -Wunused -Wmissing-prototypes -Wmissing-declarations -Wstrict-prototypes -Wmissing-prototypes -Wnested-externs -Wpointer-arith -Wno-cast-qual -Wwrite-strings -Wno-switch -Wno-switch-enum -Wno-unused-value -Qunused-arguments -Wno-unused-function -Wno-tautological-compare -Wno-parentheses-equality -Wno-self-assign -Werror-implicit-function-declaration -MT mono-md5.lo -MD -MP -MF .deps/mono-md5.Tpo -c -o .libs/mono-md5.o mono-md5.c -fPIC -DPIC",
+  "file": "/Users/joao/Dev/mono3/mono/utils/mono-md5.c"
+}
+,
+{
+  "directory": "/Users/joao/Dev/mono3/mono/utils",
+  "command": "gcc -DHAVE_CONFIG_H -I. -I../.. -I../.. -I../../mono -I../../libgc/include -I../../eglib/src -I../../eglib/src -no-cpp-precomp -D_THREAD_SAFE -DGC_MACOSX_THREADS -DPLATFORM_MACOSX -DUSE_MMAP -DUSE_MUNMAP -g -Wall -Wunused -Wmissing-prototypes -Wmissing-declarations -Wstrict-prototypes -Wmissing-prototypes -Wnested-externs -Wpointer-arith -Wno-cast-qual -Wwrite-strings -Wno-switch -Wno-switch-enum -Wno-unused-value -Qunused-arguments -Wno-unused-function -Wno-tautological-compare -Wno-parentheses-equality -Wno-self-assign -g -O2 -std=gnu99 -fno-strict-aliasing -fwrapv -DMONO_DLL_EXPORT -g -Wall -Wunused -Wmissing-prototypes -Wmissing-declarations -Wstrict-prototypes -Wmissing-prototypes -Wnested-externs -Wpointer-arith -Wno-cast-qual -Wwrite-strings -Wno-switch -Wno-switch-enum -Wno-unused-value -Qunused-arguments -Wno-unused-function -Wno-tautological-compare -Wno-parentheses-equality -Wno-self-assign -Werror-implicit-function-declaration -MT mono-logger.lo -MD -MP -MF .deps/mono-logger.Tpo -c -o .libs/mono-logger.o mono-logger.c -fPIC -DPIC",
+  "file": "/Users/joao/Dev/mono3/mono/utils/mono-logger.c"
+}
+,
+{
+  "directory": "/Users/joao/Dev/mono3/mono/utils",
+  "command": "gcc -DHAVE_CONFIG_H -I. -I../.. -I../.. -I../../mono -I../../libgc/include -I../../eglib/src -I../../eglib/src -no-cpp-precomp -D_THREAD_SAFE -DGC_MACOSX_THREADS -DPLATFORM_MACOSX -DUSE_MMAP -DUSE_MUNMAP -g -Wall -Wunused -Wmissing-prototypes -Wmissing-declarations -Wstrict-prototypes -Wmissing-prototypes -Wnested-externs -Wpointer-arith -Wno-cast-qual -Wwrite-strings -Wno-switch -Wno-switch-enum -Wno-unused-value -Qunused-arguments -Wno-unused-function -Wno-tautological-compare -Wno-parentheses-equality -Wno-self-assign -g -O2 -std=gnu99 -fno-strict-aliasing -fwrapv -DMONO_DLL_EXPORT -g -Wall -Wunused -Wmissing-prototypes -Wmissing-declarations -Wstrict-prototypes -Wmissing-prototypes -Wnested-externs -Wpointer-arith -Wno-cast-qual -Wwrite-strings -Wno-switch -Wno-switch-enum -Wno-unused-value -Qunused-arguments -Wno-unused-function -Wno-tautological-compare -Wno-parentheses-equality -Wno-self-assign -Werror-implicit-function-declaration -MT mono-sha1.lo -MD -MP -MF .deps/mono-sha1.Tpo -c -o .libs/mono-sha1.o mono-sha1.c -fPIC -DPIC",
+  "file": "/Users/joao/Dev/mono3/mono/utils/mono-sha1.c"
+}
+,
+{
+  "directory": "/Users/joao/Dev/mono3/mono/utils",
+  "command": "/Applications/Xcode61.app/Contents/Developer/usr/bin/gcc -DHAVE_CONFIG_H -I. -I../.. -I../.. -I../../mono -I../../libgc/include -I../../eglib/src -I../../eglib/src -no-cpp-precomp -D_THREAD_SAFE -DGC_MACOSX_THREADS -DPLATFORM_MACOSX -DUSE_MMAP -DUSE_MUNMAP -g -Wall -Wunused -Wmissing-prototypes -Wmissing-declarations -Wstrict-prototypes -Wmissing-prototypes -Wnested-externs -Wpointer-arith -Wno-cast-qual -Wwrite-strings -Wno-switch -Wno-switch-enum -Wno-unused-value -Qunused-arguments -Wno-unused-function -Wno-tautological-compare -Wno-parentheses-equality -Wno-self-assign -g -O2 -std=gnu99 -fno-strict-aliasing -fwra

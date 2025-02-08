@@ -1,0 +1,143 @@
+l(text, self.TEXT * 5)
+
+    def testDecompressTrailingJunk(self):
+        text = bz2.decompress(self.DATA + self.BAD_DATA)
+        self.assertEqual(text, self.TEXT)
+
+    def testDecompressMultiStreamTrailingJunk(self):
+        text = bz2.decompress(self.DATA * 5 + self.BAD_DATA)
+        self.assertEqual(text, self.TEXT * 5)
+
+
+class OpenTest(BaseTest):
+    "Test the open function."
+
+    def open(self, *args, **kwargs):
+        return bz2.open(*args, **kwargs)
+
+    def test_binary_modes(self):
+        for mode in ("wb", "xb"):
+            if mode == "xb":
+                unlink(self.filename)
+            with self.open(self.filename, mode) as f:
+                f.write(self.TEXT)
+            with open(self.filename, "rb") as f:
+                file_data = ext_decompress(f.read())
+                self.assertEqual(file_data, self.TEXT)
+            with self.open(self.filename, "rb") as f:
+                self.assertEqual(f.read(), self.TEXT)
+            with self.open(self.filename, "ab") as f:
+                f.write(self.TEXT)
+            with open(self.filename, "rb") as f:
+                file_data = ext_decompress(f.read())
+                self.assertEqual(file_data, self.TEXT * 2)
+
+    def test_implicit_binary_modes(self):
+        # Test implicit binary modes (no "b" or "t" in mode string).
+        for mode in ("w", "x"):
+            if mode == "x":
+                unlink(self.filename)
+            with self.open(self.filename, mode) as f:
+                f.write(self.TEXT)
+            with open(self.filename, "rb") as f:
+                file_data = ext_decompress(f.read())
+                self.assertEqual(file_data, self.TEXT)
+            with self.open(self.filename, "r") as f:
+                self.assertEqual(f.read(), self.TEXT)
+            with self.open(self.filename, "a") as f:
+                f.write(self.TEXT)
+            with open(self.filename, "rb") as f:
+                file_data = ext_decompress(f.read())
+                self.assertEqual(file_data, self.TEXT * 2)
+
+    def test_text_modes(self):
+        text = self.TEXT.decode("ascii")
+        text_native_eol = text.replace("\n", os.linesep)
+        for mode in ("wt", "xt"):
+            if mode == "xt":
+                unlink(self.filename)
+            with self.open(self.filename, mode) as f:
+                f.write(text)
+            with open(self.filename, "rb") as f:
+                file_data = ext_decompress(f.read()).decode("ascii")
+                self.assertEqual(file_data, text_native_eol)
+            with self.open(self.filename, "rt") as f:
+                self.assertEqual(f.read(), text)
+            with self.open(self.filename, "at") as f:
+                f.write(text)
+            with open(self.filename, "rb") as f:
+                file_data = ext_decompress(f.read()).decode("ascii")
+                self.assertEqual(file_data, text_native_eol * 2)
+
+    def test_x_mode(self):
+        for mode in ("x", "xb", "xt"):
+            unlink(self.filename)
+            with self.open(self.filename, mode) as f:
+                pass
+            with self.assertRaises(FileExistsError):
+                with self.open(self.filename, mode) as f:
+                    pass
+
+    def test_fileobj(self):
+        with self.open(BytesIO(self.DATA), "r") as f:
+            self.assertEqual(f.read(), self.TEXT)
+        with self.open(BytesIO(self.DATA), "rb") as f:
+            self.assertEqual(f.read(), self.TEXT)
+        text = self.TEXT.decode("ascii")
+        with self.open(BytesIO(self.DATA), "rt") as f:
+            self.assertEqual(f.read(), text)
+
+    def test_bad_params(self):
+        # Test invalid parameter combinations.
+        self.assertRaises(ValueError,
+                          self.open, self.filename, "wbt")
+        self.assertRaises(ValueError,
+                          self.open, self.filename, "xbt")
+        self.assertRaises(ValueError,
+                          self.open, self.filename, "rb", encoding="utf-8")
+        self.assertRaises(ValueError,
+                          self.open, self.filename, "rb", errors="ignore")
+        self.assertRaises(ValueError,
+                          self.open, self.filename, "rb", newline="\n")
+
+    def test_encoding(self):
+        # Test non-default encoding.
+        text = self.TEXT.decode("ascii")
+        text_native_eol = text.replace("\n", os.linesep)
+        with self.open(self.filename, "wt", encoding="utf-16-le") as f:
+            f.write(text)
+        with open(self.filename, "rb") as f:
+            file_data = ext_decompress(f.read()).decode("utf-16-le")
+            self.assertEqual(file_data, text_native_eol)
+        with self.open(self.filename, "rt", encoding="utf-16-le") as f:
+            self.assertEqual(f.read(), text)
+
+    def test_encoding_error_handler(self):
+        # Test with non-default encoding error handler.
+        with self.open(self.filename, "wb") as f:
+            f.write(b"foo\xffbar")
+        with self.open(self.filename, "rt", encoding="ascii", errors="ignore") \
+                as f:
+            self.assertEqual(f.read(), "foobar")
+
+    def test_newline(self):
+        # Test with explicit newline (universal newline mode disabled).
+        text = self.TEXT.decode("ascii")
+        with self.open(self.filename, "wt", newline="\n") as f:
+            f.write(text)
+        with self.open(self.filename, "rt", newline="\r") as f:
+            self.assertEqual(f.readlines(), [text])
+
+
+def test_main():
+    support.run_unittest(
+        BZ2FileTest,
+        BZ2CompressorTest,
+        BZ2DecompressorTest,
+        CompressDecompressTest,
+        OpenTest,
+    )
+    support.reap_children()
+
+if __name__ == '__main__':
+    t

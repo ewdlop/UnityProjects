@@ -1,0 +1,194 @@
+ (FPlatformProcess::SupportsMultithreading())
+	{
+		EnabledStats = InEnabledStats;
+	}
+	else
+	{
+		UE_LOG(LogPlayerManagement, Warning, TEXT("WARNING: Stats disabled for non multi-threading platforms"));
+	}
+
+#if ENABLE_AUDIO_DEBUG
+	if (UWorld* MyWorld = GetWorld())
+	{
+		if (FAudioDeviceManager* DeviceManager = GEngine->GetAudioDeviceManager())
+		{
+			Audio::FAudioDebugger::ResolveDesiredStats(this);
+		}
+	}
+#endif // ENABLE_AUDIO_DEBUG
+}
+
+
+void UGameViewportClient::Init(struct FWorldContext& WorldContext, UGameInstance* OwningGameInstance, bool bCreateNewAudioDevice)
+{
+	// set reference to world context
+	WorldContext.AddRef(World);
+
+	// remember our game instance
+	GameInstance = OwningGameInstance;
+
+	// Set the projects default viewport mouse capture mode
+	MouseCaptureMode = GetDefault<UInputSettings>()->DefaultViewportMouseCaptureMode;
+	FString DefaultViewportMouseCaptureMode;
+	if (FParse::Value(FCommandLine::Get(), TEXT("DefaultViewportMouseCaptureMode="), DefaultViewportMouseCaptureMode))
+	{
+		const UEnum* EnumPtr = StaticEnum<EMouseCaptureMode>();
+		checkf(EnumPtr, TEXT("Unable to find EMouseCaptureMode enum"));
+		if (EnumPtr)
+		{
+			int64 EnumValue = EnumPtr->GetValueByName(FName(*DefaultViewportMouseCaptureMode));
+			if (EnumValue != INDEX_NONE)
+			{
+				MouseCaptureMode = static_cast<EMouseCaptureMode>(EnumValue);
+			}
+			else
+			{
+				UE_LOG(LogInit, Warning, TEXT("Unknown DefaultViewportMouseCaptureMode %s. Command line setting will be ignored."), *DefaultViewportMouseCaptureMode);
+			}
+		}
+	}
+	MouseLockMode = GetDefault<UInputSettings>()->DefaultViewportMouseLockMode;
+
+	// Don't capture mouse when headless
+	if(!FApp::CanEverRender())
+	{
+		MouseCaptureMode = EMouseCaptureMode::NoCapture;
+		MouseLockMode = EMouseLockMode::DoNotLock;
+	}
+
+	// In off-screen rendering mode don't lock mouse to the viewport, as we don't want mouse to lock to an invisible window
+	if (FSlateApplication::Get().IsRenderingOffScreen()) {
+		MouseLockMode = EMouseLockMode::DoNotLock;
+	}
+
+	// Create the cursor Widgets
+	UUserInterfaceSettings* UISettings = GetMutableDefault<UUserInterfaceSettings>(UUserInterfaceSettings::StaticClass());
+
+	if (GEngine)
+	{
+		FAudioDeviceManager* AudioDeviceManager = GEngine->GetAudioDeviceManager();
+		if (AudioDeviceManager)
+		{
+			// Get a new audio device for this world.
+			FAudioDeviceParams DeviceParams = AudioDeviceManager->GetDefaultParamsForNewWorld();
+			DeviceParams.AssociatedWorld = World;
+
+			AudioDevice = AudioDeviceManager->RequestAudioDevice(DeviceParams);
+
+			if (AudioDevice.IsValid())
+			{
+#if ENABLE_AUDIO_DEBUG
+				Audio::FAudioDebugger::ResolveDesiredStats(this);
+#endif // ENABLE_AUDIO_DEBUG
+
+				// Set the base mix of the new device based on the world settings of the world
+				if (World)
+				{
+					AudioDevice.GetAudioDevice()->SetDefaultBaseSoundMix(World->GetWorldSettings()->DefaultBaseSoundMix);
+
+					// Set the world's audio device handle to use so that sounds which play in that world will use the correct audio device
+					World->SetAudioDevice(AudioDevice);
+				}
+
+				// Set this audio device handle on the world context so future world's set onto the world context
+				// will pass the audio device handle to them and audio will play on the correct audio device
+				WorldContext.AudioDeviceID = AudioDevice.GetDeviceID();
+			}
+		}
+	}
+
+	// Set all the software cursors.
+	for ( auto& Entry : UISettings->SoftwareCursors )
+	{
+		AddSoftwareCursor(Entry.Key, Entry.Value);
+	}
+
+	// Set all the hardware cursors.
+	for ( auto& Entry : UISettings->HardwareCursors )
+	{
+		SetHardwareCursor(Entry.Key, Entry.Value.CursorPath, Entry.Value.HotSpot);
+	}
+}
+
+void UGameViewportClient::RebuildCursors()
+{
+	UUserInterfaceSettings* UISettings = GetMutableDefault<UUserInterfaceSettings>(UUserInterfaceSettings::StaticClass());
+	// Set all the software cursors.
+	for (auto& Entry : UISettings->SoftwareCursors)
+	{
+		AddSoftwareCursor(Entry.Key, Entry.Value);
+	}
+
+	// Set all the hardware cursors.
+	for (auto& Entry : UISettings->HardwareCursors)
+	{
+		SetHardwareCursor(Entry.Key, Entry.Value.CursorPath, Entry.Value.HotSpot);
+	}
+}
+
+UWorld* UGameViewportClient::GetWorld() const
+{
+	return World;
+}
+
+UGameInstance* UGameViewportClient::GetGameInstance() const
+{
+	return GameInstance;
+}
+
+bool UGameViewportClient::TryToggleFullscreenOnInputKey(FKey Key, EInputEvent EventType)
+{
+	if ((Key == EKeys::Enter && EventType == EInputEvent::IE_Pressed && FSlateApplication::Get().GetModifierKeys().IsAltDown() && GetDefault<UInputSettings>()->bAltEnterTogglesFullscreen)
+		|| (IsRunningGame() && Key == EKeys::F11 && EventType == EInputEvent::IE_Pressed && GetDefault<UInputSettings>()->bF11TogglesFullscreen && !FSlateApplication::Get().GetModifierKeys().AreModifersDown(EModifierKey::Control | EModifierKey::Alt)))
+	{
+		HandleToggleFullscreenCommand();
+		return true;
+	}
+
+	return false;
+}
+
+bool UGameViewportClient::InputKey(const FInputKeyEventArgs& EventArgs)
+{
+	int32 ControllerId = EventArgs.ControllerId;
+
+	if (TryToggleFullscreenOnInputKey(EventArgs.Key, EventArgs.Event))
+	{
+		return true;
+	}
+
+	if (IgnoreInput())
+	{
+		return ViewportConsole ? ViewportConsole->InputKey(ControllerId, EventArgs.Key, EventArgs.Event, EventArgs.AmountDepressed, EventArgs.IsGamepad()) : false;
+	}
+
+	const int32 NumLocalPlayers = World ? World->GetGameInstance()->GetNumLocalPlayers() : 0;
+
+	if (NumLocalPlayers > 1 && EventArgs.Key.IsGamepadKey() && GetDefault<UGameMapsSettings>()->bOffsetPlayerGamepadIds)
+	{
+		++ControllerId;
+	}
+	else if (EventArgs.Viewport->IsPlayInEditorViewport() && EventArgs.Key.IsGamepadKey())
+	{
+		GEngine->RemapGamepadControllerIdForPIE(this, ControllerId);
+	}
+
+	OnInputKeyEvent.Broadcast(EventArgs);
+
+#if WITH_EDITOR
+	// Give debugger commands a chance to process key binding
+	if (GameViewportInputKeyDelegate.IsBound())
+	{
+		if ( GameViewportInputKeyDelegate.Execute(EventArgs.Key, FSlateApplication::Get().GetModifierKeys(), EventArgs.Event) )
+		{
+			return true;
+		}
+	}
+#endif
+
+	// route to subsystems that care
+	bool bResult = ( ViewportConsole ? ViewportConsole->InputKey(ControllerId, EventArgs.Key, EventArgs.Event, EventArgs.AmountDepressed, EventArgs.IsGamepad()) : false );
+
+	if (!bResult)
+	{
+		ULocalPlayer* const TargetPlayer = GEngine->GetLocalPlayerFromControllerId(this, 

@@ -1,0 +1,99 @@
+ses());
+		startIndex = PxMin(classCount, startIndex);
+		uint32_t retAmount = PxMin(requestCount, classCount - startIndex);
+
+		uint32_t idx = 0;
+		while(startIndex)
+		{
+			if(mClasses[idx] != NULL)
+				--startIndex;
+			++idx;
+		}
+
+		uint32_t inserted = 0;
+		uint32_t classesSize = static_cast<uint32_t>(mClasses.size());
+		while(inserted < retAmount && idx < classesSize)
+		{
+			if(mClasses[idx] != NULL)
+			{
+				outClasses[inserted] = *mClasses[idx];
+				++inserted;
+			}
+			++idx;
+		}
+		return inserted;
+	}
+
+	uint32_t updateByteSizeAndGetPropertyAlignment(ClassDescriptionSizeInfo& dest, const ClassDescriptionSizeInfo& src)
+	{
+		uint32_t alignment = src.mAlignment;
+		dest.mAlignment = PxMax(dest.mAlignment, alignment);
+		uint32_t offset = align(dest.mDataByteSize, alignment);
+		dest.mDataByteSize = offset + src.mByteSize;
+		dest.mByteSize = align(dest.mDataByteSize, dest.mAlignment);
+		return offset;
+	}
+
+	void transferPtrOffsets(ClassDescriptionSizeInfo& destInfo, Array<PtrOffset>& destArray,
+	                        const Array<PtrOffset>& src, uint32_t offset)
+	{
+		PVD_FOREACH(idx, src.size())
+		destArray.pushBack(PtrOffset(src[idx].mOffsetType, src[idx].mOffset + offset));
+		destInfo.mPtrOffsets = DataRef<PtrOffset>(destArray.begin(), destArray.end());
+	}
+
+	virtual Option<PropertyDescription> createProperty(int32_t classId, String name, String semantic, int32_t datatype,
+	                                                   PropertyType::Enum propertyType)
+	{
+		ClassDescImpl* cls(getClassImpl(classId));
+		PX_ASSERT(cls);
+		if(!cls)
+			return None();
+		if(cls->mLocked)
+		{
+            PX_ASSERT(false);
+			return None();
+		}
+		PropDescImpl* impl(cls->findProperty(name));
+		// duplicate property definition
+		if(impl)
+		{
+			PX_ASSERT(false);
+			return None();
+		}
+		if(datatype == getPvdTypeForType<String>())
+		{
+			PX_ASSERT(false);
+			return None();
+		}
+		// The datatype for this property has not been declared.
+		ClassDescImpl* propDType(getClassImpl(datatype));
+		PX_ASSERT(propDType);
+		if(!propDType)
+			return None();
+		NamespacedName propClsName(propDType->mName);
+		int32_t propPackedWidth = propDType->mPackedUniformWidth;
+		int32_t propPackedType = propDType->mPackedClassType;
+		// The implications of properties being complex types aren't major
+		//*until* you start trying to undue a property event that set values
+		// of those complex types.  Then things just get too complex.
+		if(propDType->mRequiresDestruction)
+		{
+			PX_ASSERT(false);
+			return None();
+		}
+		bool requiresDestruction = propDType->mRequiresDestruction || cls->mRequiresDestruction;
+
+		if(propertyType == PropertyType::Array)
+		{
+			int32_t tempId = DataTypeToPvdTypeMap<ArrayData>::BaseTypeEnum;
+			propDType = getClassImpl(tempId);
+			PX_ASSERT(propDType);
+			if(!propDType)
+				return None();
+			requiresDestruction = true;
+		}
+		uint32_t offset32 = updateByteSizeAndGetPropertyAlignment(cls->get32BitSizeInfo(), propDType->get32BitSizeInfo());
+		uint32_t offset64 = updateByteSizeAndGetPropertyAlignment(cls->get64BitSizeInfo(), propDType->get64BitSizeInfo());
+		transferPtrOffsets(cls->get32BitSizeInfo(), cls->m32OffsetArray, propDType->m32OffsetArray, offset32);
+		transferPtr

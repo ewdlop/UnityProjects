@@ -1,0 +1,60 @@
+//------------------------------------------------------------
+// Copyright (c) Microsoft Corporation.  All rights reserved.
+//------------------------------------------------------------
+namespace System.ServiceModel.Dispatcher
+{
+    using System.ServiceModel.Channels;
+
+    class DurableMessageDispatchInspector : IDispatchMessageInspector
+    {
+        public const string NewDurableInstanceIdPropertyName = "newDurableInstanceIdProperty";
+        const string suppressContextOnReply = "suppressContextOnReply";
+        SessionMode sessionMode;
+
+        public DurableMessageDispatchInspector(SessionMode sessionMode)
+        {
+            this.sessionMode = sessionMode;
+        }
+
+        public static void SuppressContextOnReply(OperationContext operationContext)
+        {
+            if (operationContext == null)
+            {
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgumentNull("operationContext");
+            }
+            operationContext.OutgoingMessageProperties[suppressContextOnReply] = true;
+        }
+
+        public object AfterReceiveRequest(ref Message request, IClientChannel channel, InstanceContext instanceContext)
+        {
+            if (instanceContext == null)
+            {
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgumentNull("instanceContext");
+            }
+
+            if (request == null)
+            {
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgumentNull("request");
+            }
+
+            if (sessionMode != SessionMode.NotAllowed)
+            {
+                object result = null;
+
+                if (request.Properties.TryGetValue(NewDurableInstanceIdPropertyName, out result))
+                {
+                    return result.ToString();
+                }
+            }
+            return null;
+        }
+
+        public void BeforeSendReply(ref Message reply, object correlationState)
+        {
+            try
+            {
+                if (reply != null)
+                {
+                    ContextMessageProperty context = null;
+
+                    if (sessionMode == SessionMode.NotAllowed || reply.Properties.ContainsKey(suppressCo

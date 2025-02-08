@@ -1,0 +1,295 @@
+ssert((Size % 8) == 0 && "Need pointer size in bytes.");
+      Size /= 8;
+      unsigned Reg = (++MOI)->getReg();
+      int64_t Imm = (++MOI)->getImm();
+      Locs.emplace_back(StackMaps::Location::Direct, Size,
+                        getDwarfRegNum(Reg, TRI), Imm);
+      break;
+    }
+    case StackMaps::IndirectMemRefOp: {
+      int64_t Size = (++MOI)->getImm();
+      assert(Size > 0 && "Need a valid size for indirect memory locations.");
+      unsigned Reg = (++MOI)->getReg();
+      int64_t Imm = (++MOI)->getImm();
+      Locs.emplace_back(StackMaps::Location::Indirect, Size,
+                        getDwarfRegNum(Reg, TRI), Imm);
+      break;
+    }
+    case StackMaps::ConstantOp: {
+      ++MOI;
+      assert(MOI->isImm() && "Expected constant operand.");
+      int64_t Imm = MOI->getImm();
+      Locs.emplace_back(Location::Constant, sizeof(int64_t), 0, Imm);
+      break;
+    }
+    }
+    return ++MOI;
+  }
+
+  // The physical register number will ultimately be encoded as a DWARF regno.
+  // The stack map also records the size of a spill slot that can hold the
+  // register content. (The runtime can track the actual size of the data type
+  // if it needs to.)
+  if (MOI->isReg()) {
+    // Skip implicit registers (this includes our scratch registers)
+    if (MOI->isImplicit())
+      return ++MOI;
+
+    assert(TargetRegisterInfo::isPhysicalRegister(MOI->getReg()) &&
+           "Virtreg operands should have been rewritten before now.");
+    const TargetRegisterClass *RC = TRI->getMinimalPhysRegClass(MOI->getReg());
+    assert(!MOI->getSubReg() && "Physical subreg still around.");
+
+    unsigned Offset = 0;
+    unsigned DwarfRegNum = getDwarfRegNum(MOI->getReg(), TRI);
+    unsigned LLVMRegNum = TRI->getLLVMRegNum(DwarfRegNum, false);
+    unsigned SubRegIdx = TRI->getSubRegIndex(LLVMRegNum, MOI->getReg());
+    if (SubRegIdx)
+      Offset = TRI->getSubRegIdxOffset(SubRegIdx);
+
+    Locs.emplace_back(Location::Register, TRI->getSpillSize(*RC),
+                      DwarfRegNum, Offset);
+    return ++MOI;
+  }
+
+  if (MOI->isRegLiveOut())
+    LiveOuts = parseRegisterLiveOutMask(MOI->getRegLiveOut());
+
+  return ++MOI;
+}
+
+void StackMaps::print(raw_ostream &OS) {
+  const TargetRegisterInfo *TRI =
+      AP.MF ? AP.MF->getSubtarget().getRegisterInfo() : nullptr;
+  OS << WSMP << "callsites:\n";
+  for (const auto &CSI : CSInfos) {
+    const LocationVec &CSLocs = CSI.Locations;
+    const LiveOutVec &LiveOuts = CSI.LiveOuts;
+
+    OS << WSMP << "callsite " << CSI.ID << "\n";
+    OS << WSMP << "  has " << CSLocs.size() << " locations\n";
+
+    unsigned Idx = 0;
+    for (const auto &Loc : CSLocs) {
+      OS << WSMP << "\t\tLoc " << Idx << ": ";
+      switch (Loc.Type) {
+      case Location::Unprocessed:
+        OS << "<Unprocessed operand>";
+        break;
+      case Location::Register:
+        OS << "Register ";
+        if (TRI)
+          OS << printReg(Loc.Reg, TRI);
+        else
+          OS << Loc.Reg;
+        break;
+      case Location::Direct:
+        OS << "Direct ";
+        if (TRI)
+          OS << printReg(Loc.Reg, TRI);
+        else
+          OS << Loc.Reg;
+        if (Loc.Offset)
+          OS << " + " << Loc.Offset;
+        break;
+      case Location::Indirect:
+        OS << "Indirect ";
+        if (TRI)
+          OS << printReg(Loc.Reg, TRI);
+        else
+          OS << Loc.Reg;
+        OS << "+" << Loc.Offset;
+        break;
+      case Location::Constant:
+        OS << "Constant " << Loc.Offset;
+        break;
+      case Location::ConstantIndex:
+        OS << "Constant Index " << Loc.Offset;
+        break;
+      }
+      OS << "\t[encoding: .byte " << Loc.Type << ", .byte 0"
+         << ", .short " << Loc.Size << ", .short " << Loc.Reg << ", .short 0"
+         << ", .int " << Loc.Offset << "]\n";
+      Idx++;
+    }
+
+    OS << WSMP << "\thas " << LiveOuts.size() << " live-out registers\n";
+
+    Idx = 0;
+    for (const auto &LO : LiveOuts) {
+      OS << WSMP << "\t\tLO " << Idx << ": ";
+      if (TRI)
+        OS << printReg(LO.Reg, TRI);
+      else
+        OS << LO.Reg;
+      OS << "\t[encoding: .short " << LO.DwarfRegNum << ", .byte 0, .byte "
+         << LO.Size << "]\n";
+      Idx++;
+    }
+  }
+}
+
+/// Create a live-out register record for the given register Reg.
+StackMaps::LiveOutReg
+StackMaps::createLiveOutReg(unsigned Reg, const TargetRegisterInfo *TRI) const {
+  unsigned DwarfRegNum = getDwarfRegNum(Reg, TRI);
+  unsigned Size = TRI->getSpillSize(*TRI->getMinimalPhysRegClass(Reg));
+  return LiveOutReg(Reg, DwarfRegNum, Size);
+}
+
+/// Parse the register live-out mask and return a vector of live-out registers
+/// that need to be recorded in the stackmap.
+StackMaps::LiveOutVec
+StackMaps::parseRegisterLiveOutMask(const uint32_t *Mask) const {
+  assert(Mask && "No register mask specified");
+  const TargetRegisterInfo *TRI = AP.MF->getSubtarget().getRegisterInfo();
+  LiveOutVec LiveOuts;
+
+  // Create a LiveOutReg for each bit that is set in the register mask.
+  for (unsigned Reg = 0, NumRegs = TRI->getNumRegs(); Reg != NumRegs; ++Reg)
+    if ((Mask[Reg / 32] >> Reg % 32) & 1)
+      LiveOuts.push_back(createLiveOutReg(Reg, TRI));
+
+  // We don't need to keep track of a register if its super-register is already
+  // in the list. Merge entries that refer to the same dwarf register and use
+  // the maximum size that needs to be spilled.
+
+  std::sort(LiveOuts.begin(), LiveOuts.end(),
+            [](const LiveOutReg &LHS, const LiveOutReg &RHS) {
+              // Only sort by the dwarf register number.
+              return LHS.DwarfRegNum < RHS.DwarfRegNum;
+            });
+
+  for (auto I = LiveOuts.begin(), E = LiveOuts.end(); I != E; ++I) {
+    for (auto II = std::next(I); II != E; ++II) {
+      if (I->DwarfRegNum != II->DwarfRegNum) {
+        // Skip all the now invalid entries.
+        I = --II;
+        break;
+      }
+      I->Size = std::max(I->Size, II->Size);
+      if (TRI->isSuperRegister(I->Reg, II->Reg))
+        I->Reg = II->Reg;
+      II->Reg = 0; // mark for deletion.
+    }
+  }
+
+  LiveOuts.erase(
+      llvm::remove_if(LiveOuts,
+                      [](const LiveOutReg &LO) { return LO.Reg == 0; }),
+      LiveOuts.end());
+
+  return LiveOuts;
+}
+
+void StackMaps::recordStackMapOpers(const MachineInstr &MI, uint64_t ID,
+                                    MachineInstr::const_mop_iterator MOI,
+                                    MachineInstr::const_mop_iterator MOE,
+                                    bool recordResult) {
+  MCContext &OutContext = AP.OutStreamer->getContext();
+  MCSymbol *MILabel = OutContext.createTempSymbol();
+  AP.OutStreamer->EmitLabel(MILabel);
+
+  LocationVec Locations;
+  LiveOutVec LiveOuts;
+
+  if (recordResult) {
+    assert(PatchPointOpers(&MI).hasDef() && "Stackmap has no return value.");
+    parseOperand(MI.operands_begin(), std::next(MI.operands_begin()), Locations,
+                 LiveOuts);
+  }
+
+  // Parse operands.
+  while (MOI != MOE) {
+    MOI = parseOperand(MOI, MOE, Locations, LiveOuts);
+  }
+
+  // Move large constants into the constant pool.
+  for (auto &Loc : Locations) {
+    // Constants are encoded as sign-extended integers.
+    // -1 is directly encoded as .long 0xFFFFFFFF with no constant pool.
+    if (Loc.Type == Location::Constant && !isInt<32>(Loc.Offset)) {
+      Loc.Type = Location::ConstantIndex;
+      // ConstPool is intentionally a MapVector of 'uint64_t's (as
+      // opposed to 'int64_t's).  We should never be in a situation
+      // where we have to insert either the tombstone or the empty
+      // keys into a map, and for a DenseMap<uint64_t, T> these are
+      // (uint64_t)0 and (uint64_t)-1.  They can be and are
+      // represented using 32 bit integers.
+      assert((uint64_t)Loc.Offset != DenseMapInfo<uint64_t>::getEmptyKey() &&
+             (uint64_t)Loc.Offset !=
+                 DenseMapInfo<uint64_t>::getTombstoneKey() &&
+             "empty and tombstone keys should fit in 32 bits!");
+      auto Result = ConstPool.insert(std::make_pair(Loc.Offset, Loc.Offset));
+      Loc.Offset = Result.first - ConstPool.begin();
+    }
+  }
+
+  // Create an expression to calculate the offset of the callsite from function
+  // entry.
+  const MCExpr *CSOffsetExpr = MCBinaryExpr::createSub(
+      MCSymbolRefExpr::create(MILabel, OutContext),
+      MCSymbolRefExpr::create(AP.CurrentFnSymForSize, OutContext), OutContext);
+
+  CSInfos.emplace_back(CSOffsetExpr, ID, std::move(Locations),
+                       std::move(LiveOuts));
+
+  // Record the stack size of the current function and update callsite count.
+  const MachineFrameInfo &MFI = AP.MF->getFrameInfo();
+  const TargetRegisterInfo *RegInfo = AP.MF->getSubtarget().getRegisterInfo();
+  bool HasDynamicFrameSize =
+      MFI.hasVarSizedObjects() || RegInfo->needsStackRealignment(*(AP.MF));
+  uint64_t FrameSize = HasDynamicFrameSize ? UINT64_MAX : MFI.getStackSize();
+
+  auto CurrentIt = FnInfos.find(AP.CurrentFnSym);
+  if (CurrentIt != FnInfos.end())
+    CurrentIt->second.RecordCount++;
+  else
+    FnInfos.insert(std::make_pair(AP.CurrentFnSym, FunctionInfo(FrameSize)));
+}
+
+void StackMaps::recordStackMap(const MachineInstr &MI) {
+  assert(MI.getOpcode() == TargetOpcode::STACKMAP && "expected stackmap");
+
+  StackMapOpers opers(&MI);
+  const int64_t ID = MI.getOperand(PatchPointOpers::IDPos).getImm();
+  recordStackMapOpers(MI, ID, std::next(MI.operands_begin(), opers.getVarIdx()),
+                      MI.operands_end());
+}
+
+void StackMaps::recordPatchPoint(const MachineInstr &MI) {
+  assert(MI.getOpcode() == TargetOpcode::PATCHPOINT && "expected patchpoint");
+
+  PatchPointOpers opers(&MI);
+  const int64_t ID = opers.getID();
+  auto MOI = std::next(MI.operands_begin(), opers.getStackMapStartIdx());
+  recordStackMapOpers(MI, ID, MOI, MI.operands_end(),
+                      opers.isAnyReg() && opers.hasDef());
+
+#ifndef NDEBUG
+  // verify anyregcc
+  auto &Locations = CSInfos.back().Locations;
+  if (opers.isAnyReg()) {
+    unsigned NArgs = opers.getNumCallArgs();
+    for (unsigned i = 0, e = (opers.hasDef() ? NArgs + 1 : NArgs); i != e; ++i)
+      assert(Locations[i].Type == Location::Register &&
+             "anyreg arg must be in reg.");
+  }
+#endif
+}
+
+void StackMaps::recordStatepoint(const MachineInstr &MI) {
+  assert(MI.getOpcode() == TargetOpcode::STATEPOINT && "expected statepoint");
+
+  StatepointOpers opers(&MI);
+  // Record all the deopt and gc operands (they're contiguous and run from the
+  // initial index to the end of the operand list)
+  const unsigned StartIdx = opers.getVarIdx();
+  recordStackMapOpers(MI, opers.getID(), MI.operands_begin() + StartIdx,
+                      MI.operands_end(), false);
+}
+
+/// Emit the stackmap header.
+///
+/// Header {
+///   uint8  : Stack Map Version 

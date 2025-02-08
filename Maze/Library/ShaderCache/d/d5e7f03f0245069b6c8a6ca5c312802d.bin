@@ -1,0 +1,79 @@
+     int8_t i;
+                for(i=1;
+                    lastSource<source && !isSingleOrLead(stateTable, state, isDBCSOnly, *lastSource);
+                    ++i
+                ) {
+                    *bytes++=*lastSource++;
+                }
+                cnv->toULength=i;
+                source=lastSource;
+            }
+        } else {
+            /* no output because of empty input or only state changes */
+            *pErrorCode=U_INDEX_OUTOFBOUNDS_ERROR;
+        }
+        c=0xffff;
+    }
+
+    /* set the converter state back into UConverter, ready for a new character */
+    cnv->toUnicodeStatus=0;
+    cnv->mode=state;
+
+    /* write back the updated pointer */
+    pArgs->source=(const char *)source;
+    return c;
+}
+
+#if 0
+/*
+ * Code disabled 2002dec09 (ICU 2.4) because it is not currently used in ICU. markus
+ * Removal improves code coverage.
+ */
+/**
+ * This version of ucnv_MBCSSimpleGetNextUChar() is optimized for single-byte, single-state codepages.
+ * It does not handle the EBCDIC swaplfnl option (set in UConverter).
+ * It does not handle conversion extensions (_extToU()).
+ */
+U_CFUNC UChar32
+ucnv_MBCSSingleSimpleGetNextUChar(UConverterSharedData *sharedData,
+                              uint8_t b, UBool useFallback) {
+    int32_t entry;
+    uint8_t action;
+
+    entry=sharedData->mbcs.stateTable[0][b];
+    /* MBCS_ENTRY_IS_FINAL(entry) */
+
+    if(MBCS_ENTRY_FINAL_IS_VALID_DIRECT_16(entry)) {
+        /* output BMP code point */
+        return (UChar)MBCS_ENTRY_FINAL_VALUE_16(entry);
+    }
+
+    /*
+     * An if-else-if chain provides more reliable performance for
+     * the most common cases compared to a switch.
+     */
+    action=(uint8_t)(MBCS_ENTRY_FINAL_ACTION(entry));
+    if(action==MBCS_STATE_VALID_DIRECT_20) {
+        /* output supplementary code point */
+        return 0x10000+MBCS_ENTRY_FINAL_VALUE(entry);
+    } else if(action==MBCS_STATE_FALLBACK_DIRECT_16) {
+        if(!TO_U_USE_FALLBACK(useFallback)) {
+            return 0xfffe;
+        }
+        /* output BMP code point */
+        return (UChar)MBCS_ENTRY_FINAL_VALUE_16(entry);
+    } else if(action==MBCS_STATE_FALLBACK_DIRECT_20) {
+        if(!TO_U_USE_FALLBACK(useFallback)) {
+            return 0xfffe;
+        }
+        /* output supplementary code point */
+        return 0x10000+MBCS_ENTRY_FINAL_VALUE(entry);
+    } else if(action==MBCS_STATE_UNASSIGNED) {
+        return 0xfffe;
+    } else if(action==MBCS_STATE_ILLEGAL) {
+        return 0xffff;
+    } else {
+        /* reserved, must never occur */
+        return 0xffff;
+    }
+}

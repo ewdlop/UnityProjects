@@ -1,0 +1,112 @@
+/// Multiple threads are subscribing to a FromEventPattern sequence and disposing their subscriptions.
+        /// While this is going on, one consumer does not want to be disturbed while receiving the sequence.
+        /// 
+        /// Uses exponential increments for the concurrency level.
+        /// </summary>
+        /// <param name="N">Number of messages.</param>
+        /// <param name="n">Number of iterations.</param>
+        /// <param name="min">Minimum level of concurrency.</param>
+        /// <param name="max">Maximum level of concurrency.</param>
+        /// <param name="step">Multiplicative step size to increase level of concurrency.</param>
+        public static void RefCount_ConcurrencyLevel_Exponential(int N, int n, int min, int max, int step)
+        {
+            RefCount_(RefCount_ConcurrencyLevel_Exponential_Params(N, n, min, max, step));
+        }
+
+        /// <summary>
+        /// Multiple threads are subscribing to a FromEventPattern sequence and disposing their subscriptions.
+        /// While this is going on, one consumer does not want to be disturbed while receiving the sequence.
+        /// Subscriptions are happening on the ThreadPool, possibly causing (expected) time gaps.
+        /// 
+        /// Uses exponential increments for the concurrency level.
+        /// </summary>
+        /// <param name="N">Number of messages.</param>
+        /// <param name="n">Number of iterations.</param>
+        /// <param name="min">Minimum level of concurrency.</param>
+        /// <param name="max">Maximum level of concurrency.</param>
+        /// <param name="step">Multiplicative step size to increase level of concurrency.</param>
+        public static void RefCountWithPost_ConcurrencyLevel_Exponential(int N, int n, int min, int max, int step)
+        {
+            RefCountWithPost_(RefCount_ConcurrencyLevel_Exponential_Params(N, n, min, max, step));
+        }
+
+        private static IEnumerable<Tuple<int, int>> RefCount_ConcurrencyLevel_Exponential_Params(int N, int n, int min, int max, int step)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                for (int M = min; M <= max; M *= step)
+                {
+                    yield return new Tuple<int, int>(N, M);
+                }
+            }
+        }
+
+        private static void RefCount_(IEnumerable<Tuple<int, int>> parameters)
+        {
+            foreach (var p in parameters)
+            {
+                var N = p.Item1;
+                var M = p.Item2;
+
+                Console.Write("N = {0}, M = {1} - ", N, M);
+
+                var bar = new Bar();
+
+                var foo = Observable.FromEventPattern<FooEventArgs>(h => { Console.Write("+"); bar.Foo += h; }, h => { bar.Foo -= h; Console.Write("-"); });
+
+                var res = new List<int>();
+                var n = 0;
+                var e = new ManualResetEvent(false);
+
+                var cd = new CountdownEvent(M * 2);
+                for (int i = 0; i < M; i++)
+                {
+                    var f = new SingleAssignmentDisposable();
+
+                    ThreadPool.QueueUserWorkItem(_ =>
+                    {
+                        f.Disposable = foo.Subscribe(__ => { Console.Write("!"); });
+                        cd.Signal();
+                    });
+
+                    ThreadPool.QueueUserWorkItem(_ =>
+                    {
+                        f.Dispose();
+                        cd.Signal();
+                    });
+                }
+
+                Console.Write("{SB}");
+
+                var d = foo.Subscribe(x =>
+                {
+                    //Console.Write("&");
+
+                    if (++n == N)
+                        e.Set();
+
+                    res.Add(x.EventArgs.Qux);
+                });
+
+                Console.Write("{SE}");
+
+                var t = new Thread(() =>
+                {
+                    Console.Write("{TB}");
+
+                    for (int i = 0; i < N; i++)
+                        bar.OnFoo(i);
+
+                    Console.Write("{TE}");
+                });
+
+                t.Start();
+                t.Join();
+
+                cd.Wait();
+
+                e.WaitOne();
+                d.Dispose();
+
+                if (!res.SequenceEqual(Enumerable.Range(0, N)))
+              

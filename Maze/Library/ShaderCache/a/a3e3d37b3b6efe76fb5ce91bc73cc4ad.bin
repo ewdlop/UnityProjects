@@ -1,0 +1,70 @@
+pRunState = ApplicationStateDisposition.Undefined;
+
+#if ISOLATION_IN_MSCORLIB
+            Contract.Assert(_definitionIdentities.Count == 2, "An application must have exactly 1 deployment component and 1 application component in Whidbey");
+#endif
+        }
+
+        [ResourceExposure(ResourceScope.Machine)]
+        [ResourceConsumption(ResourceScope.Machine)]
+        [SecuritySafeCritical]
+        private void CreateFromNameAndManifests (ApplicationIdentity applicationIdentity, string[] manifestPaths)
+        {
+            if (applicationIdentity == null)
+                throw new ArgumentNullException("applicationIdentity");
+            if (manifestPaths == null)
+                throw new ArgumentNullException("manifestPaths");
+            Contract.EndContractBlock();
+
+            _applicationIdentity = applicationIdentity;
+
+            // ISSUE - need validation on manifestPaths
+
+            IEnumDefinitionIdentity idenum = _applicationIdentity.Identity.EnumAppPath();
+
+            _manifests = new ArrayList(DefaultComponentCount);
+            _manifestPaths = new String[manifestPaths.Length];
+
+            IDefinitionIdentity[] asbId = new IDefinitionIdentity[1];
+            int i=0;
+            while (idenum.Next(1, asbId) == 1)
+            {
+                ICMS cms = (ICMS) IsolationInterop.ParseManifest(manifestPaths[i], null, ref IsolationInterop.IID_ICMS);
+
+                if (IsolationInterop.IdentityAuthority.AreDefinitionsEqual(0, cms.Identity, asbId[0]))
+                {
+                    _manifests.Add(cms);
+                    _manifestPaths[i]=manifestPaths[i];
+                }
+                else
+                {
+#if ISOLATION_IN_MSCORLIB
+                    throw new ArgumentException(Environment.GetResourceString("Argument_IllegalAppIdMismatch"));
+#else
+                    throw new ArgumentException("Application Identity does not match identity in manifests");
+#endif
+                }
+                i++;
+            }
+            if (i!=manifestPaths.Length)
+            {
+#if ISOLATION_IN_MSCORLIB
+                throw new ArgumentException(Environment.GetResourceString("Argument_IllegalAppId"));
+#else
+                throw new ArgumentException("Application Identity does not have same number of components as manifest paths");
+#endif
+            }
+            _manifests.TrimToSize();
+            if (_manifests.Count <= 1)
+            {
+#if ISOLATION_IN_MSCORLIB
+                throw new ArgumentException(Environment.GetResourceString("Argument_InvalidAppId"));
+#else
+                throw new ArgumentException("Invalid identity: no deployment/app identity specified");
+#endif
+            }
+
+            _definitionIdentities = null;
+            _actContext = null;
+            _form = ContextForm.Loose;
+            _appRunState = Appli

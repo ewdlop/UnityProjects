@@ -1,0 +1,148 @@
+e machine state - fromUnicode */
+    UBool fromUIsSingleByteMode;
+    int8_t fromUDynamicWindow;
+
+    /*
+     * windowUse[] keeps track of the use of the dynamic windows:
+     * At nextWindowUseIndex there is the least recently used window,
+     * and the following windows (in a wrapping manner) are more and more
+     * recently used.
+     * At nextWindowUseIndex-1 there is the most recently used window.
+     */
+    uint8_t locale;
+    int8_t nextWindowUseIndex;
+    int8_t windowUse[8];
+} SCSUData;
+
+static const int8_t initialWindowUse[8]={ 7, 0, 3, 2, 4, 5, 6, 1 };
+static const int8_t initialWindowUse_ja[8]={ 3, 2, 4, 1, 0, 7, 5, 6 };
+
+enum {
+    lGeneric, l_ja
+};
+
+/* SCSU setup functions ----------------------------------------------------- */
+
+static void
+_SCSUReset(UConverter *cnv, UConverterResetChoice choice) {
+    SCSUData *scsu=(SCSUData *)cnv->extraInfo;
+
+    if(choice<=UCNV_RESET_TO_UNICODE) {
+        /* reset toUnicode */
+        uprv_memcpy(scsu->toUDynamicOffsets, initialDynamicOffsets, 32);
+
+        scsu->toUIsSingleByteMode=TRUE;
+        scsu->toUState=readCommand;
+        scsu->toUQuoteWindow=scsu->toUDynamicWindow=0;
+        scsu->toUByteOne=0;
+
+        cnv->toULength=0;
+    }
+    if(choice!=UCNV_RESET_TO_UNICODE) {
+        /* reset fromUnicode */
+        uprv_memcpy(scsu->fromUDynamicOffsets, initialDynamicOffsets, 32);
+
+        scsu->fromUIsSingleByteMode=TRUE;
+        scsu->fromUDynamicWindow=0;
+
+        scsu->nextWindowUseIndex=0;
+        switch(scsu->locale) {
+        case l_ja:
+            uprv_memcpy(scsu->windowUse, initialWindowUse_ja, 8);
+            break;
+        default:
+            uprv_memcpy(scsu->windowUse, initialWindowUse, 8);
+            break;
+        }
+
+        cnv->fromUChar32=0;
+    }
+}
+
+static void
+_SCSUOpen(UConverter *cnv,
+          UConverterLoadArgs *pArgs,
+          UErrorCode *pErrorCode) {
+    const char *locale=pArgs->locale;
+    if(pArgs->onlyTestIsLoadable) {
+        return;
+    }
+    cnv->extraInfo=uprv_malloc(sizeof(SCSUData));
+    if(cnv->extraInfo!=NULL) {
+        if(locale!=NULL && locale[0]=='j' && locale[1]=='a' && (locale[2]==0 || locale[2]=='_')) {
+            ((SCSUData *)cnv->extraInfo)->locale=l_ja;
+        } else {
+            ((SCSUData *)cnv->extraInfo)->locale=lGeneric;
+        }
+        _SCSUReset(cnv, UCNV_RESET_BOTH);
+    } else {
+        *pErrorCode=U_MEMORY_ALLOCATION_ERROR;
+    }
+
+    /* Set the substitution character U+fffd as a Unicode string. */
+    cnv->subUChars[0]=0xfffd;
+    cnv->subCharLen=-1;
+}
+
+static void
+_SCSUClose(UConverter *cnv) {
+    if(cnv->extraInfo!=NULL) {
+        if(!cnv->isExtraLocal) {
+            uprv_free(cnv->extraInfo);
+        }
+        cnv->extraInfo=NULL;
+    }
+}
+
+/* SCSU-to-Unicode conversion functions ------------------------------------- */
+
+static void
+_SCSUToUnicodeWithOffsets(UConverterToUnicodeArgs *pArgs,
+                          UErrorCode *pErrorCode) {
+    UConverter *cnv;
+    SCSUData *scsu;
+    const uint8_t *source, *sourceLimit;
+    UChar *target;
+    const UChar *targetLimit;
+    int32_t *offsets;
+    UBool isSingleByteMode;
+    uint8_t state, byteOne;
+    int8_t quoteWindow, dynamicWindow;
+
+    int32_t sourceIndex, nextSourceIndex;
+
+    uint8_t b;
+
+    /* set up the local pointers */
+    cnv=pArgs->converter;
+    scsu=(SCSUData *)cnv->extraInfo;
+
+    source=(const uint8_t *)pArgs->source;
+    sourceLimit=(const uint8_t *)pArgs->sourceLimit;
+    target=pArgs->target;
+    targetLimit=pArgs->targetLimit;
+    offsets=pArgs->offsets;
+
+    /* get the state machine state */
+    isSingleByteMode=scsu->toUIsSingleByteMode;
+    state=scsu->toUState;
+    quoteWindow=scsu->toUQuoteWindow;
+    dynamicWindow=scsu->toUDynamicWindow;
+    byteOne=scsu->toUByteOne;
+
+    /* sourceIndex=-1 if the current character began in the previous buffer */
+    sourceIndex=state==readCommand ? 0 : -1;
+    nextSourceIndex=0;
+
+    /*
+     * conversion "loop"
+     *
+     * For performance, this is not a normal C loop.
+     * Instead, there are two code blocks for the two SCSU modes.
+     * The function branches to either one, and a change of the mode is done with a goto to
+     * the other branch.
+     *
+     * Each branch has two conventional loops:
+     * - a fast-path loop for the most common codes in the mode
+     * - a loop for all other codes in the mode
+     * When the fas

@@ -1,0 +1,280 @@
+uctor waits until the taskgroup is empty before returning.
+    //
+
+    isEmpty.wait ();
+
+#ifdef ENABLE_SEM_DTOR_WORKAROUND
+    // Update: this was fixed in v. 2.2.21, so this ifdef checks for that
+    //
+    // Alas, given the current bug in glibc we need a secondary
+    // syncronisation primitive here to account for the fact that
+    // destructing the isEmpty Semaphore in this thread can cause
+    // an error for a separate thread that is issuing the post() call.
+    // We are entitled to destruct the semaphore at this point, however,
+    // that post() call attempts to access data out of the associated
+    // memory *after* it has woken the waiting threads, including this one,
+    // potentially leading to invalid memory reads.
+    // http://sources.redhat.com/bugzilla/show_bug.cgi?id=12674
+
+    Lock lock (dtorMutex);
+#endif
+}
+
+
+void
+TaskGroup::Data::addTask () 
+{
+    //
+    // in c++11, we use an atomic to protect numPending to avoid the
+    // extra lock but for c++98, to add the ability for custom thread
+    // pool we add the lock here
+    //
+#if ILMBASE_FORCE_CXX03
+    Lock lock (dtorMutex);
+#endif
+    if (numPending++ == 0)
+        isEmpty.wait ();
+}
+
+
+void
+TaskGroup::Data::removeTask ()
+{
+    // Alas, given the current bug in glibc we need a secondary
+    // syncronisation primitive here to account for the fact that
+    // destructing the isEmpty Semaphore in a separate thread can
+    // cause an error. Issuing the post call here the current libc
+    // implementation attempts to access memory *after* it has woken
+    // waiting threads.
+    // Since other threads are entitled to delete the semaphore the
+    // access to the memory location can be invalid.
+    // http://sources.redhat.com/bugzilla/show_bug.cgi?id=12674
+    // Update: this bug has been fixed, but how do we know which
+    // glibc version we're in?
+
+    // Further update:
+    //
+    // we could remove this if it is a new enough glibc, however 
+    // we've changed the API to enable a custom override of a
+    // thread pool. In order to provide safe access to the numPending,
+    // we need the lock anyway, except for c++11 or newer
+#ifdef ILMBASE_FORCE_CXX03
+    Lock lock (dtorMutex);
+
+    if (--numPending == 0)
+        isEmpty.post ();
+#else
+    if (--numPending == 0)
+    {
+#ifdef ENABLE_SEM_DTOR_WORKAROUND
+        Lock lock (dtorMutex);
+#endif
+        isEmpty.post ();
+    }
+#endif
+}
+    
+
+//
+// struct ThreadPool::Data
+//
+
+ThreadPool::Data::Data ():
+    provUsers (0), provider (NULL)
+#ifdef ILMBASE_FORCE_CXX03
+    , oldprovider (NULL)
+#else
+#endif
+{
+    // empty
+}
+
+
+ThreadPool::Data::~Data()
+{
+#ifdef ILMBASE_FORCE_CXX03
+    provider->finish();
+#else
+    ThreadPoolProvider *p = provider.load( std::memory_order_relaxed );
+    p->finish();
+#endif
+}
+
+inline ThreadPool::Data::SafeProvider
+ThreadPool::Data::getProvider ()
+{
+#ifdef ILMBASE_FORCE_CXX03
+    Lock provLock( provMutex );
+    ++provUsers;
+    return SafeProvider( this, provider );
+#else
+    provUsers.fetch_add( 1, std::memory_order_relaxed );
+    return SafeProvider( this, provider.load( std::memory_order_relaxed ) );
+#endif
+}
+
+
+inline void
+ThreadPool::Data::coalesceProviderUse ()
+{
+#ifdef ILMBASE_FORCE_CXX03
+    Lock provLock( provMutex );
+    --provUsers;
+    if ( provUsers == 0 )
+    {
+        if ( oldprovider )
+            provSem.post();
+    }
+#else
+    int ov = provUsers.fetch_sub( 1, std::memory_order_relaxed );
+    // ov is the previous value, so one means that now it might be 0
+    if ( ov == 1 )
+    {
+        
+    }
+#endif
+}
+
+
+inline void
+ThreadPool::Data::bumpProviderUse ()
+{
+#ifdef ILMBASE_FORCE_CXX03
+    Lock lock (provMutex);
+    ++provUsers;
+#else
+    provUsers.fetch_add( 1, std::memory_order_relaxed );
+#endif
+}
+
+
+inline void
+ThreadPool::Data::setProvider (ThreadPoolProvider *p)
+{
+#ifdef ILMBASE_FORCE_CXX03
+    Lock provLock( provMutex );
+
+    if ( oldprovider )
+        throw IEX_INTERNAL_NAMESPACE::ArgExc ("Attempt to set the thread pool provider while"
+                                              " another thread is currently setting the provider.");
+
+    oldprovider = provider;
+    provider = p;
+
+    while ( provUsers > 0 )
+    {
+        provLock.release();
+        provSem.wait();
+        provLock.acquire();
+    }
+    if ( oldprovider )
+    {
+        oldprovider->finish();
+        delete oldprovider;
+        oldprovider = NULL;
+    }
+#else
+    ThreadPoolProvider *old = provider.load( std::memory_order_relaxed );
+    do
+    {
+        if ( ! provider.compare_exchange_weak( old, p, std::memory_order_release, std::memory_order_relaxed ) )
+            continue;
+    } while ( false );
+
+    // wait for any other users to finish prior to deleting, given
+    // that these are just mostly to query the thread count or push a
+    // task to the queue (so fast), just spin...
+    //
+    // (well, and normally, people don't do this mid stream anyway, so
+    // this will be 0 99.999% of the time, but just to be safe)
+    // 
+    while ( provUsers.load( std::memory_order_relaxed ) > 0 )
+        std::this_thread::yield();
+
+    if ( old )
+    {
+        old->finish();
+        delete old;
+    }
+
+    // NB: the shared_ptr mechanism is safer and means we don't have
+    // to have the provUsers counter since the shared_ptr keeps that
+    // for us. However, gcc 4.8/9 compilers which many people are
+    // still using even though it is 2018 forgot to add the shared_ptr
+    // functions... once that compiler is fully deprecated, switch to
+    // using the below, change provider to a std::shared_ptr and remove
+    // provUsers...
+    //
+//    std::shared_ptr<ThreadPoolProvider> newp( p );
+//    std::shared_ptr<ThreadPoolProvider> curp = std::atomic_load_explicit( &provider, std::memory_order_relaxed );
+//    do
+//    {
+//        if ( ! std::atomic_compare_exchange_weak_explicit( &provider, &curp, newp, std::memory_order_release, std::memory_order_relaxed ) )
+//            continue;
+//    } while ( false );
+//    if ( curp )
+//        curp->finish();
+#endif
+}
+
+//
+// class Task
+//
+
+Task::Task (TaskGroup* g): _group(g)
+{
+    if ( g )
+        g->_data->addTask ();
+}
+
+
+Task::~Task()
+{
+    // empty
+}
+
+
+TaskGroup*
+Task::group ()
+{
+    return _group;
+}
+
+
+TaskGroup::TaskGroup ():
+    _data (new Data())
+{
+    // empty
+}
+
+
+TaskGroup::~TaskGroup ()
+{
+    delete _data;
+}
+
+
+void
+TaskGroup::finishOneTask ()
+{
+    _data->removeTask ();
+}
+
+//
+// class ThreadPoolProvider
+//
+
+
+ThreadPoolProvider::ThreadPoolProvider()
+{
+}
+
+
+ThreadPoolProvider::~ThreadPoolProvider()
+{
+}
+
+
+//
+// class ThreadPool
+//

@@ -1,0 +1,298 @@
+ir";
+}
+
+def regpair : Operand<i32> {
+  let EncoderMethod = "getRegisterPairOpValue";
+  let ParserMatchClass = RegPairAsmOperand;
+  let PrintMethod = "printRegisterPair";
+  let DecoderMethod = "DecodeRegPairOperand";
+  let MIOperandInfo = (ops ptr_rc, ptr_rc);
+}
+
+class StorePairMM<string opstr, ComplexPattern Addr = addr>
+    :  InstSE<(outs), (ins regpair:$rt, mem_simm12:$addr),
+         !strconcat(opstr, "\t$rt, $addr"), [], II_SWP, FrmI, opstr> {
+  let DecoderMethod = "DecodeMemMMImm12";
+  let mayStore = 1;
+}
+
+class LoadPairMM<string opstr, ComplexPattern Addr = addr>
+    : InstSE<(outs regpair:$rt), (ins mem_simm12:$addr),
+          !strconcat(opstr, "\t$rt, $addr"), [], II_LWP, FrmI, opstr> {
+  let DecoderMethod = "DecodeMemMMImm12";
+  let mayLoad = 1;
+}
+
+class LLBaseMM<string opstr, RegisterOperand RO> :
+  InstSE<(outs RO:$rt), (ins mem_mm_12:$addr),
+         !strconcat(opstr, "\t$rt, $addr"), [], II_LL, FrmI> {
+  let DecoderMethod = "DecodeMemMMImm12";
+  let mayLoad = 1;
+}
+
+class LLEBaseMM<string opstr, RegisterOperand RO> :
+  InstSE<(outs RO:$rt), (ins mem_simm9:$addr),
+         !strconcat(opstr, "\t$rt, $addr"), [], II_LLE, FrmI> {
+  let DecoderMethod = "DecodeMemMMImm9";
+  let mayLoad = 1;
+}
+
+class SCBaseMM<string opstr, RegisterOperand RO> :
+  InstSE<(outs RO:$dst), (ins RO:$rt, mem_mm_12:$addr),
+         !strconcat(opstr, "\t$rt, $addr"), [], II_SC, FrmI> {
+  let DecoderMethod = "DecodeMemMMImm12";
+  let mayStore = 1;
+  let Constraints = "$rt = $dst";
+}
+
+class SCEBaseMM<string opstr, RegisterOperand RO> :
+  InstSE<(outs RO:$dst), (ins RO:$rt, mem_simm9:$addr),
+         !strconcat(opstr, "\t$rt, $addr"), [], II_SCE, FrmI> {
+  let DecoderMethod = "DecodeMemMMImm9";
+  let mayStore = 1;
+  let Constraints = "$rt = $dst";
+}
+
+class LoadMM<string opstr, DAGOperand RO, SDPatternOperator OpNode = null_frag,
+             InstrItinClass Itin = NoItinerary, DAGOperand MO = mem_mm_12> :
+  InstSE<(outs RO:$rt), (ins MO:$addr),
+         !strconcat(opstr, "\t$rt, $addr"),
+         [(set RO:$rt, (OpNode addrimm12:$addr))], Itin, FrmI, opstr> {
+  let DecoderMethod = "DecodeMemMMImm12";
+  let canFoldAsLoad = 1;
+  let mayLoad = 1;
+}
+
+class ArithRMM16<string opstr, RegisterOperand RO, bit isComm = 0,
+                 InstrItinClass Itin = NoItinerary,
+                 SDPatternOperator OpNode = null_frag> :
+  MicroMipsInst16<(outs RO:$rd), (ins RO:$rs, RO:$rt),
+                  !strconcat(opstr, "\t$rd, $rs, $rt"),
+                  [(set RO:$rd, (OpNode RO:$rs, RO:$rt))], Itin, FrmR> {
+  let isCommutable = isComm;
+}
+
+class AndImmMM16<string opstr, RegisterOperand RO,
+                 InstrItinClass Itin = NoItinerary> :
+  MicroMipsInst16<(outs RO:$rd), (ins RO:$rs, uimm4_andi:$imm),
+                  !strconcat(opstr, "\t$rd, $rs, $imm"), [], Itin, FrmI>;
+
+class LogicRMM16<string opstr, RegisterOperand RO,
+                 InstrItinClass Itin = NoItinerary,
+                 SDPatternOperator OpNode = null_frag> :
+  MicroMipsInst16<(outs RO:$dst), (ins RO:$rs, RO:$rt),
+         !strconcat(opstr, "\t$rt, $rs"),
+         [(set RO:$dst, (OpNode RO:$rs, RO:$rt))], Itin, FrmR> {
+  let isCommutable = 1;
+  let Constraints = "$rt = $dst";
+}
+
+class NotMM16<string opstr, RegisterOperand RO> :
+  MicroMipsInst16<(outs RO:$rt), (ins RO:$rs),
+         !strconcat(opstr, "\t$rt, $rs"),
+         [(set RO:$rt, (not RO:$rs))], II_NOT, FrmR>;
+
+class ShiftIMM16<string opstr, Operand ImmOpnd, RegisterOperand RO,
+                 InstrItinClass Itin = NoItinerary> :
+  MicroMipsInst16<(outs RO:$rd), (ins RO:$rt, ImmOpnd:$shamt),
+                  !strconcat(opstr, "\t$rd, $rt, $shamt"), [], Itin, FrmR>;
+
+class LoadMM16<string opstr, DAGOperand RO, SDPatternOperator OpNode,
+               InstrItinClass Itin, Operand MemOpnd> :
+  MicroMipsInst16<(outs RO:$rt), (ins MemOpnd:$addr),
+                  !strconcat(opstr, "\t$rt, $addr"), [], Itin, FrmI> {
+  let DecoderMethod = "DecodeMemMMImm4";
+  let canFoldAsLoad = 1;
+  let mayLoad = 1;
+}
+
+class StoreMM16<string opstr, DAGOperand RTOpnd, DAGOperand RO,
+                SDPatternOperator OpNode, InstrItinClass Itin,
+                Operand MemOpnd> :
+  MicroMipsInst16<(outs), (ins RTOpnd:$rt, MemOpnd:$addr),
+                  !strconcat(opstr, "\t$rt, $addr"), [], Itin, FrmI> {
+  let DecoderMethod = "DecodeMemMMImm4";
+  let mayStore = 1;
+}
+
+class LoadSPMM16<string opstr, DAGOperand RO, InstrItinClass Itin,
+                 Operand MemOpnd> :
+  MicroMipsInst16<(outs RO:$rt), (ins MemOpnd:$offset),
+                  !strconcat(opstr, "\t$rt, $offset"), [], Itin, FrmI> {
+  let DecoderMethod = "DecodeMemMMSPImm5Lsl2";
+  let canFoldAsLoad = 1;
+  let mayLoad = 1;
+}
+
+class StoreSPMM16<string opstr, DAGOperand RO, InstrItinClass Itin,
+                  Operand MemOpnd> :
+  MicroMipsInst16<(outs), (ins RO:$rt, MemOpnd:$offset),
+                  !strconcat(opstr, "\t$rt, $offset"), [], Itin, FrmI> {
+  let DecoderMethod = "DecodeMemMMSPImm5Lsl2";
+  let mayStore = 1;
+}
+
+class LoadGPMM16<string opstr, DAGOperand RO, InstrItinClass Itin,
+                 Operand MemOpnd> :
+  MicroMipsInst16<(outs RO:$rt), (ins MemOpnd:$offset),
+                  !strconcat(opstr, "\t$rt, $offset"), [], Itin, FrmI> {
+  let DecoderMethod = "DecodeMemMMGPImm7Lsl2";
+  let canFoldAsLoad = 1;
+  let mayLoad = 1;
+}
+
+class AddImmUR2<string opstr, RegisterOperand RO> :
+  MicroMipsInst16<(outs RO:$rd), (ins RO:$rs, simm3_lsa2:$imm),
+                  !strconcat(opstr, "\t$rd, $rs, $imm"),
+                  [], II_ADDIU, FrmR> {
+  let isCommutable = 1;
+}
+
+class AddImmUS5<string opstr, RegisterOperand RO> :
+  MicroMipsInst16<(outs RO:$dst), (ins RO:$rd, simm4:$imm),
+                  !strconcat(opstr, "\t$rd, $imm"), [], II_ADDIU, FrmR> {
+  let Constraints = "$rd = $dst";
+}
+
+class AddImmUR1SP<string opstr, RegisterOperand RO> :
+  MicroMipsInst16<(outs RO:$rd), (ins uimm6_lsl2:$imm),
+                  !strconcat(opstr, "\t$rd, $imm"), [], II_ADDIU, FrmR>;
+
+class AddImmUSP<string opstr> :
+  MicroMipsInst16<(outs), (ins simm9_addiusp:$imm),
+                  !strconcat(opstr, "\t$imm"), [], II_ADDIU, FrmI>;
+
+class MoveFromHILOMM<string opstr, RegisterOperand RO, Register UseReg> :
+      MicroMipsInst16<(outs RO:$rd), (ins), !strconcat(opstr, "\t$rd"),
+  [], II_MFHI_MFLO, FrmR> {
+  let Uses = [UseReg];
+  let hasSideEffects = 0;
+}
+
+class MoveMM16<string opstr, RegisterOperand RO>
+    :  MicroMipsInst16<(outs RO:$rd), (ins RO:$rs),
+                       !strconcat(opstr, "\t$rd, $rs"), [], II_MOVE, FrmR> {
+  let isReMaterializable = 1;
+}
+
+class LoadImmMM16<string opstr, Operand Od, RegisterOperand RO> :
+  MicroMipsInst16<(outs RO:$rd), (ins Od:$imm),
+                  !strconcat(opstr, "\t$rd, $imm"), [], II_LI, FrmI> {
+  let isReMaterializable = 1;
+}
+
+// 16-bit Jump and Link (Call)
+class JumpLinkRegMM16<string opstr, RegisterOperand RO> :
+  MicroMipsInst16<(outs), (ins RO:$rs), !strconcat(opstr, "\t$rs"),
+           [(MipsJmpLink RO:$rs)], II_JALR, FrmR>, PredicateControl {
+  let isCall = 1;
+  let hasDelaySlot = 1;
+  let Defs = [RA];
+}
+
+// 16-bit Jump Reg
+class JumpRegMM16<string opstr, RegisterOperand RO> :
+  MicroMipsInst16<(outs), (ins RO:$rs), !strconcat(opstr, "\t$rs"),
+           [], II_JR, FrmR> {
+  let hasDelaySlot = 1;
+  let isBranch = 1;
+  let isIndirectBranch = 1;
+}
+
+// Base class for JRADDIUSP instruction.
+class JumpRAddiuStackMM16 :
+  MicroMipsInst16<(outs), (ins uimm5_lsl2:$imm), "jraddiusp\t$imm",
+                  [], II_JRADDIUSP, FrmR> {
+  let isTerminator = 1;
+  let isBarrier = 1;
+  let isBranch = 1;
+  let isIndirectBranch = 1;
+}
+
+// 16-bit Jump and Link (Call) - Short Delay Slot
+class JumpLinkRegSMM16<string opstr, RegisterOperand RO> :
+  MicroMipsInst16<(outs), (ins RO:$rs), !strconcat(opstr, "\t$rs"),
+           [], II_JALRS, FrmR> {
+  let isCall = 1;
+  let hasDelaySlot = 1;
+  let Defs = [RA];
+}
+
+// 16-bit Jump Register Compact - No delay slot
+class JumpRegCMM16<string opstr, RegisterOperand RO> :
+  MicroMipsInst16<(outs), (ins RO:$rs), !strconcat(opstr, "\t$rs"),
+                  [], II_JRC, FrmR> {
+  let isTerminator = 1;
+  let isBarrier = 1;
+  let isBranch = 1;
+  let isIndirectBranch = 1;
+}
+
+// Break16 and Sdbbp16
+class BrkSdbbp16MM<string opstr, InstrItinClass Itin> :
+  MicroMipsInst16<(outs), (ins uimm4:$code_),
+                  !strconcat(opstr, "\t$code_"),
+                  [], Itin, FrmOther>;
+
+class CBranchZeroMM<string opstr, DAGOperand opnd, RegisterOperand RO> :
+  MicroMipsInst16<(outs), (ins RO:$rs, opnd:$offset),
+                  !strconcat(opstr, "\t$rs, $offset"), [], II_BCCZ, FrmI> {
+  let isBranch = 1;
+  let isTerminator = 1;
+  let hasDelaySlot = 1;
+  let Defs = [AT];
+}
+
+// MicroMIPS Jump and Link (Call) - Short Delay Slot
+let isCall = 1, hasDelaySlot = 1, Defs = [RA] in {
+  class JumpLinkMM<string opstr, DAGOperand opnd> :
+    InstSE<(outs), (ins opnd:$target), !strconcat(opstr, "\t$target"),
+           [], II_JALS, FrmJ, opstr> {
+    let DecoderMethod = "DecodeJumpTargetMM";
+  }
+
+  class JumpLinkRegMM<string opstr, RegisterOperand RO>:
+    InstSE<(outs RO:$rd), (ins RO:$rs), !strconcat(opstr, "\t$rd, $rs"),
+            [], II_JALRS, FrmR>;
+
+  class BranchCompareToZeroLinkMM<string opstr, DAGOperand opnd,
+                                  RegisterOperand RO> :
+    InstSE<(outs), (ins RO:$rs, opnd:$offset),
+           !strconcat(opstr, "\t$rs, $offset"), [], II_BCCZALS, FrmI, opstr>;
+}
+
+class LoadWordIndexedScaledMM<string opstr, RegisterOperand RO,
+                              SDPatternOperator OpNode = null_frag> :
+  InstSE<(outs RO:$rd), (ins PtrRC:$base, PtrRC:$index),
+         !strconcat(opstr, "\t$rd, ${index}(${base})"), [], II_LWXS, FrmFI>;
+
+class PrefetchIndexed<string opstr> :
+  InstSE<(outs), (ins PtrRC:$base, PtrRC:$index, uimm5:$hint),
+         !strconcat(opstr, "\t$hint, ${index}(${base})"), [], II_PREF, FrmOther>;
+
+class AddImmUPC<string opstr, RegisterOperand RO> :
+  InstSE<(outs RO:$rs), (ins simm23_lsl2:$imm),
+         !strconcat(opstr, "\t$rs, $imm"), [], II_ADDIU, FrmR>;
+
+/// A list of registers used by load/store multiple instructions.
+def RegListAsmOperand : AsmOperandClass {
+  let Name = "RegList";
+  let ParserMethod = "parseRegisterList";
+}
+
+def reglist : Operand<i32> {
+  let EncoderMethod = "getRegisterListOpValue";
+  let ParserMatchClass = RegListAsmOperand;
+  let PrintMethod = "printRegisterList";
+  let DecoderMethod = "DecodeRegListOperand";
+}
+
+def RegList16AsmOperand : AsmOperandClass {
+  let Name = "RegList16";
+  let ParserMethod = "parseRegisterList";
+  let PredicateMethod = "isRegList16";
+  let RenderMethod = "addRegListOperands";
+}
+
+def reglist16 : Operand<i32> {
+  let EncoderMethod = "getRegisterListOpValue16"

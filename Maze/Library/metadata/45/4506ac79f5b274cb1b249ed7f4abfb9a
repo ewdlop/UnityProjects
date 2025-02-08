@@ -1,0 +1,106 @@
+ value is larger than max.
+    inline bool operator()(const ElementType& v) const { return v>maxVal; }
+
+    /// Return true if any of the vector components are larger than max.
+    template <typename T>
+    inline typename boost::enable_if_c<VecTraits<T>::IsVec, bool>::type
+    operator()(const T& v) const {
+        for (int i=0; i<VecTraits<T>::Size; ++i) if ((*this)(v[i])) return true;
+        return false;
+    }
+
+    /// @brief Return true if the tile at the iterator location is larger than max.
+    bool operator()(const TreeIterT  &iter) const { return (*this)(*iter); }
+
+    /// @brief Return true if the voxel at the iterator location is larger than max.
+    bool operator()(const VoxelIterT &iter) const { return (*this)(*iter); }
+
+    /// @brief Return a string describing a failed check.
+    std::string str() const
+    {
+        std::ostringstream ss;
+        ss << "larger than "<<maxVal;
+        return ss.str();
+    }
+
+    const ElementType maxVal;
+};// CheckMax
+
+////////////////////////////////////////////////////////////////////////////////
+
+/// @brief Checks the norm of the gradient against a range, i.e. @f$|\nabla\phi|\in[min,max]@f$
+///
+/// @note Internally the test is performed as @f$|\nabla\phi|^2\in[min^2,max^2]@f$
+/// for optimization reasons.  
+template<typename GridT,
+         typename TreeIterT = typename GridT::ValueOnCIter,
+         math::BiasedGradientScheme GradScheme = math::FIRST_BIAS>//math::WENO5_BIAS>
+struct CheckNormGrad
+{
+    typedef typename GridT::ValueType ValueType;
+    BOOST_STATIC_ASSERT(boost::is_floating_point<ValueType>::value);
+    typedef TreeIterT TileIterT;
+    typedef typename tree::IterTraits<typename TreeIterT::NodeT, typename TreeIterT::ValueIterT>
+    ::template NodeConverter<typename GridT::TreeType::LeafNodeType>::Type VoxelIterT;
+    typedef typename GridT::ConstAccessor AccT;
+
+    /// @brief Constructor taking a grid and a range to be tested against.
+    CheckNormGrad(const GridT&  grid, const ValueType& _min, const ValueType& _max)
+        : acc(grid.getConstAccessor())
+        , invdx2(ValueType(1.0/math::Pow2(grid.voxelSize()[0])))
+        , minVal2(_min*_min)
+        , maxVal2(_max*_max)
+    {
+        if ( !grid.hasUniformVoxels() ) {
+            OPENVDB_THROW(ValueError, "CheckNormGrad: The transform must have uniform scale");
+        }
+        if (_min > _max) {
+            OPENVDB_THROW(ValueError, "CheckNormGrad: Invalid range (min > max)");
+        }
+    }
+
+    CheckNormGrad(const CheckNormGrad& other)
+        : acc(other.acc.tree())
+        , invdx2(other.invdx2)
+        , minVal2(other.minVal2)
+        , maxVal2(other.maxVal2)
+    {
+    }
+
+    /// Return true if the value is smaller than min or larger than max.
+    inline bool operator()(const ValueType& v) const { return v<minVal2 || v>maxVal2; }
+
+    /// @brief Return true if zero is outside the range.
+    /// @note We assume that the norm of the gradient of a tile is always zero.
+    inline bool operator()(const TreeIterT&) const { return (*this)(ValueType(0)); }
+
+    /// @brief Return true if the norm of the gradient at a voxel
+    /// location of the iterator is out of range.
+    inline bool operator()(const VoxelIterT &iter) const
+    {
+        const Coord ijk = iter.getCoord();
+        return (*this)(invdx2 * math::ISGradientNormSqrd<GradScheme>::result(acc, ijk));
+    }
+
+    /// @brief Return a string describing a failed check.
+    std::string str() const
+    {
+        std::ostringstream ss;
+        ss << "outside the range of NormGrad ["<<math::Sqrt(minVal2)<<","<<math::Sqrt(maxVal2)<<"]";
+        return ss.str();
+    }
+
+    AccT acc;
+    const ValueType invdx2, minVal2, maxVal2;
+};// CheckNormGrad
+
+////////////////////////////////////////////////////////////////////////////////
+
+/// @brief Checks the norm of the gradient at zero-crossing voxels against a range
+/// @details CheckEikonal differs from CheckNormGrad in that it only
+/// checks the norm of the gradient at voxel locations where the
+/// FD-stencil crosses the zero isosurface!
+template<typename GridT,
+         typename TreeIterT = typename GridT::ValueOnCIter,
+         typename StencilT  = math::WenoStencil<GridT> >//math::GradStencil<GridT>
+str

@@ -1,0 +1,48 @@
+size();
+    unsigned NumSymTabSymbols =
+      NumLocalSymbols + NumExternalSymbols + NumUndefinedSymbols;
+    uint64_t IndirectSymbolSize = NumIndirectSymbols * 4;
+    uint64_t IndirectSymbolOffset = 0;
+
+    // If used, the indirect symbols are written after the section data.
+    if (NumIndirectSymbols)
+      IndirectSymbolOffset = LOHTableEnd;
+
+    // The symbol table is written after the indirect symbol data.
+    uint64_t SymbolTableOffset = LOHTableEnd + IndirectSymbolSize;
+
+    // The string table is written after symbol table.
+    uint64_t StringTableOffset =
+      SymbolTableOffset + NumSymTabSymbols * (is64Bit() ?
+                                              sizeof(MachO::nlist_64) :
+                                              sizeof(MachO::nlist));
+    writeSymtabLoadCommand(SymbolTableOffset, NumSymTabSymbols,
+                           StringTableOffset, StringTable.getSize());
+
+    writeDysymtabLoadCommand(FirstLocalSymbol, NumLocalSymbols,
+                             FirstExternalSymbol, NumExternalSymbols,
+                             FirstUndefinedSymbol, NumUndefinedSymbols,
+                             IndirectSymbolOffset, NumIndirectSymbols);
+  }
+
+  // Write the linker options load commands.
+  for (const auto &Option : Asm.getLinkerOptions())
+    writeLinkerOptionsLoadCommand(Option);
+
+  // Write the actual section data.
+  for (const MCSection &Sec : Asm) {
+    Asm.writeSectionData(&Sec, Layout);
+
+    uint64_t Pad = getPaddingSize(&Sec, Layout);
+    WriteZeros(Pad);
+  }
+
+  // Write the extra padding.
+  WriteZeros(SectionDataPadding);
+
+  // Write the relocation entries.
+  for (const MCSection &Sec : Asm) {
+    // Write the section relocation entries, in reverse order to match 'as'
+    // (approximately, the exact algorithm is more complicated than this).
+    std::vector<RelAndSymbol> &Relocs = Relocations[&Sec];
+    for (const RelAn

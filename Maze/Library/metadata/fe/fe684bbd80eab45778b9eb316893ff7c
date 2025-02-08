@@ -1,0 +1,115 @@
+///     nearest neighbors).
+///
+/// @note The values of any voxels are unchanged.
+template<typename TreeType> OPENVDB_STATIC_SPECIALIZATION
+inline void dilateVoxels(tree::LeafManager<TreeType>& manager,
+                         int iterations = 1,
+                         NearestNeighbors nn = NN_FACE);
+
+
+//@{
+/// @brief Topologically erode all leaf-level active voxels in the given tree.
+/// @details That is, shrink the set of active voxels by @a iterations voxels
+/// in the +x, -x, +y, -y, +z and -z directions, but don't change the values
+/// of any voxels, only their active states.
+/// @todo Currently operates only on leaf voxels; need to extend to tiles.
+template<typename TreeType> OPENVDB_STATIC_SPECIALIZATION
+inline void erodeVoxels(TreeType& tree,
+                        int iterations=1,
+                        NearestNeighbors nn = NN_FACE);
+
+template<typename TreeType> OPENVDB_STATIC_SPECIALIZATION
+inline void erodeVoxels(tree::LeafManager<TreeType>& manager,
+                        int iterations = 1,
+                        NearestNeighbors nn = NN_FACE);
+//@}
+
+
+/// @brief Mark as active any inactive tiles or voxels in the given grid or tree
+/// whose values are equal to @a value (optionally to within the given @a tolerance).
+template<typename GridOrTree>
+inline void activate(
+    GridOrTree&,
+    const typename GridOrTree::ValueType& value,
+    const typename GridOrTree::ValueType& tolerance = zeroVal<typename GridOrTree::ValueType>()
+);
+
+
+/// @brief Mark as inactive any active tiles or voxels in the given grid or tree
+/// whose values are equal to @a value (optionally to within the given @a tolerance).
+template<typename GridOrTree>
+inline void deactivate(
+    GridOrTree&,
+    const typename GridOrTree::ValueType& value,
+    const typename GridOrTree::ValueType& tolerance = zeroVal<typename GridOrTree::ValueType>()
+);
+
+
+////////////////////////////////////////
+
+
+/// Mapping from a Log2Dim to a data type of size 2^Log2Dim bits
+template<Index Log2Dim> struct DimToWord {};
+template<> struct DimToWord<3> { typedef uint8_t Type; };
+template<> struct DimToWord<4> { typedef uint16_t Type; };
+template<> struct DimToWord<5> { typedef uint32_t Type; };
+template<> struct DimToWord<6> { typedef uint64_t Type; };
+
+
+////////////////////////////////////////
+
+
+template<typename TreeType>
+class Morphology
+{
+public:
+    typedef tree::LeafManager<TreeType> ManagerType;
+
+    Morphology(TreeType& tree):
+        mOwnsManager(true), mManager(new ManagerType(tree)), mAcc(tree), mSteps(1) {}
+    Morphology(ManagerType* mgr):
+        mOwnsManager(false), mManager(mgr), mAcc(mgr->tree()), mSteps(1) {}
+    virtual ~Morphology() { if (mOwnsManager) delete mManager; }
+
+    /// @brief Face-adjacent dilation pattern
+    void dilateVoxels6();
+    /// @brief Face- and edge-adjacent dilation pattern.
+    void dilateVoxels18();
+    /// @brief Face-, edge- and vertex-adjacent dilation pattern.
+    void dilateVoxels26();
+    void dilateVoxels(int iterations = 1, NearestNeighbors nn = NN_FACE);
+
+    /// @brief Face-adjacent erosion pattern.
+    void erodeVoxels6()  { mSteps = 1; this->doErosion(NN_FACE); }
+    /// @brief Face- and edge-adjacent erosion pattern.
+    void erodeVoxels18() { mSteps = 1; this->doErosion(NN_FACE_EDGE); }
+    /// @brief Face-, edge- and vertex-adjacent erosion pattern.
+    void erodeVoxels26() { mSteps = 1; this->doErosion(NN_FACE_EDGE_VERTEX); }
+    void erodeVoxels(int iterations = 1, NearestNeighbors nn = NN_FACE)
+    {
+        mSteps = iterations;
+        this->doErosion(nn);
+    }
+
+protected:
+
+    void doErosion(NearestNeighbors nn);
+
+    typedef typename TreeType::LeafNodeType LeafType;
+    typedef typename LeafType::NodeMaskType MaskType;
+    typedef tree::ValueAccessor<TreeType>   AccessorType;
+
+    const bool   mOwnsManager;
+    ManagerType* mManager;
+    AccessorType mAcc;
+    int mSteps;
+
+    static const int LEAF_DIM     = LeafType::DIM;
+    static const int LEAF_LOG2DIM = LeafType::LOG2DIM;
+    typedef typename DimToWord<LEAF_LOG2DIM>::Type Word;
+
+    struct Neighbor {
+        LeafType* leaf;//null if a tile
+        bool      init;//true if initialization is required
+        bool      isOn;//true if an active tile
+  

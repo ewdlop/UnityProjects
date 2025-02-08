@@ -1,0 +1,104 @@
+/**
+ * \file
+ * Expensive asserts used when mono is built with --with-checked-build=yes
+ *
+ * Author:
+ *	Rodrigo Kumpera (kumpera@gmail.com)
+ *
+ * (C) 2015 Xamarin
+ */
+
+#ifndef __CHECKED_BUILD_H__
+#define __CHECKED_BUILD_H__
+
+#include <config.h>
+#include <mono/utils/atomic.h>
+#include <mono/utils/mono-compiler.h>
+#include <mono/utils/mono-publib.h>
+
+typedef enum {
+	MONO_CHECK_MODE_NONE = 0,
+	MONO_CHECK_MODE_GC = 0x1,
+	MONO_CHECK_MODE_METADATA = 0x2,
+	MONO_CHECK_MODE_THREAD = 0x4,
+	MONO_CHECK_MODE_ALL = MONO_CHECK_MODE_GC | MONO_CHECK_MODE_METADATA | MONO_CHECK_MODE_THREAD,
+	MONO_CHECK_MODE_UNKNOWN = 0x8
+} MonoCheckMode;
+
+G_ENUM_FUNCTIONS (MonoCheckMode)
+
+mono_bool mono_check_mode_enabled (MonoCheckMode query);
+
+// This is for metadata writes which we have chosen not to check at the current time.
+// Because in principle this should never happen, we still use a macro so that the exemptions will be easier to find, and remove, later.
+// The current reason why this is needed is for pointers to constant strings, which the checker cannot verify yet.
+#define CHECKED_METADATA_WRITE_PTR_EXEMPT(ptr, val) do { (ptr) = (val); } while (0)
+
+#ifdef ENABLE_CHECKED_BUILD
+
+#define g_assert_checked g_assert
+
+/*
+This can be called by embedders
+*/
+#define MONO_REQ_API_ENTRYPOINT
+
+/*
+The JIT will generate code that will land on this function
+*/
+#define MONO_REQ_RUNTIME_ENTRYPOINT
+
+#define CHECKED_MONO_INIT() do { checked_build_init (); } while (0)
+
+void checked_build_init (void);
+
+#else
+
+#define g_assert_checked(...)
+
+#define MONO_REQ_API_ENTRYPOINT
+#define MONO_REQ_RUNTIME_ENTRYPOINT
+
+#define CHECKED_MONO_INIT()
+
+#endif /* ENABLE_CHECKED_BUILD */
+
+#ifdef ENABLE_CHECKED_BUILD_GC
+/*
+GC runtime modes rules:
+
+- GC Safe
+Can:
+Call into foreigh functions.
+Call GC Safe or Neutral modes functions.
+Read from pinned managed memory.
+
+Cannot:
+Touch managed memory (read/write).
+Be dettached.
+
+What's good for?
+Doing blocking calls.
+
+- GC Unsafe
+Can:
+Touch managed memory (read/write).
+Call GC Unsafe or Neutral modes functions.
+
+Cannot:
+Call foreign native code (embedder callbacks, pinvokes, etc)
+Call into any Blocking functions/syscalls (mutexes, IO, etc)
+Be dettached.
+
+What's good for?
+Poking into managed memory.
+
+-- GC Neutral
+Can:
+Call other GC Neutral mode functions.
+
+Cannot:
+Touch managed memory.
+Call foreign native code (embedder callbacks, pinvokes, etc)
+Call into any Blocking functions/syscalls (mutexes, IO, etc)
+B

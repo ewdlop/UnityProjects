@@ -1,0 +1,135 @@
+/*
+ *  Copyright (c) 2014 The WebRTC project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+#ifndef TEST_CALL_TEST_H_
+#define TEST_CALL_TEST_H_
+
+#include <memory>
+#include <vector>
+
+#include "call/call.h"
+#include "call/rtp_transport_controller_send.h"
+#include "logging/rtc_event_log/rtc_event_log.h"
+#include "modules/audio_device/include/test_audio_device.h"
+#include "test/encoder_settings.h"
+#include "test/fake_decoder.h"
+#include "test/fake_videorenderer.h"
+#include "test/fake_vp8_encoder.h"
+#include "test/frame_generator_capturer.h"
+#include "test/function_video_encoder_factory.h"
+#include "test/rtp_rtcp_observer.h"
+#include "test/single_threaded_task_queue.h"
+
+namespace webrtc {
+namespace test {
+
+class BaseTest;
+
+class CallTest : public ::testing::Test {
+ public:
+  CallTest();
+  virtual ~CallTest();
+
+  static constexpr size_t kNumSsrcs = 6;
+  static const int kNumSimulcastStreams = 3;
+  static const int kDefaultWidth = 320;
+  static const int kDefaultHeight = 180;
+  static const int kDefaultFramerate = 30;
+  static const int kDefaultTimeoutMs;
+  static const int kLongTimeoutMs;
+  enum classPayloadTypes : uint8_t {
+    kSendRtxPayloadType = 98,
+    kRtxRedPayloadType = 99,
+    kVideoSendPayloadType = 100,
+    kAudioSendPayloadType = 103,
+    kRedPayloadType = 118,
+    kUlpfecPayloadType = 119,
+    kFlexfecPayloadType = 120,
+    kPayloadTypeH264 = 122,
+    kPayloadTypeVP8 = 123,
+    kPayloadTypeVP9 = 124,
+    kFakeVideoSendPayloadType = 125,
+  };
+  static const uint32_t kSendRtxSsrcs[kNumSsrcs];
+  static const uint32_t kVideoSendSsrcs[kNumSsrcs];
+  static const uint32_t kAudioSendSsrc;
+  static const uint32_t kFlexfecSendSsrc;
+  static const uint32_t kReceiverLocalVideoSsrc;
+  static const uint32_t kReceiverLocalAudioSsrc;
+  static const int kNackRtpHistoryMs;
+  static const uint8_t kDefaultKeepalivePayloadType;
+  static const std::map<uint8_t, MediaType> payload_type_map_;
+
+ protected:
+  // RunBaseTest overwrites the audio_state of the send and receive Call configs
+  // to simplify test code.
+  void RunBaseTest(BaseTest* test);
+
+  void CreateCalls();
+  void CreateCalls(const Call::Config& sender_config,
+                   const Call::Config& receiver_config);
+  void CreateSenderCall();
+  void CreateSenderCall(const Call::Config& config);
+  void CreateReceiverCall(const Call::Config& config);
+  void DestroyCalls();
+
+  void CreateVideoSendConfig(VideoSendStream::Config* video_config,
+                             size_t num_video_streams,
+                             size_t num_used_ssrcs,
+                             Transport* send_transport);
+  void CreateAudioAndFecSendConfigs(size_t num_audio_streams,
+                                    size_t num_flexfec_streams,
+                                    Transport* send_transport);
+  void SetAudioConfig(const AudioSendStream::Config& config);
+
+  void SetSendFecConfig(std::vector<uint32_t> video_send_ssrcs);
+  void SetSendUlpFecConfig(VideoSendStream::Config* send_config);
+  void SetReceiveUlpFecConfig(VideoReceiveStream::Config* receive_config);
+  void CreateSendConfig(size_t num_video_streams,
+                        size_t num_audio_streams,
+                        size_t num_flexfec_streams,
+                        Transport* send_transport);
+
+  void CreateMatchingVideoReceiveConfigs(
+      const VideoSendStream::Config& video_send_config,
+      Transport* rtcp_send_transport);
+  void CreateMatchingVideoReceiveConfigs(
+      const VideoSendStream::Config& video_send_config,
+      Transport* rtcp_send_transport,
+      bool send_side_bwe,
+      absl::optional<size_t> decode_sub_stream,
+      bool receiver_reference_time_report,
+      int rtp_history_ms);
+  void AddMatchingVideoReceiveConfigs(
+      std::vector<VideoReceiveStream::Config>* receive_configs,
+      const VideoSendStream::Config& video_send_config,
+      Transport* rtcp_send_transport,
+      bool send_side_bwe,
+      absl::optional<size_t> decode_sub_stream,
+      bool receiver_reference_time_report,
+      int rtp_history_ms);
+
+  void CreateMatchingAudioAndFecConfigs(Transport* rtcp_send_transport);
+  void CreateMatchingAudioConfigs(Transport* transport, std::string sync_group);
+  static AudioReceiveStream::Config CreateMatchingAudioConfig(
+      const AudioSendStream::Config& send_config,
+      rtc::scoped_refptr<AudioDecoderFactory> audio_decoder_factory,
+      Transport* transport,
+      std::string sync_group);
+  void CreateMatchingFecConfig(
+      Transport* transport,
+      const VideoSendStream::Config& video_send_config);
+  void CreateMatchingReceiveConfigs(Transport* rtcp_send_transport);
+
+  void CreateFrameGeneratorCapturerWithDrift(Clock* drift_clock,
+                                             float speed,
+                                             int framerate,
+                                             int width,
+                                             int height);
+  void CreateFrameGeneratorCapturer(int framerate, int

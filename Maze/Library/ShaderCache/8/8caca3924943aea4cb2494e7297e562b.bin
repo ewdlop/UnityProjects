@@ -1,0 +1,53 @@
+(!TgtPtrBegin && arg_sizes[i]) {
+      // If arg_sizes[i]==0, then the argument is a pointer to NULL, so
+      // getOrAlloc() returning NULL is not an error.
+      DP("Call to getOrAllocTgtPtr returned null pointer (device failure or "
+          "illegal mapping).\n");
+    }
+    DP("There are %" PRId64 " bytes allocated at target address " DPxMOD
+        " - is%s new\n", arg_sizes[i], DPxPTR(TgtPtrBegin),
+        (IsNew ? "" : " not"));
+
+    if (arg_types[i] & OMP_TGT_MAPTYPE_RETURN_PARAM) {
+      void *ret_ptr;
+      if (arg_types[i] & OMP_TGT_MAPTYPE_PTR_AND_OBJ)
+        ret_ptr = Pointer_TgtPtrBegin;
+      else {
+        bool IsLast; // not used
+        ret_ptr = Device.getTgtPtrBegin(HstPtrBegin, 0, IsLast, false);
+      }
+
+      DP("Returning device pointer " DPxMOD "\n", DPxPTR(ret_ptr));
+      args_base[i] = ret_ptr;
+    }
+
+    if (arg_types[i] & OMP_TGT_MAPTYPE_TO) {
+      bool copy = false;
+      if (IsNew || (arg_types[i] & OMP_TGT_MAPTYPE_ALWAYS)) {
+        copy = true;
+      } else if (arg_types[i] & OMP_TGT_MAPTYPE_MEMBER_OF) {
+        // Copy data only if the "parent" struct has RefCount==1.
+        short parent_idx = member_of(arg_types[i]);
+        long parent_rc = Device.getMapEntryRefCnt(args[parent_idx]);
+        assert(parent_rc > 0 && "parent struct not found");
+        if (parent_rc == 1) {
+          copy = true;
+        }
+      }
+
+      if (copy) {
+        DP("Moving %" PRId64 " bytes (hst:" DPxMOD ") -> (tgt:" DPxMOD ")\n",
+            arg_sizes[i], DPxPTR(HstPtrBegin), DPxPTR(TgtPtrBegin));
+        int rt = Device.data_submit(TgtPtrBegin, HstPtrBegin, arg_sizes[i]);
+        if (rt != OFFLOAD_SUCCESS) {
+          DP("Copying data to device failed.\n");
+          rc = OFFLOAD_FAIL;
+        }
+      }
+    }
+
+    if (arg_types[i] & OMP_TGT_MAPTYPE_PTR_AND_OBJ) {
+      DP("Update pointer (" DPxMOD ") -> [" DPxMOD "]\n",
+          DPxPTR(Pointer_TgtPtrBegin), DPxPTR(TgtPtrBegin));
+      uint64_t Delta = (uint64_t)HstPtrBegin - (uint64_t)HstPtrBase;
+      void *TgtPtrBase = (void

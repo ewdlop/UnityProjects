@@ -1,0 +1,159 @@
+td::string &key, const SecByteBlock &data)
+	{
+		output += key;
+		output += "= ";
+		HexEncoder(new StringSink(output), false).Put(data, data.size());
+		output += "\n";
+	}
+
+	void OutputData(std::string &output, const std::string &key, const Integer &data, int size=-1)
+	{
+		SecByteBlock s(size < 0 ? data.MinEncodedSize() : size);
+		data.Encode(s, s.size());
+		OutputData(output, key, s);
+	}
+
+	void OutputData(std::string &output, const std::string &key, const PolynomialMod2 &data, int size=-1)
+	{
+		SecByteBlock s(size < 0 ? data.MinEncodedSize() : size);
+		data.Encode(s, s.size());
+		OutputData(output, key, s);
+	}
+
+	void OutputData(std::string &output, DataType t, const std::string &data)
+	{
+		if (m_algorithm == "SKIPJACK")
+		{
+			if (m_test == "KAT")
+			{
+				if (t == OUTPUT)
+					output = m_line + data + "\n";
+			}
+			else
+			{
+				if (t != COUNT)
+				{
+					output += m_typeToName[t];
+					output += "=";
+				}
+				output += data;
+				output += t == OUTPUT ? "\n" : "  ";
+			}
+		}
+		else if (m_algorithm == "TDES" && t == KEY_T && m_typeToName[KEY_T].empty())
+		{
+			output += "KEY1 = ";
+			output += data.substr(0, 16);
+			output += "\nKEY2 = ";
+			output += data.size() > 16 ? data.substr(16, 16) : data.substr(0, 16);
+			output += "\nKEY3 = ";
+			output += data.size() > 32 ? data.substr(32, 16) : data.substr(0, 16);
+			output += "\n";
+		}
+		else
+		{
+			output += m_typeToName[t];
+			output += " = ";
+			output += data;
+			output += "\n";
+		}
+	}
+
+	void OutputData(std::string &output, DataType t, int i)
+	{
+		OutputData(output, t, IntToString(i));
+	}
+
+	void OutputData(std::string &output, DataType t, const SecByteBlock &data)
+	{
+		std::string hexData;
+		StringSource(data.begin(), data.size(), true, new HexEncoder(new StringSink(hexData), false));
+		OutputData(output, t, hexData);
+	}
+
+	void OutputGivenData(std::string &output, DataType t, bool optional = false)
+	{
+		if (m_data.find(m_typeToName[t]) == m_data.end())
+		{
+			if (optional)
+				return;
+			throw Exception(Exception::OTHER_ERROR, "TestDataParser: key not found: " + m_typeToName[t]);
+		}
+
+		OutputData(output, t, m_data[m_typeToName[t]]);
+	}
+
+	template <class T>
+		BlockCipher * NewBT(T *)
+	{
+		if (!m_encrypt && (m_mode == "ECB" || m_mode == "CBC"))
+			return new typename T::Decryption;
+		else
+			return new typename T::Encryption;
+	}
+
+	template <class T>
+		SymmetricCipher * NewMode(T *, BlockCipher &bt, const byte *iv)
+	{
+		if (!m_encrypt)
+			return new typename T::Decryption(bt, iv, m_feedbackSize/8);
+		else
+			return new typename T::Encryption(bt, iv, m_feedbackSize/8);
+	}
+
+	static inline void Xor(SecByteBlock &z, const SecByteBlock &x, const SecByteBlock &y)
+	{
+		assert(x.size() == y.size());
+		z.resize(x.size());
+		xorbuf(z, x, y, x.size());
+	}
+
+	SecByteBlock UpdateKey(SecByteBlock key, const SecByteBlock *text)
+	{
+		unsigned int innerCount = (m_algorithm == "AES") ? 1000 : 10000;
+		int keySize = key.size(), blockSize = text[0].size();
+		SecByteBlock x(keySize);
+		for (int k=0; k<keySize;)
+		{
+			int pos = innerCount * blockSize - keySize + k;
+			memcpy(x + k, text[pos / blockSize] + pos % blockSize, blockSize - pos % blockSize);
+			k += blockSize - pos % blockSize;
+		}
+
+		if (m_algorithm == "TDES" || m_algorithm == "DES")
+		{
+			for (int i=0; i<keySize; i+=8)
+			{
+				xorbuf(key+i, x+keySize-8-i, 8);
+				DES::CorrectKeyParityBits(key+i);
+			}
+		}
+		else
+			xorbuf(key, x, keySize);
+
+		return key;
+	}
+
+	static inline void AssignLeftMostBits(SecByteBlock &z, const SecByteBlock &x, unsigned int K)
+	{
+		z.Assign(x, K/8);
+	}
+
+	template <class EC>
+	void EC_KeyPair(string &output, int n, const OID &oid)
+	{
+		DL_GroupParameters_EC<EC> params(oid);
+		for (int i=0; i<n; i++)
+		{
+			DL_PrivateKey_EC<EC> priv;
+			DL_PublicKey_EC<EC> pub;
+			priv.Initialize(m_rng, params);
+			priv.MakePublicKey(pub);
+
+			OutputData(output, "d ", priv.GetPrivateExponent());
+			OutputData(output, "Qx ", pub.GetPublicElement().x, params.GetCurve().GetField().MaxElementByteLength());
+			OutputData(output, "Qy ", pub.GetPublicElement().y, params.GetCurve().GetField().MaxElementByteLength());
+		}
+	}
+
+	template <class EC>

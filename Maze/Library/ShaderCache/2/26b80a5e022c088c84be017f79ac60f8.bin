@@ -1,0 +1,204 @@
+   return self._command_complete(name, self._command(name, *args))
+
+
+    def _untagged_response(self, typ, dat, name):
+
+        if typ == 'NO':
+            return typ, dat
+        if not name in self.untagged_responses:
+            return typ, [None]
+        data = self.untagged_responses.pop(name)
+        if __debug__:
+            if self.debug >= 5:
+                self._mesg('untagged_responses[%s] => %s' % (name, data))
+        return typ, data
+
+
+    if __debug__:
+
+        def _mesg(self, s, secs=None):
+            if secs is None:
+                secs = time.time()
+            tm = time.strftime('%M:%S', time.localtime(secs))
+            sys.stderr.write('  %s.%02d %s\n' % (tm, (secs*100)%100, s))
+            sys.stderr.flush()
+
+        def _dump_ur(self, dict):
+            # Dump untagged responses (in `dict').
+            l = dict.items()
+            if not l: return
+            t = '\n\t\t'
+            l = map(lambda x:'%s: "%s"' % (x[0], x[1][0] and '" "'.join(x[1]) or ''), l)
+            self._mesg('untagged responses dump:%s%s' % (t, t.join(l)))
+
+        def _log(self, line):
+            # Keep log of last `_cmd_log_len' interactions for debugging.
+            self._cmd_log[self._cmd_log_idx] = (line, time.time())
+            self._cmd_log_idx += 1
+            if self._cmd_log_idx >= self._cmd_log_len:
+                self._cmd_log_idx = 0
+
+        def print_log(self):
+            self._mesg('last %d IMAP4 interactions:' % len(self._cmd_log))
+            i, n = self._cmd_log_idx, self._cmd_log_len
+            while n:
+                try:
+                    self._mesg(*self._cmd_log[i])
+                except:
+                    pass
+                i += 1
+                if i >= self._cmd_log_len:
+                    i = 0
+                n -= 1
+
+
+
+try:
+    import ssl
+except ImportError:
+    pass
+else:
+    class IMAP4_SSL(IMAP4):
+
+        """IMAP4 client class over SSL connection
+
+        Instantiate with: IMAP4_SSL([host[, port[, keyfile[, certfile]]]])
+
+                host - host's name (default: localhost);
+                port - port number (default: standard IMAP4 SSL port).
+                keyfile - PEM formatted file that contains your private key (default: None);
+                certfile - PEM formatted certificate chain file (default: None);
+
+        for more documentation see the docstring of the parent class IMAP4.
+        """
+
+
+        def __init__(self, host = '', port = IMAP4_SSL_PORT, keyfile = None, certfile = None):
+            self.keyfile = keyfile
+            self.certfile = certfile
+            IMAP4.__init__(self, host, port)
+
+
+        def open(self, host = '', port = IMAP4_SSL_PORT):
+            """Setup connection to remote server on "host:port".
+                (default: localhost:standard IMAP4 SSL port).
+            This connection will be used by the routines:
+                read, readline, send, shutdown.
+            """
+            self.host = host
+            self.port = port
+            self.sock = socket.create_connection((host, port))
+            self.sslobj = ssl.wrap_socket(self.sock, self.keyfile, self.certfile)
+            self.file = self.sslobj.makefile('rb')
+
+
+        def read(self, size):
+            """Read 'size' bytes from remote."""
+            return self.file.read(size)
+
+
+        def readline(self):
+            """Read line from remote."""
+            return self.file.readline()
+
+
+        def send(self, data):
+            """Send data to remote."""
+            bytes = len(data)
+            while bytes > 0:
+                sent = self.sslobj.write(data)
+                if sent == bytes:
+                    break    # avoid copy
+                data = data[sent:]
+                bytes = bytes - sent
+
+
+        def shutdown(self):
+            """Close I/O established in "open"."""
+            self.file.close()
+            self.sock.close()
+
+
+        def socket(self):
+            """Return socket instance used to connect to IMAP4 server.
+
+            socket = <instance>.socket()
+            """
+            return self.sock
+
+
+        def ssl(self):
+            """Return SSLObject instance used to communicate with the IMAP4 server.
+
+            ssl = ssl.wrap_socket(<instance>.socket)
+            """
+            return self.sslobj
+
+    __all__.append("IMAP4_SSL")
+
+
+class IMAP4_stream(IMAP4):
+
+    """IMAP4 client class over a stream
+
+    Instantiate with: IMAP4_stream(command)
+
+            where "command" is a string that can be passed to subprocess.Popen()
+
+    for more documentation see the docstring of the parent class IMAP4.
+    """
+
+
+    def __init__(self, command):
+        self.command = command
+        IMAP4.__init__(self)
+
+
+    def open(self, host = None, port = None):
+        """Setup a stream connection.
+        This connection will be used by the routines:
+            read, readline, send, shutdown.
+        """
+        self.host = None        # For compatibility with parent class
+        self.port = None
+        self.sock = None
+        self.file = None
+        self.process = subprocess.Popen(self.command,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            shell=True, close_fds=True)
+        self.writefile = self.process.stdin
+        self.readfile = self.process.stdout
+
+
+    def read(self, size):
+        """Read 'size' bytes from remote."""
+        return self.readfile.read(size)
+
+
+    def readline(self):
+        """Read line from remote."""
+        return self.readfile.readline()
+
+
+    def send(self, data):
+        """Send data to remote."""
+        self.writefile.write(data)
+        self.writefile.flush()
+
+
+    def shutdown(self):
+        """Close I/O established in "open"."""
+        self.readfile.close()
+        self.writefile.close()
+        self.process.wait()
+
+
+
+class _Authenticator:
+
+    """Private class to provide en/decoding
+            for base64-based authentication conversation.
+    """
+
+    def __init__(self, mechinst):
+     

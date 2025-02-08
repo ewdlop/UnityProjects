@@ -1,0 +1,523 @@
+ion from classType and apply on the RCW
+            //
+            if (!classType.IsNull())
+            {
+                GCPressureRange gcPressureRange = classType.GetGCPressureRange();
+                if (gcPressureRange != GCPressureRange.None)
+                    AddGCMemoryPressure(gcPressureRange);
+
+                UpdateComMarshalingType(classType.GetMarshalingType());
+            }
+
+            // Save the IUnknown vtbl for debugging in case the object has been incorrectly destroyed
+            m_savedIUnknownVtbl = GetVtbl(pBaseIUnknown);
+
+            m_baseIUnknown.Initialize(pBaseIUnknown, MarshalingType);
+
+#if ENABLE_WINRT
+            IntPtr pJupiterObj =
+                McgMarshal.ComQueryInterfaceNoThrow(pBaseIUnknown, ref Interop.COM.IID_IJupiterObject);
+
+            if (pJupiterObj != default(IntPtr))
+            {
+                m_flags |= ComObjectFlags.IsJupiterObject;
+
+                m_cachedInterfaces[0].Assign(pJupiterObj, InternalTypes.IJupiterObject);
+                RCWWalker.OnJupiterRCWCreated(this);
+
+                //
+                // If this COM object is aggregated, don't keep a ref count on IJupiterObject
+                // Otherwise this would keep the CCW alive and therefore keeping this RCW alive, forming
+                // a cycle
+                //
+                if (IsAggregated)
+                    McgMarshal.ComRelease(pJupiterObj);
+
+                pJupiterObj = default(IntPtr);
+            }
+#endif
+            // Insert self into global cache, assuming pBaseIUnknown *is* the identity
+            if (!ComObjectCache.Add(pBaseIUnknown, this))
+            {
+                // Add failed - this means somebody else beat us in creating the RCW
+                // We need to make this RCW a duplicate RCW
+                m_flags |= ComObjectFlags.IsDuplicate;
+            }
+
+            if (IsJupiterObject)
+            {
+                RCWWalker.AfterJupiterRCWCreated(this);
+            }
+
+            // Register for finalization of this RCW
+            m_finalizer = new RCWFinalizer(this);
+
+            if (InteropEventProvider.IsEnabled())
+                InteropEventProvider.Log.TaskRCWCreation(
+                    (long)InteropExtensions.GetObjectID(this),
+                    this.GetTypeHandle().GetRawValue().ToInt64(),
+#if ENABLE_WINRT
+                    McgComHelpers.GetRuntimeClassName(this),
+#else
+                    null,
+#endif
+                    (long)ContextCookie.pCookie,
+                    (long)m_flags);
+        }
+
+        /// <summary>
+        /// Attach RCW to the returned interface pointer from the factory and release the extra release
+        /// Potentially we could optimize RCW to "swallow" the extra reference and avoid an extra pair of
+        /// AddRef & Release
+        /// </summary>
+        [CLSCompliant(false)]
+        public void __AttachAndRelease(IntPtr pBaseIUnknown)
+        {
+            try
+            {
+                if (pBaseIUnknown != default(IntPtr))
+                {
+                    __Attach(pBaseIUnknown);
+                }
+            }
+            finally
+            {
+                McgMarshal.ComSafeRelease(pBaseIUnknown);
+            }
+        }
+
+        #endregion
+
+        #region Properties
+
+        /// <summary>
+        /// Whether this __ComObject represents a Jupiter UI object that implements IJupiterObject for life
+        /// time tracking purposes
+        /// </summary>
+        [DebuggerBrowsable(DebuggerBrowsableState.Never)]
+        internal bool IsJupiterObject
+        {
+            [GCCallback]
+            get
+            {
+                return (m_flags & ComObjectFlags.IsJupiterObject) != 0;
+            }
+        }
+
+        /// <summary>
+        /// Whether this RCW is used as a baseclass of a managed class. For example, MyButton: Button
+        /// </summary>
+        [DebuggerBrowsable(DebuggerBrowsableState.Never)]
+        internal bool ExtendsComObject
+        {
+            get
+            {
+                return (m_flags & ComObjectFlags.ExtendsComObject) != 0;
+            }
+
+            set
+            {
+                //
+                // NOTE: This isn't thread safe, but you are only supposed to call this from the constructor
+                // anyway from MCG inside a ctor
+                //
+                if (value)
+                    m_flags |= ComObjectFlags.ExtendsComObject;
+                else
+                    m_flags &= (~ComObjectFlags.ExtendsComObject);
+            }
+        }
+
+        /// <summary>
+        /// Whether this RCW/underlying COM object is being aggregated.
+        /// Note that ExtendsComObject is not necessarily the same as aggregation. It just that this is true
+        /// in .NET Native (but not true in desktop CLR, where extends a COM object could mean either
+        /// aggregation or containment, depending on whether the underlying COM objects supports it)
+        /// </summary>
+        [DebuggerBrowsable(DebuggerBrowsableState.Never)]
+        internal bool IsAggregated
+        {
+            get
+            {
+                // In .NET Native - extending a COM base object means aggregation
+                return ExtendsComObject;
+            }
+        }
+
+        #endregion
+
+        #region Jupiter Lifetime
+
+        /// <remarks>
+        /// WARNING: This function might be called under a GC callback. Please read the comments in
+        /// GCCallbackAttribute to understand all the implications before you make any changes
+        /// </remarks>
+        [GCCallback]
+        internal unsafe __com_IJupiterObject* GetIJupiterObject_NoAddRef()
+        {
+            Debug.Assert(IsJupiterObject);
+            RuntimeTypeHandle interfaceType;
+            Debug.Assert(m_cachedInterfaces[0].TryGetType(out interfaceType) && interfaceType.IsIJupiterObject());
+
+            // Slot 0 is always IJupiterObject*
+            return (__com_IJupiterObject*)m_cachedInterfaces[0].GetPtr().ToPointer();
+        }
+
+        #endregion
+
+        #region Lifetime Management
+
+        /// <summary>
+        /// AddRef on the RCW
+        /// See m_refCount for more details
+        /// </summary>
+        internal int AddRef()
+        {
+            int newRefCount = Threading.Interlocked.Increment(ref m_refCount);
+
+            if (InteropEventProvider.IsEnabled())
+                InteropEventProvider.Log.TaskRCWRefCountInc((long)InteropExtensions.GetObjectID(this), newRefCount);
+
+            return newRefCount;
+        }
+
+        /// <summary>
+        /// Release on the RCW
+        /// See m_refCount for more details
+        /// </summary>
+        internal int Release()
+        {
+            int newRefCount = Threading.Interlocked.Decrement(ref m_refCount);
+
+            if (InteropEventProvider.IsEnabled())
+                InteropEventProvider.Log.TaskRCWRefCountDec((long)InteropExtensions.GetObjectID(this), newRefCount);
+
+            if (newRefCount == 0)
+            {
+                Cleanup(disposing: true);
+            }
+
+            return newRefCount;
+        }
+
+        /// <summary>
+        /// Completely release the RCW by setting m_refCount to 0
+        /// </summary>
+        internal void FinalReleaseSelf()
+        {
+            int prevCount = Threading.Interlocked.Exchange(ref m_refCount, 0);
+
+            if (prevCount > 0)
+            {
+                Cleanup(disposing: true);
+            }
+        }
+
+        /// <summary>
+        /// Returns the current ref count
+        /// </summary>
+        internal int PeekRefCount()
+        {
+            return m_refCount;
+        }
+
+        internal void Cleanup(bool disposing)
+        {
+            //
+            // If the RCW hasn't been initialized yet or has already cleaned by ReleaseComObject - skip
+            //
+            if (m_baseIUnknown.IsDisposed)
+            {
+                return;
+            }
+
+            RCWFinalizer rcwFinalizer = Interlocked.Exchange(ref m_finalizer, null);
+
+            //
+            // Another thread is attempting to clean up this __ComObject instance and we lost the race
+            //
+            if (rcwFinalizer == null)
+            {
+                return;
+            }
+
+            //
+            // If the cleanup is not being performed by RCWFinalizer on the finalizer thread then suppress the 
+            // finalization of RCWFinalizer since we don't need it
+            //
+            if (disposing)
+            {
+                GC.SuppressFinalize(rcwFinalizer);
+            }
+
+            if (InteropEventProvider.IsEnabled())
+                InteropEventProvider.Log.TaskRCWFinalization((long)InteropExtensions.GetObjectID(this), this.m_refCount);
+
+            //
+            // Remove self from cache if this RCW is not a duplicate RCW
+            // Duplicate RCW is not stored in the cache
+            //
+            if (!IsDuplicate)
+                ComObjectCache.Remove(m_baseIUnknown.ComPointer_UnsafeNoAddRef, this);
+
+            //
+            // Check if we're in the right context for our base IUnknown
+            //
+            ContextEntry baseContext = m_baseIUnknown.ContextEntry;
+            bool inBaseContext = IsFreeThreaded || baseContext.IsCurrent;
+
+            //
+            // We didn't AddRef on cached interfaces if this is an aggregated COM object
+            // So don't release either
+            //
+            if (!IsAggregated)
+            {
+                //
+                // For Jupiter objects, start with index 1 because we need the IJupiterObject* to call
+                // BeforeRelease
+                //
+                int startIndex = 0;
+
+                if (IsJupiterObject)
+                {
+                    RuntimeTypeHandle zeroSlotInterfaceType;
+                    Debug.Assert(m_cachedInterfaces[0].TryGetType(out zeroSlotInterfaceType) && zeroSlotInterfaceType.IsIJupiterObject());
+                    startIndex = 1;
+                }
+
+                //
+                // Disposing simple fixed cache
+                //
+                for (int i = startIndex; i < FIXED_CACHE_SIZE; ++i)
+                {
+                    IntPtr ptr;
+                    if (m_cachedInterfaces[i].TryGetPtr(out ptr))
+                    {
+                        if (IsJupiterObject)
+                            RCWWalker.BeforeRelease(this);
+
+                        if (inBaseContext)
+                            McgMarshal.ComRelease(ptr);
+                        else
+                            baseContext.EnqueueDelayedComRelease(ptr);
+                    }
+                }
+
+                //
+                // Disposing additional cache
+                //
+                AdditionalComInterfaceCacheContext[] cacheContext = AcquireAdditionalCacheForRead();
+                if (cacheContext != null)
+                {
+                    for (int i = 0; i < cacheContext.Length; i++)
+                    {
+                        var cache = cacheContext[i];
+                        if (cache == null) continue;
+
+                        bool isCacheContextCurrent = cache.context.IsCurrent;
+
+                        foreach (var cacheEntry in cache.items)
+                        {
+                            if (IsJupiterObject)
+                                RCWWalker.BeforeRelease(this);
+
+                            if (isCacheContextCurrent)
+                                McgMarshal.ComRelease(cacheEntry.ptr);
+                            else
+                                cache.context.EnqueueDelayedComRelease(cacheEntry.ptr);
+                        }
+                    }
+                }
+            }
+
+            //
+            // Dispose self
+            //
+            if (IsJupiterObject)
+                RCWWalker.BeforeRelease(this);
+
+            m_baseIUnknown.Dispose(inBaseContext);
+
+            //
+            // Last step
+            // Dispose IJupiterObject*
+            //
+            if (IsJupiterObject && !IsAggregated)
+            {
+                RuntimeTypeHandle interfaceType;
+                Debug.Assert(m_cachedInterfaces[0].TryGetType(out interfaceType) && interfaceType.IsIJupiterObject());
+
+                RCWWalker.BeforeRelease(this);
+
+                if (inBaseContext)
+                    McgMarshal.ComRelease(m_cachedInterfaces[0].GetPtr());
+                else
+                    baseContext.EnqueueDelayedComRelease(m_cachedInterfaces[0].GetPtr());
+            }
+
+            if (IsAggregated)
+            {
+                //
+                // Release the extra AddRef that we did when we create the aggregated CCW
+                // This makes sure the CCW is released is nobody else is holding on it and delay the cleanup
+                // if there is anybody holding on to it until the final release.
+                // For example, Jupiter object's release are posted to the STA thread, which means their
+                // final release won't get called until the STA thread process them, and this would
+                // create a problem if we clean up CCW in RCW finalization and the jupiter object's
+                // final release touch the CCW (such as as Release or QI on ICCW).
+                //
+                m_outer.Release();
+            }
+
+#if ENABLE_WINRT
+            if (IsGCPressureSet)
+                GC.RemoveMemoryPressure(GCMemoryPressure);
+#endif
+        }
+
+        internal void RemoveInterfacesForContext(ContextCookie currentContext)
+        {
+            Debug.Assert(currentContext.IsCurrent && !currentContext.IsDefault);
+
+            //
+            // Only clean up if this object is context bound, which could be either
+            // 1) context-bound and not free threaded
+            // 2) is a jupiter object (which is be free-threaded but considered STA)
+            //
+            if (IsFreeThreaded && !IsJupiterObject)
+                return;
+
+            if (m_baseIUnknown.ContextCookie.Equals(currentContext))
+            {
+                // We cannot use this object any more, as calls to IUnknown will fail.
+                FinalReleaseSelf();
+            }
+            else
+            {
+                // We know that the base IUnknown is not in this context; therefore nothing in the
+                // "simple" cache is in this context.  But we may have marshaled interfaces into this context,
+                // and stored them in the "additional" cache.  Remove and release those interfaces now.
+                AdditionalComInterfaceCacheContext[] cache = AcquireAdditionalCacheExclusive();
+
+                try
+                {
+                    if (cache != null)
+                    {
+                        for (int i = 0; i < cache.Length; i++)
+                        {
+                            AdditionalComInterfaceCacheContext cacheContext = cache[i];
+
+                            if (cacheContext != null &&
+                                cacheContext.context.ContextCookie.Equals(currentContext))
+                            {
+                                // Remove the context from the cache . Note that there might be
+                                // active readers using cache[i] and it's up to the reader to check
+                                // if cache[i] is null
+                                cache[i] = null;
+
+                                if (!IsAggregated)
+                                {
+                                    // Release all interfaces in the context
+                                    foreach (var cacheEntry in cacheContext.items)
+                                    {
+                                        if (IsJupiterObject)
+                                            RCWWalker.BeforeRelease(this);
+
+                                        McgMarshal.ComRelease(cacheEntry.ptr);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    ReleaseAdditionalCacheExclusive(cache);
+                }
+            }
+        }
+
+        #endregion
+
+        #region Properties
+
+        /// <summary>
+        /// Whether the RCW is free-threaded
+        /// <summary>
+        [DebuggerBrowsable(DebuggerBrowsableState.Never)]
+        internal bool IsFreeThreaded
+        {
+            get
+            {
+                return m_baseIUnknown.IsFreeThreaded;
+            }
+        }
+
+        /// <summary>
+        /// Whether the RCW is a duplicate RCW that is not saved in cache
+        /// </summary>
+        [DebuggerBrowsable(DebuggerBrowsableState.Never)]
+        internal bool IsDuplicate
+        {
+            get
+            {
+                return (m_flags & ComObjectFlags.IsDuplicate) != 0;
+            }
+        }
+
+        /// <summary>
+        /// Returns the context cookie where this RCW is created
+        /// </summary>
+        [DebuggerBrowsable(DebuggerBrowsableState.Never)]
+        internal ContextCookie ContextCookie
+        {
+            get
+            {
+                return m_baseIUnknown.ContextCookie;
+            }
+        }
+
+        [DebuggerBrowsable(DebuggerBrowsableState.Never)]
+        internal ComObjectFlags Flags
+        {
+            get
+            {
+                return m_flags;
+            }
+        }
+
+        #endregion
+
+        #region QueryInterface
+        /// <summary>
+        /// QueryInterface for the specified IID and returns a Non-AddRefed COM interface pointer for the
+        /// the interface you've specified. The returned interface pointer is always callable from current
+        /// context
+        /// NOTE: This version uses RuntimeTypeHandle and is much faster than GUID version
+        /// </summary>
+        /// <returns>A non-AddRef-ed interface pointer that is callable under current context</returns>
+        private int QueryInterface_NoAddRef(
+            RuntimeTypeHandle interfaceType,
+            bool cacheOnly,
+            out IntPtr pComPtr)
+        {
+#if !RHTESTCL
+            // Throw if the underlying object is already disposed.
+            if (m_baseIUnknown.IsDisposed)
+            {
+                throw new InvalidComObjectException(SR.Excep_InvalidComObject_NoRCW_Wrapper);
+            }
+#endif
+
+            ContextCookie currentCookie = ContextCookie.Default;
+
+            //
+            // Do we have an existing cached interface in the simple cache that matches
+            //
+
+            // For free-threaded RCWs we don't care about context
+            bool matchContext = m_baseIUnknown.IsFreeThreaded;
+
+            if (!matchContext)
+            {
+                // In most cases WinRT objects are free

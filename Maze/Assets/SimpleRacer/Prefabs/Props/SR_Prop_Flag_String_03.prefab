@@ -1,0 +1,81 @@
+
+		// Add and merge vertices.
+		for (int j = 0; j < cont.nverts; ++j)
+		{
+			const unsigned short* v = &cont.verts[j*4];
+			indices[j] = addVertex(v[0], v[1], v[2], mesh.verts, firstVert, nextVert, mesh.nverts);
+			if (v[3] & 0x80)
+			{
+				// This vertex should be removed.
+				vflags[indices[j]] = 1;
+			}
+		}
+		
+		// Build initial polygons.
+		int npolys = 0;
+		memset(polys, 0xff, sizeof(unsigned short) * maxVertsPerCont * MAX_VERTS_PER_POLY);
+		for (int j = 0; j < ntris; ++j)
+		{
+			const unsigned short* t = &tris[j*3];
+			if (t[0] != t[1] && t[0] != t[2] && t[1] != t[2])
+			{
+				polys[npolys*MAX_VERTS_PER_POLY+0] = indices[t[0]];
+				polys[npolys*MAX_VERTS_PER_POLY+1] = indices[t[1]];
+				polys[npolys*MAX_VERTS_PER_POLY+2] = indices[t[2]];
+				npolys++;
+			}
+		}
+		if (!npolys)
+			continue;
+		
+		// Merge polygons.
+		int maxVertsPerPoly =MAX_VERTS_PER_POLY ;
+		if (maxVertsPerPoly > 3) //-V547
+		{
+			for(;;)
+			{
+				// Find best polygons to merge.
+				int bestMergeVal = 0;
+				int bestPa = 0, bestPb = 0, bestEa = 0, bestEb = 0;
+				
+				for (int j = 0; j < npolys-1; ++j)
+				{
+					unsigned short* pj = &polys[j*MAX_VERTS_PER_POLY];
+					for (int k = j+1; k < npolys; ++k)
+					{
+						unsigned short* pk = &polys[k*MAX_VERTS_PER_POLY];
+						int ea, eb;
+						int v = getPolyMergeValue(pj, pk, mesh.verts, ea, eb);
+						if (v > bestMergeVal)
+						{
+							bestMergeVal = v;
+							bestPa = j;
+							bestPb = k;
+							bestEa = ea;
+							bestEb = eb;
+						}
+					}
+				}
+				
+				if (bestMergeVal > 0)
+				{
+					// Found best, merge.
+					unsigned short* pa = &polys[bestPa*MAX_VERTS_PER_POLY];
+					unsigned short* pb = &polys[bestPb*MAX_VERTS_PER_POLY];
+					mergePolys(pa, pb, bestEa, bestEb);
+					memcpy(pb, &polys[(npolys-1)*MAX_VERTS_PER_POLY], sizeof(unsigned short)*MAX_VERTS_PER_POLY);
+					npolys--;
+				}
+				else
+				{
+					// Could not merge any polygons, stop.
+					break;
+				}
+			}
+		}
+		
+		// Store polygons.
+		for (int j = 0; j < npolys; ++j)
+		{
+			unsigned short* p = &mesh.polys[mesh.npolys*MAX_VERTS_PER_POLY*2];
+			unsigned short* q = &polys[j*MAX_VE

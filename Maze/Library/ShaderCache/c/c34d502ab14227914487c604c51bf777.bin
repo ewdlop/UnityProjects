@@ -1,0 +1,111 @@
+y result in a tightening of some of
+ * the constraints.  If this happens, then we may end up with two
+ * opposite inequalities that can be replaced by an equality.
+ * We therefore call isl_basic_map_detect_inequality_pairs,
+ * which checks for such pairs of inequalities as well as eliminate_divs_eq
+ * and isl_basic_map_gauss if such a pair was found.
+ *
+ * Note that this function may leave the result in an inconsistent state.
+ * In particular, the constraints may not be gaussed.
+ * Unfortunately, isl_map_coalesce actually depends on this inconsistent state
+ * for some of the test cases to pass successfully.
+ * Any potential modification of the representation is therefore only
+ * performed on a single copy of the basic map.
+ */
+__isl_give isl_basic_map *isl_basic_map_reduce_coefficients(
+	__isl_take isl_basic_map *bmap)
+{
+	unsigned total;
+	isl_ctx *ctx;
+	isl_vec *v;
+	isl_mat *eq, *T, *T2;
+	int i;
+	int tightened;
+
+	if (!bmap)
+		return NULL;
+	if (ISL_F_ISSET(bmap, ISL_BASIC_MAP_REDUCED_COEFFICIENTS))
+		return bmap;
+	if (isl_basic_map_is_rational(bmap))
+		return bmap;
+	if (bmap->n_eq == 0)
+		return bmap;
+	if (!has_multiple_var_equality(bmap))
+		return bmap;
+
+	total = isl_basic_map_dim(bmap, isl_dim_all);
+	ctx = isl_basic_map_get_ctx(bmap);
+	v = isl_vec_alloc(ctx, 1 + total);
+	if (!v)
+		return isl_basic_map_free(bmap);
+
+	eq = isl_mat_sub_alloc6(ctx, bmap->eq, 0, bmap->n_eq, 0, 1 + total);
+	T = isl_mat_variable_compression(eq, &T2);
+	if (!T || !T2)
+		goto error;
+	if (T->n_col == 0) {
+		isl_mat_free(T);
+		isl_mat_free(T2);
+		isl_vec_free(v);
+		return isl_basic_map_set_to_empty(bmap);
+	}
+
+	bmap = isl_basic_map_cow(bmap);
+	if (!bmap)
+		goto error;
+
+	tightened = 0;
+	for (i = 0; i < bmap->n_ineq; ++i) {
+		isl_seq_cpy(v->el, bmap->ineq[i], 1 + total);
+		v = isl_vec_mat_product(v, isl_mat_copy(T));
+		v = normalize_constraint(v, &tightened);
+		v = isl_vec_mat_product(v, isl_mat_copy(T2));
+		if (!v)
+			goto error;
+		isl_seq_cpy(bmap->ineq[i], v->el, 1 + total);
+	}
+
+	isl_mat_free(T);
+	isl_mat_free(T2);
+	isl_vec_free(v);
+
+	ISL_F_SET(bmap, ISL_BASIC_MAP_REDUCED_COEFFICIENTS);
+
+	if (tightened) {
+		int progress = 0;
+
+		bmap = isl_basic_map_detect_inequality_pairs(bmap, &progress);
+		if (progress) {
+			bmap = eliminate_divs_eq(bmap, &progress);
+			bmap = isl_basic_map_gauss(bmap, NULL);
+		}
+	}
+
+	return bmap;
+error:
+	isl_mat_free(T);
+	isl_mat_free(T2);
+	isl_vec_free(v);
+	return isl_basic_map_free(bmap);
+}
+
+/* Shift the integer division at position "div" of "bmap"
+ * by "shift" times the variable at position "pos".
+ * "pos" is as determined by isl_basic_map_offset, i.e., pos == 0
+ * corresponds to the constant term.
+ *
+ * That is, if the integer division has the form
+ *
+ *	floor(f(x)/d)
+ *
+ * then replace it by
+ *
+ *	floor((f(x) + shift * d * x_pos)/d) - shift * x_pos
+ */
+__isl_give isl_basic_map *isl_basic_map_shift_div(
+	__isl_take isl_basic_map *bmap, int div, int pos, isl_int shift)
+{
+	int i;
+	unsigned total;
+
+	if (isl_in

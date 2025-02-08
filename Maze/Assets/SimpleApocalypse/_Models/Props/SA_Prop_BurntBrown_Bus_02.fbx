@@ -1,0 +1,566 @@
+ancellationState.ExternalCancellationToken);
+                IEnumerable<TSource> childWithCancelChecks = CancellableEnumerable.Wrap(childAsSequential, settings.CancellationState.ExternalCancellationToken);
+                return ExceptionAggregator.WrapEnumerable(childWithCancelChecks, settings.CancellationState)
+                    .First();
+            }
+
+            return GetOneWithPossibleDefault(queryOp, false, false);
+        }
+
+        /// <summary>
+        /// Returns the first element in a parallel sequence that satisfies a specified condition.
+        /// </summary>
+        /// <remarks>There's a temporary difference from LINQ to Objects, this does not throw
+        /// ArgumentNullException when the predicate is null.</remarks>
+        /// <typeparam name="TSource">The type of the elements of <paramref name="source"/>.</typeparam>
+        /// <param name="source">The sequence to return an element from.</param>
+        /// <param name="predicate">A function to test each element for a condition.</param>
+        /// <returns>The first element in the sequence that passes the test in the specified predicate function.</returns>
+        /// <exception cref="T:System.ArgumentNullException">
+        /// <paramref name="source"/> or <paramref name="predicate"/> is a null reference (Nothing in Visual Basic).
+        /// </exception>
+        /// <exception cref="T:System.InvalidOperationException">
+        /// No element in <paramref name="source"/> satisfies the condition in <paramref name="predicate"/>.
+        /// </exception>
+        /// <exception cref="T:System.AggregateException">
+        /// One or more exceptions occurred during the evaluation of the query.
+        /// </exception>
+        /// <exception cref="T:System.OperationCanceledException">
+        /// The query was canceled.
+        /// </exception>
+        public static TSource First<TSource>(this ParallelQuery<TSource> source, Func<TSource, bool> predicate)
+        {
+            if (source == null) throw new ArgumentNullException(nameof(source));
+            if (predicate == null) throw new ArgumentNullException(nameof(predicate));
+
+            FirstQueryOperator<TSource> queryOp = new FirstQueryOperator<TSource>(source, predicate);
+
+            // If in conservative mode and a premature merge would be inserted by the First operator,
+            // run the whole query sequentially.
+            QuerySettings settings = queryOp.SpecifiedQuerySettings.WithDefaults();
+            if (queryOp.LimitsParallelism && settings.ExecutionMode != ParallelExecutionMode.ForceParallelism)
+            {
+                IEnumerable<TSource> childAsSequential = queryOp.Child.AsSequentialQuery(settings.CancellationState.ExternalCancellationToken);
+                IEnumerable<TSource> childWithCancelChecks = CancellableEnumerable.Wrap(childAsSequential, settings.CancellationState.ExternalCancellationToken);
+                return ExceptionAggregator.WrapEnumerable(childWithCancelChecks, settings.CancellationState)
+                    .First(ExceptionAggregator.WrapFunc<TSource, bool>(predicate, settings.CancellationState));
+            }
+
+            return GetOneWithPossibleDefault(queryOp, false, false);
+        }
+
+        /// <summary>
+        /// Returns the first element of a parallel sequence, or a default value if the 
+        /// sequence contains no elements.
+        /// </summary>
+        /// <typeparam name="TSource">The type of the elements of <paramref name="source"/>.</typeparam>
+        /// <param name="source">The sequence to return the first element of.</param>
+        /// <returns>
+        /// default(<B>TSource</B>) if <paramref name="source"/> is empty; otherwise, the first element in <paramref name="source"/>.
+        /// </returns>
+        /// <exception cref="T:System.ArgumentNullException">
+        /// <paramref name="source"/> is a null reference (Nothing in Visual Basic).
+        /// </exception>
+        /// <exception cref="T:System.AggregateException">
+        /// One or more exceptions occurred during the evaluation of the query.
+        /// </exception>
+        /// <exception cref="T:System.OperationCanceledException">
+        /// The query was canceled.
+        /// </exception>
+        public static TSource FirstOrDefault<TSource>(this ParallelQuery<TSource> source)
+        {
+            if (source == null) throw new ArgumentNullException(nameof(source));
+
+            // @PERF: optimize for seekable data sources.  E.g. if an array, we can
+            //     seek directly to the 0th element.
+            FirstQueryOperator<TSource> queryOp = new FirstQueryOperator<TSource>(source, null);
+
+            // If in conservative mode and a premature merge would be inserted by the First operator,
+            // run the whole query sequentially.
+            QuerySettings settings = queryOp.SpecifiedQuerySettings.WithDefaults();
+            if (queryOp.LimitsParallelism
+                && settings.ExecutionMode != ParallelExecutionMode.ForceParallelism)
+            {
+                IEnumerable<TSource> childAsSequential = queryOp.Child.AsSequentialQuery(settings.CancellationState.ExternalCancellationToken);
+                IEnumerable<TSource> childWithCancelChecks = CancellableEnumerable.Wrap(childAsSequential, settings.CancellationState.ExternalCancellationToken);
+                return ExceptionAggregator.WrapEnumerable(childWithCancelChecks,
+                    settings.CancellationState).FirstOrDefault();
+            }
+
+            return GetOneWithPossibleDefault(queryOp, false, true);
+        }
+
+        /// <summary>
+        /// Returns the first element of the parallel sequence that satisfies a condition or a 
+        /// default value if no such element is found.
+        /// </summary>
+        /// <remarks>There's a temporary difference from LINQ to Objects, this does not throw
+        /// ArgumentNullException when the predicate is null.</remarks>
+        /// <typeparam name="TSource">The type of the elements of <paramref name="source"/>.</typeparam>
+        /// <param name="source">The sequence to return an element from.</param>
+        /// <param name="predicate">A function to test each element for a condition.</param>
+        /// <returns>
+        /// default(<B>TSource</B>) if <paramref name="source"/> is empty or if no element passes the test 
+        /// specified by <B>predicate</B>; otherwise, the first element in <paramref name="source"/> that 
+        /// passes the test specified by <B>predicate</B>.
+        /// </returns>
+        /// <exception cref="T:System.ArgumentNullException">
+        /// <paramref name="source"/> or <paramref name="predicate"/> is a null reference (Nothing in Visual Basic).
+        /// </exception>
+        /// <exception cref="T:System.AggregateException">
+        /// One or more exceptions occurred during the evaluation of the query.
+        /// </exception>
+        /// <exception cref="T:System.OperationCanceledException">
+        /// The query was canceled.
+        /// </exception>
+        public static TSource FirstOrDefault<TSource>(this ParallelQuery<TSource> source, Func<TSource, bool> predicate)
+        {
+            if (source == null) throw new ArgumentNullException(nameof(source));
+            if (predicate == null) throw new ArgumentNullException(nameof(predicate));
+
+            FirstQueryOperator<TSource> queryOp = new FirstQueryOperator<TSource>(source, predicate);
+
+            // If in conservative mode and a premature merge would be inserted by the First operator,
+            // run the whole query sequentially.
+            QuerySettings settings = queryOp.SpecifiedQuerySettings.WithDefaults();
+            if (queryOp.LimitsParallelism
+                && settings.ExecutionMode != ParallelExecutionMode.ForceParallelism)
+            {
+                IEnumerable<TSource> childAsSequential = queryOp.Child.AsSequentialQuery(settings.CancellationState.ExternalCancellationToken);
+                IEnumerable<TSource> childWithCancelChecks = CancellableEnumerable.Wrap(childAsSequential, settings.CancellationState.ExternalCancellationToken);
+                return ExceptionAggregator.WrapEnumerable(
+                    childWithCancelChecks, settings.CancellationState)
+                    .FirstOrDefault(ExceptionAggregator.WrapFunc<TSource, bool>(predicate, settings.CancellationState));
+            }
+
+            return GetOneWithPossibleDefault(queryOp, false, true);
+        }
+
+        //-----------------------------------------------------------------------------------
+        // Last simply returns the last element from the data source; if the predicate
+        // overload is used, the last element satisfying the predicate is returned.
+        // An exception is thrown for empty data sources. Alternatively, the LastOrDefault
+        // method can be used which returns default(T) if empty (or no elements satisfy the
+        // predicate).
+        // 
+
+        /// <summary>
+        /// Returns the last element of a parallel sequence.</summary>
+        /// <typeparam name="TSource">The type of the elements of <paramref name="source"/>.</typeparam>
+        /// <param name="source">The sequence to return the last element from.</param>
+        /// <returns>The value at the last position in the source sequence.</returns>
+        /// <exception cref="T:System.ArgumentNullException">
+        /// <paramref name="source"/> is a null reference (Nothing in Visual Basic).
+        /// </exception>
+        /// <exception cref="T:System.InvalidOperationException">
+        /// <paramref name="source"/> contains no elements.
+        /// </exception>
+        /// <exception cref="T:System.AggregateException">
+        /// One or more exceptions occurred during the evaluation of the query.
+        /// </exception>
+        /// <exception cref="T:System.OperationCanceledException">
+        /// The query was canceled.
+        /// </exception>
+        public static TSource Last<TSource>(this ParallelQuery<TSource> source)
+        {
+            // @PERF: optimize for seekable data sources.  E.g. if an array, we can
+            //     seek directly to the last element.
+            if (source == null) throw new ArgumentNullException(nameof(source));
+
+            LastQueryOperator<TSource> queryOp = new LastQueryOperator<TSource>(source, null);
+
+            // If in conservative mode and a premature merge would be inserted by the First operator,
+            // run the whole query sequentially.
+            QuerySettings settings = queryOp.SpecifiedQuerySettings.WithDefaults();
+            if (queryOp.LimitsParallelism
+                && settings.ExecutionMode != ParallelExecutionMode.ForceParallelism)
+            {
+                IEnumerable<TSource> childAsSequential = queryOp.Child.AsSequentialQuery(settings.CancellationState.ExternalCancellationToken);
+                IEnumerable<TSource> childWithCancelChecks = CancellableEnumerable.Wrap(childAsSequential, settings.CancellationState.ExternalCancellationToken);
+                return ExceptionAggregator.WrapEnumerable(childWithCancelChecks, settings.CancellationState).Last();
+            }
+
+            return GetOneWithPossibleDefault(queryOp, false, false);
+        }
+
+        /// <summary>
+        /// Returns the last element of a parallel sequence that satisfies a specified condition.
+        /// </summary>
+        /// <typeparam name="TSource">The type of the elements of <paramref name="source"/>.</typeparam>
+        /// <param name="source">The sequence to return an element from.</param>
+        /// <param name="predicate">A function to test each element for a condition.</param>
+        /// <returns>
+        /// The last element in the sequence that passes the test in the specified predicate function.
+        /// </returns>
+        /// <exception cref="T:System.ArgumentNullException">
+        /// <paramref name="source"/> or <paramref name="predicate"/> is a null reference (Nothing in Visual Basic).
+        /// </exception>
+        /// <exception cref="T:System.InvalidOperationException">
+        /// No element in <paramref name="source"/> satisfies the condition in <paramref name="predicate"/>.
+        /// </exception>
+        /// <exception cref="T:System.AggregateException">
+        /// One or more exceptions occurred during the evaluation of the query.
+        /// </exception>
+        /// <exception cref="T:System.OperationCanceledException">
+        /// The query was canceled.
+        /// </exception>
+        public static TSource Last<TSource>(this ParallelQuery<TSource> source, Func<TSource, bool> predicate)
+        {
+            if (source == null) throw new ArgumentNullException(nameof(source));
+            if (predicate == null) throw new ArgumentNullException(nameof(predicate));
+
+            LastQueryOperator<TSource> queryOp = new LastQueryOperator<TSource>(source, predicate);
+
+            // If in conservative mode and a premature merge would be inserted by the First operator,
+            // run the whole query sequentially.
+            QuerySettings settings = queryOp.SpecifiedQuerySettings.WithDefaults();
+            if (queryOp.LimitsParallelism
+                && settings.ExecutionMode != ParallelExecutionMode.ForceParallelism)
+            {
+                IEnumerable<TSource> childAsSequential = queryOp.Child.AsSequentialQuery(settings.CancellationState.ExternalCancellationToken);
+                IEnumerable<TSource> childWithCancelChecks = CancellableEnumerable.Wrap(childAsSequential, settings.CancellationState.ExternalCancellationToken);
+                return ExceptionAggregator.WrapEnumerable(
+                    childWithCancelChecks, settings.CancellationState)
+                    .Last(ExceptionAggregator.WrapFunc<TSource, bool>(predicate, settings.CancellationState));
+            }
+
+            return GetOneWithPossibleDefault(queryOp, false, false);
+        }
+
+        /// <summary>
+        /// Returns the last element of a parallel sequence, or a default value if the 
+        /// sequence contains no elements.
+        /// </summary>
+        /// <typeparam name="TSource">The type of the elements of <paramref name="source"/>.</typeparam>
+        /// <param name="source">The sequence to return an element from.</param>
+        /// <returns>
+        /// default(<typeparamref name="TSource"/>) if the source sequence is empty; otherwise, the last element in the sequence.
+        /// </returns>
+        /// <exception cref="T:System.ArgumentNullException">
+        /// <paramref name="source"/> is a null reference (Nothing in Visual Basic).
+        /// </exception>
+        /// <exception cref="T:System.AggregateException">
+        /// One or more exceptions occurred during the evaluation of the query.
+        /// </exception>
+        /// <exception cref="T:System.OperationCanceledException">
+        /// The query was canceled.
+        /// </exception>
+        public static TSource LastOrDefault<TSource>(this ParallelQuery<TSource> source)
+        {
+            // @PERF: optimize for seekable data sources.  E.g. if an array, we can
+            //     seek directly to the last element.
+            if (source == null) throw new ArgumentNullException(nameof(source));
+
+            LastQueryOperator<TSource> queryOp = new LastQueryOperator<TSource>(source, null);
+
+            // If in conservative mode and a premature merge would be inserted by the First operator,
+            // run the whole query sequentially.
+            QuerySettings settings = queryOp.SpecifiedQuerySettings.WithDefaults();
+            if (queryOp.LimitsParallelism
+                && settings.ExecutionMode != ParallelExecutionMode.ForceParallelism)
+            {
+                IEnumerable<TSource> childAsSequential = queryOp.Child.AsSequentialQuery(settings.CancellationState.ExternalCancellationToken);
+                IEnumerable<TSource> childWithCancelChecks = CancellableEnumerable.Wrap(childAsSequential, settings.CancellationState.ExternalCancellationToken);
+                return ExceptionAggregator.WrapEnumerable(childWithCancelChecks, settings.CancellationState).LastOrDefault();
+            }
+
+            return GetOneWithPossibleDefault(queryOp, false, true);
+        }
+
+        /// <summary>
+        /// Returns the last element of a parallel sequence that satisfies a condition, or 
+        /// a default value if no such element is found.
+        /// </summary>
+        /// <typeparam name="TSource">The type of the elements of <paramref name="source"/>.</typeparam>
+        /// <param name="source">The sequence to return an element from.</param>
+        /// <param name="predicate">A function to test each element for a condition.</param>
+        /// <returns>
+        /// default(<typeparamref name="TSource"/>) if the sequence is empty or if no elements pass the test in the 
+        /// predicate function; otherwise, the last element that passes the test in the predicate function.
+        /// </returns>
+        /// <exception cref="T:System.ArgumentNullException">
+        /// <paramref name="source"/> or <paramref name="predicate"/> is a null reference (Nothing in Visual Basic).
+        /// </exception>
+        /// <exception cref="T:System.AggregateException">
+        /// One or more exceptions occurred during the evaluation of the query.
+        /// </exception>
+        /// <exception cref="T:System.OperationCanceledException">
+        /// The query was canceled.
+        /// </exception>
+        public static TSource LastOrDefault<TSource>(this ParallelQuery<TSource> source, Func<TSource, bool> predicate)
+        {
+            if (source == null) throw new ArgumentNullException(nameof(source));
+            if (predicate == null) throw new ArgumentNullException(nameof(predicate));
+
+            LastQueryOperator<TSource> queryOp = new LastQueryOperator<TSource>(source, predicate);
+
+            // If in conservative mode and a premature merge would be inserted by the First operator,
+            // run the whole query sequentially.
+            QuerySettings settings = queryOp.SpecifiedQuerySettings.WithDefaults();
+            if (queryOp.LimitsParallelism
+                && settings.ExecutionMode != ParallelExecutionMode.ForceParallelism)
+            {
+                IEnumerable<TSource> childAsSequential = queryOp.Child.AsSequentialQuery(settings.CancellationState.ExternalCancellationToken);
+                IEnumerable<TSource> childWithCancelChecks = CancellableEnumerable.Wrap(childAsSequential, settings.CancellationState.ExternalCancellationToken);
+                return ExceptionAggregator.WrapEnumerable(
+                    childWithCancelChecks, settings.CancellationState)
+                    .LastOrDefault(ExceptionAggregator.WrapFunc<TSource, bool>(predicate, settings.CancellationState));
+            }
+
+            return GetOneWithPossibleDefault(queryOp, false, true);
+        }
+
+        //-----------------------------------------------------------------------------------
+        // Single yields the single element matching the optional predicate, or throws an
+        // exception if there is zero or more than one match. SingleOrDefault is similar
+        // except that it returns the default value in this condition.
+        //
+
+        /// <summary>
+        /// Returns the only element of a parallel sequence, and throws an exception if there is not 
+        /// exactly one element in the sequence.
+        /// </summary>
+        /// <typeparam name="TSource">The type of the elements of <paramref name="source"/>.</typeparam>
+        /// <param name="source">The sequence to return the single element of.</param>
+        /// <returns>The single element of the input sequence.</returns>
+        /// <exception cref="T:System.ArgumentNullException">
+        /// <paramref name="source"/> is a null reference (Nothing in Visual Basic).
+        /// </exception>
+        /// <exception cref="T:System.InvalidOperationException">
+        /// The input sequence contains more than one element. -or- The input sequence is empty.
+        /// </exception>
+        /// <exception cref="T:System.AggregateException">
+        /// One or more exceptions occurred during the evaluation of the query.
+        /// </exception>
+        /// <exception cref="T:System.OperationCanceledException">
+        /// The query was canceled.
+        /// </exception>
+        public static TSource Single<TSource>(this ParallelQuery<TSource> source)
+        {
+            // @PERF: optimize for ICollection-typed data sources, i.e. we can just
+            //     check the Count property and avoid costly fork/join/synchronization.
+            if (source == null) throw new ArgumentNullException(nameof(source));
+
+            return GetOneWithPossibleDefault(new SingleQueryOperator<TSource>(source, null), true, false);
+        }
+
+        /// <summary>
+        /// Returns the only element of a parallel sequence that satisfies a specified condition, 
+        /// and throws an exception if more than one such element exists.
+        /// </summary>
+        /// <typeparam name="TSource">The type of the elements of <paramref name="source"/>.</typeparam>
+        /// <param name="source">The sequence to return the single element of.</param>
+        /// <param name="predicate">A function to test an element for a condition.</param>
+        /// <returns>The single element of the input sequence that satisfies a condition.</returns>
+        /// <exception cref="T:System.ArgumentNullException">
+        /// <paramref name="source"/> or <paramref name="predicate"/> is a null reference (Nothing in Visual Basic).
+        /// </exception>
+        /// <exception cref="T:System.InvalidOperationException">
+        /// No element satisfies the condition in <paramref name="predicate"/>. -or- More than one element satisfies the condition in <paramref name="predicate"/>.
+        /// </exception>
+        /// <exception cref="T:System.AggregateException">
+        /// One or more exceptions occurred during the evaluation of the query.
+        /// </exception>
+        /// <exception cref="T:System.OperationCanceledException">
+        /// The query was canceled.
+        /// </exception>
+        public static TSource Single<TSource>(this ParallelQuery<TSource> source, Func<TSource, bool> predicate)
+        {
+            if (source == null) throw new ArgumentNullException(nameof(source));
+            if (predicate == null) throw new ArgumentNullException(nameof(predicate));
+
+            return GetOneWithPossibleDefault(new SingleQueryOperator<TSource>(source, predicate), true, false);
+        }
+
+        /// <summary>
+        /// Returns the only element of a parallel sequence, or a default value if the sequence is 
+        /// empty; this method throws an exception if there is more than one element in the sequence.
+        /// </summary>
+        /// <typeparam name="TSource">The type of the elements of <paramref name="source"/>.</typeparam>
+        /// <param name="source">The sequence to return the single element of.</param>
+        /// <returns>
+        /// The single element of the input sequence, or default(<typeparamref name="TSource"/>) if the 
+        /// sequence contains no elements.
+        /// </returns>
+        /// <exception cref="T:System.ArgumentNullException">
+        /// <paramref name="source"/> is a null reference (Nothing in Visual Basic).
+        /// </exception>
+        /// <exception cref="T:System.AggregateException">
+        /// One or more exceptions occurred during the evaluation of the query.
+        /// </exception>
+        /// <exception cref="T:System.OperationCanceledException">
+        /// The query was canceled.
+        /// </exception>
+        public static TSource SingleOrDefault<TSource>(this ParallelQuery<TSource> source)
+        {
+            // @PERF: optimize for ICollection-typed data sources, i.e. we can just
+            //     check the Count property and avoid costly fork/join/synchronization.
+            if (source == null) throw new ArgumentNullException(nameof(source));
+
+            return GetOneWithPossibleDefault(new SingleQueryOperator<TSource>(source, null), true, true);
+        }
+
+        /// <summary>
+        /// Returns the only element of a parallel sequence that satisfies a specified condition 
+        /// or a default value if no such element exists; this method throws an exception 
+        /// if more than one element satisfies the condition.
+        /// </summary>
+        /// <typeparam name="TSource">The type of the elements of <paramref name="source"/>.</typeparam>
+        /// <param name="source">The sequence to return the single element of.</param>
+        /// <param name="predicate">A function to test an element for a condition.</param>
+        /// <returns>
+        /// The single element of the input sequence that satisfies the condition, or 
+        /// default(<typeparamref name="TSource"/>) if no such element is found.
+        /// </returns>
+        /// <exception cref="T:System.ArgumentNullException">
+        /// <paramref name="source"/> or <paramref name="predicate"/> is a null reference (Nothing in Visual Basic).
+        /// </exception>
+        /// <exception cref="T:System.AggregateException">
+        /// One or more exceptions occurred during the evaluation of the query.
+        /// </exception>
+        /// <exception cref="T:System.OperationCanceledException">
+        /// The query was canceled.
+        /// </exception>
+        public static TSource SingleOrDefault<TSource>(this ParallelQuery<TSource> source, Func<TSource, bool> predicate)
+        {
+            if (source == null) throw new ArgumentNullException(nameof(source));
+            if (predicate == null) throw new ArgumentNullException(nameof(predicate));
+
+            return GetOneWithPossibleDefault(new SingleQueryOperator<TSource>(source, predicate), true, true);
+        }
+
+        //-----------------------------------------------------------------------------------
+        // DefaultIfEmpty yields the data source, unmodified, if it is non-empty. Otherwise,
+        // it yields a single occurrence of the default value.
+        //
+
+        /// <summary>
+        /// Returns the elements of the specified parallel sequence or the type parameter's 
+        /// default value in a singleton collection if the sequence is empty.
+        /// </summary>
+        /// <typeparam name="TSource">The type of the elements of <paramref name="source"/>.</typeparam>
+        /// <param name="source">The sequence to return a default value for if it is empty.</param>
+        /// <returns>
+        /// A sequence that contains default(<B>TSource</B>) if <paramref name="source"/> is empty; otherwise, <paramref name="source"/>.
+        /// </returns>
+        /// <exception cref="T:System.ArgumentNullException">
+        /// <paramref name="source"/> is a null reference (Nothing in Visual Basic).
+        /// </exception>
+        public static ParallelQuery<TSource> DefaultIfEmpty<TSource>(this ParallelQuery<TSource> source)
+        {
+            return DefaultIfEmpty<TSource>(source, default(TSource));
+        }
+
+        /// <summary>
+        /// Returns the elements of the specified parallel sequence or the specified value 
+        /// in a singleton collection if the sequence is empty.
+        /// </summary>
+        /// <typeparam name="TSource">The type of the elements of <paramref name="source"/>.</typeparam>
+        /// <param name="source">The sequence to return the specified value for if it is empty.</param>
+        /// <param name="defaultValue">The value to return if the sequence is empty.</param>
+        /// <returns>
+        /// A sequence that contains <B>defaultValue</B> if <paramref name="source"/> is empty; otherwise, <paramref name="source"/>.
+        /// </returns>
+        /// <exception cref="T:System.ArgumentNullException">
+        /// <paramref name="source"/> is a null reference (Nothing in Visual Basic).
+        /// </exception>
+        public static ParallelQuery<TSource> DefaultIfEmpty<TSource>(this ParallelQuery<TSource> source, TSource defaultValue)
+        {
+            if (source == null) throw new ArgumentNullException(nameof(source));
+            return new DefaultIfEmptyQueryOperator<TSource>(source, defaultValue);
+        }
+
+        //-----------------------------------------------------------------------------------
+        // ElementAt yields an element at a specific index.  If the data source doesn't
+        // contain such an element, an exception is thrown.  Alternatively, ElementAtOrDefault
+        // will return a default value if the given index is invalid.
+        // 
+
+        /// <summary>
+        /// Returns the element at a specified index in a parallel sequence.
+        /// </summary>
+        /// <typeparam name="TSource">The type of the elements of <paramref name="source"/>.</typeparam>
+        /// <param name="source">A sequence to return an element from.</param>
+        /// <param name="index">The zero-based index of the element to retrieve.</param>
+        /// <returns>The element at the specified position in the source sequence.</returns>
+        /// <exception cref="T:System.ArgumentNullException">
+        /// <paramref name="source"/> is a null reference (Nothing in Visual Basic).
+        /// </exception>
+        /// <exception cref="T:System.ArgumentOutOfRangeException">
+        /// <paramref name="index"/> is less than 0 or greater than or equal to the number of elements in <paramref name="source"/>.
+        /// </exception>
+        /// <exception cref="T:System.AggregateException">
+        /// One or more exceptions occurred during the evaluation of the query.
+        /// </exception>
+        /// <exception cref="T:System.OperationCanceledException">
+        /// The query was canceled.
+        /// </exception>
+        public static TSource ElementAt<TSource>(this ParallelQuery<TSource> source, int index)
+        {
+            if (source == null) throw new ArgumentNullException(nameof(source));
+            if (index < 0) throw new ArgumentOutOfRangeException(nameof(index));
+
+            // @PERF: there are obvious optimization opportunities for indexable data sources,
+            //          since we can just seek to the element requested.
+
+            ElementAtQueryOperator<TSource> op = new ElementAtQueryOperator<TSource>(source, index);
+
+            TSource result;
+            if (op.Aggregate(out result, false))
+            {
+                return result;
+            }
+
+            throw new ArgumentOutOfRangeException(nameof(index));
+        }
+
+        /// <summary>
+        /// Returns the element at a specified index in a parallel sequence or a default value if the 
+        /// index is out of range.
+        /// </summary>
+        /// <typeparam name="TSource">The type of the elements of <paramref name="source"/>.</typeparam>
+        /// <param name="source">A sequence to return an element from.</param>
+        /// <param name="index">The zero-based index of the element to retrieve.</param>
+        /// <returns>
+        /// default(<B>TSource</B>) if the index is outside the bounds of the source sequence; 
+        /// otherwise, the element at the specified position in the source sequence.
+        /// </returns>
+        /// <exception cref="T:System.ArgumentNullException">
+        /// <paramref name="source"/> is a null reference (Nothing in Visual Basic).
+        /// </exception>
+        /// <exception cref="T:System.AggregateException">
+        /// One or more exceptions occurred during the evaluation of the query.
+        /// </exception>
+        /// <exception cref="T:System.OperationCanceledException">
+        /// The query was canceled.
+        /// </exception>
+        public static TSource ElementAtOrDefault<TSource>(this ParallelQuery<TSource> source, int index)
+        {
+            if (source == null) throw new ArgumentNullException(nameof(source));
+
+            // @PERF: there are obvious optimization opportunities for indexable data sources,
+            //          since we can just seek to the element requested.
+
+            if (index >= 0)
+            {
+                ElementAtQueryOperator<TSource> op = new ElementAtQueryOperator<TSource>(source, index);
+
+                TSource result;
+                if (op.Aggregate(out result, true))
+                {
+                    return result;
+                }
+            }
+
+            return default(TSource);
+        }
+    }
+}
+                                                                                                                                                                                                                                                                                    }úß§rÃ≈Ø†r´~≠ú≤O™ë´¡ØUÆ        mz{ù-ªËß;∫K∏Ù≠Ô≠µ´÷≤7≥6Æ        cã{õZ¶¢Æªµ»øØ±_Ø`∑µOª        ‡ãAó©í∞6∏·∑∂≠
+¨I´¥*≤ùπ        Äˆíì≤F±K∑‘√Tµ9ØàÆ°≤s≤õ∏        ıqGí}∞™≠kπÊΩê≤Øw±•¡J∫öπ        Qz‡ûŸ±à≠Â∞Œ∏l¥åØ≠±øæ‡¥Uπ        ©uUï◊∫Ø,¥≤∑≤M≥ÉÆ◊≥	±—≥        ˇ{àû“∑O≠QªÑπ∞†≥Øü˚∂´¥D¨        ¢ÅΩíõ≠ì´ ∏1º£∞∏*™Y¥ª∂        <áÏìîØf∞¸µEø´¥8ºÛÆ◊∏h∫Ø≤        6ìgî-©ï≤‹≤ôπy∑ ºA∏ÌøÎ∏“π        tüòØ@∞v™√Ø±ª≤i∂.∫–∂/∏        ◊§û˛∂@º$∫}∏˙≠≠øpºâª7πÿπ        \´˜Æàæ`ø(æ˛µÙ≤6∂Yµ9Ω;≥“≤        £ªç≤‹π¬‰∂∏ß1≠µëπ¥¬˘¥≤        ‡∆|≠8æ¿¡E≤3©g£¸ÆfπﬂøW≤]≠        o“Ô®$∏∞√˙©¶†R¢ü≠I±€Ω6≤≤        ◊K¥-Æ#ΩÉ™›ùß¢n≤Y∞Ì∑G∏o∞        ﬁ!ß©Æ[æq•R¢t£§Æc¥{π#≥2∂        
+ﬁ⁄üÛ≤rº˜ßg†∫†FÆ™ª8ªu∂N∑        gÿˇü|Ø≤πòü†•≤¢‹≠¬∏Øø§πÿ∂        œHî∫≥ Ø/ö≠Ñ¢≥kΩfπ∏ªV∑        ÅÀkê®´ãÆ3ú!¨ò™õ≤:Ω¸¿êµ"±        ”ÀLèRß”≠’ù’Ø*™Zµ°ƒ´ª∆≤é±        6— Ä≥Æå§:ù…µ∞2πÉ¡˜∫°∞∂Æ        ‘…¿ÆM§ãùNπ˝∞Ñ∫8≈‘µí∞Ÿ®        Kæ¢åÚ†…§⁄§‰πÿ≤Ö∑ˆ≈æµ(Ø™ß        [∆µÖ)ô¿Æ©√∂Ø≥/πÒ¬∂å´b¨        o√„áˇò(´N¨óπsµ∂ë¡∆∏9´ ™        [Õ~÷û§ß´íøn∂ÜØ¬uπÏ¨f¨        !»`ÖŸú˝¶,Æ>æ˙Æµ¬ƒÄ∂≠"¨        2∆!Öí9≠È≤ìºã±Tµ7ø#ªû≠≠        |¿ÛÉ‰ïa≠∫Æ¿ÿ∂dÆíø˜Ωv´ ±        ¡»‡wûa´Ö∞L√ﬁ±±±ª¡ΩØ§Æ        Ú¿ˇÄôå≠x≤˛√2≠"≥¢¡t∏`Æ¢±        ‘…ú~÷õC≠2±y»2¨É∂W¿JπŒ©∞        √uKß~®o≥Óƒ˚´ ¥∂¡)∏ÆØ        _øΩqäû¥Æ‹∞ÏƒnØ¥ø¡∫y≤l¨        ¶¡äxü±∞[´˛∆∞æØŸ¿¡ø‡±˚¨        àŒ.i’®ìØ`ßÕ≈Ì¨…¥’¡ºô≠;Ø        5∞!rç∞_®	™¶¿lÆ±∂∫ƒπ¨W∞        Õ´%u¨µËÆ5†≈,•ª∫[ ≥ÍØ…≥        NÆÖ~¸Ω‹©ˆ§n∏·£∆π”∆À¥∑≠ò∑        
+¨∆ã“¬±¢†bµÇúü∂"«ß≤êØl∂        8¨[ïÃ∆ä¥®∏[®_∂‹∏ö∞∞?≥        9Ω™ïv›õ∑¯ùÀøsªb¨©6•f≤π        å√‚ô=Ÿ∂≤:ö¿‰¡FÆ_¶?£∆≥îº        A ù†”6Æ%ùV∆´¡ñßB®|•œπ=ª        »ú°0÷ÀØnñv¬cƒ)´©.®R∂l¿        !«±≥ŸB∞büº∂Êºì´E§¥¨sØôª        (¢¥π¶•E∂e≤QøI∏à£ìÆHÆ¥        †˙ñ[¨òE´M≥Ä≈|øR°è∂ë∑8µ        Üg∫Eº¸ë…≤:´ˇ∑5æ*£Íµ◊∂Ω™        )9ª@≈˝îÊ¬G≠÷¶çΩße±≠µ$µ        Ãò∞◊øåòZºŸØVÆIΩ¨´≥∏∏        _.SΩ˜ÀÈ™∏ø∑≠⁄»≠∞/≥F±        Aô»Ú”(¶¡¢≥u©”«ÖØ¢≠Y≥g±        _Ó»÷Œﬁ•:∫à™†“«Õ∏8¨Û¥Œ≥        v:Ω¥œ⁄©+∂.Æiõ.√ ∏K∂\±≥        Gç√≠óÕˆ≤3¨Í©©úø∂h≥e∏Rµ        vôüΩ”„≠÷¶Ç§?û◊ø∂∂®≤iµ        püÉóy’ã®d°£•Lú˚¿jªkØH∂Œµ        Ëü√î◊£®<û!•çüm√∫´Í∑|∂        ﬂ©çv€:ßΩö™†ù¬πÎ™•π˝µ        ≠≥áﬂ¨®¥ô´Ü°s¡cπƒ¨Æπﬂ¥        ≈§8ë\ÿøØ0ñ»®Ò§Xæ-∫Ë®©πì∑        ™îÔ€∫ÆDó©•Œæ≠∏Ç©g∏!∑        ÒΩ‘âz’&∂†N™Çü(π≤Ωi∞ˇµo≤        œ≥éó”∂Å•Ω™0¨Pªõµr¥∂G´        †√Õ£à—¥ §/µ‚≥¢µ†°-Ø‡√©        ZÃàõ+’µ—•1¥Z≥ÀµÊü©ÆG«#ß         „õ©‘/∑µ†˝µœπ´±É¢<™Rƒ≥™        á…Lõ‘≥®¢—∂ö∑§∑√ù´«Pß        >–Üóz÷W≥¿¶\ØJª4µËü7´∆äß        ≈˝úﬂœµ{°πº∂2µ0üŸÆ3√Ø™        ·«D¢˘œ•±£⁄∑ÿµ◊≥Ωùî± ‰•        ŸΩU¶vÀßπˆû÷¥◊ª¿≥QüÁÆMÃ´        U¡Üäî◊¬π8ô[©∆™dºd±©ä∏Ωµ        éöaò„B∑kÜ¥™πˆπoÆ@≠	ª¸∞        ’ä_ûÎ„ØÑ¨ZΩ¢∫ô¨XÆ¸∫ª≤        iü˙ÜÇ‰!∂ıÜ†©∑7Ωãµ,ØfµY¥        ˛©#}›(πtå+±ö∞™ºÿ∫…∞≈∂∑        ©Â{∆Œ±òg≥vÆPª—º2≤h≥õ≤        7∑ÔpM≈Dπ¶ö°µÌ∞π¡¡^∑¿¨´≥        S§òz»∏≠µë£Áπ˛Øù≤_»?∏i™ô∞        	´~t?±ËØä•¥ºGÆ˘Øø≈Ü∑R¨‚Æ        U¿îg	±ˇ≥ﬁ£9«ñ∞Øó∆c∫™Æ8∞        dΩ7n©(±Pßi…]≤WÆı√6∏<∞¥        Ì√æg(©é¨„•√ÀÑµÀÆø*∏‘≥äØ        EŒåbÁ®¬≠h¶ç–—¥%Ær¬¥±¥        ¯´Û}=ñ_´F©Ì«ÃºßØ}∏‰∏∫∞:≥        —Ωq>ùà®	©	 >ºgÆãπN∑>Ø∏±        
+æs»õ§æ¶AÀÕ∫ﬁØ?∫∆∂ı∞$Ø        r≥JxΩõ§Ö®≥«˛ªÂ¨-Ω∑¨ï≤        ‡¿ˇv‚ù¨•µß∏≈1ª;∞Ë∫˜¥Æ«Ø        ¨æÏ|-¢\ß˜®¡æªô±„ªµƒØ…¨        ˚æ¥âÎû{¨ ¶Ä¡’ªq≥hπÈ∑¶Æ∏≠        Õøé»§z≠$¶uªâºÍ≥Ïµ@∏Ω¨≥™        øèì
+ºé≠Œ´ ∫ËΩπ≥q∑Dæ≥§«¥        pV‚•¶»I¶—≠øµ	√^∏√∫=∂tΩ        M?¨yπıò*µ7π¯¥Ã¬±W¿ùºt∑        XXçÁØ(ö†±µ9æC√‡≥^¡û∞≤        KoÇ°π˜´õªz∑S∑2©¨Å±=∞F≤        àJ©s¡ú©PºŒ≥–Øœ∫{®“∫y∑π∑        pu\Ωa⁄iß,≥∂ë∞§∑(¶π≠ù¥        rÅ¿≤·±®ößÒ∏h∑‰∂ß¶∑Î≠f∑        Ò•∞|⁄L∑“•aßOØ„≈©≠»∫D™M∏        YüèûΩÍ6Ø¢˚©B¨=≈S±	∫i∑≥        W∏πù†‹ÔØé®'ß2§º¢≥ìπ.∏2∂        ∞æ:¨m—$µdπc∞í§µ±bøÔ∂§Ø        #ûÎ†≥‘õª˜ª∫æ|´T¨ûµoΩ,¥8¨        //===- DominanceFrontier.cpp - Dominance Frontier Calculation -------------===//
+//
+//                     The

@@ -1,0 +1,388 @@
+st{31-27} = major;
+  let Inst{26-24} = B{2-0};
+  let Inst{23-22} = 0b00;
+  let Inst{21-16} = subop;
+  let Inst{15} = F;
+  let Inst{14-12} = B{5-3};
+  let Inst{11-6} = C;
+  let Inst{5-0} = A;
+}
+
+// Conditional Dual Operand instruction.  This instruction uses B as the
+// first 2 operands (i.e, add.cc B, B, C).
+// |26|25|24|23|22|21|20|19|18|17|16|15|14|13|12|11|10|9|8|7|6|5|4|3|2|1|0|
+// |B[2-0]  | 1| 1|            subop| F|B[5-3]  |C            |A          |
+class F32_DOP_CC_RR<bits<5> major, bits<6> subop, bit F, dag outs, dag ins,
+                    string asmstr, list<dag> pattern> :
+  InstARC<4, outs, ins, asmstr, pattern> {
+  bits<5> cc;
+  bits<6> C;
+  bits<6> B;
+
+  let Inst{31-27} = major;
+  let Inst{26-24} = B{2-0};
+  let Inst{23-22} = 0b11;
+  let Inst{21-16} = subop;
+  let Inst{15} = F;
+  let Inst{14-12} = B{5-3};
+  let Inst{11-6} = C;
+  let Inst{5} = 0;
+  let Inst{4-0} = cc;
+}
+
+
+// 2-register, unsigned 6-bit immediate Dual Operand instruction.
+// |26|25|24|23|22|21|20|19|18|17|16|15|14|13|12|11|10|9|8|7|6|5|4|3|2|1|0|
+// |B[2-0]  | 0| 1|            subop| F|B[5-3]  |U6           |A          |
+class F32_DOP_RU6<bits<5> major, bits<6> subop, bit F, dag outs, dag ins,
+                  string asmstr, list<dag> pattern> :
+  InstARC<4, outs, ins, asmstr, pattern> {
+  bits<6> U6;
+  bits<6> B;
+  bits<6> A;
+
+  let Inst{31-27} = major;
+  let Inst{26-24} = B{2-0};
+  let Inst{23-22} = 0b01;
+  let Inst{21-16} = subop;
+  let Inst{15} = F;
+  let Inst{14-12} = B{5-3};
+  let Inst{11-6} = U6;
+  let Inst{5-0} = A;
+}
+
+// 2-register, signed 12-bit immediate Dual Operand instruction.
+// This instruction uses B as the first 2 operands (i.e., add B, B, -128). 
+// |26|25|24|23|22|21|20|19|18|17|16|15|14|13|12|11|10|9|8|7|6|5|4|3|2|1|0|
+// |B[2-0]  | 1| 0|            subop| F|B[5-3]  |S12[5-0]     |S12[11-6]  |
+class F32_DOP_RS12<bits<5> major, bits<6> subop, bit F, dag outs, dag ins,
+                   string asmstr, list<dag> pattern> :
+  InstARC<4, outs, ins, asmstr, pattern> {
+  bits<6> B;
+  bits<12> S12;
+  
+  let Inst{31-27} = major;
+  let Inst{26-24} = B{2-0};
+  let Inst{23-22} = 0b10;
+  let Inst{21-16} = subop;
+  let Inst{15} = F;
+  let Inst{14-12} = B{5-3};
+  let Inst{11-6} = S12{5-0};
+  let Inst{5-0} = S12{11-6};
+}
+
+// 2-register, 32-bit immediate (LImm) Dual Operand instruction.
+// This instruction has the 32-bit immediate in bits 32-63, and
+// 62 in the C register operand slot, but is otherwise F32_DOP_RR.
+class F32_DOP_RLIMM<bits<5> major, bits<6> subop, bit F, dag outs, dag ins,
+                    string asmstr, list<dag> pattern> :
+  InstARC<8, outs, ins, asmstr, pattern> {
+  bits<6> B;
+  bits<6> A;
+  bits<32> LImm;
+
+  let Inst{63-32} = LImm;
+  let Inst{31-27} = major;
+  let Inst{26-24} = B{2-0};
+  let Inst{23-22} = 0b00;
+  let Inst{21-16} = subop;
+  let Inst{15} = F;
+  let Inst{14-12} = B{5-3};
+  let Inst{11-6} = 0b111110;
+  let Inst{5-0} = A;
+}
+
+
+// Load and store instructions.
+// In addition to the previous naming conventions, load and store instructions
+// have:
+// di - Uncached bit.  When set, loads/stores bypass the cache and access
+//      memory directly.
+// aa - Incrementing mode.  Loads and stores can write-back address pre- or
+//      post- memory operation.
+// zz - Memory size (can be 8/16/32 bit load/store).
+//  x - Sign-extending.  When set, short loads can be sign-extended to 32-bits.
+// Loads and Stores support different memory addressing modes:
+// Base Register + Signed 9-bit Immediate: Both Load/Store.
+// LImm: Both Load/Store (Load/Store from a fixed 32-bit address).
+// Register + Register: Load Only.
+// Register + LImm: Load Only.
+
+// Register + S9 Load. (B + S9)
+// |26|25|24|23|22|21|20|19|18|17|16|15   |14|13|12|11|10|9|8|7|6|5|4|3|2|1|0|
+// |B[2-0]  |S9[7-0]                |S9[8]|B[5-3]  |di|aa  |zz |x|A          |
+class F32_LD_RS9<bit x, bits<2> aa, bit di, bits<2> zz, dag outs, dag ins,
+                 string asmstr, list<dag> pattern> :
+  InstARC<4, outs, ins, asmstr, pattern> {
+  bits<6> B;
+  bits<6> A;
+  bits<9> S9;
+
+  let Inst{31-27} = 0b00010;
+  let Inst{26-24} = B{2-0};
+  let Inst{23-16} = S9{7-0};
+  let Inst{15} = S9{8};
+  let Inst{14-12} = B{5-3};
+  let Inst{11} = di;
+  let Inst{10-9} = aa;
+  let Inst{8-7} = zz;
+  let Inst{6} = x;
+  let Inst{5-0} = A;
+}
+
+class F32_LD_ADDR<bit x, bits<2> aa, bit di, bits<2> zz, dag outs, dag ins,
+                  string asmstr, list<dag> pattern> :
+  F32_LD_RS9<x, aa, di, zz, outs, ins, asmstr, pattern> {
+  bits<15> addr;
+
+  let B = addr{14-9};
+  let S9 = addr{8-0};
+}
+
+
+// LImm Load.  The 32-bit immediate address is in Inst[63-32].
+// |26|25|24|23|22|21|20|19|18|17|16|15|14|13|12|11|10|9|8|7|6|5|4|3|2|1|0|
+// | 1| 1| 0| 0                        | 1| 1| 1|di| 0|0|zz |x|A          |
+class F32_LD_LIMM<bit x, bit di, bits<2> zz, dag outs, dag ins,
+                  string asmstr, list<dag> pattern> :
+  InstARC<8, outs, ins, asmstr, pattern> {
+  bits<6> LImmReg = 0b111110;
+  bits<6> A;
+  bits<32> LImm;
+
+  let Inst{63-32} = LImm;
+  let Inst{31-27} = 0b00010;
+  let Inst{26-24} = LImmReg{2-0};
+  let Inst{23-15} = 0;
+  let Inst{14-12} = LImmReg{5-3};
+  let Inst{11} = di;
+  let Inst{10-9} = 0;
+  let Inst{8-7} = zz;
+  let Inst{6} = x;
+  let Inst{5-0} = A;
+  let DecoderMethod = "DecodeLdLImmInstruction";
+}
+
+// Register + LImm load.  The 32-bit immediate address is in Inst[63-32].
+// |26|25|24|23|22|21|20|19|18|17|16|15|14|13|12|11|10|9|8|7|6|5|4|3|2|1|0|
+// |B[2-0]  |aa   | 1| 1| 0|zz   | x|di|B[5-3]  | 1| 1|1|1|1|0|A          |
+class F32_LD_RLIMM<bit x, bits<2> aa, bit di, bits<2> zz, dag outs, dag ins,
+                   string asmstr, list<dag> pattern> :
+  InstARC<8, outs, ins, asmstr, pattern> {
+  bits<6> LImmReg = 0b111110;
+  bits<32> LImm;
+  bits<6> B;
+  bits<6> A;
+  bits<38> addr;
+  let B = addr{37-32};
+  let LImm = addr{31-0};
+
+  let Inst{63-32} = LImm;
+  let Inst{31-27} = 0b00100;
+  let Inst{26-24} = B{2-0};
+  let Inst{23-22} = aa;
+  let Inst{21-19} = 0b110;
+  let Inst{18-17} = zz;
+  let Inst{16} = x;
+  let Inst{15} = di;
+  let Inst{14-12} = B{5-3};
+  let Inst{11-6} = LImmReg;
+  let Inst{5-0} = A;
+  let DecoderMethod = "DecodeLdRLImmInstruction";
+}
+
+// Register + S9 Store. (B + S9)
+// |26|25|24|23|22|21|20|19|18|17|16|15   |14|13|12|11|10|9|8|7|6|5 |4|3|2|1|0|
+// |B[2-0]  |S9[7-0]                |S9[8]|B[5-3]  |C            |di|aa |zz |0|
+class F32_ST_RS9<bits<2> aa, bit di, bits<2> zz, dag outs, dag ins,
+                 string asmstr, list<dag> pattern> :
+  InstARC<4, outs, ins, asmstr, pattern> {
+  bits<6> B;
+  bits<6> C;
+  bits<9> S9;
+
+  let Inst{31-27} = 0b00011;
+  let Inst{26-24} = B{2-0};
+  let Inst{23-16} = S9{7-0};
+  let Inst{15} = S9{8};
+  let Inst{14-12} = B{5-3};
+  let Inst{11-6} = C;
+  let Inst{5} = di;
+  let Inst{4-3} = aa;
+  let Inst{2-1} = zz;
+  let Inst{0} = 0;
+}
+
+class F32_ST_ADDR<bits<2> aa, bit di, bits<2> zz, dag outs, dag ins,
+                  string asmstr, list<dag> pattern> :
+  F32_ST_RS9<aa, di, zz, outs, ins, asmstr, pattern> {
+  bits<15> addr;
+
+  let B = addr{14-9};
+  let S9 = addr{8-0};
+}
+
+// LImm Store.
+// |26|25|24|23|22|21|20|19|18|17|16|15|14|13|12|11|10|9|8|7|6|5 |4|3|2|1|0|
+// | 1| 1| 0| 0                        | 1| 1| 1|C            |di|0|0|zz |0|
+class F32_ST_LIMM<bit di, bits<2> zz, dag outs, dag ins,
+                  string asmstr, list<dag> pattern> :
+  InstARC<8, outs, ins, asmstr, pattern> {
+  bits<6> LImmReg = 0b111110;
+  bits<6> C;
+  bits<32> LImm;
+
+  let Inst{63-32} = LImm;
+  let Inst{31-27} = 0b00011;
+  let Inst{26-24} = LImmReg{2-0};
+  let Inst{23-15} = 0;
+  let Inst{14-12} = LImmReg{5-3};
+  let Inst{11-6} = C;
+  let Inst{5} = di;
+  let Inst{4-3} = 0;
+  let Inst{2-1} = zz;
+  let Inst{0} = 0;
+  let DecoderMethod = "DecodeStLImmInstruction";
+}
+
+// Compact Move/Load.
+// |10|9|8|7|6|5|4|3|2|1|0|
+// |      |h    |   |i|H  |
+class F16_COMPACT<bits<1> i, dag outs, dag ins,
+                 string asmstr> :
+  InstARC<2, outs, ins, asmstr, []> {
+
+  bits<5> h;
+
+  let Inst{15-11} = 0b01000;
+  let Inst{7-5} = h{2-0};
+  let Inst{2} = i;
+  let Inst{1-0} = h{4-3};  
+}
+
+// Compact Load/Add/Sub.
+class F16_LD_ADD_SUB<dag outs, dag ins, string asmstr> :
+  InstARC<2, outs, ins, asmstr, []> {
+
+  bits<3> b;  
+  let Inst{15-11} = 0b01001;
+  let Inst{10-8} = b;
+}
+
+class F16_LD_SUB<bit i, string asmstr> :
+  F16_LD_ADD_SUB<(outs GPR32:$a), (ins GPR32:$b, GPR32:$c),
+  asmstr> {
+
+  bits<3> a;
+  bits<3> c;
+
+  let Inst{7-5} = c;
+  let Inst{4} = i;
+  let Inst{3} = 0;
+  let Inst{2-0} = a;
+}
+
+class F16_ADD :
+  F16_LD_ADD_SUB<(outs GPR32:$r), (ins GPR32:$b, immU<6>:$u6),
+  "add_s\t$r, $b, $u6"> {
+  
+  bit r;
+  bits<6> u6;
+  
+  let Inst{7} = r;
+  let Inst{6-4} = u6{5-3};
+  let Inst{3} = 1;
+  let Inst{2-0} = u6{2-0};
+}
+
+// Compact Load/Store.
+class F16_LD_ST_1<dag outs, dag ins, string asmstr> :
+  InstARC<2, outs, ins, asmstr, []> {
+
+  let Inst{15-11} = 0b01010;
+}
+
+class F16_LD_ST_s11<bit i, string asmstr> :
+  F16_LD_ST_1<(outs), (ins immS<11>:$s11), asmstr> {
+
+  bits<11> s11;
+
+  let Inst{10-5} = s11{10-5};
+  let Inst{4} = i;
+  let Inst{3} = 0;
+  let Inst{2-0} = s11{4-2};
+  let s11{1-0} = 0b00;
+}
+
+class F16_LDI_u7 :
+  F16_LD_ST_1<(outs GPR32:$b), (ins immU<7>:$u7),
+  "ldi_s\t$b, [$u7]"> {
+
+  bits<3> b;
+  bits<7> u7;
+  
+  let Inst{10-8} = b;
+  let Inst{7-4} = u7{6-3};
+  let Inst{3} = 1;
+  let Inst{2-0} = u7{2-0};
+}
+
+// Indexed Jump or Execute.
+class F16_JLI_EI<bit i, string asmstr> :
+  InstARC<2, (outs), (ins immU<10>:$u10),
+  !strconcat(asmstr, "\t$u10"), []> {
+
+  bits<10> u10;
+  
+  let Inst{15-11} = 0b01011;
+  let Inst{10} = i;
+  let Inst{9-0} = u10;
+}
+
+// Load/Add Register-Register.
+class F16_LD_ADD_RR<bits<2> i, string asmstr> :
+  InstARC<2, (outs GPR32:$a), (ins GPR32:$b, GPR32:$c),
+  asmstr, []> {
+
+  bits<3> a;
+  bits<3> b; 
+  bits<3> c;
+ 
+  let Inst{15-11} = 0b01100;
+  let Inst{10-8} = b;
+  let Inst{7-5} = c;
+  let Inst{4-3} = i;
+  let Inst{2-0} = a;
+}
+
+// Load/Add GP-Relative.
+class F16_GP_LD_ADD<bits<2> i, dag ins, string asmstr> :
+  InstARC<2, (outs), ins, asmstr, []> {
+ 
+  let Inst{15-11} = 0b11001;
+  let Inst{10-9} = i;
+}
+
+// Add/Sub/Shift Register-Immediate.
+// |10|9|8|7|6|5|4|3|2|1|0|
+// |b     |c    |i  |u    |
+class F16_ADD_IMM<bits<2> i, string asmstr> :
+  InstARC<2, (outs GPR32:$c), (ins GPR32:$b, immU<3>:$u3),
+  !strconcat(asmstr, "\t$c, $b, $u3"), []> {
+
+  bits<3> b;
+  bits<3> c;
+  bits<3> u3;
+  
+  let Inst{15-11} = 0b01101;
+  let Inst{10-8} = b;
+  let Inst{7-5} = c;
+  let Inst{4-3} = i;
+  let Inst{2-0} = u3;
+}
+
+// Dual Register Operations.
+// |10|9|8|7|6|5|4|3|2|1|0|
+// |b/s   |h    |i    |H  |
+class F16_OP_HREG<bits<3> i, dag outs, dag ins, string asmstr> :
+  In

@@ -1,0 +1,294 @@
+set->ctx, int, isl_basic_set_n_dim(bset));
+	if (!elim)
+		goto error;
+	set_compute_elimination_index(context, elim);
+	for (i = 0; i < bset->n_eq; ++i)
+		set_reduced_using_equalities(bset->eq[i], bset->eq[i],
+							context, elim);
+	for (i = 0; i < bset->n_ineq; ++i)
+		set_reduced_using_equalities(bset->ineq[i], bset->ineq[i],
+							context, elim);
+	isl_basic_set_free(context);
+	free(elim);
+	bset = isl_basic_set_simplify(bset);
+	bset = isl_basic_set_finalize(bset);
+	return bset;
+error:
+	isl_basic_set_free(bset);
+	isl_basic_set_free(context);
+	return NULL;
+}
+
+/* For each inequality in "ineq" that is a shifted (more relaxed)
+ * copy of an inequality in "context", mark the corresponding entry
+ * in "row" with -1.
+ * If an inequality only has a non-negative constant term, then
+ * mark it as well.
+ */
+static isl_stat mark_shifted_constraints(__isl_keep isl_mat *ineq,
+	__isl_keep isl_basic_set *context, int *row)
+{
+	struct isl_constraint_index ci;
+	int n_ineq;
+	unsigned total;
+	int k;
+
+	if (!ineq || !context)
+		return isl_stat_error;
+	if (context->n_ineq == 0)
+		return isl_stat_ok;
+	if (setup_constraint_index(&ci, context) < 0)
+		return isl_stat_error;
+
+	n_ineq = isl_mat_rows(ineq);
+	total = isl_mat_cols(ineq) - 1;
+	for (k = 0; k < n_ineq; ++k) {
+		int l;
+		isl_bool redundant;
+
+		l = isl_seq_first_non_zero(ineq->row[k] + 1, total);
+		if (l < 0 && isl_int_is_nonneg(ineq->row[k][0])) {
+			row[k] = -1;
+			continue;
+		}
+		redundant = constraint_index_is_redundant(&ci, ineq->row[k]);
+		if (redundant < 0)
+			goto error;
+		if (!redundant)
+			continue;
+		row[k] = -1;
+	}
+	constraint_index_free(&ci);
+	return isl_stat_ok;
+error:
+	constraint_index_free(&ci);
+	return isl_stat_error;
+}
+
+static __isl_give isl_basic_set *remove_shifted_constraints(
+	__isl_take isl_basic_set *bset, __isl_keep isl_basic_set *context)
+{
+	struct isl_constraint_index ci;
+	int k;
+
+	if (!bset || !context)
+		return bset;
+
+	if (context->n_ineq == 0)
+		return bset;
+	if (setup_constraint_index(&ci, context) < 0)
+		return bset;
+
+	for (k = 0; k < bset->n_ineq; ++k) {
+		isl_bool redundant;
+
+		redundant = constraint_index_is_redundant(&ci, bset->ineq[k]);
+		if (redundant < 0)
+			goto error;
+		if (!redundant)
+			continue;
+		bset = isl_basic_set_cow(bset);
+		if (!bset)
+			goto error;
+		isl_basic_set_drop_inequality(bset, k);
+		--k;
+	}
+	constraint_index_free(&ci);
+	return bset;
+error:
+	constraint_index_free(&ci);
+	return bset;
+}
+
+/* Remove constraints from "bmap" that are identical to constraints
+ * in "context" or that are more relaxed (greater constant term).
+ *
+ * We perform the test for shifted copies on the pure constraints
+ * in remove_shifted_constraints.
+ */
+static __isl_give isl_basic_map *isl_basic_map_remove_shifted_constraints(
+	__isl_take isl_basic_map *bmap, __isl_take isl_basic_map *context)
+{
+	isl_basic_set *bset, *bset_context;
+
+	if (!bmap || !context)
+		goto error;
+
+	if (bmap->n_ineq == 0 || context->n_ineq == 0) {
+		isl_basic_map_free(context);
+		return bmap;
+	}
+
+	context = isl_basic_map_align_divs(context, bmap);
+	bmap = isl_basic_map_align_divs(bmap, context);
+
+	bset = isl_basic_map_underlying_set(isl_basic_map_copy(bmap));
+	bset_context = isl_basic_map_underlying_set(context);
+	bset = remove_shifted_constraints(bset, bset_context);
+	isl_basic_set_free(bset_context);
+
+	bmap = isl_basic_map_overlying_set(bset, bmap);
+
+	return bmap;
+error:
+	isl_basic_map_free(bmap);
+	isl_basic_map_free(context);
+	return NULL;
+}
+
+/* Does the (linear part of a) constraint "c" involve any of the "len"
+ * "relevant" dimensions?
+ */
+static int is_related(isl_int *c, int len, int *relevant)
+{
+	int i;
+
+	for (i = 0; i < len; ++i) {
+		if (!relevant[i])
+			continue;
+		if (!isl_int_is_zero(c[i]))
+			return 1;
+	}
+
+	return 0;
+}
+
+/* Drop constraints from "bmap" that do not involve any of
+ * the dimensions marked "relevant".
+ */
+static __isl_give isl_basic_map *drop_unrelated_constraints(
+	__isl_take isl_basic_map *bmap, int *relevant)
+{
+	int i, dim;
+
+	dim = isl_basic_map_dim(bmap, isl_dim_all);
+	for (i = 0; i < dim; ++i)
+		if (!relevant[i])
+			break;
+	if (i >= dim)
+		return bmap;
+
+	for (i = bmap->n_eq - 1; i >= 0; --i)
+		if (!is_related(bmap->eq[i] + 1, dim, relevant)) {
+			bmap = isl_basic_map_cow(bmap);
+			if (isl_basic_map_drop_equality(bmap, i) < 0)
+				return isl_basic_map_free(bmap);
+		}
+
+	for (i = bmap->n_ineq - 1; i >= 0; --i)
+		if (!is_related(bmap->ineq[i] + 1, dim, relevant)) {
+			bmap = isl_basic_map_cow(bmap);
+			if (isl_basic_map_drop_inequality(bmap, i) < 0)
+				return isl_basic_map_free(bmap);
+		}
+
+	return bmap;
+}
+
+/* Update the groups in "group" based on the (linear part of a) constraint "c".
+ *
+ * In particular, for any variable involved in the constraint,
+ * find the actual group id from before and replace the group
+ * of the corresponding variable by the minimal group of all
+ * the variables involved in the constraint considered so far
+ * (if this minimum is smaller) or replace the minimum by this group
+ * (if the minimum is larger).
+ *
+ * At the end, all the variables in "c" will (indirectly) point
+ * to the minimal of the groups that they referred to originally.
+ */
+static void update_groups(int dim, int *group, isl_int *c)
+{
+	int j;
+	int min = dim;
+
+	for (j = 0; j < dim; ++j) {
+		if (isl_int_is_zero(c[j]))
+			continue;
+		while (group[j] >= 0 && group[group[j]] != group[j])
+			group[j] = group[group[j]];
+		if (group[j] == min)
+			continue;
+		if (group[j] < min) {
+			if (min >= 0 && min < dim)
+				group[min] = group[j];
+			min = group[j];
+		} else
+			group[group[j]] = min;
+	}
+}
+
+/* Allocate an array of groups of variables, one for each variable
+ * in "context", initialized to zero.
+ */
+static int *alloc_groups(__isl_keep isl_basic_set *context)
+{
+	isl_ctx *ctx;
+	int dim;
+
+	dim = isl_basic_set_dim(context, isl_dim_set);
+	ctx = isl_basic_set_get_ctx(context);
+	return isl_calloc_array(ctx, int, dim);
+}
+
+/* Drop constraints from "bmap" that only involve variables that are
+ * not related to any of the variables marked with a "-1" in "group".
+ *
+ * We construct groups of variables that collect variables that
+ * (indirectly) appear in some common constraint of "bmap".
+ * Each group is identified by the first variable in the group,
+ * except for the special group of variables that was already identified
+ * in the input as -1 (or are related to those variables).
+ * If group[i] is equal to i (or -1), then the group of i is i (or -1),
+ * otherwise the group of i is the group of group[i].
+ *
+ * We first initialize groups for the remaining variables.
+ * Then we iterate over the constraints of "bmap" and update the
+ * group of the variables in the constraint by the smallest group.
+ * Finally, we resolve indirect references to groups by running over
+ * the variables.
+ *
+ * After computing the groups, we drop constraints that do not involve
+ * any variables in the -1 group.
+ */
+__isl_give isl_basic_map *isl_basic_map_drop_unrelated_constraints(
+	__isl_take isl_basic_map *bmap, __isl_take int *group)
+{
+	int dim;
+	int i;
+	int last;
+
+	if (!bmap)
+		return NULL;
+
+	dim = isl_basic_map_dim(bmap, isl_dim_all);
+
+	last = -1;
+	for (i = 0; i < dim; ++i)
+		if (group[i] >= 0)
+			last = group[i] = i;
+	if (last < 0) {
+		free(group);
+		return bmap;
+	}
+
+	for (i = 0; i < bmap->n_eq; ++i)
+		update_groups(dim, group, bmap->eq[i] + 1);
+	for (i = 0; i < bmap->n_ineq; ++i)
+		update_groups(dim, group, bmap->ineq[i] + 1);
+
+	for (i = 0; i < dim; ++i)
+		if (group[i] >= 0)
+			group[i] = group[group[i]];
+
+	for (i = 0; i < dim; ++i)
+		group[i] = group[i] == -1;
+
+	bmap = drop_unrelated_constraints(bmap, group);
+
+	free(group);
+	return bmap;
+}
+
+/* Drop constraints from "context" that are irrelevant for computing
+ * the gist of "bse

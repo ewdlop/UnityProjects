@@ -1,0 +1,83 @@
+ bodyXml.EncryptionMethod, this.AlgorithmSuite))
+            {
+                bodyXml.SetUpDecryption(algorithm);
+                this.SecurityVerifiedMessage.SetDecryptedBody(bodyXml.GetDecryptedBuffer());
+            }
+        }
+
+        protected virtual DecryptedHeader DecryptHeader(XmlDictionaryReader reader, WrappedKeySecurityToken wrappedKeyToken)
+        {
+            throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(
+                new MessageSecurityException(SR.GetString(SR.HeaderDecryptionNotSupportedInWsSecurityJan2004)));
+        }
+
+        protected override byte[] DecryptSecurityHeaderElement(
+            EncryptedData encryptedData, WrappedKeySecurityToken wrappedKeyToken, out SecurityToken encryptionToken)
+        {
+            if ((encryptedData.KeyIdentifier != null) || (wrappedKeyToken == null))
+            {
+                // The EncryptedData might have a KeyInfo inside it. Try resolving the SecurityKeyIdentifier. 
+                encryptionToken = ResolveKeyIdentifier(encryptedData.KeyIdentifier, this.CombinedPrimaryTokenResolver, false);
+                if (wrappedKeyToken != null && wrappedKeyToken.ReferenceList != null && encryptedData.HasId && wrappedKeyToken.ReferenceList.ContainsReferredId(encryptedData.Id) && (wrappedKeyToken != encryptionToken))
+                {
+                    // We have a EncryptedKey with a ReferenceList inside it. This would mean that 
+                    // all the EncryptedData pointed by the ReferenceList should be encrypted only
+                    // by this key. The individual EncryptedData elements if containing a KeyInfo
+                    // clause should point back to the same EncryptedKey token.
+                    throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new MessageSecurityException(SR.GetString(SR.EncryptedKeyWasNotEncryptedWithTheRequiredEncryptingToken, wrappedKeyToken)));
+                }
+            }
+            else
+            {
+                encryptionToken = wrappedKeyToken;
+            }
+            using (SymmetricAlgorithm algorithm = CreateDecryptionAlgorithm(encryptionToken, encryptedData.EncryptionMethod, this.AlgorithmSuite))
+            {
+                encryptedData.SetUpDecryption(algorithm);
+                return encryptedData.GetDecryptedBuffer();
+            }
+        }
+
+        protected override WrappedKeySecurityToken DecryptWrappedKey(XmlDictionaryReader reader)
+        {
+            if (TD.WrappedKeyDecryptionStartIsEnabled())
+            {
+                TD.WrappedKeyDecryptionStart(this.EventTraceActivity);
+            }
+
+            WrappedKeySecurityToken token = (WrappedKeySecurityToken)this.StandardsManager.SecurityTokenSerializer.ReadToken(
+                reader, this.PrimaryTokenResolver);
+            this.AlgorithmSuite.EnsureAcceptableKeyWrapAlgorithm(token.WrappingAlgorithm, token.WrappingSecurityKey is AsymmetricSecurityKey);
+
+            if (TD.WrappedKeyDecryptionSuccessIsEnabled())
+            {
+                TD.WrappedKeyDecryptionSuccess(this.EventTraceActivity);
+            }
+            return token;
+        }
+
+        bool EnsureDigestValidityIfIdMatches(
+            SignedInfo signedInfo,
+            string id, XmlDictionaryReader reader, bool doSoapAttributeChecks,
+            MessagePartSpecification signatureParts, MessageHeaderInfo info, bool checkForTokensAtHeaders)
+        {
+            if (signedInfo == null)
+            {
+                return false;
+            }
+            if (doSoapAttributeChecks)
+            {
+                VerifySoapAttributeMatchForHeader(info, signatureParts, reader);
+            }
+
+            bool signed = false;
+            bool isRecognizedSecurityToken = checkForTokensAtHeaders && this.StandardsManager.SecurityTokenSerializer.CanReadToken(reader);
+
+            try
+            {
+                signed = signedInfo.EnsureDigestValidityIfIdMatches(id, reader);
+            }
+            catch (CryptographicException exception)
+            {
+                //
+                // Wrap the crypto exceptio

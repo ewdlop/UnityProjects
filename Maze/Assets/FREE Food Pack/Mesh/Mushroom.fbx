@@ -1,0 +1,442 @@
+'$temp1=$gChannelsLayersForm')
+                channelBoxForm = mel.eval('$temp1 = $gChannelButtonForm')
+
+                #edit the channel box pane's attachment to the formLayout
+                cmds.formLayout(channelBoxLayout, edit = True, af = [(channelBox, "left", 0),(channelBox, "right", 0), (channelBox, "bottom", 0)], attachControl = (channelBox, "top", 0, channelBoxForm))
+
+            cmds.deleteUI("artAnimUIDock")
+
+
+
+        if cmds.window("artAnimUI", exists = True):
+            cmds.deleteUI("artAnimUI")
+
+
+        #build window
+        self.widgets["window"] = cmds.window("artAnimUI", w = 400, h = 700, title = "Animation UI", sizeable = True)
+
+        #create the main layout
+        self.widgets["topLevelLayout"] = cmds.columnLayout()
+
+        #create the menu bar
+        self.widgets["menuBarLayout"] = cmds.menuBarLayout(w = 400, h =20, parent = self.widgets["topLevelLayout"] )
+        self.widgets["menuBar_settings"] = cmds.menu(label = "Settings", parent = self.widgets["menuBarLayout"])
+        self.widgets["menuBar_settings_channelBox"] = cmds.menuItem(label = "Show Channel Box", checkBox = False, parent = self.widgets["menuBar_settings"], c = self.showChannelBox)
+        self.widgets["menuBar_settings_matching"] = cmds.menuItem(label = "Match On Switch", checkBox = True, parent = self.widgets["menuBar_settings"])
+
+        #add match options
+        cmds.menuItem(parent = self.widgets["menuBar_settings"], divider = True)
+        cmds.menuItem(parent = self.widgets["menuBar_settings"], label = "Space Switch Settings", enable = False)
+        cmds.menuItem(parent = self.widgets["menuBar_settings"], divider = True)
+
+        self.widgets["spaceSwitch_MatchToggleCB"] = cmds.menuItem(parent = self.widgets["menuBar_settings"], label = "Match?", cb = True, c = self.saveUISettings)
+        self.widgets["spaceSwitch_MatchMethodCB"] = cmds.menuItem(parent = self.widgets["menuBar_settings"], label = "Match To Control?", cb = True, c = self.saveUISettings)		
+
+        #Add animation menu
+        self.widgets["menuBar_animation"] = cmds.menu(label = "Animation", parent = self.widgets["menuBarLayout"])
+        self.widgets["menuBar_animation_eulerAll"] = cmds.menuItem(label = "Run Euler Filter On All",  c = self.eulerFilterAll, parent = self.widgets["menuBar_animation"])
+        self.widgets["menuBar_animation_eulerSel"] = cmds.menuItem(label = "Run Euler Filter On Selected",  c = self.eulerFilterSelected, parent = self.widgets["menuBar_animation"])
+        self.widgets["menuBar_animation_bakeDyn"] = cmds.menuItem(label = "Bake Dynamics to FK",  c = self.bakeDynToFK, parent = self.widgets["menuBar_animation"])
+
+
+
+        #create the area for the active character controls
+        self.widgets["activeCharacterLayout"] = cmds.formLayout(w = 400, h = 60, parent = self.widgets["topLevelLayout"])
+        self.widgets["projectBanner"] = cmds.image(w = 400, h = 60, bgc = [.5, .5, .5],  parent = self.widgets["activeCharacterLayout"], image = projectBanner )
+        self.widgets["activeCharacterThumb"] = cmds.symbolButton('activeCharacterThumb', w = 50, h = 50,  parent = self.widgets["activeCharacterLayout"])
+
+        cmds.formLayout(self.widgets["activeCharacterLayout"], edit = True, af = [(self.widgets["activeCharacterThumb"], "right", 5), (self.widgets["activeCharacterThumb"], "top", 6)])
+
+        #create the character list pop-up menu
+        self.widgets["characterRigList"] = cmds.popupMenu(parent = self.widgets["activeCharacterThumb"], b = 1)
+        self.populateCharacterRigList()
+
+        #create the row column layout where the left column will contain pretty much everything, and the right column is optional for channel box display
+        self.widgets["rowColLayout"] = cmds.rowColumnLayout(nc = 3, cw = [(1, 400), (2, 50), (3, 1)], parent = self.widgets["topLevelLayout"])
+
+
+        #create the main tab Layout
+        self.widgets["mainLayout"] = cmds.tabLayout(w = 400, h = 700, parent = self.widgets["rowColLayout"])
+
+        #create the formLayout that will contain each character's picker
+        self.widgets["pickerLayout"] = cmds.formLayout(w = 400, h = 700, parent = self.widgets["mainLayout"])
+        self.widgets["pickerScroll"] = cmds.scrollLayout(w = 400, h = 700, hst = 0, parent = self.widgets["pickerLayout"])
+
+
+
+
+        #create the tools layout(50 pixel column on the screen right)
+        self.widgets["pickerTools"] = cmds.columnLayout(w = 50, h = 700, parent = self.widgets["rowColLayout"], rowSpacing = 10)
+        cmds.text(label = "")
+        self.widgets["pickerSelectTool"] = cmds.symbolButton(w = 50, h = 50, image = self.mayaToolsDir + "/General/Icons/ART/pickerSelect.bmp", parent = self.widgets["pickerTools"], ann = "Selection Tools")
+        self.widgets["pickerResetTool"] = cmds.symbolButton(w = 50, h = 50, image = self.mayaToolsDir + "/General/Icons/ART/zero.bmp", parent = self.widgets["pickerTools"], ann = "Reset Rig to the Defaults")
+        self.widgets["pickerImportMotionTool"] = cmds.symbolButton(w = 50, h = 50, image = self.mayaToolsDir + "/General/Icons/ART/importMotion.bmp", parent = self.widgets["pickerTools"], c = self.importMotion, ann = "Import Motion")
+        self.widgets["pickerExportMotionTool"] = cmds.symbolButton(w = 50, h = 50, image = self.mayaToolsDir + "/General/Icons/ART/exportMotion.bmp", parent = self.widgets["pickerTools"], c = self.exportMotion, ann = "Export Motion")
+        self.widgets["pickerSpaceSwitchTool"] = cmds.symbolButton(w = 50, h = 50, image = self.mayaToolsDir + "/General/Icons/ART/picker_spaceSwitch.bmp", parent = self.widgets["pickerTools"], c = self.spaceSwitcher, ann = "Space Switching")
+        self.widgets["pickerPoseTools"] = cmds.symbolButton(c = self.poseEditor, w = 50, h = 50, image = self.mayaToolsDir + "/General/Icons/ART/poseTools.bmp", parent = self.widgets["pickerTools"], ann = "Pose Tools and Utilities")
+        self.widgets["pickerMatchOverRange"] = cmds.symbolButton(c = self.match_frameRange_UI, w = 50, h = 50, image = self.mayaToolsDir + "/General/Icons/ART/spaceSwitchMatch_on.bmp", parent = self.widgets["pickerTools"], ann = "Match Over Frame Range")
+        self.widgets["pickerControlScaleTool"] = cmds.symbolButton(c = self.control_scale_init, w = 50, h = 50, image = self.mayaToolsDir + "/General/Icons/ART/controlScale.bmp", parent = self.widgets["pickerTools"], ann = "Scale selected controls' size. Use to make controls larger or smaller for selecting.")
+        self.widgets["pickerControlVisibility"] = cmds.iconTextCheckBox(w = 50, h = 50, style='iconOnly', value = True,  selectionImage = self.mayaToolsDir + "/General/Icons/ART/pickerVisible.bmp", image = self.mayaToolsDir + "/General/Icons/ART/pickerInvisible.bmp", parent = self.widgets["pickerTools"], onc = partial(self.toggleControlVis, True), ofc = partial(self.toggleControlVis, False), ann = "Toggle Current Rig's Control Visibility" )
+        self.widgets["pickerSelectionSets"] = cmds.symbolButton(c = self.control_scale_init, w = 50, h = 50, image = self.mayaToolsDir + "/General/Icons/ART/selectionSets.bmp", parent = self.widgets["pickerTools"], ann = "Selection Sets that are created are stored here.")
+        self.widgets["pickerHelpMenu"] = cmds.symbolButton(w = 50, h = 50, image = self.mayaToolsDir + "/General/Icons/ART/helpicon.bmp", parent = self.widgets["pickerTools"], c = self.animHelp, ann = "Help")
+
+        #create popup menu for space switcher
+        menu = cmds.popupMenu(parent = self.widgets["pickerSpaceSwitchTool"], b = 3)
+        cmds.menuItem(label = "Create Space", parent = menu, c = self.createSpace)
+
+        #create radial menu for pose button for copy, paste, and paste opposite
+        self.widgets["pickerPoseToolsRadial"] = cmds.popupMenu(b = 3, parent = self.widgets["pickerPoseTools"], mm = True)
+        self.widgets["pickerPoseToolsRadial_copy"] = cmds.menuItem(label = "Copy", parent = self.widgets["pickerPoseToolsRadial"], rp = "N", c = self.copyPose)
+        self.widgets["pickerPoseToolsRadial_paste"] = cmds.menuItem(label = "Paste", parent = self.widgets["pickerPoseToolsRadial"], rp = "W", c = self.pastePose)
+        self.widgets["pickerPoseToolsRadial_pasteOpposite"] = cmds.menuItem(label = "Paste Opposite", parent = self.widgets["pickerPoseToolsRadial"], rp = "S", c = self.pastePoseOpposite)
+        self.widgets["pickerPoseToolsRadial_pastePreview"] = cmds.menuItem(label = "Show Paste Controls", parent = self.widgets["pickerPoseToolsRadial"], rp = "NW", c = self.pastePreview)
+        self.widgets["pickerPoseToolsRadial_pastePreviewOpp"] = cmds.menuItem(label = "Show Paste Opposite Controls", parent = self.widgets["pickerPoseToolsRadial"], rp = "SW", c = self.pasteOppositePreview)
+
+        #create radial menu for iso select tools
+        self.widgets["isoSelectRadial"] = cmds.popupMenu(b = 3, parent = self.widgets["pickerControlVisibility"])
+        self.widgets["isoSelect_Generate"] = cmds.menuItem(label = "Generate Iso Selection Sets", parent = self.widgets["isoSelectRadial"], c = self.getIsoSelectionPolygons, enable = True)
+        cmds.menuItem(divider = True, parent = self.widgets["isoSelectRadial"] )
+
+
+        self.widgets["isoSelect_Torso"] = cmds.menuItem(label = "Torso", parent = self.widgets["isoSelectRadial"], c = self.isoSelect, cb = True, enable = False)
+        self.widgets["isoSelect_LeftArm"] = cmds.menuItem(label = "Left Arm", parent = self.widgets["isoSelectRadial"], c = self.isoSelect, cb = True, enable = False)
+        self.widgets["isoSelect_RightArm"] = cmds.menuItem(label = "Right Arm", parent = self.widgets["isoSelectRadial"], c = self.isoSelect, cb = True, enable = False)
+        self.widgets["isoSelect_LeftLeg"] = cmds.menuItem(label = "Left Leg", parent = self.widgets["isoSelectRadial"], c = self.isoSelect, cb = True, enable = False)
+        self.widgets["isoSelect_RightLeg"] = cmds.menuItem(label = "Right Leg", parent = self.widgets["isoSelectRadial"], c = self.isoSelect, cb = True, enable = False)
+        self.widgets["isoSelect_Head"] = cmds.menuItem(label = "Head", parent = self.widgets["isoSelectRadial"], c = self.isoSelect, cb = True, enable = False)
+        self.widgets["isoSelect_ShowAll"] = cmds.menuItem(label = "Show All", parent = self.widgets["isoSelectRadial"], c = self.exitIso, enable = False)
+
+
+        cmds.menuItem(divider = True, parent = self.widgets["isoSelectRadial"] )
+        cmds.menuItem(label = "Isolation Method:", parent = self.widgets["isoSelectRadial"], enable = False)
+        isoMethodCollection = cmds.radioMenuItemCollection(parent = self.widgets["isoSelectRadial"])
+        self.widgets["isoMethodClassic"] = cmds.menuItem(label = "Classic", rb = True, cl  = isoMethodCollection, parent = self.widgets["isoSelectRadial"], ann = "Use Maya's isolate selection, where everything except selection is hidden", c = self.exitIso)
+        self.widgets["isoMethodMaterial"] = cmds.menuItem(label = "Material", rb = False, cl  = isoMethodCollection, parent = self.widgets["isoSelectRadial"], c = self.exitIso, ann = "Use custom isolate selection function where any unselected parts are invisible, but the rest of the scene does not get hidden.")
+
+
+
+
+
+
+
+
+        #selection sets menu 
+        self.widgets["selectionSetMenuPopUp"] = cmds.popupMenu(b = 1, parent = self.widgets["pickerSelectionSets"])
+
+        #create the selection popupMenu
+        self.widgets["pickerSelectionToolPopup"] = cmds.popupMenu(b = 1, parent = self.widgets["pickerSelectTool"])
+        self.widgets["pickerSelectionToolPopup_Controls"] = cmds.menuItem(label = "Select All Controls", parent = self.widgets["pickerSelectionToolPopup"], c = self.selectAll)
+        self.widgets["pickerSelectionToolPopup_All"] = cmds.menuItem(label = "Select All (Controls + Spaces)", parent = self.widgets["pickerSelectionToolPopup"], c = self.selectEverything)
+        self.widgets["pickerSelectionToolPopup_Settings"] = cmds.menuItem(label = "Select Rig Settings", parent = self.widgets["pickerSelectionToolPopup"], c = self.selectRigSettings)
+        self.widgets["pickerSelectionToolPopup_Custom"] = cmds.menuItem(label = "Create Selection Set", parent = self.widgets["pickerSelectionToolPopup"], c = self.createSelectionSet)
+        self.widgets["selectionSetsCustom"] = cmds.menuItem(label = "Selection Sets", parent = self.widgets["pickerSelectionToolPopup"], subMenu = True, tearOff = True)
+
+        #create the reset popupMenu
+        self.widgets["pickerResetToolPopup"] = cmds.popupMenu(b = 1, parent = self.widgets["pickerResetTool"])
+        self.widgets["pickerResetToolPopup_All"] = cmds.menuItem(label = "Zero out All", parent = self.widgets["pickerResetToolPopup"], c = self.resetAll)
+        self.widgets["pickerResetToolPopup_Selected"] = cmds.menuItem(label = "Zero out Selected", parent = self.widgets["pickerResetToolPopup"], c = self.resetSelection)
+
+
+
+        #create the character picker for each character found in the scene
+        characters = self.getCharacters()
+
+        for character in characters:
+            self.createCharacterPicker(character, self.widgets["pickerScroll"])
+
+
+
+        #create the list view picker for each character found in the scene
+        self.widgets["listViewLayout"] = cmds.formLayout(w = 400, h = 700, parent = self.widgets["mainLayout"])
+
+        for character in characters:
+            self.createListView(character, self.widgets["listViewLayout"])
+
+
+        #create channel box layout
+        self.widgets["cbFormLayout"] = cmds.formLayout("ART_cbFormLayout", w = 200, h = 700, parent = self.widgets["rowColLayout"])
+
+
+
+
+        #create the rig settings tab
+        self.widgets["rigSettingsLayout"] = cmds.formLayout(w = 400, h = 700, parent = self.widgets["mainLayout"])
+        self.widgets["rigSettingsScroll"] = cmds.scrollLayout(w = 400, h = 700, hst = 0, parent = self.widgets["rigSettingsLayout"])
+
+        for character in characters:
+            self.createRigSettings(character, self.widgets["rigSettingsScroll"])
+
+
+
+
+
+        #name the tabs
+        cmds.tabLayout(self.widgets["mainLayout"], edit = True, tabLabel = [(self.widgets["pickerLayout"], "Picker"), (self.widgets["listViewLayout"], "List View"), (self.widgets["rigSettingsLayout"], "Rig Settings")])
+
+
+        #show window
+        self.widgets["dock"] = cmds.dockControl("artAnimUIDock", label = "Animation Interface", content = self.widgets["window"], area = "right", allowedArea = "right", visibleChangeCommand = self.interfaceScriptJob)
+
+
+        #add attributes to controls
+        self.setupButtonAttrsOnControls()
+
+        #setup selection scriptJob
+        self.scriptJob = cmds.scriptJob(parent = self.widgets["window"], event = ["SelectionChanged", self.selectionScriptJob], kws = True)
+
+        #set the current selected character and change the thumbnail
+        selected = characters[len(characters)-1]
+        self.setThumbnail(selected, self.project)
+        self.switchActiveCharacter(selected)
+
+
+        #get all controls
+        self.controls = []
+        for control in ["head_fk_anim", "neck_01_fk_anim", "neck_02_fk_anim", "neck_03_fk_anim", "spine_01_anim", "spine_02_anim", "spine_03_anim", "spine_04_anim", "spine_05_anim", "mid_ik_anim", "chest_ik_anim",
+                        "body_anim", "hip_anim", "clavicle_l_anim", "clavicle_r_anim", "fk_arm_l_anim", "fk_arm_r_anim", "fk_elbow_l_anim", "fk_elbow_r_anim", "fk_wrist_l_anim", "fk_wrist_r_anim",
+                        "ik_elbow_l_anim", "ik_elbow_r_anim", "ik_wrist_l_anim", "ik_wrist_r_anim", "fk_thigh_l_anim", "fk_thigh_r_anim", "fk_calf_l_anim", "fk_calf_r_anim", "fk_foot_l_anim", "fk_foot_r_anim",
+                        "fk_ball_l_anim", "fk_ball_r_anim", "ik_foot_anim_l", "ik_foot_anim_r", "heel_ctrl_l", "heel_ctrl_r", "toe_wiggle_ctrl_l", "toe_wiggle_ctrl_r",
+                        "toe_tip_ctrl_l", "toe_tip_ctrl_r", "master_anim", "offset_anim", "root_anim", "upperarm_l_twist_anim", "upperarm_l_twist_2_anim", "upperarm_l_twist_3_anim", "upperarm_r_twist_anim", "upperarm_r_twist_2_anim", "upperarm_r_twist_3_anim", "l_thigh_twist_01_anim", "r_thigh_twist_01_anim",
+                        "pinky_metacarpal_ctrl_l", "pinky_metacarpal_ctrl_r", "pinky_finger_fk_ctrl_1_l", "pinky_finger_fk_ctrl_1_r", "pinky_finger_fk_ctrl_2_l", "pinky_finger_fk_ctrl_2_r", "pinky_finger_fk_ctrl_3_l", "pinky_finger_fk_ctrl_3_r",
+                        "ring_metacarpal_ctrl_l", "ring_metacarpal_ctrl_r", "ring_finger_fk_ctrl_1_l", "ring_finger_fk_ctrl_1_r", "ring_finger_fk_ctrl_2_l", "ring_finger_fk_ctrl_2_r", "ring_finger_fk_ctrl_3_l", "ring_finger_fk_ctrl_3_r",
+                        "middle_metacarpal_ctrl_l", "middle_metacarpal_ctrl_r", "middle_finger_fk_ctrl_1_l", "middle_finger_fk_ctrl_1_r", "middle_finger_fk_ctrl_2_l", "middle_finger_fk_ctrl_2_r", "middle_finger_fk_ctrl_3_l", "middle_finger_fk_ctrl_3_r",
+                        "index_metacarpal_ctrl_l", "index_metacarpal_ctrl_r", "index_finger_fk_ctrl_1_l", "index_finger_fk_ctrl_1_r", "index_finger_fk_ctrl_2_l", "index_finger_fk_ctrl_2_r", "index_finger_fk_ctrl_3_l", "index_finger_fk_ctrl_3_r",
+                        "thumb_finger_fk_ctrl_1_l", "thumb_finger_fk_ctrl_1_r", "thumb_finger_fk_ctrl_2_l", "thumb_finger_fk_ctrl_2_r", "thumb_finger_fk_ctrl_3_l", "thumb_finger_fk_ctrl_3_r",
+                        "index_l_ik_anim", "index_r_ik_anim", "middle_l_ik_anim", "middle_r_ik_anim", "ring_l_ik_anim", "ring_r_ik_anim", "pinky_l_ik_anim", "pinky_r_ik_anim", "thumb_l_ik_anim", "thumb_r_ik_anim",
+                        "index_l_poleVector", "index_r_poleVector", "middle_l_poleVector", "middle_r_poleVector", "ring_l_poleVector", "ring_r_poleVector", "pinky_l_poleVector", "pinky_r_poleVector", "thumb_l_poleVector", "thumb_r_poleVector",
+                        "l_global_ik_anim", "r_global_ik_anim", "lowerarm_l_twist_anim", "lowerarm_l_twist2_anim", "lowerarm_l_twist3_anim", "lowerarm_r_twist_anim", "lowerarm_r_twist2_anim", "lowerarm_r_twist3_anim", "calf_r_twist_anim", "calf_r_twist2_anim", "calf_r_twist3_anim",
+                        "calf_l_twist_anim", "calf_l_twist2_anim", "calf_l_twist3_anim", "thigh_l_twist_2_anim", "thigh_l_twist_3_anim", "thigh_r_twist_2_anim", "thigh_r_twist_3_anim"]:
+            self.controls.append(control)
+
+        #hack
+        character = selected
+        for obj in ["fk_clavicle_l_anim", "fk_clavicle_r_anim"]:
+            if cmds.objExists(character + ":" + obj):
+                self.controls.append(obj)
+
+        #find custom joints
+        character = selected
+        customJoints = []
+        attrs = cmds.listAttr(character + ":" + "Skeleton_Settings")
+        for attr in attrs:
+            if attr.find("extraJoint") == 0:
+                customJoints.append(attr)
+
+        for joint in customJoints:
+            attribute = cmds.getAttr(character + ":" + "Skeleton_Settings." + joint, asString = True)
+            jointType = attribute.partition("/")[2].partition("/")[0]
+            label = attribute.rpartition("/")[2]
+
+            if jointType == "leaf":
+                label = label.partition(" (")[0]
+                control = label + "_anim"
+                self.controls.append(control)
+
+            if jointType == "jiggle":
+                control = label + "_anim"
+                self.controls.append(control)
+
+            if jointType == "chain" or jointType == "dynamic":
+                numJointsInChain = label.partition("(")[2].partition(")")[0]
+                label = label.partition(" (")[0]
+
+                self.controls.append(label + "_dyn_anim")
+
+                cmds.select("*:" + label + "_ik_*_anim")
+                selection = cmds.ls(sl = True)
+                for each in selection:
+                    niceName = each.partition(":")[2]
+                    self.controls.append(niceName)		
+
+                for i in range(int(numJointsInChain)):
+                    self.controls.append("fk_" + label + "_0" + str(i + 1) + "_anim")
+                    self.controls.append(label + "_cv_" + str(i) + "_anim")		    
+
+
+
+        #load UI settings
+        self.loadUISettings()
+        self.findCustomSelectionSets()
+
+        #create script job for updating ui
+        self.updateUI_scriptJob()
+
+        #setup the scriptJob
+        cmds.scriptJob(event = ["readingFile", self.killUIScriptJob], runOnce = True, kws = True)
+        cmds.scriptJob(event = ["SceneSaved", self.exitIsoOnSave], parent = self.widgets["window"], kws = True, runOnce = True)
+
+
+
+
+    # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+    # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+    # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+    # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+    # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+    def bakeDynToFK(self, *args):
+
+        #find all of the dynamic controls
+        character = cmds.symbolButton(self.widgets["activeCharacterThumb"], q = True, ann = True)
+        cmds.select(character + ":" + "*dyn_anim")
+        dynControls = cmds.ls(sl = True)
+
+        if len(dynControls) > 0:
+
+            #list the controls in a UI
+            if cmds.window("bakeDynToFKControls_UI", exists = True):
+                cmds.deleteUI("bakeDynToFKControls_UI")
+
+            window = cmds.window("bakeDynToFKControls_UI", title = "Bake Dynamics", w = 300, h = 400, sizeable = True, mnb = False, mxb = False)
+            mainLayout = cmds.formLayout(w = 300, h = 400)
+
+            #textScrollList
+            self.widgets["bakeDynToFK_List"] = cmds.textScrollList(w = 200, h = 300, allowMultiSelection = True, parent = mainLayout)
+
+            for control in dynControls:
+                cmds.textScrollList(self.widgets["bakeDynToFK_List"], edit = True, append = control)
+
+            cmds.formLayout(mainLayout, edit = True, af = [(self.widgets["bakeDynToFK_List"], "top", 50), (self.widgets["bakeDynToFK_List"], "left", 5)] )
+
+            #process button
+            button = cmds.button(w = 80, h = 40, label = "Bake", c = self.bakeDynToFK_Process)
+            cmds.formLayout(mainLayout, edit = True, af = [(button, "bottom", 50),(button, "right", 5)])
+            cmds.showWindow(window)
+
+
+        else:
+            cmds.warning("No Dynamic controls found on the current character.")
+            return
+
+
+    # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+    # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+    # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+    # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+    # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+    def bakeDynToFK_Process(self, *args):
+
+        character = cmds.symbolButton(self.widgets["activeCharacterThumb"], q = True, ann = True)
+
+        #get the selected controls in the list
+        controlsToBake = cmds.textScrollList(self.widgets["bakeDynToFK_List"], q = True, si = True)
+
+        if controlsToBake != None:
+
+            #find the corresponding fk controls
+            for control in controlsToBake:
+                name = control.partition(":")[2].partition("_dyn_anim")[0]
+
+                masterGrp = character + ":" + name + "_master_ctrl_grp"
+
+                cmds.select(masterGrp, hi = True)
+                nodes = cmds.ls(sl = True)
+
+                fkControls = []
+                for node in nodes:
+                    if node.find(":fk_") != -1:
+                        if node.find("_anim") != -1:
+                            if cmds.nodeType(node) == "transform":
+                                fkControls.append(node)
+
+
+                #constrain the fk controls to the dny joints
+                #Husk_Base:fk_hood_01_anim
+                constraints = []
+                for control in fkControls:
+                    niceName = control.partition("fk_")[2].partition("_anim")[0]
+                    joint = character + ":" + "rig_dyn_" + niceName
+
+                    constraint = cmds.orientConstraint(joint, control)[0]
+                    constraints.append(constraint)
+
+                #select the FK controls and bake
+                start = cmds.playbackOptions(q = True, min = True)
+                end = cmds.playbackOptions(q = True, max = True)
+
+                cmds.select(clear = True)
+                for control in fkControls:
+                    cmds.select(control, add = True)
+
+                cmds.bakeResults(simulation = True, time = (start, end))
+                cmds.delete(constraints)
+
+                #set to FK
+                cmds.setAttr(character + ":" + "Rig_Settings." + name + "_fk", 1)
+                cmds.setAttr(character + ":" + "Rig_Settings." + name + "_ik", 0)
+                cmds.setAttr(character + ":" + "Rig_Settings." + name + "_dynamic", 0)
+
+        #delete the UI
+        cmds.deleteUI("bakeDynToFKControls_UI")
+
+
+
+    # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+    # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+    # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+    # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+    # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+    def getIsoSelectionPolygons(self, *args):
+
+        cmds.progressWindow(title='Animation UI', progress=0, status='Building Iso Selection Sets', isInterruptable=True )
+        character = cmds.symbolButton(self.widgets["activeCharacterThumb"], q = True, ann = True)
+
+
+        #create the list of iso selection polygons
+        self.torsoFaces = []
+        self.leftArmFaces = []
+        self.rightArmFaces = []
+        self.leftLegFaces = []
+        self.rightLegFaces = []
+        self.headFaces = []
+
+        #lists of what joints belong to which "part"
+        torso = ["pelvis", "spine_01", "spine_02", "spine_03", "spine_04", "spine_05", "clavicle_l", "clavicle_r"]
+        leftArm = ["upperarm_l", "lowerarm_l", "hand_l", "index_metacarpal_l", "index_01_l", "index_02_l", "index_03_l", "middle_metacarpal_l", "middle_01_l", "middle_02_l", "middle_03_l", "ring_metacarpal_l", "ring_01_l", "ring_02_l", "ring_03_l", "pinky_metacarpal_l", "pinky_01_l", "pinky_02_l", "pinky_03_l", "thumb_01_l", "thumb_02_l", "thumb_03_l", "lowerarm_twist_01_l", "lowerarm_twist_02_l", "lowerarm_twist_03_l", "upperarm_twist_01_l", "upperarm_twist_02_l", "upperarm_twist_03_l" ]
+        rightArm = ["upperarm_r", "lowerarm_r", "hand_r", "index_metacarpal_r", "index_01_r", "index_02_r", "index_03_r", "middle_metacarpal_r", "middle_01_r", "middle_02_r", "middle_03_r", "ring_metacarpal_r", "ring_01_r", "ring_02_r", "ring_03_r", "pinky_metacarpal_r", "pinky_01_r", "pinky_02_r", "pinky_03_r", "thumb_01_r", "thumb_02_r", "thumb_03_r", "lowerarm_twist_01_r", "lowerarm_twist_02_r", "lowerarm_twist_03_r", "upperarm_twist_01_r", "upperarm_twist_02_r", "upperarm_twist_03_r" ]
+        leftLeg = ["thigh_l", "calf_l", "foot_l", "ball_l", "thigh_twist_01_l", "thigh_twist_02_l", "thigh_twist_03_l", "calf_twist_01_l", "calf_twist_02_l", "calf_twist_03_l"]
+        rightLeg = ["thigh_r", "calf_r", "foot_r", "ball_r", "thigh_twist_01_r", "thigh_twist_02_r", "thigh_twist_03_r", "calf_twist_01_r", "calf_twist_02_r", "calf_twist_03_r"]
+        head = ["neck_01", "neck_02", "neck_03", "head"]
+        characterGeo = []
+
+
+        #find all of the skin clusters. In each one, find the weighted joints and the geometry weighted to those joints
+        skinClusters = cmds.ls(type = 'skinCluster')
+
+
+        for skin in skinClusters:
+            weightedJoints = cmds.skinCluster(skin, q = True, weightedInfluence = True)
+
+            for joint in weightedJoints:
+                #add faces to the iso selection lists
+                if joint.partition(character + ":")[2] in torso:
+                    geometryShape = cmds.skinCluster(skin, q = True, geometry = True)
+                    geometry = cmds.listRelatives(geometryShape, parent = True)[0]
+                    characterGeo.append([geometry, "Torso", skin])
+
+                if joint.partition(character + ":")[2] in leftArm:
+                    geometryShape = cmds.skinCluster(skin, q = True, geometry = True)
+                    geometry = cmds.listRelatives(geometryShape, parent = True)[0]
+                    characterGeo.append([geometry, "LeftArm", skin])
+
+                if joint.partition(character + ":")[2] in rightArm:
+                    geometryShape = cmds.skinCluster(skin, q = True, geometry = True)
+                    geometry = cmds.listRelatives(geometryShape, parent = True)[0]
+                    characterGeo.append([geometry, "RightArm", skin])
+
+
+                if joint.partition(character + ":")[2] in leftLeg:
+                    geometryShape = cmds.skinCluster(skin, q = True, geometry = True)
+                    geometry = cmds.listRelatives(geometryShape, parent = True)[0]
+                    characterGeo.append([geometry, "LeftLeg", skin])
+
+
+                if joint.partition(character + ":")[2] in rightLeg:
+                    geometryShape = cmds.skinCluster(skin, q = True, geometry = True)
+                    geometry = cmds.listRelatives(geometryShape, parent = True)[0]
+                    characterGeo.append([geometry, "RightLeg", skin])
+
+
+                if joint.partition(character + ":")[2] in head:
+                    geometryShape = cmds.skinCluster(skin, q = True, geometry = True)
+                    geometry = cmds.listRelatives(geometryShape, parent = True)[0]
+  

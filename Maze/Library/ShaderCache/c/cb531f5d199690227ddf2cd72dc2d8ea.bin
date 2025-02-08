@@ -1,0 +1,103 @@
+e if we can build in parallel without an OOM kill.
+CPU_COUNT=1
+MEM_SIZE=512
+
+if [[ (-e "/proc/cpuinfo") && (-e "/proc/meminfo") ]]; then
+	CPU_COUNT=$(cat /proc/cpuinfo | "$GREP" -c '^processor')
+	MEM_SIZE=$(cat /proc/meminfo | "$GREP" "MemTotal" | "$AWK" '{print $2}')
+	MEM_SIZE=$(($MEM_SIZE/1024))
+elif [[ "$IS_DARWIN" -ne "0" ]]; then
+	CPU_COUNT=$(sysctl -a 2>&1 | "$GREP" 'hw.availcpu' | "$AWK" '{print $3; exit}')
+	MEM_SIZE=$(sysctl -a 2>&1 | "$GREP" 'hw.memsize' | "$AWK" '{print $3; exit;}')
+	MEM_SIZE=$(($MEM_SIZE/1024/1024))
+elif [[ "$IS_SOLARIS" -ne "0" ]]; then
+	CPU_COUNT=$(psrinfo 2>/dev/null | wc -l | "$AWK" '{print $1}')
+	MEM_SIZE=$(prtconf 2>/dev/null | "$GREP" Memory | "$AWK" '{print $3}')
+fi
+
+# Benchmarks expect frequency in GiHz.
+CPU_FREQ=0.5
+if [[ (-e "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq") ]]; then
+	CPU_FREQ=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq)
+	CPU_FREQ=$("$AWK" "BEGIN {print $CPU_FREQ/1024/1024}")
+elif [[ (-e "/proc/cpuinfo") ]]; then
+	CPU_FREQ=$(cat /proc/cpuinfo | "$GREP" 'MHz' | "$AWK" '{print $4; exit}')
+	if [[ -z "$CPU_FREQ" ]]; then CPU_FREQ=512; fi
+	CPU_FREQ=$("$AWK" "BEGIN {print $CPU_FREQ/1024}")
+elif [[ "$IS_DARWIN" -ne "0" ]]; then
+	CPU_FREQ=$(sysctl -a 2>&1 | "$GREP" 'hw.cpufrequency' | "$AWK" '{print $3; exit;}')
+	CPU_FREQ=$("$AWK" "BEGIN {print $CPU_FREQ/1024/1024/1024}")
+elif [[ "$IS_SOLARIS" -ne "0" ]]; then
+	CPU_FREQ=$(psrinfo -v 2>/dev/null | "$GREP" 'MHz' | "$AWK" '{print $6; exit;}')
+	CPU_FREQ=$("$AWK" "BEGIN {print $CPU_FREQ/1024}")
+fi
+
+# Some ARM devboards cannot use 'make -j N', even with multiple cores and RAM
+#  An 8-core Cubietruck Plus with 2GB RAM experiences OOM kills with '-j 2'.
+HAVE_SWAP=1
+if [[ "$IS_LINUX" -ne "0" ]]; then
+	if [[ (-e "/proc/meminfo") ]]; then
+		SWAP_SIZE=$(cat /proc/meminfo | "$GREP" "SwapTotal" | "$AWK" '{print $2}')
+		if [[ "$SWAP_SIZE" -eq "0" ]]; then
+			HAVE_SWAP=0
+		fi
+	else
+		HAVE_SWAP=0
+	fi
+fi
+
+echo | tee -a "$TEST_RESULTS"
+echo "CPU: $CPU_COUNT logical" | tee -a "$TEST_RESULTS"
+echo "FREQ: $CPU_FREQ GHz" | tee -a "$TEST_RESULTS"
+echo "MEM: $MEM_SIZE MB" | tee -a "$TEST_RESULTS"
+
+if [[ ("$CPU_COUNT" -ge "2" && "$MEM_SIZE" -ge "1280" && "$HAVE_SWAP" -ne "0") ]]; then
+	if [[ ("$WANT_NICE" -eq "1") ]]; then
+		CPU_COUNT=$(echo -n "$CPU_COUNT 2" | "$AWK" '{print int($1/$2)}')
+	fi
+	MAKEARGS=(-j "$CPU_COUNT")
+	echo "Using $MAKE -j $CPU_COUNT"
+fi
+
+############################################
+
+GIT_REPO=$(git branch 2>&1 | "$GREP" -v "fatal" | wc -l | "$AWK" '{print $1; exit;}')
+if [[ "$GIT_REPO" -ne "0" ]]; then
+	GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+	GIT_HASH=$(git rev-parse HEAD 2>/dev/null | cut -c 1-16)
+fi
+
+echo | tee -a "$TEST_RESULTS"
+if [[ ! -z "$GIT_BRANCH" ]]; then
+	echo "Git branch: $GIT_BRANCH (commit $GIT_HASH)" | tee -a "$TEST_RESULTS"
+fi
+
+if [[ ("$SUN_COMPILER" -ne "0") ]]; then
+	echo $("$CXX" -V 2>&1 | "$SED" 's|CC:|Compiler:|g' | head -1) | tee -a "$TEST_RESULTS"
+else
+	echo "Compiler:" $("$CXX" --version | head -1) | tee -a "$TEST_RESULTS"
+fi
+
+CXX_PATH=$(which "$CXX")
+CXX_SYMLINK=$(ls -l "$CXX_PATH" 2>/dev/null | "$GREP" -c '\->' | "$AWK" '{print $1}')
+if [[ ("$CXX_SYMLINK" -ne "0") ]]; then CXX_PATH="$CXX_PATH (symlinked)"; fi
+echo "Pathname: $CXX_PATH" | tee -a "$TEST_RESULTS"
+
+############################################
+
+# Calcualte these once. They handle Clang, GCC, ICC, etc
+DEBUG_CXXFLAGS="-DDEBUG $OPT_G3 $OPT_O0"
+RELEASE_CXXFLAGS="-DNDEBUG $OPT_G2 $OPT_O2"
+VALGRIND_CXXFLAGS="-DNDEBUG $OPT_G3 $OPT_O1"
+PLATFORM_CXXFLAGS=()
+ELEVATED_CXXFLAGS=()
+DEPRECATED_CXXFLAGS=()
+
+# Keep noise to a minimum
+"$CXX" -DCRYPTOPP_ADHOC_MAIN -Wno-deprecated-declarations adhoc.cpp -o "$TMP/adhoc.exe" > /dev/null 2>&1
+if [[ "$?" -eq "0" ]]; then
+	DEPRECATED_CXXFLAGS+=("-Wno-deprecated-declarations")
+fi
+
+# Clang {3.4|3.5|3.6} only advertises SSE2, http://bugs.launchpad.net/ubuntu/+bug/1616723,
+#   http://bugs.launchpad.net/ubuntu/+bug/1616729 and http://bugs.la

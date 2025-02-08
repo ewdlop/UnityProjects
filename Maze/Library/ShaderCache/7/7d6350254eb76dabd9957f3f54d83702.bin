@@ -1,0 +1,58 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "ProxyLODRasterizer.h"
+
+#include "ProxyLODBarycentricUtilities.h"
+#include "ProxyLODMeshUtilities.h"
+#include "ProxyLODThreadedWrappers.h"
+
+THIRD_PARTY_INCLUDES_START
+#include <tbb/spin_mutex.h>
+THIRD_PARTY_INCLUDES_END
+
+namespace ProxyLOD
+{
+
+
+
+	FRasterGrid::Ptr RasterizeTriangles(const FVertexDataMesh& TriangleMesh, const FTextureAtlasDesc& TextureAtlasDesc, const int32 Padding, const int32 SuperSampleCount)
+	{
+
+		typedef std::array<int32, 2>  IntArray2;
+
+		// Number of super samples in each direction
+
+		const int32 SuperSamples = FMath::CeilToInt(FMath::Sqrt(float(SuperSampleCount)));
+
+		const FIntPoint& TextureSize = TextureAtlasDesc.Size;
+
+		const double Lx = TextureSize.X * SuperSamples;
+		const double Ly = TextureSize.Y * SuperSamples;
+
+		// Create the target grid.
+
+		FRasterGrid::Ptr RasterGridPtr = FRasterGrid::Create(TextureSize.X * SuperSamples, TextureSize.Y * SuperSamples);
+		FIntPoint GridSize = RasterGridPtr->Size();
+		FRasterGrid& RasterGrid = *RasterGridPtr;
+
+		// The grid spacing used when converting from texel space to UV space
+
+		const double DeltaX = 1. / Lx;
+		const double DeltaY = 1. / Ly;
+
+		// This mesh only hold triangles: 3 indices per triangle.
+
+		const auto& UVArray = TriangleMesh.UVs;
+		const auto& Indices = TriangleMesh.Indices;
+		const uint32 NumTriangles = Indices.Num() / 3;
+
+		TArray<float> TriangleAreaSqrArray;
+		ResizeArray(TriangleAreaSqrArray, NumTriangles);
+
+		Parallel_For(FIntRange(0, NumTriangles),
+			[&TriangleMesh, &TriangleAreaSqrArray](const FIntRange& Range)
+		{
+			const auto& Position = TriangleMesh.Points;
+			const auto& Indices = TriangleMesh.Indices;
+
+			for 

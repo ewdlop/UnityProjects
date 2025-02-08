@@ -1,0 +1,71 @@
+e);
+    ASSERT( lmb, ASSERT_TEXT );
+
+    const size_t memSize1 = backend->getTotalMemSize();
+    ASSERT( (intptr_t)(memSize1-memSize0) >= 4*MByte, "The backend has not increased the amount of using memory." );
+
+    backend->putLargeBlock(lmb);
+    const size_t memSize2 = backend->getTotalMemSize();
+    ASSERT( memSize2 == memSize0, "The backend has not decreased the amount of using memory." );
+
+    pool_destroy(mPool);
+}
+
+void TestBitMask()
+{
+    BitMaskMin<256> mask;
+
+    mask.reset();
+    mask.set(10, 1);
+    mask.set(5, 1);
+    mask.set(1, 1);
+    ASSERT(mask.getMinTrue(2) == 5, NULL);
+
+    mask.reset();
+    mask.set(0, 1);
+    mask.set(64, 1);
+    mask.set(63, 1);
+    mask.set(200, 1);
+    mask.set(255, 1);
+    ASSERT(mask.getMinTrue(0) == 0, NULL);
+    ASSERT(mask.getMinTrue(1) == 63, NULL);
+    ASSERT(mask.getMinTrue(63) == 63, NULL);
+    ASSERT(mask.getMinTrue(64) == 64, NULL);
+    ASSERT(mask.getMinTrue(101) == 200, NULL);
+    ASSERT(mask.getMinTrue(201) == 255, NULL);
+    mask.set(255, 0);
+    ASSERT(mask.getMinTrue(201) == -1, NULL);
+}
+
+size_t getMemSize()
+{
+    return defaultMemPool->extMemPool.backend.getTotalMemSize();
+}
+
+class CheckNotCached {
+    static size_t memSize;
+public:
+    void operator() () const {
+        int res = scalable_allocation_mode(TBBMALLOC_SET_SOFT_HEAP_LIMIT, 1);
+        ASSERT(res == TBBMALLOC_OK, NULL);
+        if (memSize==(size_t)-1) {
+            memSize = getMemSize();
+        } else {
+            ASSERT(getMemSize() == memSize, NULL);
+            memSize=(size_t)-1;
+        }
+    }
+};
+
+size_t CheckNotCached::memSize = (size_t)-1;
+
+class RunTestHeapLimit: public SimpleBarrier {
+public:
+    void operator()( int /*mynum*/ ) const {
+        // Provoke bootstrap heap initialization before recording memory size.
+        // NOTE: The initialization should be processed only with a "large"
+        // object. Since the "small" object allocation lead to blocking of a
+        // slab as an active block and it is impossible to release it with
+        // foreign thread.
+        scalable_free(scalable_malloc(minLargeObjectSize));
+        barri

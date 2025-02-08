@@ -1,0 +1,252 @@
+ null))
+                {
+                    itemType = item.GetType();
+                }
+
+                // Types are special, because the are abstract classes, so if the item casts to Type, we assume System.Type
+                if (item is Type)
+                {
+                    itemType = TypeType;
+                }
+
+                // only try to call this if we got a meaningful type
+                if (itemType != null)
+                {
+                    this.InferArrayType(itemType);
+                }
+
+                this._innerList.Add(item);
+            }
+
+            private void InferArrayType(Type itemType)
+            {
+                Assumes.NotNull(itemType);
+
+                if (this._arrayType == null)
+                {
+                    // this is the first typed element we've been given, it sets the type of the array
+                    this._arrayType = itemType;
+                }
+                else
+                {
+                    // if there's a disagreement on the array type, we flip to Object
+                    // NOTE : we can try to do better in the future to find common base class, but given that we support very limited set of types
+                    // in metadata right now, it's a moot point
+                    if (this._arrayType != itemType)
+                    {
+                        this._arrayType = ObjectType;
+                    }
+                }
+            }
+
+            public Array ToArray()
+            {
+                if (this._arrayType == null)
+                {
+                    // if the array type has not been set, assume Object 
+                    this._arrayType = ObjectType;
+                }
+                else if (this._containsNulls && this._arrayType.IsValueType)
+                {
+                    // if the array type is a value type and we have seen nulls, then assume Object
+                    this._arrayType = ObjectType;
+                }
+
+                Array array = Array.CreateInstance(this._arrayType, this._innerList.Count);
+
+                for(int i = 0; i < array.Length; i++)
+                {
+                    array.SetValue(this._innerList[i], i);
+                }
+                return array;
+            }
+        }
+
+        //UNDONE: Need to add these warnings somewhere...Dev10:472538 should address this.
+        //internal static CompositionResult MatchRequiredMetadata(this IDictionary<string, object> metadata, IEnumerable<string> requiredMetadata, string contractName)
+        //{
+        //    Assumes.IsTrue(metadata != null);
+
+        //    var result = CompositionResult.SucceededResult;
+
+        //    var missingMetadata = (requiredMetadata == null) ? null : requiredMetadata.Except<string>(metadata.Keys);
+        //    if (missingMetadata != null && missingMetadata.Any())
+        //    {
+        //        result = result.MergeIssue(
+        //            CompositionError.CreateIssueAsWarning(CompositionErrorId.RequiredMetadataNotFound,
+        //            Strings.RequiredMetadataNotFound,
+        //            contractName,
+        //            string.Join(", ", missingMetadata.ToArray())));
+
+        //        return new CompositionResult(false, result.Issues);
+        //    }
+
+        //    return result;
+        //}
+
+        internal static IEnumerable<KeyValuePair<string, Type>> GetRequiredMetadata(Type metadataViewType)
+        {
+            if ((metadataViewType == null) ||
+                ExportServices.IsDefaultMetadataViewType(metadataViewType) ||
+                ExportServices.IsDictionaryConstructorViewType(metadataViewType) ||
+                !metadataViewType.IsInterface)
+            {
+                return Enumerable.Empty<KeyValuePair<string, Type>>();
+            }
+
+            // A metadata view is required to be an Intrerface, and therefore only properties are allowed
+            List<PropertyInfo> properties = metadataViewType.GetAllProperties().
+                Where(property => property.GetFirstAttribute<DefaultValueAttribute>() == null).
+                ToList();
+
+            // NOTE : this is a carefully found balance between eager and delay-evaluation - the properties are filtered once and upfront
+            // whereas the key/Type pairs are created every time. The latter is fine as KVPs are structs and as such copied on access regardless.
+            // This also allows us to avoid creation of List<KVP> which - at least according to FxCop - leads to isues with NGEN
+            return properties.Select(property => new KeyValuePair<string, Type>(property.Name, property.PropertyType));
+        }
+
+        internal static IDictionary<string, object> GetImportMetadata(ImportType importType, IAttributedImport attributedImport)
+        {
+            return GetImportMetadata(importType.ContractType, attributedImport);
+        }
+
+        internal static IDictionary<string, object> GetImportMetadata(Type type, IAttributedImport attributedImport)
+        {
+            Dictionary<string, object> metadata = null;
+
+            if (type.IsGenericType)
+            {
+                metadata = new Dictionary<string, object>();
+                
+                if (type.ContainsGenericParameters)
+                {
+                    metadata[CompositionConstants.GenericImportParametersOrderMetadataName] = GenericServices.GetGenericParametersOrder(type);
+                }
+                else
+                {
+                    metadata[CompositionConstants.GenericContractMetadataName] = ContractNameServices.GetTypeIdentity(type.GetGenericTypeDefinition());
+                    metadata[CompositionConstants.GenericParametersMetadataName] = type.GetGenericArguments();
+                }
+            }
+
+            // Default value is ImportSource.Any
+            if(attributedImport != null && attributedImport.Source != ImportSource.Any)
+            {
+                if(metadata == null)
+                {
+                    metadata = new Dictionary<string, object>();
+                }
+                metadata[CompositionConstants.ImportSourceMetadataName] = attributedImport.Source;
+            }
+
+            if(metadata != null)
+            {
+                return metadata.AsReadOnly();
+            }
+            else
+            {
+                return MetadataServices.EmptyMetadata;
+            }
+        }
+
+        internal static object GetExportedValueFromComposedPart(ImportEngine engine, ComposablePart part, ExportDefinition definition)
+        {
+            if (engine != null)
+            {
+                try
+                {
+                    engine.SatisfyImports(part);
+                }
+                catch (CompositionException ex)
+                {
+                    throw ExceptionBuilder.CreateCannotGetExportedValue(part, definition, ex);
+                }
+            }
+
+            try
+            {
+                return part.GetExportedValue(definition);
+            }
+            catch (ComposablePartException ex)
+            {
+                throw ExceptionBuilder.CreateCannotGetExportedValue(part, definition, ex);
+            }
+        }
+        
+        internal static bool IsRecomposable(this ComposablePart part)
+        {
+            return part.ImportDefinitions.Any(import => import.IsRecomposable);
+        }
+
+        internal static CompositionResult TryInvoke(Action action)
+        {
+            try
+            {
+                action();
+                return CompositionResult.SucceededResult;
+            }
+            catch (CompositionException ex)
+            {
+                return new CompositionResult(ex.Errors);
+            }
+        }
+
+        internal static CompositionResult TryFire<TEventArgs>(EventHandler<TEventArgs> _delegate, object sender, TEventArgs e)
+            where TEventArgs : EventArgs
+        {
+            CompositionResult result = CompositionResult.SucceededResult;
+            foreach (EventHandler<TEventArgs> _subscriber in _delegate.GetInvocationList())
+            {
+                try
+                {
+                    _subscriber.Invoke(sender, e);
+                }
+                catch (CompositionException ex)
+                {
+                    result = result.MergeErrors(ex.Errors);
+                }
+            }
+
+            return result;
+        }
+
+        internal static CreationPolicy GetRequiredCreationPolicy(this ImportDefinition definition)
+        {
+            ContractBasedImportDefinition contractDefinition = definition as ContractBasedImportDefinition;
+
+            if (contractDefinition != null)
+            {
+                return contractDefinition.RequiredCreationPolicy;
+            }
+
+            return CreationPolicy.Any;
+        }
+
+        /// <summary>
+        ///     Returns a value indicating whether cardinality is 
+        ///     <see cref="ImportCardinality.ZeroOrOne"/> or 
+        ///     <see cref="ImportCardinality.ExactlyOne"/>.
+        /// </summary>
+        internal static bool IsAtMostOne(this ImportCardinality cardinality)
+        {
+            return cardinality == ImportCardinality.ZeroOrOne || cardinality == ImportCardinality.ExactlyOne;
+        }
+
+        private static bool IsValidAttributeType(Type type)
+        {
+            return IsValidAttributeType(type, true);
+        }
+
+        private static bool IsValidAttributeType(Type type, bool arrayAllowed)
+        {
+            Assumes.NotNull(type);
+            // Definitions of valid attribute type taken from C# 3.0 Specification section 17.1.3.
+
+            // One of the following types: bool, byte, char, double, float, int, long, sbyte, short, string, uint, ulong, ushort.
+            if (type.IsPrimitive)
+            {
+                return true;
+            }
+
+            if (type == typeof(string))
+         

@@ -1,0 +1,62 @@
+; Test that the loop PM infrastructure is invalidated appropriately.
+;
+; Check that we always nuke the LPM stuff when the loops themselves are
+; invalidated.
+; RUN: opt -disable-output -disable-verify -debug-pass-manager %s 2>&1 \
+; RUN:     -passes='loop(no-op-loop),invalidate<loops>,loop(no-op-loop)' \
+; RUN:     | FileCheck %s --check-prefix=CHECK-LOOP-INV
+;
+; If we ended up building the standard analyses, their invalidation should nuke
+; stuff as well.
+; RUN: opt -disable-output -disable-verify -debug-pass-manager %s 2>&1 \
+; RUN:     -passes='loop(no-op-loop),invalidate<scalar-evolution>,loop(no-op-loop)' \
+; RUN:     | FileCheck %s --check-prefix=CHECK-SCEV-INV
+;
+; Also provide a test that can delete loops after populating analyses for them.
+; RUN: opt -disable-output -disable-verify -debug-pass-manager %s 2>&1 \
+; RUN:     -passes='loop(no-op-loop,loop-deletion),invalidate<scalar-evolution>,loop(no-op-loop)' \
+; RUN:     | FileCheck %s --check-prefix=CHECK-SCEV-INV-AFTER-DELETE
+
+define void @no_loops() {
+; CHECK-LOOP-INV-LABEL: Running pass: FunctionToLoopPassAdaptor<{{.*}}> on no_loops
+; CHECK-LOOP-INV-NEXT: Starting {{.*}}Function pass manager run
+; CHECK-LOOP-INV-NEXT: Running pass: LoopSimplifyPass
+; CHECK-LOOP-INV-NEXT: Running analysis: LoopAnalysis
+; CHECK-LOOP-INV-NEXT: Running analysis: DominatorTreeAnalysis
+; CHECK-LOOP-INV-NEXT: Running analysis: AssumptionAnalysis
+; CHECK-LOOP-INV-NEXT: Running pass: LCSSAPass
+; CHECK-LOOP-INV-NEXT: Finished {{.*}}Function pass manager run
+; CHECK-LOOP-INV-NEXT: Running pass: InvalidateAnalysisPass<{{.*}}LoopAnalysis
+; CHECK-LOOP-INV-NEXT: Invalidating all non-preserved analyses
+; CHECK-LOOP-INV-NEXT: Invalidating analysis: LoopAnalysis
+; CHECK-LOOP-INV-NEXT: Running pass: FunctionToLoopPassAdaptor<{{.*}}> on no_loops
+; CHECK-LOOP-INV-NEXT: Starting {{.*}}Function pass manager run
+; CHECK-LOOP-INV-NEXT: Running pass: LoopSimplifyPass
+; CHECK-LOOP-INV-NEXT: Running analysis: LoopAnalysis
+; CHECK-LOOP-INV-NEXT: Running pass: LCSSAPass
+; CHECK-LOOP-INV-NEXT: Finished {{.*}}Function pass manager run
+; CHECK-LOOP-INV-NEXT: Finished {{.*}}Function pass manager run.
+;
+; CHECK-SCEV-INV-LABEL: Running pass: FunctionToLoopPassAdaptor<{{.*}}> on no_loops
+; CHECK-SCEV-INV-NEXT: Starting {{.*}}Function pass manager run
+; CHECK-SCEV-INV-NEXT: Running pass: LoopSimplifyPass
+; CHECK-SCEV-INV-NEXT: Running analysis: LoopAnalysis
+; CHECK-SCEV-INV-NEXT: Running analysis: DominatorTreeAnalysis
+; CHECK-SCEV-INV-NEXT: Running analysis: AssumptionAnalysis
+; CHECK-SCEV-INV-NEXT: Running pass: LCSSAPass
+; CHECK-SCEV-INV-NEXT: Finished {{.*}}Function pass manager run
+; CHECK-SCEV-INV-NEXT: Running pass: InvalidateAnalysisPass<{{.*}}ScalarEvolutionAnalysis
+; CHECK-SCEV-INV-NEXT: Invalidating all non-preserved analyses
+; CHECK-SCEV-INV-NEXT: Running pass: FunctionToLoopPassAdaptor<{{.*}}> on no_loops
+; CHECK-SCEV-INV-NEXT: Starting {{.*}}Function pass manager run
+; CHECK-SCEV-INV-NEXT: Running pass: LoopSimplifyPass
+; CHECK-SCEV-INV-NEXT: Running pass: LCSSAPass
+; CHECK-SCEV-INV-NEXT: Finished {{.*}}Function pass manager run
+; CHECK-SCEV-INV-NEXT: Finished {{.*}}Function pass manager run.
+
+entry:
+  ret void
+}
+
+define void @one_loop(i1* %ptr) {
+; CHECK-

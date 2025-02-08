@@ -1,0 +1,107 @@
+  }
+                else {
+                    Debug.Assert(customWebEventKey != null);
+                    _cachedMatchedRulesForCustomEvents[customWebEventKey] = matchedRules;
+                }
+
+                return matchedRules;
+            }
+        }
+
+        internal class RuleInfo {
+            internal string _customEvaluator;
+            internal ConfigurationElement _customEvaluatorConfig;
+
+            // The following properties are cached here for performance reason
+            internal int _minInstances;
+            internal int _maxLimit;
+            internal TimeSpan _minInterval;   // in seconds
+
+            internal RuleSettings _ruleSettings;
+
+            internal WebEventProvider _referencedProvider;
+
+            internal Type _customEvaluatorType;
+
+            internal EventMappingSettings _eventMappingSettings;
+
+            internal RuleFiringRecord _ruleFiringRecord;
+
+            internal RuleInfo(RuleSettings ruleSettings, HealthMonitoringSection section) {
+                _eventMappingSettings = section.EventMappings[ruleSettings.EventName];
+
+                _ruleSettings = ruleSettings;
+                _ruleFiringRecord = new RuleFiringRecord(this);
+            }
+
+            internal bool Match(Type eventType, int eventCode) {
+                // Fail if the type doesn't match.
+                if (!(eventType.Equals(_eventMappingSettings.RealType) ||
+                       eventType.IsSubclassOf(_eventMappingSettings.RealType))) {
+                    return false;
+                }
+
+                // Fail if the event code doesn't match
+                if (!(_eventMappingSettings.StartEventCode <= eventCode &&
+                        eventCode <= _eventMappingSettings.EndEventCode)) {
+                    return false;
+                }
+
+                return true;
+            }
+        }
+
+        internal class FiringRuleInfo {
+            internal RuleInfo _ruleInfo;
+            internal int _indexOfFirstRuleInfoWithSameProvider;
+
+            internal FiringRuleInfo(RuleInfo ruleInfo) {
+                _ruleInfo = ruleInfo;
+                _indexOfFirstRuleInfoWithSameProvider = -1;
+            }
+        }
+
+        internal class ProviderInstances {
+            internal Hashtable _instances; // case-insensitive because the providers collection is too.
+
+            [PermissionSet(SecurityAction.Assert, Unrestricted = true)]
+            internal ProviderInstances(HealthMonitoringSection section) {
+                // Build the array of providers
+                // Don't create an instance yet, but only store the providerInfo in the HashTable.
+                _instances = CollectionsUtil.CreateCaseInsensitiveHashtable(section.Providers.Count);
+
+                foreach (object obj in section.Providers) {
+                    ProviderSettings settings = (ProviderSettings)obj;
+
+                    // Please note we are storing the ProviderSettings in the hashtable.
+                    // But if we create an instance of that provider, we will replace
+                    // that string with a provider object.
+                    _instances.Add(settings.Name, settings);
+                }
+            }
+
+            WebEventProvider GetProviderInstance(string providerName) {
+                WebEventProvider provider;
+                object o;
+
+                o = _instances[providerName];
+                if (o == null) {
+                    return null;
+                }
+
+                ProviderSettings providerSettings = o as ProviderSettings;
+
+                if (providerSettings != null) {
+                    // If what we got is still a ProviderSettings, it means we haven't created an instance
+                    // of it yet.
+                    Type type;
+                    string typeName = providerSettings.Type;
+
+                    type = BuildManager.GetType(typeName, false);
+                    Debug.Assert(type != null, "type != null");
+
+                    if (typeof(IInternalWebEventProvider).IsAssignableFrom(type)) {
+                        provider = (WebEventProvider)HttpRuntime.CreateNonPublicInstance(type);
+                    }
+                    else {
+                        provider = (WebEventProvider)

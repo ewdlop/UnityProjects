@@ -1,0 +1,129 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "DataprepEditingOperations.h"
+
+#include "DataprepCoreUtils.h"
+#include "DataprepOperationsLibrary.h"
+#include "DataprepOperationsLibraryUtil.h"
+#include "IDataprepProgressReporter.h"
+
+#include "ActorEditorUtils.h"
+#include "ActorFactories/ActorFactory.h"
+#include "AssetRegistryModule.h"
+#include "Async/ParallelFor.h"
+#include "IContentBrowserSingleton.h"
+#include "ContentBrowserModule.h"
+#include "Editor.h"
+#include "EditorLevelLibrary.h"
+#include "Engine/StaticMesh.h"
+#include "Engine/StaticMeshActor.h"
+#include "Engine/Texture.h"
+#include "Engine/World.h"
+#include "GameFramework/Actor.h"
+#include "GameFramework/WorldSettings.h"
+#include "GenericPlatform/GenericPlatformTime.h"
+#include "IMeshBuilderModule.h"
+#include "IMeshMergeUtilities.h"
+#include "LevelSequence.h"
+#include "Materials/MaterialInstance.h"
+#include "MeshMergeModule.h"
+#include "ObjectTools.h"
+#include "StaticMeshAttributes.h"
+#include "StaticMeshResources.h"
+#include "ScopedTransaction.h"
+
+// UI related section
+#include "DetailCategoryBuilder.h"
+#include "DetailLayoutBuilder.h"
+#include "DetailWidgetRow.h"
+#include "Widgets/Input/SButton.h"
+
+#define LOCTEXT_NAMESPACE "DatasmithEditingOperations"
+
+#ifdef LOG_TIME
+namespace DataprepEditingOperationTime
+{
+	typedef TFunction<void(FText)> FLogFunc;
+
+	class FTimeLogger
+	{
+	public:
+		FTimeLogger(const FString& InText, FLogFunc&& InLogFunc)
+			: StartTime( FPlatformTime::Cycles64() )
+			, Text( InText )
+			, LogFunc(MoveTemp(InLogFunc))
+		{
+			UE_LOG( LogDataprep, Log, TEXT("%s ..."), *Text );
+		}
+
+		~FTimeLogger()
+		{
+			// Log time spent to import incoming file in minutes and seconds
+			double ElapsedSeconds = FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - StartTime);
+
+			int ElapsedMin = int(ElapsedSeconds / 60.0);
+			ElapsedSeconds -= 60.0 * (double)ElapsedMin;
+			FText Msg = FText::Format( LOCTEXT("DataprepOperation_LogTime", "{0} took {1} min {2} s."), FText::FromString( Text ), ElapsedMin, FText::FromString( FString::Printf( TEXT("%.3f"), ElapsedSeconds ) ) );
+			LogFunc( Msg );
+		}
+
+	private:
+		uint64 StartTime;
+		FString Text;
+		FLogFunc LogFunc;
+	};
+}
+#endif
+
+namespace DatasmithEditingOperationsUtils
+{
+	void FindActorsToMerge(const TArray<AActor*>& ChildrenActors, TArray<AActor*>& ActorsToMerge);
+	void FindActorsToCollapseOrDelete(const TArray<AActor*>& ActorsToVisit, TArray<AActor*>& ActorsToCollapse, TArray<UObject*>& ActorsToDelete );
+	void GetRootActors(UWorld* World, TArray<AActor*>& RootActors);
+	void GetActorsToMerge(UWorld*& World, const TArray<UObject*>& InObjects, TArray<AActor*>& ActorsToMerge, TArray<UPrimitiveComponent*>& ComponentsToMerge);
+
+	int32 GetActorDepth(AActor* Actor)
+	{
+		return Actor ? 1 + GetActorDepth(Actor->GetAttachParentActor()) : 0;
+	}
+
+	class FMergingData
+	{
+	public:
+		FMergingData(const TArray<UPrimitiveComponent*>& PrimitiveComponents);
+
+		bool Equals(const FMergingData& Other);
+
+		TMap< FString, TArray< FTransform > > Data;
+	};
+}
+
+void UDataprepDeleteObjectsOperation::OnExecution_Implementation(const FDataprepContext& InContext)
+{
+#ifdef LOG_TIME
+	DataprepEditingOperationTime::FTimeLogger TimeLogger( TEXT("RemoveObjects"), [&]( FText Text) { this->LogInfo( Text ); });
+#endif
+
+	// Implementation based on DatasmithImporterImpl::DeleteActorsMissingFromScene, UEditorLevelLibrary::DestroyActor
+	struct FActorAndDepth
+	{
+		AActor* Actor;
+		int32 Depth;
+	};
+
+	TArray<FActorAndDepth> ActorsToDelete;
+	ActorsToDelete.Reserve(InContext.Objects.Num());
+
+	TArray<UObject*> ObjectsToDelete;
+	ObjectsToDelete.Reserve(InContext.Objects.Num());
+
+	for (UObject* Object : InContext.Objects)
+	{
+		if ( !ensure(Object) || Object->IsPendingKill() )
+		{
+			continue;
+		}
+
+		if (AActor* Actor = Cast< AActor >( Object ))
+		{
+			ActorsToDelete.Add(FActorAndDepth{Actor,

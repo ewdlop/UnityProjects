@@ -1,0 +1,95 @@
+   for (typename Range1::Iterator leafIter = range.begin(); leafIter; ++leafIter) {
+            for (VoxelIter voxelIter = leafIter->cbeginValueOn(); voxelIter; ++voxelIter) {
+                Coord ijk = voxelIter.getCoord();
+                ijk[0] = int(math::Round(ijk[0] * scale));
+                ijk[1] = int(math::Round(ijk[1] * scale));
+                ijk[2] = int(math::Round(ijk[2] * scale));
+                acc.setValueOn( ijk );
+            }//loop over active voxels in the fine tree
+        }// loop over leaf nodes in the fine tree
+    }
+    void operator()(const tbb::blocked_range<PoolIterT>& range) const
+    {
+        for (PoolIterT it=range.begin(); it!=range.end(); ++it) {
+            tools::dilateVoxels( *it, 1, NN_FACE_EDGE_VERTEX);
+        }
+    }
+    void operator()(const Range2 &r) const
+    {
+        typedef typename TreeType::LeafNodeType::ValueOnIter VoxelIter;
+        // Let mLevel = level + frac, where
+        // level is integer part of mLevel and frac is the fractional part
+        // high-res voxel size in world units = dx0 = 2^(level)
+        // low-res voxel size in world units = dx1 = 2^(level+1)
+        // mid-res voxel size in world units = dx  = 2^(mLevel) = 2^(level + frac)
+        // mid-res index -> world: ijk * dx
+        // world -> high-res index: world / dx0
+        // world -> low-res index: world / dx1
+        // mid-res index -> high-res index: (ijk * dx) / dx0 = ijk * scale0 where
+        // scale0 = dx/dx0 = 2^(level+frac)/2^(level) = 2^(frac)
+        // mid-res index -> low-res index: (ijk * dx) / dx1 = ijk * scale1 where
+        // scale1 = dx/dx1 = 2^(level+frac)/2^(level+1) = 2^(frac-1)
+        const float b = math::FractionalPart(mLevel), a = 1.0f - b;
+        const float scale0 = math::Pow( 2.0f, b );
+        const float scale1 = math::Pow( 2.0f,-a );
+        ConstAccessor acc0( *mTree0 ), acc1( *mTree1 );
+        for (typename Range2::Iterator leafIter = r.begin(); leafIter; ++leafIter) {
+            for (VoxelIter voxelIter = leafIter->beginValueOn(); voxelIter; ++voxelIter) {
+                const Vec3R xyz =  Vec3R( voxelIter.getCoord().data() );// mid level coord
+                const ValueType v0 = tools::Sampler<Order>::sample( acc0, xyz * scale0 );
+                const ValueType v1 = tools::Sampler<Order>::sample( acc1, xyz * scale1 );
+                voxelIter.setValue( ValueType(a*v0 + b*v1) );
+            }
+        }
+    }
+    const float mLevel;
+    PoolType* mPool;
+    const TreeType *mTree0, *mTree1;
+};// FractionOp
+
+
+template<typename TreeType>
+template<typename OperatorType>
+struct MultiResGrid<TreeType>::CookOp
+{
+    typedef tree::LeafManager<TreeType>  ManagerT;
+    typedef typename ManagerT::LeafRange RangeT;
+
+    CookOp(const TreeType& srcTree, TreeType& dstTree, size_t grainSize): acc(srcTree)
+    {
+        ManagerT leafs(dstTree);
+        tbb::parallel_for(leafs.leafRange(grainSize), *this);
+    }
+    CookOp(const CookOp &other): acc(other.acc.tree()) {}
+
+    void operator()(const RangeT& range) const
+    {
+        for (auto leafIt = range.begin(); leafIt; ++leafIt) {
+            auto& phi = leafIt.buffer(0);
+            for (auto voxelIt = leafIt->beginValueOn(); voxelIt; ++voxelIt) {
+                phi.setValue(voxelIt.pos(), OperatorType::run(voxelIt.getCoord(), acc));
+            }
+        }
+    }
+
+    const ConstAccessor acc;
+};// CookOp
+
+
+template<typename TreeType>
+struct MultiResGrid<TreeType>::RestrictOp
+{
+    /// @brief Static method that performs restriction by full weighting
+    /// @param ijk Coordinate location on the coarse tree
+    /// @param acc ValueAccessor to the fine tree
+    static ValueType run(Coord ijk, const ConstAccessor &acc)
+    {
+        ijk <<= 1;
+        // Overlapping grid point
+        ValueType v = 8*acc.getValue(ijk);
+        // neighbors in one axial direction
+        v += 4*(acc.getValue(ijk.offsetBy(-1, 0, 0)) + acc.getValue(ijk.offsetBy( 1, 0, 0)) +// x
+                acc.getValue(ijk.offsetBy( 0,-1, 0)) + acc.getValue(ijk.offsetBy( 0, 1, 0)) +// y
+                acc.getValue(ijk.offsetBy( 0, 0,-1)) + acc.getValue(ijk.offsetBy( 0, 0, 1)));// z
+        // neighbors in two axial directions
+        v += 2*(acc.getValue(ijk.offset

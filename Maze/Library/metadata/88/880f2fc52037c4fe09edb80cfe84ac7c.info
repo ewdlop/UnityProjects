@@ -1,0 +1,258 @@
+tion that sets NZCV.
+        int32_t KnownImm = PredI.getOperand(2).getImm();
+        int32_t Shift = PredI.getOperand(3).getImm();
+        KnownImm <<= Shift;
+        if (IsCMN)
+          KnownImm = -KnownImm;
+        FirstUse = PredI;
+        KnownRegs.push_back(RegImm(SrcReg, KnownImm));
+        Res = true;
+      }
+
+      // If this instructions defines something other than WZR/XZR, we know it's
+      // result is zero in some cases.
+      if (DstReg == AArch64::WZR || DstReg == AArch64::XZR)
+        return Res;
+
+      // The destination register must not be modified between the NZCV setting
+      // instruction and the conditional branch.
+      if (DomBBClobberedRegs[DstReg])
+        return Res;
+
+      FirstUse = PredI;
+      KnownRegs.push_back(RegImm(DstReg, 0));
+      return true;
+    }
+
+    // Look for NZCV setting instructions that define something other than
+    // WZR/XZR.
+    case AArch64::ADCSWr:
+    case AArch64::ADCSXr:
+    case AArch64::ADDSWrr:
+    case AArch64::ADDSWrs:
+    case AArch64::ADDSWrx:
+    case AArch64::ADDSXrr:
+    case AArch64::ADDSXrs:
+    case AArch64::ADDSXrx:
+    case AArch64::ADDSXrx64:
+    case AArch64::ANDSWri:
+    case AArch64::ANDSWrr:
+    case AArch64::ANDSWrs:
+    case AArch64::ANDSXri:
+    case AArch64::ANDSXrr:
+    case AArch64::ANDSXrs:
+    case AArch64::BICSWrr:
+    case AArch64::BICSWrs:
+    case AArch64::BICSXrs:
+    case AArch64::BICSXrr:
+    case AArch64::SBCSWr:
+    case AArch64::SBCSXr:
+    case AArch64::SUBSWrr:
+    case AArch64::SUBSWrs:
+    case AArch64::SUBSWrx:
+    case AArch64::SUBSXrr:
+    case AArch64::SUBSXrs:
+    case AArch64::SUBSXrx:
+    case AArch64::SUBSXrx64: {
+      MCPhysReg DstReg = PredI.getOperand(0).getReg();
+      if (DstReg == AArch64::WZR || DstReg == AArch64::XZR)
+        return false;
+
+      // The destination register of the NZCV setting instruction must not be
+      // modified before the conditional branch.
+      if (DomBBClobberedRegs[DstReg])
+        return false;
+
+      // We've found the instruction that sets NZCV whose DstReg == 0.
+      FirstUse = PredI;
+      KnownRegs.push_back(RegImm(DstReg, 0));
+      return true;
+    }
+    }
+
+    // Bail if we see an instruction that defines NZCV that we don't handle.
+    if (PredI.definesRegister(AArch64::NZCV))
+      return false;
+
+    // Track clobbered registers.
+    trackRegDefs(PredI, DomBBClobberedRegs, TRI);
+  }
+  return false;
+}
+
+bool AArch64RedundantCopyElimination::optimizeBlock(MachineBasicBlock *MBB) {
+  // Check if the current basic block has a single predecessor.
+  if (MBB->pred_size() != 1)
+    return false;
+
+  // Check if the predecessor has two successors, implying the block ends in a
+  // conditional branch.
+  MachineBasicBlock *PredMBB = *MBB->pred_begin();
+  if (PredMBB->succ_size() != 2)
+    return false;
+
+  MachineBasicBlock::iterator CondBr = PredMBB->getLastNonDebugInstr();
+  if (CondBr == PredMBB->end())
+    return false;
+
+  // Keep track of the earliest point in the PredMBB block where kill markers
+  // need to be removed if a COPY is removed.
+  MachineBasicBlock::iterator FirstUse;
+  // After calling knownRegValInBlock, FirstUse will either point to a CBZ/CBNZ
+  // or a compare (i.e., SUBS).  In the latter case, we must take care when
+  // updating FirstUse when scanning for COPY instructions.  In particular, if
+  // there's a COPY in between the compare and branch the COPY should not
+  // update FirstUse.
+  bool SeenFirstUse = false;
+  // Registers that contain a known value at the start of MBB.
+  SmallVector<RegImm, 4> KnownRegs;
+
+  MachineBasicBlock::iterator Itr = std::next(CondBr);
+  do {
+    --Itr;
+
+    if (!knownRegValInBlock(*Itr, MBB, KnownRegs, FirstUse))
+      continue;
+
+    // Reset the clobber list.
+    OptBBClobberedRegs.reset();
+
+    // Look backward in PredMBB for COPYs from the known reg to find other
+    // registers that are known to be a constant value.
+    for (auto PredI = Itr;; --PredI) {
+      if (FirstUse == PredI)
+        SeenFirstUse = true;
+
+      if (PredI->isCopy()) {
+        MCPhysReg CopyDstReg = PredI->getOperand(0).getReg();
+        MCPhysReg CopySrcReg = PredI->getOperand(1).getReg();
+        for (auto &KnownReg : KnownRegs) {
+          if (OptBBClobberedRegs[KnownReg.Reg])
+            continue;
+          // If we have X = COPY Y, and Y is known to be zero, then now X is
+          // known to be zero.
+          if (CopySrcReg == KnownReg.Reg && !OptBBClobberedRegs[CopyDstReg]) {
+            KnownRegs.push_back(RegImm(CopyDstReg, KnownReg.Imm));
+            if (SeenFirstUse)
+              FirstUse = PredI;
+            break;
+          }
+          // If we have X = COPY Y, and X is known to be zero, then now Y is
+          // known to be zero.
+          if (CopyDstReg == KnownReg.Reg && !OptBBClobberedRegs[CopySrcReg]) {
+            KnownRegs.push_back(RegImm(CopySrcReg, KnownReg.Imm));
+            if (SeenFirstUse)
+              FirstUse = PredI;
+            break;
+          }
+        }
+      }
+
+      // Stop if we get to the beginning of PredMBB.
+      if (PredI == PredMBB->begin())
+        break;
+
+      trackRegDefs(*PredI, OptBBClobberedRegs, TRI);
+      // Stop if all of the known-zero regs have been clobbered.
+      if (all_of(KnownRegs, [&](RegImm KnownReg) {
+            return OptBBClobberedRegs[KnownReg.Reg];
+          }))
+        break;
+    }
+    break;
+
+  } while (Itr != PredMBB->begin() && Itr->isTerminator());
+
+  // We've not found a registers with a known value, time to bail out.
+  if (KnownRegs.empty())
+    return false;
+
+  bool Changed = false;
+  // UsedKnownRegs is the set of KnownRegs that have had uses added to MBB.
+  SmallSetVector<unsigned, 4> UsedKnownRegs;
+  MachineBasicBlock::iterator LastChange = MBB->begin();
+  // Remove redundant copy/move instructions unless KnownReg is modified.
+  for (MachineBasicBlock::iterator I = MBB->begin(), E = MBB->end(); I != E;) {
+    MachineInstr *MI = &*I;
+    ++I;
+    bool RemovedMI = false;
+    bool IsCopy = MI->isCopy();
+    bool IsMoveImm = MI->isMoveImmediate();
+    if (IsCopy || IsMoveImm) {
+      MCPhysReg DefReg = MI->getOperand(0).getReg();
+      MCPhysReg SrcReg = IsCopy ? MI->getOperand(1).getReg() : 0;
+      int64_t SrcImm = IsMoveImm ? MI->getOperand(1).getImm() : 0;
+      if (!MRI->isReserved(DefReg) &&
+          ((IsCopy && (SrcReg == AArch64::XZR || SrcReg == AArch64::WZR)) ||
+           IsMoveImm)) {
+        for (RegImm &KnownReg : KnownRegs) {
+          if (KnownReg.Reg != DefReg &&
+              !TRI->isSuperRegister(DefReg, KnownReg.Reg))
+            continue;
+
+          // For a copy, the known value must be a zero.
+          if (IsCopy && KnownReg.Imm != 0)
+            continue;
+
+          if (IsMoveImm) {
+            // For a move immediate, the known immediate must match the source
+            // immediate.
+            if (KnownReg.Imm != SrcImm)
+              continue;
+
+            // Don't remove a move immediate that implicitly defines the upper
+            // bits when only the lower 32 bits are known.
+            MCPhysReg CmpReg = KnownReg.Reg;
+            if (any_of(MI->implicit_operands(), [CmpReg](MachineOperand &O) {
+                  return !O.isDead() && O.isReg() && O.isDef() &&
+                         O.getReg() != CmpReg;
+                }))
+              continue;
+          }
+
+          if (IsCopy)
+            DEBUG(dbgs() << "Remove redundant Copy : " << *MI);
+          else
+            DEBUG(dbgs() << "Remove redundant Move : " << *MI);
+
+          MI->eraseFromParent();
+          Changed = true;
+          LastChange = I;
+          NumCopiesRemoved++;
+          UsedKnownRegs.insert(KnownReg.Reg);
+          RemovedMI = true;
+          break;
+        }
+      }
+    }
+
+    // Skip to the next instruction if we removed the COPY/MovImm.
+    if (RemovedMI)
+      continue;
+
+    // Remove any regs the MI clobbers from the KnownConstRegs set.
+    for (unsigned RI = 0; RI < KnownRegs.size();)
+      if (MI->modifiesRegister(KnownRegs[RI].Reg, TRI)) {
+        std::swap(KnownRegs[RI], KnownRegs[KnownRegs.size() - 1]);
+        KnownRegs.pop_back();
+        // Don't increment RI since we need to now check the swapped-in
+        // KnownRegs[RI].
+      } else {
+        ++RI;
+      }
+
+    // Continue until the KnownRegs set is empty.
+    if (KnownRegs.empty())
+      break;
+  }
+
+  if (!Changed)
+    return false;
+
+  // Add newly used regs to the block's live-in list if they aren't there
+  // already.
+  for (MCPhysReg KnownReg : UsedKnownRegs)
+    if (!MBB->isLiveIn(KnownReg))
+      MBB->addLiveIn(KnownReg);
+
+  // Clear kills in the range where changes were made.  This is conse

@@ -1,0 +1,211 @@
+NTICS(
+        convertToInteger(Input, Width, IsSigned, RM, IsExact));
+  }
+  opStatus convertToInteger(APSInt &Result, roundingMode RM,
+                            bool *IsExact) const;
+  opStatus convertFromAPInt(const APInt &Input, bool IsSigned,
+                            roundingMode RM) {
+    APFLOAT_DISPATCH_ON_SEMANTICS(convertFromAPInt(Input, IsSigned, RM));
+  }
+  opStatus convertFromSignExtendedInteger(const integerPart *Input,
+                                          unsigned int InputSize, bool IsSigned,
+                                          roundingMode RM) {
+    APFLOAT_DISPATCH_ON_SEMANTICS(
+        convertFromSignExtendedInteger(Input, InputSize, IsSigned, RM));
+  }
+  opStatus convertFromZeroExtendedInteger(const integerPart *Input,
+                                          unsigned int InputSize, bool IsSigned,
+                                          roundingMode RM) {
+    APFLOAT_DISPATCH_ON_SEMANTICS(
+        convertFromZeroExtendedInteger(Input, InputSize, IsSigned, RM));
+  }
+  opStatus convertFromString(StringRef, roundingMode);
+  APInt bitcastToAPInt() const {
+    APFLOAT_DISPATCH_ON_SEMANTICS(bitcastToAPInt());
+  }
+  double convertToDouble() const { return getIEEE().convertToDouble(); }
+  float convertToFloat() const { return getIEEE().convertToFloat(); }
+
+  bool operator==(const APFloat &) const = delete;
+
+  cmpResult compare(const APFloat &RHS) const {
+    assert(&getSemantics() == &RHS.getSemantics() &&
+           "Should only compare APFloats with the same semantics");
+    if (usesLayout<IEEEFloat>(getSemantics()))
+      return U.IEEE.compare(RHS.U.IEEE);
+    if (usesLayout<DoubleAPFloat>(getSemantics()))
+      return U.Double.compare(RHS.U.Double);
+    llvm_unreachable("Unexpected semantics");
+  }
+
+  bool bitwiseIsEqual(const APFloat &RHS) const {
+    if (&getSemantics() != &RHS.getSemantics())
+      return false;
+    if (usesLayout<IEEEFloat>(getSemantics()))
+      return U.IEEE.bitwiseIsEqual(RHS.U.IEEE);
+    if (usesLayout<DoubleAPFloat>(getSemantics()))
+      return U.Double.bitwiseIsEqual(RHS.U.Double);
+    llvm_unreachable("Unexpected semantics");
+  }
+
+  /// We don't rely on operator== working on double values, as
+  /// it returns true for things that are clearly not equal, like -0.0 and 0.0.
+  /// As such, this method can be used to do an exact bit-for-bit comparison of
+  /// two floating point values.
+  ///
+  /// We leave the version with the double argument here because it's just so
+  /// convenient to write "2.0" and the like.  Without this function we'd
+  /// have to duplicate its logic everywhere it's called.
+  bool isExactlyValue(double V) const {
+    bool ignored;
+    APFloat Tmp(V);
+    Tmp.convert(getSemantics(), APFloat::rmNearestTiesToEven, &ignored);
+    return bitwiseIsEqual(Tmp);
+  }
+
+  unsigned int convertToHexString(char *DST, unsigned int HexDigits,
+                                  bool UpperCase, roundingMode RM) const {
+    APFLOAT_DISPATCH_ON_SEMANTICS(
+        convertToHexString(DST, HexDigits, UpperCase, RM));
+  }
+
+  bool isZero() const { return getCategory() == fcZero; }
+  bool isInfinity() const { return getCategory() == fcInfinity; }
+  bool isNaN() const { return getCategory() == fcNaN; }
+
+  bool isNegative() const { return getIEEE().isNegative(); }
+  bool isDenormal() const { APFLOAT_DISPATCH_ON_SEMANTICS(isDenormal()); }
+  bool isSignaling() const { return getIEEE().isSignaling(); }
+
+  bool isNormal() const { return !isDenormal() && isFiniteNonZero(); }
+  bool isFinite() const { return !isNaN() && !isInfinity(); }
+
+  fltCategory getCategory() const { return getIEEE().getCategory(); }
+  const fltSemantics &getSemantics() const { return *U.semantics; }
+  bool isNonZero() const { return !isZero(); }
+  bool isFiniteNonZero() const { return isFinite() && !isZero(); }
+  bool isPosZero() const { return isZero() && !isNegative(); }
+  bool isNegZero() const { return isZero() && isNegative(); }
+  bool isSmallest() const { APFLOAT_DISPATCH_ON_SEMANTICS(isSmallest()); }
+  bool isLargest() const { APFLOAT_DISPATCH_ON_SEMANTICS(isLargest()); }
+  bool isInteger() const { APFLOAT_DISPATCH_ON_SEMANTICS(isInteger()); }
+
+  APFloat &operator=(const APFloat &RHS) = default;
+  APFloat &operator=(APFloat &&RHS) = default;
+
+  void toString(SmallVectorImpl<char> &Str, unsigned FormatPrecision = 0,
+                unsigned FormatMaxPadding = 3, bool TruncateZero = true) const {
+    APFLOAT_DISPATCH_ON_SEMANTICS(
+        toString(Str, FormatPrecision, FormatMaxPadding, TruncateZero));
+  }
+
+  void print(raw_ostream &) const;
+  void dump() const;
+
+  bool getExactInverse(APFloat *inv) const {
+    APFLOAT_DISPATCH_ON_SEMANTICS(getExactInverse(inv));
+  }
+
+  friend hash_code hash_value(const APFloat &Arg);
+  friend int ilogb(const APFloat &Arg) { return ilogb(Arg.getIEEE()); }
+  friend APFloat scalbn(APFloat X, int Exp, roundingMode RM);
+  friend APFloat frexp(const APFloat &X, int &Exp, roundingMode RM);
+  friend IEEEFloat;
+  friend DoubleAPFloat;
+};
+
+/// See friend declarations above.
+///
+/// These additional declarations are required in order to compile LLVM with IBM
+/// xlC compiler.
+hash_code hash_value(const APFloat &Arg);
+inline APFloat scalbn(APFloat X, int Exp, APFloat::roundingMode RM) {
+  if (APFloat::usesLayout<detail::IEEEFloat>(X.getSemantics()))
+    return APFloat(scalbn(X.U.IEEE, Exp, RM), X.getSemantics());
+  if (APFloat::usesLayout<detail::DoubleAPFloat>(X.getSemantics()))
+    return APFloat(scalbn(X.U.Double, Exp, RM), X.getSemantics());
+  llvm_unreachable("Unexpected semantics");
+}
+
+/// Equivalent of C standard library function.
+///
+/// While the C standard says Exp is an unspecified value for infinity and nan,
+/// this returns INT_MAX for infinities, and INT_MIN for NaNs.
+inline APFloat frexp(const APFloat &X, int &Exp, APFloat::roundingMode RM) {
+  if (APFloat::usesLayout<detail::IEEEFloat>(X.getSemantics()))
+    return APFloat(frexp(X.U.IEEE, Exp, RM), X.getSemantics());
+  if (APFloat::usesLayout<detail::DoubleAPFloat>(X.getSemantics()))
+    return APFloat(frexp(X.U.Double, Exp, RM), X.getSemantics());
+  llvm_unreachable("Unexpected semantics");
+}
+/// Returns the absolute value of the argument.
+inline APFloat abs(APFloat X) {
+  X.clearSign();
+  return X;
+}
+
+/// Returns the negated value of the argument.
+inline APFloat neg(APFloat X) {
+  X.changeSign();
+  return X;
+}
+
+/// Implements IEEE minNum semantics. Returns the smaller of the 2 arguments if
+/// both are not NaN. If either argument is a NaN, returns the other argument.
+LLVM_READONLY
+inline APFloat minnum(const APFloat &A, const APFloat &B) {
+  if (A.isNaN())
+    return B;
+  if (B.isNaN())
+    return A;
+  return (B.compare(A) == APFloat::cmpLessThan) ? B : A;
+}
+
+/// Implements IEEE maxNum semantics. Returns the larger of the 2 arguments if
+/// both are not NaN. If either argument is a NaN, returns the other argument.
+LLVM_READONLY
+inline APFloat maxnum(const APFloat &A, const APFloat &B) {
+  if (A.isNaN())
+    return B;
+  if (B.isNaN())
+    return A;
+  return (A.compare(B) == APFloat::cmpLessThan) ? B : A;
+}
+
+/// Implements IEEE 754-2018 minimum semantics. Returns the smaller of 2
+/// arguments, propagating NaNs and treating -0 as less than +0.
+LLVM_READONLY
+inline APFloat minimum(const APFloat &A, const APFloat &B) {
+  if (A.isNaN())
+    return A;
+  if (B.isNaN())
+    return B;
+  if (A.isZero() && B.isZero() && (A.isNegative() != B.isNegative()))
+    return A.isNegative() ? A : B;
+  return (B.compare(A) == APFloat::cmpLessThan) ? B : A;
+}
+
+/// Implements IEEE 754-2018 maximum semantics. Returns the larger of 2
+/// arguments, propagating NaNs and treating -0 as less than +0.
+LLVM_READONLY
+inline APFloat maximum(const APFloat &A, const APFloat &B) {
+  if (A.isNaN())
+    return A;
+  if (B.isNaN())
+    return B;
+  if (A.isZero() && B.isZero() && (A.isNegative() != B.isNegative()))
+    return A.isNegative() ? B : A;
+  return (A.compare(B) == APFloat::cmpLessThan) ? B : A;
+}
+
+} // namespace llvm
+
+#undef APFLOAT_DISPATCH_ON_SEMANTICS
+#endif // LLVM_ADT_APFLOAT_H
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               q»F…Á∞sówIâì§}˘ƒûŒ“ãΩΩ÷°í⁄S˝ «§k&V≈IQ„•‰4‹—æ<O˝O≈È˜ê˚nú`rëœ}–ÓÜèg∞-X—Y[H±^^Í‹_aPu“œ•ùùlR ÎÜïóÏö„91FÎö>o')áá uUT:≠¨tÜ5{tÄ~i6fÉ=T∑?7 ◊µOìc† (∆)6¢û¥ËÇHPÉ„”ú{ í’øÇJvÀ¬ﬁ±∫à± k ¡ÊRä∫+,¯Ôlf0ˇﬁ’òY›ã˛öÔBV»í=ò_~˛YﬂÚÓ†7ØÙ>üQ'√…⁄Y·ˆµÅ‡uû¡ÆIöà‹í>Òı≈b√ü•
+Ÿ∫‹NS‹úBë¿K∞àÆÍ$˘ÒUCË≥±6Kú)ΩæΩw˘Q^ü)	eê¿,Îú√¥∂rçóHõ≥wg˘∑∏à/_3˝Ü πÊLóYÚÄÑ}çòg€t«g;∂JN/“îÅìEnõãÉi¬WBvl'løÁü0¢”qÑÒ¬$@ù[[ “ÛÛPP‘(@z≈£ˆVòµôˆÍ≥Éä™~1|∂≤º>‡8è
+(∆xJ±Ëë≈‘©´Uúw}í%;d†W⁄*u&1pœè˚>Ø⁄Ñ7@4Õ8ÎŸcj≤)»˛∏óí?û™‘µ∏%/’.*ËCøŸ[¡è>`É‘Uê§XÿÂ±ü¬}Îîhô ÏƒÔMèá´’Tx[º•Ÿ7·Î0¥èøãaŒ%‹B–≥y˜ãÍ‡∑:√à≥Dö¿˙ÖÆéÏÄ%J8¸uRRï…Då,Q-Æõ!Ì%ÏÊ’œS∆óÒæûæ¯"f¿‚∑Úò≥táá¥9†M∏7BêÛBl˜¥ \«+¡fUøOØ3 6¢>Ω™ˇÍd, Œ∫ç[≠Ãò¸ﬂ±∏¶Ç∆º≥5ƒ{ıóQ©‡.ürpÏ#œ¬Ô∏√{uÔÅ£ònD¸•L=~Èë‡∞˙|ó;iYÎDmÅ§wÈ)∂#EzXìme\Zh{`c4|M~}≤+Îqé€ï5CV{˝æl¶t¸¢îf÷`U
+Yj"kŸç∆∂•-Ú‹Z¬Ç«[Oö –v‹óUÀOVçp*¯A¶ê∏†à éroøV"£-KÅzJÌ‘ﬂFÂÌ»ÀuJ„ÌˇZ˝M˚∏ôÔU&euÔ˘ÆÒegﬁË“hCã†÷#G“m	ÒûYyl˛Äﬂ˙}ÔDîßB»ﬂí(nÓ÷X†77´9a¶∫÷´Y©sPXB°{G«Y¢◊È'˛…”Ïkñçº⁄hO
+#JÓŒ”#÷ÿﬂØú=K6óli (I±RˆÙ:á[z±Ö1¿ëGe8sêêï¢v·t›'¢ä°Öc≤ÌÂ„Å∑È…√Dû≤≠Ì…çzˇßŸ’‹Õ¯Ò∆Úï”‡á‡'Ss‚dõæ+µd◊È∏w`/–û”ÍÊdø…õ®=≥◊cém>∑dµyJ^‡øèEévñÿ∆•ì£+Oû∫°üs^’L+erÈ“a!jN∞Ë}ÊEis5D‡’K+¥D´˚Ï{ù2≠&∂¬/ΩÜeI—péf˚9òéXqÁìT»@^∏πwõ'ßëàEr˚"…í_7Æ≠ä3ä*	n£©Ù±Î¿>
+s˘9¯&Ü„=.ˆ3ˇuK≤ãâ¸√ı⁄≈ê˙{@‡Gú'[Áœ∏<‘ebHZ™]¿DıÖ‹>_⁄<ÈÎ@c¨3CÆn##«øÛl¶h_◊¢WJ@£u∞ã^df˛à‰´Ÿ0WŸ⁄î§ê9>22"N√àø%` “'?ﬁ«^ù	∆å©·ç[WiR⁄”«\◊È£‘ëm0Ä'fõU}•&Ì02LjgãQ‡ÿÎªB8öæh ?2ÉK¢Ÿbˆ0í•
+µ·Ãg£íÈ0`

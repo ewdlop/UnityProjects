@@ -1,0 +1,105 @@
+///////////////////////////////////////////////////////////////////////////
+//
+// Copyright (c) 2012-2017 DreamWorks Animation LLC
+//
+// All rights reserved. This software is distributed under the
+// Mozilla Public License 2.0 ( http://www.mozilla.org/MPL/2.0/ )
+//
+// Redistributions of source code must retain the above copyright
+// and license notice and the following restrictions and disclaimer.
+//
+// *     Neither the name of DreamWorks Animation nor the names of
+// its contributors may be used to endorse or promote products derived
+// from this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+// IN NO EVENT SHALL THE COPYRIGHT HOLDERS' AND CONTRIBUTORS' AGGREGATE
+// LIABILITY FOR ALL CLAIMS REGARDLESS OF THEIR BASIS EXCEED US$250.00.
+//
+///////////////////////////////////////////////////////////////////////////
+
+/// @file MultiResGrid.h
+///
+/// @author Ken Museth
+///
+/// @warning This class is fairly new and as such has not seen a lot of
+/// use in production. Please report any issues or request for new
+/// features directly to ken.museth@dreamworks.com.
+///
+/// @brief Multi-resolution grid that contains LoD sequences of trees
+/// with powers of two refinements.
+///
+/// @note While this class can arguably be used to implement a sparse
+/// Multi-Grid solver it is currently intended as a means to
+/// efficiently compute LoD levels for applications like rendering
+///
+/// @note Prolongation means interpolation from coarse -> fine
+/// @note Restriction means interpolation (or remapping) from fine -> coarse
+
+#ifndef OPENVDB_TOOLS_MULTIRESGRID_HAS_BEEN_INCLUDED
+#define OPENVDB_TOOLS_MULTIRESGRID_HAS_BEEN_INCLUDED
+
+#include <openvdb/Grid.h>
+#include <openvdb/math/FiniteDifference.h>
+#include <openvdb/math/Math.h>
+#include <openvdb/math/Operators.h>
+#include <openvdb/math/Stencils.h>
+#include <openvdb/Metadata.h>
+#include <openvdb/tree/LeafManager.h>
+#include <openvdb/tree/NodeManager.h>
+#include "Interpolation.h"
+#include "Morphology.h"
+#include "Prune.h"
+#include "SignedFloodFill.h"
+#include "ValueTransformer.h"
+
+#include <tbb/enumerable_thread_specific.h>
+#include <tbb/task_scheduler_init.h>
+#include <tbb/tbb_thread.h>
+
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+namespace openvdb {
+OPENVDB_USE_VERSION_NAMESPACE
+namespace OPENVDB_VERSION_NAME {
+namespace tools {
+
+template<typename TreeType>
+class MultiResGrid: public MetaMap
+{
+public:
+
+    typedef boost::shared_ptr<MultiResGrid>         Ptr;
+    typedef boost::shared_ptr<const MultiResGrid>   ConstPtr;
+
+    typedef typename TreeType::ValueType            ValueType;
+    typedef typename TreeType::ValueOnCIter         ValueOnCIter;
+    typedef typename TreeType::ValueOnIter          ValueOnIter;
+    typedef typename TreeType::Ptr                  TreePtr;
+    typedef typename TreeType::ConstPtr             ConstTreePtr;
+    typedef typename Grid<TreeType>::Ptr            GridPtr;
+    typedef typename Grid<TreeType>::ConstPtr       ConstGridPtr;
+
+    //////////////////////////////////////////////////////////////////////
+
+    /// @brief Constructor of empty grids
+    /// @param levels The number of trees in this MultiResGrid
+    /// @param background Background value
+    /// @param voxelSize Size of a (uniform voxel). Defaults to one.
+    /// @note The multiple grids are all empty.
+    MultiResGrid(size_t levels, ValueType background, double voxelSize = 1.0);
+
+    /// @brief Given an initial h

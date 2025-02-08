@@ -1,0 +1,200 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	VulkanCommands.cpp: Vulkan RHI commands implementation.
+=============================================================================*/
+
+#include "VulkanRHIPrivate.h"
+#include "VulkanPendingState.h"
+#include "VulkanContext.h"
+#include "EngineGlobals.h"
+#include "VulkanLLM.h"
+#include "RenderUtils.h"
+
+static TAutoConsoleVariable<int32> GCVarSubmitOnDispatch(
+	TEXT("r.Vulkan.SubmitOnDispatch"),
+	0,
+	TEXT("0 to not do anything special on dispatch(default)\n")\
+	TEXT("1 to submit the cmd buffer after each dispatch"),
+	ECVF_RenderThreadSafe
+);
+
+int32 GVulkanSubmitAfterEveryEndRenderPass = 0;
+static FAutoConsoleVariableRef CVarVulkanSubmitAfterEveryEndRenderPass(
+	TEXT("r.Vulkan.SubmitAfterEveryEndRenderPass"),
+	GVulkanSubmitAfterEveryEndRenderPass,
+	TEXT("Forces a submit after every end render pass.\n")
+	TEXT(" 0: Don't(default)\n")
+	TEXT(" 1: Enable submitting"),
+	ECVF_Default
+);
+
+// make sure what the hardware expects matches what we give it for indirect arguments
+static_assert(sizeof(FRHIDrawIndirectParameters) == sizeof(VkDrawIndirectCommand), "FRHIDrawIndirectParameters size is wrong.");
+static_assert(STRUCT_OFFSET(FRHIDrawIndirectParameters, VertexCountPerInstance) == STRUCT_OFFSET(VkDrawIndirectCommand, vertexCount), "Wrong offset of FRHIDrawIndirectParameters::VertexCountPerInstance.");
+static_assert(STRUCT_OFFSET(FRHIDrawIndirectParameters, InstanceCount) == STRUCT_OFFSET(VkDrawIndirectCommand, instanceCount), "Wrong offset of FRHIDrawIndirectParameters::InstanceCount.");
+static_assert(STRUCT_OFFSET(FRHIDrawIndirectParameters, StartVertexLocation) == STRUCT_OFFSET(VkDrawIndirectCommand, firstVertex), "Wrong offset of FRHIDrawIndirectParameters::StartVertexLocation.");
+static_assert(STRUCT_OFFSET(FRHIDrawIndirectParameters, StartInstanceLocation) == STRUCT_OFFSET(VkDrawIndirectCommand, firstInstance), "Wrong offset of FRHIDrawIndirectParameters::StartInstanceLocation.");
+
+static_assert(sizeof(FRHIDrawIndexedIndirectParameters) == sizeof(VkDrawIndexedIndirectCommand), "FRHIDrawIndexedIndirectParameters size is wrong.");
+static_assert(STRUCT_OFFSET(FRHIDrawIndexedIndirectParameters, IndexCountPerInstance) == STRUCT_OFFSET(VkDrawIndexedIndirectCommand, indexCount), "Wrong offset of FRHIDrawIndexedIndirectParameters::IndexCountPerInstance.");
+static_assert(STRUCT_OFFSET(FRHIDrawIndexedIndirectParameters, InstanceCount) == STRUCT_OFFSET(VkDrawIndexedIndirectCommand, instanceCount), "Wrong offset of FRHIDrawIndexedIndirectParameters::InstanceCount.");
+static_assert(STRUCT_OFFSET(FRHIDrawIndexedIndirectParameters, StartIndexLocation) == STRUCT_OFFSET(VkDrawIndexedIndirectCommand, firstIndex), "Wrong offset of FRHIDrawIndexedIndirectParameters::StartIndexLocation.");
+static_assert(STRUCT_OFFSET(FRHIDrawIndexedIndirectParameters, BaseVertexLocation) == STRUCT_OFFSET(VkDrawIndexedIndirectCommand, vertexOffset), "Wrong offset of FRHIDrawIndexedIndirectParameters::BaseVertexLocation.");
+static_assert(STRUCT_OFFSET(FRHIDrawIndexedIndirectParameters, StartInstanceLocation) == STRUCT_OFFSET(VkDrawIndexedIndirectCommand, firstInstance), "Wrong offset of FRHIDrawIndexedIndirectParameters::StartInstanceLocation.");
+
+static_assert(sizeof(FRHIDispatchIndirectParameters) == sizeof(VkDispatchIndirectCommand), "FRHIDispatchIndirectParameters size is wrong.");
+static_assert(STRUCT_OFFSET(FRHIDispatchIndirectParameters, ThreadGroupCountX) == STRUCT_OFFSET(VkDispatchIndirectCommand, x), "FRHIDispatchIndirectParameters X dimension is wrong.");
+static_assert(STRUCT_OFFSET(FRHIDispatchIndirectParameters, ThreadGroupCountY) == STRUCT_OFFSET(VkDispatchIndirectCommand, y), "FRHIDispatchIndirectParameters Y dimension is wrong.");
+static_assert(STRUCT_OFFSET(FRHIDispatchIndirectParameters, ThreadGroupCountZ) == STRUCT_OFFSET(VkDispatchIndirectCommand, z), "FRHIDispatchIndirectParameters Z dimension is wrong.");
+
+/** Given a pointer to a RHI texture that was created by the Vulkan RHI, returns a pointer to the FVulkanTextureBase it encapsulates. */
+inline FVulkanTextureBase* GetVulkanTextureFromRHITexture(FRHITexture* Texture)
+{
+	if (!Texture)
+	{
+		return NULL;
+	}
+	if(FRHITextureReference* TexRef = Texture->GetTextureReference())
+	{
+		Texture = TexRef->GetReferencedTexture();
+		if (!Texture)
+		{
+			return NULL;
+		}
+	}
+
+
+	if (FRHITexture2D* Tex2D = Texture->GetTexture2D())
+	{
+		return static_cast<FVulkanTexture2D*>(Tex2D);
+	}
+	else if (FRHITexture2DArray* Tex2DArray = Texture->GetTexture2DArray())
+	{
+		return static_cast<FVulkanTexture2DArray*>(Tex2DArray);
+	}
+	else if (FRHITexture3D* Tex3D = Texture->GetTexture3D())
+	{
+		return static_cast<FVulkanTexture3D*>(Tex3D);
+	}
+	else if (FRHITextureCube* TexCube = Texture->GetTextureCube())
+	{
+		return static_cast<FVulkanTextureCube*>(TexCube);
+	}
+	else
+	{
+		UE_LOG(LogVulkanRHI, Fatal, TEXT("Unknown Vulkan RHI texture type"));
+		return nullptr;
+	}
+}
+
+static FORCEINLINE ShaderStage::EStage GetAndVerifyShaderStage(FRHIGraphicsShader* ShaderRHI, FVulkanPendingGfxState* PendingGfxState)
+{
+	switch (ShaderRHI->GetFrequency())
+	{
+	case SF_Vertex:
+		check(PendingGfxState->GetCurrentShaderKey(ShaderStage::Vertex) == GetShaderKey<FVulkanVertexShader>(ShaderRHI));
+		return ShaderStage::Vertex;
+	case SF_Hull:
+#if PLATFORM_SUPPORTS_TESSELLATION_SHADERS
+		check(PendingGfxState->GetCurrentShaderKey(ShaderStage::Hull) == GetShaderKey<FVulkanHullShader>(ShaderRHI));
+		return ShaderStage::Hull;
+#else
+		checkf(0, TEXT("Tessellation (Hull) not supported on this platform!"));
+		UE_LOG(LogVulkanRHI, Fatal, TEXT("Tessellation (Hull) not supported on this platform!"));
+		break;
+#endif
+	case SF_Domain:
+#if PLATFORM_SUPPORTS_TESSELLATION_SHADERS
+		check(PendingGfxState->GetCurrentShaderKey(ShaderStage::Domain) == GetShaderKey<FVulkanDomainShader>(ShaderRHI));
+		return ShaderStage::Domain;
+#else
+		checkf(0, TEXT("Tessellation (Domain) not supported on this platform!"));
+		UE_LOG(LogVulkanRHI, Fatal, TEXT("Tessellation (Domain) not supported on this platform!"));
+		break;
+#endif
+	case SF_Geometry:
+#if VULKAN_SUPPORTS_GEOMETRY_SHADERS
+		check(PendingGfxState->GetCurrentShaderKey(ShaderStage::Geometry) == GetShaderKey<FVulkanGeometryShader>(ShaderRHI));
+		return ShaderStage::Geometry;
+#else
+		checkf(0, TEXT("Geometry shaders not supported on this platform!"));
+		UE_LOG(LogVulkanRHI, Fatal, TEXT("Geometry shaders not supported on this platform!"));
+		break;
+#endif
+	case SF_Pixel:
+		check(PendingGfxState->GetCurrentShaderKey(ShaderStage::Pixel) == GetShaderKey<FVulkanPixelShader>(ShaderRHI));
+		return ShaderStage::Pixel;
+	default:
+		checkf(0, TEXT("Undefined FRHIShader Type %d!"), (int32)ShaderRHI->GetFrequency());
+		break;
+	}
+
+	return ShaderStage::Invalid;
+}
+
+static FORCEINLINE ShaderStage::EStage GetAndVerifyShaderStageAndVulkanShader(FRHIGraphicsShader* ShaderRHI, FVulkanPendingGfxState* PendingGfxState, FVulkanShader*& OutShader)
+{
+	switch (ShaderRHI->GetFrequency())
+	{
+	case SF_Vertex:
+		//check(PendingGfxState->GetCurrentShaderKey(ShaderStage::Vertex) == GetShaderKey<FVulkanVertexShader>(ShaderRHI));
+		OutShader = static_cast<FVulkanVertexShader*>(static_cast<FRHIVertexShader*>(ShaderRHI));
+		return ShaderStage::Vertex;
+	case SF_Hull:
+#if PLATFORM_SUPPORTS_TESSELLATION_SHADERS
+		//check(PendingGfxState->GetCurrentShaderKey(ShaderStage::Hull) == GetShaderKey<FVulkanHullShader>(ShaderRHI));
+		OutShader = static_cast<FVulkanHullShader*>(static_cast<FRHIHullShader*>(ShaderRHI));
+		return ShaderStage::Hull;
+#else
+		checkf(0, TEXT("Tessellation (Domain) not supported on this platform!"));
+		UE_LOG(LogVulkanRHI, Fatal, TEXT("Tessellation (Domain) not supported on this platform!"));
+		break;
+#endif
+	case SF_Domain:
+#if PLATFORM_SUPPORTS_TESSELLATION_SHADERS
+		//check(PendingGfxState->GetCurrentShaderKey(ShaderStage::Domain) == GetShaderKey<FVulkanDomainShader>(ShaderRHI));
+		OutShader = static_cast<FVulkanDomainShader*>(static_cast<FRHIDomainShader*>(ShaderRHI));
+		return ShaderStage::Domain;
+#else
+		checkf(0, TEXT("Tessellation (Hull) not supported on this platform!"));
+		UE_LOG(LogVulkanRHI, Fatal, TEXT("Tessellation (Hull) not supported on this platform!"));
+		break;
+#endif
+	case SF_Geometry:
+#if VULKAN_SUPPORTS_GEOMETRY_SHADERS
+		//check(PendingGfxState->GetCurrentShaderKey(ShaderStage::Geometry) == GetShaderKey<FVulkanGeometryShader>(ShaderRHI));
+		OutShader = static_cast<FVulkanGeometryShader*>(static_cast<FRHIGeometryShader*>(ShaderRHI));
+		return ShaderStage::Geometry;
+#else
+		checkf(0, TEXT("Geometry shaders not supported on this platform!"));
+		UE_LOG(LogVulkanRHI, Fatal, TEXT("Geometry shaders not supported on this platform!"));
+		break;
+#endif
+	case SF_Pixel:
+		//check(PendingGfxState->GetCurrentShaderKey(ShaderStage::Pixel) == GetShaderKey<FVulkanPixelShader>(ShaderRHI));
+		OutShader = static_cast<FVulkanPixelShader*>(static_cast<FRHIPixelShader*>(ShaderRHI));
+		return ShaderStage::Pixel;
+	default:
+		checkf(0, TEXT("Undefined FRHIShader Type %d!"), (int32)ShaderRHI->GetFrequency());
+		break;
+	}
+
+	OutShader = nullptr;
+	return ShaderStage::Invalid;
+}
+
+void FVulkanCommandListContext::RHISetStreamSource(uint32 StreamIndex, FRHIVertexBuffer* VertexBufferRHI, uint32 Offset)
+{
+	FVulkanVertexBuffer* VertexBuffer = ResourceCast(VertexBufferRHI);
+	if (VertexBuffer != nullptr)
+	{
+		PendingGfxState->SetStreamSource(StreamIndex, VertexBuffer->GetHandle(), Offset + VertexBuffer->GetOffset());
+	}
+}
+
+void FVulkanCommandListContext::RHISetComputeShader(FRHIComputeShader* ComputeShaderRHI)
+{
+	FVulkanComputeShader* ComputeShader = ResourceCast(ComputeShaderRHI);
+	FVulkanComputePipeline* ComputePipeline = Device->GetPipelineStateCache()->GetOrCreateComputePipeline(ComputeShader);
+	RHISetComputePipelineState(Co

@@ -1,0 +1,53 @@
+//===-- AArch64ConditionalCompares.cpp --- CCMP formation for AArch64 -----===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements the AArch64ConditionalCompares pass which reduces
+// branching and code size by using the conditional compare instructions CCMP,
+// CCMN, and FCMP.
+//
+// The CFG transformations for forming conditional compares are very similar to
+// if-conversion, and this pass should run immediately before the early
+// if-conversion pass.
+//
+//===----------------------------------------------------------------------===//
+
+#include "AArch64.h"
+#include "llvm/ADT/DepthFirstIterator.h"
+#include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/Statistic.h"
+#include "llvm/CodeGen/MachineBranchProbabilityInfo.h"
+#include "llvm/CodeGen/MachineDominators.h"
+#include "llvm/CodeGen/MachineFunction.h"
+#include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/CodeGen/MachineInstrBuilder.h"
+#include "llvm/CodeGen/MachineLoopInfo.h"
+#include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/CodeGen/MachineTraceMetrics.h"
+#include "llvm/CodeGen/Passes.h"
+#include "llvm/CodeGen/TargetInstrInfo.h"
+#include "llvm/CodeGen/TargetRegisterInfo.h"
+#include "llvm/CodeGen/TargetSubtargetInfo.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
+
+using namespace llvm;
+
+#define DEBUG_TYPE "aarch64-ccmp"
+
+// Absolute maximum number of instructions allowed per speculated block.
+// This bypasses all other heuristics, so it should be set fairly high.
+static cl::opt<unsigned> BlockInstrLimit(
+    "aarch64-ccmp-limit", cl::init(30), cl::Hidden,
+    cl::desc("Maximum number of instructions per speculated block."));
+
+// Stress testing mode - disable heuristics.
+static cl::opt<bool> Stress("aarch64-stress-ccmp", cl::Hidden,
+                            cl::desc("Turn all knobs to 11"));

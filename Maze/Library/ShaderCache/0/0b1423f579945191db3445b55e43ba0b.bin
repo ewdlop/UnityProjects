@@ -1,0 +1,195 @@
+                tcs.TrySetResult(false);
+                        return;
+                    }
+                    else if (ie == null)
+                        b = true;
+                    else if (oe == null)
+                        b = false;
+                    useOuter = !useOuter;
+
+                    var enqueue = new Func<TOuter, TInner, bool>((o, i) =>
+                    {
+                        var result = default(TResult);
+                        try
+                        {
+                            result = resultSelector(o, i);
+                        }
+                        catch (Exception exception)
+                        {
+                            tcs.TrySetException(exception);
+                            return false;
+                        }
+
+                        q.Enqueue(result);
+                        return true;
+                    });
+
+                    if (b)
+                        oe.MoveNext(ct).ContinueWith(t =>
+                        {
+                            t.Handle(tcs, res =>
+                            {
+                                if (res)
+                                {
+                                    var element = oe.Current;
+                                    var key = default(TKey);
+
+                                    try
+                                    {
+                                        key = outerKeySelector(element);
+                                    }
+                                    catch (Exception exception)
+                                    {
+                                        tcs.TrySetException(exception);
+                                        return;
+                                    }
+
+                                    var outerList = default(List<TOuter>);
+                                    if (!outerMap.TryGetValue(key, out outerList))
+                                    {
+                                        outerList = new List<TOuter>();
+                                        outerMap.Add(key, outerList);
+                                    }
+
+                                    outerList.Add(element);
+
+                                    var innerList = default(List<TInner>);
+                                    if (!innerMap.TryGetValue(key, out innerList))
+                                    {
+                                        innerList = new List<TInner>();
+                                        innerMap.Add(key, innerList);
+                                    }
+
+                                    foreach (var v in innerList)
+                                    {
+                                        if (!enqueue(element, v))
+                                            return;
+                                    }
+                                    
+                                    f(tcs, ct);
+                                }
+                                else
+                                {
+                                    oe.Dispose();
+                                    oe = null;
+                                    f(tcs, ct);
+                                }
+                            });
+                        });
+                    else
+                        ie.MoveNext(ct).ContinueWith(t =>
+                        {
+                            t.Handle(tcs, res =>
+                            {
+                                if (res)
+                                {
+                                    var element = ie.Current;
+                                    var key = default(TKey);
+
+                                    try
+                                    {
+                                        key = innerKeySelector(element);
+                                    }
+                                    catch (Exception exception)
+                                    {
+                                        tcs.TrySetException(exception);
+                                        return;
+                                    }
+
+                                    var innerList = default(List<TInner>);
+                                    if (!innerMap.TryGetValue(key, out innerList))
+                                    {
+                                        innerList = new List<TInner>();
+                                        innerMap.Add(key, innerList);
+                                    }
+
+                                    innerList.Add(element);
+
+                                    var outerList = default(List<TOuter>);
+                                    if (!outerMap.TryGetValue(key, out outerList))
+                                    {
+                                        outerList = new List<TOuter>();
+                                        outerMap.Add(key, outerList);
+                                    }
+
+                                    foreach (var v in outerList)
+                                    {
+                                        if (!enqueue(v, element))
+                                            return;
+                                    }
+
+                                    f(tcs, ct);
+                                }
+                                else
+                                {
+                                    ie.Dispose();
+                                    ie = null;
+                                    f(tcs, ct);
+                                }
+                            });
+                        });
+                };
+
+                return Create(
+                    (ct, tcs) =>
+                    {
+                        f(tcs, cts.Token);
+                        return tcs.Task.UsingEnumerator(oe).UsingEnumerator(ie);
+                    },
+                    () => current,
+                    d.Dispose
+                );
+            });
+        }
+
+        public static IAsyncEnumerable<TResult> Join<TOuter, TInner, TKey, TResult>(this IAsyncEnumerable<TOuter> outer, IAsyncEnumerable<TInner> inner, Func<TOuter, TKey> outerKeySelector, Func<TInner, TKey> innerKeySelector, Func<TOuter, TInner, TResult> resultSelector)
+        {
+            if (outer == null)
+                throw new ArgumentNullException("outer");
+            if (inner == null)
+                throw new ArgumentNullException("inner");
+            if (outerKeySelector == null)
+                throw new ArgumentNullException("outerKeySelector");
+            if (innerKeySelector == null)
+                throw new ArgumentNullException("innerKeySelector");
+            if (resultSelector == null)
+                throw new ArgumentNullException("resultSelector");
+
+            return outer.Join(inner, outerKeySelector, innerKeySelector, resultSelector, EqualityComparer<TKey>.Default);
+        }
+
+        public static IAsyncEnumerable<TSource> Concat<TSource>(this IEnumerable<IAsyncEnumerable<TSource>> sources)
+        {
+            if (sources == null)
+                throw new ArgumentNullException("sources");
+
+            return sources.Concat_();
+        }
+
+        public static IAsyncEnumerable<TSource> Concat<TSource>(params IAsyncEnumerable<TSource>[] sources)
+        {
+            if (sources == null)
+                throw new ArgumentNullException("sources");
+
+            return sources.Concat_();
+        }
+
+        private static IAsyncEnumerable<TSource> Concat_<TSource>(this IEnumerable<IAsyncEnumerable<TSource>> sources)
+        {
+            return Create(() =>
+            {
+                var se = sources.GetEnumerator();
+                var e = default(IAsyncEnumerator<TSource>);
+
+                var cts = new CancellationTokenDisposable();
+                var a = new AssignableDisposable();
+                var d = new CompositeDisposable(cts, se, a);
+
+                var f = default(Action<TaskCompletionSource<bool>, CancellationToken>);
+                f = (tcs, ct) =>
+                {
+                    if (e == null)
+                    {
+                        var b = false;
+                        try
+ 

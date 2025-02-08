@@ -1,0 +1,1287 @@
+//-----------------------------------------------------------------------------
+// Copyright (c) Microsoft Corporation.  All rights reserved.
+//-----------------------------------------------------------------------------
+namespace System.ServiceModel.ComIntegration
+{
+    using System;
+    using System.CodeDom;
+    using System.Collections.ObjectModel;
+    using System.Reflection;
+    using System.Runtime;
+    using System.Runtime.InteropServices;
+    using System.Runtime.InteropServices.ComTypes;
+    using System.Runtime.Serialization;
+    using System.Security;
+    using System.Security.Permissions;
+    using SafeHGlobalHandle = System.IdentityModel.SafeHGlobalHandle;
+
+
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown),
+    Guid("0000010c-0000-0000-C000-000000000046")]
+    internal interface IPersist
+    {
+        void GetClassID( /* [out] */ out Guid pClassID);
+    };
+
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown),
+    Guid("00000109-0000-0000-C000-000000000046")]
+    internal interface IPersistStream : IPersist
+    {
+        new void GetClassID(out Guid pClassID);
+        [PreserveSig]
+        int IsDirty();
+        void Load([In] IStream pStm);
+        void Save([In] IStream pStm, [In,
+        MarshalAs(UnmanagedType.Bool)] bool fClearDirty);
+        void GetSizeMax(out long pcbSize);
+    };
+
+    internal class PersistHelper
+    {
+        [Fx.Tag.SecurityNote(Critical = "Uses critical type SafeHGlobalHandle.",
+            Safe = "Performs a Demand for full trust.")]
+        [SecuritySafeCritical]
+        [SecurityPermission(SecurityAction.Demand, Unrestricted = true)]
+        internal static byte[] ConvertHGlobalToByteArray(SafeHGlobalHandle hGlobal)
+        {
+            // this has to be Int32, even on 64 bit machines since Marshal.Copy takes a 32 bit integer
+            Int32 sizeOfByteArray = (SafeNativeMethods.GlobalSize(hGlobal)).ToInt32();
+            if (sizeOfByteArray > 0)
+            {
+                byte[] byteArray = new Byte[sizeOfByteArray];
+                IntPtr pBuff = SafeNativeMethods.GlobalLock(hGlobal);
+                if (IntPtr.Zero == pBuff)
+                    throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new OutOfMemoryException());
+
+                try
+                {
+                    Marshal.Copy(pBuff, byteArray, 0, sizeOfByteArray);
+                }
+                finally
+                {
+                    SafeNativeMethods.GlobalUnlock(hGlobal);
+                }
+                return byteArray;
+            }
+            return null;
+        }
+
+        [Fx.Tag.SecurityNote(Critical = "Uses critical type SafeHGlobalHandle.",
+            Safe = "Performs a Demand for full trust.")]
+        [SecuritySafeCritical]
+        [SecurityPermission(SecurityAction.Demand, Unrestricted = true)]
+        internal static Byte[] PersistIPersistStreamToByteArray(IPersistStream persistableObject)
+        {
+            IStream stream = SafeNativeMethods.CreateStreamOnHGlobal(SafeHGlobalHandle.InvalidHandle, false);
+            try
+            {
+                persistableObject.Save(stream, true);
+                SafeHGlobalHandle hGlobal = SafeNativeMethods.GetHGlobalFromStream(stream);
+                if (null == hGlobal || IntPtr.Zero == hGlobal.DangerousGetHandle())
+                {
+                    throw Fx.AssertAndThrow("HGlobal returned from  GetHGlobalFromStream is NULL");
+                }
+
+                return ConvertHGlobalToByteArray(hGlobal);
+            }
+            finally
+            {
+                Marshal.ReleaseComObject(stream);
+            }
+        }
+
+        [Fx.Tag.SecurityNote(Critical = "Uses critical type SafeHGlobalHandle.",
+            Safe = "Performs a Demand for full trust.")]
+        [SecuritySafeCritical]
+        [SecurityPermission(SecurityAction.Demand, Unrestricted = true)]
+        internal static void LoadIntoObjectFromByteArray(IPersistStream persistableObject, Byte[] byteStream)
+        {
+            SafeHGlobalHandle hGlobal = SafeHGlobalHandle.AllocHGlobal(byteStream.Length);
+
+            IntPtr pBuff = SafeNativeMethods.GlobalLock(hGlobal);
+            if (IntPtr.Zero == pBuff)
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new OutOfMemoryException());
+            try
+            {
+                Marshal.Copy(byteStream, 0, pBuff, byteStream.Length);
+                IStream stream = SafeNativeMethods.CreateStreamOnHGlobal(hGlobal, false);
+                try
+                {
+                    persistableObject.Load(stream);
+                }
+                finally
+                {
+                    Marshal.ReleaseComObject(stream);
+                }
+            }
+            finally
+            {
+                SafeNativeMethods.GlobalUnlock(hGlobal);
+            }
+        }
+
+        internal static object ActivateAndLoadFromByteStream(Guid clsid, byte[] byteStream)
+        {
+            IPersistStream persistableObject = SafeNativeMethods.CoCreateInstance(
+                            clsid,
+                            null,
+                            CLSCTX.INPROC_SERVER,
+                            typeof(IPersistStream).GUID) as IPersistStream;
+            if (null != persistableObject)
+            {
+                LoadIntoObjectFromByteArray(persistableObject, byteStream);
+                return persistableObject;
+            }
+            throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new InvalidOperationException(SR.GetString(SR.CLSIDDoesNotSupportIPersistStream, clsid.ToString("B"))));
+        }
+    }
+
+    [DataContract]
+    public class PersistStreamTypeWrapper : IExtensibleDataObject
+    {
+        [DataMember]
+        internal Guid clsid;
+        [DataMember]
+        internal byte[] dataStream;
+
+        public PersistStreamTypeWrapper() { }
+
+        public ExtensionDataObject ExtensionData
+        {
+            get;
+            set;
+        }
+
+        [PermissionSet(SecurityAction.Demand, Unrestricted = true), SecuritySafeCritical]
+        public void SetObject<T>(T obj)
+        {
+            if (Marshal.IsComObject(obj))
+            {
+                IntPtr punk = Marshal.GetIUnknownForObject(obj);
+                if (IntPtr.Zero == punk)
+                {
+                    throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new ArgumentException(SR.GetString(SR.UnableToRetrievepUnk)));
+                }
+                try
+                {
+                    IntPtr persistStream = IntPtr.Zero;
+                    Guid iidPersistStream = typeof(IPersistStream).GUID;
+                    int hr = Marshal.QueryInterface(punk, ref iidPersistStream, out persistStream);
+                    if (HR.S_OK == hr)
+                    {
+                        try
+                        {
+                            if (IntPtr.Zero == persistStream)
+                            {
+                                throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new ArgumentException(SR.GetString(SR.PersistWrapperIsNull)));
+                            }
+                            IPersistStream persistableObject = (IPersistStream)System.Runtime.Remoting.Services.EnterpriseServicesHelper.WrapIUnknownWithComObject(persistStream);
+                            try
+                            {
+                                this.dataStream = PersistHelper.PersistIPersistStreamToByteArray(persistableObject);
+                                this.clsid = typeof(T).GUID;
+                            }
+                            finally
+                            {
+                                Marshal.ReleaseComObject(persistableObject);
+                            }
+                        }
+                        finally
+                        {
+                            Marshal.Release(persistStream);
+                        }
+                    }
+                    else
+                        throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new InvalidOperationException(SR.GetString(SR.CLSIDDoesNotSupportIPersistStream, typeof(T).GUID.ToString("B"))));
+                }
+                finally
+                {
+                    Marshal.Release(punk);
+                }
+            }
+            else
+            {
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new ArgumentException(SR.GetString(SR.NotAComObject)));
+
+            }
+        }
+
+        [PermissionSet(SecurityAction.Demand, Unrestricted = true), SecuritySafeCritical]
+        public void GetObject<T>(ref T obj)
+        {
+            if (clsid == typeof(T).GUID)
+            {
+                IntPtr punk = Marshal.GetIUnknownForObject(obj);
+                if (IntPtr.Zero == punk)
+                {
+                    throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new ArgumentException(SR.GetString(SR.UnableToRetrievepUnk)));
+                }
+                try
+                {
+                    IntPtr persistStream = IntPtr.Zero;
+                    Guid iidPersistStream = typeof(IPersistStream).GUID;
+                    int hr = Marshal.QueryInterface(punk, ref iidPersistStream, out persistStream);
+                    if (HR.S_OK == hr)
+                    {
+                        try
+                        {
+                            if (IntPtr.Zero == persistStream)
+                            {
+                                throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new ArgumentException(SR.GetString(SR.PersistWrapperIsNull)));
+                            }
+                            IPersistStream persistableObject = (IPersistStream)System.Runtime.Remoting.Services.EnterpriseServicesHelper.WrapIUnknownWithComObject(persistStream);
+                            try
+                            {
+                                PersistHelper.LoadIntoObjectFromByteArray(persistableObject, dataStream);
+                            }
+                            finally
+                            {
+                                Marshal.ReleaseComObject(persistableObject);
+                            }
+                        }
+                        finally
+                        {
+                            Marshal.Release(persistStream);
+                        }
+                    }
+                    else
+                        throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new InvalidOperationException(SR.GetString(SR.CLSIDDoesNotSupportIPersistStream, typeof(T).GUID.ToString("B"))));
+                }
+                finally
+                {
+                    Marshal.Release(punk);
+                }
+            }
+            else
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new InvalidOperationException(SR.GetString(SR.CLSIDOfTypeDoesNotMatch, typeof(T).GUID.ToString(), clsid.ToString("B"))));
+        }
+    }
+
+    internal class DataContractSurrogateForPersistWrapper : IDataContractSurrogate
+    {
+        Guid[] allowedClasses;
+        public DataContractSurrogateForPersistWrapper(Guid[] allowedClasses)
+        {
+            this.allowedClasses = allowedClasses;
+        }
+
+        bool IsAllowedClass(Guid clsid)
+        {
+            foreach (Guid classID in allowedClasses)
+                if (clsid == classID)
+                    return true;
+            return false;
+        }
+
+        public Type GetDataContractType(Type type)
+        {
+            if (type.IsInterface)
+                return typeof(PersistStreamTypeWrapper);
+            else
+                return type;
+        }
+
+        public object GetObjectToSerialize(object obj, Type targetType)
+        {
+            if (targetType == typeof(object) || (targetType.IsInterface))
+            {
+                IPersistStream streamableObject = obj as IPersistStream;
+                if (null != streamableObject)
+                {
+                    PersistStreamTypeWrapper objToSerialize = new PersistStreamTypeWrapper();
+                    streamableObject.GetClassID(out objToSerialize.clsid);
+                    objToSerialize.dataStream = PersistHelper.PersistIPersistStreamToByteArray(streamableObject);
+                    return objToSerialize;
+                }
+                if (targetType.IsInterface)
+                    throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new InvalidOperationException(SR.GetString(SR.TargetObjectDoesNotSupportIPersistStream)));
+                return obj;
+            }
+            return obj;
+        }
+
+        public object GetDeserializedObject(object obj, Type targetType)
+        {
+            if (targetType == typeof(object) || (targetType.IsInterface))
+            {
+                PersistStreamTypeWrapper streamWrapper = obj as PersistStreamTypeWrapper;
+                if (null != streamWrapper)
+                {
+                    if (IsAllowedClass(streamWrapper.clsid))
+                    {
+                        return PersistHelper.ActivateAndLoadFromByteStream(streamWrapper.clsid, streamWrapper.dataStream);
+                    }
+                    else
+                        throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new InvalidOperationException(SR.GetString(SR.NotAllowedPersistableCLSID, streamWrapper.clsid.ToString("B"))));
+                }
+                if (targetType.IsInterface)
+                    throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new InvalidOperationException(SR.GetString(SR.TargetTypeIsAnIntefaceButCorrespoindingTypeIsNotPersistStreamTypeWrapper)));
+            }
+            return obj;
+        }
+
+        public object GetCustomDataToExport(MemberInfo memberInfo, Type dataContractType)
+        {
+            return null;
+        }
+
+        public object GetCustomDataToExport(Type clrType, Type dataContractType)
+        {
+            return null;
+        }
+
+        public void GetKnownCustomDataTypes(Collection<Type> customDataTypes)
+        {
+            customDataTypes.Add(typeof(PersistStreamTypeWrapper));
+        }
+
+        public Type GetReferencedTypeOnImport(string typeName, string typeNamespace, object customData)
+        {
+            return null;
+        }
+
+        public CodeTypeDeclaration ProcessImportedType(CodeTypeDeclaration typeDeclaration, CodeCompileUnit compileUnit)
+        {
+            return null;
+        }
+    }
+}
+                                                                                                                                                           )
+					{
+						TKey key = (TKey) data [i].key;
+						if (key != null && key != tombstone)
+							list.Add (key);
+					}
+				}
+				return list;
+			}
+		}
+
+		internal ICollection<TValue> Values
+		{
+			[System.Security.SecuritySafeCritical]
+			get
+			{
+				var tombstone = GC.EPHEMERON_TOMBSTONE;
+				List<TValue> list = new List<TValue>(data.Length);
+				lock (_lock)
+				{
+					for (int i = 0; i < data.Length; ++i)
+					{
+						var item = data[i];
+						if (item.key != null && item.key != tombstone)
+							list.Add((TValue)item.value);
+					}
+				}
+
+				return list;
+			}
+		}
+
+		// IEnumerable implementation was copied from CoreCLR
+		IEnumerator<KeyValuePair<TKey, TValue>> IEnumerable<KeyValuePair<TKey, TValue>>.GetEnumerator ()
+		{
+			lock (_lock)
+			{
+				return size == 0 ?
+					((IEnumerable<KeyValuePair<TKey, TValue>>)Array.Empty<KeyValuePair<TKey, TValue>>()).GetEnumerator() :
+					new Enumerator(this);
+			}
+		}
+
+		IEnumerator IEnumerable.GetEnumerator () => ((IEnumerable<KeyValuePair<TKey, TValue>>)this).GetEnumerator ();
+		
+		/// <summary>Provides an enumerator for the table.</summary>
+		private sealed class Enumerator : IEnumerator<KeyValuePair<TKey, TValue>>
+		{
+			// The enumerator would ideally hold a reference to the Container and the end index within that
+			// container.  However, the safety of the CWT depends on the only reference to the Container being
+			// from the CWT itself; the Container then employs a two-phase finalization scheme, where the first
+			// phase nulls out that parent CWT's referenc# RUN: llc -march=amdgcn -verify-machineinstrs -run-pass si-optimize-exec-masking -o -  %s | FileCheck %s
+
+--- |
+  target datalayout = "e-p:32:32-p1:64:64-p2:64:64-p3:32:32-p4:64:64-p5:32:32-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128-v192:256-v256:256-v512:512-v1024:1024-v2048:2048-n32:64"
+
+  define amdgpu_kernel void @optimize_if_and_saveexec_xor(i32 %z, i32 %v) #0 {
+  main_body:
+    %id = call i32 @llvm.amdgcn.workitem.id.x()
+    %cc = icmp eq i32 %id, 0
+    %0 = call { i1, i64 } @llvm.amdgcn.if(i1 %cc)
+    %1 = extractvalue { i1, i64 } %0, 0
+    %2 = extractvalue { i1, i64 } %0, 1
+    br i1 %1, label %if, label %end
+
+  if:                                               ; preds = %main_body
+    %v.if = load volatile i32, i32 addrspace(1)* undef
+    br label %end
+
+  end:                                              ; preds = %if, %main_body
+    %r = phi i32 [ 4, %main_body ], [ %v.if, %if ]
+    call void @llvm.amdgcn.end.cf(i64 %2)
+    store i32 %r, i32 addrspace(1)* undef
+    ret void
+  }
+
+  define amdgpu_kernel void @optimize_if_and_saveexec(i32 %z, i32 %v)  #0 {
+  main_body:
+      br i1 undef, label %if, label %end
+
+  if:
+    br label %end
+
+  end:
+    ret void
+  }
+
+  define amdgpu_kernel void @optimize_if_or_saveexec(i32 %z, i32 %v)  #0 {
+  main_body:
+      br i1 undef, label %if, label %end
+
+  if:
+    br label %end
+
+  end:
+    ret void
+  }
+
+
+  define amdgpu_kernel void @optimize_if_and_saveexec_xor_valu_middle(i32 %z, i32 %v) #0 {
+  main_body:
+    %id = call i32 @llvm.amdgcn.workitem.id.x()
+    %cc = icmp eq i32 %id, 0
+    %0 = call { i1, i64 } @llvm.amdgcn.if(i1 %cc)
+    %1 = extractvalue { i1, i64 } %0, 0
+    %2 = extractvalue { i1, i64 } %0, 1
+    store i32 %id, i32 addrspace(1)* undef
+    br i1 %1, label %if, label %end
+
+  if:                                               ; preds = %main_body
+    %v.if = load volatile i32, i32 addrspace(1)* undef
+    br label %end
+
+  end:                                              ; preds = %if, %main_body
+    %r = phi i32 [ 4, %main_body ], [ %v.if, %if ]
+    call void @llvm.amdgcn.end.cf(i64 %2)
+    store i32 %r, i32 addrspace(1)* undef
+    ret void
+  }
+
+  define amdgpu_kernel void @optimize_if_and_saveexec_xor_wrong_reg(i32 %z, i32 %v)  #0 {
+  main_body:
+      br i1 undef, label %if, label %end
+
+  if:
+    br label %end
+
+  end:
+    ret void
+  }
+
+  define amdgpu_kernel void @optimize_if_and_saveexec_xor_modify_copy_to_exec(i32 %z, i32 %v)  #0 {
+  main_body:
+      br i1 undef, label %if, label %end
+
+  if:
+    br label %end
+
+  end:
+    ret void
+  }
+
+  define amdgpu_kernel void @optimize_if_and_saveexec_xor_live_out_setexec(i32 %z, i32 %v)  #0 {
+  main_body:
+      br i1 undef, label %if, label %end
+
+  if:
+    br label %end
+
+  end:
+    ret void
+  }
+
+  define amdgpu_kernel void @optimize_if_unknown_saveexec(i32 %z, i32 %v)  #0 {
+  main_body:
+      br i1 undef, label %if, label %end
+
+  if:
+    br label %end
+
+  end:
+    ret void
+  }
+
+  define amdgpu_kernel void @optimize_if_andn2_saveexec(i32 %z, i32 %v)  #0 {
+  main_body:
+      br i1 undef, label %if, label %end
+
+  if:
+    br label %end
+
+  end:
+    ret void
+  }
+
+  define amdgpu_kernel void @optimize_if_andn2_saveexec_no_commute(i32 %z, i32 %v)  #0 {
+  main_body:
+      br i1 undef, label %if, label %end
+
+  if:
+    br label %end
+
+  end:
+    ret void
+  }
+
+  ; Function Attrs: nounwind readnone
+  declare i32 @llvm.amdgcn.workitem.id.x() #1
+
+  declare { i1, i64 } @llvm.amdgcn.if(i1)
+
+  declare void @llvm.amdgcn.end.cf(i64)
+
+
+  attributes #0 = { nounwind }
+  attributes #1 = { nounwind readnone }
+
+...
+---
+# CHECK-LABEL: name: optimize_if_and_saveexec_xor{{$}}
+# CHECK: %sgpr0_sgpr1 = S_AND_SAVEEXEC_B64 %vcc, implicit-def %exec, implicit-def %scc, implicit %exec
+# CHECK-NEXT: %sgpr0_sgpr1 = S_XOR_B64 %exec, killed %sgpr0_sgpr1, implicit-def %scc
+# CHECK-NEXT: SI_MASK_BRANCH
+
+name:            optimize_if_and_saveexec_xor
+alignment:       0
+exposesReturnsTwice: false
+legalized:       false
+regBankSelected: false
+selected:        false
+tracksRegLiveness: true
+liveins:
+  - { reg: '%vgpr0' }
+frameInfo:
+  isFrameAddressTaken: false
+  isReturnAddressTaken: false
+  hasStackMap:     false
+  hasPatchPoint:   false
+  stackSize:       0
+  offsetAdjustment: 0
+  maxAlignment:    0
+  adjustsStack:    false
+  hasCalls:        false
+  maxCallFrameSize: 0
+  hasOpaqueSPAdjustment: false
+  hasVAStart:      false
+  hasMustTailInVarArgFunc: false
+body:             |
+  bb.0.main_body:
+    liveins: %vgpr0
+
+    %sgpr0_sgpr1 = COPY %exec
+    %vcc = V_CMP_EQ_I32_e64 0, killed %vgpr0, implicit %exec
+    %vgpr0 = V_MOV_B32_e32 4, implicit %exec
+    %sgpr2_sgpr3 = S_AND_B64 %sgpr0_sgpr1, killed %vcc, implicit-def %scc
+    %sgpr0_sgpr1 = S_XOR_B64 %sgpr2_sgpr3, killed %sgpr0_sgpr1, implicit-def %scc
+    %exec = S_MOV_B64_term killed %sgpr2_sgpr3
+    SI_MASK_BRANCH %bb.2, implicit %exec
+    S_BRANCH %bb.1
+
+  bb.1.if:
+    liveins: %sgpr0_sgpr1
+
+    %sgpr7 = S_MOV_B32 61440
+    %sgpr6 = S_MOV_B32 -1
+    %vgpr0 = BUFFER_LOAD_DWORD_OFFSET %sgpr4_sgpr5_sgpr6_sgpr7, 0, 0, 0, 0, 0, implicit %exec :: (volatile load 4 from `i32 addrspace(1)* undef`)
+
+  bb.2.end:
+    liveins: %vgpr0, %sgpr0_sgpr1
+
+    %exec = S_OR_B64 %exec, killed %sgpr0_sgpr1, implicit-def %scc
+    %sgpr3 = S_MOV_B32 61440
+    %sgpr2 = S_MOV_B32 -1
+    BUFFER_STORE_DWORD_OFFSET killed %vgpr0, %sgpr0_sgpr1_sgpr2_sgpr3, 0, 0, 0, 0, 0, implicit %exec :: (store 4 into `i32 addrspace(1)* undef`)
+    S_ENDPGM
+
+...
+---
+# CHECK-LABEL: name: optimize_if_and_saveexec{{$}}
+# CHECK: %sgpr0_sgpr1 = S_AND_SAVEEXEC_B64 %vcc, implicit-def %exec, implicit-def %scc, implicit %exec
+# CHECK-NEXT: SI_MASK_BRANCH
+
+name:            optimize_if_and_saveexec
+alignment:       0
+exposesReturnsTwice: false
+legalized:       false
+regBankSelected: false
+selected:        false
+tracksRegLiveness: true
+liveins:
+  - { reg: '%vgpr0' }
+frameInfo:
+  isFrameAddressTaken: false
+  isReturnAddressTaken: false
+  hasStackMap:     false
+  hasPatchPoint:   false
+  stackSize:       0
+  offsetAdjustment: 0
+  maxAlignment:    0
+  adjustsStack:    false
+  hasCalls:        false
+  maxCallFrameSize: 0
+  hasOpaqueSPAdjustment: false
+  hasVAStart:      false
+  hasMustTailInVarArgFunc: false
+body:             |
+  bb.0.main_body:
+    liveins: %vgpr0
+
+    %sgpr0_sgpr1 = COPY %exec
+    %vcc = V_CMP_EQ_I32_e64 0, killed %vgpr0, implicit %exec
+    %vgpr0 = V_MOV_B32_e32 4, implicit %exec
+    %sgpr2_sgpr3 = S_AND_B64 %sgpr0_sgpr1, killed %vcc, implicit-def %scc
+    %exec = S_MOV_B64_term killed %sgpr2_sgpr3
+    SI_MASK_BRANCH %bb.2, implicit %exec
+    S_BRANCH %bb.1
+
+  bb.1.if:
+    liveins: %sgpr0_sgpr1
+
+    %sgpr7 = S_MOV_B32 61440
+    %sgpr6 = S_MOV_B32 -1
+    %vgpr0 = BUFFER_LOAD_DWORD_OFFSET %sgpr4_sgpr5_sgpr6_sgpr7, 0, 0, 0, 0, 0, implicit %exec :: (volatile load 4 from `i32 addrspace(1)* undef`)
+
+  bb.2.end:
+    liveins: %vgpr0, %sgpr0_sgpr1
+
+    %exec = S_OR_B64 %exec, killed %sgpr0_sgpr1, implicit-def %scc
+    %sgpr3 = S_MOV_B32 61440
+    %sgpr2 = S_MOV_B32 -1
+    BUFFER_STORE_DWORD_OFFSET killed %vgpr0, %sgpr0_sgpr1_sgpr2_sgpr3, 0, 0, 0, 0, 0, implicit %exec :: (store 4 into `i32 addrspace(1)* undef`)
+    S_ENDPGM
+
+...
+---
+# CHECK-LABEL: name: optimize_if_or_saveexec{{$}}
+# CHECK: %sgpr0_sgpr1 = S_OR_SAVEEXEC_B64 %vcc, implicit-def %exec, implicit-def %scc, implicit %exec
+# CHECK-NEXT: SI_MASK_BRANCH
+
+name:            optimize_if_or_saveexec
+alignment:       0
+exposesReturnsTwice: false
+legalized:       false
+regBankSelected: false
+selected:        false
+tracksRegLiveness: true
+liveins:
+  - { reg: '%vgpr0' }
+frameInfo:
+  isFrameAddressTaken: false
+  isReturnAddressTaken: false
+  hasStackMap:     false
+  hasPatchPoint:   false
+  stackSize:       0
+  offsetAdjustment: 0
+  maxAlignment:    0
+  adjustsStack:    false
+  hasCalls:        false
+  maxCallFrameSize: 0
+  hasOpaqueSPAdjustment: false
+  hasVAStart:      false
+  hasMustTailInVarArgFunc: false
+body:             |
+  bb.0.main_body:
+    liveins: %vgpr0
+
+    %sgpr0_sgpr1 = COPY %exec
+    %vcc = V_CMP_EQ_I32_e64 0, killed %vgpr0, implicit %exec
+    %vgpr0 = V_MOV_B32_e32 4, implicit %exec
+    %sgpr2_sgpr3 = S_OR_B64 %sgpr0_sgpr1, killed %vcc, implicit-def %scc
+    %exec = S_MOV_B64_term killed %sgpr2_sgpr3
+    SI_MASK_BRANCH %bb.2, implicit %exec
+    S_BRANCH %bb.1
+
+  bb.1.if:
+    liveins: %sgpr0_sgpr1
+
+    %sgpr7 = S_MOV_B32 61440
+    %sgpr6 = S_MOV_B32 -1
+    %vgpr0 = BUFFER_LOAD_DWORD_OFFSET %sgpr4_sgpr5_sgpr6_sgpr7, 0, 0, 0, 0, 0, implicit %exec :: (volatile load 4 from `i32 addrspace(1)* undef`)
+
+  bb.2.end:
+    liveins: %vgpr0, %sgpr0_sgpr1
+
+    %exec = S_OR_B64 %exec, killed %sgpr0_sgpr1, implicit-def %scc
+    %sgpr3 = S_MOV_B32 61440
+    %sgpr2 = S_MOV_B32 -1
+    BUFFER_STORE_DWORD_OFFSET killed %vgpr0, %sgpr0_sgpr1_sgpr2_sgpr3, 0, 0, 0, 0, 0, implicit %exec :: (store 4 into `i32 addrspace(1)* undef`)
+    S_ENDPGM
+
+...
+---
+# CHECK-LABEL: name: optimize_if_and_saveexec_xor_valu_middle
+# CHECK: %sgpr2_sgpr3 = S_AND_B64 %sgpr0_sgpr1, killed %vcc, implicit-def %scc
+# CHECK-NEXT: BUFFER_STORE_DWORD_OFFSET %vgpr0, undef %sgpr0_sgpr1_sgpr2_sgpr3, 0, 0, 0, 0, 0, implicit %exec :: (store 4 into `i32 addrspace(1)* undef`)
+# CHECK-NEXT: %sgpr0_sgpr1 = S_XOR_B64 %sgpr2_sgpr3, killed %sgpr0_sgpr1, implicit-def %scc
+# CHECK-NEXT: %exec = COPY killed %sgpr2_sgpr3
+# CHECK-NEXT: SI_MASK_BRANCH
+name:            optimize_if_and_saveexec_xor_valu_middle
+alignment:       0
+exposesReturnsTwice: false
+legalized:       false
+regBankSelected: false
+selected:        false
+tracksRegLiveness: true
+liveins:
+  - { reg: '%vgpr0' }
+frameInfo:
+  isFrameAddressTaken: false
+  isReturnAddressTaken: false
+  hasStackMap:     false
+  hasPatchPoint:   false
+  stackSize:       0
+  offsetAdjustment: 0
+  maxAlignment:    0
+  adjustsStack:    false
+  hasCalls:        false
+  maxCallFrameSize: 0
+  hasOpaqueSPAdjustment: false
+  hasVAStart:      false
+  hasMustTailInVarArgFunc: false
+body:             |
+  bb.0.main_body:
+    liveins: %vgpr0
+
+    %sgpr0_sgpr1 = COPY %exec
+    %vcc = V_CMP_EQ_I32_e64 0, killed %vgpr0, implicit %exec
+    %vgpr0 = V_MOV_B32_e32 4, implicit %exec
+    %sgpr2_sgpr3 = S_AND_B64 %sgpr0_sgpr1, killed %vcc, implicit-def %scc
+    BUFFER_STORE_DWORD_OFFSET %vgpr0, undef %sgpr0_sgpr1_sgpr2_sgpr3, 0, 0, 0, 0, 0, implicit %exec :: (store 4 into `i32 addrspace(1)* undef`)
+    %sgpr0_sgpr1 = S_XOR_B64 %sgpr2_sgpr3, killed %sgpr0_sgpr1, implicit-def %scc
+    %exec = S_MOV_B64_term killed %sgpr2_sgpr3
+    SI_MASK_BRANCH %bb.2, implicit %exec
+    S_BRANCH %bb.1
+
+  bb.1.if:
+    liveins: %sgpr0_sgpr1
+
+    %sgpr7 = S_MOV_B32 61440
+    %sgpr6 = S_MOV_B32 -1
+    %vgpr0 = BUFFER_LOAD_DWORD_OFFSET %sgpr4_sgpr5_sgpr6_sgpr7, 0, 0, 0, 0, 0, implicit %exec :: (volatile load 4 from `i32 addrspace(1)* undef`)
+
+  bb.2.end:
+    liveins: %vgpr0, %sgpr0_sgpr1
+
+    %exec = S_OR_B64 %exec, killed %sgpr0_sgpr1, implicit-def %scc
+    %sgpr3 = S_MOV_B32 61440
+    %sgpr2 = S_MOV_B32 -1
+    BUFFER_STORE_DWORD_OFFSET killed %vgpr0, %sgpr0_sgpr1_sgpr2_sgpr3, 0, 0, 0, 0, 0, implicit %exec :: (store 4 into `i32 addrspace(1)* undef`)
+    S_ENDPGM
+
+...
+---
+# CHECK-LABEL: name: optimize_if_and_saveexec_xor_wrong_reg{{$}}
+# CHECK: %sgpr0_sgpr1 = S_AND_B64 %sgpr0_sgpr1, killed %vcc, implicit-def %scc
+# CHECK-NEXT: %sgpr0_sgpr1 = S_XOR_B64 undef %sgpr2_sgpr3, killed %sgpr0_sgpr1, implicit-def %scc
+# CHECK-NEXT: %exec = COPY %sgpr0_sgpr1
+# CHECK-NEXT: SI_MASK_BRANCH %bb.2, implicit %exec
+name:            optimize_if_and_saveexec_xor_wrong_reg
+alignment:       0
+exposesReturnsTwice: false
+legalized:       false
+regBankSelected: false
+selected:        false
+tracksRegLiveness: true
+liveins:
+  - { reg: '%vgpr0' }
+frameInfo:
+  isFrameAddressTaken: false
+  isReturnAddressTaken: false
+  hasStackMap:     false
+  hasPatchPoint:   false
+  stackSize:       0
+  offsetAdjustment: 0
+  maxAlignment:    0
+  adjustsStack:    false
+  hasCalls:        false
+  maxCallFrameSize: 0
+  hasOpaqueSPAdjustment: false
+  hasVAStart:      false
+  hasMustTailInVarArgFunc: false
+body:             |
+  bb.0.main_body:
+    liveins: %vgpr0
+
+    %sgpr6 = S_MOV_B32 -1
+    %sgpr7 = S_MOV_B32 61440
+    %sgpr0_sgpr1 = COPY %exec
+    %vcc = V_CMP_EQ_I32_e64 0, killed %vgpr0, implicit %exec
+    %vgpr0 = V_MOV_B32_e32 4, implicit %exec
+    %sgpr0_sgpr1 = S_AND_B64 %sgpr0_sgpr1, killed %vcc, implicit-def %scc
+    %sgpr0_sgpr1 = S_XOR_B64 undef %sgpr2_sgpr3, killed %sgpr0_sgpr1, implicit-def %scc
+    %exec = S_MOV_B64_term %sgpr0_sgpr1
+    SI_MASK_BRANCH %bb.2, implicit %exec
+    S_BRANCH %bb.1
+
+  bb.1.if:
+    liveins: %sgpr0_sgpr1 , %sgpr4_sgpr5_sgpr6_sgpr7
+    %vgpr0 = BUFFER_LOAD_DWORD_OFFSET %sgpr4_sgpr5_sgpr6_sgpr7, 0, 0, 0, 0, 0, implicit %exec :: (volatile load 4 from `i32 addrspace(1)* undef`)
+
+  bb.2.end:
+    liveins: %vgpr0, %sgpr0_sgpr1, %sgpr4_sgpr5_sgpr6_sgpr7
+
+    %exec = S_OR_B64 %exec, killed %sgpr0_sgpr1, implicit-def %scc
+    %sgpr3 = S_MOV_B32 61440
+    %sgpr2 = S_MOV_B32 -1
+    BUFFER_STORE_DWORD_OFFSET killed %vgpr0, %sgpr4_sgpr5_sgpr6_sgpr7, 0, 0, 0, 0, 0, implicit %exec :: (store 4 into `i32 addrspace(1)* undef`)
+    S_ENDPGM
+
+...
+---
+# CHECK-LABEL: name: optimize_if_and_saveexec_xor_modify_copy_to_exec{{$}}
+# CHECK: %sgpr2_sgpr3 = S_AND_B64 %sgpr0_sgpr1, killed %vcc, implicit-def %scc
+# CHECK-NEXT: %sgpr2_sgpr3 = S_OR_B64 killed %sgpr2_sgpr3, 1, implicit-def %scc
+# CHECK-NEXT: %sgpr0_sgpr1 = S_XOR_B64 %sgpr2_sgpr3, killed %sgpr0_sgpr1, implicit-def %scc
+# CHECK-NEXT: %exec = COPY killed %sgpr2_sgpr3
+# CHECK-NEXT: SI_MASK_BRANCH %bb.2, implicit %exec
+
+name:            optimize_if_and_saveexec_xor_modify_copy_to_exec
+alignment:       0
+exposesReturnsTwice: false
+legalized:       false
+regBankSelected: false
+selected:        false
+tracksRegLiveness: true
+liveins:
+  - { reg: '%vgpr0' }
+frameInfo:
+  isFrameAddressTaken: false
+  isReturnAddressTaken: false
+  hasStackMap:     false
+  hasPatchPoint:   false
+  stackSize:       0
+  offsetAdjustment: 0
+  maxAlignment:    0
+  adjustsStack:    false
+  hasCalls:        false
+  maxCallFrameSize: 0
+  hasOpaqueSPAdjustment: false
+  hasVAStart:      false
+  hasMustTailInVarArgFunc: false
+body:             |
+  bb.0.main_body:
+    liveins: %vgpr0
+
+    %sgpr0_sgpr1 = COPY %exec
+    %vcc = V_CMP_EQ_I32_e64 0, killed %vgpr0, implicit %exec
+    %vgpr0 = V_MOV_B32_e32 4, implicit %exec
+    %sgpr2_sgpr3 = S_AND_B64 %sgpr0_sgpr1, killed %vcc, implicit-def %scc
+    %sgpr2_sgpr3 = S_OR_B64 killed %sgpr2_sgpr3, 1, implicit-def %scc
+    %sgpr0_sgpr1 = S_XOR_B64 %sgpr2_sgpr3, killed %sgpr0_sgpr1, implicit-def %scc
+    %exec = S_MOV_B64_term killed %sgpr2_sgpr3
+    SI_MASK_BRANCH %bb.2, implicit %exec
+    S_BRANCH %bb.1
+
+  bb.1.if:
+    liveins: %sgpr0_sgpr1
+
+    %sgpr7 = S_MOV_B32 61440
+    %sgpr6 = S_MOV_B32 -1
+    %vgpr0 = BUFFER_LOAD_DWORD_OFFSET %sgpr4_sgpr5_sgpr6_sgpr7, 0, 0, 0, 0, 0, implicit %exec :: (volatile load 4 from `i32 addrspace(1)* undef`)
+
+  bb.2.end:
+    liveins: %vgpr0, %sgpr0_sgpr1
+
+    %exec = S_OR_B64 %exec, killed %sgpr0_sgpr1, implicit-def %scc
+    %sgpr0 = S_MOV_B32 0
+    %sgpr1 = S_MOV_B32 1
+    %sgpr2 = S_MOV_B32 -1
+    %sgpr3 = S_MOV_B32 61440
+    BUFFER_STORE_DWORD_OFFSET killed %vgpr0, %sgpr0_sgpr1_sgpr2_sgpr3, 0, 0, 0, 0, 0, implicit %exec :: (store 4 into `i32 addrspace(1)* undef`)
+    S_ENDPGM
+
+...
+---
+# CHECK-LABEL: name: optimize_if_and_saveexec_xor_live_out_setexec{{$}}
+# CHECK: %sgpr2_sgpr3 = S_AND_B64 %sgpr0_sgpr1, killed %vcc, implicit-def %scc
+# CHECK-NEXT: %sgpr0_sgpr1 = S_XOR_B64 %sgpr2_sgpr3, killed %sgpr0_sgpr1, implicit-def %scc
+# CHECK-NEXT: %exec = COPY %sgpr2_sgpr3
+# CHECK-NEXT: SI_MASK_BRANCH
+name:            optimize_if_and_saveexec_xor_live_out_setexec
+alignment:       0
+exposesReturnsTwice: false
+legalized:       false
+regBankSelected: false
+selected:        false
+tracksRegLiveness: true
+liveins:
+  - { reg: '%vgpr0' }
+frameInfo:
+  isFrameAddressTaken: false
+  isReturnAddressTaken: false
+  hasStackMap:     false
+  hasPatchPoint:   false
+  stackSize:       0
+  offsetAdjustment: 0
+  maxAlignment:    0
+  adjustsStack:    false
+  hasCalls:        false
+  maxCallFrameSize: 0
+  hasOpaqueSPAdjustment: false
+  hasVAStart:      false
+  hasMustTailInVarArgFunc: false
+body:             |
+  bb.0.main_body:
+    liveins: %vgpr0
+
+    %sgpr0_sgpr1 = COPY %exec
+    %vcc = V_CMP_EQ_I32_e64 0, killed %vgpr0, implicit %exec
+    %vgpr0 = V_MOV_B32_e32 4, implicit %exec
+    %sgpr2_sgpr3 = S_AND_B64 %sgpr0_sgpr1, killed %vcc, implicit-def %scc
+    %sgpr0_sgpr1 = S_XOR_B64 %sgpr2_sgpr3, killed %sgpr0_sgpr1, implicit-def %scc
+    %exec = S_MOV_B64_term %sgpr2_sgpr3
+    SI_MASK_BRANCH %bb.2, implicit %exec
+    S_BRANCH %bb.1
+
+  bb.1.if:
+    liveins: %sgpr0_sgpr1, %sgpr2_sgpr3
+    S_SLEEP 0, implicit %sgpr2_sgpr3
+    %sgpr7 = S_MOV_B32 61440
+    %sgpr6 = S_MOV_B32 -1
+    %vgpr0 = BUFFER_LOAD_DWORD_OFFSET %sgpr4_sgpr5_sgpr6_sgpr7, 0, 0, 0, 0, 0, implicit %exec :: (volatile load 4 from `i32 addrspace(1)* undef`)
+
+  bb.2.end:
+    liveins: %vgpr0, %sgpr0_sgpr1
+
+    %exec = S_OR_B64 %exec, killed %sgpr0_sgpr1, implicit-def %scc
+    %sgpr3 = S_MOV_B32 61440
+    %sgpr2 = S_MOV_B32 -1
+    BUFFER_STORE_DWORD_OFFSET killed %vgpr0, %sgpr0_sgpr1_sgpr2_sgpr3, 0, 0, 0, 0, 0, implicit %exec :: (store 4 into `i32 addrspace(1)* undef`)
+    S_ENDPGM
+
+...
+
+# CHECK-LABEL: name: optimize_if_unknown_saveexec{{$}}
+# CHECK: %sgpr0_sgpr1 = COPY %exec
+# CHECK: %sgpr2_sgpr3 = S_LSHR_B64 %sgpr0_sgpr1, killed %vcc_lo, implicit-def %scc
+# CHECK-NEXT: %exec = COPY killed %sgpr2_sgpr3
+# CHECK-NEXT: SI_MASK_BRANCH %bb.2, implicit %exec
+
+name:            optimize_if_unknown_saveexec
+alignment:       0
+exposesReturnsTwice: false
+legalized:       false
+regBankSelected: false
+selected:        false
+tracksRegLiveness: true
+liveins:
+  - { reg: '%vgpr0' }
+frameInfo:
+  isFrameAddressTaken: false
+  isReturnAddressTaken: false
+  hasStackMap:     false
+  hasPatchPoint:   false
+  stackSize:       0
+  offsetAdjustment: 0
+  maxAlignment:    0
+  adjustsStack:    false
+  hasCalls:        false
+  maxCallFrameSize: 0
+  hasOpaqueSPAdjustment: false
+  hasVAStart:      false
+  hasMustTailInVarArgFunc: false
+body:             |
+  bb.0.main_body:
+    liveins: %vgpr0
+
+    %sgpr0_sgpr1 = COPY %exec
+    %vcc = V_CMP_EQ_I32_e64 0, killed %vgpr0, implicit %exec
+    %vgpr0 = V_MOV_B32_e32 4, implicit %exec
+    %sgpr2_sgpr3 = S_LSHR_B64 %sgpr0_sgpr1, killed %vcc_lo, implicit-def %scc
+    %exec = S_MOV_B64_term killed %sgpr2_sgpr3
+    SI_MASK_BRANCH %bb.2, implicit %exec
+    S_BRANCH %bb.1
+
+  bb.1.if:
+    liveins: %sgpr0_sgpr1
+
+    %sgpr7 = S_MOV_B32 61440
+    %sgpr6 = S_MOV_B32 -1
+    %vgpr0 = BUFFER_LOAD_DWORD_OFFSET %sgpr4_sgpr5_sgpr6_sgpr7, 0, 0, 0, 0, 0, implicit %exec :: (volatile load 4 from `i32 addrspace(1)* undef`)
+
+  bb.2.end:
+    liveins: %vgpr0, %sgpr0_sgpr1
+
+    %exec = S_OR_B64 %exec, killed %sgpr0_sgpr1, implicit-def %scc
+    %sgpr3 = S_MOV_B32 61440
+    %sgpr2 = S_MOV_B32 -1
+    BUFFER_STORE_DWORD_OFFSET killed %vgpr0, %sgpr0_sgpr1_sgpr2_sgpr3, 0, 0, 0, 0, 0, implicit %exec :: (store 4 into `i32 addrspace(1)* undef`)
+    S_ENDPGM
+
+...
+---
+# CHECK-LABEL: name: optimize_if_andn2_saveexec{{$}}
+# CHECK: %sgpr0_sgpr1 = S_ANDN2_SAVEEXEC_B64 %vcc, implicit-def %exec, implicit-def %scc, implicit %exec
+# CHECK-NEXT: SI_MASK_BRANCH
+
+name:            optimize_if_andn2_saveexec
+alignment:       0
+exposesReturnsTwice: false
+legalized:       false
+regBankSelected: false
+selected:        false
+tracksRegLiveness: true
+liveins:
+  - { reg: '%vgpr0' }
+frameInfo:
+  isFrameAddressTaken: false
+  isReturnAddressTaken: false
+  hasStackMap:     false
+  hasPatchPoint:   false
+  stackSize:       0
+  offsetAdjustment: 0
+  maxAlignment:    0
+  adjustsStack:    false
+  hasCalls:        false
+  maxCallFrameSize: 0
+  hasOpaqueSPAdjustment: false
+  hasVAStart:      false
+  hasMustTailInVarArgFunc: false
+body:             |
+  bb.0.main_body:
+    liveins: %vgpr0
+
+    %sgpr0_sgpr1 = COPY %exec
+    %vcc = V_CMP_EQ_I32_e64 0, killed %vgpr0, implicit %exec
+    %vgpr0 = V_MOV_B32_e32 4, implicit %exec
+    %sgpr2_sgpr3 = S_ANDN2_B64 %sgpr0_sgpr1, killed %vcc, implicit-def %scc
+    %exec = S_MOV_B64_term killed %sgpr2_sgpr3
+    SI_MASK_BRANCH %bb.2, implicit %exec
+    S_BRANCH %bb.1
+
+  bb.1.if:
+    liveins: %sgpr0_sgpr1
+
+    %sgpr7 = S_MOV_B32 61440
+    %sgpr6 = S_MOV_B32 -1
+    %vgpr0 = BUFFER_LOAD_DWORD_OFFSET %sgpr4_sgpr5_sgpr6_sgpr7, 0, 0, 0, 0, 0, implicit %exec :: (volatile load 4 from `i32 addrspace(1)* undef`)
+
+  bb.2.end:
+    liveins: %vgpr0, %sgpr0_sgpr1
+
+    %exec = S_OR_B64 %exec, killed %sgpr0_sgpr1, implicit-def %scc
+    %sgpr3 = S_MOV_B32 61440
+    %sgpr2 = S_MOV_B32 -1
+    BUFFER_STORE_DWORD_OFFSET killed %vgpr0, %sgpr0_sgpr1_sgpr2_sgpr3, 0, 0, 0, 0, 0, implicit %exec :: (store 4 into `i32 addrspace(1)* undef`)
+    S_ENDPGM
+
+...
+---
+# CHECK-LABEL: name: optimize_if_andn2_saveexec_no_commute{{$}}
+# CHECK: %sgpr2_sgpr3 = S_ANDN2_B64 killed %vcc, %sgpr0_sgpr1, implicit-def %scc
+# CHECK-NEXT: %exec = COPY killed %sgpr2_sgpr3
+# CHECK-NEXT: SI_MASK_BRANCH %bb.2, implicit %exec
+name:            optimize_if_andn2_saveexec_no_commute
+alignment:       0
+exposesReturnsTwice: false
+legalized:       false
+regBankSelected: false
+selected:        false
+tracksRegLiveness: true
+liveins:
+  - { reg: '%vgpr0' }
+frameInfo:
+  isFrameAddressTaken: false
+  isReturnAddressTaken: false
+  hasStackMap:     false
+  hasPatchPoint:   false
+  stackSize:       0
+  offsetAdjustment: 0
+  maxAlignment:    0
+  adjustsStack:    false
+  hasCalls:        false
+  maxCallFrameSize: 0
+  hasOpaqueSPAdjustment: false
+  hasVAStart:      false
+  hasMustTailInVarArgFunc: false
+body:             |
+  bb.0.main_body:
+    liveins: %vgpr0
+
+    %sgpr0_sgpr1 = COPY %exec
+    %vcc = V_CMP_EQ_I32_e64 0, killed %vgpr0, implicit %exec
+    %vgpr0 = V_MOV_B32_e32 4, implicit %exec
+    %sgpr2_sgpr3 = S_ANDN2_B64 killed %vcc, %sgpr0_sgpr1, implicit-def %scc
+    %exec = S_MOV_B64_term killed %sgpr2_sgpr3
+    SI_MASK_BRANCH %bb.2, implicit %exec
+    S_BRANCH %bb.1
+
+  bb.1.if:
+    liveins: %sgpr0_sgpr1
+
+    %sgpr7 = S_MOV_B32 61440
+    %sgpr6 = S_MOV_B32 -1
+    %vgpr0 = BUFFER_LOAD_DWORD_OFFSET %sgpr4_sgpr5_sgpr6_sgpr7, 0, 0, 0, 0, 0, implicit %exec :: (volatile load 4 from `i32 addrspace(1)* undef`)
+
+  bb.2.end:
+    liveins: %vgpr0, %sgpr0_sgpr1
+
+    %exec = S_OR_B64 %exec, killed %sgpr0_sgpr1, implicit-def %scc
+    %sgpr3 = S_MOV_B32 61440
+    %sgpr2 = S_MOV_B32 -1
+    BUFFER_STORE_DWORD_OFFSET killed %vgpr0, %sgpr0_sgpr1_sgpr2_sgpr3, 0, 0, 0, 0, 0, implicit %exec :: (store 4 into `i32 addrspace(1)* undef`)
+    S_ENDPGM
+
+...
+                                                                                                                                                                                                                                                                                                                                                                                                                                          >name[0]        data->sample_spec_is_set && pa_sample_spec_valid(&data->sample_spec)    pa_channel_map_init_auto(&data->channel_map, data->sample_spec.channels, PA_CHANNEL_MAP_DEFAULT)        pa_channel_map_valid(&data->channel_map)        data->channel_map.channels == data->sample_spec.channels        !data->volume_is_set || !(flags & PA_SINK_SHARE_VOLUME_WITH_MASTER)     pa_cvolume_valid(&data->volume) pa_cvolume_compatible(&data->volume, &data->sample_spec)        pa_idxset_put(core->sinks, s, &s->index) >= 0   pa_idxset_put(s->card->sinks, s, NULL) >= 0     Created sink %u "%s" with sample spec %s and channel map %s
+    %s      Volume change to %d at %llu was written %llu usec late  Next volume change in %lld usec The reference volume of sink %s changed from %s to %s.  !volume || pa_cvolume_valid(volume)     volume || pa_sink_flat_volume_enabled(s)        !volume || volume->channels == 1 || pa_cvolume_compatible(volume, &s->sample_spec)      Cannot change volume, Sink is connected to PASSTHROUGH input    <?xml version="1.0" encoding="utf-8" ?>
+<settingsMap>
+  <map sectionType="System.Web.Configuration.MembershipSection, System.Web, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+       mapperType="Mono.Web.Util.MembershipSectionMapper, System.Web, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+       platform="Unix">
+
+    <!-- The 'what' tag specifies which region of the section to modify. The 'value' attribute value is mapper-specific and is not defined here. It can be
+         any expression understood by the mapper to designate the section region to modify.
+    -->
+    <what value="providers">
+      <!-- 'what' can contain any number of occurrences of any three elements:
+              replace - replace the designated region
+	      add - add a new entry to the region
+	      clear - clear the region
+	      remove - remove the designatedregion
+
+              The attributes to any of the above are freeform and are not processed by the mapper manager. They are stored verbatim for the
+	      mapper to peruse.
+      -->
+      <replace name="AspNetSqlMembershipProvider" 
+	       type="System.Web.Security.SqliteMembershipProvider, System.Web, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a" 
+	       connectionStringName="LocalSqliteServer" />
+    </what>
+  </map>
+
+  <map sectionType="System.Web.Configuration.RoleManagerSection, System.Web, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+       mapperType="Mono.Web.Util.RoleManagerSectionMapper, System.Web, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+       platform="Unix">
+
+    <!-- The 'what' tag specifies which region of the section to modify. The 'value' attribute value is mapper-specific and is not defined here. It can be
+         any expression understood by the mapper to designate the section region to modify.
+    -->
+    <what value="providers">
+      <!-- 'what' can contain any number of occurrences of any three elements:
+              replace - replace the designated region
+	      add - add a new entry to the region
+	      clear - clear the region
+	      remove - remove the designatedregion
+
+              The attributes to any of the above are freeform and are not processed by the mapper manager. They are stored verbatim for the
+	      mapper to peruse.
+      -->
+      <replace name="AspNetSqlRoleProvider" 
+	       type="System.Web.Security.SqliteRoleProvider, System.Web, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a" 
+	       connectionStringName="LocalSqliteServer" />
+    </what>
+  </map>
+</settingsMap>
+                                                                                                                                                                                                                                                                                                                                                                                                                  ºªAWBáy–ñœ:%'b‡n≥≈ §–ñ£3ÓâVM§ÕÏË}	dŸój≠ñwRjÁª#TŒ%Fô›Ω	i5ùh∞wu∏å;∞É7ç€í ]Œ»&C∫ÿfïB[4Î:Mh∞˛·4%7û˜Ëk4À)q‘ˇå<ï∫Í\{ÅÀ–ã|≥ÖX»≤%ﬁìPUÖ'≠AQ€5®l2R∑•–-•©ê‚mUTK*¯/€üt%hlL(Y˜D∂≈”n&››ˇá€«Vqò’aSïT5/‡2ÄÌ(¯*íMIÑ°¨1;ï#ÆÃôyP™dÆ»ˆÆÜ¶ôê¯]6YcOTÿF5“aòñ“£6øM†◊D†˘∞¢ù.·∫Æ∫«\˜}•ïùpÎ∫Ißh≥™°©˜` 1Ù5á,¿>]1ù54—jÉàt"·	5d—√¢%4ŸÆ‡¸í5 ˙
+ø∆“Á5‰C’µÈ	GqpäSπ∏À√K_P˙Ü∞àı=;v∫mnã∫lˇ~LÙ€s˛ÖT‘ï‚–‹bn100£«]ƒ ∞í√¨¡°®¡ﬂJvANìI`[›-ìé*åäR7f¥ÎçC[∫)”H™
+∆ZN>vPª¢Q,≤±c¬• ∑‡,Dº‘q∏k˜ΩﬂD¢√Ä‡øxÎk°q«ˆ+UÿFà>⁄\W¸À°)§¬–*2JŒ"Ñµ[02ök
+∫jà∏–å=`>ÉÉ„®KUÖ<UèûºWër≠TTå|R<	wôƒx!ø(√!’Çƒ(Å.ãàEê¿%‘"OÃ™‹n°+á>∂!|„•]	h°]	HCó]h!5ñ∫ôcÖîYdÆÓât“`ÂG–îä‘Œ%¶ ´aÀ´EXéøS|πUPÃ∫Ûä2”*¥ô≥Æa	Ôu¥ÜµÉ‰Bív}D§QqirÖŸ]ÅU’—-$É¿ Z•Q)'»˜[∏®>Ñµ\?ïBS)\Fª(∫¿B†ª∫ëB‘cUAO˘¡Ìb`”–≥zß@÷∑π»,a"ËÛ=Ì'         @SFA  8       Q  µ         ºŒiÚ‘ÒÏ1.·˝ÎÙ2 Ê≤)@"¸0Ù£Ô2‡; @œÒY’Ï"“.‹ gÊ±:O11„¬˛AˇZ                                     º?‚?¡–B¿#Æ ]]ÂﬂPpß√ƒ<K].‚Ùî M 6?‡^—¿D˝†^=’Ô |pß¥≈<^„≥Ò>            //------------------------------------------------------------------------------
+// <copyright file="RuleSettingsCollection.cs" company="Microsoft">
+//     Copyright (c) Microsoft Corporation.  All rights reserved.
+// </copyright>
+//------------------------------------------------------------------------------
+
+namespace System.Web.Configuration {
+    using System;
+    using System.Xml;
+    using System.Configuration;
+    using System.Collections.Specialized;
+    using System.Collections;
+    using System.Globalization;
+    using System.IO;
+    using System.Text;
+    using System.ComponentModel;
+    using System.Web.Hosting;
+    using System.Web.Util;
+    using System.Web.Configuration;
+    using System.Web.Management;
+    using System.Web.Compilation;
+    using System.Security.Permissions;
+
+    [ConfigurationCollection(typeof(RuleSettings))]
+    public sealed class RuleSettingsCollection : ConfigurationElementCollection {
+        private static ConfigurationPropertyCollection _properties;
+
+        static RuleSettingsCollection() {
+            // Property initialization
+            _properties = new ConfigurationPropertyCollection();
+        }
+
+        protected override ConfigurationPropertyCollection Properties {
+            get {
+                return _properties;
+            }
+        }
+
+        public RuleSettingsCollection() {
+        }
+
+        // public properties
+        public RuleSettings this[int index] {
+            get {
+                return (RuleSettings)BaseGet(index);
+            }
+            set {
+                if (BaseGet(index) != null) {
+                    BaseRemoveAt(index);
+                }
+                BaseAdd(index, value);
+            }
+        }
+
+        public new RuleSettings this[string key] {
+            get {
+                return (RuleSettings)BaseGet(key);
+            }
+        }
+
+        protected override ConfigurationElement CreateNewElement() {
+            return new RuleSettings();
+        }
+
+        protected override Object GetElementKey(ConfigurationElement element) {
+            return ((RuleSettings)element).Name;
+        }
+
+        // public methods
+        public void Add(RuleSettings ruleSettings) {
+            BaseAdd(ruleSettings); // add to the end of the list and dont overwrite dups!
+        }
+
+        public void Clear() {
+            BaseClear();
+        }
+
+        public void RemoveAt(int index) {
+            BaseRemoveAt(index);
+        }
+
+        public void Insert(int index, RuleSettings eventSettings) {
+            BaseAdd(index, eventSettings);
+        }
+
+        public void Remove(String name) {
+            BaseRemove(name);
+        }
+
+
+        public int IndexOf(String name) {
+            ConfigurationElement element = BaseGet((Object)name);
+            return (element != null) ? BaseIndexOf(element) : -1;
+        }
+
+        public bool Contains(String name) {
+            return (IndexOf(name) != -1);
+        }
+    }
+}
+                                                                                                                                                   

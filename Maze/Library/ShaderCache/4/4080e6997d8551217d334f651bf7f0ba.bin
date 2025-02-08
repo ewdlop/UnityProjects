@@ -1,0 +1,260 @@
+eElement ("child");
+			node.InnerXml = "<include id='new' />";
+
+			XmlNode new_include = node.SelectSingleNode ("//include");
+			Assert.AreEqual ("<include id=\"new\" />", new_include.OuterXml, "#1");
+
+			// In this case 'node2' has parent 'node'
+			doc = new XmlDocument ();
+			doc.LoadXml ("<foo><include id='original' /></foo>");
+
+			node = doc.CreateElement ("child");
+			XmlNode node2 = doc.CreateElement ("grandchild");
+			node.AppendChild (node2);
+			node2.InnerXml = "<include id='new' />";
+
+			new_include = node2.SelectSingleNode ("/");
+			Assert.AreEqual ("<child><grandchild><include id=\"new\" /></grandchild></child>",
+				new_include.OuterXml, "#2");
+		}
+
+		[Test]
+		public void XPathDocumentMoveToId ()
+		{
+			string dtd = "<!DOCTYPE root [<!ELEMENT root EMPTY><!ATTLIST root id ID #REQUIRED>]>";
+			string xml = dtd + "<root id='aaa'/>";
+			StringReader sr = new StringReader (xml);
+			XPathNavigator nav = new XPathDocument (sr).CreateNavigator ();
+			Assert.IsTrue (nav.MoveToId ("aaa"), "ctor() from TextReader");
+
+			XmlValidatingReader xvr = new XmlValidatingReader (xml, XmlNodeType.Document, null);
+			nav = new XPathDocument (xvr).CreateNavigator ();
+			Assert.IsTrue (nav.MoveToId ("aaa"), "ctor() from XmlValidatingReader");
+
+			// FIXME: it seems to result in different in .NET 2.0.
+		}
+
+		[Test]
+		public void SignificantWhitespaceConstruction ()
+		{
+			string xml = @"<root>
+        <child xml:space='preserve'>    <!-- -->   </child>
+        <child xml:space='preserve'>    </child>
+</root>";
+			XPathNavigator nav = new XPathDocument (
+				new XmlTextReader (xml, XmlNodeType.Document, null),
+				XmlSpace.Preserve).CreateNavigator ();
+			nav.MoveToFirstChild ();
+			nav.MoveToFirstChild ();
+			Assert.AreEqual (XPathNodeType.Whitespace, nav.NodeType, "#1");
+			nav.MoveToNext ();
+			nav.MoveToFirstChild ();
+			Assert.AreEqual (XPathNodeType.SignificantWhitespace,
+				nav.NodeType, "#2");
+		}
+
+		[Test]
+		public void VariableReference ()
+		{
+			XPathDocument xpd = new XPathDocument (
+				new StringReader ("<root>sample text</root>"));
+			XPathNavigator nav = xpd.CreateNavigator ();
+
+			XPathExpression expr = nav.Compile ("foo(string(.),$idx)");
+			XsltArgumentList args = new XsltArgumentList ();
+			args.AddParam ("idx", "", 5);
+			MyContext ctx = new MyContext (nav.NameTable as NameTable, args);
+			ctx.AddNamespace ("x", "urn:foo");
+
+			expr.SetContext (ctx);
+
+			XPathNodeIterator iter = nav.Select ("/root");
+			iter.MoveNext ();
+			Assert.AreEqual ("e", iter.Current.Evaluate (expr), "#1");
+		}
+
+		class MyContext : XsltContext
+		{
+			XsltArgumentList args;
+
+			public MyContext (NameTable nt, XsltArgumentList args)
+				: base (nt)
+			{
+				this.args = args;
+			}
+
+			public override IXsltContextFunction ResolveFunction (
+				string prefix, string name, XPathResultType [] argtypes)
+			{
+				if (name == "foo")
+					return new MyFunction (argtypes);
+				return null;
+			}
+
+			public override IXsltContextVariable ResolveVariable (string prefix, string name)
+			{
+				return new MyVariable (name);
+			}
+
+			public override bool PreserveWhitespace (XPathNavigator nav)
+			{
+				return false;
+			}
+
+			public override int CompareDocument (string uri1, string uri2)
+			{
+				return String.CompareOrdinal (uri1, uri2);
+			}
+
+			public override bool Whitespace {
+				get { return false; }
+			}
+
+			public object GetParam (string name, string ns)
+			{
+				return args.GetParam (name, ns);
+			}
+		}
+
+		public class MyFunction : IXsltContextFunction
+		{
+			XPathResultType [] argtypes;
+
+			public MyFunction (XPathResultType [] argtypes)
+			{
+				this.argtypes = argtypes;
+			}
+
+			public XPathResultType [] ArgTypes {
+				get { return argtypes; }
+			}
+
+			public int Maxargs {
+				get { return 2; }
+			}
+
+			public int Minargs {
+				get { return 2; }
+			}
+
+			public XPathResultType ReturnType {
+				get { return XPathResultType.String; }
+			}
+
+			public object Invoke (XsltContext xsltContext,
+				object [] args, XPathNavigator instanceContext)
+			{
+				return ((string) args [0]) [(int) (double) args [1]].ToString ();
+			}
+		}
+
+		public class MyVariable : IXsltContextVariable
+		{
+			string name;
+
+			public MyVariable (string name)
+			{
+				this.name = name;
+			}
+
+			public object Evaluate (XsltContext ctx)
+			{
+				return ((MyContext) ctx).GetParam (name, String.Empty);
+			}
+
+			public bool IsLocal {
+				get { return false; }
+			}
+
+			public bool IsParam {
+				get { return false; }
+			}
+
+			public XPathResultType VariableType {
+				get { return XPathResultType.Any; }
+			}
+		}
+
+		[Test]
+		public void TextMatchesWhitespace ()
+		{
+			string xml = "<root><ws>   </ws><sws xml:space='preserve'> </sws></root>";
+			XmlDocument doc = new XmlDocument ();
+			doc.PreserveWhitespace = true;
+			doc.LoadXml (xml);
+			XPathNavigator nav = doc.CreateNavigator ();
+			nav.MoveToFirstChild (); // root
+			nav.MoveToFirstChild (); // ws
+			nav.MoveToFirstChild (); // '   '
+			Assert.AreEqual (true, nav.Matches ("text()"), "#1");
+			nav.MoveToParent ();
+			nav.MoveToNext (); // sws
+			nav.MoveToFirstChild (); // ' '
+			Assert.AreEqual (true, nav.Matches ("text()"), "#2");
+		}
+
+		[Test]
+		public void Bug456103 ()
+		{
+			XmlDocument doc = new XmlDocument ();
+			doc.LoadXml ("<root><X/></root>");
+
+			XPathNavigator nav = doc.DocumentElement.CreateNavigator ();
+			// ".//*" does not reproduce the bug.
+			var i = nav.Select ("descendant::*");
+
+			// without this call to get_Count() the bug does not reproduce.
+			Assert.AreEqual (1, i.Count, "#1");
+
+			Assert.IsTrue (i.MoveNext (), "#2");
+		}
+
+		[Test]
+		public void ValueAsBoolean ()
+		{
+			string xml = "<root>1</root>";
+			XmlDocument doc = new XmlDocument ();
+			doc.LoadXml (xml);
+			XPathNavigator nav = doc.CreateNavigator ();
+			nav.MoveToFirstChild ();
+			Assert.AreEqual (true, nav.ValueAsBoolean, "#1");
+			nav.MoveToFirstChild ();
+			Assert.AreEqual (true, nav.ValueAsBoolean, "#2");
+		}
+
+		[Test]
+		[ExpectedException (typeof (FormatException))]
+		public void ValueAsBooleanFail ()
+		{
+			string xml = "<root>1.0</root>";
+			XmlDocument doc = new XmlDocument ();
+			doc.LoadXml (xml);
+			XPathNavigator nav = doc.CreateNavigator ();
+			nav.MoveToFirstChild ();
+			bool i = nav.ValueAsBoolean;
+		}
+
+		[Test]
+		public void ValueAsDateTime ()
+		{
+			DateTime time = new DateTime (2005, 12, 13);
+			string xml = "<root>2005-12-13</root>";
+			XmlDocument doc = new XmlDocument ();
+			doc.LoadXml (xml);
+			XPathNavigator nav = doc.CreateNavigator ();
+			nav.MoveToFirstChild ();
+			Assert.AreEqual (time, nav.ValueAsDateTime, "#1");
+			nav.MoveToFirstChild ();
+			Assert.AreEqual (time, nav.ValueAsDateTime, "#2");
+		}
+
+		[Test]
+		[ExpectedException (typeof (FormatException))]
+		public void ValueAsDateTimeFail ()
+		{
+			string xml = "<root>dating time</root>";
+			XmlDocument doc = new XmlDocument ();
+			doc.LoadXml (xml);
+			XPathNavigator nav = doc.CreateNavigator ();
+			nav.MoveToFirstChild ();
+			DateTim

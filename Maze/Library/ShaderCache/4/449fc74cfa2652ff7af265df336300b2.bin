@@ -1,0 +1,85 @@
+code to
+	the CIL universe: internal calls and native C code.   Internal
+	calls are tightly integrated with the runtime, and have the
+	least overhead, as they use the same data types that the
+	runtime uses.
+
+	The other option is to use the Platform Invoke (P/Invoke) to
+	call C code from the CIL universe, using the standard P/Invoke
+	mechanisms.
+
+	To register an internal call, use this call in the C code:
+
+	mono_add_internal_call ("Hello::Sample", sample);
+
+	Now, you need to declare this on the C# side:
+
+		using System;
+		using System.Runtime.CompilerServices;
+
+	class Hello {
+		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+		extern static string Sample ();
+	}
+
+	Since this routine returns a string, here is the C definition:
+
+		static MonoString*
+		Sample () 
+		{
+			return mono_string_new (mono_domain_get (), "Hello!");
+		}
+
+	Notice that we have to return a `MonoString', and we use the
+	`mono_string_new' API call to obtain this from a string.
+
+* Invoking Methods in the CIL universe
+
+	Calling a method in the CIL universe from C requires a number of steps:
+
+		* Obtaining the MonoMethod handle to the method.
+
+		* The method invocation.
+
+** Obtaining a MonoMethod
+
+	To get a MonoMethod there are several ways.
+
+	You can get a MonoClass (the structure representing a type)
+	using:
+
+	MonoClass *
+	mono_class_from_name (MonoImage *image, const char* name_space, const char *name);
+
+	and then loop in the returned class method array until you get
+	the one you're looking for. There are examples of such
+	searches as static functions in several C files in
+	metadata/*.c: we need to expose one through the API and remove
+	the duplicates.
+
+	The other, simpler, way is to use the functions in
+	debug-helpers.h: there are examples of their use in monograph,
+	mint and the jit as well.  You basically use a string
+	description of the method, like:
+	
+	        "System.Object:GetHashCode()"
+	
+	and create a MonoMethodDesc out of it with:
+	
+	MonoMethodDesc* mono_method_desc_new (const char *name, gboolean include_namespace);
+	
+	You can then use:
+	
+	MonoMethod*     mono_method_desc_search_in_class (MonoMethodDesc *desc, MonoClass *klass);
+	MonoMethod*     mono_method_desc_search_in_image (MonoMethodDesc *desc, MonoImage *image);
+	
+	to search for the method in a class or in an image.  You would
+	tipically do this just once at the start of the program and
+	store the result for reuse somewhere.
+			
+** Invoking a Method
+
+	There are two functions to call a managed method:
+	
+	MonoObject*
+	mono_runtime_invoke         (MonoMethod *method, void *obj, void *

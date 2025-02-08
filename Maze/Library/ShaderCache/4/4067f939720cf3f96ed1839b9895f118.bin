@@ -1,0 +1,176 @@
+   sys.displayhook = self.displayhook
+                exec code in globals, locals
+            finally:
+                sys.stdout = save_stdout
+                sys.stdin = save_stdin
+                sys.displayhook = save_displayhook
+        except:
+            t, v = sys.exc_info()[:2]
+            if type(t) == type(''):
+                exc_type_name = t
+            else: exc_type_name = t.__name__
+            print >>self.stdout, '***', exc_type_name + ':', v
+
+    def precmd(self, line):
+        """Handle alias expansion and ';;' separator."""
+        if not line.strip():
+            return line
+        args = line.split()
+        while args[0] in self.aliases:
+            line = self.aliases[args[0]]
+            ii = 1
+            for tmpArg in args[1:]:
+                line = line.replace("%" + str(ii),
+                                      tmpArg)
+                ii = ii + 1
+            line = line.replace("%*", ' '.join(args[1:]))
+            args = line.split()
+        # split into ';;' separated commands
+        # unless it's an alias command
+        if args[0] != 'alias':
+            marker = line.find(';;')
+            if marker >= 0:
+                # queue up everything after marker
+                next = line[marker+2:].lstrip()
+                self.cmdqueue.append(next)
+                line = line[:marker].rstrip()
+        return line
+
+    def onecmd(self, line):
+        """Interpret the argument as though it had been typed in response
+        to the prompt.
+
+        Checks whether this line is typed at the normal prompt or in
+        a breakpoint command list definition.
+        """
+        if not self.commands_defining:
+            return cmd.Cmd.onecmd(self, line)
+        else:
+            return self.handle_command_def(line)
+
+    def handle_command_def(self,line):
+        """Handles one command line during command list definition."""
+        cmd, arg, line = self.parseline(line)
+        if not cmd:
+            return
+        if cmd == 'silent':
+            self.commands_silent[self.commands_bnum] = True
+            return # continue to handle other cmd def in the cmd list
+        elif cmd == 'end':
+            self.cmdqueue = []
+            return 1 # end of cmd list
+        cmdlist = self.commands[self.commands_bnum]
+        if arg:
+            cmdlist.append(cmd+' '+arg)
+        else:
+            cmdlist.append(cmd)
+        # Determine if we must stop
+        try:
+            func = getattr(self, 'do_' + cmd)
+        except AttributeError:
+            func = self.default
+        # one of the resuming commands
+        if func.func_name in self.commands_resuming:
+            self.commands_doprompt[self.commands_bnum] = False
+            self.cmdqueue = []
+            return 1
+        return
+
+    # Command definitions, called by cmdloop()
+    # The argument is the remaining string on the command line
+    # Return true to exit from the command loop
+
+    do_h = cmd.Cmd.do_help
+
+    def do_commands(self, arg):
+        """Defines a list of commands associated to a breakpoint.
+
+        Those commands will be executed whenever the breakpoint causes
+        the program to stop execution."""
+        if not arg:
+            bnum = len(bdb.Breakpoint.bpbynumber)-1
+        else:
+            try:
+                bnum = int(arg)
+            except:
+                print >>self.stdout, "Usage : commands [bnum]\n        ..." \
+                                     "\n        end"
+                return
+        self.commands_bnum = bnum
+        self.commands[bnum] = []
+        self.commands_doprompt[bnum] = True
+        self.commands_silent[bnum] = False
+        prompt_back = self.prompt
+        self.prompt = '(com) '
+        self.commands_defining = True
+        try:
+            self.cmdloop()
+        finally:
+            self.commands_defining = False
+            self.prompt = prompt_back
+
+    def do_break(self, arg, temporary = 0):
+        # break [ ([filename:]lineno | function) [, "condition"] ]
+        if not arg:
+            if self.breaks:  # There's at least one
+                print >>self.stdout, "Num Type         Disp Enb   Where"
+                for bp in bdb.Breakpoint.bpbynumber:
+                    if bp:
+                        bp.bpprint(self.stdout)
+            return
+        # parse arguments; comma has lowest precedence
+        # and cannot occur in filename
+        filename = None
+        lineno = None
+        cond = None
+        comma = arg.find(',')
+        if comma > 0:
+            # parse stuff after comma: "condition"
+            cond = arg[comma+1:].lstrip()
+            arg = arg[:comma].rstrip()
+        # parse stuff before comma: [filename:]lineno | function
+        colon = arg.rfind(':')
+        funcname = None
+        if colon >= 0:
+            filename = arg[:colon].rstrip()
+            f = self.lookupmodule(filename)
+            if not f:
+                print >>self.stdout, '*** ', repr(filename),
+                print >>self.stdout, 'not found from sys.path'
+                return
+            else:
+                filename = f
+            arg = arg[colon+1:].lstrip()
+            try:
+                lineno = int(arg)
+            except ValueError, msg:
+                print >>self.stdout, '*** Bad lineno:', arg
+                return
+        else:
+            # no colon; can be lineno or function
+            try:
+                lineno = int(arg)
+            except ValueError:
+                try:
+                    func = eval(arg,
+                                self.curframe.f_globals,
+                                self.curframe_locals)
+                except:
+                    func = arg
+                try:
+                    if hasattr(func, 'im_func'):
+                        func = func.im_func
+                    code = func.func_code
+                    #use co_name to identify the bkpt (function names
+                    #could be aliased, but co_name is invariant)
+                    funcname = code.co_name
+                    lineno = code.co_firstlineno
+                    filename = code.co_filename
+                except:
+                    # last thing to try
+                    (ok, filename, ln) = self.lineinfo(arg)
+                    if not ok:
+                        print >>self.stdout, '*** The specified object',
+                        print >>self.stdout, repr(arg),
+                        print >>self.stdout, 'is not a function'
+                 

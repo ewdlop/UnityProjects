@@ -1,0 +1,208 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "GoogleVRSplash.h"
+#include "PipelineStateCache.h"
+#include "ClearQuad.h"
+
+#if GOOGLEVRHMD_SUPPORTED_PLATFORMS
+#include "GoogleVRHMD.h"
+#include "ScreenRendering.h"
+
+static constexpr gvr_mat4f GVRHeadPoseIdentity = {{{1.0f, 0.0f, 0.0f, 0.0f},
+											       {0.0f, 1.0f, 0.0f, 0.0f},
+											       {0.0f, 0.0f, 1.0f, 0.0f},
+											       {0.0f, 0.0f, 0.0f, 1.0f}}};
+
+FGoogleVRSplash::FGoogleVRSplash(FGoogleVRHMD* InGVRHMD)
+	: bEnableSplashScreen(true)
+	, SplashTexture(nullptr)
+	, RenderDistanceInMeter(2.0f)
+	, RenderScale(1.0f)
+	, ViewAngleInDegree(180.0f)
+	, GVRHMD(InGVRHMD)
+	, RendererModule(nullptr)
+	, GVRCustomPresent(nullptr)
+	, bInitialized(false)
+	, bIsShown(false)
+	, bSplashScreenRendered(false)
+{
+	// Make sure we have a valid GoogleVRHMD plugin;
+	check(GVRHMD && GVRHMD->CustomPresent);
+
+	RendererModule = GVRHMD->RendererModule;
+	GVRCustomPresent = GVRHMD->CustomPresent;
+}
+
+FGoogleVRSplash::~FGoogleVRSplash()
+{
+	Hide();
+
+	if (bInitialized)
+	{
+		FCoreUObjectDelegates::PreLoadMap.RemoveAll(this);
+		FCoreUObjectDelegates::PostLoadMapWithWorld.RemoveAll(this);
+	}
+}
+
+void FGoogleVRSplash::Init()
+{
+	if (!bInitialized)
+	{
+		FCoreUObjectDelegates::PreLoadMap.AddSP(this, &FGoogleVRSplash::OnPreLoadMap);
+		FCoreUObjectDelegates::PostLoadMapWithWorld.AddSP(this, &FGoogleVRSplash::OnPostLoadMap);
+
+		LoadDefaultSplashTexturePath();
+		bInitialized = true;
+	}
+}
+
+void FGoogleVRSplash::OnPreLoadMap(const FString&)
+{
+	Show();
+}
+
+void FGoogleVRSplash::OnPostLoadMap(UWorld*)
+{
+	Hide();
+}
+
+void FGoogleVRSplash::AllocateSplashScreenRenderTarget()
+{
+	if (!GVRCustomPresent->TextureSet.IsValid())
+	{
+		const uint32 NumLayers = (GVRHMD->IsMobileMultiView()) ? 2 : 1;
+		GVRCustomPresent->AllocateRenderTargetTexture(0, GVRHMD->GVRRenderTargetSize.X, GVRHMD->GVRRenderTargetSize.Y, PF_B8G8R8A8, NumLayers, 1, TexCreate_None, TexCreate_RenderTargetable);
+	}
+}
+
+void FGoogleVRSplash::Show()
+{
+	check(IsInGameThread());
+
+	if (!bEnableSplashScreen || bIsShown)
+	{
+		return;
+	}
+
+	// Load the splash screen texture if it is specified from the path.
+	if (!SplashTexturePath.IsEmpty())
+	{
+		LoadTexture();
+	}
+
+	bSplashScreenRendered = false;
+
+	GVRHMD->UpdateGVRViewportList();
+
+	// Render the splash screen in the front direction in start space
+	// In this case, recenter will always put the splash screen in front of the user.
+	SplashScreenRenderingHeadPose = GVRHeadPoseIdentity;
+	SplashScreenRenderingOrientation = FRotator(0.0f, 0.0f, 0.0f);
+
+	// Uncomment the following code if you want to put the splash screen using the current
+	// head pose.
+	// Be aware, if you do this, when user recenter the hmd using the controller when
+	// the splash screen displaying, the splash screen may not be in front of the user.
+	// You probably want to call ForceRerenderSplashScreen to rerender the splash screen after
+	// the recentering happens.
+	//GVRHMD->UpdateHeadPose();
+	//SplashScreenRenderingHeadPose = GVRHMD->CachedHeadPose;
+	//SplashScreenRenderingOrientation = FRotator(GVRHMD->CachedFinalHeadRotation);
+
+	RenderThreadTicker = MakeShareable(new FGoogleVRSplashTicker(this));
+	FTickableObjectRenderThread* RenderThreadTickerLocal = RenderThreadTicker.Get();
+	FGoogleVRSplash* pGVRSplash = this;
+	ENQUEUE_RENDER_COMMAND(RegisterAsyncTick)(
+		[RenderThreadTickerLocal, pGVRSplash](FRHICommandListImmediate& RHICmdList)
+		{
+			pGVRSplash->AllocateSplashScreenRenderTarget();
+			RenderThreadTickerLocal->Register();
+		});
+
+	bIsShown = true;
+}
+
+void FGoogleVRSplash::Hide()
+{
+	check(IsInGameThread());
+
+	if (!bIsShown)
+	{
+		return;
+	}
+
+	auto* RenderThreadTickerPtr = &RenderThreadTicker;
+	FGoogleVRSplash* pGVRSplash = this;
+	ENQUEUE_RENDER_COMMAND(UnregisterAsyncTick)(
+		[RenderThreadTickerPtr, pGVRSplash](FRHICommandListImmediate& RHICmdList)
+		{
+			pGVRSplash->SubmitBlackFrame();
+
+			(*RenderThreadTickerPtr)->Unregister();
+			(*RenderThreadTickerPtr) = nullptr;
+		});
+	FlushRenderingCommands();
+
+	if (!SplashTexturePath.IsEmpty())
+	{
+		UnloadTexture();
+	}
+
+	bIsShown = false;
+}
+
+void FGoogleVRSplash::Tick(float DeltaTime)
+{
+	check(IsInRenderingThread());
+
+	if (!bSplashScreenRendered)
+	{
+		RenderStereoSplashScreen(FRHICommandListExecutor::GetImmediateCommandList(), GVRCustomPresent->TextureSet->GetTexture2D());
+		bSplashScreenRendered = true;
+	}
+
+	/*
+	GVRHMD->UpdatePoses();
+	FRotator CurrentHeadOrientation = FRotator(GVRHMD->CachedFinalHeadRotation);
+	// Use the user defined angle to hide the splash screen.
+	// Note that if we do not hide the splash screen at all, users will see a flipped splash screen
+	// when they look backward due to artifact of the async reprojection
+	float HalfViewAngle = ViewAngleInDegree * 0.5f;
+	bool bHideSplashScreen = FMath::Abs(CurrentHeadOrientation.Yaw - SplashScreenRenderingOrientation.Yaw) > HalfViewAngle;
+
+	if (!bSplashScreenRendered && !bHideSplashScreen)
+	{
+		RenderStereoSplashScreen(FRHICommandListExecutor::GetImmediateCommandList(), GVRCustomPresent->TextureSet->GetTexture2D());
+		bSplashScreenRendered = true;
+	}
+	else if (bSplashScreenRendered && bHideSplashScreen)
+	{
+		SubmitBlackFrame();
+		bSplashScreenRendered = false;
+	}
+	*/
+}
+
+bool FGoogleVRSplash::IsTickable() const
+{
+	return bIsShown;
+}
+
+void FGoogleVRSplash::RenderStereoSplashScreen(FRHICommandListImmediate& RHICmdList, FRHITexture2D* DstTexture)
+{
+	UpdateSplashScreenEyeOffset();
+
+	check(IsInRenderingThread());
+
+	// Make sure we have a valid render target
+	check(GVRCustomPresent->TextureSet.IsValid());
+
+	// Bind GVR RenderTarget
+	GVRCustomPresent->BeginRendering(SplashScreenRenderingHeadPose);
+
+	const uint32 ViewportWidth = DstTexture->GetSizeX();
+	const uint32 ViewportHeight = DstTexture->GetSizeY();
+
+	FIntRect DstRect = FIntRect(0, 0, ViewportWidth, ViewportHeight);
+
+	const auto FeatureLevel = GMaxRHIF

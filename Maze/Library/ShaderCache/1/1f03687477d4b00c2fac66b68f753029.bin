@@ -1,0 +1,54 @@
+rary() && FB.getAtom() != SA.getFragment()->getAtom() &&
+           Asm.getSubsectionsViaSymbols()))
+        return false;
+      return true;
+    }
+    // For Darwin x86_64, there is one special case when the reference IsPCRel.
+    // If the fragment with the reference does not have a base symbol but meets
+    // the simple way of dealing with this, in that it is a temporary symbol in
+    // the same atom then it is assumed to be fully resolved.  This is needed so
+    // a relocation entry is not created and so the static linker does not
+    // mess up the reference later.
+    else if(!FB.getAtom() &&
+            SA.isTemporary() && SA.isInSection() && &SecA == &SecB){
+      return true;
+    }
+  }
+
+  // If they are not in the same section, we can't compute the diff.
+  if (&SecA != &SecB)
+    return false;
+
+  const MCFragment *FA = SA.getFragment();
+
+  // Bail if the symbol has no fragment.
+  if (!FA)
+    return false;
+
+  // If the atoms are the same, they are guaranteed to have the same address.
+  if (FA->getAtom() == FB.getAtom())
+    return true;
+
+  // Otherwise, we can't prove this is fully resolved.
+  return false;
+}
+
+static MachO::LoadCommandType getLCFromMCVM(MCVersionMinType Type) {
+  switch (Type) {
+  case MCVM_OSXVersionMin:     return MachO::LC_VERSION_MIN_MACOSX;
+  case MCVM_IOSVersionMin:     return MachO::LC_VERSION_MIN_IPHONEOS;
+  case MCVM_TvOSVersionMin:    return MachO::LC_VERSION_MIN_TVOS;
+  case MCVM_WatchOSVersionMin: return MachO::LC_VERSION_MIN_WATCHOS;
+  }
+  llvm_unreachable("Invalid mc version min type");
+}
+
+void MachObjectWriter::writeObject(MCAssembler &Asm,
+                                   const MCAsmLayout &Layout) {
+  // Compute symbol table information and bind symbol indices.
+  computeSymbolTable(Asm, LocalSymbolData, ExternalSymbolData,
+                     UndefinedSymbolData);
+
+  unsigned NumSections = Asm.size();
+  const MCAssembler::VersionInfoType &VersionInfo =
+    Layout.ge

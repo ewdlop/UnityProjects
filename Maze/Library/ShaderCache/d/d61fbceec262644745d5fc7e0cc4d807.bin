@@ -1,0 +1,55 @@
+
+                    /* output roundtrip or fallback supplementary code point */
+                    c=((c&0x3ff)<<10)+unicodeCodeUnits[offset]+(0x10000-0xdc00);
+                    break;
+                } else if(UCNV_TO_U_USE_FALLBACK(cnv) ? (c&0xfffe)==0xe000 : c==0xe000) {
+                    /* output roundtrip BMP code point above 0xd800 or fallback BMP code point */
+                    c=unicodeCodeUnits[offset];
+                    break;
+                } else if(c==0xffff) {
+                    /* callback(illegal) */
+                    *pErrorCode=U_ILLEGAL_CHAR_FOUND;
+                }
+            } else if(action==MBCS_STATE_VALID_DIRECT_20 ||
+                      (action==MBCS_STATE_FALLBACK_DIRECT_20 && UCNV_TO_U_USE_FALLBACK(cnv))
+            ) {
+                /* output supplementary code point */
+                c=(UChar32)(MBCS_ENTRY_FINAL_VALUE(entry)+0x10000);
+                break;
+            } else if(action==MBCS_STATE_CHANGE_ONLY) {
+                /*
+                 * This serves as a state change without any output.
+                 * It is useful for reading simple stateful encodings,
+                 * for example using just Shift-In/Shift-Out codes.
+                 * The 21 unused bits may later be used for more sophisticated
+                 * state transitions.
+                 */
+                if(cnv->sharedData->mbcs.dbcsOnlyState!=0) {
+                    /* SI/SO are illegal for DBCS-only conversion */
+                    state=(uint8_t)(cnv->mode); /* restore the previous state */
+
+                    /* callback(illegal) */
+                    *pErrorCode=U_ILLEGAL_CHAR_FOUND;
+                }
+            } else if(action==MBCS_STATE_FALLBACK_DIRECT_16) {
+                if(UCNV_TO_U_USE_FALLBACK(cnv)) {
+                    /* output BMP code point */
+                    c=(UChar)MBCS_ENTRY_FINAL_VALUE_16(entry);
+                    break;
+                }
+            } else if(action==MBCS_STATE_UNASSIGNED) {
+                /* just fall through */
+            } else if(action==MBCS_STATE_ILLEGAL) {
+                /* callback(illegal) */
+                *pErrorCode=U_ILLEGAL_CHAR_FOUND;
+            } else {
+                /* reserved (must never occur), or only state change */
+                offset=0;
+                lastSource=source;
+                continue;
+            }
+
+            /* end of action codes: prepare for a new character */
+            offset=0;
+
+            if(U_FAILURE(*pErr

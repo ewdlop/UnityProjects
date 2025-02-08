@@ -1,0 +1,112 @@
+isl::space Space = Map.get_space();
+  isl::space RangeSpace = Space.range();
+
+  if (!RangeSpace.is_wrapping())
+    return true;
+
+  auto *PHI = dyn_cast<PHINode>(static_cast<Value *>(
+      RangeSpace.unwrap().get_tuple_id(isl::dim::out).get_user()));
+  if (!PHI)
+    return true;
+
+  auto *IncomingStmt = static_cast<ScopStmt *>(
+      RangeSpace.unwrap().get_tuple_id(isl::dim::in).get_user());
+  MemoryAccess *PHIRead = IncomingStmt->lookupPHIReadOf(PHI);
+  if (!isNormalizable(PHIRead))
+    return true;
+
+  return false;
+}
+
+bool ZoneAlgorithm::isNormalized(isl::union_map UMap) {
+  auto Result = UMap.foreach_map([this](isl::map Map) -> isl::stat {
+    if (isNormalized(Map))
+      return isl::stat::ok;
+    return isl::stat::error;
+  });
+  return Result == isl::stat::ok;
+}
+
+void ZoneAlgorithm::computeCommon() {
+  AllReads = makeEmptyUnionMap();
+  AllMayWrites = makeEmptyUnionMap();
+  AllMustWrites = makeEmptyUnionMap();
+  AllWriteValInst = makeEmptyUnionMap();
+  AllReadValInst = makeEmptyUnionMap();
+
+  // Default to empty, i.e. no normalization/replacement is taking place. Call
+  // computeNormalizedPHIs() to initialize.
+  NormalizeMap = makeEmptyUnionMap();
+  ComputedPHIs.clear();
+
+  for (auto &Stmt : *S) {
+    for (auto *MA : Stmt) {
+      if (!MA->isLatestArrayKind())
+        continue;
+
+      if (MA->isRead())
+        addArrayReadAccess(MA);
+
+      if (MA->isWrite())
+        addArrayWriteAccess(MA);
+    }
+  }
+
+  // { DomainWrite[] -> Element[] }
+  AllWrites =
+      give(isl_union_map_union(AllMustWrites.copy(), AllMayWrites.copy()));
+
+  // { [Element[] -> Zone[]] -> DomainWrite[] }
+  WriteReachDefZone =
+      computeReachingDefinition(Schedule, AllWrites, false, true);
+  simplify(WriteReachDefZone);
+}
+
+void ZoneAlgorithm::computeNormalizedPHIs() {
+  // Determine which PHIs can reference themselves. They are excluded from
+  // normalization to avoid problems with transitive closures.
+  for (ScopStmt &Stmt : *S) {
+    for (MemoryAccess *MA : Stmt) {
+      if (!MA->isPHIKind())
+        continue;
+      if (!MA->isRead())
+        continue;
+
+      // TODO: Can be more efficient since isRecursivePHI can theoretically
+      // determine recursiveness for multiple values and/or cache results.
+      auto *PHI = cast<PHINode>(MA->getAccessInstruction());
+      if (isRecursivePHI(PHI)) {
+        NumRecursivePHIs++;
+        RecursivePHIs.insert(PHI);
+      }
+    }
+  }
+
+  // { PHIValInst[] -> IncomingValInst[] }
+  isl::union_map AllPHIMaps = makeEmptyUnionMap();
+
+  // Discover new PHIs and try to normalize them.
+  DenseSet<PHINode *> AllPHIs;
+  for (ScopStmt &Stmt : *S) {
+    for (MemoryAccess *MA : Stmt) {
+      if (!MA->isOriginalPHIKind())
+        continue;
+      if (!MA->isRead())
+        continue;
+      if (!isNormalizable(MA))
+        continue;
+
+      auto *PHI = cast<PHINode>(MA->getAccessInstruction());
+      const ScopArrayInfo *SAI = MA->getOriginalScopArrayInfo();
+
+      // { PHIDomain[] -> PHIValInst[] }
+      isl::map PHIValInst = makeValInst(PHI, &Stmt, Stmt.getSurroundingLoop());
+
+      // { IncomingDomain[] -> IncomingValInst[] }
+      isl::union_map IncomingValInsts = makeEmptyUnionMap();
+
+      // Get all incoming values.
+      for (MemoryAccess *MA : S->getPHIIncomings(SAI)) {
+        ScopStmt *IncomingStmt = MA->getStatement();
+
+        auto Incoming

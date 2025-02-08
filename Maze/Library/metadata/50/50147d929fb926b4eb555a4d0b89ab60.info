@@ -1,0 +1,220 @@
+eturns>
+        internal Dictionary<Var, Node> GetVarMap(Node varDefListNode, Dictionary<Var, int> varRefMap)
+        {
+            VarDefListOp varDefListOp = (VarDefListOp)varDefListNode.Op;
+
+            Dictionary<Var, Node> varMap = new Dictionary<Var, Node>();
+            foreach (Node chi in varDefListNode.Children)
+            {
+                VarDefOp varDefOp = (VarDefOp)chi.Op;
+                int nonLeafNodeCount = 0;
+                int refCount = 0;
+                if (!IsScalarOpTree(chi.Child0, null, ref nonLeafNodeCount))
+                {
+                    return null;
+                }
+                //
+                // More heuristics. If there are multiple references to this Var *and*
+                // the defining expression for the Var is "expensive" (ie) has larger than
+                // 100 nodes, then simply pretend that this is too hard to do
+                // Note: we check for more than 2 references, (rather than just more than 1) - this
+                // is simply to let some additional cases through
+                // 
+                if ((nonLeafNodeCount > 100) &&
+                    (varRefMap != null) &&
+                    varRefMap.TryGetValue(varDefOp.Var, out refCount) &&
+                    (refCount > 2))
+                {
+                    return null;
+                }
+
+                Node n;
+                if (varMap.TryGetValue(varDefOp.Var, out n))
+                {
+                    PlanCompiler.Assert(n == chi.Child0, "reusing varDef for different Node?");
+                }
+                else
+                {
+                    varMap.Add(varDefOp.Var, chi.Child0);
+                }
+            }
+
+            return varMap;
+        }
+
+        /// <summary>
+        /// Builds a NULLIF expression (ie) a Case expression that looks like
+        ///    CASE WHEN v is null THEN null ELSE expr END
+        /// where v is the conditionVar parameter, and expr is the value of the expression
+        /// when v is non-null
+        /// </summary>
+        /// <param name="conditionVar">null discriminator var</param>
+        /// <param name="expr">expression</param>
+        /// <returns></returns>
+        internal Node BuildNullIfExpression(Var conditionVar, Node expr)
+        {
+            VarRefOp varRefOp = this.Command.CreateVarRefOp(conditionVar);
+            Node varRefNode = this.Command.CreateNode(varRefOp);
+            Node whenNode = this.Command.CreateNode(this.Command.CreateConditionalOp(OpType.IsNull), varRefNode);
+            Node elseNode = expr;
+            Node thenNode = this.Command.CreateNode(this.Command.CreateNullOp(elseNode.Op.Type));
+            Node caseNode = this.Command.CreateNode(this.Command.CreateCaseOp(elseNode.Op.Type), whenNode, thenNode, elseNode);
+
+            return caseNode;
+        }
+
+        #region Rule Interactions
+        /// <summary>
+        /// Shut off filter pushdown for this subtree
+        /// </summary>
+        /// <param name="n"></param>
+        internal void SuppressFilterPushdown(Node n)
+        {
+            m_suppressions[n] = n;
+        }
+
+        /// <summary>
+        /// Is filter pushdown shut off for this subtree?
+        /// </summary>
+        /// <param name="n"></param>
+        /// <returns></returns>
+        internal bool IsFilterPushdownSuppressed(Node n)
+        {
+            return m_suppressions.ContainsKey(n);
+        }
+
+        /// <summary>
+        /// Given a list of vars try to get one that is of type Int32
+        /// </summary>
+        /// <param name="varList"></param>
+        /// <param name="int32Var"></param>
+        /// <returns></returns>
+        internal static bool TryGetInt32Var(IEnumerable<Var> varList, out Var int32Var)
+        {
+            foreach (Var v in varList)
+            {
+                // Any Int32 var regardless of the fasets will do
+                System.Data.Metadata.Edm.PrimitiveTypeKind typeKind;
+                if (System.Data.Common.TypeHelpers.TryGetPrimitiveTypeKind(v.Type, out typeKind) && typeKind == System.Data.Metadata.Edm.PrimitiveTypeKind.Int32)
+                {
+                    int32Var = v;
+                    return true;
+                }
+            }
+            int32Var = null;
+            return false;
+        }
+
+        #endregion
+
+        #endregion
+
+        #region constructors
+        internal TransformationRulesContext(PlanCompiler compilerState)
+            : base(compilerState.Command)
+        {
+            m_compilerState = compilerState;
+            m_remapper = new VarRemapper(compilerState.Command);
+            m_suppressions = new Dictionary<Node, Node>();
+            m_remappedVars = compilerState.Command.CreateVarVec();
+        }
+
+        #endregion
+
+        #region private state
+        private readonly PlanCompiler m_compilerState;
+        private readonly VarRemapper m_remapper;
+        private readonly Dictionary<Node, Node> m_suppressions;
+        private readonly VarVec m_remappedVars;
+        private bool m_projectionPruningRequired = false;
+        private bool m_reapplyNullabilityRules = false;
+        private Stack<Node> m_relOpAncestors = new Stack<Node>();
+#if DEBUG
+        /// <summary>
+        /// Used to see all the applied rules. 
+        /// One way to use it is to put a conditional breakpoint at the end of
+        /// PostProcessSubTree with the condition m_relOpAncestors.Count == 0
+        /// </summary>
+        internal readonly System.Text.StringBuilder appliedRules = new System.Text.StringBuilder();
+#endif
+        #endregion
+
+        #region RuleProcessingContext Overrides
+        /// <summary>
+        /// Callback function to invoke *before* rules are applied. 
+        /// Calls the VarRemapper to update any Vars in this node, and recomputes 
+        /// the nodeinfo
+        /// </summary>
+        /// <param name="n"></param>
+        internal override void PreProcess(Node n)
+        {
+            m_remapper.RemapNode(n);
+            Command.RecomputeNodeInfo(n);
+        }
+
+        /// <summary>
+        /// Callback function to invoke *before* rules are applied. 
+        /// Calls the VarRemapper to update any Vars in the entire subtree
+        /// If the given node has a RelOp it is pushed on the relOp ancestors stack.
+        /// </summary>
+        /// <param name="subTree"></param>
+        internal override void PreProcessSubTree(Node subTree)
+        {
+            if (subTree.Op.IsRelOp)
+            {
+                m_relOpAncestors.Push(subTree);
+            }
+
+            if (m_remappedVars.IsEmpty)
+            {
+                return;
+            }
+
+            NodeInfo nodeInfo = this.Command.GetNodeInfo(subTree);
+
+            //We need to do remapping only if m_remappedVars overlaps with nodeInfo.ExternalReferences
+            foreach (Var v in nodeInfo.ExternalReferences)
+            {
+                if (m_remappedVars.IsSet(v))
+                {
+                    m_remapper.RemapSubtree(subTree);
+                    break;
+                }
+            }
+        }
+
+        /// <summary>
+        /// If the given node has a RelOp it is popped from the relOp ancestors stack.
+        /// </summary>
+        /// <param name="subtree"></param>
+        internal override void PostProcessSubTree(Node subtree)
+        {
+            if (subtree.Op.IsRelOp)
+            {
+                PlanCompiler.Assert(m_relOpAncestors.Count != 0, "The RelOp ancestors stack is empty when post processing a RelOp subtree");
+                Node poppedNode = m_relOpAncestors.Pop();
+                PlanCompiler.Assert(Object.ReferenceEquals(subtree, poppedNode), "The popped ancestor is not equal to the root of the subtree being post processed");
+            }
+        }
+
+        /// <summary>
+        /// Callback function to invoke *after* rules are applied
+        /// Recomputes the node info, if this node has changed
+        /// If the rule is among the rules after which projection pruning may be beneficial, 
+        /// m_projectionPruningRequired is set to true.
+        /// If the rule is among the rules after which reapplying the nullability rules may be beneficial,
+        /// m_reapplyNullabilityRules is set to true.
+        /// </summary>
+        /// <param name="n"></param>
+        /// <param name="rule">the rule that was applied</param>
+        internal override void PostProcess(Node n, InternalTrees.Rule rule)
+        {
+            if (rule != null)
+            {
+#if DEBUG
+                appliedRules.Append(rule.MethodName);
+                appliedRules.AppendLine();
+#endif
+                if (!this.m_projectionPruningRequired && TransformationRules.RulesRequiringProjectionPruning.Contains(rule))
+                {
+                    this.m_projectionPruni

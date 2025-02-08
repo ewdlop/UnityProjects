@@ -1,0 +1,206 @@
+c"
+  };
+  auto *Data = new GlobalVariable(*M, DataTy, false, NamePtr->getLinkage(),
+                                  ConstantStruct::get(DataTy, DataVals),
+                                  getVarName(Inc, getInstrProfDataVarPrefix()));
+  Data->setVisibility(NamePtr->getVisibility());
+  Data->setSection(getInstrProfSectionName(IPSK_data, TT.getObjectFormat()));
+  Data->setAlignment(INSTR_PROF_DATA_ALIGNMENT);
+  Data->setComdat(ProfileVarsComdat);
+
+  PD.RegionCounters = CounterPtr;
+  PD.DataVar = Data;
+  ProfileDataMap[NamePtr] = PD;
+
+  // Mark the data variable as used so that it isn't stripped out.
+  UsedVars.push_back(Data);
+  // Now that the linkage set by the FE has been passed to the data and counter
+  // variables, reset Name variable's linkage and visibility to private so that
+  // it can be removed later by the compiler.
+  NamePtr->setLinkage(GlobalValue::PrivateLinkage);
+  // Collect the referenced names to be used by emitNameData.
+  ReferencedNames.push_back(NamePtr);
+
+  return CounterPtr;
+}
+
+void InstrProfiling::emitVNodes() {
+  if (!ValueProfileStaticAlloc)
+    return;
+
+  // For now only support this on platforms that do
+  // not require runtime registration to discover
+  // named section start/end.
+  if (needsRuntimeRegistrationOfSectionRange(*M))
+    return;
+
+  size_t TotalNS = 0;
+  for (auto &PD : ProfileDataMap) {
+    for (uint32_t Kind = IPVK_First; Kind <= IPVK_Last; ++Kind)
+      TotalNS += PD.second.NumValueSites[Kind];
+  }
+
+  if (!TotalNS)
+    return;
+
+  uint64_t NumCounters = TotalNS * NumCountersPerValueSite;
+// Heuristic for small programs with very few total value sites.
+// The default value of vp-counters-per-site is chosen based on
+// the observation that large apps usually have a low percentage
+// of value sites that actually have any profile data, and thus
+// the average number of counters per site is low. For small
+// apps with very few sites, this may not be true. Bump up the
+// number of counters in this case.
+#define INSTR_PROF_MIN_VAL_COUNTS 10
+  if (NumCounters < INSTR_PROF_MIN_VAL_COUNTS)
+    NumCounters = std::max(INSTR_PROF_MIN_VAL_COUNTS, (int)NumCounters * 2);
+
+  auto &Ctx = M->getContext();
+  Type *VNodeTypes[] = {
+#define INSTR_PROF_VALUE_NODE(Type, LLVMType, Name, Init) LLVMType,
+#include "llvm/ProfileData/InstrProfData.inc"
+  };
+  auto *VNodeTy = StructType::get(Ctx, makeArrayRef(VNodeTypes));
+
+  ArrayType *VNodesTy = ArrayType::get(VNodeTy, NumCounters);
+  auto *VNodesVar = new GlobalVariable(
+      *M, VNodesTy, false, GlobalValue::PrivateLinkage,
+      Constant::getNullValue(VNodesTy), getInstrProfVNodesVarName());
+  VNodesVar->setSection(
+      getInstrProfSectionName(IPSK_vnodes, TT.getObjectFormat()));
+  UsedVars.push_back(VNodesVar);
+}
+
+void InstrProfiling::emitNameData() {
+  std::string UncompressedData;
+
+  if (ReferencedNames.empty())
+    return;
+
+  std::string CompressedNameStr;
+  if (Error E = collectPGOFuncNameStrings(ReferencedNames, CompressedNameStr,
+                                          DoNameCompression)) {
+    report_fatal_error(toString(std::move(E)), false);
+  }
+
+  auto &Ctx = M->getContext();
+  auto *NamesVal = ConstantDataArray::getString(
+      Ctx, StringRef(CompressedNameStr), false);
+  NamesVar = new GlobalVariable(*M, NamesVal->getType(), true,
+                                GlobalValue::PrivateLinkage, NamesVal,
+                                getInstrProfNamesVarName());
+  NamesSize = CompressedNameStr.size();
+  NamesVar->setSection(
+      getInstrProfSectionName(IPSK_name, TT.getObjectFormat()));
+  UsedVars.push_back(NamesVar);
+
+  for (auto *NamePtr : ReferencedNames)
+    NamePtr->eraseFromParent();
+}
+
+void InstrProfiling::emitRegistration() {
+  if (!needsRuntimeRegistrationOfSectionRange(*M))
+    return;
+
+  // Construct the function.
+  auto *VoidTy = Type::getVoidTy(M->getContext());
+  auto *VoidPtrTy = Type::getInt8PtrTy(M->getContext());
+  auto *Int64Ty = Type::getInt64Ty(M->getContext());
+  auto *RegisterFTy = FunctionType::get(VoidTy, false);
+  auto *RegisterF = Function::Create(RegisterFTy, GlobalValue::InternalLinkage,
+                                     getInstrProfRegFuncsName(), M);
+  RegisterF->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+  if (Options.NoRedZone)
+    RegisterF->addFnAttr(Attribute::NoRedZone);
+
+  auto *RuntimeRegisterTy = FunctionType::get(VoidTy, VoidPtrTy, false);
+  auto *RuntimeRegisterF =
+      Function::Create(RuntimeRegisterTy, GlobalVariable::ExternalLinkage,
+                       getInstrProfRegFuncName(), M);
+
+  IRBuilder<> IRB(BasicBlock::Create(M->getContext(), "", RegisterF));
+  for (Value *Data : UsedVars)
+    if (Data != NamesVar)
+      IRB.CreateCall(RuntimeRegisterF, IRB.CreateBitCast(Data, VoidPtrTy));
+
+  if (NamesVar) {
+    Type *ParamTypes[] = {VoidPtrTy, Int64Ty};
+    auto *NamesRegisterTy =
+        FunctionType::get(VoidTy, makeArrayRef(ParamTypes), false);
+    auto *NamesRegisterF =
+        Function::Create(NamesRegisterTy, GlobalVariable::ExternalLinkage,
+                         getInstrProfNamesRegFuncName(), M);
+    IRB.CreateCall(NamesRegisterF, {IRB.CreateBitCast(NamesVar, VoidPtrTy),
+                                    IRB.getInt64(NamesSize)});
+  }
+
+  IRB.CreateRetVoid();
+}
+
+void InstrProfiling::emitRuntimeHook() {
+  // We expect the linker to be invoked with -u<hook_var> flag for linux,
+  // for which case there is no need to emit the user function.
+  if (Triple(M->getTargetTriple()).isOSLinux())
+    return;
+
+  // If the module's provided its own runtime, we don't need to do anything.
+  if (M->getGlobalVariable(getInstrProfRuntimeHookVarName()))
+    return;
+
+  // Declare an external variable that will pull in the runtime initialization.
+  auto *Int32Ty = Type::getInt32Ty(M->getContext());
+  auto *Var =
+      new GlobalVariable(*M, Int32Ty, false, GlobalValue::ExternalLinkage,
+                         nullptr, getInstrProfRuntimeHookVarName());
+
+  // Make a function that uses it.
+  auto *User = Function::Create(FunctionType::get(Int32Ty, false),
+                                GlobalValue::LinkOnceODRLinkage,
+                                getInstrProfRuntimeHookVarUseFuncName(), M);
+  User->addFnAttr(Attribute::NoInline);
+  if (Options.NoRedZone)
+    User->addFnAttr(Attribute::NoRedZone);
+  User->setVisibility(GlobalValue::HiddenVisibility);
+  if (Triple(M->getTargetTriple()).supportsCOMDAT())
+    User->setComdat(M->getOrInsertComdat(User->getName()));
+
+  IRBuilder<> IRB(BasicBlock::Create(M->getContext(), "", User));
+  auto *Load = IRB.CreateLoad(Var);
+  IRB.CreateRet(Load);
+
+  // Mark the user variable as used so that it isn't stripped out.
+  UsedVars.push_back(User);
+}
+
+void InstrProfiling::emitUses() {
+  if (!UsedVars.empty())
+    appendToUsed(*M, UsedVars);
+}
+
+void InstrProfiling::emitInitialization() {
+  StringRef InstrProfileOutput = Options.InstrProfileOutput;
+
+  if (!InstrProfileOutput.empty()) {
+    // Create variable for profile name.
+    Constant *ProfileNameConst =
+        ConstantDataArray::getString(M->getContext(), InstrProfileOutput, true);
+    GlobalVariable *ProfileNameVar = new GlobalVariable(
+        *M, ProfileNameConst->getType(), true, GlobalValue::WeakAnyLinkage,
+        ProfileNameConst, INSTR_PROF_QUOTE(INSTR_PROF_PROFILE_NAME_VAR));
+    if (TT.supportsCOMDAT()) {
+      ProfileNameVar->setLinkage(GlobalValue::ExternalLinkage);
+      ProfileNameVar->setComdat(M->getOrInsertComdat(
+          StringRef(INSTR_PROF_QUOTE(INSTR_PROF_PROFILE_NAME_VAR))));
+    }
+  }
+
+  Constant *RegisterF = M->getFunction(getInstrProfRegFuncsName());
+  if (!RegisterF)
+    return;
+
+  // Create the initialization function.
+  auto *VoidTy = Type::getVoidTy(M->getContext());
+  auto *F = Function::Create(FunctionType::get(VoidTy, false),
+                             GlobalValue::InternalLinkage,
+                             getInstrProfInitFuncName(), M);
+  F->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);

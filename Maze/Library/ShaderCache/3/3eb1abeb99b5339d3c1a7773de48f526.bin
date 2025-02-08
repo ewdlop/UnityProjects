@@ -1,0 +1,69 @@
+_ops") {
+      isVariadic = true;
+      continue;
+    } else if (Rec->isSubClassOf("RegisterClass")) {
+      OperandType = "OPERAND_REGISTER";
+    } else if (!Rec->isSubClassOf("PointerLikeRegClass") &&
+               !Rec->isSubClassOf("unknown_class"))
+      PrintFatalError("Unknown operand class '" + Rec->getName() +
+        "' in '" + R->getName() + "' instruction!");
+
+    // Check that the operand has a name and that it's unique.
+    if (ArgName.empty())
+      PrintFatalError("In instruction '" + R->getName() + "', operand #" +
+                      Twine(i) + " has no name!");
+    if (!OperandNames.insert(ArgName).second)
+      PrintFatalError("In instruction '" + R->getName() + "', operand #" +
+                      Twine(i) + " has the same name as a previous operand!");
+
+    OperandList.emplace_back(Rec, ArgName, PrintMethod, EncoderMethod,
+                             OperandNamespace + "::" + OperandType, MIOperandNo,
+                             NumOps, MIOpInfo);
+    MIOperandNo += NumOps;
+  }
+
+
+  // Make sure the constraints list for each operand is large enough to hold
+  // constraint info, even if none is present.
+  for (OperandInfo &OpInfo : OperandList)
+    OpInfo.Constraints.resize(OpInfo.MINumOperands);
+}
+
+
+/// getOperandNamed - Return the index of the operand with the specified
+/// non-empty name.  If the instruction does not have an operand with the
+/// specified name, abort.
+///
+unsigned CGIOperandList::getOperandNamed(StringRef Name) const {
+  unsigned OpIdx;
+  if (hasOperandNamed(Name, OpIdx)) return OpIdx;
+  PrintFatalError("'" + TheDef->getName() +
+                  "' does not have an operand named '$" + Name + "'!");
+}
+
+/// hasOperandNamed - Query whether the instruction has an operand of the
+/// given name. If so, return true and set OpIdx to the index of the
+/// operand. Otherwise, return false.
+bool CGIOperandList::hasOperandNamed(StringRef Name, unsigned &OpIdx) const {
+  assert(!Name.empty() && "Cannot search for operand with no name!");
+  for (unsigned i = 0, e = OperandList.size(); i != e; ++i)
+    if (OperandList[i].Name == Name) {
+      OpIdx = i;
+      return true;
+    }
+  return false;
+}
+
+std::pair<unsigned,unsigned>
+CGIOperandList::ParseOperandName(const std::string &Op, bool AllowWholeOp) {
+  if (Op.empty() || Op[0] != '$')
+    PrintFatalError(TheDef->getName() + ": Illegal operand name: '" + Op + "'");
+
+  std::string OpName = Op.substr(1);
+  std::string SubOpName;
+
+  // Check to see if this is $foo.bar.
+  std::string::size_type DotIdx = OpName.find_first_of('.');
+  if (DotIdx != std::string::npos) {
+    SubOpName = OpName.substr(DotIdx+1);
+    if (SubOpName.e

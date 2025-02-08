@@ -1,0 +1,478 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "SceneCapturer.h"
+#include "StereoPanoramaManager.h"
+#include "StereoPanorama.h"
+#include "StereoCapturePawn.h"
+#include "Engine/TextureRenderTarget2D.h"
+#include "Engine/World.h"
+#include "IImageWrapper.h"
+#include "IImageWrapperModule.h"
+#include "Modules/ModuleManager.h"
+#include "Misc/Paths.h"
+#include "UnrealEngine.h"
+#include "Kismet/GameplayStatics.h"
+#include "Misc/FileHelper.h"
+#include "Misc/App.h"
+#include "GameFramework/Actor.h"
+#include "GameFramework/DefaultPawn.h"
+#include "GameFramework/GameModeBase.h"
+#include "GameFramework/Pawn.h"
+#include "GameFramework/PlayerController.h"
+#include "TextureResource.h"
+#include "Engine/BlendableInterface.h"
+#include "ImageUtils.h"
+#include "CoreMinimal.h"
+#include "UObject/ConstructorHelpers.h"
+#include "EngineUtils.h"
+#include "CoreMinimal.h"
+#include "LatentActions.h"
+#include "Engine/LatentActionManager.h"
+#include "MessageLogModule.h"
+#include "Tickable.h"
+
+#define LOCTEXT_NAMESPACE "LogStereoPanorama"
+
+// always combine both eyes
+const bool CombineAtlasesOnOutput = true;
+
+// Rotated Grid Supersampling
+const int32 maxNumSamples = 16;
+struct SamplingPattern
+{
+    int numSamples;
+    FVector2D ssOffsets[maxNumSamples];
+};
+const SamplingPattern g_ssPatterns[] =
+{
+    {
+        1,
+        {
+            FVector2D(0, 0),
+        }
+    },
+    {
+        4,
+        {
+            FVector2D(0.125f, 0.625f),
+            FVector2D(0.375f, 0.125f),
+            FVector2D(0.625f, 0.875f),
+            FVector2D(0.875f, 0.375f),
+        }
+    },
+    {
+        16,
+        {
+            FVector2D(0.125f, 0.125f),
+            FVector2D(0.125f, 0.375f),
+            FVector2D(0.125f, 0.625f),
+            FVector2D(0.125f, 0.875f),
+            FVector2D(0.375f, 0.125f),
+            FVector2D(0.375f, 0.375f),
+            FVector2D(0.375f, 0.625f),
+            FVector2D(0.375f, 0.875f),
+            FVector2D(0.625f, 0.125f),
+            FVector2D(0.625f, 0.375f),
+            FVector2D(0.625f, 0.625f),
+            FVector2D(0.625f, 0.875f),
+            FVector2D(0.875f, 0.125f),
+            FVector2D(0.875f, 0.375f),
+            FVector2D(0.875f, 0.625f),
+            FVector2D(0.875f, 0.875f),
+        }
+    },
+
+};
+
+void USceneCapturer::InitCaptureComponent(USceneCaptureComponent2D* CaptureComponent, float HFov, float VFov, EStereoscopicPass InStereoPass)
+{
+	CaptureComponent->SetVisibility( true );
+	CaptureComponent->SetHiddenInGame( false );
+	CaptureComponent->CaptureStereoPass = InStereoPass;
+	CaptureComponent->FOVAngle = FMath::Max( HFov, VFov );
+	CaptureComponent->bCaptureEveryFrame = false;
+	CaptureComponent->bCaptureOnMovement = false;
+	CaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
+	DisableUnsupportedPostProcesses(CaptureComponent);
+
+	const FName TargetName = MakeUniqueObjectName(this, UTextureRenderTarget2D::StaticClass(), TEXT("SceneCaptureTextureTarget"));
+	CaptureComponent->TextureTarget = NewObject<UTextureRenderTarget2D>(this, TargetName);
+	CaptureComponent->TextureTarget->InitCustomFormat(CaptureWidth, CaptureHeight, PF_FloatRGBA, false);
+	CaptureComponent->TextureTarget->ClearColor = FLinearColor::Red;
+	CaptureComponent->TextureTarget->TargetGamma = 2.2f;
+	CaptureComponent->RegisterComponentWithWorld( GetWorld() ); //GWorld
+
+	// UE4 cannot serialize an array of subobject pointers, so add these objects to the root
+	CaptureComponent->AddToRoot();
+}
+
+USceneCapturer::USceneCapturer(FVTableHelper& Helper)
+    : Super(Helper)
+    , ImageWrapperModule(FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper")))
+    , bIsTicking(false)
+    , CapturePlayerController(NULL)
+    , CaptureGameMode(NULL)
+    , hAngIncrement(FStereoPanoramaManager::HorizontalAngularIncrement->GetFloat())
+    , vAngIncrement(FStereoPanoramaManager::VerticalAngularIncrement->GetFloat())
+    , eyeSeparation(FStereoPanoramaManager::EyeSeparation->GetFloat())
+    , NumberOfHorizontalSteps((int32)(360.0f / hAngIncrement))
+    , NumberOfVerticalSteps((int32)(180.0f / vAngIncrement) + 1) /* Need an extra b/c we only grab half of the top & bottom slices */
+    , SphericalAtlasWidth(FStereoPanoramaManager::StepCaptureWidth->GetInt())
+    , SphericalAtlasHeight(SphericalAtlasWidth / 2)
+    , bForceAlpha(FStereoPanoramaManager::ForceAlpha->GetInt() != 0)
+    , bEnableBilerp(FStereoPanoramaManager::EnableBilerp->GetInt() != 0)
+    , SSMethod(FMath::Clamp<int32>(FStereoPanoramaManager::SuperSamplingMethod->GetInt(), 0, UE_ARRAY_COUNT(g_ssPatterns)))
+    , bOverrideInitialYaw(FStereoPanoramaManager::ShouldOverrideInitialYaw->GetInt() != 0)
+    , ForcedInitialYaw(FRotator::ClampAxis(FStereoPanoramaManager::ForcedInitialYaw->GetFloat()))
+    , OutputDir(FStereoPanoramaManager::OutputDir->GetString().IsEmpty() ? FPaths::ProjectSavedDir() / TEXT("StereoPanorama") : FStereoPanoramaManager::OutputDir->GetString())
+	, UseCameraRotation(FStereoPanoramaManager::UseCameraRotation->GetInt())
+    , dbgDisableOffsetRotation(FStereoPanoramaManager::FadeStereoToZeroAtSides->GetInt() != 0)
+	, OutputBitDepth(FStereoPanoramaManager::OutputBitDepth->GetInt())
+	, bOutputSceneDepth(FStereoPanoramaManager::OutputSceneDepth->GetInt() != 0)
+	, bOutputFinalColor(FStereoPanoramaManager::OutputFinalColor->GetInt() != 0)
+	, bOutputWorldNormal(FStereoPanoramaManager::OutputWorldNormal->GetInt() != 0)
+	, bOutputRoughness(FStereoPanoramaManager::OutputRoughness->GetInt() != 0)
+	, bOutputMetallic(FStereoPanoramaManager::OutputMetalic->GetInt() != 0)
+	, bOutputBaseColor(FStereoPanoramaManager::OutputBaseColor->GetInt() != 0)
+	, bOutputAmbientOcclusion(FStereoPanoramaManager::OutputAmbientOcclusion->GetInt() != 0)
+	, bMonoscopicMode(FStereoPanoramaManager::MonoscopicMode->GetInt() != 0)
+{}
+
+USceneCapturer::USceneCapturer()
+	: ImageWrapperModule(FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper")))
+	, bIsTicking(false)
+	, CapturePlayerController(NULL)
+	, CaptureGameMode(NULL)
+	, hAngIncrement(FStereoPanoramaManager::HorizontalAngularIncrement->GetFloat())
+	, vAngIncrement(FStereoPanoramaManager::VerticalAngularIncrement->GetFloat())
+	, eyeSeparation(FStereoPanoramaManager::EyeSeparation->GetFloat())
+	, NumberOfHorizontalSteps((int32)(360.0f / hAngIncrement))
+	, NumberOfVerticalSteps((int32)(180.0f / vAngIncrement) + 1) /* Need an extra b/c we only grab half of the top & bottom slices */
+	, SphericalAtlasWidth(FStereoPanoramaManager::StepCaptureWidth->GetInt())
+	, SphericalAtlasHeight(SphericalAtlasWidth / 2)
+	, bForceAlpha(FStereoPanoramaManager::ForceAlpha->GetInt() != 0)
+	, bEnableBilerp(FStereoPanoramaManager::EnableBilerp->GetInt() != 0)
+	, SSMethod(FMath::Clamp<int32>(FStereoPanoramaManager::SuperSamplingMethod->GetInt(), 0, UE_ARRAY_COUNT(g_ssPatterns)))
+	, bOverrideInitialYaw(FStereoPanoramaManager::ShouldOverrideInitialYaw->GetInt() != 0)
+	, ForcedInitialYaw(FRotator::ClampAxis(FStereoPanoramaManager::ForcedInitialYaw->GetFloat()))
+	, OutputDir(FStereoPanoramaManager::OutputDir->GetString().IsEmpty() ? FPaths::ProjectSavedDir() / TEXT("StereoPanorama") : FStereoPanoramaManager::OutputDir->GetString())
+	, UseCameraRotation(FStereoPanoramaManager::UseCameraRotation->GetInt())
+	, dbgDisableOffsetRotation(FStereoPanoramaManager::FadeStereoToZeroAtSides->GetInt() != 0)
+	, OutputBitDepth(FStereoPanoramaManager::OutputBitDepth->GetInt())
+	, bOutputSceneDepth(FStereoPanoramaManager::OutputSceneDepth->GetInt() != 0)
+	, bOutputFinalColor(FStereoPanoramaManager::OutputFinalColor->GetInt() != 0)
+	, bOutputWorldNormal(FStereoPanoramaManager::OutputWorldNormal->GetInt() != 0)
+	, bOutputRoughness(FStereoPanoramaManager::OutputRoughness->GetInt() != 0)
+	, bOutputMetallic(FStereoPanoramaManager::OutputMetalic->GetInt() != 0)
+	, bOutputBaseColor(FStereoPanoramaManager::OutputBaseColor->GetInt() != 0)
+	, bOutputAmbientOcclusion(FStereoPanoramaManager::OutputAmbientOcclusion->GetInt() != 0)
+	, bMonoscopicMode(FStereoPanoramaManager::MonoscopicMode->GetInt() != 0)
+{
+	//NOTE: ikrimae: Keeping the old sampling mechanism just until we're sure the new way is always better
+	dbgMatchCaptureSliceFovToAtlasSliceFov = false;
+
+	// NOTE: fmaheux: Adding support for monoscopic capture: lefteye containers will be used to store data
+	//				  righteye containers will be initialized but wont be processed
+	// remove eye separation to avoid offset in mono
+	if (bMonoscopicMode)
+	{
+		eyeSeparation = 0.0f;
+	}
+
+	// Add a message log category for this plugin
+	FMessageLogModule& MessageLogModule = FModuleManager::LoadModuleChecked<FMessageLogModule>("MessageLog");
+	FMessageLogInitializationOptions MessageLogOptions;
+	MessageLogOptions.bShowPages = true;
+	MessageLogOptions.bAllowClear = true;
+	MessageLogOptions.MaxPageCount = 10;
+	MessageLogModule.RegisterLogListing(StereoPanoramaLogName, LOCTEXT("StereoPanoramaLogLabel", "Panoramic Capture Log"));
+	
+	// Get all blendable materials
+	ConstructorHelpers::FObjectFinder<UMaterial> Tmp1(TEXT("/PanoramicCapture/Materials/WorldNormal.WorldNormal"));
+	MaterialBlendableWorldNormal = Tmp1.Object;
+	
+	ConstructorHelpers::FObjectFinder<UMaterial> Tmp2(TEXT("/PanoramicCapture/Materials/AmbientOcclusion.AmbientOcclusion"));
+	MaterialBlendableAO = Tmp2.Object;
+	
+	ConstructorHelpers::FObjectFinder<UMaterial> Tmp3(TEXT("/PanoramicCapture/Materials/BaseColor.BaseColor"));
+	MaterialBlendableBaseColor = Tmp3.Object;
+	
+	ConstructorHelpers::FObjectFinder<UMaterial> Tmp4(TEXT("/PanoramicCapture/Materials/Metallic.Metallic"));
+	MaterialBlendableMetallic = Tmp4.Object;
+	
+	ConstructorHelpers::FObjectFinder<UMaterial> Tmp5(TEXT("/PanoramicCapture/Materials/Roughness.Roughness"));
+	MaterialBlendableRoughness = Tmp5.Object;
+	
+	// Cache all PP volumes and current state
+	CacheAllPostProcessVolumes();
+
+    float captureHFov = 0, captureVFov = 0;
+
+    if (dbgMatchCaptureSliceFovToAtlasSliceFov)
+    {
+        
+		// check bitdepth
+		ensure(OutputBitDepth == 8 || OutputBitDepth == 32);
+		
+		
+		//Slicing Technique 1: Match Capture Slice StripWidth to match the pixel dimensions of AtlasWidth/NumHorizSteps & s.t. stripwidth/stripheight fovs match hAngIncr & vAngIncr
+        //                     Legacy technique but allows setting the strip width to match atlas slice width
+        //                     Pretty wasteful and will break if CaptureHFov & hangIncr/vAngIncr diverge greatly b/c resultant texture will exceed GPU bounds
+        //                     StripHeight is computed based on solving CpxV = CpxH * SpxV / SpxH
+        //                                                               CpxV = CV   * SpxV / SV
+        //                                                               captureVfov = 2 * atan( tan(captureHfov / 2) * (SpxV / SpxH) )
+        sliceHFov = hAngIncrement;
+        sliceVFov = vAngIncrement;
+
+        //TODO: ikrimae: Also do a quick test to see if there are issues with setting fov to something really small ( < 1 degree)
+        //               And it does. Current noted issues: screen space effects like SSAO, AA, SSR are all off
+        //                                                  local eyeadaptation also causes problems. Should probably turn off all PostProcess effects
+        //                                                  small fovs cause floating point errors in the sampling function (probably a bug b/c no thought put towards that)
+        captureHFov = FStereoPanoramaManager::CaptureHorizontalFOV->GetFloat();
+
+        ensure(captureHFov >= hAngIncrement);
+
+        //TODO: ikrimae: In hindsight, there's no reason that strip size should be this at all. Just select a square FOV larger than hAngIncr & vAngIncr
+        //               and then sample the resulting plane accordingly. Remember when updating to this to recheck the math in resample function. Might
+        //               have made assumptions about capture slice dimensions matching the sample strips
+        StripWidth = SphericalAtlasWidth / NumberOfHorizontalSteps;
+        //The scenecapture cube won't allow horizontal & vertical fov to not match the aspect ratio so we have to compute the right dimensions here for square pixels
+        StripHeight = StripWidth * FMath::Tan(FMath::DegreesToRadians(vAngIncrement / 2.0f)) / FMath::Tan(FMath::DegreesToRadians(hAngIncrement / 2.0f));
+
+        const FVector2D slicePlaneDim = FVector2D(
+            2.0f * FMath::Tan(FMath::DegreesToRadians(hAngIncrement) / 2.0f),
+            2.0f * FMath::Tan(FMath::DegreesToRadians(vAngIncrement) / 2.0f));
+
+        const float capturePlaneWidth = 2.0f * FMath::Tan(FMath::DegreesToRadians(captureHFov) / 2.0f);
+
+        //TODO: ikrimae: This is just to let the rest of the existing code work. Sampling rate of the slice can be whatever.
+        //      Ex: To match the highest sampling frequency of the spherical atlas, it should match the area of differential patch
+        //      at ray direction of pixel(0,1) in the atlas
+
+        //Need stripwidth/slicePlaneDim.X = capturewidth / capturePlaneDim.X
+        CaptureWidth = capturePlaneWidth * StripWidth / slicePlaneDim.X;
+        CaptureHeight = CaptureWidth * StripHeight / StripWidth;
+
+        captureVFov = FMath::RadiansToDegrees(2 * FMath::Atan(FMath::Tan(FMath::DegreesToRadians(captureHFov / 2.0f)) * CaptureHeight / CaptureWidth));
+
+        //float dbgCapturePlaneDimY = 2.0f * FMath::Tan(FMath::DegreesToRadians(captureVFov) / 2.0f);
+        //float dbgCaptureHeight = dbgCapturePlaneDimY * StripHeight / slicePlaneDim.Y;
+    }
+    else
+    {
+        //Slicing Technique 2: Each slice is a determined square FOV at a configured preset resolution.
+        //                     Strip Width/Strip Height is determined based on hAngIncrement & vAngIncrement
+        //                     Just make sure pixels/captureHFov >= pixels/hAngIncr && pixels/vAngIncr
+
+        captureVFov = captureHFov = FStereoPanoramaManager::CaptureHorizontalFOV->GetFloat();
+        sliceVFov   = sliceHFov   = captureHFov;
+
+        ensure(captureHFov >= FMath::Max(hAngIncrement, vAngIncrement));
+        
+        //TODO: ikrimae: Re-do for floating point accuracy
+        const FVector2D slicePlaneDim = FVector2D(
+            2.0f * FMath::Tan(FMath::DegreesToRadians(hAngIncrement) / 2.0f),
+            2.0f * FMath::Tan(FMath::DegreesToRadians(vAngIncrement) / 2.0f));
+
+        const FVector2D capturePlaneDim = FVector2D(
+            2.0f * FMath::Tan(FMath::DegreesToRadians(captureHFov) / 2.0f),
+            2.0f * FMath::Tan(FMath::DegreesToRadians(captureVFov) / 2.0f));
+
+        CaptureHeight = CaptureWidth = FStereoPanoramaManager::CaptureSlicePixelWidth->GetInt();
+
+        StripWidth  = CaptureWidth  * slicePlaneDim.X / capturePlaneDim.X;
+        StripHeight = CaptureHeight * slicePlaneDim.Y / capturePlaneDim.Y;
+
+        //TODO: ikrimae: Come back and check for the actual right sampling rate
+        check(StripWidth  >=  (SphericalAtlasWidth / NumberOfHorizontalSteps) && 
+              StripHeight >= (SphericalAtlasHeight / NumberOfVerticalSteps));
+        
+        //Ensure Width/Height is always even
+        StripWidth  += StripWidth & 1;
+        StripHeight += StripHeight & 1;
+
+    }
+
+    UnprojectedAtlasWidth  = NumberOfHorizontalSteps * StripWidth;
+    UnprojectedAtlasHeight = NumberOfVerticalSteps   * StripHeight;
+
+    //NOTE: ikrimae: Ensure that the main gameview is > CaptureWidth x CaptureHeight. Bug in UE4 that won't re-alloc scene render targets to the correct size
+    //               when the scenecapture component > current window render target. https://answers.unrealengine.com/questions/80531/scene-capture-2d-max-resolution.html
+    //TODO: ikrimae: Ensure that r.SceneRenderTargetResizeMethod=2
+    FSystemResolution::RequestResolutionChange(CaptureWidth, CaptureHeight, EWindowMode::Windowed);
+
+	// Creating CaptureSceneComponent to use it as parent scene component.
+	// This scene component will hold same world location from camera.
+	// Camera rotation will be used following UseCameraRotation settings.
+	// Then, angular step turn will be applied to capture components locally to simplify calculation step that finding proper rotation.
+	CaptureSceneComponent = CreateDefaultSubobject<USceneComponent>(TEXT("CaptureSceneComponent"));
+	CaptureSceneComponent->AddToRoot();
+
+	for( int CaptureIndex = 0; CaptureIndex < FStereoPanoramaManager::ConcurrentCaptures->GetInt(); CaptureIndex++ )
+	{
+		EStereoscopicPass StereoPass = EStereoscopicPass::eSSP_LEFT_EYE;
+		if (bMonoscopicMode)
+		{
+			// use left eye for monoscopic capture
+			StereoPass = EStereoscopicPass::eSSP_FULL;
+		}
+
+		// initialize left eye
+		FString LeftCounter = FString::Printf(TEXT("LeftEyeCaptureComponent_%04d"), CaptureIndex);
+		USceneCaptureComponent2D* LeftEyeCaptureComponent = CreateDefaultSubobject<USceneCaptureComponent2D>(*LeftCounter);
+		LeftEyeCaptureComponent->bTickInEditor = false;
+		LeftEyeCaptureComponent->SetComponentTickEnabled(false);
+		LeftEyeCaptureComponent->AttachToComponent(CaptureSceneComponent, FAttachmentTransformRules::KeepRelativeTransform);
+		InitCaptureComponent( LeftEyeCaptureComponent, captureHFov, captureVFov, StereoPass);
+		LeftEyeCaptureComponents.Add( LeftEyeCaptureComponent );
+
+		// initialize right eye
+		FString RightCounter = FString::Printf(TEXT("RightEyeCaptureComponent_%04d"), CaptureIndex);
+		USceneCaptureComponent2D* RightEyeCaptureComponent = CreateDefaultSubobject<USceneCaptureComponent2D>(*RightCounter);
+		RightEyeCaptureComponent->bTickInEditor = false;
+		RightEyeCaptureComponent->SetComponentTickEnabled(false);
+		RightEyeCaptureComponent->AttachToComponent(CaptureSceneComponent, FAttachmentTransformRules::KeepRelativeTransform);
+		InitCaptureComponent(RightEyeCaptureComponent, captureHFov, captureVFov, EStereoscopicPass::eSSP_RIGHT_EYE);
+		RightEyeCaptureComponents.Add(RightEyeCaptureComponent);
+	}
+
+	CurrentStep = 0;
+	TotalSteps = 0;
+	FrameDescriptors = TEXT( "FrameNumber, GameClock, TimeTaken(s)" LINE_TERMINATOR );
+	CaptureStep = ECaptureStep::Reset;
+
+	// populate RenderPasses based on user options
+	CurrentRenderPassIndex = 0;
+	if (bOutputFinalColor)
+	{
+		RenderPasses.Add(ERenderPass::FinalColor);
+	}
+
+	if (bOutputSceneDepth)
+	{
+		RenderPasses.Add(ERenderPass::SceneDepth);
+	}
+
+	if (bOutputWorldNormal)
+	{
+		RenderPasses.Add(ERenderPass::WorldNormal);
+	}
+
+	if (bOutputRoughness)
+	{
+		RenderPasses.Add(ERenderPass::Roughness);
+	}
+
+	if (bOutputMetallic)
+	{
+		RenderPasses.Add(ERenderPass::Metallic);
+	}
+
+	if (bOutputBaseColor)
+	{
+		RenderPasses.Add(ERenderPass::BaseColor);
+	}
+
+	if (bOutputAmbientOcclusion)
+	{
+		RenderPasses.Add(ERenderPass::AO);
+	}
+
+	// default behavior is to render finalcolor if no passes are specified
+	if (RenderPasses.Num() == 0)
+	{
+		RenderPasses.Add(ERenderPass::FinalColor);
+	}
+
+}
+
+// Output current render pass name as string
+FString USceneCapturer::GetCurrentRenderPassName()
+{
+	FString RenderPassString;
+	switch (RenderPasses[CurrentRenderPassIndex])
+	{
+		case ERenderPass::FinalColor: RenderPassString = "FinalColor"; break;
+		case ERenderPass::WorldNormal: RenderPassString = "WorldNormal"; break;
+		case ERenderPass::AO: RenderPassString = "AO"; break;
+		case ERenderPass::BaseColor: RenderPassString = "BaseColor"; break;
+		case ERenderPass::Metallic: RenderPassString = "Metallic"; break;
+		case ERenderPass::Roughness: RenderPassString = "Roughness"; break;
+		case ERenderPass::SceneDepth: RenderPassString = "SceneDepth"; break;
+		default: RenderPassString = ""; break;
+	}
+	return RenderPassString;
+}
+
+UMaterial* USceneCapturer::GetCurrentBlendableMaterial()
+{
+	UMaterial* CurrentBlendable;
+	switch (RenderPasses[CurrentRenderPassIndex])
+	{
+		case ERenderPass::WorldNormal: CurrentBlendable = MaterialBlendableWorldNormal; break;
+		case ERenderPass::AO: CurrentBlendable = MaterialBlendableAO; break;
+		case ERenderPass::BaseColor: CurrentBlendable = MaterialBlendableBaseColor; break;
+		case ERenderPass::Metallic: CurrentBlendable = MaterialBlendableMetallic; break;
+		case ERenderPass::Roughness: CurrentBlendable = MaterialBlendableRoughness; break;
+		default: CurrentBlendable = NULL; break;
+	}
+	return CurrentBlendable;
+}
+
+UWorld* USceneCapturer::GetTickableGameObjectWorld() const 
+{
+	// Check SceneCapturer have CaptureComponents and parent scene component is not marked as pending kill.
+	if (LeftEyeCaptureComponents.Num() > 0 && !CaptureSceneComponent->IsPendingKill())
+	{
+		return CaptureSceneComponent->GetWorld();
+	}
+	return nullptr;
+}
+
+void USceneCapturer::Reset()
+{
+	// apply old states on PP volumes
+	EnablePostProcessVolumes();
+	
+	for( int CaptureIndex = 0; CaptureIndex < FStereoPanoramaManager::ConcurrentCaptures->GetInt(); CaptureIndex++ )
+	{
+		USceneCaptureComponent2D* LeftEyeCaptureComponent = LeftEyeCaptureComponents[CaptureIndex];
+		USceneCaptureComponent2D* RightEyeCaptureComponent = RightEyeCaptureComponents[CaptureIndex];
+
+		LeftEyeCaptureComponent->SetVisibility( false );
+		LeftEyeCaptureComponent->SetHiddenInGame( true );
+		
+		// UE4 cannot serialize an array of subobject pointers, so work around the GC problems
+		LeftEyeCaptureComponent->RemoveFromRoot();
+
+		RightEyeCaptureComponent->SetVisibility( false );
+		RightEyeCaptureComponent->SetHiddenInGame( true );
+		
+		// UE4 cannot serialize an array of subobject pointers, so work around the GC problems
+		RightEyeCaptureComponent->RemoveFromRoot();
+	}
+
+	UnprojectedLeftEyeAtlas.Empty();
+	UnprojectedRightEyeAtlas.Empty();
+	CaptureSceneComponent->RemoveFromRoot();
+}
+
+// Make sure we remove all blendables
+void USceneCapturer::RemoveAllBlendables(USceneCaptureComponent2D* CaptureComponent)
+{
+	CaptureComponent->PostProcessSettings.RemoveBlendable(MaterialBlendableWorldNormal);
+	CaptureComponent->PostProcessSettings.RemoveBlendable(MaterialBlendableAO);
+	CaptureComponent->PostProcessSettings.RemoveBlendable(MaterialBlendableBaseColor);
+	CaptureComponent->PostProcessSettings.RemoveBlendable(MaterialBlendableMetallic);
+	CaptureComponent->PostProcessSettings.RemoveBlendable(MaterialBlendableRoughness);
+}
+
+// Disable screen space post processes we cannot use while capturing
+void USceneCapturer::DisableUnsupportedPostProcesses(USceneCaptureComponent2D* CaptureComponent)
+{
+	CaptureComponent->PostProcessSettings.bOverride_GrainIntensity = true;
+	CaptureComponent->PostProcessSettings.GrainIntensity = 0.0f;
+	CaptureComponent->PostProcessSettings.bOverride_MotionBlurAmount = true;
+	CaptureComponent->PostProcessSettings.MotionBlurAmount = 0.0f;
+	CaptureComponent->PostProcessSettings.bOverride_ScreenSpaceReflectionIntensity = true;
+	CaptureComponent->PostProcessSettings.ScreenSpaceReflectionIntensity = 

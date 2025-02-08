@@ -1,0 +1,258 @@
+/*
+*******************************************************************************
+* Copyright (C) 2009-2014, International Business Machines Corporation and
+* others. All Rights Reserved.
+*******************************************************************************
+*/
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_COLLATION
+
+#include "unicode/alphaindex.h"
+#include "unicode/coll.h"
+#include "unicode/localpointer.h"
+#include "unicode/normalizer2.h"
+#include "unicode/tblcoll.h"
+#include "unicode/uchar.h"
+#include "unicode/ulocdata.h"
+#include "unicode/uniset.h"
+#include "unicode/uobject.h"
+#include "unicode/usetiter.h"
+#include "unicode/utf16.h"
+
+#include "cmemory.h"
+#include "cstring.h"
+#include "uassert.h"
+#include "uvector.h"
+#include "uvectr64.h"
+
+//#include <string>
+//#include <iostream>
+
+#define LENGTHOF(array) (int32_t)(sizeof(array)/sizeof((array)[0]))
+
+U_NAMESPACE_BEGIN
+
+namespace {
+
+/**
+ * Prefix string for Chinese index buckets.
+ * See http://unicode.org/repos/cldr/trunk/specs/ldml/tr35-collation.html#Collation_Indexes
+ */
+const UChar BASE[1] = { 0xFDD0 };
+const int32_t BASE_LENGTH = 1;
+
+UBool isOneLabelBetterThanOther(const Normalizer2 &nfkdNormalizer,
+                                const UnicodeString &one, const UnicodeString &other);
+
+}  // namespace
+
+static int32_t U_CALLCONV
+collatorComparator(const void *context, const void *left, const void *right);
+
+static int32_t U_CALLCONV
+recordCompareFn(const void *context, const void *left, const void *right);
+
+//  UVector<Record *> support function, delete a Record.
+static void U_CALLCONV
+alphaIndex_deleteRecord(void *obj) {
+    delete static_cast<AlphabeticIndex::Record *>(obj);
+}
+
+namespace {
+
+UnicodeString *ownedString(const UnicodeString &s, LocalPointer<UnicodeString> &owned,
+                           UErrorCode &errorCode) {
+    if (U_FAILURE(errorCode)) { return NULL; }
+    if (owned.isValid()) {
+        return owned.orphan();
+    }
+    UnicodeString *p = new UnicodeString(s);
+    if (p == NULL) {
+        errorCode = U_MEMORY_ALLOCATION_ERROR;
+    }
+    return p;
+}
+
+inline UnicodeString *getString(const UVector &list, int32_t i) {
+    return static_cast<UnicodeString *>(list[i]);
+}
+
+inline AlphabeticIndex::Bucket *getBucket(const UVector &list, int32_t i) {
+    return static_cast<AlphabeticIndex::Bucket *>(list[i]);
+}
+
+inline AlphabeticIndex::Record *getRecord(const UVector &list, int32_t i) {
+    return static_cast<AlphabeticIndex::Record *>(list[i]);
+}
+
+/**
+ * Like Java Collections.binarySearch(List, String, Comparator).
+ *
+ * @return the index>=0 where the item was found,
+ *         or the index<0 for inserting the string at ~index in sorted order
+ */
+int32_t binarySearch(const UVector &list, const UnicodeString &s, const Collator &coll) {
+    if (list.size() == 0) { return ~0; }
+    int32_t start = 0;
+    int32_t limit = list.size();
+    for (;;) {
+        int32_t i = (start + limit) / 2;
+        const UnicodeString *si = static_cast<UnicodeString *>(list.elementAt(i));
+        UErrorCode errorCode = U_ZERO_ERROR;
+        UCollationResult cmp = coll.compare(s, *si, errorCode);
+        if (cmp == UCOL_EQUAL) {
+            return i;
+        } else if (cmp < 0) {
+            if (i == start) {
+                return ~start;  // insert s before *si
+            }
+            limit = i;
+        } else {
+            if (i == start) {
+                return ~(start + 1);  // insert s after *si
+            }
+            start = i;
+        }
+    }
+}
+
+}  // namespace
+
+// The BucketList is not in the anonymous namespace because only Clang
+// seems to support its use in other classes from there.
+// However, we also don't need U_I18N_API because it is not used from outside the i18n library.
+class BucketList : public UObject {
+public:
+    BucketList(UVector *bucketList, UVector *publicBucketList)
+            : bucketList_(bucketList), immutableVisibleList_(publicBucketList) {
+        int32_t displayIndex = 0;
+        for (int32_t i = 0; i < publicBucketList->size(); ++i) {
+            getBucket(*publicBucketList, i)->displayIndex_ = displayIndex++;
+        }
+    }
+
+    // The virtual destructor must not be inline.
+    // See ticket #8454 for details.
+    virtual ~BucketList();
+
+    int32_t getBucketCount() const {
+        return immutableVisibleList_->size();
+    }
+
+    int32_t getBucketIndex(const UnicodeString &name, const Collator &collatorPrimaryOnly,
+                           UErrorCode &errorCode) {
+        // binary search
+        int32_t start = 0;
+        int32_t limit = bucketList_->size();
+        while ((start + 1) < limit) {
+            int32_t i = (start + limit) / 2;
+            const AlphabeticIndex::Bucket *bucket = getBucket(*bucketList_, i);
+            UCollationResult nameVsBucket =
+                collatorPrimaryOnly.compare(name, bucket->lowerBoundary_, errorCode);
+            if (nameVsBucket < 0) {
+                limit = i;
+            } else {
+                start = i;
+            }
+        }
+        const AlphabeticIndex::Bucket *bucket = getBucket(*bucketList_, start);
+        if (bucket->displayBucket_ != NULL) {
+            bucket = bucket->displayBucket_;
+        }
+        return bucket->displayIndex_;
+    }
+
+    /** All of the buckets, visible and invisible. */
+    UVector *bucketList_;
+    /** Just the visible buckets. */
+    UVector *immutableVisibleList_;
+};
+
+BucketList::~BucketList() {
+    delete bucketList_;
+    if (immutableVisibleList_ != bucketList_) {
+        delete immutableVisibleList_;
+    }
+}
+
+AlphabeticIndex::ImmutableIndex::~ImmutableIndex() {
+    delete buckets_;
+    delete collatorPrimaryOnly_;
+}
+
+int32_t
+AlphabeticIndex::ImmutableIndex::getBucketCount() const {
+    return buckets_->getBucketCount();
+}
+
+int32_t
+AlphabeticIndex::ImmutableIndex::getBucketIndex(
+        const UnicodeString &name, UErrorCode &errorCode) const {
+    return buckets_->getBucketIndex(name, *collatorPrimaryOnly_, errorCode);
+}
+
+const AlphabeticIndex::Bucket *
+AlphabeticIndex::ImmutableIndex::getBucket(int32_t index) const {
+    if (0 <= index && index < buckets_->getBucketCount()) {
+        return icu::getBucket(*buckets_->immutableVisibleList_, index);
+    } else {
+        return NULL;
+    }
+}
+
+AlphabeticIndex::AlphabeticIndex(const Locale &locale, UErrorCode &status)
+        : inputList_(NULL),
+          labelsIterIndex_(-1), itemsIterIndex_(0), currentBucket_(NULL),
+          maxLabelCount_(99),
+          initialLabels_(NULL), firstCharsInScripts_(NULL),
+          collator_(NULL), collatorPrimaryOnly_(NULL),
+          buckets_(NULL) {
+    init(&locale, status);
+}
+
+
+AlphabeticIndex::AlphabeticIndex(RuleBasedCollator *collator, UErrorCode &status)
+        : inputList_(NULL),
+          labelsIterIndex_(-1), itemsIterIndex_(0), currentBucket_(NULL),
+          maxLabelCount_(99),
+          initialLabels_(NULL), firstCharsInScripts_(NULL),
+          collator_(collator), collatorPrimaryOnly_(NULL),
+          buckets_(NULL) {
+    init(NULL, status);
+}
+
+
+
+AlphabeticIndex::~AlphabeticIndex() {
+    delete collator_;
+    delete collatorPrimaryOnly_;
+    delete firstCharsInScripts_;
+    delete buckets_;
+    delete inputList_;
+    delete initialLabels_;
+}
+
+
+AlphabeticIndex &AlphabeticIndex::addLabels(const UnicodeSet &additions, UErrorCode &status) {
+    if (U_FAILURE(status)) {
+        return *this;
+    }
+    initialLabels_->addAll(additions);
+    clearBuckets();
+    return *this;
+}
+
+
+AlphabeticIndex &AlphabeticIndex::addLabels(const Locale &locale, UErrorCode &status) {
+    addIndexExemplars(locale, status);
+    clearBuckets();
+    return *this;
+}
+
+
+AlphabeticIndex::ImmutableIndex *AlphabeticIndex::buildImmutableIndex(UErrorCode &errorCode) {
+    if (U_FAILURE(errorCode)) { return NULL; }
+    // In C++, the ImmutableIndex must own its copy of the BucketList,
+    // even if it contains no records, for p

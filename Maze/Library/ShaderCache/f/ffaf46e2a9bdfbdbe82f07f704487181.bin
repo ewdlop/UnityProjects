@@ -1,0 +1,201 @@
+// Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+// See the LICENSE file in the project root for more information.
+
+#include "pal_config.h"
+#include "pal_networking.h"
+#include "pal_io.h"
+#include "pal_safecrt.h"
+#include "pal_utilities.h"
+#include <fcntl.h>
+
+#include <stdlib.h>
+#include <limits.h>
+#include <pthread.h>
+#include <arpa/inet.h>
+#include <assert.h>
+#include <sys/time.h>
+#if HAVE_EPOLL
+#include <sys/epoll.h>
+#elif HAVE_KQUEUE
+#include <sys/types.h>
+#include <sys/event.h>
+#elif HAVE_SYS_POLL_H
+#include <sys/poll.h>
+#endif
+#include <errno.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#if HAVE_SYS_SOCKIO_H
+#include <sys/sockio.h>
+#endif
+#include <sys/un.h>
+#if defined(__APPLE__) && __APPLE__
+#include <sys/socketvar.h>
+#endif
+#if !HAVE_GETDOMAINNAME && HAVE_UTSNAME_DOMAINNAME
+#include <sys/utsname.h>
+#include <stdio.h>
+#endif
+#include <unistd.h>
+#include <pwd.h>
+#if HAVE_SENDFILE_4
+#include <sys/sendfile.h>
+#elif HAVE_SENDFILE_6
+#include <sys/uio.h>
+#endif
+#if !HAVE_IN_PKTINFO
+#include <net/if.h>
+#if HAVE_GETIFADDRS
+#include <ifaddrs.h>
+#endif
+#endif
+
+#if HAVE_KQUEUE
+#if KEVENT_HAS_VOID_UDATA
+static void* GetKeventUdata(uintptr_t udata)
+{
+    return (void*)udata;
+}
+static uintptr_t GetSocketEventData(void* udata)
+{
+    return (uintptr_t)udata;
+}
+#else
+static intptr_t GetKeventUdata(uintptr_t udata)
+{
+    return (intptr_t)udata;
+}
+static uintptr_t GetSocketEventData(intptr_t udata)
+{
+    return (uintptr_t)udata;
+}
+#endif
+#if KEVENT_REQUIRES_INT_PARAMS
+static int GetKeventNchanges(int nchanges)
+{
+    return nchanges;
+}
+static int16_t GetKeventFilter(int16_t filter)
+{
+    return filter;
+}
+static uint16_t GetKeventFlags(uint16_t flags)
+{
+    return flags;
+}
+#else
+static size_t GetKeventNchanges(int nchanges)
+{
+    return (size_t)nchanges;
+}
+static int16_t GetKeventFilter(uint32_t filter)
+{
+    return (int16_t)filter;
+}
+static uint16_t GetKeventFlags(uint32_t flags)
+{
+    return (uint16_t)flags;
+}
+#endif
+#endif
+
+#if !HAVE_IN_PKTINFO
+// On platforms, such as FreeBSD, where in_pktinfo
+// is not available, fallback to custom definition
+// with required members.
+struct in_pktinfo
+{
+    struct in_addr ipi_addr;
+};
+#define IP_PKTINFO IP_RECVDSTADDR
+#endif
+
+#if !defined(IPV6_ADD_MEMBERSHIP) && defined(IPV6_JOIN_GROUP)
+#define IPV6_ADD_MEMBERSHIP IPV6_JOIN_GROUP
+#endif
+
+#if !defined(IPV6_DROP_MEMBERSHIP) && defined(IPV6_LEAVE_GROUP)
+#define IPV6_DROP_MEMBERSHIP IPV6_LEAVE_GROUP
+#endif
+
+enum
+{
+#if defined(__APPLE__) && __APPLE__
+    LINGER_OPTION_NAME = SO_LINGER_SEC
+#else
+    LINGER_OPTION_NAME = SO_LINGER,
+#endif
+};
+
+enum
+{
+    INET6_ADDRSTRLEN_MANAGED = 65 // Managed code has a longer max IPv6 string length
+};
+
+c_static_assert(GetHostErrorCodes_HOST_NOT_FOUND == HOST_NOT_FOUND);
+c_static_assert(GetHostErrorCodes_TRY_AGAIN == TRY_AGAIN);
+c_static_assert(GetHostErrorCodes_NO_RECOVERY == NO_RECOVERY);
+c_static_assert(GetHostErrorCodes_NO_DATA == NO_DATA);
+c_static_assert(GetHostErrorCodes_NO_ADDRESS == NO_ADDRESS);
+c_static_assert(sizeof(uint8_t) == sizeof(char)); // We make casts from uint8_t to char so make sure it's legal
+
+// We require that IOVector have the same layout as iovec.
+c_static_assert(sizeof(struct IOVector) == sizeof(struct iovec));
+c_static_assert(sizeof_member(struct IOVector, Base) == sizeof_member(struct iovec, iov_base));
+c_static_assert(offsetof(struct IOVector, Base) == offsetof(struct iovec, iov_base));
+c_static_assert(sizeof_member(struct IOVector, Count) == sizeof_member(struct iovec, iov_len));
+c_static_assert(offsetof(struct IOVector, Count) == offsetof(struct iovec, iov_len));
+
+#define Min(left,right) (((left) < (right)) ? (left) : (right))
+
+static void ConvertByteArrayToIn6Addr(struct in6_addr* addr, const uint8_t* buffer, int32_t bufferLength)
+{
+    assert(bufferLength == NUM_BYTES_IN_IPV6_ADDRESS);
+    memcpy_s(addr->s6_addr, NUM_BYTES_IN_IPV6_ADDRESS, buffer, (uint32_t)bufferLength);
+}
+
+static void ConvertIn6AddrToByteArray(uint8_t* buffer, int32_t bufferLength, const struct in6_addr* addr)
+{
+    assert(bufferLength == NUM_BYTES_IN_IPV6_ADDRESS);
+    memcpy_s(buffer, (uint32_t)bufferLength, addr->s6_addr, NUM_BYTES_IN_IPV6_ADDRESS);
+}
+
+static void ConvertByteArrayToSockAddrIn6(struct sockaddr_in6* addr, const uint8_t* buffer, int32_t bufferLength)
+{
+    ConvertByteArrayToIn6Addr(&addr->sin6_addr, buffer, bufferLength);
+
+    // Mark that this is INET6
+    addr->sin6_family = AF_INET6;
+}
+
+static void ConvertByteArrayToInAddr(struct in_addr* addr, const uint8_t* buffer, int32_t bufferLength)
+{
+    assert(bufferLength == NUM_BYTES_IN_IPV4_ADDRESS);
+    memcpy_s(&addr->s_addr, NUM_BYTES_IN_IPV4_ADDRESS, buffer, (uint32_t)bufferLength); // Send back in network byte order.
+}
+
+static void ConvertInAddrToByteArray(uint8_t* buffer, int32_t bufferLength, const struct in_addr* addr)
+{
+    assert(bufferLength == NUM_BYTES_IN_IPV4_ADDRESS);
+    memcpy_s(buffer, (uint32_t)bufferLength, &addr->s_addr, NUM_BYTES_IN_IPV4_ADDRESS); // Send back in network byte order.
+}
+
+static void ConvertByteArrayToSockAddrIn(struct sockaddr_in* addr, const uint8_t* buffer, int32_t bufferLength)
+{
+    ConvertByteArrayToInAddr(&addr->sin_addr, buffer, bufferLength);
+
+    addr->sin_family = AF_INET;
+}
+
+static int32_t ConvertGetAddrInfoAndGetNameInfoErrorsToPal(int32_t error)
+{
+    switch (error)
+    {
+        case 0:
+            return 0;

@@ -1,0 +1,75 @@
+     if self.writefile(self.filename):
+                self.set_saved(True)
+                try:
+                    self.editwin.store_file_breaks()
+                except AttributeError:  # may be a PyShell
+                    pass
+        self.text.focus_set()
+        return "break"
+
+    def save_as(self, event):
+        filename = self.asksavefile()
+        if filename:
+            if self.writefile(filename):
+                self.set_filename(filename)
+                self.set_saved(1)
+                try:
+                    self.editwin.store_file_breaks()
+                except AttributeError:
+                    pass
+        self.text.focus_set()
+        self.updaterecentfileslist(filename)
+        return "break"
+
+    def save_a_copy(self, event):
+        filename = self.asksavefile()
+        if filename:
+            self.writefile(filename)
+        self.text.focus_set()
+        self.updaterecentfileslist(filename)
+        return "break"
+
+    def writefile(self, filename):
+        self.fixlastline()
+        chars = self.encode(self.text.get("1.0", "end-1c"))
+        if self.eol_convention != "\n":
+            chars = chars.replace("\n", self.eol_convention)
+        try:
+            with open(filename, "wb") as f:
+                f.write(chars)
+                f.flush()
+                os.fsync(f.fileno())
+            return True
+        except IOError as msg:
+            tkMessageBox.showerror("I/O Error", str(msg),
+                                   parent=self.text)
+            return False
+
+    def encode(self, chars):
+        if isinstance(chars, str):
+            # This is either plain ASCII, or Tk was returning mixed-encoding
+            # text to us. Don't try to guess further.
+            return chars
+        # See whether there is anything non-ASCII in it.
+        # If not, no need to figure out the encoding.
+        try:
+            return chars.encode('ascii')
+        except UnicodeError:
+            pass
+        # If there is an encoding declared, try this first.
+        try:
+            enc = coding_spec(chars)
+            failed = None
+        except LookupError as msg:
+            failed = msg
+            enc = None
+        if enc:
+            try:
+                return chars.encode(enc)
+            except UnicodeError:
+                failed = "Invalid encoding '%s'" % enc
+        if failed:
+            tkMessageBox.showerror(
+                "I/O Error",
+                "%s. Saving as UTF-8" % failed,
+                parent = self.text

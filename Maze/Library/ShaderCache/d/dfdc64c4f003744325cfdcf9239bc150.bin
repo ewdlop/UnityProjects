@@ -1,0 +1,67 @@
+/*
+  Simple DirectMedia Layer
+  Copyright (C) 1997-2020 Sam Lantinga <slouken@libsdl.org>
+
+  This software is provided 'as-is', without any express or implied
+  warranty.  In no event will the authors be held liable for any damages
+  arising from the use of this software.
+
+  Permission is granted to anyone to use this software for any purpose,
+  including commercial applications, and to alter it and redistribute it
+  freely, subject to the following restrictions:
+
+  1. The origin of this software must not be misrepresented; you must not
+     claim that you wrote the original software. If you use this software
+     in a product, an acknowledgment in the product documentation would be
+     appreciated but is not required.
+  2. Altered source versions must be plainly marked as such, and must not be
+     misrepresented as being the original software.
+  3. This notice may not be removed or altered from any source distribution.
+*/
+#include "../../SDL_internal.h"
+
+#if SDL_VIDEO_VULKAN && SDL_VIDEO_DRIVER_X11
+
+#include "SDL_x11video.h"
+#include "SDL_assert.h"
+
+#include "SDL_loadso.h"
+#include "SDL_x11vulkan.h"
+
+#include <X11/Xlib.h>
+/*#include <xcb/xcb.h>*/
+/*
+typedef uint32_t xcb_window_t;
+typedef uint32_t xcb_visualid_t;
+*/
+
+int X11_Vulkan_LoadLibrary(_THIS, const char *path)
+{
+    SDL_VideoData *videoData = (SDL_VideoData *)_this->driverdata;
+    VkExtensionProperties *extensions = NULL;
+    Uint32 extensionCount = 0;
+    SDL_bool hasSurfaceExtension = SDL_FALSE;
+    SDL_bool hasXlibSurfaceExtension = SDL_FALSE;
+    SDL_bool hasXCBSurfaceExtension = SDL_FALSE;
+    PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = NULL;
+    Uint32 i;
+    if(_this->vulkan_config.loader_handle)
+        return SDL_SetError("Vulkan already loaded");
+
+    /* Load the Vulkan loader library */
+    if(!path)
+        path = SDL_getenv("SDL_VULKAN_LIBRARY");
+    if(!path)
+        path = "libvulkan.so.1";
+    _this->vulkan_config.loader_handle = SDL_LoadObject(path);
+    if(!_this->vulkan_config.loader_handle)
+        return -1;
+    SDL_strlcpy(_this->vulkan_config.loader_path, path, SDL_arraysize(_this->vulkan_config.loader_path));
+    vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)SDL_LoadFunction(
+        _this->vulkan_config.loader_handle, "vkGetInstanceProcAddr");
+    if(!vkGetInstanceProcAddr)
+        goto fail;
+    _this->vulkan_config.vkGetInstanceProcAddr = (void *)vkGetInstanceProcAddr;
+    _this->vulkan_config.vkEnumerateInstanceExtensionProperties =
+        (void *)((PFN_vkGetInstanceProcAddr)_this->vulkan_config.vkGetInstanceProcAddr)(
+            VK_NULL_HANDLE, "vkEnumerateInstanceExten

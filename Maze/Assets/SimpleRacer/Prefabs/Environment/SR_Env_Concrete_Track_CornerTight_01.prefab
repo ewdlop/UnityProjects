@@ -1,0 +1,84 @@
+//-----------------------------------------------------------------------------
+//
+// Copyright (C) Microsoft Corporation.  All Rights Reserved.
+//
+//-----------------------------------------------------------------------------
+using System;
+using System.IO;
+
+namespace Microsoft.Cci.Pdb {
+  internal class DataStream {
+    internal DataStream() {
+      this.contentSize = 0;
+      this.pages = null;
+    }
+
+    internal DataStream(int contentSize, BitAccess bits, int count) {
+      this.contentSize = contentSize;
+      if (count > 0) {
+        this.pages = new int[count];
+        bits.ReadInt32(this.pages);
+      }
+    }
+
+    internal void Read(PdbReader reader, BitAccess bits) {
+      bits.MinCapacity(contentSize);
+      Read(reader, 0, bits.Buffer, 0, contentSize);
+    }
+
+    internal void Read(PdbReader reader, int position,
+                     byte[] bytes, int offset, int data) {
+      if (position + data > contentSize) {
+        throw new PdbException("DataStream can't read off end of stream. " +
+                                       "(pos={0},siz={1})",
+                               position, data);
+      }
+      if (position == contentSize) {
+        return;
+      }
+
+      int left = data;
+      int page = position / reader.pageSize;
+      int rema = position % reader.pageSize;
+
+      // First get remained of first page.
+      if (rema != 0) {
+        int todo = reader.pageSize - rema;
+        if (todo > left) {
+          todo = left;
+        }
+
+        reader.Seek(pages[page], rema);
+        reader.Read(bytes, offset, todo);
+
+        offset += todo;
+        left -= todo;
+        page++;
+      }
+
+      // Now get the remaining pages.
+      while (left > 0) {
+        int todo = reader.pageSize;
+        if (todo > left) {
+          todo = left;
+        }
+
+        reader.Seek(pages[page], 0);
+        reader.Read(bytes, offset, todo);
+
+        offset += todo;
+        left -= todo;
+        page++;
+      }
+    }
+
+    internal void Write(PdbWriter writer, byte[] bytes) {
+      Write(writer, bytes, bytes.Length);
+    }
+
+    internal void Write(PdbWriter writer, byte[] bytes, int data) {
+      if (bytes == null || data == 0) {
+        return;
+      }
+
+  

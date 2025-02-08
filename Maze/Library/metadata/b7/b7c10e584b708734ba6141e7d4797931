@@ -1,0 +1,140 @@
+//===- BinaryStreamRef.h - A copyable reference to a stream -----*- C++ -*-===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef LLVM_SUPPORT_BINARYSTREAMREF_H
+#define LLVM_SUPPORT_BINARYSTREAMREF_H
+
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/Optional.h"
+#include "llvm/Support/BinaryStream.h"
+#include "llvm/Support/BinaryStreamError.h"
+#include "llvm/Support/Error.h"
+#include <algorithm>
+#include <cstdint>
+#include <memory>
+
+namespace llvm {
+
+/// Common stuff for mutable and immutable StreamRefs.
+template <class RefType, class StreamType> class BinaryStreamRefBase {
+protected:
+  BinaryStreamRefBase() = default;
+  explicit BinaryStreamRefBase(StreamType &BorrowedImpl)
+      : BorrowedImpl(&BorrowedImpl), ViewOffset(0) {
+    if (!(BorrowedImpl.getFlags() & BSF_Append))
+      Length = BorrowedImpl.getLength();
+  }
+
+  BinaryStreamRefBase(std::shared_ptr<StreamType> SharedImpl, uint32_t Offset,
+                      Optional<uint32_t> Length)
+      : SharedImpl(SharedImpl), BorrowedImpl(SharedImpl.get()),
+        ViewOffset(Offset), Length(Length) {}
+  BinaryStreamRefBase(StreamType &BorrowedImpl, uint32_t Offset,
+                      Optional<uint32_t> Length)
+      : BorrowedImpl(&BorrowedImpl), ViewOffset(Offset), Length(Length) {}
+  BinaryStreamRefBase(const BinaryStreamRefBase &Other) = default;
+  BinaryStreamRefBase &operator=(const BinaryStreamRefBase &Other) = default;
+
+  BinaryStreamRefBase &operator=(BinaryStreamRefBase &&Other) = default;
+  BinaryStreamRefBase(BinaryStreamRefBase &&Other) = default;
+
+public:
+  llvm::support::endianness getEndian() const {
+    return BorrowedImpl->getEndian();
+  }
+
+  uint32_t getLength() const {
+    if (Length.hasValue())
+      return *Length;
+
+    return BorrowedImpl ? (BorrowedImpl->getLength() - ViewOffset) : 0;
+  }
+
+  /// Return a new BinaryStreamRef with the first \p N elements removed.  If
+  /// this BinaryStreamRef is length-tracking, then the resulting one will be
+  /// too.
+  RefType drop_front(uint32_t N) const {
+    if (!BorrowedImpl)
+      return RefType();
+
+    N = std::min(N, getLength());
+    RefType Result(static_cast<const RefType &>(*this));
+    if (N == 0)
+      return Result;
+
+    Result.ViewOffset += N;
+    if (Result.Length.hasValue())
+      *Result.Length -= N;
+    return Result;
+  }
+
+  /// Return a new BinaryStreamRef with the last \p N elements removed.  If
+  /// this BinaryStreamRef is length-tracking and \p N is greater than 0, then
+  /// this BinaryStreamRef will no longer length-track.
+  RefType drop_back(uint32_t N) const {
+    if (!BorrowedImpl)
+      return RefType();
+
+    RefType Result(static_cast<const RefType &>(*this));
+    N = std::min(N, getLength());
+
+    if (N == 0)
+      return Result;
+
+    // Since we're dropping non-zero bytes from the end, stop length-tracking
+    // by setting the length of the resulting StreamRef to an explicit value.
+    if (!Result.Length.hasValue())
+      Result.Length = getLength();
+
+    *Result.Length -= N;
+    return Result;
+  }
+
+  /// Return a new BinaryStreamRef with only the first \p N elements remaining.
+  RefType keep_front(uint32_t N) const {
+    assert(N <= getLength());
+    return drop_back(getLength() - N);
+  }
+
+  /// Return a new BinaryStreamRef with only the last \p N elements remaining.
+  RefType keep_back(uint32_t N) const {
+    assert(N <= getLength());
+    return drop_front(getLength() - N);
+  }
+
+  /// Return a new BinaryStreamRef with the first and last \p N elements
+  /// removed.
+  RefType drop_symmetric(uint32_t N) const {
+    return drop_front(N).drop_back(N);
+  }
+
+  /// Return a new BinaryStreamRef with the first \p Offset elements removed,
+  /// and retaining exactly \p Len elements.
+  RefType slice(uint32_t Offset, uint32_t Len) const {
+    return drop_front(Offset).keep_front(Len);
+  }
+
+  bool valid() const { return BorrowedImpl != nullptr; }
+
+  bool operator==(const RefType &Other) const {
+    if (BorrowedImpl != Other.BorrowedImpl)
+      return false;
+    if (ViewOffset != Other.ViewOffset)
+      return false;
+    if (Length != Other.Length)
+      return false;
+    return true;
+  }
+
+protected:
+  Error checkOffsetForRead(uint32_t Offset, uint32_t DataSize) const {
+    if (Offset > getLength())
+      return make_error<BinaryStreamError>(stream_error_code::invalid_offset);
+    if (getLength() < DataSize + Offset)
+      return make_error<BinaryStreamError>(stream_error_code::stream_too_short);

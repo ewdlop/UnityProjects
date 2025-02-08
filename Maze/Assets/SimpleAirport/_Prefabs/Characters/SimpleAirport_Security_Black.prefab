@@ -1,0 +1,797 @@
+; RUN:  llc -amdgpu-scalarize-global-loads=false  -march=amdgcn -verify-machineinstrs < %s | FileCheck -check-prefix=GCN -check-prefix=SI %s
+; RUN:  llc -amdgpu-scalarize-global-loads=false  -march=amdgcn -mcpu=tonga -mattr=-flat-for-global -verify-machineinstrs < %s | FileCheck -check-prefix=GCN -check-prefix=VI %s
+
+; GCN-LABEL: {{^}}bfe_i32_arg_arg_arg:
+; GCN: v_bfe_i32
+define amdgpu_kernel void @bfe_i32_arg_arg_arg(i32 addrspace(1)* %out, i32 %src0, i32 %src1, i32 %src2) #0 {
+  %bfe_i32 = call i32 @llvm.amdgcn.sbfe.i32(i32 %src0, i32 %src1, i32 %src1)
+  store i32 %bfe_i32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_arg_arg_imm:
+; GCN: v_bfe_i32
+define amdgpu_kernel void @bfe_i32_arg_arg_imm(i32 addrspace(1)* %out, i32 %src0, i32 %src1) #0 {
+  %bfe_i32 = call i32 @llvm.amdgcn.sbfe.i32(i32 %src0, i32 %src1, i32 123)
+  store i32 %bfe_i32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_arg_imm_arg:
+; GCN: v_bfe_i32
+define amdgpu_kernel void @bfe_i32_arg_imm_arg(i32 addrspace(1)* %out, i32 %src0, i32 %src2) #0 {
+  %bfe_i32 = call i32 @llvm.amdgcn.sbfe.i32(i32 %src0, i32 123, i32 %src2)
+  store i32 %bfe_i32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_imm_arg_arg:
+; GCN: v_bfe_i32
+define amdgpu_kernel void @bfe_i32_imm_arg_arg(i32 addrspace(1)* %out, i32 %src1, i32 %src2) #0 {
+  %bfe_i32 = call i32 @llvm.amdgcn.sbfe.i32(i32 123, i32 %src1, i32 %src2)
+  store i32 %bfe_i32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}v_bfe_print_arg:
+; GCN: v_bfe_i32 v{{[0-9]+}}, v{{[0-9]+}}, 2, 8
+define amdgpu_kernel void @v_bfe_print_arg(i32 addrspace(1)* %out, i32 addrspace(1)* %src0) #0 {
+  %load = load i32, i32 addrspace(1)* %src0, align 4
+  %bfe_i32 = call i32 @llvm.amdgcn.sbfe.i32(i32 %load, i32 2, i32 8)
+  store i32 %bfe_i32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_arg_0_width_reg_offset:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_arg_0_width_reg_offset(i32 addrspace(1)* %out, i32 %src0, i32 %src1) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.sbfe.i32(i32 %src0, i32 %src1, i32 0)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_arg_0_width_imm_offset:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_arg_0_width_imm_offset(i32 addrspace(1)* %out, i32 %src0, i32 %src1) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.sbfe.i32(i32 %src0, i32 8, i32 0)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_test_6:
+; GCN: v_lshlrev_b32_e32 v{{[0-9]+}}, 31, v{{[0-9]+}}
+; GCN: v_ashrrev_i32_e32 v{{[0-9]+}}, 1, v{{[0-9]+}}
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_test_6(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %shl = shl i32 %x, 31
+  %bfe = call i32 @llvm.amdgcn.sbfe.i32(i32 %shl, i32 1, i32 31)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_test_7:
+; GCN-NOT: shl
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 0
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_test_7(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %shl = shl i32 %x, 31
+  %bfe = call i32 @llvm.amdgcn.sbfe.i32(i32 %shl, i32 0, i32 31)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_test_8:
+; GCN: buffer_load_dword
+; GCN: v_bfe_i32 v{{[0-9]+}}, v{{[0-9]+}}, 0, 1
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_test_8(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %shl = shl i32 %x, 31
+  %bfe = call i32 @llvm.amdgcn.sbfe.i32(i32 %shl, i32 31, i32 1)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_test_9:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_ashrrev_i32_e32 v{{[0-9]+}}, 31, v{{[0-9]+}}
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_test_9(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %bfe = call i32 @llvm.amdgcn.sbfe.i32(i32 %x, i32 31, i32 1)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_test_10:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_ashrrev_i32_e32 v{{[0-9]+}}, 1, v{{[0-9]+}}
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_test_10(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %bfe = call i32 @llvm.amdgcn.sbfe.i32(i32 %x, i32 1, i32 31)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_test_11:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_ashrrev_i32_e32 v{{[0-9]+}}, 8, v{{[0-9]+}}
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_test_11(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %bfe = call i32 @llvm.amdgcn.sbfe.i32(i32 %x, i32 8, i32 24)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_test_12:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_ashrrev_i32_e32 v{{[0-9]+}}, 24, v{{[0-9]+}}
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_test_12(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %bfe = call i32 @llvm.amdgcn.sbfe.i32(i32 %x, i32 24, i32 8)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_test_13:
+; GCN: v_ashrrev_i32_e32 {{v[0-9]+}}, 31, {{v[0-9]+}}
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_test_13(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %shl = ashr i32 %x, 31
+  %bfe = call i32 @llvm.amdgcn.sbfe.i32(i32 %shl, i32 31, i32 1)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4 ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_test_14:
+; GCN-NOT: lshr
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_test_14(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %shl = lshr i32 %x, 31
+  %bfe = call i32 @llvm.amdgcn.sbfe.i32(i32 %shl, i32 31, i32 1)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4 ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_constant_fold_test_0:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 0
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_constant_fold_test_0(i32 addrspace(1)* %out) #0 {
+  %bfe_i32 = call i32 @llvm.amdgcn.sbfe.i32(i32 0, i32 0, i32 0)
+  store i32 %bfe_i32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_constant_fold_test_1:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 0
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_constant_fold_test_1(i32 addrspace(1)* %out) #0 {
+  %bfe_i32 = call i32 @llvm.amdgcn.sbfe.i32(i32 12334, i32 0, i32 0)
+  store i32 %bfe_i32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_constant_fold_test_2:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 0
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_constant_fold_test_2(i32 addrspace(1)* %out) #0 {
+  %bfe_i32 = call i32 @llvm.amdgcn.sbfe.i32(i32 0, i32 0, i32 1)
+  store i32 %bfe_i32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_constant_fold_test_3:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], -1
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_constant_fold_test_3(i32 addrspace(1)* %out) #0 {
+  %bfe_i32 = call i32 @llvm.amdgcn.sbfe.i32(i32 1, i32 0, i32 1)
+  store i32 %bfe_i32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_constant_fold_test_4:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], -1
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_constant_fold_test_4(i32 addrspace(1)* %out) #0 {
+  %bfe_i32 = call i32 @llvm.amdgcn.sbfe.i32(i32 4294967295, i32 0, i32 1)
+  store i32 %bfe_i32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_constant_fold_test_5:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], -1
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_constant_fold_test_5(i32 addrspace(1)* %out) #0 {
+  %bfe_i32 = call i32 @llvm.amdgcn.sbfe.i32(i32 128, i32 7, i32 1)
+  store i32 %bfe_i32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_constant_fold_test_6:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 0xffffff80
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_constant_fold_test_6(i32 addrspace(1)* %out) #0 {
+  %bfe_i32 = call i32 @llvm.amdgcn.sbfe.i32(i32 128, i32 0, i32 8)
+  store i32 %bfe_i32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_constant_fold_test_7:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 0x7f
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_constant_fold_test_7(i32 addrspace(1)* %out) #0 {
+  %bfe_i32 = call i32 @llvm.amdgcn.sbfe.i32(i32 127, i32 0, i32 8)
+  store i32 %bfe_i32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_constant_fold_test_8:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 1
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_constant_fold_test_8(i32 addrspace(1)* %out) #0 {
+  %bfe_i32 = call i32 @llvm.amdgcn.sbfe.i32(i32 127, i32 6, i32 8)
+  store i32 %bfe_i32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_constant_fold_test_9:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 1
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_constant_fold_test_9(i32 addrspace(1)* %out) #0 {
+  %bfe_i32 = call i32 @llvm.amdgcn.sbfe.i32(i32 65536, i32 16, i32 8)
+  store i32 %bfe_i32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_constant_fold_test_10:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 0
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_constant_fold_test_10(i32 addrspace(1)* %out) #0 {
+  %bfe_i32 = call i32 @llvm.amdgcn.sbfe.i32(i32 65535, i32 16, i32 16)
+  store i32 %bfe_i32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_constant_fold_test_11:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], -6
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_constant_fold_test_11(i32 addrspace(1)* %out) #0 {
+  %bfe_i32 = call i32 @llvm.amdgcn.sbfe.i32(i32 160, i32 4, i32 4)
+  store i32 %bfe_i32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_constant_fold_test_12:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 0
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_constant_fold_test_12(i32 addrspace(1)* %out) #0 {
+  %bfe_i32 = call i32 @llvm.amdgcn.sbfe.i32(i32 160, i32 31, i32 1)
+  store i32 %bfe_i32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_constant_fold_test_13:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 1
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_constant_fold_test_13(i32 addrspace(1)* %out) #0 {
+  %bfe_i32 = call i32 @llvm.amdgcn.sbfe.i32(i32 131070, i32 16, i32 16)
+  store i32 %bfe_i32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_constant_fold_test_14:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 40
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_constant_fold_test_14(i32 addrspace(1)* %out) #0 {
+  %bfe_i32 = call i32 @llvm.amdgcn.sbfe.i32(i32 160, i32 2, i32 30)
+  store i32 %bfe_i32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_constant_fold_test_15:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 10
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_constant_fold_test_15(i32 addrspace(1)* %out) #0 {
+  %bfe_i32 = call i32 @llvm.amdgcn.sbfe.i32(i32 160, i32 4, i32 28)
+  store i32 %bfe_i32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_constant_fold_test_16:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], -1
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_constant_fold_test_16(i32 addrspace(1)* %out) #0 {
+  %bfe_i32 = call i32 @llvm.amdgcn.sbfe.i32(i32 4294967295, i32 1, i32 7)
+  store i32 %bfe_i32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_constant_fold_test_17:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 0x7f
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_constant_fold_test_17(i32 addrspace(1)* %out) #0 {
+  %bfe_i32 = call i32 @llvm.amdgcn.sbfe.i32(i32 255, i32 1, i32 31)
+  store i32 %bfe_i32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_i32_constant_fold_test_18:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 0
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_i32_constant_fold_test_18(i32 addrspace(1)* %out) #0 {
+  %bfe_i32 = call i32 @llvm.amdgcn.sbfe.i32(i32 255, i32 31, i32 1)
+  store i32 %bfe_i32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_sext_in_reg_i24:
+; GCN: buffer_load_dword [[LOAD:v[0-9]+]],
+; GCN-NOT: v_lshl
+; GCN-NOT: v_ashr
+; GCN: v_bfe_i32 [[BFE:v[0-9]+]], [[LOAD]], 0, 24
+; GCN: buffer_store_dword [[BFE]],
+define amdgpu_kernel void @bfe_sext_in_reg_i24(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %bfe = call i32 @llvm.amdgcn.sbfe.i32(i32 %x, i32 0, i32 24)
+  %shl = shl i32 %bfe, 8
+  %ashr = ashr i32 %shl, 8
+  store i32 %ashr, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: @simplify_demanded_bfe_sdiv
+; GCN: buffer_load_dword [[LOAD:v[0-9]+]]
+; GCN: v_bfe_i32 [[BFE:v[0-9]+]], [[LOAD]], 1, 16
+; GCN: v_lshrrev_b32_e32 [[TMP0:v[0-9]+]], 31, [[BFE]]
+; GCN: v_add_{{[iu]}}32_e32 [[TMP1:v[0-9]+]], vcc, [[TMP0]], [[BFE]]
+; GCN: v_ashrrev_i32_e32 [[TMP2:v[0-9]+]], 1, [[TMP1]]
+; GCN: buffer_store_dword [[TMP2]]
+define amdgpu_kernel void @simplify_demanded_bfe_sdiv(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %src = load i32, i32 addrspace(1)* %in, align 4
+  %bfe = call i32 @llvm.amdgcn.sbfe.i32(i32 %src, i32 1, i32 16)
+  %div = sdiv i32 %bfe, 2
+  store i32 %div, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_0_width:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_0_width(i32 addrspace(1)* %out, i32 addrspace(1)* %ptr) #0 {
+  %load = load i32, i32 addrspace(1)* %ptr, align 4
+  %bfe = call i32 @llvm.amdgcn.sbfe.i32(i32 %load, i32 8, i32 0)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_8_bfe_8:
+; GCN: v_bfe_i32
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_8_bfe_8(i32 addrspace(1)* %out, i32 addrspace(1)* %ptr) #0 {
+  %load = load i32, i32 addrspace(1)* %ptr, align 4
+  %bfe0 = call i32 @llvm.amdgcn.sbfe.i32(i32 %load, i32 0, i32 8)
+  %bfe1 = call i32 @llvm.amdgcn.sbfe.i32(i32 %bfe0, i32 0, i32 8)
+  store i32 %bfe1, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_8_bfe_16:
+; GCN: v_bfe_i32 v{{[0-9]+}}, v{{[0-9]+}}, 0, 8
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_8_bfe_16(i32 addrspace(1)* %out, i32 addrspace(1)* %ptr) #0 {
+  %load = load i32, i32 addrspace(1)* %ptr, align 4
+  %bfe0 = call i32 @llvm.amdgcn.sbfe.i32(i32 %load, i32 0, i32 8)
+  %bfe1 = call i32 @llvm.amdgcn.sbfe.i32(i32 %bfe0, i32 0, i32 16)
+  store i32 %bfe1, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; This really should be folded into 1
+; GCN-LABEL: {{^}}bfe_16_bfe_8:
+; GCN: v_bfe_i32 v{{[0-9]+}}, v{{[0-9]+}}, 0, 8
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_16_bfe_8(i32 addrspace(1)* %out, i32 addrspace(1)* %ptr) #0 {
+  %load = load i32, i32 addrspace(1)* %ptr, align 4
+  %bfe0 = call i32 @llvm.amdgcn.sbfe.i32(i32 %load, i32 0, i32 16)
+  %bfe1 = call i32 @llvm.amdgcn.sbfe.i32(i32 %bfe0, i32 0, i32 8)
+  store i32 %bfe1, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; Make sure there isn't a redundant BFE
+; GCN-LABEL: {{^}}sext_in_reg_i8_to_i32_bfe:
+; GCN: s_sext_i32_i8 s{{[0-9]+}}, s{{[0-9]+}}
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @sext_in_reg_i8_to_i32_bfe(i32 addrspace(1)* %out, i32 %a, i32 %b) #0 {
+  %c = add i32 %a, %b ; add to prevent folding into extload
+  %bfe = call i32 @llvm.amdgcn.sbfe.i32(i32 %c, i32 0, i32 8)
+  %shl = shl i32 %bfe, 24
+  %ashr = ashr i32 %shl, 24
+  store i32 %ashr, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}sext_in_reg_i8_to_i32_bfe_wrong:
+define amdgpu_kernel void @sext_in_reg_i8_to_i32_bfe_wrong(i32 addrspace(1)* %out, i32 %a, i32 %b) #0 {
+  %c = add i32 %a, %b ; add to prevent folding into extload
+  %bfe = call i32 @llvm.amdgcn.sbfe.i32(i32 %c, i32 8, i32 0)
+  %shl = shl i32 %bfe, 24
+  %ashr = ashr i32 %shl, 24
+  store i32 %ashr, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}sextload_i8_to_i32_bfe:
+; GCN: buffer_load_sbyte
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @sextload_i8_to_i32_bfe(i32 addrspace(1)* %out, i8 addrspace(1)* %ptr) #0 {
+  %load = load i8, i8 addrspace(1)* %ptr, align 1
+  %sext = sext i8 %load to i32
+  %bfe = call i32 @llvm.amdgcn.sbfe.i32(i32 %sext, i32 0, i32 8)
+  %shl = shl i32 %bfe, 24
+  %ashr = ashr i32 %shl, 24
+  store i32 %ashr, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN: .text
+; GCN-LABEL: {{^}}sextload_i8_to_i32_bfe_0:{{.*$}}
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @sextload_i8_to_i32_bfe_0(i32 addrspace(1)* %out, i8 addrspace(1)* %ptr) #0 {
+  %load = load i8, i8 addrspace(1)* %ptr, align 1
+  %sext = sext i8 %load to i32
+  %bfe = call i32 @llvm.amdgcn.sbfe.i32(i32 %sext, i32 8, i32 0)
+  %shl = shl i32 %bfe, 24
+  %ashr = ashr i32 %shl, 24
+  store i32 %ashr, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}sext_in_reg_i1_bfe_offset_0:
+; GCN-NOT: shr
+; GCN-NOT: shl
+; GCN: v_bfe_i32 v{{[0-9]+}}, v{{[0-9]+}}, 0, 1
+; GCN: s_endpgm
+define amdgpu_kernel void @sext_in_reg_i1_bfe_offset_0(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %shl = shl i32 %x, 31
+  %shr = ashr i32 %shl, 31
+  %bfe = call i32 @llvm.amdgcn.sbfe.i32(i32 %shr, i32 0, i32 1)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}sext_in_reg_i1_bfe_offset_1:
+; GCN: buffer_load_dword
+; GCN-NOT: shl
+; GCN-NOT: shr
+; GCN: v_bfe_i32 v{{[0-9]+}}, v{{[0-9]+}}, 1, 1
+; GCN: s_endpgm
+define amdgpu_kernel void @sext_in_reg_i1_bfe_offset_1(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %shl = shl i32 %x, 30
+  %shr = ashr i32 %shl, 30
+  %bfe = call i32 @llvm.amdgcn.sbfe.i32(i32 %shr, i32 1, i32 1)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}sext_in_reg_i2_bfe_offset_1:
+; GCN: buffer_load_dword
+; GCN-NOT: v_lshl
+; GCN-NOT: v_ashr
+; GCN: v_bfe_i32 v{{[0-9]+}}, v{{[0-9]+}}, 0, 2
+; GCN: v_bfe_i32 v{{[0-9]+}}, v{{[0-9]+}}, 1, 2
+; GCN: s_endpgm
+define amdgpu_kernel void @sext_in_reg_i2_bfe_offset_1(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %shl = shl i32 %x, 30
+  %shr = ashr i32 %shl, 30
+  %bfe = call i32 @llvm.amdgcn.sbfe.i32(i32 %shr, i32 1, i32 2)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+declare i32 @llvm.amdgcn.sbfe.i32(i32, i32, i32) #1
+
+attributes #0 = { nounwind }
+attributes #1 = { nounwind readnone }
+                                                                                                                                                                                                                                                                                                      É¯¯t
+Hç|$xËÒnˇˇIçEHâD$@HãD$XHÉ¯¯ï¡HÖ¿ï¬Ñ—tHÉ¯t
+Hç|$HË¬nˇˇLâˇË™mˇˇAãT$HãÑ$∏   E1ˆÖ“ÑH˙ˇˇâ¡â∆ÉÍIã<$¡Ó	¡È1Ò!—AâŒI¡ÊI˛IãvH9∆Ñ˙ˇˇAπ   E1¿HÉ˛¯Ñ	˙ˇˇHÉ˛uMÖ¿MD∆D…EçQ!—AâŒI¡ÊI˛IãvH9∆Ñ‹˘ˇˇHÉ˛¯ÖÖ  MÖ¿MEÈ∆˘ˇˇAãL$IçuE1¿H««¯ˇˇˇI«D$    ∫   H¡·Hâº$à   H¡Hât$pH«D$x   H«Ñ$Ä       H«Ñ$ê       H9»u
+Î, HãT$xÉ‚H«@    HÉ¿@HâP»HâxÿHâp¿Lâ@‡H9¡u◊Lã-¿: È—˛ˇˇEâ»MâÒIâ˛MÖ…Ö1  HÉ˘Ö'  D¬EçH!Úâ◊H¡ÁLˇHãOH9»Ö  Iâ˛È ˙ˇˇHÉˇ¯ÖZ  MçEHÉ˙¯Ñ|˜ˇˇHÉ˙¯IâUï¡HÖ“ï¿Ñ¡Ñc˜ˇˇHÉ˙ÑY˜ˇˇIãvLâ«HÉÊ¯ËÌlˇˇÈD˜ˇˇHÉˇ¯Öƒ   MçEHÉ˙¯Ñ˝ˇˇHÉ˙¯IâUï¡HÖ“ï¿Ñ¡ÑÛ¸ˇˇHÉ˙ÑÈ¸ˇˇIãvLâ«HÉÊ¯ËùlˇˇÈ‘¸ˇˇLã-—9 ÈÀ˜ˇˇAπ   E1¿HÉ˛¯Ñ/¯ˇˇMÖ¿uHÉ˛MD∆D EçQ! Aâ÷I¡ÊI˛IãvH9∆Ñ¯ˇˇHÉ˛¯Ñ&˛ˇˇEâ—ÎƒD  MâŒÈ—˛ˇˇHÉ˘¯Ö´˛ˇˇMÖˆLD˜ÈÖ˙ˇˇMâËA∫   E1ÌMÖÌuHÉˇMDËD—EçJ!¡Aâ»I¡‡IIãxH9˙Ö∫   Mâ≈È¸ˇˇËÙkˇˇMâËA∫   E1ÌMÖÌuHÉˇMDËD–EçJ!»Aâ¿I¡‡IIãxH9˙uMâ≈ÈÛıˇˇEâ—È<˝ˇˇHÉˇ¯Öæ   MÖÌÑ≠   IãEMçEH9¬Ñ«ıˇˇHÉ¯¯@ï∆HÖ¿ï¡@ÑŒÑ4˛ˇˇHÉ¯Ñ*˛ˇˇLâ«LâD$ËMkˇˇIãVLãD$È˛ˇˇLâ‡ÈoÛˇˇHÉˇ¯ujMÖÌt]IãEMçEH9¬ÑG˚ˇˇHÉ¯¯@ï∆HÖ¿ï¡@ÑŒÑ$˛ˇˇHÉ¯Ñ˛ˇˇLâ«LâD$ËÌjˇˇIãVLãD$Èˇ˝ˇˇMâ≈Èô˝ˇˇEâ È˜˛ˇˇMâ≈ÈŸ˝ˇˇEâ È°˛ˇˇHã%   D  HÖˆt3ATIâ¸USHâÛHãsLâÁË%mˇˇHãkHâﬂËyiˇˇHâÎHÖÌu‡[]A\√@ √Ä    HãWHçGHÖ“t3HãHâ∆Î Hâ÷HãRHÖ“tH9J sÓHãRHÖ“uÒH9∆tH9N HF∆√ffffff.Ñ     AWAVLçwAUIâıATUHâ˝SHÉÏHã_HÖ€Ñ„   Lã&ÎfD  HãC∫   HÖ¿tHâ√Hã{ I9¸rÊHãC1“HÖ¿uÈÑ“uWI9¸viAø   I9ﬁÖá   ø(   ËπhˇˇHâ⁄LâÒDâˇIâƒIãE LâÊIâD$ Ë,kˇˇHÉE(HÉƒLâ‡[∫   ]A\A]A^A_√H;]t®HâﬂË‚iˇˇL;` wHâ√HÉƒHâÿ1“[]A\A]A^A_√D  HÖ€t‚Aø   I9ﬁÑyˇˇˇE1ˇL;c Aí«Èiˇˇˇ@ LâÛL;wtLã&Î†f.Ñ     Aø   ÈBˇˇˇD  AWIâ◊HâÚAVAUATIâÙUSHâ˚HÉÏ(HãOHã/Hâ»H)ÍH)ËH¡¯Ñ¸   Hç< I«∆¯ˇˇˇH9¯Ü∞   Lâ˜HâT$HâL$Ë¶gˇˇHãT$HãL$Iâ≈I∆IãIâ»MçLM)‡IâD Oç<I9ÏÑñ   HâÓLâÔLâL$LâD$HâL$ËåhˇˇHãL$LãD$LãL$I9Ãt0Lâ¬LâÊLâœËzhˇˇHÖÌuLâ+Lâ{LâsHÉƒ([]A\A]A^A_√ HâÔËfˇˇÎŸfD  H∏ˇˇˇˇˇˇˇH9«á=ˇˇˇE1ˆE1ÌHÖˇÑPˇˇˇÎ@ I9ÃuìÎüfÑ     ø   Lç4˝    Èˇˇˇfff.Ñ       AWAVAUATUSHÅÏ®  HãYHât$XHâL$LâD$hdHã%(   HâÑ$ò  1¿HãHâ\$`H9ÿÑd	  HâD$0HçÑ$   Iâ’HâD$HHçÑ$P  HâD$HçÑ$®   HâD$ fÑ     HãD$0HãHâﬂHâ\$(IâﬁËËgˇˇHâﬂHâÑ$   ∏  fâÑ$`  HãD$HHâî$(  HâÑ$P  Hçñ} HâÑ$X  Ëgiˇˇø@   Hâ≈Ë eˇˇLã|$E1¿HâÓHãL$hHâ√Hâ«Lâ˙ËLiˇˇHâú$ò   Lâ¥$P  H«Ñ$X     H«Ñ$`      Hâú$h  HÉ˚tHÉ˚¯t	IçËwfˇˇHã\$Hã|$HLâÓHâ⁄ËRÌˇˇHãÑ$h  HÉ¯¯ï¡HÖ¿ï¬Ñ—tHÉ¯t	Hç{ËfˇˇHã\$XHãsH;sÑW  HãÑ$ò   HÉ∆HâF¯HâsHãD$(Lã`0HÉ¿(HâD$I9ƒÑ2  Hã˘2 1ÌLçp MÖ‰Mç|$ËLD˝LâˇËthˇˇLâº$†   HÉ¯¯Hâ√HâÑ$∏   ï¬HÖ¿H«Ñ$®      ï¿Hâ¨$∞   Ñ¬tHÉ˚tHã|$ ËåeˇˇLãº$†   MÖˇHâ¨$–   ï¬IÉˇ¯H«Ñ$»      ï¿Lâº$ÿ   Ñ¬Ñk  IÉˇÑa  Hçº$»   Ë<eˇˇHã¥$»   HãÑ$ÿ   Lâ¥$¿   Lâ¨$‡   HâÚHâ¨$`  É‚HÖ¿HâÑ$h  ï¡HÉ¯¯Hâî$X  ï¬Ñ—ÑÏ  HÉ¯Ñ‚  HãD$HÉÊ¯HçxËùdˇˇHãÑ$‡   HâÑ$p  HãÑ$∏   Lâ¥$P  HÉ¯¯Hâ¨$Ä  ï¡HÖ¿H«Ñ$x     ï¬HâÑ$à  Ñ—t HÉ¯tHã¥$®   HãD$HÉÊ¯Hçx(Ë0dˇˇAãUMã] Ö“Ö†  çLˇLâ\$8Hâ»â$H—ËH	»Hâ¡H¡ÈH	»Hâ¡H¡ÈH	»Hâ¡H¡ÈH	»Hâ¡H¡ÈH	»π@   HÉ¿É¯@B¡AâEâ«H¡ÁËÂbˇˇLã\$8ã$IâE MÖ€Ñx  AãMH¡‚I«E    H«Ñ$(     Iç<H¡·Iâ˙H¡H9»t=∫   HâÔH«∆¯ˇˇˇÎHãî$(  É‚H«@    HÉ¿@HâP»HâpÿLâp¿Hâx‡H9¡u‘H«¡¯ˇˇˇHâ¨$   H«Ñ$¯      Hâå$  Lâ¥$   Hâ¨$  H«Ñ$(     Hâ¨$0  H«Ñ$8  ˇˇˇLâ¥$   Hâ¨$@  M9”Ñ†  Hâ$Mâ◊Lâ€Lâ\$8Lâd$@Î
+fêHãå$  HãSH9 Ñ…   Hãå$8  H9 Ñ∏   AãuÖˆÑ–~ˇˇâ◊â—ÉÓMãM ¡È	¡Ô1œ!˜â˘H¡·Mç$	MãD$L9¬ÖÈ  HãS I«D$(   I«D$0    IâT$ HãS8HÉ˙¯IâT$8@ï«HÖ“@ï∆@Ñ˜tHÉ˙tHãs(Iç|$(HÉÊ¯ËbˇˇHãS8AÉEHÖ“@ï∆HÉ˙¯ï¡@ÑŒtHÉ˙t	Hç{(ËˆaˇˇHãKLã%/ HÉ˘¯@ï«HÖ…Içt$Hâ3@ï∆@Ñ˜tHÉ˘t	Hç{Ë¿aˇˇHÉ√@I9ﬂÖ„˛ˇˇHãÑ$8  Lâ‚Hã$HçJLã\$8Lãd$@HÖ¿Hâå$   @ï∆HÉ¯¯ï¡@ÑŒt&HÉ¯t HãD$HHâT$8Lâ$HçxË^aˇˇHãT$8Lã$HçBHâÑ$   HãÑ$  HÖ¿@ï∆HÉ¯¯ï¡@ÑŒt%HÉ¯tHçº$¯   HâT$8Lâ$ËaˇˇHãT$8Lã$LâﬂHâ$ËÌ<?xml version="1.0" encoding="utf-8"?>
+<Type Name="BuildProviderAppliesTo" FullName="System.Web.Compilation.BuildProviderAppliesTo">
+  <TypeSignature Language="C#" Value="public enum BuildProviderAppliesTo" />
+  <AssemblyInfo>
+    <AssemblyName>System.Web</AssemblyName>
+    <AssemblyVersion>2.0.0.0</AssemblyVersion>
+  </AssemblyInfo>
+  <Base>
+    <BaseTypeName>System.Enum</BaseTypeName>
+  </Base>
+  <Attributes>
+    <Attribute>
+      <AttributeName>System.Flags</AttributeName>
+    </Attribute>
+  </Attributes>
+  <Docs>
+    <since version=".NET 2.0" />
+    <remarks>
+      <attribution license="cc4" from="Microsoft" modified="false" />
+      <para>A <see cref="T:System.Web.Compilation.BuildProvider" /> object provides functionality to parse a particular file type and generate code during compilation of a resource. A build provider generates code for those resources that correspond to the <see cref="T:System.Web.Compilation.BuildProviderAppliesToAttribute" /> attribute and which have the extension mapped to the build provider.</para>
+    </remarks>
+    <summary>
+      <attribution license="cc4" from="Microsoft" modified="false" />
+      <para>Specifies the locations where the <see cref="T:System.Web.Compilation.BuildProviderAppliesToAttribute" /> attribute is respected during code generation for a resource by a <see cref="T:System.Web.Compilation.BuildProvider" /> object.</para>
+    </summary>
+  </Docs>
+  <Members>
+    <Member MemberName="All">
+      <MemberSignature Language="C#" Value="All" />
+      <MemberType>Field</MemberType>
+      <ReturnValue>
+        <ReturnType>System.Web.Compilation.BuildProviderAppliesTo</ReturnType>
+      </ReturnValue>
+      <Docs>
+        <since version=".NET 2.0" />
+        <summary>
+          <attribution license="cc4" from="Microsoft" modified="false" />
+          <para>Specifies that the build provider generates code for resources wherever the resources are found. This is the default value for the <see cref="T:System.Web.Compilation.BuildProviderAppliesToAttribute" /> attribute.</para>
+        </summary>
+      </Docs>
+      <AssemblyInfo>
+        <AssemblyVersion>2.0.0.0</AssemblyVersion>
+      </AssemblyInfo>
+    </Member>
+    <Member MemberName="Code">
+      <MemberSignature Language="C#" Value="Code" />
+      <MemberType>Field</MemberType>
+      <ReturnValue>
+        <ReturnType>System.Web.Compilation.BuildProviderAppliesTo</ReturnType>
+      </ReturnValue>
+      <Docs>
+        <since version=".NET 2.0" />
+        <summary>
+          <attribution license="cc4" from="Microsoft" modified="false" />
+          <para>Specifies that the build provider generates code for only those resources in the \App_Code directory.</para>
+        </summary>
+      </Docs>
+      <AssemblyInfo>
+        <AssemblyVersion>2.0.0.0</AssemblyVersion>
+      </AssemblyInfo>
+    </Member>
+    <Member MemberName="Resources">
+      <MemberSignature Language="C#" Value="Resources" />
+      <MemberType>Field</MemberType>
+      <ReturnValue>
+        <ReturnType>System.Web.Compilation.BuildProviderAppliesTo</ReturnType>
+      </ReturnValue>
+      <Docs>
+        <since version=".NET 2.0" />
+        <summary>
+          <attribution license="cc4" from="Microsoft" modified="false" />
+          <para>Specifies that the build provider generates code for resources in the \App_GlobalResources and \App_LocalResources directories.</para>
+        </summary>
+      </Docs>
+      <AssemblyInfo>
+        <AssemblyVersion>2.0.0.0</AssemblyVersion>
+      </AssemblyInfo>
+    </Member>
+    <Member MemberName="Web">
+      <MemberSignature Language="C#" Value="Web" />
+      <MemberType>Field</MemberType>
+      <ReturnValue>
+        <ReturnType>System.Web.Compilation.BuildProviderAppliesTo</ReturnType>
+      </ReturnValue>
+      <Docs>
+        <since version=".NET 2.0" />
+        <summary>
+          <attribution license="cc4" from="Microsoft" modified="false" />
+          <para>Specifies that the build provider generates code for only those resources in Web content directories, which are directories other than the reserved ASP.NET directories \App_Code, \App_GlobalResources, and \App_LocalResources.</para>
+        </summary>
+      </Docs>
+      <AssemblyInfo>
+        <AssemblyVersion>2.0.0.0</AssemblyVersion>
+      </AssemblyInfo>
+    </Member>
+  </Members>
+</Type>                                                                                                                                                                                                                                                                                                  ?∫©*Í9€†Ëz˚l{I˚pù⁄Ü*J√EÆáãhx°ë†_¸ù£	x_TÌÜüÛHgM]kd¢åE4∞Ìòè*eª6‰™œ¢ˇÙèlo˚∏XU„m“7E¿Õ\¨Ω¶¨ÅW1~ï“Yπ-%ÒsﬂsPÒÎU=¨æı@/ä∏åËv°\#¸›*Zm^Ã©¶*˘[∑#ò±¯mÕ îÏëÚÀ§7oklõ˙Î¢l∞ù π∑ÁùÁRÄ!π≠Y≈Ó2uNä¶ÿ:f+ƒ$√LDIŸãΩqôÊîHœyÍ©£—s(|¡⁄&£¸p(eDü"||n=ˆf◊~ÖmL7ÊÑLDQ
+∞éÛ?çÓA| S˛üæFπæ∑çëCò•Ë∆–œ“?`‘;ˇF¶$íÒº≠ùPÓÀ#˘
+ œœ#sp¥±h≠Ç_€ª$Ôr8rS˙2Ö3?¡≈˚ÌÒæÆ◊ﬂßPk ©KcqÑ¢˙WÈ^ÑÏ!Œ4~–Ãˆã^—ü¡2á®;5ƒzÕ«⁄*ôóí%±}#ñi\ÔÔfBÄh€{XTÄMw–ùç«6‘8ãmæ9œ72¨‰©UlÀ·"·-ÿ30¶C¿üÄÔŒä#(2!J∆%∞€M±›∑∑SÅsΩ{ûÍYlÖ”ì?∑‰©ŸÜ∏&—ïçáh4ﬁ‚íÛ…¨bJ8]îœ!T≈N¯Œ9wg„åœ˝‹ºı#A_Öª˝Ò>d∑D BŒ§ìXêÍhgP°¥âk˘eß=ºåTP*BLû3]˚’ne•„¸5ÂhN∂V@zb¸UŸóµ'◊›[÷ı1Rë‚∞pÔåCHìCùıl{Öà=›µ}2y£zN{ó≤˜ÛJ_G Ÿ2Ê∫É®–¶áÕ{Ïx=€"BCûÍËˇfÔar”ÚÅª‚4„*	ïñ&]ÉÓ“äÏ7∞È˘$Nfûs\
+ï%˙~ÿ
+kÑ]\ÕS“áúÔd¨≠zk8Hè∂ˆ3Îú”â>÷z·¶xB%p4µk∫ÃÖ&ﬂ3{'*s∞Ì⁄I;ÊwÌˆ™eWxÑ¨wŸë]ºHZx'†rﬂ∏;r“Hæi∏≈óÓŸ…=∆ŒﬁGsbY•o8|_"√‚Bv∞∏·‚uZœ{∆Ã·-'ÿ}ÿ—[$æZ}jNàê‚Bl3⁄ hÅ∞L!„dÌA¸ OÖ˙üƒRdé\∏¯∆™t#ÒÇªU|´fQL±n…2
+~âÙ˜≥¨∂b)√uüfπ∫\¯;:
+uµÔŸ§l]÷∏-y+†\ÀÎÖöM-àO9>ÔÌ^Êπ¨Œ™ s|ÁìˆM9ŸÓe‘¯1 ù¢¡!ocò#¨≥ÇEK:∞»Ìˇ˜€ú»Tyº!jÏ∏Í<ß¡1ª`a7Éà¢∫U€ú⁄_q‹ÓFQ@sSˆ—∂ˆøÆñ4W•{ÁÊ„Ï´É§ÌídrCZ˚(Â7ƒ·|ëb¡âÈaπÊÍÄ¨ﬁGtiæn2ânJ‰∂´±0À!ùŸ∞ä¶˜á£¡Ò≤:ê—«—ı˜ˇ‡øåúËY|àóLVw¢¬4–ç8∏n+D¥àURˆRxÿ—.ßåÕ	çøòÀ6|)f/2⁄lÙ”í&®9[ŸUæë˛^n'_]\Ú8Â∂∫•∆ ∏ı◊¿/zy¯ÆŸGÜêøH£WLª∫¬ËÍ·"h:U¢»ΩFÓoãJ≈é[âm≠â“‚õè,
+∂ï!ÂX\Ä
+€ç’âu€Z¶c5`8á„†Q¸9o»=¢Ó1ÏêSı,À”0óˆ\ı4#â:h–≠©&\∞R[&≥◊åJeT≤}ÿvΩ⁄!0Æ4›Ï:“LíÍPVÂœ˚«2lQ…˚øÿ÷n¥.œ	‡vÇ(√¶9Ãfœ¥îˆx·˝ÁôƒEG˚ F˘ Æ‘Ó^ò}¡πò\¸ÈÙ¬‰H‘.qŸ¡ZMsõñ‘ê¨˛æ1.He‹Y◊SíúœJßÈ‚Pg(¨E°˝óısÕ;Á™¯√]7\»$ËtVœc}œxF<’ÑÛÉÑy¶µw9\≥ wB\8h£ Éh˙ê@¶¯X≠p§&Y∑üªzÌNÈ√‡ÅÚ∞·nh ∆Ôä”›÷Òâ–(`õ†îƒçx<‰mJµòÂﬂCf!¸„Çñ\˛oæXuóJıÙn£úœ9CÔ}J 	Eömîﬁ¶*.¢˝EÛ¢J⁄;ãûí˘ Ôéñ§NC‚√àø)ÔÌNÇÇ8Ç”»'õiúiéàZCdt2(]e±)∂	Sô“ë{Ö Çó9ıÇx_S
+£ ›™÷.∫ÙÅ ”d¬ßRëi ∞{‰}¡ﬂÌvÊPFı–@I†V†&ÒQ∆sÍ∞RÜ©øøc~ﬁ˛–òqu·ó®≤"ÈYﬂ>˜>o®/]LÅ≈Ì>L´F˛™ìü˝B<bˆ9ìB(Ñ¸&ﬂ„„‰[öÈO}'∂œ‘‰Åöz∂[’9”/˝Ò–ﬂ©à=@«QfﬁPaÅ^é≠«Ω›±’Z‰¿@YOæÕé∑a•CqÀß∏ºªftÀm˘Ìt%ÈÏzƒ’t¸Ì†lgl„¶ÿ«˜î–4j¥k B/ßÚE%`œ¢€F≤\≈g‘ñ÷ÁÄx—˚1µÀ„4\äÇÏås·ƒ5áΩ¬Í{ô*‡é∏é˙‘O·¯
+àÄc˜é…–î'ìÉÓ^√èÓ›Léq¡÷¡Á7È]r– ï`nú§A„J¨ÌM^∑√ˆÚB‹Ú⁄{¯®‚ìßfzÎ‰}ç˚üe˚k©.≈B2ÿb¡hÜj2pÊë œ”QÛKa;µKN¯≥ÂT€î7%*v2ƒ€XbIÿÎíPP/a∫¬Lˆ6◊P.Uc»;*·Üd˛äÇíx9L@e≈’~‘ øÅCæ
+„)|V˝äŒ[ ‡G@≤õòˆ÷Å$√%UÆj≠(8RkLª4Lº÷cŸÑ„´+—%•ç¿∞úO±≈‡m ˘Ö1óêq˜≤¯–£+núI≈¯,á—¡HMdÂ…	=^Ã§hx”0t˚á/58PrW VÅÓ}SzêæàBH(c‡¥Ï`cæb$ˆËH1õ@_»∑-ÎzºXÔ¨7v* ÏÔ#•O√.ÿ1
+|O:/GxJ?aØPäEOyGeÔÆò˘ÃLµ_"}~wôŸ
+∏g}kâ$¿MÉòJO4€æA‡ZA”˙≠ª†Pµxˇ%üâÛ	Ç\{æã‰Oºh!ﬁ+•ª'IÎ∞z±ã•‡,⁄s[%<©S#Ω˘˜SL¯o	÷‰Ô˝˝k•Õ#sB}Í8ßë∆ßÆÏﬁJè
+£ÊJ%‚˝T4ã(V2,Ix}íëñ ˇaDhTy‚%fÎfmCg3Ì∂V®ñÈâ>5Oª0Æ≤Ç2ERybÇ…NVJÇèS˛ õ»Ä/¡≥7*¯√ÑÙ…b@ßeQ(»UÏ_œ|#QòB√zäpBÈ≥(˘RÇ)ÄjN"◊c;Î‹(EcyÃ#≠ÃÎô¸∞ÎZ-üæÑñﬁ~“pê{&n≥Z »◊ô¸Ç≠¥ñ‡ñ÷ˇrúl_Mó·)c≤4X’Æs&`xÁ∞CŒ€à√?ÿSóà>	™n–ˆ¯s	¡Ó[ÏE0ò3qÆôê∫„ÊÆóT*˙Aù¸üÍˆn’â¥DˆπÃAµ˜¥Ω∑Ü∏C‘P±cí†
+ñe+¿n˛¢”˙.=[_¸+›—öt⁄Zπ*T∂¡Cc{€ûÑ`≤[ß“Åp√`wıÒ9ôk@C∑íÒmW”c≠ê·†V»§√Œ=&µ	>^”‡È¬»∂¶I^FÖ›π\…ÎñÅiN◊$ƒ√QµN‘Ü9™<%ªÉjÑr	u™Ü˛Êñ›nÇ‰ÿÄı◊ì„ƒÆ∞GTÈ¯™øÔ&x°#µA¿d7uäâ¨Î’Y)%ed„ÿ÷kﬁ!“C#˜¯	PêÏ‘°k9?2h†0	+os”EÕ©Ûp∏–G#Tˆ‚áÂåº+ı¬õï<A™7Î4Ω…˚jÃŸú◊Á+]ãIHC”O~d&Iû©uoªOB‹,õ∆Ìqœ°xŸ[ô[≠*‡œÅXÈ¨jFA>„Ó¢∏^L∂π#â7ì≤¨"Ùa„8Sπ:)$Ï¬q¢+ˆÙîN1Œâ
+KµQ3îˇk∑Œ3ùÁ¬¨
+´'$$ÛQEdk6Z±-9[ W˜èÓËû"l¶˝ˆeM*ú7M¥≥iÀ1¡‚XH-ΩWt¨Ã!fŸpœ~<•˚LÆ*Èôpè’^ﬁ} BB,´uÓ∑QWΩ£ë≤ú‹éÔë)èv¡I∑…Uu?<™J:;øYJ+ÙÍwæfŸ≈™Sä√,L∑0W÷ã^M‹é™íú˜€eîìÆRœπã)0Õ ¥¶8Ä~ï7Vπﬂvwbßv€:k’<çy»j%”¢¡öqπ{´Á¸∫}ƒπΩ©´ã˜*ƒâaQX™∑pù7~^ùÿ¶›ú˝Ol:[≈-ö^±∆0”àÖ#›"˝¸m¥%;¡¡è?¿»ø,◊`jmA≥(ÉÁñCuÁ¨ÏgÇÖ9Ì≠\íORy<ÖR5÷4fÌø©j˜ 0É[xLíà¯:ﬁﬁÅ¿¬,◊BπØ%™ﬂf∑‡y„◊üAO†µëÛ„ØòÑïHºÊ±ƒÀöú|¯∆)ªè5˘˛„ PîrYí⁄W≈LF-˘|˝±“Ì∏ì§öÀ€¯CÄgYJU¢ó–¨3¥°4hn6âÚ©ˆH#ö// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "SNetStatsView.h"
+
+#include "EditorStyleSet.h"
+#include "Framework/MultiBox/MultiBoxBuilder.h"
+#include "SlateOptMacros.h"
+#include "Templates/UniquePtr.h"
+#include "TraceServices/AnalysisService.h"
+#include "TraceServices/Model/NetProfiler.h"
+#include "Widgets/Input/SCheckBox.h"
+#include "Widgets/Layout/SScrollBox.h"
+#include "Widgets/Input/SSearchBox.h"
+#include "Widgets/Images/SImage.h"
+#include "Widgets/Layout/SGridPanel.h"
+#include "Widgets/Layout/SSeparator.h"
+#include "Widgets/SToolTip.h"
+#include "Widgets/Views/STableViewBase.h"
+
+// Insights
+#include "Insights/Table/ViewModels/Table.h"
+#include "Insights/Table/ViewModels/TableColumn.h"
+#include "Insights/NetworkingProfiler/NetworkingProfilerManager.h"
+#include "Insights/NetworkingProfiler/ViewModels/NetStatsViewColumnFactory.h"
+#include "Insights/NetworkingProfiler/Widgets/SNetStatsViewTooltip.h"
+#include "Insights/NetworkingProfiler/Widgets/SNetStatsTableRow.h"
+#include "Insights/NetworkingProfiler/Widgets/SNetworkingProfilerWindow.h"
+#include "Insights/NetworkingProfiler/Widgets/SPacketContentView.h"
+
+#define LOCTEXT_NAMESPACE "SNetStatsView"
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+SNetStatsView::SNetStatsView()
+	: ProfilerWindow()
+	, Table(MakeShared<Insights::FTable>())
+	, bExpansionSaved(false)
+	, bFilterOutZeroCountEvents(false)
+	, GroupingMode(ENetEventGroupingMode::Flat)
+	, AvailableSorters()
+	, CurrentSorter(nullptr)
+	, ColumnBeingSorted(GetDefaultColumnBeingSorted())
+	, ColumnSortMode(GetDefaultColumnSortMode())
+	, NextTimestamp(0)
+	, ObjectsChangeCount(0)
+	, GameInstanceIndex(0)
+	, ConnectionIndex(0)
+	, ConnectionMode(Trace::ENetProfilerConnectionMode::Outgoing)
+	, StatsPacketStartIndex(0)
+	, StatsPacketEndIndex(0)
+	, StatsStartPosition(0)
+	, StatsEndPosition(0)
+{
+	FMemory::Memset(bNetEventTypeIsVisible, 1);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+SNetStatsView::~SNetStatsView()
+{
+	// Remove ourselves from the Insights manager.
+	if (FInsightsManager::Get().IsValid())
+	{
+		FInsightsManager::Get()->GetSessionChangedEvent().RemoveAll(this);
+	}
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+BEGIN_SLATE_FUNCTION_BUILD_OPTIMIZATION
+void SNetStatsView::Construct(const FArguments& InArgs, TSharedPtr<SNetworkingProfilerWindow> InProfilerWindow)
+{
+	ProfilerWindow = InProfilerWindow;
+
+	SAssignNew(ExternalScrollbar, SScrollBar)
+	.AlwaysShowScrollbar(true);
+
+	ChildSlot
+	[
+		SNew(SVerticalBox)
+
+		+ SVerticalBox::Slot()
+		.VAlign(VAlign_Center)
+		.AutoHeight()
+		[
+			SNew(SBorder)
+			.BorderImage(FEditorStyle::GetBrush("ToolPanel.GroupBorder"))
+			.Padding(2.0f)
+			[
+				SNew(SVerticalBox)
+
+				+ SVerticalBox::Slot()
+				.VAlign(VAlign_Center)
+				.Padding(2.0f)
+				.AutoHeight()
+				[
+					SNew(SHorizontalBox)
+
+					// Search box
+					+ SHorizontalBox::Slot()
+					.VAlign(VAlign_Center)
+					.Padding(2.0f)
+					.FillWidth(1.0f)
+					[
+						SAssignNew(SearchBox, SSearchBox)
+						.HintText(LOCTEXT("SearchBoxHint", "Search net events or groups"))
+						.OnTextChanged(this, &SNetStatsView::SearchBox_OnTextChanged)
+						.IsEnabled(this, &SNetStatsView::SearchBox_IsEnabled)
+						.ToolTipText(LOCTEXT("FilterSearchHint", "Type here to search net events or groups"))
+					]
+
+					// Filter out net event types with zero instance count
+					+ SHorizontalBox::Slot()
+					.VAlign(VAlign_Center)
+					.Padding(2.0f)
+					.AutoWidth()
+					[
+						SNew(SCheckBox)
+						.Style(FEditorStyle::Get(), "ToggleButtonCheckbox")
+						.HAlign(HAlign_Center)
+						.Padding(2.0f)
+						.OnCheckStateChanged(this, &SNetStatsView::FilterOutZeroCountEvents_OnCheckStateChanged)
+						.IsChecked(this, &SNetStatsView::FilterOutZeroCountEvents_IsChecked)
+						.ToolTipText(LOCTEXT("FilterOutZeroCountEvents_Tooltip", "Filter out 

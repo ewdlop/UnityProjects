@@ -1,0 +1,86 @@
+﻿// Copyright (c) Microsoft Open Technologies, Inc. All rights reserved. See License.txt in the project root for license information.
+
+#if HAS_WINRT
+using System.Reactive.Disposables;
+using System.Reactive.Linq;
+using System.Reactive.Subjects;
+using System.Reactive.Threading.Tasks;
+using System.Runtime.InteropServices.WindowsRuntime;
+using System.Threading.Tasks;
+using Windows.Foundation;
+
+namespace System.Reactive.Linq
+{
+    /// <summary>
+    /// Provides a set of extension methods to expose observable sequences as Windows Runtime asynchronous actions and operations.
+    /// </summary>
+    public static class AsyncInfoObservable
+    {
+        #region IAsyncAction
+
+        /// <summary>
+        /// Creates a Windows Runtime asynchronous action that represents the completion of the observable sequence.
+        /// Upon cancellation of the asynchronous action, the subscription to the source sequence will be disposed.
+        /// </summary>
+        /// <typeparam name="TSource">The type of the elements in the source sequence.</typeparam>
+        /// <param name="source">Source sequence to expose as an asynchronous action.</param>
+        /// <returns>Windows Runtime asynchronous action object representing the completion of the observable sequence.</returns>
+        /// <exception cref="ArgumentNullException"><paramref name="source"/> is null.</exception>
+        public static IAsyncAction ToAsyncAction<TSource>(this IObservable<TSource> source)
+        {
+            if (source == null)
+                throw new ArgumentNullException("source");
+
+            return AsyncInfo.Run(ct => (Task)source.DefaultIfEmpty().ToTask(ct));
+        }
+
+        #region Progress
+
+        /// <summary>
+        /// Creates a Windows Runtime asynchronous action that represents the completion of the observable sequence, reporting incremental progress for each element produced by the sequence.
+        /// Upon cancellation of the asynchronous action, the subscription to the source sequence will be disposed.
+        /// </summary>
+        /// <typeparam name="TSource">The type of the elements in the source sequence.</typeparam>
+        /// <param name="source">Source sequence to expose as an asynchronous action.</param>
+        /// <returns>Windows Runtime asynchronous action object representing the completion of the observable sequence, reporting incremental progress for each source sequence element.</returns>
+        /// <exception cref="ArgumentNullException"><paramref name="source"/> is null.</exception>
+        public static IAsyncActionWithProgress<int> ToAsyncActionWithProgress<TSource>(this IObservable<TSource> source)
+        {
+            if (source == null)
+                throw new ArgumentNullException("source");
+
+            return AsyncInfo.Run<int>((ct, progress) =>
+            {
+                var i = 0;
+                return (Task)source.Do(_ => progress.Report(i++)).DefaultIfEmpty().ToTask(ct);
+            });
+        }
+
+        /// <summary>
+        /// Creates a Windows Runtime asynchronous action that represents the completion of the observable sequence, using a selector function to map the source sequence on a progress reporting sequence.
+        /// Upon cancellation of the asynchronous action, the subscription to the source sequence will be disposed.
+        /// </summary>
+        /// <typeparam name="TSource">The type of the elements in the source sequence.</typeparam>
+        /// <typeparam name="TProgress">The type of the elements in the progress sequence.</typeparam>
+        /// <param name="source">Source sequence to expose as an asynchronous action and to compute a progress sequence that gets reported through the asynchronous action.</param>
+        /// <param name="progressSelector">Selector function to map the source sequence on a progress reporting sequence.</param>
+        /// <returns>Windows Runtime asynchronous action object representing the completion of the result sequence, reporting progress computed through the progress sequence.</returns>
+        /// <exception cref="ArgumentNullException"><paramref name="source"/> or <paramref name="progressSelector"/> is null.</exception>
+        public static IAsyncActionWithProgress<TProgress> ToAsyncActionWithProgress<TSource, TProgress>(this IObservable<TSource> source, Func<IObservable<TSource>, IObservable<TProgress>> progressSelector)
+        {
+            if (source == null)
+                throw new ArgumentNullException("source");
+            if (progressSelector == null)
+                throw new ArgumentNullException("progressSelector");
+
+            return AsyncInfo.Run<TProgress>((ct, progress) =>
+            {
+                return (Task)Observable.Create<TSource>(observer =>
+                {
+                    var obs = Observer.Synchronize(observer);
+
+                    var data = source.Publish();
+
+                    var progressSubscription = progressSelector(data).Subscribe(progress.Report, obs.OnError);
+                    var dataSubscription = data.DefaultIfEmpty().Subscribe(obs);
+                    var connection

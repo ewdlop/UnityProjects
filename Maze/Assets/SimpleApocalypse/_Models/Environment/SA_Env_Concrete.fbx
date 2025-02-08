@@ -1,0 +1,540 @@
+pMutex);
+		if (!CloudAnchorMap.Contains(InCloudAnchorID))
+		{
+			Callback(EAzureSpatialAnchorsResult::FailAnchorDoesNotExist, L"Provided AzureCloudSpatialAnchor does not have an associated cloud anchor. This anchor was not saved/declared to the Azure Spatial Anchors service");
+			return;
+		}
+
+		CloudAnchor = CloudAnchorMap[InCloudAnchorID];
+	}
+
+	if (CloudAnchor->Identifier().empty())
+	{
+		Callback(EAzureSpatialAnchorsResult::FailNoCloudAnchor, L"Provided AzureCloudSpatialAnchor has not been saved to the service");
+		return;
+	}
+
+	Session->UpdateAnchorPropertiesAsync(CloudAnchor, [Callback](Status status) {
+		if (status != Status::OK)
+		{
+			std::wstringstream string;
+			string << "Failed to update azure spatial anchor properties: " << static_cast<int32_t>(status);
+			Callback(EAzureSpatialAnchorsResult::FailSeeErrorString, string.str().c_str());
+			return;
+		}
+
+		Callback(EAzureSpatialAnchorsResult::Success, L"");
+	});
+}
+
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsAndroidInterop::GetConfiguration(FAzureSpatialAnchorsSessionConfiguration& OutConfig)
+{
+	if (!Session)
+	{
+		UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("Azure Spatial Anchors failed to obtain session configuration, session was null"));
+		return EAzureSpatialAnchorsResult::FailNoSession;
+	}
+
+	auto Configuration = Session->Configuration();
+	OutConfig.AccessToken = FString{ Configuration->AccessToken().c_str() };
+	OutConfig.AccountId = FString{ Configuration->AccountId().c_str() };
+	OutConfig.AccountKey = FString{ Configuration->AccountKey().c_str() };
+	OutConfig.AccountDomain = FString{ Configuration->AccountDomain().c_str() };
+	OutConfig.AuthenticationToken = FString{ Configuration->AuthenticationToken().c_str() };
+
+	return EAzureSpatialAnchorsResult::Success;
+}
+
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsAndroidInterop::SetConfiguration(const FAzureSpatialAnchorsSessionConfiguration& InConfig)
+{
+	if (!Session)
+	{
+		UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("Azure Spatial Anchors failed to configure session, session was null"));
+		return EAzureSpatialAnchorsResult::FailNoSession;
+	}
+
+	UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Log, TEXT("Attempting to configure Azure Spatial Anchors session"));
+	auto Configuration = Session->Configuration();
+
+	if (!InConfig.AccessToken.IsEmpty())
+	{
+		Configuration->AccessToken(TCHAR_TO_UTF8(*InConfig.AccessToken));
+	}
+
+	if (!InConfig.AccountId.IsEmpty())
+	{
+		Configuration->AccountId(TCHAR_TO_UTF8(*InConfig.AccountId));
+	}
+
+	if (!InConfig.AccountKey.IsEmpty())
+	{
+		Configuration->AccountKey(TCHAR_TO_UTF8(*InConfig.AccountKey));
+	}
+
+	if (!InConfig.AccountDomain.IsEmpty())
+	{
+		Configuration->AccountDomain(TCHAR_TO_UTF8(*InConfig.AccountDomain));
+	}
+
+	if (!InConfig.AuthenticationToken.IsEmpty())
+	{
+		Configuration->AuthenticationToken(TCHAR_TO_UTF8(*InConfig.AuthenticationToken));
+	}
+
+	UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Log, TEXT("Azure Spatial Anchors successfully configured session"));
+	return EAzureSpatialAnchorsResult::Success;
+}
+
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsAndroidInterop::SetLocationProvider(const FCoarseLocalizationSettings& InConfig)
+{
+	if (!Session)
+	{
+		UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("Azure Spatial Anchors failed to set location provider for session, session was null"));
+		return EAzureSpatialAnchorsResult::FailNoSession;
+	}
+
+	UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Log, TEXT("Attempting to set location provider for Azure Spatial Anchors session"));
+	if (InConfig.bEnable)
+	{
+		std::shared_ptr<PlatformLocationProvider> LocationProvider = std::make_shared<PlatformLocationProvider>();
+		std::shared_ptr<SensorCapabilities> Sensors = LocationProvider->Sensors();
+		Sensors->GeoLocationEnabled(InConfig.bEnableGPS);
+		Sensors->WifiEnabled(InConfig.bEnableWifi);
+
+		bool bBluetoothEnabled = InConfig.BLEBeaconUUIDs.Num() > 0;
+		Sensors->BluetoothEnabled(bBluetoothEnabled);
+		if (bBluetoothEnabled)
+		{
+			std::vector<std::string> uuids;
+			for (int i = 0; i < InConfig.BLEBeaconUUIDs.Num(); i++)
+			{
+				uuids.push_back(TCHAR_TO_UTF8(*InConfig.BLEBeaconUUIDs[i]));
+			}
+
+			Sensors->KnownBeaconProximityUuids(uuids);
+		}
+
+		Session->LocationProvider(LocationProvider);
+	}
+	else
+	{
+		// TODO: jeff.fisher - uncomment out this bottom line when the service crash is fixed
+		// Session->LocationProvider(nullptr);
+	}
+
+	UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Log, TEXT("Local provider succesfully set for Azure Spatial Anchors session"));
+	return EAzureSpatialAnchorsResult::Success;
+}
+
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsAndroidInterop::GetLogLevel(EAzureSpatialAnchorsLogVerbosity& OutLogVerbosity)
+{
+	if (!Session)
+	{
+		UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("Azure Spatial Anchors failed to get log level for session, session was null"));
+		return EAzureSpatialAnchorsResult::FailNoSession;
+	}
+
+	OutLogVerbosity = static_cast<EAzureSpatialAnchorsLogVerbosity>(Session->LogLevel());
+	return EAzureSpatialAnchorsResult::Success;
+}
+	
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsAndroidInterop::SetLogLevel(EAzureSpatialAnchorsLogVerbosity InLogVerbosity)
+{
+	if (!Session)
+	{
+		UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("Azure Spatial Anchors failed to set log level for session, session was null"));
+		return EAzureSpatialAnchorsResult::FailNoSession;
+	}
+
+	Session->LogLevel(static_cast<SessionLogLevel>(InLogVerbosity));
+	return EAzureSpatialAnchorsResult::Success;
+}
+
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsAndroidInterop::GetSessionId(FString& OutSessionID)
+{
+	if (!Session)
+	{
+		UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("Azure Spatial Anchors failed to get session Id, session was null"));
+		return EAzureSpatialAnchorsResult::FailNoSession;
+	}
+
+	OutSessionID = FString{ UTF8_TO_TCHAR(Session->SessionId().c_str()) };
+	return EAzureSpatialAnchorsResult::Success;
+}
+
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsAndroidInterop::StopWatcher(IAzureSpatialAnchors::WatcherID InWatcherIdentifier)
+{
+	if (!Session ||
+		!bSessionRunning)
+	{
+		UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("Attempted to stop a watcher when no Azure Spatial Anchor session was running"));
+		return EAzureSpatialAnchorsResult::NotStarted;
+	}
+
+	if (!CurrentWatcher ||
+		CurrentWatcher->Identifier() != InWatcherIdentifier)
+	{
+		UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("Attempted to stop a watcher that was not known to the current Azure Spatial Anchor"));
+		return EAzureSpatialAnchorsResult::FailNoWatcher;
+	}
+
+	CurrentWatcher->Stop();
+	CurrentWatcher = nullptr;
+	return EAzureSpatialAnchorsResult::Success;
+}
+
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsAndroidInterop::GetCloudSpatialAnchorIdentifier(IAzureSpatialAnchors::CloudAnchorID CloudAnchorID, FString& OutCloudAnchorIdentifier)
+{
+	OutCloudAnchorIdentifier = FString{};
+
+	if (!Session)
+	{
+		UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("Attempted to get cloud anchor identifier when no Azure Spatial Anchor session is running"));
+		return EAzureSpatialAnchorsResult::FailNoSession;
+	}
+
+	std::shared_ptr<CloudSpatialAnchor> Anchor;
+	{
+		FScopeLock Lock(&CloudAnchorMapMutex);
+		if (!CloudAnchorMap.Contains(CloudAnchorID))
+		{
+			UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("Attempted to get cloud anchor identifier when for an anchor not known to the plugin"));
+			return EAzureSpatialAnchorsResult::FailNoCloudAnchor;
+		}
+
+		Anchor = CloudAnchorMap[CloudAnchorID];
+	}
+
+	OutCloudAnchorIdentifier = FString{ UTF8_TO_TCHAR(Anchor->Identifier().c_str()) };
+	return EAzureSpatialAnchorsResult::Success;
+}
+
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsAndroidInterop::SetCloudAnchorExpiration(IAzureSpatialAnchors::CloudAnchorID InCloudAnchorID, float InLifetimeInSeconds)
+{
+	if (!Session ||
+		!bSessionRunning)
+	{
+		UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("Attempted to set cloud anchor expiration when no Azure Spatial Anchors session is running"));
+		return EAzureSpatialAnchorsResult::NotStarted;
+	}
+
+	std::shared_ptr < CloudSpatialAnchor> Anchor;
+	{
+		FScopeLock Lock(&CloudAnchorMapMutex);
+		if (!CloudAnchorMap.Contains(InCloudAnchorID))
+		{
+			UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("Attempted to set cloud anchor expiration for an anchor not known to the plugin"));
+			return EAzureSpatialAnchorsResult::FailNoCloudAnchor;
+		}
+
+		Anchor = CloudAnchorMap[InCloudAnchorID];
+	}
+
+    std::chrono::system_clock::time_point Expiration = std::chrono::system_clock::now() + std::chrono::milliseconds(static_cast<int64_t>(InLifetimeInSeconds * 1000));
+	const int64_t ExpirationSinceEpochMs = std::chrono::duration_cast<std::chrono::milliseconds>(Expiration.time_since_epoch()).count();
+
+	try
+	{
+		Anchor->Expiration(ExpirationSinceEpochMs);
+		return EAzureSpatialAnchorsResult::Success;
+	}
+	catch (runtime_error& e)
+	{
+		UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("Exception thrown attempting to set cloud anchor expiration"));
+		return EAzureSpatialAnchorsResult::FailUnknown;
+	}
+}
+
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsAndroidInterop::GetCloudAnchorExpiration(IAzureSpatialAnchors::CloudAnchorID InCloudAnchorID, float& OutLifetimeInSeconds)
+{
+	OutLifetimeInSeconds = -1;
+	if (!Session ||
+		!bSessionRunning)
+	{
+		UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("Attempted to get cloud anchor expiration when no Azure Spatial Anchors session is running"));
+		return EAzureSpatialAnchorsResult::NotStarted;
+	}
+	
+	int64_t ExpirationSinceEpochMs = -1;
+	{
+		FScopeLock Lock(&CloudAnchorMapMutex);
+		if (!CloudAnchorMap.Contains(InCloudAnchorID))
+		{
+			UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("Attempted to get cloud anchor expiration for an AzureCloudSpatialAnchor not known to the plugin"));
+			return EAzureSpatialAnchorsResult::FailNoCloudAnchor;
+		}
+
+		ExpirationSinceEpochMs = CloudAnchorMap[InCloudAnchorID]->Expiration();
+	}
+
+	auto Expiration = std::chrono::milliseconds(ExpirationSinceEpochMs) - std::chrono::system_clock::now().time_since_epoch();
+	int64_t ExpirationMs = std::chrono::duration_cast<std::chrono::milliseconds>(Expiration).count();
+	OutLifetimeInSeconds = ExpirationMs / 1000.0f; // milliseconds to seconds
+	return EAzureSpatialAnchorsResult::Success;
+}
+
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsAndroidInterop::SetCloudAnchorAppProperties(IAzureSpatialAnchors::CloudAnchorID InCloudAnchorID, const TMap<FString, FString>& InAppProperties)
+{
+	if (!Session ||
+		!bSessionRunning)
+	{
+		UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("Attempted to set cloud anchor app properties when no Azure Spatial Anchors session is running"));
+		return EAzureSpatialAnchorsResult::NotStarted;
+	}
+
+	std::shared_ptr<CloudSpatialAnchor> CloudAnchor;
+	{
+		FScopeLock Lock(&CloudAnchorMapMutex);
+		if (!CloudAnchorMap.Contains(InCloudAnchorID))
+		{
+			UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("Attempted to set cloud anchor app properties for an AzureCloudSpatialAnchor not known to the plugin"));
+			return EAzureSpatialAnchorsResult::FailNoCloudAnchor;
+		}
+
+		CloudAnchor = CloudAnchorMap[InCloudAnchorID];
+	}
+
+	if (CloudAnchor->Identifier().empty())
+	{
+		UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("Attempted to set cloud anchor app properties for an AzureCloudSpatialAnchor not known to the service"));
+		return EAzureSpatialAnchorsResult::FailNoCloudAnchor;
+	}
+
+	auto Properties = CloudAnchor->AppProperties();
+	for (auto Property : InAppProperties)
+	{
+		UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("Attempted to set cloud anchor app property for an AzureCloudSpatialAnchor: %s, %s"), *Property.Key, *Property.Value);
+		Properties->Insert(std::string(TCHAR_TO_UTF8(*Property.Key)), std::string(TCHAR_TO_UTF8(*Property.Value)));
+	}
+	
+	return EAzureSpatialAnchorsResult::Success;
+}
+
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsAndroidInterop::GetCloudAnchorAppProperties(IAzureSpatialAnchors::CloudAnchorID InCloudAnchorID, TMap<FString, FString>& OutAppProperties)
+{
+	OutAppProperties.Empty();
+	if (!Session ||
+		!bSessionRunning)
+	{
+		UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("Attempted to get cloud anchor app properties when no Azure Spatial Anchors session is running"));
+		return EAzureSpatialAnchorsResult::NotStarted;
+	}
+
+	std::shared_ptr<IMap<std::string, std::string>> Properties;
+	{
+		FScopeLock Lock(&CloudAnchorMapMutex);
+		if (!CloudAnchorMap.Contains(InCloudAnchorID))
+		{
+			UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("Attempted to get cloud anchor app properties for an AzureCloudSpatialAnchor not known to the plugin"));
+			return EAzureSpatialAnchorsResult::FailNoCloudAnchor;
+		}
+
+		Properties = CloudAnchorMap[InCloudAnchorID]->AppProperties();
+	}
+
+	for (uint32_t i = 0; i < Properties->Size(); i++)
+	{
+		auto Pair = Properties->GetAt(i);
+		OutAppProperties.Add(FString{ UTF8_TO_TCHAR(Pair.Key().c_str()) }, FString{ UTF8_TO_TCHAR(Pair.Value().c_str()) });
+	}
+
+	return EAzureSpatialAnchorsResult::Success;
+}
+
+EAzureSpatialAnchorsResult FAzureSpatialAnchorsAndroidInterop::SetDiagnosticsConfig(FAzureSpatialAnchorsDiagnosticsConfig& InConfig)
+{
+	if (!Session)
+	{
+		return EAzureSpatialAnchorsResult::FailNoSession;
+	}
+
+	auto Diagnostics = Session->Diagnostics();
+	Diagnostics->ImagesEnabled(InConfig.bImagesEnabled);
+	Diagnostics->LogDirectory(TCHAR_TO_UTF8(*InConfig.LogDirectory));
+	Diagnostics->LogLevel(static_cast<SessionLogLevel>(InConfig.LogLevel));
+	Diagnostics->MaxDiskSizeInMB(InConfig.MaxDiskSizeInMB);
+
+	return EAzureSpatialAnchorsResult::Success;
+}
+
+void FAzureSpatialAnchorsAndroidInterop::CreateDiagnosticsManifestAsync(const FString& Description, IAzureSpatialAnchors::Callback_Result_String Callback)
+{
+	if (!Session)
+	{
+		Callback(EAzureSpatialAnchorsResult::FailNoSession, L"", L"");
+	}
+
+	std::string description = std::string(TCHAR_TO_UTF8(*Description));
+	Session->Diagnostics()->CreateManifestAsync(description, [Callback](Status status, const std::string& manifest)
+	{
+		std::wstringstream string;
+		if (status != Status::OK)
+		{
+			string << L"Failed to create diagnostics manifest: " << static_cast<int32_t>(status);
+			Callback(EAzureSpatialAnchorsResult::FailSeeErrorString, string.str().c_str(), L"");
+			return;
+		}
+
+		string << manifest.c_str();
+		Callback(EAzureSpatialAnchorsResult::Success, L"", string.str().c_str());
+	});
+}
+
+void FAzureSpatialAnchorsAndroidInterop::SubmitDiagnosticsManifestAsync(const FString& ManifestPath, IAzureSpatialAnchors::Callback_Result Callback)
+{
+	if (!Session)
+	{
+		Callback(EAzureSpatialAnchorsResult::FailNoSession, L"");
+	}
+
+	std::string manifestPath = std::string(TCHAR_TO_UTF8(*ManifestPath));
+	Session->Diagnostics()->SubmitManifestAsync(manifestPath, [Callback](Status status)
+	{
+		if (status != Status::OK)
+		{
+			std::wstringstream string;
+			string << L"Failed to submit diagnostics manifest: " << static_cast<int32_t>(status);
+			Callback(EAzureSpatialAnchorsResult::FailSeeErrorString, string.str().c_str());
+			return;
+		}
+
+		Callback(EAzureSpatialAnchorsResult::Success, L"");
+	});
+}
+
+void FAzureSpatialAnchorsAndroidInterop::CreateNamedARPinAroundAnchor(const FString& InLocalAnchorId, UARPin*& OutARPin)
+{
+	OutARPin = nullptr;
+	UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("CreateNamedARPinAroundAnchor is not implemented for ARCore!  Returning Null."));
+	// TODO: jeff.fisher - fix this logic
+	// ARCore doesn't maintain anchors based on an id. Anchors do map directly to ARPins when understood by the ARCore session.
+	// It seems like this function does not belong here
+	//jeff.fisher says: I think that is correct, seems like I can remove this entirely.
+}
+
+bool FAzureSpatialAnchorsAndroidInterop::CreateARPinAroundAzureCloudSpatialAnchor(const FString& PinId, UAzureCloudSpatialAnchor* InAzureCloudSpatialAnchor, UARPin*& OutARPin)
+{
+	OutARPin = nullptr;
+	if (!ARSystem.IsValid())
+	{
+		UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("Attempted to create an ARPin for an AzureCloudSpatialAnchor when no valid AR System was found"));
+		return false;
+	}
+
+	if (!Session ||
+		!bSessionRunning)
+	{
+		UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("Attempted to create an ARPin for an AzureCloudSpatialAnchor when no Azure Spatial Anchor session was running"));
+		return false;
+	}
+
+	if (!InAzureCloudSpatialAnchor)
+	{
+		UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("Attempted to create an ARPin for a null AzureCloudSpatialAnchor"));
+		return false;
+	}
+
+	if (InAzureCloudSpatialAnchor->ARPin)
+	{
+		UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Warning, TEXT("Attempted to create an ARPin for an AzureCloudSpatialAnchor that already had an ARPin"));
+		return true;
+	}
+
+	std::shared_ptr<CloudSpatialAnchor> Anchor;
+	{
+		FScopeLock Lock(&CloudAnchorMapMutex);
+		if (!CloudAnchorMap.Contains(InAzureCloudSpatialAnchor->CloudAnchorID))
+		{
+			UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("Attempted to create an ARPin for an invalid AzureCloudSpatialAnchor"));
+			return false;
+		}
+
+		Anchor = CloudAnchorMap[InAzureCloudSpatialAnchor->CloudAnchorID];
+	}
+
+	ArAnchor* LocalAnchor = Anchor->LocalAnchor();
+	if (!LocalAnchor)
+	{
+		UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("Attempted to create an ARPin for an AzureCloudSpatialAnchor without a valid ArAnchor"));
+		return false;
+	}
+
+	UARPin* ARPin = nullptr;
+	if (!ARSystem->TryGetOrCreatePinForNativeResource(reinterpret_cast<void*>(LocalAnchor), PinId, ARPin))
+	{
+		UE_LOG(LogAzureSpatialAnchorsAndroidInterop, Error, TEXT("ARCore failed to create an ARPin for the provided ArAnchor"));
+		return false;
+	}
+
+	InAzureCloudSpatialAnchor->ARPin = ARPin;
+	OutARPin = ARPin;
+	return true;
+}
+
+FString FAzureSpatialAnchorsAndroidInterop::SessionUserFeedbackToString(SessionUserFeedback userFeedback)
+{
+	switch (userFeedback)
+	{
+	case SessionUserFeedback::MotionTooQuick:
+		return TEXT("MotionTooQuick");
+	case SessionUserFeedback::NotEnoughFeatures:
+		return TEXT("NotEnoughFeatures");
+	case SessionUserFeedback::NotEnoughMotion:
+		return TEXT("NotEnoughMotion");
+	case SessionUserFeedback::None:
+	default:
+		return TEXT("None");
+	}
+}
+
+IAzureSpatialAnchors::CloudAnchorID FAzureSpatialAnchorsAndroidInterop::GetNextID()
+{
+	FScopeLock Lock(&CurrentIDMutex);
+	int Id = CurrentID;
+	CurrentID++;
+	return Id;
+}
+
+void FAzureSpatialAnchorsAndroidInterop::OnAnchorLocated(const std::shared_ptr<Microsoft::Azure::SpatialAnchors::AnchorLocatedEventArgs>& Args)
+{
+	if (Session &&
+		bSessionRunning &&
+		ARSystem.IsValid())
+	{
+		std::shared_ptr<CloudSpatialAnchor> Anchor = Args->Anchor();
+		if (Anchor != nullptr)
+		{
+			IAzureSpatialAnchors::CloudAnchorID CloudAnchorID = IAzureSpatialAnchors::CloudAnchorID_Invalid;
+			{
+				FScopeLock Lock(&CloudAnchorMapMutex);
+				for (auto Pair : CloudAnchorMap)
+				{
+					if (Pair.Value->Identifier() == Anchor->Identifier())
+					{
+						CloudAnchorID = Pair.Key;
+						break;
+					}
+				}
+			}
+
+			if (CloudAnchorID == IAzureSpatialAnchors::CloudAnchorID_Invalid)
+			{
+				UAzureCloudSpatialAnchor* CloudAnchor = NewObject<UAzureCloudSpatialAnchor>();
+				CloudAnchor->ARPin = nullptr;
+				CloudAnchor->CloudAnchorID = GetNextID();
+				CloudAnchorID = CloudAnchor->CloudAnchorID;
+
+				LocalAnchorMap.Add(CloudAnchor->CloudAnchorID, CloudAnchor);
+
+				{
+					FScopeLock Lock(&CloudAnchorMapMutex);
+					CloudAnchorMap.Add(CloudAnchor->CloudAnchorID, Anchor);
+				}
+			}
+
+			AnchorLocatedCallback(Args->Watcher()->Identifier(), static_cast<int32>(Args->Status()), static_cast<int32>(CloudAnchorID));
+		}
+	}
+}
+
+void FAzureSpatialAnchorsAndroidInterop::ClearAnchorData(IAzureSpa

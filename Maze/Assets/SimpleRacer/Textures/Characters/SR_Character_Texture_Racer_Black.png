@@ -1,0 +1,210 @@
+
+// of this class. Instances of subclass ProcResource will be automatically
+// attached to a processor, so SchedModel is not needed.
+class ProcResourceUnits<ProcResourceKind kind, int num> {
+  ProcResourceKind Kind = kind;
+  int NumUnits = num;
+  ProcResourceKind Super = ?;
+  int BufferSize = -1;
+  SchedMachineModel SchedModel = ?;
+}
+
+// EponymousProcResourceKind helps implement ProcResourceUnits by
+// allowing a ProcResourceUnits definition to reference itself. It
+// should not be referenced anywhere else.
+def EponymousProcResourceKind : ProcResourceKind;
+
+// Subtargets typically define processor resource kind and number of
+// units in one place.
+class ProcResource<int num> : ProcResourceKind,
+  ProcResourceUnits<EponymousProcResourceKind, num>;
+
+class ProcResGroup<list<ProcResource> resources> : ProcResourceKind {
+  list<ProcResource> Resources = resources;
+  SchedMachineModel SchedModel = ?;
+  int BufferSize = -1;
+}
+
+// A target architecture may define SchedReadWrite types and associate
+// them with instruction operands.
+class SchedReadWrite;
+
+// List the per-operand types that map to the machine model of an
+// instruction. One SchedWrite type must be listed for each explicit
+// def operand in order. Additional SchedWrite types may optionally be
+// listed for implicit def operands.  SchedRead types may optionally
+// be listed for use operands in order. The order of defs relative to
+// uses is insignificant. This way, the same SchedReadWrite list may
+// be used for multiple forms of an operation. For example, a
+// two-address instruction could have two tied operands or single
+// operand that both reads and writes a reg. In both cases we have a
+// single SchedWrite and single SchedRead in any order.
+class Sched<list<SchedReadWrite> schedrw> {
+  list<SchedReadWrite> SchedRW = schedrw;
+}
+
+// Define a scheduler resource associated with a def operand.
+class SchedWrite : SchedReadWrite;
+def NoWrite : SchedWrite;
+
+// Define a scheduler resource associated with a use operand.
+class SchedRead  : SchedReadWrite;
+
+// Define a SchedWrite that is modeled as a sequence of other
+// SchedWrites with additive latency. This allows a single operand to
+// be mapped the resources composed from a set of previously defined
+// SchedWrites.
+//
+// If the final write in this sequence is a SchedWriteVariant marked
+// Variadic, then the list of prior writes are distributed across all
+// operands after resolving the predicate for the final write.
+//
+// SchedModel silences warnings but is ignored.
+class WriteSequence<list<SchedWrite> writes, int rep = 1> : SchedWrite {
+  list<SchedWrite> Writes = writes;
+  int Repeat = rep;
+  SchedMachineModel SchedModel = ?;
+}
+
+// Define values common to WriteRes and SchedWriteRes.
+//
+// SchedModel ties these resources to a processor.
+class ProcWriteResources<list<ProcResourceKind> resources> {
+  list<ProcResourceKind> ProcResources = resources;
+  list<int> ResourceCycles = [];
+  int Latency = 1;
+  int NumMicroOps = 1;
+  bit BeginGroup = 0;
+  bit EndGroup = 0;
+  // Allow a processor to mark some scheduling classes as unsupported
+  // for stronger verification.
+  bit Unsupported = 0;
+  // Allow a processor to mark some scheduling classes as single-issue.
+  // SingleIssue is an alias for Begin/End Group.
+  bit SingleIssue = 0;
+  SchedMachineModel SchedModel = ?;
+}
+
+// Define the resources and latency of a SchedWrite. This will be used
+// directly by targets that have no itinerary classes. In this case,
+// SchedWrite is defined by the target, while WriteResources is
+// defined by the subtarget, and maps the SchedWrite to processor
+// resources.
+//
+// If a target already has itinerary classes, SchedWriteResources can
+// be used instead to define subtarget specific SchedWrites and map
+// them to processor resources in one place. Then ItinRW can map
+// itinerary classes to the subtarget's SchedWrites.
+//
+// ProcResources indicates the set of resources consumed by the write.
+// Optionally, ResourceCycles indicates the number of cycles the
+// resource is consumed. Each ResourceCycles item is paired with the
+// ProcResource item at the same position in its list. Since
+// ResourceCycles are rarely specialized, the list may be
+// incomplete. By default, resources are consumed for a single cycle,
+// regardless of latency, which models a fully pipelined processing
+// unit. A value of 0 for ResourceCycles means that the resource must
+// be available but is not consumed, which is only relevant for
+// unbuffered resources.
+//
+// By default, each SchedWrite takes one micro-op, which is counted
+// against the processor's IssueWidth limit. If an instruction can
+// write multiple registers with a single micro-op, the subtarget
+// should define one of the writes to be zero micro-ops. If a
+// subtarget requires multiple micro-ops to write a single result, it
+// should either override the write's NumMicroOps to be greater than 1
+// or require additional writes. Extra writes can be required either
+// by defining a WriteSequence, or simply listing extra writes in the
+// instruction's list of writers beyond the number of "def"
+// operands. The scheduler assumes that all micro-ops must be
+// dispatched in the same cycle. These micro-ops may be required to
+// begin or end the current dispatch group.
+class WriteRes<SchedWrite write, list<ProcResourceKind> resources>
+  : ProcWriteResources<resources> {
+  SchedWrite WriteType = write;
+}
+
+// Directly name a set of WriteResources defining a new SchedWrite
+// type at the same time. This class is unaware of its SchedModel so
+// must be referenced by InstRW or ItinRW.
+class SchedWriteRes<list<ProcResourceKind> resources> : SchedWrite,
+  ProcWriteResources<resources>;
+
+// Define values common to ReadAdvance and SchedReadAdvance.
+//
+// SchedModel ties these resources to a processor.
+class ProcReadAdvance<int cycles, list<SchedWrite> writes = []> {
+  int Cycles = cycles;
+  list<SchedWrite> ValidWrites = writes;
+  // Allow a processor to mark some scheduling classes as unsupported
+  // for stronger verification.
+  bit Unsupported = 0;
+  SchedMachineModel SchedModel = ?;
+}
+
+// A processor may define a ReadAdvance associated with a SchedRead
+// to reduce latency of a prior write by N cycles. A negative advance
+// effectively increases latency, which may be used for cross-domain
+// stalls.
+//
+// A ReadAdvance may be associated with a list of SchedWrites
+// to implement pipeline bypass. The Writes list may be empty to
+// indicate operands that are always read this number of Cycles later
+// than a normal register read, allowing the read's parent instruction
+// to issue earlier relative to the writer.
+class ReadAdvance<SchedRead read, int cycles, list<SchedWrite> writes = []>
+  : ProcReadAdvance<cycles, writes> {
+  SchedRead ReadType = read;
+}
+
+// Directly associate a new SchedRead type with a delay and optional
+// pipeline bypass. For use with InstRW or ItinRW.
+class SchedReadAdvance<int cycles, list<SchedWrite> writes = []> : SchedRead,
+  ProcReadAdvance<cycles, writes>;
+
+// Define SchedRead defaults. Reads seldom need special treatment.
+def ReadDefault : SchedRead;
+def NoReadAdvance : SchedReadAdvance<0>;
+
+// Define shared code that will be in the same scope as all
+// SchedPredicates. Available variables are:
+// (const MachineInstr *MI, const TargetSchedModel *SchedModel)
+class PredicateProlog<code c> {
+  code Code = c;
+}
+
+// Define a predicate to determine which SchedVariant applies to a
+// particular MachineInstr. The code snippet is used as an
+// if-statement's expression. Available variables are MI, SchedModel,
+// and anything defined in a PredicateProlog.
+//
+// SchedModel silences warnings but is ignored.
+class SchedPredicate<code pred> {
+  SchedMachineModel SchedModel = ?;
+  code Predicate = pred;
+}
+def NoSchedPred : SchedPredicate<[{true}]>;
+
+// Associate a predicate with a list of SchedReadWrites. By default,
+// the selected SchedReadWrites are still associated with a single
+// operand and assumed to execute sequentially with additive
+// latency. However, if the parent SchedWriteVariant or
+// SchedReadVariant is marked "Variadic", then each Selected
+// SchedReadWrite is mapped in place to the instruction's variadic
+// operands. In this case, latency is not additive. If the current Variant
+// is already part of a Sequence, then that entire chain leading up to
+// the Variant is distributed over the variadic operands.
+class SchedVar<SchedPredicate pred, list<SchedReadWrite> selected> {
+  SchedPredicate Predicate = pred;
+  list<SchedReadWrite> Selected = selected;
+}
+
+// SchedModel silences warnings but is ignored.
+class SchedVariant<list<SchedVar> variants> {
+  list<SchedVar> Variants = variants;
+  bit Variadic = 0;
+  SchedMachineModel SchedModel = ?;
+}
+
+// A SchedWriteVariant is a single SchedWrite type that maps to a list
+// of SchedWrite types under the conditions d

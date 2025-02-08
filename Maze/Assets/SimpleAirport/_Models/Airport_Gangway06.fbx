@@ -1,0 +1,1179 @@
+; RUN:  llc -amdgpu-scalarize-global-loads=false  -march=amdgcn -mcpu=tahiti -verify-machineinstrs < %s | FileCheck -check-prefix=GCN -check-prefix=GCN-NOHSA -check-prefix=SI %s
+; RUN:  llc -amdgpu-scalarize-global-loads=false  -march=amdgcn -mcpu=bonaire -verify-machineinstrs < %s | FileCheck -check-prefix=GCN -check-prefix=GCN-NOHSA -check-prefix=CI %s
+; RUN:  llc -amdgpu-scalarize-global-loads=false  -mtriple=amdgcn--amdhsa -mcpu=bonaire -verify-machineinstrs < %s | FileCheck -check-prefix=GCN -check-prefix=CI --check-prefix=GCN-HSA %s
+
+declare i32 @llvm.amdgcn.workitem.id.x() #0
+declare i32 @llvm.amdgcn.workitem.id.y() #0
+
+; In this test both the pointer and the offset operands to the
+; BUFFER_LOAD instructions end up being stored in vgprs.  This
+; requires us to add the pointer and offset together, store the
+; result in the offset operand (vaddr), and then store 0 in an
+; sgpr register pair and use that for the pointer operand
+; (low 64-bits of srsrc).
+
+; GCN-LABEL: {{^}}mubuf:
+
+; Make sure we aren't using VGPRs for the source operand of s_mov_b64
+; GCN-NOT: s_mov_b64 s[{{[0-9]+:[0-9]+}}], v
+
+; Make sure we aren't using VGPR's for the srsrc operand of BUFFER_LOAD_*
+; instructions
+; GCN-NOHSA: buffer_load_ubyte v{{[0-9]+}}, v[{{[0-9]+:[0-9]+}}], s[{{[0-9]+:[0-9]+}}], 0 addr64
+; GCN-NOHSA: buffer_load_ubyte v{{[0-9]+}}, v[{{[0-9]+:[0-9]+}}], s[{{[0-9]+:[0-9]+}}], 0 addr64
+; GCN-HSA: flat_load_ubyte v{{[0-9]+}}, v[{{[0-9]+:[0-9]+}}
+; GCN-HSA: flat_load_ubyte v{{[0-9]+}}, v[{{[0-9]+:[0-9]+}}
+
+define amdgpu_kernel void @mubuf(i32 addrspace(1)* %out, i8 addrspace(1)* %in) #1 {
+entry:
+  %tmp = call i32 @llvm.amdgcn.workitem.id.x()
+  %tmp1 = call i32 @llvm.amdgcn.workitem.id.y()
+  %tmp2 = sext i32 %tmp to i64
+  %tmp3 = sext i32 %tmp1 to i64
+  br label %loop
+
+loop:                                             ; preds = %loop, %entry
+  %tmp4 = phi i64 [ 0, %entry ], [ %tmp5, %loop ]
+  %tmp5 = add i64 %tmp2, %tmp4
+  %tmp6 = getelementptr i8, i8 addrspace(1)* %in, i64 %tmp5
+  %tmp7 = load i8, i8 addrspace(1)* %tmp6, align 1
+  %tmp8 = or i64 %tmp5, 1
+  %tmp9 = getelementptr i8, i8 addrspace(1)* %in, i64 %tmp8
+  %tmp10 = load i8, i8 addrspace(1)* %tmp9, align 1
+  %tmp11 = add i8 %tmp7, %tmp10
+  %tmp12 = sext i8 %tmp11 to i32
+  store i32 %tmp12, i32 addrspace(1)* %out
+  %tmp13 = icmp slt i64 %tmp5, 10
+  br i1 %tmp13, label %loop, label %done
+
+done:                                             ; preds = %loop
+  ret void
+}
+
+; Test moving an SMRD instruction to the VALU
+; FIXME: movs can be moved before nop to reduce count
+
+; GCN-LABEL: {{^}}smrd_valu:
+; SI: s_movk_i32 [[OFFSET:s[0-9]+]], 0x2ee0
+; SI: s_mov_b32
+; GCN: v_readfirstlane_b32 s[[PTR_LO:[0-9]+]], v{{[0-9]+}}
+; GCN: v_readfirstlane_b32 s[[PTR_HI:[0-9]+]], v{{[0-9]+}}
+; SI: s_nop 3
+; SI: s_load_dword [[OUT:s[0-9]+]], s{{\[}}[[PTR_LO]]:[[PTR_HI]]{{\]}}, [[OFFSET]]
+
+; CI: s_load_dword [[OUT:s[0-9]+]], s{{\[}}[[PTR_LO]]:[[PTR_HI]]{{\]}}, 0xbb8
+; GCN: v_mov_b32_e32 [[V_OUT:v[0-9]+]], [[OUT]]
+; GCN-NOHSA: buffer_store_dword [[V_OUT]]
+; GCN-HSA: flat_store_dword {{.*}}, [[V_OUT]]
+define amdgpu_kernel void @smrd_valu(i32 addrspace(2)* addrspace(1)* %in, i32 %a, i32 %b, i32 addrspace(1)* %out) #1 {
+entry:
+  %tmp = icmp ne i32 %a, 0
+  br i1 %tmp, label %if, label %else
+
+if:                                               ; preds = %entry
+  %tmp1 = load i32 addrspace(2)*, i32 addrspace(2)* addrspace(1)* %in
+  br label %endif
+
+else:                                             ; preds = %entry
+  %tmp2 = getelementptr i32 addrspace(2)*, i32 addrspace(2)* addrspace(1)* %in
+  %tmp3 = load i32 addrspace(2)*, i32 addrspace(2)* addrspace(1)* %tmp2
+  br label %endif
+
+endif:                                            ; preds = %else, %if
+  %tmp4 = phi i32 addrspace(2)* [ %tmp1, %if ], [ %tmp3, %else ]
+  %tmp5 = getelementptr i32, i32 addrspace(2)* %tmp4, i32 3000
+  %tmp6 = load i32, i32 addrspace(2)* %tmp5
+  store i32 %tmp6, i32 addrspace(1)* %out
+  ret void
+}
+
+; Test moving an SMRD with an immediate offset to the VALU
+
+; GCN-LABEL: {{^}}smrd_valu2:
+; GCN-NOHSA-NOT: v_add
+; GCN-NOHSA: buffer_load_dword v{{[0-9]+}}, v{{\[[0-9]+:[0-9]+\]}}, s[{{[0-9]+:[0-9]+}}], 0 addr64 offset:16{{$}}
+; GCN-HSA: flat_load_dword v{{[0-9]+}}, v[{{[0-9]+:[0-9]+}}]
+define amdgpu_kernel void @smrd_valu2(i32 addrspace(1)* %out, [8 x i32] addrspace(2)* %in) #1 {
+entry:
+  %tmp = call i32 @llvm.amdgcn.workitem.id.x()
+  %tmp1 = add i32 %tmp, 4
+  %tmp2 = getelementptr [8 x i32], [8 x i32] addrspace(2)* %in, i32 %tmp, i32 4
+  %tmp3 = load i32, i32 addrspace(2)* %tmp2
+  store i32 %tmp3, i32 addrspace(1)* %out
+  ret void
+}
+
+; Use a big offset that will use the SMRD literal offset on CI
+; GCN-LABEL: {{^}}smrd_valu_ci_offset:
+; GCN-NOHSA-NOT: v_add
+; GCN-NOHSA: s_movk_i32 [[OFFSET:s[0-9]+]], 0x4e20{{$}}
+; GCN-NOHSA-NOT: v_add
+; GCN-NOHSA: buffer_load_dword v{{[0-9]+}}, v{{\[[0-9]+:[0-9]+\]}}, s[{{[0-9]+:[0-9]+}}], [[OFFSET]] addr64{{$}}
+; GCN-NOHSA: v_add_i32_e32
+; GCN-NOHSA: buffer_store_dword
+; GCN-HSA: flat_load_dword v{{[0-9]+}}, v[{{[0-9]+:[0-9]+}}]
+; GCN-HSA: flat_store_dword v[{{[0-9]+:[0-9]+}}], v{{[0-9]+}}
+define amdgpu_kernel void @smrd_valu_ci_offset(i32 addrspace(1)* %out, i32 addrspace(2)* %in, i32 %c) #1 {
+entry:
+  %tmp = call i32 @llvm.amdgcn.workitem.id.x()
+  %tmp2 = getelementptr i32, i32 addrspace(2)* %in, i32 %tmp
+  %tmp3 = getelementptr i32, i32 addrspace(2)* %tmp2, i32 5000
+  %tmp4 = load i32, i32 addrspace(2)* %tmp3
+  %tmp5 = add i32 %tmp4, %c
+  store i32 %tmp5, i32 addrspace(1)* %out
+  ret void
+}
+
+; GCN-LABEL: {{^}}smrd_valu_ci_offset_x2:
+; GCN-NOHSA-NOT: v_add
+; GCN-NOHSA: s_mov_b32 [[OFFSET:s[0-9]+]], 0x9c40{{$}}
+; GCN-NOHSA-NOT: v_add
+; GCN-NOHSA: buffer_load_dwordx2 v{{\[[0-9]+:[0-9]+\]}}, v{{\[[0-9]+:[0-9]+\]}}, s[{{[0-9]+:[0-9]+}}], [[OFFSET]] addr64{{$}}
+; GCN-NOHSA: v_or_b32_e32 {{v[0-9]+}}, {{s[0-9]+}}, {{v[0-9]+}}
+; GCN-NOHSA: v_or_b32_e32 {{v[0-9]+}}, {{s[0-9]+}}, {{v[0-9]+}}
+; GCN-NOHSA: buffer_store_dwordx2
+; GCN-HSA: flat_load_dwordx2 v[{{[0-9]+:[0-9]+}}], v[{{[0-9]+:[0-9]+}}]
+define amdgpu_kernel void @smrd_valu_ci_offset_x2(i64 addrspace(1)* %out, i64 addrspace(2)* %in, i64 %c) #1 {
+entry:
+  %tmp = call i32 @llvm.amdgcn.workitem.id.x()
+  %tmp2 = getelementptr i64, i64 addrspace(2)* %in, i32 %tmp
+  %tmp3 = getelementptr i64, i64 addrspace(2)* %tmp2, i32 5000
+  %tmp4 = load i64, i64 addrspace(2)* %tmp3
+  %tmp5 = or i64 %tmp4, %c
+  store i64 %tmp5, i64 addrspace(1)* %out
+  ret void
+}
+
+; GCN-LABEL: {{^}}smrd_valu_ci_offset_x4:
+; GCN-NOHSA-NOT: v_add
+; GCN-NOHSA: s_movk_i32 [[OFFSET:s[0-9]+]], 0x4d20{{$}}
+; GCN-NOHSA-NOT: v_add
+; GCN-NOHSA: buffer_load_dwordx4 v{{\[[0-9]+:[0-9]+\]}}, v{{\[[0-9]+:[0-9]+\]}}, s[{{[0-9]+:[0-9]+}}], [[OFFSET]] addr64{{$}}
+; GCN-NOHSA: v_or_b32_e32 {{v[0-9]+}}, {{s[0-9]+}}, {{v[0-9]+}}
+; GCN-NOHSA: v_or_b32_e32 {{v[0-9]+}}, {{s[0-9]+}}, {{v[0-9]+}}
+; GCN-NOHSA: v_or_b32_e32 {{v[0-9]+}}, {{s[0-9]+}}, {{v[0-9]+}}
+; GCN-NOHSA: v_or_b32_e32 {{v[0-9]+}}, {{s[0-9]+}}, {{v[0-9]+}}
+; GCN-NOHSA: buffer_store_dwordx4
+; GCN-HSA: flat_load_dwordx4 v[{{[0-9]+:[0-9]+}}], v[{{[0-9]+:[0-9]+}}]
+define amdgpu_kernel void @smrd_valu_ci_offset_x4(<4 x i32> addrspace(1)* %out, <4 x i32> addrspace(2)* %in, <4 x i32> %c) #1 {
+entry:
+  %tmp = call i32 @llvm.amdgcn.workitem.id.x()
+  %tmp2 = getelementptr <4 x i32>, <4 x i32> addrspace(2)* %in, i32 %tmp
+  %tmp3 = getelementptr <4 x i32>, <4 x i32> addrspace(2)* %tmp2, i32 1234
+  %tmp4 = load <4 x i32>, <4 x i32> addrspace(2)* %tmp3
+  %tmp5 = or <4 x i32> %tmp4, %c
+  store <4 x i32> %tmp5, <4 x i32> addrspace(1)* %out
+  ret void
+}
+
+; Original scalar load uses SGPR offset on SI and 32-bit literal on
+; CI.
+
+; GCN-LABEL: {{^}}smrd_valu_ci_offset_x8:
+; GCN-NOHSA: s_mov_b32 [[OFFSET0:s[0-9]+]], 0x9a40{{$}}
+; GCN-NOHSA-NOT: v_add
+; GCN-NOHSA: s_mov_b32 [[OFFSET1:s[0-9]+]], 0x9a50{{$}}
+; GCN-NOHSA-NOT: v_add
+; GCN-NOHSA: buffer_load_dwordx4 v{{\[[0-9]+:[0-9]+\]}}, v{{\[[0-9]+:[0-9]+\]}}, s[{{[0-9]+:[0-9]+}}], [[OFFSET1]] addr64{{$}}
+; GCN-NOHSA: buffer_load_dwordx4 v{{\[[0-9]+:[0-9]+\]}}, v{{\[[0-9]+:[0-9]+\]}}, s[{{[0-9]+:[0-9]+}}], [[OFFSET0]] addr64{{$}}
+
+; GCN-NOHSA: v_or_b32_e32 {{v[0-9]+}}, {{s[0-9]+}}, {{v[0-9]+}}
+; GCN-NOHSA: v_or_b32_e32 {{v[0-9]+}}, {{s[0-9]+}}, {{v[0-9]+}}
+; GCN-NOHSA: v_or_b32_e32 {{v[0-9]+}}, {{s[0-9]+}}, {{v[0-9]+}}
+; GCN-NOHSA: v_or_b32_e32 {{v[0-9]+}}, {{s[0-9]+}}, {{v[0-9]+}}
+; GCN-NOHSA: v_or_b32_e32 {{v[0-9]+}}, {{s[0-9]+}}, {{v[0-9]+}}
+; GCN-NOHSA: v_or_b32_e32 {{v[0-9]+}}, {{s[0-9]+}}, {{v[0-9]+}}
+; GCN-NOHSA: v_or_b32_e32 {{v[0-9]+}}, {{s[0-9]+}}, {{v[0-9]+}}
+; GCN-NOHSA: v_or_b32_e32 {{v[0-9]+}}, {{s[0-9]+}}, {{v[0-9]+}}
+; GCN-NOHSA: buffer_store_dwordx4
+; GCN-NOHSA: buffer_store_dwordx4
+; GCN-HSA: flat_load_dwordx4
+; GCN-HSA: flat_load_dwordx4
+define amdgpu_kernel void @smrd_valu_ci_offset_x8(<8 x i32> addrspace(1)* %out, <8 x i32> addrspace(2)* %in, <8 x i32> %c) #1 {
+entry:
+  %tmp = call i32 @llvm.amdgcn.workitem.id.x()
+  %tmp2 = getelementptr <8 x i32>, <8 x i32> addrspace(2)* %in, i32 %tmp
+  %tmp3 = getelementptr <8 x i32>, <8 x i32> addrspace(2)* %tmp2, i32 1234
+  %tmp4 = load <8 x i32>, <8 x i32> addrspace(2)* %tmp3
+  %tmp5 = or <8 x i32> %tmp4, %c
+  store <8 x i32> %tmp5, <8 x i32> addrspace(1)* %out
+  ret void
+}
+
+; GCN-LABEL: {{^}}smrd_valu_ci_offset_x16:
+
+; GCN-NOHSA-DAG: s_mov_b32 [[OFFSET0:s[0-9]+]], 0x13480{{$}}
+; GCN-NOHSA-DAG: buffer_load_dwordx4 v{{\[[0-9]+:[0-9]+\]}}, v{{\[[0-9]+:[0-9]+\]}}, s[{{[0-9]+:[0-9]+}}], [[OFFSET0]] addr64{{$}}
+; GCN-NOHSA-DAG: s_mov_b32 [[OFFSET1:s[0-9]+]], 0x13490{{$}}
+; GCN-NOHSA-DAG: buffer_load_dwordx4 v{{\[[0-9]+:[0-9]+\]}}, v{{\[[0-9]+:[0-9]+\]}}, s[{{[0-9]+:[0-9]+}}], [[OFFSET1]] addr64{{$}}
+; GCN-NOHSA-DAG: s_mov_b32 [[OFFSET2:s[0-9]+]], 0x134a0{{$}}
+; GCN-NOHSA-DAG: buffer_load_dwordx4 v{{\[[0-9]+:[0-9]+\]}}, v{{\[[0-9]+:[0-9]+\]}}, s[{{[0-9]+:[0-9]+}}], [[OFFSET2]] addr64{{$}}
+; GCN-NOHSA-DAG: s_mov_b32 [[OFFSET3:s[0-9]+]], 0x134b0{{$}}
+; GCN-NOHSA-DAG: buffer_load_dwordx4 v{{\[[0-9]+:[0-9]+\]}}, v{{\[[0-9]+:[0-9]+\]}}, s[{{[0-9]+:[0-9]+}}], [[OFFSET3]] addr64{{$}}
+
+; GCN-NOHSA: v_or_b32_e32 {{v[0-9]+}}, {{s[0-9]+}}, {{v[0-9]+}}
+; GCN-NOHSA: v_or_b32_e32 {{v[0-9]+}}, {{s[0-9]+}}, {{v[0-9]+}}
+; GCN-NOHSA: v_or_b32_e32 {{v[0-9]+}}, {{s[0-9]+}}, {{v[0-9]+}}
+; GCN-NOHSA: v_or_b32_e32 {{v[0-9]+}}, {{s[0-9]+}}, {{v[0-9]+}}
+; GCN-NOHSA: v_or_b32_e32 {{v[0-9]+}}, {{s[0-9]+}}, {{v[0-9]+}}
+; GCN-NOHSA: v_or_b32_e32 {{v[0-9]+}}, {{s[0-9]+}}, {{v[0-9]+}}
+; GCN-NOHSA: v_or_b32_e32 {{v[0-9]+}}, {{s[0-9]+}}, {{v[0-9]+}}
+; GCN-NOHSA: v_or_b32_e32 {{v[0-9]+}}, {{s[0-9]+}}, {{v[0-9]+}}
+; GCN-NOHSA: buffer_store_dwordx4
+; GCN-NOHSA: buffer_store_dwordx4
+; GCN-NOHSA: buffer_store_dwordx4
+; GCN-NOHSA: buffer_store_dwordx4
+
+; GCN-HSA: flat_load_dwordx4
+; GCN-HSA: flat_load_dwordx4
+; GCN-HSA: flat_load_dwordx4
+; GCN-HSA: flat_load_dwordx4
+
+; GCN: s_endpgm
+define amdgpu_kernel void @smrd_valu_ci_offset_x16(<16 x i32> addrspace(1)* %out, <16 x i32> addrspace(2)* %in, <16 x i32> %c) #1 {
+entry:
+  %tmp = call i32 @llvm.amdgcn.workitem.id.x()
+  %tmp2 = getelementptr <16 x i32>, <16 x i32> addrspace(2)* %in, i32 %tmp
+  %tmp3 = getelementptr <16 x i32>, <16 x i32> addrspace(2)* %tmp2, i32 1234
+  %tmp4 = load <16 x i32>, <16 x i32> addrspace(2)* %tmp3
+  %tmp5 = or <16 x i32> %tmp4, %c
+  store <16 x i32> %tmp5, <16 x i32> addrspace(1)* %out
+  ret void
+}
+
+; GCN-LABEL: {{^}}smrd_valu2_salu_user:
+; GCN-NOHSA: buffer_load_dword [[MOVED:v[0-9]+]], v{{\[[0-9]+:[0-9]+\]}}, s{{\[[0-9]+:[0-9]+\]}}, 0 addr64 offset:16{{$}}
+; GCN-HSA: flat_load_dword [[MOVED:v[0-9]+]], v[{{[0-9+:[0-9]+}}]
+; GCN: v_add_i32_e32 [[ADD:v[0-9]+]], vcc, s{{[0-9]+}}, [[MOVED]]
+; GCN-NOHSA: buffer_store_dword [[ADD]]
+; GCN-HSA: flat_store_dword {{.*}}, [[ADD]]
+define amdgpu_kernel void @smrd_valu2_salu_user(i32 addrspace(1)* %out, [8 x i32] addrspace(2)* %in, i32 %a) #1 {
+entry:
+  %tmp = call i32 @llvm.amdgcn.workitem.id.x()
+  %tmp1 = add i32 %tmp, 4
+  %tmp2 = getelementptr [8 x i32], [8 x i32] addrspace(2)* %in, i32 %tmp, i32 4
+  %tmp3 = load i32, i32 addrspace(2)* %tmp2
+  %tmp4 = add i32 %tmp3, %a
+  store i32 %tmp4, i32 addrspace(1)* %out
+  ret void
+}
+
+; GCN-LABEL: {{^}}smrd_valu2_max_smrd_offset:
+; GCN-NOHSA: buffer_load_dword v{{[0-9]+}}, v{{\[[0-9]+:[0-9]+\]}}, s{{\[[0-9]+:[0-9]+\]}}, 0 addr64 offset:1020{{$}}
+; GCN-HSA flat_load_dword v{{[0-9]}}, v{{[0-9]+:[0-9]+}}
+define amdgpu_kernel void @smrd_valu2_max_smrd_offset(i32 addrspace(1)* %out, [1024 x i32] addrspace(2)* %in) #1 {
+entry:
+  %tmp = call i32 @llvm.amdgcn.workitem.id.x()
+  %tmp1 = add i32 %tmp, 4
+  %tmp2 = getelementptr [1024 x i32], [1024 x i32] addrspace(2)* %in, i32 %tmp, i32 255
+  %tmp3 = load i32, i32 addrspace(2)* %tmp2
+  store i32 %tmp3, i32 addrspace(1)* %out
+  ret void
+}
+
+; GCN-LABEL: {{^}}smrd_valu2_mubuf_offset:
+; GCN-NOHSA-NOT: v_add
+; GCN-NOHSA: buffer_load_dword v{{[0-9]+}}, v{{\[[0-9]+:[0-9]+\]}}, s{{\[[0-9]+:[0-9]+\]}}, 0 addr64 offset:1024{{$}}
+; GCN-HSA: flat_load_dword v{{[0-9]}}, v[{{[0-9]+:[0-9]+}}]
+define amdgpu_kernel void @smrd_valu2_mubuf_offset(i32 addrspace(1)* %out, [1024 x i32] addrspace(2)* %in) #1 {
+entry:
+  %tmp = call i32 @llvm.amdgcn.workitem.id.x()
+  %tmp1 = add i32 %tmp, 4
+  %tmp2 = getelementptr [1024 x i32], [1024 x i32] addrspace(2)* %in, i32 %tmp, i32 256
+  %tmp3 = load i32, i32 addrspace(2)* %tmp2
+  store i32 %tmp3, i32 addrspace(1)* %out
+  ret void
+}
+
+; GCN-LABEL: {{^}}s_load_imm_v8i32:
+; GCN-NOHSA: buffer_load_dwordx4
+; GCN-NOHSA: buffer_load_dwordx4
+; GCN-HSA: flat_load_dwordx4
+; GCN-HSA: flat_load_dwordx4
+define amdgpu_kernel void @s_load_imm_v8i32(<8 x i32> addrspace(1)* %out, i32 addrspace(2)* nocapture readonly %in) #1 {
+entry:
+  %tmp0 = tail call i32 @llvm.amdgcn.workitem.id.x()
+  %tmp1 = getelementptr inbounds i32, i32 addrspace(2)* %in, i32 %tmp0
+  %tmp2 = bitcast i32 addrspace(2)* %tmp1 to <8 x i32> addrspace(2)*
+  %tmp3 = load <8 x i32>, <8 x i32> addrspace(2)* %tmp2, align 4
+  store <8 x i32> %tmp3, <8 x i32> addrspace(1)* %out, align 32
+  ret void
+}
+
+; GCN-LABEL: {{^}}s_load_imm_v8i32_salu_user:
+; GCN-NOHSA: buffer_load_dwordx4
+; GCN-NOHSA: buffer_load_dwordx4
+; GCN-NOHSA: v_add_i32_e32
+; GCN-NOHSA: v_add_i32_e32
+; GCN-NOHSA: v_add_i32_e32
+; GCN-NOHSA: v_add_i32_e32
+; GCN-NOHSA: v_add_i32_e32
+; GCN-NOHSA: v_add_i32_e32
+; GCN-NOHSA: v_add_i32_e32
+; GCN-NOHSA: buffer_store_dword
+; GCN-HSA: flat_load_dwordx4
+; GCN-HSA: flat_load_dwordx4
+define amdgpu_kernel void @s_load_imm_v8i32_salu_user(i32 addrspace(1)* %out, i32 addrspace(2)* nocapture readonly %in) #1 {
+entry:
+  %tmp0 = tail call i32 @llvm.amdgcn.workitem.id.x()
+  %tmp1 = getelementptr inbounds i32, i32 addrspace(2)* %in, i32 %tmp0
+  %tmp2 = bitcast i32 addrspace(2)* %tmp1 to <8 x i32> addrspace(2)*
+  %tmp3 = load <8 x i32>, <8 x i32> addrspace(2)* %tmp2, align 4
+
+  %elt0 = extractelement <8 x i32> %tmp3, i32 0
+  %elt1 = extractelement <8 x i32> %tmp3, i32 1
+  %elt2 = extractelement <8 x i32> %tmp3, i32 2
+  %elt3 = extractelement <8 x i32> %tmp3, i32 3
+  %elt4 = extractelement <8 x i32> %tmp3, i32 4
+  %elt5 = extractelement <8 x i32> %tmp3, i32 5
+  %elt6 = extractelement <8 x i32> %tmp3, i32 6
+  %elt7 = extractelement <8 x i32> %tmp3, i32 7
+
+  %add0 = add i32 %elt0, %elt1
+  %add1 = add i32 %add0, %elt2
+  %add2 = add i32 %add1, %elt3
+  %add3 = add i32 %add2, %elt4
+  %add4 = add i32 %add3, %elt5
+  %add5 = add i32 %add4, %elt6
+  %add6 = add i32 %add5, %elt7
+
+  store i32 %add6, i32 addrspace(1)* %out
+  ret void
+}
+
+; GCN-LABEL: {{^}}s_load_imm_v16i32:
+; GCN-NOHSA: buffer_load_dwordx4
+; GCN-NOHSA: buffer_load_dwordx4
+; GCN-NOHSA: buffer_load_dwordx4
+; GCN-NOHSA: buffer_load_dwordx4
+; GCN-HSA: flat_load_dwordx4
+; GCN-HSA: flat_load_dwordx4
+; GCN-HSA: flat_load_dwordx4
+; GCN-HSA: flat_load_dwordx4
+define amdgpu_kernel void @s_load_imm_v16i32(<16 x i32> addrspace(1)* %out, i32 addrspace(2)* nocapture readonly %in) #1 {
+entry:
+  %tmp0 = tail call i32 @llvm.amdgcn.workitem.id.x()
+  %tmp1 = getelementptr inbounds i32, i32 addrspace(2)* %in, i32 %tmp0
+  %tmp2 = bitcast i32 addrspace(2)* %tmp1 to <16 x i32> addrspace(2)*
+  %tmp3 = load <16 x i32>, <16 x i32> addrspace(2)* %tmp2, align 4
+  store <16 x i32> %tmp3, <16 x i32> addrspace(1)* %out, align 32
+  ret void
+}
+
+; GCN-LABEL: {{^}}s_load_imm_v16i32_salu_user:
+; GCN-NOHSA: buffer_load_dwordx4
+; GCN-NOHSA: buffer_load_dwordx4
+; GCN-NOHSA: buffer_load_dwordx4
+; GCN-NOHSA: buffer_load_dwordx4
+; GCN-NOHSA: v_add_i32_e32
+; GCN-NOHSA: v_add_i32_e32
+; GCN-NOHSA: v_add_i32_e32
+; GCN-NOHSA: v_add_i32_e32
+; GCN-NOHSA: v_add_i32_e32
+; GCN-NOHSA: v_add_i32_e32
+; GCN-NOHSA: v_add_i32_e32
+; GCN-NOHSA: v_add_i32_e32
+; GCN-NOHSA: v_add_i32_e32
+; GCN-NOHSA: v_add_i32_e32
+; GCN-NOHSA: v_add_i32_e32
+; GCN-NOHSA: v_add_i32_e32
+; GCN-NOHSA: v_add_i32_e32
+; GCN-NOHSA: v_add_i32_e32
+; GCN-NOHSA: v_add_i32_e32
+; GCN-NOHSA: buffer_store_dword
+; GCN-HSA: flat_load_dwordx4
+; GCN-HSA: flat_load_dwordx4
+; GCN-HSA: flat_load_dwordx4
+; GCN-HSA: flat_load_dwordx4
+define amdgpu_kernel void @s_load_imm_v16i32_salu_user(i32 addrspace(1)* %out, i32 addrspace(2)* nocapture readonly %in) #1 {
+entry:
+  %tmp0 = tail call i32 @llvm.amdgcn.workitem.id.x()
+  %tmp1 = getelementptr inbounds i32, i32 addrspace(2)* %in, i32 %tmp0
+  %tmp2 = bitcast i32 addrspace(2)* %tmp1 to <16 x i32> addrspace(2)*
+  %tmp3 = load <16 x i32>, <16 x i32> addrspace(2)* %tmp2, align 4
+
+  %elt0 = extractelement <16 x i32> %tmp3, i32 0
+  %elt1 = extractelement <16 x i32> %tmp3, i32 1
+  %elt2 = extractelement <16 x i32> %tmp3, i32 2
+  %elt3 = extractelement <16 x i32> %tmp3, i32 3
+  %elt4 = extractelement <16 x i32> %tmp3, i32 4
+  %elt5 = extractelement <16 x i32> %tmp3, i32 5
+  %elt6 = extractelement <16 x i32> %tmp3, i32 6
+  %elt7 = extractelement <16 x i32> %tmp3, i32 7
+  %elt8 = extractelement <16 x i32> %tmp3, i32 8
+  %elt9 = extractelement <16 x i32> %tmp3, i32 9
+  %elt10 = extractelement <16 x i32> %tmp3, i32 10
+  %elt11 = extractelement <16 x i32> %tmp3, i32 11
+  %elt12 = extractelement <16 x i32> %tmp3, i32 12
+  %elt13 = extractelement <16 x i32> %tmp3, i32 13
+  %elt14 = extractelement <16 x i32> %tmp3, i32 14
+  %elt15 = extractelement <16 x i32> %tmp3, i32 15
+
+  %add0 = add i32 %elt0, %elt1
+  %add1 = add i32 %add0, %elt2
+  %add2 = add i32 %add1, %elt3
+  %add3 = add i32 %add2, %elt4
+  %add4 = add i32 %add3, %elt5
+  %add5 = add i32 %add4, %elt6
+  %add6 = add i32 %add5, %elt7
+  %add7 = add i32 %add6, %elt8
+  %add8 = add i32 %add7, %elt9
+  %add9 = add i32 %add8, %elt10
+  %add10 = add i32 %add9, %elt11
+  %add11 = add i32 %add10, %elt12
+  %add12 = add i32 %add11, %elt13
+  %add13 = add i32 %add12, %elt14
+  %add14 = add i32 %add13, %elt15
+
+  store i32 %add14, i32 addrspace(1)* %out
+  ret void
+}
+
+; Make sure we legalize vopc operands after moving an sopc to the value.
+
+; {{^}}sopc_vopc_legalize_bug:
+; GCN: s_load_dword [[SGPR:s[0-9]+]]
+; GCN: v_cmp_le_u32_e32 vcc, [[SGPR]], v{{[0-9]+}}
+; GCN: s_and_b64 vcc, exec, vcc
+; GCN: s_cbranch_vccnz [[EXIT:[A-Z0-9_]+]]
+; GCN: v_mov_b32_e32 [[ONE:v[0-9]+]], 1
+; GCN-NOHSA: buffer_store_dword [[ONE]]
+; GCN-HSA: flat_store_dword v[{{[0-9]+:[0-9]+}}], [[ONE]]
+; GCN: {{^}}[[EXIT]]:
+; GCN: s_endpgm
+define amdgpu_kernel void @sopc_vopc_legalize_bug(i32 %cond, i32 addrspace(1)* %out, i32 addrspace(1)* %in) {
+bb3:                                              ; preds = %bb2
+  %tmp0 = bitcast i32 %cond to float
+  %tmp1 = fadd float %tmp0, 2.500000e-01
+  %tmp2 = bitcast float %tmp1 to i32
+  %tmp3 = icmp ult i32 %tmp2, %cond
+  br i1 %tmp3, label %bb6, label %bb7
+
+bb6:
+  store i32 1, i32 addrspace(1)* %out
+  br label %bb7
+
+bb7:                                              ; preds = %bb3
+  ret void
+}
+
+; GCN-LABEL: {{^}}phi_visit_order:
+; GCN: v_add_i32_e32 v{{[0-9]+}}, vcc, 1, v{{[0-9]+}}
+define amdgpu_kernel void @phi_visit_order() {
+bb:
+  br label %bb1
+
+bb1:
+  %tmp = phi i32 [ 0, %bb ], [ %tmp5, %bb4 ]
+  %tid = call i32 @llvm.amdgcn.workitem.id.x()
+  %cnd = icmp eq i32 %tid, 0
+  br i1 %cnd, label %bb4, label %bb2
+
+bb2:
+  %tmp3 = add nsw i32 %tmp, 1
+  br label %bb4
+
+bb4:
+  %tmp5 = phi i32 [ %tmp3, %bb2 ], [ %tmp, %bb1 ]
+  br label %bb1
+}
+
+; GCN-LABEL: {{^}}phi_imm_in_sgprs
+; GCN: s_movk_i32 [[A:s[0-9]+]], 0x400
+; GCN: s_movk_i32 [[B:s[0-9]+]], 0x400
+; GCN: [[LOOP_LABEL:[0-9a-zA-Z_]+]]:
+; GCN: s_xor_b32 [[B]], [[B]], [[A]]
+; GCN: s_cbranch_scc{{[01]}} [[LOOP_LABEL]]
+define amdgpu_kernel void @phi_imm_in_sgprs(i32 addrspace(3)* %out, i32 %cond) {
+entry:
+  br label %loop
+
+loop:
+  %i = phi i32 [0, %entry], [%i.add, %loop]
+  %offset = phi i32 [1024, %entry], [%offset.xor, %loop]
+  %offset.xor = xor i32 %offset, 1024
+  %offset.i = add i32 %offset.xor, %i
+  %ptr = getelementptr i32, i32 addrspace(3)* %out, i32 %offset.i
+  store i32 0, i32 addrspace(3)* %ptr
+  %i.add = add i32 %i, 1
+  %cmp = icmp ult i32 %i.add, %cond
+  br i1 %cmp, label %loop, label %exit
+
+exit:
+  ret void
+}
+
+attributes #0 = { nounwind readnone }
+attributes #1 = { nounwind }
+                                                                                                                                                                                                       èt      H«út     H«ôt      HÉƒ√ff.Ñ     êSHÉÏdHã%(   HâD$1¿HÖˆÑÊ   Ä> HâÛÑ∂   HâÁËé¯ˇˇÖ¿Öá   Hã$HâHã$ã!t  âJHãÎs  HâJãt  âJãt  âJ ã◊s  àJã÷s  àJãÂs  âJãÃs  àJãÀs  àJãÊs  H«ós      âJ$ã⁄s  ∆B/ˇâJ(H«B@    Hãt$dH34%(   uOHÉƒ[√fÑ     1¿HçÔA  æb˜ˇˇ1ˇË+ÌˇˇHâﬂË3Îˇˇ∏b˜ˇˇÎΩ1¿HçÀA  æb˜ˇˇ1ˇËÌˇˇ∏b˜ˇˇÎ°ËÏˇˇff.Ñ     HÉÏHã=ms  ËÍˇˇHÉ=Ps   tHç=Gs  ˇπm  Hã=jj  ˇlk  Hçel  1“Hç5
+<  Hç=$;  ˇøo  Hç»m  1“Hç5£<  Hç=;  ˇ¢o  HçKm  1“Hç5ã<  Hç=Í:  ˇÖo  HçÓj  1“Hç5s<  Hç=Õ:  ˇho  Hçqk  1“Hç5_<  Hç=∞:  ˇKo  Hçj  1“Hç5'<  Hç=ì:  ˇ.o  1¿HÉƒ√Ä    ATIâÙæH   UHâ˝ø   SË«ÎˇˇHÖ¿tyLâ Hâ√1ˆ1ˇHâ—q  Hã"i  ∆CCã H«C    H«C(   àCAH∏    »   HâC H∏       HâC0H∏ˇˇˇˇ   HâC8∆C@«iq     Ëî¸ˇˇHâ] 1¿[]A\√H«E     ∏˙ˇˇˇÎÏf.Ñ     ATãi  USã¥q  É˚Ñ◊  E1‰1ÌÖ“~3fD  Hã©q  Bã| ÉˇˇtË¢Íˇˇã‹h  É≈IÉƒX9ÍŸãoq  9”çë   Hc√Lç%Ò?  HçÄHç,PH¡ÂÎ. ÄxH tHã3h  ã Ö¿Ö	  ËÈˇˇÉ√HÉ≈X9h  ~EHã.q  HËHã8HÖˇtﬂãPÉ˙ˇt◊ã˝p  É˙~∞Ö…~¨É¡9 •É√HÉ≈X9@h  ¡fD  ã÷p  Ö€Ñ    É=#h  ΩX   Aº   ~vfD  Hã¡p  HÎHã;HÖˇtË9ËˇˇH«    HÉ{ tHç{ˇk  Hãíp  HÎHã{8HÖˇtæ   Ë‰ÁˇˇHãup  HÎHã{(AÉƒHÉ≈XË˘ÎˇˇD;%¢g  |ê«ñg     [1¿]A\√Ä    Hâ˘1¿Hç=+8  â⁄LâÊËíËˇˇHã#p  Hã<(È—˛ˇˇfêHãp  Hãx8HÖˇtæ   ËfÁˇˇHã˜o  Hãx(ËÜÎˇˇÈˇˇˇêÉ˙Ö ˛ˇˇÎèD  ATUSHÉÏHã_dHã%(   HâD$1¿HÖ€toHâ˝Iâ‰ÎÄ    Ö¿uHã$HâC8Hã[@HÖ€tKHãS0H«C8    HÖ“tÊLâÊHã} ˇ%g  =EÙˇˇu∆HãK0LãHç>  1ˇæˇˇˇˇ1¿Ë ËˇˇHã[@HÖ€u∂ê1¿HãL$dH3%(   u	HÉƒ[]A\√Ë∞ÁˇˇAWAVAUATUSHÅÏÿ   ã-˝n  dHã%(   HâÑ$»   1¿ÖÌÖ  HãÔn  Hçê8  HâHãNn  HãPHÖ“ÑŸ  HâDãP EÖ“è!  H«C8    E1…«CˇˇˇˇH«CP    H«C    fDâK@ãP âSãP$âS ãP(àS0Äx? ∫   uDã@ EÖ¿ÑX  àSB∂P?Hç{(Hç5Ü5  àSEãP,àSCãP0àSDãP8àS@ãP4àSI∂PAàSF∂PCàSH∂P@àSG∫   Äx< EÍâkÄx= ï¿1“∂¿âCË£ÊˇˇÖ¿ÖQ  Hã¸m  ∑pHãx(ãP ËÈˇˇHãÂm  æp0Hãx(Ë‡Âˇˇ1ˇË9Èˇˇâ≥m  Ö¿àÅ  ã-©m  ;-ˇd  çŸ  Hc≈E1ÌAºˇˇˇˇHçÄHçPHçD$,Hâ$HçD$0H¡„HâD$HçD$2HâD$@ Lã=qm  IﬂIãÄ9 Ñí   ã5Dm  EâgÖˆé»   Aæ   Îã*m  AÉ∆É¿A9∆=IãE1¿Dâ‚æ   Dâ˜ËÿÁˇˇÉ¯u”EâwMãEâÒ∫   Hç≈<  DâÊ1ˇ1¿ËÒÂˇˇAãÉˇˇthAÄB Ö5  Hãæc  AÉ≈ãÖ“Öÿ  É≈HÉ√X9-d  èEˇˇˇEÖÌÑ‹  1¿Hã¥$»   dH34%(   Öz  HÅƒÿ   []A\A]A^A_√êAÄH ÖU  HãD$H«     Hãt$Hç~H«Ff    H)¯Hâ¡1¿É¡l¡ÈÛH´∏   fâD$0AÄA Ö⁄  Lãt$Iã7∫l   Lâ˜Ë˝„ˇˇ1“æ   ø   ∆Ñ$ù    ËîÁˇˇÖ¿AâGâD$àƒ   Lâ˜Ël‰ˇˇãL$Hãt$çPâœËyÊˇˇÖ¿à°   Iã?æ∂  ËTÊˇˇÖ¿àå   AÄB Ñ‘˛ˇˇAãD  Hã$A∏   ∫   æ   «D$,   Ëß„ˇˇÖ¿Öø   AãHã$A∏   ∫   æ   ËÇ„ˇˇÖ¿Ñ}˛ˇˇË„ˇˇIãHçs;  DâÊã81¿Ëø‰ˇˇÈ]˛ˇˇf.Ñ     ËÎ‚ˇˇIãæÄ˜ˇˇHçÒ4  ã81¿Ëì‰ˇˇAãÉˇˇÑ>˛ˇˇË‰ˇˇEâgÈ0˛ˇˇÑ     HãÒj  Hç5*;  Hç=⁄2  HÿãHHã1¿Ë;„ˇˇÈ˛˝ˇˇfD  Ë{‚ˇˇIãHçπ:  DâÊã81¿Ë%‰ˇˇA∆GB Èˇˇˇ 1…Hç?Áˇˇød   Hç5#ÁˇˇËŒ‰ˇˇHâC8HÖ¿Ñ¿   Hãrj  Hã€i  È≠˚ˇˇfD  MãLâﬂLâ\$Ë»‚ˇˇLã\$E1…Eâ‡Dâ·∫Ì  Hâ∆LâﬂËJÂˇˇÈÛ˝ˇˇD  Iã?ËË·ˇˇÈû˝ˇˇ ãx,ÖˇÖù˚ˇˇfÉx@ ï¬Èê˚ˇˇÑ     Ë+‚ˇˇÖ¿ueHãXi  Hã·i  È˚ˇˇ@ 1¿HçO9  æHÙˇˇ1ˇË;„ˇˇ∏HÙˇˇÈ˝ˇˇ1¿Hç∞8  æˇˇˇˇ1ˇË„ˇˇHãi  Hãñi  «@     È—˙ˇˇHçT$0Hç5/3  ø   ËL„ˇˇHãmi  É¯ˇtãD$H%   = ¿  u
+Hç3  HâHã∑h  Èt˙ˇˇ˜ÿHçâ8  æˇˇˇˇâ«1¿Ë£‚ˇˇ∏Ä˜ˇˇÈo¸ˇˇË§·ˇˇ@ AT1¿US∂W>Hâ=wh  Ñ“ï¿âËh  HãGHÖ¿Ñó  1“Î âÍHã@@çjHÖ¿uÚçZ//
+// System.Web.Services.Protocols.WebServiceHelper.cs
+//
+// Author:
+//   Lluis Sanchez Gual (lluis@ximian.com)
+//
+// Copyright (C) Ximian, Inc. 2003
+//
+
+//
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+// 
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+//
+
+using System;
+using System.IO;
+using System.Net;
+using System.Text;
+using System.Xml;
+using System.Xml.Schema;
+using System.Xml.Serialization;
+using System.Web.Services.Description;
+
+namespace System.Web.Services.Protocols
+{
+	internal class WebServiceHelper
+	{
+		public const string SoapEnvelopeNamespace = "http://schemas.xmlsoap.org/soap/envelope/";
+		public const string Soap12EnvelopeNamespace = "http://www.w3.org/2003/05/soap-envelope";
+		public const string SoapEncodingNamespace = "http://schemas.xmlsoap.org/soap/encoding/";
+		public const string Soap12EncodingNamespace = "http://www.w3.org/2003/05/soap-encoding";
+		static readonly char [] trimChars = { '"', '\'' };
+		static readonly bool prettyXml;
+		
+		static WebServiceHelper ()
+		{
+			string pxml = Environment.GetEnvironmentVariable ("MONO_WEBSERVICES_PRETTYXML");
+			prettyXml = (pxml != null && pxml != "no");
+		}
+		
+		public static XmlTextWriter CreateXmlWriter (Stream s)
+		{
+			// What a waste of UTF8encoders, but it has to be thread safe.
+			XmlTextWriter xtw = new XmlTextWriter (s, new UTF8Encoding (false));
+				
+			if (prettyXml)
+				xtw.Formatting = Formatting.Indented;
+				
+			return xtw;
+		}
+		
+		public static Encoding GetContentEncoding (string cts, out string content_type)
+		{
+			string encoding;
+
+			if (cts == null) cts = "";
+			
+			encoding = "utf-8";
+			int start = 0;
+			int idx = cts.IndexOf (';');
+			if (idx == -1)
+				content_type = cts;
+			else
+				content_type = cts.Substring (0, idx);
+
+			content_type = content_type.Trim ();
+			for (start = idx + 1; idx != -1;)
+			{
+				idx = cts.IndexOf (';', start);
+				string body;
+				if (idx == -1)
+					body = cts.Substring (start);
+				else 
+				{
+					body = cts.Substring (start, idx - start);
+					start = idx + 1;
+				}
+				body = body.Trim ();
+				if (String.CompareOrdinal (body, 0, "charset=", 0, 8) == 0)
+				{
+					encoding = body.Substring (8);
+					encoding = encoding.TrimStart (trimChars).TrimEnd (trimChars);
+				}
+			}
+
+			return Encoding.GetEncoding (encoding);
+		}
+
+		public static string GetContextAction (string cts) {
+			if (cts == null || cts.Length == 0)
+				return null;
+
+			int start = 0;
+			int idx = cts.IndexOf (';');
+			for (start = idx + 1; idx != -1;)
+			{
+				idx = cts.IndexOf (';', start);
+				string body;
+				if (idx == -1)
+					body = cts.Substring (start);
+				else 
+				{
+					body = cts.Substring (start, idx - start);
+					start = idx + 1;
+				}
+				body = body.Trim ();
+				string actionEq = "action=";
+				if (String.CompareOrdinal(body, 0, actionEq, 0, actionEq.Length) == 0)
+				{
+					string action = body.Substring (actionEq.Length);
+					return action.Trim (trimChars);
+				}
+			}
+
+
+			return null;
+		}
+
+		public static void WriteSoapMessage (XmlTextWriter xtw, SoapMethodStubInfo method, SoapHeaderDirection dir, object bodyContent, SoapHeaderCollection headers, bool soap12)
+		{
+			SoapBindingUse methodUse = dir == SoapHeaderDirection.Fault ? SoapBindingUse.Literal : method.Use;
+			XmlSerializer bodySerializer = method.GetBodySerializer (dir, soap12);
+			XmlSerializer headerSerializer = method.GetHeaderSerializer (dir);
+			object[] headerArray = method.GetHeaderValueArray (dir, headers);
+			WriteSoapMessage (xtw, methodUse, bodySerializer, headerSerializer, bodyContent, headerArray, soap12);
+		}
+		
+		public static void WriteSoapMessage (XmlTextWriter xtw, SoapBindingUse methodUse, XmlSerializer bodySerializer, XmlSerializer headerSerializer, object bodyContent, object[] headers, bool soap12)
+		{
+			string ns = soap12 ?
+				WebServiceHelper.Soap12EnvelopeNamespace :
+				WebServiceHelper.SoapEnvelopeNamespace;
+			string encNS = soap12 ?
+				WebServiceHelper.Soap12EncodingNamespace :
+				WebServiceHelper.SoapEncodingNamespace;
+			xtw.WriteStartDocument ();
+			xtw.WriteStartElement ("soap", "Envelope", ns);
+			xtw.WriteAttributeString ("xmlns", "xsi", null, XmlSchema.InstanceNamespace);
+			xtw.WriteAttributeString ("xmlns", "xsd", null, XmlSchema.Namespace);
+
+			// Serialize headers
+			if (headers != null)
+			{
+				xtw.WriteStartElement ("soap", "Header", ns);
+				headerSerializer.Serialize (xtw, headers);
+				xtw.WriteEndElement ();
+			}
+
+			// Serialize body
+			xtw.WriteStartElement ("soap", "Body", ns);
+			
+			if (methodUse == SoapBindingUse.Encoded)
+				xtw.WriteAttributeString ("encodingStyle", ns, encNS);
+				
+			bodySerializer.Serialize (xtw, bodyContent);
+
+			xtw.WriteEndElement ();
+			xtw.WriteEndElement ();
+			xtw.Flush ();
+		}
+
+		public static void ReadSoapMessage (XmlTextReader xmlReader, SoapMethodStubInfo method, SoapHeaderDirection dir, bool soap12, out object body, out SoapHeaderCollection headers)
+		{
+			XmlSerializer bodySerializer = method.GetBodySerializer (dir, false);// no need to worry about soap12 arg since no call for Fault anyways here.
+			XmlSerializer headerSerializer = method.GetHeaderSerializer (dir);
+			ReadSoapMessage (xmlReader, bodySerializer, headerSerializer, soap12, out body, out headers);
+		}
+		
+		public static void ReadSoapMessage (XmlTextReader xmlReader, XmlSerializer bodySerializer, XmlSerializer headerSerializer, bool soap12, out object body, out SoapHeaderCollection headers)
+		{
+			xmlReader.MoveToContent ();
+			string ns = xmlReader.NamespaceURI;
+			switch (ns) {
+			case WebServiceHelper.Soap12EnvelopeNamespace:
+			case WebServiceHelper.SoapEnvelopeNamespace:
+				break;
+			default:
+				throw new SoapException (String.Format ("SOAP version mismatch. Namespace '{0}' is not supported in this runtime profile.", ns), VersionMismatchFaultCode (soap12));
+			}
+			xmlReader.ReadStartElement ("Envelope", ns);
+
+			headers = ReadHeaders (xmlReader, headerSerializer, ns);
+
+			xmlReader.MoveToContent ();
+			xmlReader.ReadStartElement ("Body", ns);
+			xmlReader.MoveToContent ();
+			
+			if (xmlReader.LocalName == "Fault" && xmlReader.NamespaceURI == ns)
+				bodySerializer = ns == Soap12EnvelopeNamespace ? Soap12Fault.Serializer : Fault.Serializer;
+
+			body = bodySerializer.Deserialize (xmlReader);
+		}
+
+		static SoapHeaderCollection ReadHeaders (XmlTextReader xmlReader, XmlSerializer headerSerializer, string ns)
+		{
+			SoapHeaderCollection headers = null;
+			while (! (xmlReader.NodeType == XmlNodeType.Element && xmlReader.LocalName == "Body" && xmlReader.NamespaceURI == ns))
+			{
+				if (xmlReader.NodeType == XmlNodeType.Element && xmlReader.LocalName == "Header" 
+				    && xmlReader.NamespaceURI == ns && !xmlReader.IsEmptyElement
+				    && headerSerializer != null)
+				{
+					xmlReader.ReadStartElement ();
+					xmlReader.MoveToContent ();
+					
+					HeaderSerializationHelper uh = new HeaderSerializationHelper (headerSerializer);
+					headers = uh.Deserialize (xmlReader);
+					
+					while (xmlReader.NodeType != XmlNodeType.EndElement)
+						xmlReader.Skip ();
+						
+					xmlReader.ReadEndElement ();
+				}
+				else
+					xmlReader.Skip ();
+			}
+			if (headers != null)
+				return headers;
+			else
+				return new SoapHeaderCollection ();
+		}
+		
+		class HeaderSerializationHelper
+		{
+			SoapHeaderCollection headers;
+			XmlSerializer headerSerializer;
+			
+			public HeaderSerializationHelper (XmlSerializer headerSerializer)
+			{
+				this.headers = new SoapHeaderCollection ();
+				this.headerSerializer = headerSerializer;
+			}
+			
+			public SoapHeaderCollection Deserialize (XmlTextReader xmlReader)
+			{
+				try {
+					headerSerializer.UnknownElement += new XmlElementEventHandler (OnAddUnknownHeader);
+					object[] headerArray = (object[]) headerSerializer.Deserialize (xmlReader);
+					foreach (SoapHeader h in headerArray)
+						if (h != null) headers.Add (h);
+					return headers;
+				} finally {
+					headerSerializer.UnknownElement -= new XmlElementEventHandler (OnAddUnknownHeader);
+				}
+			}
+			
+			void OnAddUnknownHeader (object sender, XmlElementEventArgs e)
+			{
+				headers.Add (new SoapUnknownHeader (e.Element));
+			}
+		}
+
+		public static SoapException Soap12FaultToSoapException (Soap12Fault fault)
+		{
+			Soap12FaultReasonText text =
+				fault.Reason != null &&
+				fault.Reason.Texts != null &&
+				fault.Reason.Texts.Length > 0 ?
+				fault.Reason.Texts [fault.Reason.Texts.Length - 1] : null;
+			XmlNode detail = (fault.Detail == null) ? null :
+				(fault.Detail.Children != null &&
+				fault.Detail.Children.Length > 0) ?
+				(XmlNode) fault.Detail.Children [0] :
+				(fault.Detail.Attributes != null &&
+				fault.Detail.Attributes.Length > 0) ?
+				fault.Detail.Attributes [0] : null;
+			SoapFaultSubCode subcode = Soap12Fault.GetSoapFaultSubCode (fault.Code.Subcode);
+			return new SoapException (
+				text != null ? text.Value : null,
+				fault.Code.Value, null, fault.Role,
+				text != null ? text.XmlLang : null,
+				detail, subcode, null);
+		}
+
+		public static XmlQualifiedName ClientFaultCode (bool soap12)
+		{
+			return soap12 ? Soap12FaultCodes.SenderFaultCode : SoapException.ClientFaultCode;
+		}
+
+		public static XmlQualifiedName ServerFaultCode (bool soap12)
+		{
+			return soap12 ? Soap12FaultCodes.ReceiverFaultCode : SoapException.ServerFaultCode;
+		}
+
+		public static XmlQualifiedName MustUnderstandFaultCode (bool soap12)
+		{
+			return soap12 ? Soap12FaultCodes.ReceiverFaultCode : SoapException.MustUnderstandFaultCode;
+		}
+
+		public static XmlQualifiedName VersionMismatchFaultCode (bool soap12)
+		{
+			return soap12 ? Soap12FaultCodes.VersionMismatchFaultCode : SoapException.VersionMismatchFaultCode;
+		}
+
+		public static void InvalidOperation (string message, WebResponse response, Encoding enc)
+		{
+			if (response == null)
+				throw new InvalidOperationException (message);
+
+			if (enc == null)
+				enc = Encoding.UTF8;
+
+			StringBuilder sb = new StringBuilder ();
+			sb.Append (message);
+			if (response.ContentLength > 0) {
+				sb.Append ("\r\nResponse error message:\r\n--\r\n");
+
+				try {
+					StreamReader resp = new StreamReader (response.GetResponseStream (), enc);
+					sb.Append (resp.ReadToEnd ());
+				} catch (Exception) {
+				}
+			}
+
+			throw new InvalidOperationException (sb.ToString ());
+		}
+	}
+}
+                                                                         ËR74˜A <Lõ€d"â3ˆçtc>¢€…3∆	MA,¡-≈ÏXëAÉ˚mÆá¸N'å{‘ıd”◊≥,¡≥PsΩô™\^+–Ê8à}“_¯j†~¬≤˛Vƒ»t⁄Êë@ıâVHWâ˝”D93Å’Ê[!püµt™Ä•ÁeªÜâ(E£ZâŒeÔËeKÿ∑Xå/ªZÅ&2J‘ŒZù˘û4ì¢*k0I:µ
+eWm,˘å$öN?*N©àú†:Lôv'\à≥c•‚0ƒ©+Ü„8[≥∆ŸQ|˙çÚ‹€~ü‚ŒªÙ#‡»Ü¡ÛW^ÏƒA˜5Fã´a®2Æ˜œ¯√≥el¨ôè›[˝·ë«ëZ¸ŸR–Ω”≤—Fπ¡B…˙≠í{ã∏Z°ØJG∫íó∂v Ø‹∫•?L∑Ç‚HÛ¬ÁÕS4[˙∞ÿÃÛ§™√TN
+¨zƒ¶ÇUí≥˘¡∑Jõ´ÿH„^ÁFR±ç·8WåÏ"æ11¨lg«o¿1⁄B jfÜ‡@Ù€ä£l
+…ßÁßRÿ≠©°Õ ë\ª˛Òzè§ì·OcRKµ∑'ôı¯∏iéiÒ»Èióv@Œ™»âˆlMçëöw≥,Êyﬂ«üQG_»«Kˆ≤éP⁄Ù)bﬁÿ}Û∏ﬂ@ŸeÓàÅ N˜«ÚxêL©¬˘ô§µÅSˆ@]Õv©º
+¨*Q‰MMÅÀ¡≈ﬁNÓk=FmÊ¥wDè$˙6‰Ë∑<ÌÑ»ßãìﬁãàp¥∫}í-ö∂‘ö,Ü¸µﬁ≈√éåadjÛ„\hGO1G/º}ˇÖì‚ayµÈ1†‡_‰å∫0]ŸYﬂ{ÑÈN-RqÏên8£œ‡Üœ¢îMa≠í‡x¥?MÒjl%ªyÜÙ™jÖiÏ˝¢Qæ≈ús˝¡q^Ä2Ì®PS“ÍÆc(¢0qÀÅãq€6≠Ç≤Ô“Ã˙cﬂ§¨m∏ÕdxJGôfMºÿ≥!π´˚Sû+üLmvòQu9Œ@.[<`’∞o‰í∫™ ˝}∞‡˜h¡ãAôã◊–ËË \Ä-.k#œY6ú¨-±Ÿu‘õˆ|ô)¯ø§¨êe*ïÁÜu=PòNá‚à+ˇu”.f∆%<Sy«?õ9‘-äHÕ˜≠7ÏT˘ÍöÙï∫5V„´FÄ
+”Âﬂ€MËˆÒ\	F∆˛˚Æ>#ËW6âk`∂·∞úW ÿ=≥q‰%√»IØ3Yï«h@'N"Åä‰ÚsE∂*˛Õ≥ÒÙ ïé<x Mïä-(#*⁄∆KZÄ‰i¸◊ö†É>•â) ,à°)¡æC⁄ÌÊ˚gÔ˚Zàˆ¡gb›{<n$æFÚ aì<html>
+  <head>
+    <title>DocTest: Mono.DocTest</title>
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+    <style>
+      a { text-decoration: none }
+
+      div.SideBar {
+        padding-left: 1em;
+        padding-right: 1em;
+        right: 0;
+        float: right;
+        border: thin solid black;
+        background-color: #f2f2f2;
+      }
+    
+      .CollectionTitle { font-weight: bold }
+      .PageTitle { font-size: 150%; font-weight: bold }
+
+      .Summary { }
+      .Signature { }          
+      .Remarks { }
+      .Members { }
+      .Copyright { }
+      
+      .Section { font-size: 125%; font-weight: bold }
+      p.Summary {
+        margin-left: 1em;
+      }
+      .SectionBox { margin-left: 2em }
+      .NamespaceName { font-size: 105%; font-weight: bold }
+      .NamespaceSumary { }
+      .MemberName { font-size: 115%; font-weight: bold; margin-top: 1em }
+      .Subsection { font-size: 105%; font-weight: bold }
+      .SubsectionBox { margin-left: 2em; margin-bottom: 1em }
+
+      .CodeExampleTable { background-color: #f5f5dd; border: thin solid black; padding: .25em; }
+      
+      .TypesListing {
+        border-collapse: collapse;
+      }
+
+      td {
+        vertical-align: top;
+      }
+      th {
+        text-align: left;
+      }
+
+      .TypesListing td { 
+        margin: 0px;  
+        padding: .25em;
+        border: solid gray 1px;
+      }
+
+      .TypesListing th { 
+        margin: 0px;  
+        padding: .25em;
+        background-color: #f2f2f2;
+        border: solid gray 1px;
+      }
+
+      div.Footer {
+        border-top: 1px solid gray;
+        margin-top: 1.5em;
+        padding-top: 0.6em;
+        text-align: center;
+        color: gray;
+      }
+
+      span.NotEntered /* Documentation for this section has not yet been entered */ {
+        font-style: italic;
+        color: red;	
+      }
+
+      div.Header {
+        background: #B0C4DE;
+        border: double;
+        border-color: white;
+        border-width: 7px;
+        padding: 0.5em;
+      }
+
+      div.Header * {
+        font-size: smaller;
+      }
+
+      div.Note {
+      }
+
+      i.ParamRef {
+      }
+
+      i.subtitle {
+      }
+
+      ul.TypeMembersIndex {
+        text-align: left;
+        background: #F8F8F8;
+      }
+
+      ul.TypeMembersIndex li {
+        display: inline;
+        margin:  0.5em;
+      }
+
+      table.HeaderTable {
+      }
+
+      table.SignatureTable {
+      }
+
+      table.Documentation, table.Enumeration, table.TypeDocumentation {
+        border-collapse: collapse;
+        width: 100%;
+      }
+
+      table.Documentation tr th, table.TypeMembers tr th, table.Enumeration tr th, table.TypeDocumentation tr th {
+        background: whitesmoke;
+        padding: 0.8em;
+        border: 1px solid gray;
+        text-align: left;
+        vertical-align: bottom;
+      }
+
+      table.Documentation tr td, table.TypeMembers tr td, table.Enumeration tr td, table.TypeDocumentation tr td {
+        padding: 0.5em;
+        border: 1px solid gray;
+        text-align: left;
+        vertical-align: top;
+      }
+
+      table.TypeMembers {
+        border: 1px solid #C0C0C0;
+        width: 100%;
+      }
+
+      table.TypeMembers tr td {
+        background: #F8F8F8;
+        border: white;
+      }
+
+      table.Documentation {
+      }
+
+      table.TypeMembers {
+      }
+
+      div.CodeExample {
+        width: 100%;
+        border: 1px solid #DDDDDD;
+        background-color: #F8F8F8;
+      }
+
+      div.CodeExample p {
+        margin: 0.5em;
+        border-bottom: 1px solid #DDDDDD;
+      }
+
+      div.CodeExample div {
+        margin: 0.5em;
+      }
+
+      h4 {
+        margin-bottom: 0;
+      }
+
+      div.Signature {
+        border: 1px solid #C0C0C0;
+        background: #F2F2F2;
+        padding: 1em;
+      }
+    </style>
+    <script type="text/JavaScript">
+      function toggle_display (block) {
+        var w = document.getElementById (block);
+        var t = document.getElementById (block + ":toggle");
+        if (w.style.display == "none") {
+          w.style.display = "block";
+          t.innerHTML = "‚äü";
+        } else {
+          w.style.display = "none";
+          t.innerHTML = "‚äû";
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div class="CollectionTitle">
+      <a href="../index.html">DocTest</a>
+    </div>
+    <h1 class="PageTitle">Mono.DocTest Namespace</h1>
+    <p class="Summary">
+    </p>
+    <div>
+    </div>
+    <div class="Remarks">
+      <h2 class="Section"> Namespace</h2>
+      <p>
+        <span class="NotEntered">Documentation for this section has not yet been entered.</span>
+      </p>
+      <table class="TypesListing" style="margin-top: 1em">
+        <tr>
+          <th>Type</th>
+          <th>Description</th>
+        </tr>
+        <tr valign="top">
+          <td>
+            <a href="./Color.html">Color</a>
+          </td>
+          <td>Possible colors</td>
+        </tr>
+        <tr valign="top">
+          <td>
+            <a href="./D.html">D</a>
+          </td>
+          <td>
+            <span class="NotEntered">Documentation for this section has not yet been entered.</span>
+          </td>
+        </tr>
+        <tr valign="top">
+          <td>
+            <a href="./DocAttribute.html">DocAttribute</a>
+          </td>
+          <td>
+            <span class="NotEntered">Documentation for this section has not yet been entered.</span>
+          </td>
+        </tr>
+        <tr valign="top">
+          <td>
+            <a href="./DocValueType.html">DocValueType</a>
+          </td>
+          <td>Process interface</td>
+        </tr>
+        <tr valign="top">
+          <td>
+            <a href="./IProcess.html">IProcess</a>
+          </td>
+          <td>Process interface</td>
+        </tr>
+        <tr valign="top">
+          <td>
+            <a href="./UseLists.html">UseLists</a>
+          </td>
+          <td>
+            <span class="NotEntered">Documentation for this section has not yet been entered.</span>
+          </td>
+        </tr>
+        <tr valign="top">
+          <td>
+            <a href="./Widget.html">Widget</a>
+          </td>
+          <td>
+            <span class="NotEntered">Documentation for this section has not yet been entered.</span>
+          </td>
+        </tr>
+        <tr valign="top">
+          <td>
+            <a href="./Widget+Del.html">Widget.Del</a>
+          </td>
+          <td>
+            <span class="NotEntered">Documentation for this section has not yet been entered.</span>
+          </td>
+        </tr>
+        <tr valign="top">
+          <td>
+            <a href="./Widget+Direction.html">Widget.Direction</a>
+          </td>
+          <td>
+            <span class="NotEntered">Documentation for this section has not yet been entered.</span>
+          </td>
+        </tr>
+        <tr valign="top">
+          <td>
+            <a href="./Widget+IMenuItem.html">Widget.IMenuItem</a>
+          </td>
+          <td>
+            <span class="NotEntered">Documentation for this section has not yet been entered.</span>
+          </td>
+        </tr>
+        <tr valign="top">
+          <td>
+            <a href="./Widget+NestedClass.html">Widget.NestedClass</a>
+          </td>
+          <td>
+            <span class="NotEntered">Documentation for this section has not yet been entered.</span>
+          </td>
+        </tr>
+        <tr valign="top">
+          <td>
+            <a href="./Widget+NestedClass`1.html">Widget.NestedClass&lt;T&gt;</a>
+          </td>
+          <td>
+            <span class="NotEntered">Documentation for this section has not yet been entered.</span>
+          </td>
+        </tr>
+        <tr valign="top">
+          <td>
+            <a href="./Widget+NestedClass+Double.html">Widget.NestedClass.Double</a>
+          </td>
+          <td>
+            <span class="NotEntered">Documentation for this section has not yet been entered.</span>
+          </td>
+        </tr>
+        <tr valign="top">
+          <td>
+            <a href="./Widget+NestedClass+Double+Triple.html">Widget.NestedClass.Double.Triple</a>
+          </td>
+          <td>
+            <span class="NotEntered">Documentation for this section has not yet been entered.</span>
+          </td>
+        </tr>
+        <tr valign="top">
+          <td>
+            <a href="./Widget+NestedClass+Double+Triple+Quadruple.html">Widget.NestedClass.Double.Triple.Quadruple</a>
+          </td>
+          <td>
+            <span class="NotEntered">Documentation for this section has not yet been entered.</span>
+          </td>
+        </tr>
+      </table>
+    </div>
+    <div class="Members">
+    </div>
+    <hr size="1" />
+    <div class="Copyright">To be added.</div>
+  </body>
+</html>                                                                                    R                              ˆ4      -               1                      æg             .                                                                                        N                             N                             N                              5      -               1                      ﬁg                                                                                                     R                             R                             R                              ◊4      -               1                      ˛g             
+                                                                                        R                             R                             R                              
+5      -               1                                                          êj      h      dh      ¨h      Ùh                              <i              \i      ñi              ∂i      ÷i      j                      0j      Pj                      pj              ch                                                                                                                                     Dh                                                  d
+                                                                   /               -               1               bh                                                 N                            

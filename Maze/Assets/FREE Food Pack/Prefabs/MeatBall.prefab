@@ -1,0 +1,57 @@
+  SRC_SIGNED : SRC_UNSIGNED,
+          DstRange IsSrcRangeContained = StaticRangeCheck<Dst, Src>::value>
+struct RangeCheckImpl {};
+
+// The following templates are for ranges that must be verified at runtime. We
+// split it into checks based on signedness to avoid confusing casts and
+// compiler warnings on signed an unsigned comparisons.
+
+// Dst range always contains the result: nothing to check.
+template <typename Dst, typename Src, DstSign IsDstSigned, SrcSign IsSrcSigned>
+struct RangeCheckImpl<Dst, Src, IsDstSigned, IsSrcSigned, CONTAINS_RANGE> {
+  static RangeCheckResult Check(Src value) {
+    return TYPE_VALID;
+  }
+};
+
+// Signed to signed narrowing.
+template <typename Dst, typename Src>
+struct RangeCheckImpl<Dst, Src, DST_SIGNED, SRC_SIGNED, OVERLAPS_RANGE> {
+  static RangeCheckResult Check(Src value) {
+    typedef std::numeric_limits<Dst> DstLimits;
+    return DstLimits::is_iec559 ?
+           BASE_NUMERIC_RANGE_CHECK_RESULT(
+               value <= static_cast<Src>(DstLimits::max()),
+               value >= static_cast<Src>(DstLimits::max() * -1)) :
+           BASE_NUMERIC_RANGE_CHECK_RESULT(
+               value <= static_cast<Src>(DstLimits::max()),
+               value >= static_cast<Src>(DstLimits::min()));
+  }
+};
+
+// Unsigned to unsigned narrowing.
+template <typename Dst, typename Src>
+struct RangeCheckImpl<Dst, Src, DST_UNSIGNED, SRC_UNSIGNED, OVERLAPS_RANGE> {
+  static RangeCheckResult Check(Src value) {
+    typedef std::numeric_limits<Dst> DstLimits;
+    return BASE_NUMERIC_RANGE_CHECK_RESULT(
+               value <= static_cast<Src>(DstLimits::max()), true);
+  }
+};
+
+// Unsigned to signed.
+template <typename Dst, typename Src>
+struct RangeCheckImpl<Dst, Src, DST_SIGNED, SRC_UNSIGNED, OVERLAPS_RANGE> {
+  static RangeCheckResult Check(Src value) {
+    typedef std::numeric_limits<Dst> DstLimits;
+    return sizeof(Dst) > sizeof(Src) ? TYPE_VALID :
+           BASE_NUMERIC_RANGE_CHECK_RESULT(
+               value <= static_cast<Src>(DstLimits::max()), true);
+  }
+};
+
+// Signed to unsigned.
+template <typename Dst, typename Src>
+struct RangeCheckImpl<Dst, Src, DST_UNSIGNED, SRC_SIGNED, OVERLAPS_RANGE> {
+  static RangeCheckResult Check(Src value) {
+    typedef std::numeric_limits<Dst> DstLimit

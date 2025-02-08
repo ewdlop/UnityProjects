@@ -1,0 +1,131 @@
+after the attached container
+    is reattached.
+
+    [IN]
+    @(SignBundle) - bundle file to sign.
+  ==================================================================================================
+  -->
+  <Target Name="SignBundle" />
+
+  <!--
+  ==================================================================================================
+  AfterSigning
+
+    Redefine this target in your project in order to run tasks just after all signing tasks.
+  ==================================================================================================
+  -->
+  <Target Name="AfterSigning" />
+
+  <!--
+  ================================================================================================
+  ConvertReferences
+
+    Converts project references to HeatProject items to auto generate authoring.
+  ================================================================================================
+  -->
+  <Target
+    Name="ConvertReferences"
+    Condition=" $(EnableProjectHarvesting) and ('$(OutputType)' == 'Package' or '$(OutputType)' == 'PatchCreation' or '$(OutputType)' == 'Module') ">
+
+    <CreateItem Include="@(_MSBuildProjectReferenceExistent)" Condition=" '%(_MSBuildProjectReferenceExistent.DoNotHarvest)' == '' " AdditionalMetadata="DirectoryIds=%(_MSBuildProjectReferenceExistent.RefTargetDir);ProjectOutputGroups=Binaries%3BSymbols%3BSources%3BContent%3BSatellites%3BDocuments;ProjectName=%(_MSBuildProjectReferenceExistent.Name);HeatOutput=$(IntermediateOutputPath)_%(_MSBuildProjectReferenceExistent.Filename).wxs">
+      <Output TaskParameter="Include" ItemName="HeatProject" />
+      <Output TaskParameter="Include" ItemName="_HeatProjectReference" />
+    </CreateItem>
+
+    <Error
+      Text="The following files are deprecated and should be removed from your project(s): @(Compile->'%(Identity)', ', ')"
+      Condition=" '%(Compile.GenerateComponentGroups)' != '' " />
+
+    <CreateItem Include="$(HarvestProjectsGeneratedFile)">
+      <!-- Unconditionally generate Compile items so they are always linked in. -->
+      <Output TaskParameter="Include" ItemName="Compile" />
+      <Output TaskParameter="Include" ItemName="_GeneratedFiles" />
+    </CreateItem>
+
+  </Target>
+
+  <!--
+  ================================================================================================
+  ConvertBundleReferences
+
+    Converts project references in Bundle projects to HeatProject items to auto generate authoring.
+  ================================================================================================
+  -->
+  <Target
+    Name="ConvertBundleReferences"
+    Condition=" $(EnableProjectHarvesting) and ('$(OutputType)' == 'Bundle') ">
+
+    <CreateItem Include="@(_MSBuildProjectReferenceExistent)" Condition=" '%(_MSBuildProjectReferenceExistent.DoNotHarvest)' == '' " AdditionalMetadata="ProjectOutputGroups=Binaries%3BSymbols%3BSources%3BContent%3BSatellites%3BDocuments;GenerateType=payloadgroup;HeatOutput=$(IntermediateOutputPath)_%(_MSBuildProjectReferenceExistent.Filename).wxs">
+      <Output TaskParameter="Include" ItemName="HeatProject" />
+      <Output TaskParameter="Include" ItemName="_HeatProjectReference" />
+    </CreateItem>
+
+    <Error
+      Text="The following files are deprecated and should be removed from your project(s): @(Compile->'%(Identity)', ', ')"
+      Condition=" '%(Compile.GenerateComponentGroups)' != '' " />
+
+    <CreateItem Include="$(HarvestProjectsGeneratedFile)">
+      <!-- Unconditionally generate Compile items so they are always linked in. -->
+      <Output TaskParameter="Include" ItemName="Compile" />
+      <Output TaskParameter="Include" ItemName="_GeneratedFiles" />
+    </CreateItem>
+
+  </Target>
+
+  <!--
+  ================================================================================================
+  CombineHarvestProjects
+
+    Combines HeatProject and HarvestProject items together and ensures each has HeatOutput metadata.
+  ================================================================================================
+  -->
+  <Target Name="CombineHarvestProjects"
+    Condition=" '@(HeatProject)' != '' or '@(HarvestProject)' != '' ">
+
+    <!-- Add default HeatOutputs for those without one specified -->
+    <CreateItem Include="@(HeatProject)" Condition= " '%(HeatProject.HeatOutput)' == '' "
+    AdditionalMetadata="HeatOutput=$(IntermediateOutputPath)_%(HeatProject.Filename).wxs">
+      <Output TaskParameter="Include" ItemName="_AllHeatProjects" />
+    </CreateItem>
+    <CreateItem Include="@(HarvestProject)" Condition= " '%(HarvestProject.HeatOutput)' == '' "
+    AdditionalMetadata="HeatOutput=$(IntermediateOutputPath)_%(HarvestProject.Filename).wxs">
+      <Output TaskParameter="Include" ItemName="_AllHeatProjects" />
+    </CreateItem>
+
+
+    <CreateItem Include="@(HeatProject)" Condition= " '%(HeatProject.HeatOutput)' != '' ">
+      <Output TaskParameter="Include" ItemName="_AllHeatProjects" />
+    </CreateItem>
+    <CreateItem Include="@(HarvestProject)" Condition= " '%(HarvestProject.HeatOutput)' != '' ">
+      <Output TaskParameter="Include" ItemName="_AllHeatProjects" />
+    </CreateItem>
+
+  </Target>
+
+  <!--
+  ================================================================================================
+  HarvestProjects
+
+    Harvests outputs of other MSBuild projects files using the VS project extension to heat.exe.
+
+    [IN]
+    @(HarvestProject)
+    @(HeatProject)
+        - The list of projects to harvest. HeatProject is provided for backward compatibility.
+          You should use HarvestProject instead.
+
+    %(HarvestProject.Transforms)
+    %(HeatProject.Transforms)
+        - XSL transforms to apply to the harvested WiX.
+
+    %(HarvestProject.ProjectOutputGroups)
+    %(HeatProjects.ProjectOutputGroups)
+        - The project output groups to harvest 
+
+    [OUT]
+    %(HeatOutput)
+        - The generated .wxs files which are added to the @(Compile) item list.
+  ================================================================================================
+  -->
+  <PropertyGroup>
+  

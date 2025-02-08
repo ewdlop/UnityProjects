@@ -1,0 +1,149 @@
+ Early.count(FV)) {
+      if (Late.count(TV) || Late.count(FV))
+        return false;
+      Early.insert(UseI);
+    } else if (Late.count(TV) || Late.count(FV)) {
+      if (Early.count(TV) || Early.count(FV))
+        return false;
+      Late.insert(UseI);
+    }
+    return true;
+  }
+
+  // Not sure what would be the example of this, but the code below relies
+  // on having at least one operand.
+  if (UseI->getNumOperands() == 0)
+    return true;
+
+  bool AE = true, AL = true;
+  for (auto &I : UseI->operands()) {
+    if (Early.count(&*I))
+      AL = false;
+    else if (Late.count(&*I))
+      AE = false;
+  }
+  // If the operands appear "all early" and "all late" at the same time,
+  // then it means that none of them are actually classified as either.
+  // This is harmless.
+  if (AE && AL)
+    return true;
+  // Conversely, if they are neither "all early" nor "all late", then
+  // we have a mixture of early and late operands that is not a known
+  // exception.
+  if (!AE && !AL)
+    return false;
+
+  // Check that we have covered the two special cases.
+  assert(AE != AL);
+
+  if (AE)
+    Early.insert(UseI);
+  else
+    Late.insert(UseI);
+  return true;
+}
+
+bool PolynomialMultiplyRecognize::commutesWithShift(Instruction *I) {
+  switch (I->getOpcode()) {
+    case Instruction::And:
+    case Instruction::Or:
+    case Instruction::Xor:
+    case Instruction::LShr:
+    case Instruction::Shl:
+    case Instruction::Select:
+    case Instruction::ICmp:
+    case Instruction::PHI:
+      break;
+    default:
+      return false;
+  }
+  return true;
+}
+
+bool PolynomialMultiplyRecognize::highBitsAreZero(Value *V,
+      unsigned IterCount) {
+  auto *T = dyn_cast<IntegerType>(V->getType());
+  if (!T)
+    return false;
+
+  KnownBits Known(T->getBitWidth());
+  computeKnownBits(V, Known, DL);
+  return Known.countMinLeadingZeros() >= IterCount;
+}
+
+bool PolynomialMultiplyRecognize::keepsHighBitsZero(Value *V,
+      unsigned IterCount) {
+  // Assume that all inputs to the value have the high bits zero.
+  // Check if the value itself preserves the zeros in the high bits.
+  if (auto *C = dyn_cast<ConstantInt>(V))
+    return C->getValue().countLeadingZeros() >= IterCount;
+
+  if (auto *I = dyn_cast<Instruction>(V)) {
+    switch (I->getOpcode()) {
+      case Instruction::And:
+      case Instruction::Or:
+      case Instruction::Xor:
+      case Instruction::LShr:
+      case Instruction::Select:
+      case Instruction::ICmp:
+      case Instruction::PHI:
+      case Instruction::ZExt:
+        return true;
+    }
+  }
+
+  return false;
+}
+
+bool PolynomialMultiplyRecognize::isOperandShifted(Instruction *I, Value *Op) {
+  unsigned Opc = I->getOpcode();
+  if (Opc == Instruction::Shl || Opc == Instruction::LShr)
+    return Op != I->getOperand(1);
+  return true;
+}
+
+bool PolynomialMultiplyRecognize::convertShiftsToLeft(BasicBlock *LoopB,
+      BasicBlock *ExitB, unsigned IterCount) {
+  Value *CIV = getCountIV(LoopB);
+  if (CIV == nullptr)
+    return false;
+  auto *CIVTy = dyn_cast<IntegerType>(CIV->getType());
+  if (CIVTy == nullptr)
+    return false;
+
+  ValueSeq RShifts;
+  ValueSeq Early, Late, Cycled;
+
+  // Find all value cycles that contain logical right shifts by 1.
+  for (Instruction &I : *LoopB) {
+    using namespace PatternMatch;
+
+    Value *V = nullptr;
+    if (!match(&I, m_LShr(m_Value(V), m_One())))
+      continue;
+    ValueSeq C;
+    if (!findCycle(&I, V, C))
+      continue;
+
+    // Found a cycle.
+    C.insert(&I);
+    classifyCycle(&I, C, Early, Late);
+    Cycled.insert(C.begin(), C.end());
+    RShifts.insert(&I);
+  }
+
+  // Find the set of all values affected by the shift cycles, i.e. all
+  // cycled values, and (recursively) all their users.
+  ValueSeq Users(Cycled.begin(), Cycled.end());
+  for (unsigned i = 0; i < Users.size(); ++i) {
+    Value *V = Users[i];
+    if (!isa<IntegerType>(V->getType()))
+      return false;
+    auto *R = cast<Instruction>(V);
+    // If the instruction does not commute with shifts, the loop cannot
+    // be unshifted.
+    if (!commutesWithShift(R))
+      return false;
+    for (auto I = R->user_begin(), E = R->user_end(); I != E; ++I) {
+      auto *T = cast<Instruction>(*I);
+     

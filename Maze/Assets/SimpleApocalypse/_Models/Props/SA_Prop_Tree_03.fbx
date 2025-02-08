@@ -1,0 +1,540 @@
+// Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+// See the LICENSE file in the project root for more information.
+
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Security.Cryptography.Asn1;
+using System.Security.Cryptography.Pkcs.Asn1;
+using System.Security.Cryptography.X509Certificates;
+using Internal.Cryptography;
+
+namespace System.Security.Cryptography.Pkcs
+{
+    public sealed class CmsSigner
+    {
+#if MONO
+        private static readonly Oid s_defaultAlgorithm = Oid.FromOidValue(Oids.Sha1, OidGroup.HashAlgorithm);
+#else
+        private static readonly Oid s_defaultAlgorithm = Oid.FromOidValue(Oids.Sha256, OidGroup.HashAlgorithm);
+#endif
+
+        private SubjectIdentifierType _signerIdentifierType;
+
+        public X509Certificate2 Certificate { get; set; }
+        public AsymmetricAlgorithm PrivateKey { get; set; }
+        public X509Certificate2Collection Certificates { get; private set; } = new X509Certificate2Collection();
+        public Oid DigestAlgorithm { get; set; }
+        public X509IncludeOption IncludeOption { get; set; }
+        public CryptographicAttributeObjectCollection SignedAttributes { get; private set; } = new CryptographicAttributeObjectCollection();
+        public CryptographicAttributeObjectCollection UnsignedAttributes { get; private set; } = new CryptographicAttributeObjectCollection();
+
+        public SubjectIdentifierType SignerIdentifierType
+        {
+            get { return _signerIdentifierType; }
+            set
+            {
+                if (value < SubjectIdentifierType.IssuerAndSerialNumber || value > SubjectIdentifierType.NoSignature)
+                    throw new ArgumentException(SR.Format(SR.Cryptography_Cms_Invalid_Subject_Identifier_Type, value));
+                _signerIdentifierType = value;
+            }
+        }
+
+        public CmsSigner()
+            : this(SubjectIdentifierType.IssuerAndSerialNumber, null)
+        {
+        }
+
+        public CmsSigner(SubjectIdentifierType signerIdentifierType)
+            : this(signerIdentifierType, null)
+        {
+        }
+
+        public CmsSigner(X509Certificate2 certificate)
+            : this(SubjectIdentifierType.IssuerAndSerialNumber, certificate)
+        {
+        }
+
+        // This can be implemented with netcoreapp20 with the cert creation API.
+        // * Open the parameters as RSACSP (RSA PKCS#1 signature was hard-coded in netfx)
+        //   * Which will fail on non-Windows
+        // * Create a certificate with subject CN=CMS Signer Dummy Certificate
+        //   * Need to check against NetFx to find out what the NotBefore/NotAfter values are
+        //   * No extensions
+        //
+        // Since it would only work on Windows, it could also be just done as P/Invokes to
+        // CertCreateSelfSignedCertificate on a split Windows/netstandard implementation.
+        public CmsSigner(CspParameters parameters) => throw new PlatformNotSupportedException();
+
+        public CmsSigner(SubjectIdentifierType signerIdentifierType, X509Certificate2 certificate)
+        {
+            switch (signerIdentifierType)
+            {
+                case SubjectIdentifierType.Unknown:
+                    _signerIdentifierType = SubjectIdentifierType.IssuerAndSerialNumber;
+                    IncludeOption = X509IncludeOption.ExcludeRoot;
+                    break;
+                case SubjectIdentifierType.IssuerAndSerialNumber:
+                    _signerIdentifierType = signerIdentifierType;
+                    IncludeOption = X509IncludeOption.ExcludeRoot;
+                    break;
+                case SubjectIdentifierType.SubjectKeyIdentifier:
+                    _signerIdentifierType = signerIdentifierType;
+                    IncludeOption = X509IncludeOption.ExcludeRoot;
+                    break;
+                case SubjectIdentifierType.NoSignature:
+                    _signerIdentifierType = signerIdentifierType;
+                    IncludeOption = X509IncludeOption.None;
+                    break;
+                default:
+                    _signerIdentifierType = SubjectIdentifierType.IssuerAndSerialNumber;
+                    IncludeOption = X509IncludeOption.ExcludeRoot;
+                    break;
+            }
+
+            Certificate = certificate;
+            DigestAlgorithm = new Oid(s_defaultAlgorithm);
+        }
+
+        internal void CheckCertificateValue()
+        {
+            if (SignerIdentifierType == SubjectIdentifierType.NoSignature)
+            {
+                return;
+            }
+
+            if (Certificate == null)
+            {
+                throw new PlatformNotSupportedException(SR.Cryptography_Cms_NoSignerCert);
+            }
+
+            if (!Certificate.HasPrivateKey)
+            {
+                throw new CryptographicException(SR.Cryptography_Cms_Signing_RequiresPrivateKey);
+            }
+        }
+
+        internal SignerInfoAsn Sign(
+            ReadOnlyMemory<byte> data,
+            string contentTypeOid,
+            bool silent,
+            out X509Certificate2Collection chainCerts)
+        {
+            HashAlgorithmName hashAlgorithmName = Helpers.GetDigestAlgorithm(DigestAlgorithm);
+            IncrementalHash hasher = IncrementalHash.CreateHash(hashAlgorithmName);
+
+            hasher.AppendData(data.Span);
+            byte[] dataHash = hasher.GetHashAndReset();
+
+            SignerInfoAsn newSignerInfo = new SignerInfoAsn();
+            newSignerInfo.DigestAlgorithm.Algorithm = DigestAlgorithm;
+
+            // If the user specified attributes (not null, count > 0) we need attributes.
+            // If the content type is null we're counter-signing, and need the message digest attr.
+            // If the content type is otherwise not-data we need to record it as the content-type attr.
+            if (SignedAttributes?.Count > 0 || contentTypeOid != Oids.Pkcs7Data)
+            {
+                List<AttributeAsn> signedAttrs = BuildAttributes(SignedAttributes);
+
+                using (var writer = new AsnWriter(AsnEncodingRules.DER))
+                {
+                    writer.PushSetOf();
+                    writer.WriteOctetString(dataHash);
+                    writer.PopSetOf();
+
+                    signedAttrs.Add(
+                        new AttributeAsn
+                        {
+                            AttrType = new Oid(Oids.MessageDigest, Oids.MessageDigest),
+                            AttrValues = writer.Encode(),
+                        });
+                }
+
+                if (contentTypeOid != null)
+                {
+                    using (var writer = new AsnWriter(AsnEncodingRules.DER))
+                    {
+                        writer.PushSetOf();
+                        writer.WriteObjectIdentifier(contentTypeOid);
+                        writer.PopSetOf();
+
+                        signedAttrs.Add(
+                            new AttributeAsn
+                            {
+                                AttrType = new Oid(Oids.ContentType, Oids.ContentType),
+                                AttrValues = writer.Encode(),
+                            });
+                    }
+                }
+
+                // Use the serializer/deserializer to DER-normalize the attribute order.
+                SignedAttributesSet signedAttrsSet = new SignedAttributesSet();
+                signedAttrsSet.SignedAttributes = Helpers.NormalizeSet(
+                    signedAttrs.ToArray(),
+                    normalized =>
+                    {
+                        AsnReader reader = new AsnReader(normalized, AsnEncodingRules.DER);
+                        hasher.AppendData(reader.PeekContentBytes().Span);
+                    });
+
+                // Since this contains user data in a context where BER is permitted, use BER.
+                // There shouldn't be any observable difference here between BER and DER, though,
+                // since the top level fields were written by NormalizeSet.
+                using (AsnWriter attrsWriter = AsnSerializer.Serialize(signedAttrsSet, AsnEncodingRules.BER))
+                {
+                    newSignerInfo.SignedAttributes = attrsWriter.Encode();
+                }
+
+                dataHash = hasher.GetHashAndReset();
+            }
+
+            switch (SignerIdentifierType)
+            {
+                case SubjectIdentifierType.IssuerAndSerialNumber:
+                    byte[] serial = Certificate.GetSerialNumber();
+                    Array.Reverse(serial);
+
+                    newSignerInfo.Sid.IssuerAndSerialNumber = new IssuerAndSerialNumberAsn
+                    {
+                        Issuer = Certificate.IssuerName.RawData,
+                        SerialNumber = serial,
+                    };
+
+                    newSignerInfo.Version = 1;
+                    break;
+                case SubjectIdentifierType.SubjectKeyIdentifier:
+                    newSignerInfo.Sid.SubjectKeyIdentifier = Certificate.GetSubjectKeyIdentifier();
+                    newSignerInfo.Version = 3;
+                    break;
+                case SubjectIdentifierType.NoSignature:
+                    newSignerInfo.Sid.IssuerAndSerialNumber = new IssuerAndSerialNumberAsn
+                    {
+                        Issuer = SubjectIdentifier.DummySignerEncodedValue,
+                        SerialNumber = new byte[1],
+                    };
+                    newSignerInfo.Version = 1;
+                    break;
+                default:
+                    Debug.Fail($"Unresolved SignerIdentifierType value: {SignerIdentifierType}");
+                    throw new CryptographicException();
+            }
+
+            if (UnsignedAttributes != null && UnsignedAttributes.Count > 0)
+            {
+                List<AttributeAsn> attrs = BuildAttributes(UnsignedAttributes);
+
+                newSignerInfo.UnsignedAttributes = Helpers.NormalizeSet(attrs.ToArray());
+            }
+
+            bool signed = CmsSignature.Sign(
+                dataHash,
+                hashAlgorithmName,
+                Certificate,
+                silent,
+                out Oid signatureAlgorithm,
+                out ReadOnlyMemory<byte> signatureValue);
+
+            if (!signed)
+            {
+                throw new CryptographicException(SR.Cryptography_Cms_CannotDetermineSignatureAlgorithm);
+            }
+
+            newSignerInfo.SignatureValue = signatureValue;
+            newSignerInfo.SignatureAlgorithm.Algorithm = signatureAlgorithm;
+
+            X509Certificate2Collection certs = new X509Certificate2Collection();
+            certs.AddRange(Certificates);
+
+            if (SignerIdentifierType != SubjectIdentifierType.NoSignature)
+            {
+                if (IncludeOption == X509IncludeOption.EndCertOnly)
+                {
+                    certs.Add(Certificate);
+                }
+                else if (IncludeOption != X509IncludeOption.None)
+                {
+                    X509Chain chain = new X509Chain();
+                    chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+                    chain.ChainPolicy.VerificationFlags = X509VerificationFlags.AllFlags;
+
+                    if (!chain.Build(Certificate))
+                    {
+                        foreach (X509ChainStatus status in chain.ChainStatus)
+                        {
+                            if (status.Status == X509ChainStatusFlags.PartialChain)
+                            {
+                                throw new CryptographicException(SR.Cryptography_Cms_IncompleteCertChain);
+                            }
+                        }
+                    }
+
+                    X509ChainElementCollection elements = chain.ChainElements;
+                    int count = elements.Count;
+                    int last = count - 1;
+
+                    if (last == 0)
+                    {
+                        // If there's always one cert treat it as EE, not root.
+                        last = -1;
+                    }
+
+                    for (int i = 0; i < count; i++)
+                    {
+                        X509Certificate2 cert = elements[i].Certificate;
+
+                        if (i == last &&
+                            IncludeOption == X509IncludeOption.ExcludeRoot &&
+                            cert.SubjectName.RawData.AsSpan().SequenceEqual(cert.IssuerName.RawData))
+                        {
+                            break;
+                        }
+
+                        certs.Add(cert);
+                    }
+                }
+            }
+
+            chainCerts = certs;
+            return newSignerInfo;
+        }
+
+        internal static List<AttributeAsn> BuildAttributes(CryptographicAttributeObjectCollection attributes)
+        {
+            List<AttributeAsn> signedAttrs = new List<AttributeAsn>();
+
+            if (attributes == null || attributes.Count == 0)
+            {
+                return signedAttrs;
+            }
+
+            foreach (CryptographicAttributeObject attributeObject in attributes)
+            {
+                using (var writer = new AsnWriter(AsnEncodingRules.DER))
+                {
+                    writer.PushSetOf();
+
+                    foreach (AsnEncodedData objectValue in attributeObject.Values)
+                    {
+                        writer.WriteEncodedValue(objectValue.RawData);
+                    }
+
+                    writer.PopSetOf();
+
+                    AttributeAsn newAttr = new AttributeAsn
+                    {
+                        AttrType = attributeObject.Oid,
+                        AttrValues = writer.Encode(),
+                    };
+
+                    signedAttrs.Add(newAttr);
+                }
+            }
+
+            return signedAttrs;
+        }
+    }
+}
+                                                                                                                                                                                                             çr&    '°   J…√Ãú‡÷  Ä            0 < O l e D b D a t a R e a d e r _ C l o s e . c s     p      ´r&    çr&    `(°   J…√Ãú‡÷           Ä   . < O l e D b D a t a R e a d e r _ c t o r . c s       p      ´r&    çr&    –(°   J…√Ãú‡÷  Ä            . < O l e D b D a t a R e a d e r _ c t o r . c s       p      èr&    çr&    @)°   J…√Ãú‡÷           Ä   0 < O l e D b D a t a R e a d e r _ D e p t h . c s     p      èr&    çr&    ∞)°   J…√Ãú‡÷  Ä            0 < O l e D b D a t a R e a d e r _ D e p t h . c s     x      êr&    çr&     *°   J…√Ãú‡÷           Ä   : < O l e D b D a t a R e a d e r _ G e t B o o l e a n . c s   x      êr&    çr&    ò*°   J…√Ãú‡÷  Ä            : < O l e D b D a t a R e a d e r _ G e t B o o l e a n . c s   Ä      ír&    çr&    +°   J…√Ãú‡÷           Ä   B < O l e D b D a t a R e a d e r _ G e t B y t e s _ I I B I I . c s   Ä      ír&    çr&    ê+°   ´Ò√Ãú‡÷  Ä            B < O l e D b D a t a R e a d e r _ G e t B y t e s _ I I B I I . c s   x      ër&    çr&    ,°   ´Ò√Ãú‡÷           Ä   8 < O l e D b D a t a R e a d e r _ G e t B y t e _ I . c s     x      ër&    çr&    à,°   ´Ò√Ãú‡÷  Ä            8 < O l e D b D a t a R e a d e r _ G e t B y t e _ I . c s     x      ìr&    çr&     -°   ´Ò√Ãú‡÷           Ä   6 < O l e D b D a t a R e a d e r _ G e t C h a r s . c s       x      ìr&    çr&    x-°   ´Ò√Ãú‡÷  Ä            6 < O l e D b D a t a R e a d e r _ G e t C h a r s . c s       Ä      îr&    çr&    -°   ´Ò√Ãú‡÷           Ä   D < O l e D b D a t a R e a d e r _ G e t D a t a T y p e N a m e . c s Ä      îr&    çr&    p.°   ´Ò√Ãú‡÷  Ä            D < O l e D b D a t a R e a d e r _ G e t D a t a T y p e N a m e . c s x      ïr&    çr&    .°   ´Ò√Ãú‡÷           Ä   < < O l e D b D a t a R e a d e r _ G e t D a t e T i m e . c s x      ïr&    çr&    h/°   ´Ò√Ãú‡÷  Ä            < < O l e D b D a t a R e a d e r _ G e t D a t e T i m e . c s                                 //
+// Copyright (c) 2005 Novell, Inc.
+//
+// Authors:
+//      Ritvik Mayank (mritvik@novell.com)
+//
+
+using System;
+using System.ComponentModel;
+using System.Drawing;
+using System.Reflection;
+using System.Windows.Forms;
+using System.Text;
+
+using NUnit.Framework;
+using CategoryAttribute = NUnit.Framework.CategoryAttribute;
+
+using MonoTests.Helpers;
+
+namespace MonoTests.System.Windows.Forms
+{
+	[TestFixture]
+	public class TextBoxTest : TestHelper
+	{
+		TextBox textBox;
+		int _changed;
+		int _invalidated;
+		int _paint;
+
+		[SetUp]
+		protected override void SetUp () {
+			textBox = new TextBox();
+			textBox.Invalidated += new InvalidateEventHandler (TextBox_Invalidated);
+			textBox.Paint += new PaintEventHandler (TextBox_Paint);
+			textBox.TextChanged += new EventHandler (TextBox_TextChanged);
+			Reset ();
+			base.SetUp ();
+		}
+
+		[Test]
+		public void TextBoxBasePropertyTest ()
+		{
+			Assert.AreEqual (false, textBox.AcceptsTab, "#1a");
+			textBox.Multiline = true;
+			textBox.AcceptsTab = true;
+			//	SendKeys.SendWait ("^%");
+			Assert.AreEqual (true, textBox.AcceptsTab, "#1b");
+			Assert.AreEqual (true, textBox.AutoSize, "#2");
+			Assert.AreEqual (null, textBox.BackgroundImage, "#4a");
+			string gif = TestResourceHelper.GetFullPathOfResource ("Test/resources/M.gif");
+			textBox.BackgroundImage = Image.FromFile (gif);
+			// comparing image objects fails on MS .Net so using Size property
+			Assert.AreEqual (Image.FromFile(gif, true).Size, textBox.BackgroundImage.Size, "#4b");
+			
+			Assert.AreEqual (BorderStyle.Fixed3D, textBox.BorderStyle, "#5");
+			Assert.AreEqual (false, textBox.CanUndo, "#6a");
+
+			Clipboard.SetDataObject ("TEST");
+			textBox.Paste ();
+			Assert.AreEqual (true, textBox.CanUndo, "#6b");
+			textBox.Undo ();
+			textBox.ClearUndo ();
+			Assert.AreEqual (false, textBox.CanUndo, "#6c");
+
+			Assert.AreEqual (true, textBox.HideSelection, "#8");
+			Assert.AreEqual (0, textBox.Lines.Length, "#9");
+			Assert.AreEqual (32767, textBox.MaxLength, "#10");
+			Assert.AreEqual (true, textBox.Modified, "#11");
+			Assert.AreEqual (true, textBox.Multiline, "#12a");
+			textBox.WordWrap = false;
+			Assert.AreEqual (true, textBox.Multiline, "#12b");
+			textBox.AcceptsReturn = true;
+			Assert.AreEqual (true, textBox.Multiline, "#12c");
+			Assert.AreEqual (20, textBox.PreferredHeight, "#13");
+			Assert.AreEqual (false, textBox.ReadOnly, "#14");
+			Assert.AreEqual ("", textBox.SelectedText, "#15");
+			textBox.Text = "sample TextBox";
+			Assert.AreEqual (0, textBox.SelectionLength, "#16b");
+			Assert.AreEqual (0, textBox.SelectionStart, "#17");
+			textBox.WordWrap = false;
+			textBox.AcceptsReturn = true;
+			Assert.AreEqual ("sample TextBox", textBox.Text, "#18");
+			Assert.AreEqual (14, textBox.TextLength, "#19");
+			Assert.AreEqual (false, textBox.WordWrap, "#20");
+		}
+
+		[Test]
+		public void TextBoxPropertyTest ()
+		{
+			Assert.AreEqual (false, textBox.AcceptsReturn, "#21");
+			Assert.AreEqual (CharacterCasing.Normal, textBox.CharacterCasing, "#22");
+			Assert.AreEqual ('\0', textBox.PasswordChar, "#23");
+			textBox.PasswordChar = '*';
+			Assert.AreEqual ('*', textBox.PasswordChar, "#23b");
+			Assert.AreEqual (ScrollBars.None, textBox.ScrollBars, "#24");
+			Assert.AreEqual (0, textBox.SelectionLength, "#25-NET20");
+			Assert.AreEqual (HorizontalAlignment.Left , textBox.TextAlign, "#26");
+			Assert.AreEqual (true, textBox.AutoCompleteCustomSource != null, "#27");
+			Assert.AreEqual (AutoCompleteMode.None, textBox.AutoCompleteMode, "#28");
+			Assert.AreEqual (AutoCompleteSource.None, textBox.AutoCompleteSource, "#29");
+
+			textBox.AutoCompleteCustomSource = null;
+			Assert.AreEqual (true, textBox.AutoCompleteCustomSource != null, "#30");
+		}
+
+		[Test]
+		public void UseSystemPasswordCharDefault()
+		{
+			Assert.IsFalse(textBox.UseSystemPasswordChar);
+		}
+
+		[Test]
+		public void UseSystemPasswordCharOverridesPasswordChar()
+		{
+			textBox.PasswordChar = '!';
+			textBox.UseSystemPasswordChar = true;
+			Assert.AreEqual('*', textBox.PasswordChar);
+		}
+
+		[Test]
+		public void AppendTextTest ()
+		{
+			Form f = new Form (); 
+			f.ShowInTaskbar = false;
+			f.Visible = true;
+			textBox.Visible = true;
+			textBox.Text = "TextBox1";
+			TextBox textBox2 = new TextBox ();
+			textBox2.Visible = true;
+			f.Controls.Add (textBox);
+			f.Controls.Add (textBox2);
+			textBox2.AppendText (textBox.Text);
+			Assert.AreEqual ("TextBox1", textBox2.Text, "#27");
+			f.Dispose ();
+		}
+
+		[Test]
+		public void AppendTextTest2 ()
+		{
+			TextBox textBox2 = new TextBox ();
+			textBox2.AppendText ("hi");
+			textBox2.AppendText ("ho");
+			Assert.AreEqual ("hiho", textBox2.Text, "#1");
+			Assert.IsNotNull (textBox2.Lines, "#2");
+			Assert.AreEqual (1, textBox2.Lines.Length, "#3");
+			Assert.AreEqual ("hiho", textBox2.Lines [0], "#4");
+		}
+
+		[Test]
+		public void AppendText_Multiline_CRLF ()
+		{
+			TextBox textBox = new TextBox ();
+			textBox.Text = "ha";
+			textBox.AppendText ("hi\r\n\r\n");
+			textBox.AppendText ("ho\r\n");
+			Assert.AreEqual ("hahi\r\n\r\nho\r\n", textBox.Text, "#A1");
+			Assert.IsNotNull (textBox.Lines, "#A2");
+			Assert.AreEqual (4, textBox.Lines.Length, "#A3");
+			Assert.AreEqual ("hahi", textBox.Lines [0], "#A4");
+			Assert.AreEqual (string.Empty, textBox.Lines [1], "#A5");
+			Assert.AreEqual ("ho", textBox.Lines [2], "#A6");
+			Assert.AreEqual (string.Empty, textBox.Lines [3], "#A7");
+
+			textBox.Multiline = true;
+
+			textBox.Text = "ha";
+			textBox.AppendText ("hi\r\n\r\n");
+			textBox.AppendText ("ho\r\n");
+			Assert.AreEqual ("hahi\r\n\r\nho\r\n", textBox.Text, "#B1");
+			Assert.IsNotNull (textBox.Lines, "#B2");
+			Assert.AreEqual (4, textBox.Lines.Length, "#B3");
+			Assert.AreEqual ("hahi", textBox.Lines [0], "#B4");
+			Assert.AreEqual (string.Empty, textBox.Lines [1], "#B5");
+			Assert.AreEqual ("ho", textBox.Lines [2], "#B6");
+			Assert.AreEqual (string.Empty, textBox.Lines [3], "#B7");
+		}
+
+		[Test]
+		public void AppendText_Multiline_LF ()
+		{
+			TextBox textBox = new TextBox ();
+
+			textBox.Text = "ha";
+			textBox.AppendText ("hi\n\n");
+			textBox.AppendText ("ho\n");
+			Assert.AreEqual ("hahi\n\nho\n", textBox.Text, "#A1");
+			Assert.IsNotNull (textBox.Lines, "#A2");
+			Assert.AreEqual (4, textBox.Lines.Length, "#A3");
+			Assert.AreEqual ("hahi", textBox.Lines [0], "#A4");
+			Assert.AreEqual (string.Empty, textBox.Lines [1], "#A5");
+			Assert.AreEqual ("ho", textBox.Lines [2], "#A6");
+			Assert.AreEqual (string.Empty, textBox.Lines [3], "#A7");
+
+			textBox.Multiline = true;
+
+			textBox.Text = "ha";
+			textBox.AppendText ("hi\n\n");
+			textBox.AppendText ("ho\n");
+			Assert.AreEqual ("hahi\n\nho\n", textBox.Text, "#B1");
+			Assert.IsNotNull (textBox.Lines, "#B2");
+			Assert.AreEqual (4, textBox.Lines.Length, "#B3");
+			Assert.AreEqual ("hahi", textBox.Lines [0], "#B4");
+			Assert.AreEqual (string.Empty, textBox.Lines [1], "#B5");
+			Assert.Are

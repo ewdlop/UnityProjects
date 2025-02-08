@@ -1,0 +1,91 @@
+// Copyright (c) 2010 Google Inc.
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are
+// met:
+//
+//     * Redistributions of source code must retain the above copyright
+// notice, this list of conditions and the following disclaimer.
+//     * Redistributions in binary form must reproduce the above
+// copyright notice, this list of conditions and the following disclaimer
+// in the documentation and/or other materials provided with the
+// distribution.
+//     * Neither the name of Google Inc. nor the names of its
+// contributors may be used to endorse or promote products derived from
+// this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+// stackwalker_x86.cc: x86-specific stackwalker.
+//
+// See stackwalker_x86.h for documentation.
+//
+// Author: Mark Mentovai
+
+#include <assert.h>
+#include <string>
+
+#include "common/scoped_ptr.h"
+#include "google_breakpad/processor/call_stack.h"
+#include "google_breakpad/processor/code_modules.h"
+#include "google_breakpad/processor/memory_region.h"
+#include "google_breakpad/processor/source_line_resolver_interface.h"
+#include "google_breakpad/processor/stack_frame_cpu.h"
+#include "processor/logging.h"
+#include "processor/postfix_evaluator-inl.h"
+#include "processor/stackwalker_x86.h"
+#include "processor/windows_frame_info.h"
+#include "processor/cfi_frame_info.h"
+
+namespace google_breakpad {
+
+// Max reasonable size for a single x86 frame is 128 KB.  This value is used in
+// a heuristic for recovering of the EBP chain after a scan for return address.
+// This value is based on a stack frame size histogram built for a set of
+// popular third party libraries which suggests that 99.5% of all frames are
+// smaller than 128 KB.
+static const uint32_t kMaxReasonableGapBetweenFrames = 128 * 1024;
+
+const StackwalkerX86::CFIWalker::RegisterSet
+StackwalkerX86::cfi_register_map_[] = {
+  // It may seem like $eip and $esp are callee-saves, because (with Unix or
+  // cdecl calling conventions) the callee is responsible for having them
+  // restored upon return. But the callee_saves flags here really means
+  // that the walker should assume they're unchanged if the CFI doesn't
+  // mention them, which is clearly wrong for $eip and $esp.
+  { "$eip", ".ra",  false,
+    StackFrameX86::CONTEXT_VALID_EIP, &MDRawContextX86::eip },
+  { "$esp", ".cfa", false,
+    StackFrameX86::CONTEXT_VALID_ESP, &MDRawContextX86::esp },
+  { "$ebp", NULL,   true,
+    StackFrameX86::CONTEXT_VALID_EBP, &MDRawContextX86::ebp },
+  { "$eax", NULL,   false,
+    StackFrameX86::CONTEXT_VALID_EAX, &MDRawContextX86::eax },
+  { "$ebx", NULL,   true,
+    StackFrameX86::CONTEXT_VALID_EBX, &MDRawContextX86::ebx },
+  { "$ecx", NULL,   false,
+    StackFrameX86::CONTEXT_VALID_ECX, &MDRawContextX86::ecx },
+  { "$edx", NULL,   false,
+    StackFrameX86::CONTEXT_VALID_EDX, &MDRawContextX86::edx },
+  { "$esi", NULL,   true,
+    StackFrameX86::CONTEXT_VALID_ESI, &MDRawContextX86::esi },
+  { "$edi", NULL,   true,
+    StackFrameX86::CONTEXT_VALID_EDI, &MDRawContextX86::edi },
+};
+
+StackwalkerX86::StackwalkerX86(const SystemInfo* system_info,
+                               const MDRawContextX86* context,
+                               MemoryRegion* memory,
+                               const CodeModules* modules,
+                               StackFrameSym

@@ -1,0 +1,360 @@
+r.
+      EndInsertOffset += U.CPEMI->getOperand(2).getImm();
+      CPUIndex++;
+    }
+
+    // Remember the last IT instruction.
+    if (MI->getOpcode() == ARM::t2IT)
+      LastIT = &*MI;
+  }
+
+  --MI;
+
+  // Avoid splitting an IT block.
+  if (LastIT) {
+    unsigned PredReg = 0;
+    ARMCC::CondCodes CC = getITInstrPredicate(*MI, PredReg);
+    if (CC != ARMCC::AL)
+      MI = LastIT;
+  }
+
+  // We really must not split an IT block.
+  DEBUG(unsigned PredReg;
+        assert(!isThumb || getITInstrPredicate(*MI, PredReg) == ARMCC::AL));
+
+  NewMBB = splitBlockBeforeInstr(&*MI);
+}
+
+/// handleConstantPoolUser - Analyze the specified user, checking to see if it
+/// is out-of-range.  If so, pick up the constant pool value and move it some
+/// place in-range.  Return true if we changed any addresses (thus must run
+/// another pass of branch lengthening), false otherwise.
+bool ARMConstantIslands::handleConstantPoolUser(unsigned CPUserIndex,
+                                                bool CloserWater) {
+  CPUser &U = CPUsers[CPUserIndex];
+  MachineInstr *UserMI = U.MI;
+  MachineInstr *CPEMI  = U.CPEMI;
+  unsigned CPI = getCombinedIndex(CPEMI);
+  unsigned Size = CPEMI->getOperand(2).getImm();
+  // Compute this only once, it's expensive.
+  unsigned UserOffset = getUserOffset(U);
+
+  // See if the current entry is within range, or there is a clone of it
+  // in range.
+  int result = findInRangeCPEntry(U, UserOffset);
+  if (result==1) return false;
+  else if (result==2) return true;
+
+  // No existing clone of this CPE is within range.
+  // We will be generating a new clone.  Get a UID for it.
+  unsigned ID = AFI->createPICLabelUId();
+
+  // Look for water where we can place this CPE.
+  MachineBasicBlock *NewIsland = MF->CreateMachineBasicBlock();
+  MachineBasicBlock *NewMBB;
+  water_iterator IP;
+  if (findAvailableWater(U, UserOffset, IP, CloserWater)) {
+    DEBUG(dbgs() << "Found water in range\n");
+    MachineBasicBlock *WaterBB = *IP;
+
+    // If the original WaterList entry was "new water" on this iteration,
+    // propagate that to the new island.  This is just keeping NewWaterList
+    // updated to match the WaterList, which will be updated below.
+    if (NewWaterList.erase(WaterBB))
+      NewWaterList.insert(NewIsland);
+
+    // The new CPE goes before the following block (NewMBB).
+    NewMBB = &*++WaterBB->getIterator();
+  } else {
+    // No water found.
+    DEBUG(dbgs() << "No water found\n");
+    createNewWater(CPUserIndex, UserOffset, NewMBB);
+
+    // splitBlockBeforeInstr adds to WaterList, which is important when it is
+    // called while handling branches so that the water will be seen on the
+    // next iteration for constant pools, but in this context, we don't want
+    // it.  Check for this so it will be removed from the WaterList.
+    // Also remove any entry from NewWaterList.
+    MachineBasicBlock *WaterBB = &*--NewMBB->getIterator();
+    IP = find(WaterList, WaterBB);
+    if (IP != WaterList.end())
+      NewWaterList.erase(WaterBB);
+
+    // We are adding new water.  Update NewWaterList.
+    NewWaterList.insert(NewIsland);
+  }
+
+  // Remove the original WaterList entry; we want subsequent insertions in
+  // this vicinity to go after the one we're about to insert.  This
+  // considerably reduces the number of times we have to move the same CPE
+  // more than once and is also important to ensure the algorithm terminates.
+  if (IP != WaterList.end())
+    WaterList.erase(IP);
+
+  // Okay, we know we can put an island before NewMBB now, do it!
+  MF->insert(NewMBB->getIterator(), NewIsland);
+
+  // Update internal data structures to account for the newly inserted MBB.
+  updateForInsertedWaterBlock(NewIsland);
+
+  // Now that we have an island to add the CPE to, clone the original CPE and
+  // add it to the island.
+  U.HighWaterMark = NewIsland;
+  U.CPEMI = BuildMI(NewIsland, DebugLoc(), CPEMI->getDesc())
+                .addImm(ID)
+                .add(CPEMI->getOperand(1))
+                .addImm(Size);
+  CPEntries[CPI].push_back(CPEntry(U.CPEMI, ID, 1));
+  ++NumCPEs;
+
+  // Decrement the old entry, and remove it if refcount becomes 0.
+  decrementCPEReferenceCount(CPI, CPEMI);
+
+  // Mark the basic block as aligned as required by the const-pool entry.
+  NewIsland->setAlignment(getCPELogAlign(U.CPEMI));
+
+  // Increase the size of the island block to account for the new entry.
+  BBInfo[NewIsland->getNumber()].Size += Size;
+  adjustBBOffsetsAfter(&*--NewIsland->getIterator());
+
+  // Finally, change the CPI in the instruction operand to be ID.
+  for (unsigned i = 0, e = UserMI->getNumOperands(); i != e; ++i)
+    if (UserMI->getOperand(i).isCPI()) {
+      UserMI->getOperand(i).setIndex(ID);
+      break;
+    }
+
+  DEBUG(dbgs() << "  Moved CPE to #" << ID << " CPI=" << CPI
+        << format(" offset=%#x\n", BBInfo[NewIsland->getNumber()].Offset));
+
+  return true;
+}
+
+/// removeDeadCPEMI - Remove a dead constant pool entry instruction. Update
+/// sizes and offsets of impacted basic blocks.
+void ARMConstantIslands::removeDeadCPEMI(MachineInstr *CPEMI) {
+  MachineBasicBlock *CPEBB = CPEMI->getParent();
+  unsigned Size = CPEMI->getOperand(2).getImm();
+  CPEMI->eraseFromParent();
+  BBInfo[CPEBB->getNumber()].Size -= Size;
+  // All succeeding offsets have the current size value added in, fix this.
+  if (CPEBB->empty()) {
+    BBInfo[CPEBB->getNumber()].Size = 0;
+
+    // This block no longer needs to be aligned.
+    CPEBB->setAlignment(0);
+  } else
+    // Entries are sorted by descending alignment, so realign from the front.
+    CPEBB->setAlignment(getCPELogAlign(&*CPEBB->begin()));
+
+  adjustBBOffsetsAfter(CPEBB);
+  // An island has only one predecessor BB and one successor BB. Check if
+  // this BB's predecessor jumps directly to this BB's successor. This
+  // shouldn't happen currently.
+  assert(!BBIsJumpedOver(CPEBB) && "How did this happen?");
+  // FIXME: remove the empty blocks after all the work is done?
+}
+
+/// removeUnusedCPEntries - Remove constant pool entries whose refcounts
+/// are zero.
+bool ARMConstantIslands::removeUnusedCPEntries() {
+  unsigned MadeChange = false;
+  for (unsigned i = 0, e = CPEntries.size(); i != e; ++i) {
+      std::vector<CPEntry> &CPEs = CPEntries[i];
+      for (unsigned j = 0, ee = CPEs.size(); j != ee; ++j) {
+        if (CPEs[j].RefCount == 0 && CPEs[j].CPEMI) {
+          removeDeadCPEMI(CPEs[j].CPEMI);
+          CPEs[j].CPEMI = nullptr;
+          MadeChange = true;
+        }
+      }
+  }
+  return MadeChange;
+}
+
+/// isBBInRange - Returns true if the distance between specific MI and
+/// specific BB can fit in MI's displacement field.
+bool ARMConstantIslands::isBBInRange(MachineInstr *MI,MachineBasicBlock *DestBB,
+                                     unsigned MaxDisp) {
+  unsigned PCAdj      = isThumb ? 4 : 8;
+  unsigned BrOffset   = getOffsetOf(MI) + PCAdj;
+  unsigned DestOffset = BBInfo[DestBB->getNumber()].Offset;
+
+  DEBUG(dbgs() << "Branch of destination " << printMBBReference(*DestBB)
+               << " from " << printMBBReference(*MI->getParent())
+               << " max delta=" << MaxDisp << " from " << getOffsetOf(MI)
+               << " to " << DestOffset << " offset "
+               << int(DestOffset - BrOffset) << "\t" << *MI);
+
+  if (BrOffset <= DestOffset) {
+    // Branch before the Dest.
+    if (DestOffset-BrOffset <= MaxDisp)
+      return true;
+  } else {
+    if (BrOffset-DestOffset <= MaxDisp)
+      return true;
+  }
+  return false;
+}
+
+/// fixupImmediateBr - Fix up an immediate branch whose destination is too far
+/// away to fit in its displacement field.
+bool ARMConstantIslands::fixupImmediateBr(ImmBranch &Br) {
+  MachineInstr *MI = Br.MI;
+  MachineBasicBlock *DestBB = MI->getOperand(0).getMBB();
+
+  // Check to see if the DestBB is already in-range.
+  if (isBBInRange(MI, DestBB, Br.MaxDisp))
+    return false;
+
+  if (!Br.isCond)
+    return fixupUnconditionalBr(Br);
+  return fixupConditionalBr(Br);
+}
+
+/// fixupUnconditionalBr - Fix up an unconditional branch whose destination is
+/// too far away to fit in its displacement field. If the LR register has been
+/// spilled in the epilogue, then we can use BL to implement a far jump.
+/// Otherwise, add an intermediate branch instruction to a branch.
+bool
+ARMConstantIslands::fixupUnconditionalBr(ImmBranch &Br) {
+  MachineInstr *MI = Br.MI;
+  MachineBasicBlock *MBB = MI->getParent();
+  if (!isThumb1)
+    llvm_unreachable("fixupUnconditionalBr is Thumb1 only!");
+
+  // Use BL to implement far jump.
+  Br.MaxDisp = (1 << 21) * 2;
+  MI->setDesc(TII->get(ARM::tBfar));
+  BBInfo[MBB->getNumber()].Size += 2;
+  adjustBBOffsetsAfter(MBB);
+  HasFarJump = true;
+  ++NumUBrFixed;
+
+  DEBUG(dbgs() << "  Changed B to long jump " << *MI);
+
+  return true;
+}
+
+/// fixupConditionalBr - Fix up a conditional branch whose destination is too
+/// far away to fit in its displacement field. It is converted to an inverse
+/// conditional branch + an unconditional branch to the destination.
+bool
+ARMConstantIslands::fixupConditionalBr(ImmBranch &Br) {
+  MachineInstr *MI = Br.MI;
+  MachineBasicBlock *DestBB = MI->getOperand(0).getMBB();
+
+  // Add an unconditional branch to the destination and invert the branch
+  // condition to jump over it:
+  // blt L1
+  // =>
+  // bge L2
+  // b   L1
+  // L2:
+  ARMCC::CondCodes CC = (ARMCC::CondCodes)MI->getOperand(1).getImm();
+  CC = ARMCC::getOppositeCondition(CC);
+  unsigned CCReg = MI->getOperand(2).getReg();
+
+  // If the branch is at the end of its MBB and that has a fall-through block,
+  // direct the updated conditional branch to the fall-through block. Otherwise,
+  // split the MBB before the next instruction.
+  MachineBasicBlock *MBB = MI->getParent();
+  MachineInstr *BMI = &MBB->back();
+  bool NeedSplit = (BMI != MI) || !BBHasFallthrough(MBB);
+
+  ++NumCBrFixed;
+  if (BMI != MI) {
+    if (std::next(MachineBasicBlock::iterator(MI)) == std::prev(MBB->end()) &&
+        BMI->getOpcode() == Br.UncondBr) {
+      // Last MI in the BB is an unconditional branch. Can we simply invert the
+      // condition and swap destinations:
+      // beq L1
+      // b   L2
+      // =>
+      // bne L2
+      // b   L1
+      MachineBasicBlock *NewDest = BMI->getOperand(0).getMBB();
+      if (isBBInRange(MI, NewDest, Br.MaxDisp)) {
+        DEBUG(dbgs() << "  Invert Bcc condition and swap its destination with "
+                     << *BMI);
+        BMI->getOperand(0).setMBB(DestBB);
+        MI->getOperand(0).setMBB(NewDest);
+        MI->getOperand(1).setImm(CC);
+        return true;
+      }
+    }
+  }
+
+  if (NeedSplit) {
+    splitBlockBeforeInstr(MI);
+    // No need for the branch to the next block. We're adding an unconditional
+    // branch to the destination.
+    int delta = TII->getInstSizeInBytes(MBB->back());
+    BBInfo[MBB->getNumber()].Size -= delta;
+    MBB->back().eraseFromParent();
+
+    // The conditional successor will be swapped between the BBs after this, so
+    // update CFG.
+    MBB->addSuccessor(DestBB);
+    std::next(MBB->getIterator())->removeSuccessor(DestBB);
+
+    // BBInfo[SplitBB].Offset is wrong temporarily, fixed below
+  }
+  MachineBasicBlock *NextBB = &*++MBB->getIterator();
+
+  DEBUG(dbgs() << "  Insert B to " << printMBBReference(*DestBB)
+               << " also invert condition and change dest. to "
+               << printMBBReference(*NextBB) << "\n");
+
+  // Insert a new conditional branch and a new unconditional branch.
+  // Also update the ImmBranch as well as adding a new entry for the new branch.
+  BuildMI(MBB, DebugLoc(), TII->get(MI->getOpcode()))
+    .addMBB(NextBB).addImm(CC).addReg(CCReg);
+  Br.MI = &MBB->back();
+  BBInfo[MBB->getNumber()].Size += TII->getInstSizeInBytes(MBB->back());
+  if (isThumb)
+    BuildMI(MBB, DebugLoc(), TII->get(Br.UncondBr))
+        .addMBB(DestBB)
+        .add(predOps(ARMCC::AL));
+  else
+    BuildMI(MBB, DebugLoc(), TII->get(Br.UncondBr)).addMBB(DestBB);
+  BBInfo[MBB->getNumber()].Size += TII->getInstSizeInBytes(MBB->back());
+  unsigned MaxDisp = getUnconditionalBrDisp(Br.UncondBr);
+  ImmBranches.push_back(ImmBranch(&MBB->back(), MaxDisp, false, Br.UncondBr));
+
+  // Remove the old conditional branch.  It may or may not still be in MBB.
+  BBInfo[MI->getParent()->getNumber()].Size -= TII->getInstSizeInBytes(*MI);
+  MI->eraseFromParent();
+  adjustBBOffsetsAfter(MBB);
+  return true;
+}
+
+/// undoLRSpillRestore - Remove Thumb push / pop instructions that only spills
+/// LR / restores LR to pc. FIXME: This is done here because it's only possible
+/// to do this if tBfar is not used.
+bool ARMConstantIslands::undoLRSpillRestore() {
+  bool MadeChange = false;
+  for (unsigned i = 0, e = PushPopMIs.size(); i != e; ++i) {
+    MachineInstr *MI = PushPopMIs[i];
+    // First two operands are predicates.
+    if (MI->getOpcode() == ARM::tPOP_RET &&
+        MI->getOperand(2).getReg() == ARM::PC &&
+        MI->getNumExplicitOperands() == 3) {
+      // Create the new insn and copy the predicate from the old.
+      BuildMI(MI->getParent(), MI->getDebugLoc(), TII->get(ARM::tBX_RET))
+          .add(MI->getOperand(0))
+          .add(MI->getOperand(1));
+      MI->eraseFromParent();
+      MadeChange = true;
+    } else if (MI->getOpcode() == ARM::tPUSH &&
+               MI->getOperand(2).getReg() == ARM::LR &&
+               MI->getNumExplicitOperands() == 3) {
+      // Just remove the push.
+      MI->eraseFromParent();
+      MadeChange = true;
+    }
+  }
+  return MadeChange;
+}
+
+bool ARMConstantIslands::optimizeThumb2Instruct

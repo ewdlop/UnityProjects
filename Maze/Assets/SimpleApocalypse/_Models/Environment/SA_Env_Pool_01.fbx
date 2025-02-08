@@ -1,0 +1,1926 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "CoreMinimal.h"
+#include "Containers/IndirectArray.h"
+#include "Stats/Stats.h"
+#include "UObject/ObjectMacros.h"
+#include "Misc/Guid.h"
+#include "UObject/Class.h"
+#include "UObject/UnrealType.h"
+#include "EdGraph/EdGraphPin.h"
+
+// WARNING: This should always be the last include in any file that needs it (except .generated.h)
+#include "UObject/UndefineUPropertyMacros.h"
+
+#include "BlueprintGeneratedClass.generated.h"
+
+class AActor;
+class UActorComponent;
+class UDynamicBlueprintBinding;
+class UInheritableComponentHandler;
+class UTimelineTemplate;
+
+DECLARE_MEMORY_STAT_EXTERN(TEXT("Persistent Uber Graph Frame memory"), STAT_PersistentUberGraphFrameMemory, STATGROUP_Memory, );
+DECLARE_MEMORY_STAT_EXTERN(TEXT("BPComp Instancing Fast Path memory"), STAT_BPCompInstancingFastPathMemory, STATGROUP_Memory, );
+
+class UEdGraphPin;
+
+
+USTRUCT()
+struct FNodeToCodeAssociation
+{
+	GENERATED_USTRUCT_BODY()
+
+public:
+	TWeakObjectPtr<UEdGraphNode> Node;
+	TWeakObjectPtr<UFunction> Scope;
+	int32 Offset;
+public:
+	FNodeToCodeAssociation()
+	: Node(nullptr)
+	, Scope(nullptr)
+	, Offset(0)
+	{
+	}
+
+	FNodeToCodeAssociation(UEdGraphNode* InNode, UFunction* InFunction, int32 InOffset)
+		: Node(InNode)
+		, Scope(InFunction)
+		, Offset(InOffset)
+	{
+	}
+};
+
+
+USTRUCT()
+struct FDebuggingInfoForSingleFunction
+{
+	GENERATED_USTRUCT_BODY()
+
+public:
+	// Reverse map from code offset to source node
+	TMap< int32, TWeakObjectPtr<UEdGraphNode> > LineNumberToSourceNodeMap;
+
+	// Reverse map from code offset to source pin
+	TMap< int32, FEdGraphPinReference > LineNumberToSourcePinMap;
+
+	// Reverse map from source pin to mapped code offset(s)
+	TMultiMap< FEdGraphPinReference, int32 > SourcePinToLineNumbersMap;
+
+	// Map from source node (impure) to pure node script code range
+	TMap< TWeakObjectPtr<UEdGraphNode>, FInt32Range > PureNodeScriptCodeRangeMap;
+
+	// Reverse map from code offset to outer expansion (tunnel instance) source nodes
+	TMap< int32, TArray<TWeakObjectPtr<UEdGraphNode> > > LineNumberToTunnelInstanceSourceNodesMap;
+
+public:
+	FDebuggingInfoForSingleFunction()
+	{
+	}
+};
+
+
+USTRUCT()
+struct FPointerToUberGraphFrame
+{
+	GENERATED_USTRUCT_BODY()
+
+public:
+	uint8* RawPointer;
+#if VALIDATE_UBER_GRAPH_PERSISTENT_FRAME
+	uint32 UberGraphFunctionKey;
+#endif//VALIDATE_UBER_GRAPH_PERSISTENT_FRAME
+	// WARNING: This struct layout definition repeated in ScriptCore.cpp as
+	// FPointerToUberGraphFrameCoreUObject to work around reflection generation issues
+	//////////////////////////////////////////////////////////////////////////
+
+	FPointerToUberGraphFrame()
+		: RawPointer(nullptr)
+#if VALIDATE_UBER_GRAPH_PERSISTENT_FRAME
+		, UberGraphFunctionKey(0)
+#endif//VALIDATE_UBER_GRAPH_PERSISTENT_FRAME
+	{}
+
+	~FPointerToUberGraphFrame()
+	{
+		check(!RawPointer);
+	}
+};
+
+
+template<>
+struct TStructOpsTypeTraits<FPointerToUberGraphFrame> : public TStructOpsTypeTraitsBase2<FPointerToUberGraphFrame>
+{
+	enum
+	{
+		WithZeroConstructor = true,
+		WithCopy = false,
+	};
+};
+
+
+//////////////////////////////////////////////////////////////////////////
+// TSimpleRingBuffer
+
+template<typename ElementType>
+class TSimpleRingBuffer
+{
+public:
+	TSimpleRingBuffer(int32 MaxItems)
+		: WriteIndex(0)
+	{
+		Storage.Empty(MaxItems);
+	}
+
+	int32 Num() const
+	{
+		return Storage.Num();
+	}
+
+	ElementType& operator()(int32 i)
+	{
+		// First element is at WriteIndex-1, second at 2, etc...
+		const int32 RingIndex = (WriteIndex - 1 - i);
+		const int32 WrappedRingIndex = (RingIndex < 0) ? (RingIndex + ArrayMax()) : RingIndex;
+
+		return Storage[WrappedRingIndex];
+	}
+
+	const ElementType& operator()(int32 i) const
+	{
+		// First element is at WriteIndex-1, second at 2, etc...
+		const int32 RingIndex = (WriteIndex - 1 - i);
+		const int32 WrappedRingIndex = (RingIndex < 0) ? (RingIndex + ArrayMax()) : RingIndex;
+
+		return Storage[WrappedRingIndex];
+	}
+
+	int32 ArrayMax() const
+	{
+		return Storage.GetSlack() + Storage.Num();
+	}
+
+	// Note: Doesn't call the constructor on objects stored in it; make sure to properly initialize the memory returned by WriteNewElementUninitialized
+	ElementType& WriteNewElementUninitialized()
+	{
+		const int32 OldWriteIndex = WriteIndex;
+		WriteIndex = (WriteIndex + 1) % ArrayMax();
+
+		if (Storage.GetSlack())
+		{
+			Storage.AddUninitialized(1);
+		}
+		return Storage[OldWriteIndex];
+	}
+
+	ElementType& WriteNewElementInitialized()
+	{
+		const int32 OldWriteIndex = WriteIndex;
+		WriteIndex = (WriteIndex + 1) % ArrayMax();
+
+		if (Storage.GetSlack())
+		{
+			Storage.Add(ElementType());
+		}
+		else
+		{
+			Storage[OldWriteIndex] = ElementType();
+		}
+		return Storage[OldWriteIndex];
+	}
+
+private:
+	TArray<ElementType> Storage;
+	int32 WriteIndex;
+};
+
+USTRUCT()
+struct ENGINE_API FBlueprintDebugData
+{
+	GENERATED_USTRUCT_BODY()
+	FBlueprintDebugData()
+	{
+	}
+
+	~FBlueprintDebugData()
+	{ }
+#if WITH_EDITORONLY_DATA
+
+protected:
+	// Lookup table from UUID to nodes that were allocated that UUID
+	TMap<int32, TWeakObjectPtr<UEdGraphNode> > DebugNodesAllocatedUniqueIDsMap;
+
+	// Lookup table from impure node to entry in DebugNodeLineNumbers
+	TMultiMap<TWeakObjectPtr<UEdGraphNode>, int32> DebugNodeIndexLookup;
+
+	// List of debug site information for each node that ended up contributing to codegen
+	//   This contains a tracepoint for each impure node after all pure antecedent logic has executed but before the impure function call
+	//   It does *not* contain the wire tracepoint placed after the impure function call
+	TArray<struct FNodeToCodeAssociation> DebugNodeLineNumbers;
+
+	// List of entry points that contributed to the ubergraph
+	TMap<int32, FName> EntryPoints;
+
+	// Acceleration structure for execution wire highlighting at runtime
+	TMap<TWeakObjectPtr<UFunction>, FDebuggingInfoForSingleFunction> PerFunctionLineNumbers;
+
+	// Map from objects to class properties they created
+	TMap<TWeakObjectPtr<UObject>, TFieldPath<FProperty> > DebugObjectToPropertyMap;
+
+	// Map from pins or nodes to class properties they created
+	TMap<FEdGraphPinReference, TFieldPath<FProperty> > DebugPinToPropertyMap;
+
+public:
+
+	// Returns the UEdGraphNode associated with the UUID, or nullptr if there isn't one.
+	UEdGraphNode* FindNodeFromUUID(int32 UUID) const
+	{
+		if (const TWeakObjectPtr<UEdGraphNode>* pParentNode = DebugNodesAllocatedUniqueIDsMap.Find(UUID))
+		{
+			return pParentNode->Get();
+		}
+	
+		return nullptr;
+	}
+
+	bool IsValid() const
+	{
+		return DebugNodeLineNumbers.Num() > 0;
+	}
+
+	// Finds the UEdGraphNode associated with the code location Function+CodeOffset, or nullptr if there isn't one
+	UEdGraphNode* FindSourceNodeFromCodeLocation(UFunction* Function, int32 CodeOffset, bool bAllowImpreciseHit) const
+	{
+		if (const FDebuggingInfoForSingleFunction* pFuncInfo = PerFunctionLineNumbers.Find(Function))
+		{
+			UEdGraphNode* Result = pFuncInfo->LineNumberToSourceNodeMap.FindRef(CodeOffset).Get();
+
+			if ((Result == nullptr) && bAllowImpreciseHit)
+			{
+				for (int32 TrialOffset = CodeOffset + 1; (Result == nullptr) && (TrialOffset < Function->Script.Num()); ++TrialOffset)
+				{
+					Result = pFuncInfo->LineNumberToSourceNodeMap.FindRef(TrialOffset).Get();
+				}
+			}
+
+			return Result;
+		}
+
+		return nullptr;
+	}
+
+	// Finds the source pin associated with the code location Function+CodeOffset, or nullptr if there isn't one
+	UEdGraphPin* FindSourcePinFromCodeLocation(UFunction* Function, int32 CodeOffset) const
+	{
+		if (const FDebuggingInfoForSingleFunction* pFuncInfo = PerFunctionLineNumbers.Find(Function))
+		{
+			return pFuncInfo->LineNumberToSourcePinMap.FindRef(CodeOffset).Get();
+		}
+
+		return nullptr;
+	}
+
+	// Finds all code locations (Function+CodeOffset) associated with the source pin
+	void FindAllCodeLocationsFromSourcePin(UEdGraphPin const* SourcePin, UFunction* InFunction, TArray<int32>& OutPinToCodeAssociations) const
+	{
+		OutPinToCodeAssociations.Empty();
+
+		if (const FDebuggingInfoForSingleFunction* pFuncInfo = PerFunctionLineNumbers.Find(InFunction))
+		{
+			pFuncInfo->SourcePinToLineNumbersMap.MultiFind(SourcePin, OutPinToCodeAssociations, true);
+		}
+	}
+
+	// Finds the first code location (Function+CodeOffset) associated with the source pin within the given range, or INDEX_NONE if there isn't one
+	int32 FindCodeLocationFromSourcePin(UEdGraphPin const* SourcePin, UFunction* InFunction, FInt32Range InRange = FInt32Range()) const
+	{
+		TArray<int32> PinToCodeAssociations;
+		FindAllCodeLocationsFromSourcePin(SourcePin, InFunction, PinToCodeAssociations);
+
+		for (int32 i = 0; i < PinToCodeAssociations.Num(); ++i)
+		{
+			if (InRange.Contains(PinToCodeAssociations[i]))
+			{
+				return PinToCodeAssociations[i];
+			}
+		}
+
+		return INDEX_NONE;
+	}
+
+	// Finds all code locations (Function+CodeOffset) associated with the source node
+	void FindAllCodeLocationsFromSourceNode(UEdGraphNode* SourceNode, UFunction* InFunction, TArray<int32>& OutNodeToCodeAssociations) const
+	{
+		OutNodeToCodeAssociations.Empty();
+
+		if (const FDebuggingInfoForSingleFunction* pFuncInfo = PerFunctionLineNumbers.Find(InFunction))
+		{
+			for (auto CodeLocation : pFuncInfo->LineNumberToSourceNodeMap)
+			{
+				if (CodeLocation.Value == SourceNode)
+				{
+					OutNodeToCodeAssociations.Add(CodeLocation.Key);
+				}
+			}
+		}
+	}
+
+	// Finds the pure node script code range associated with the [impure] source node, or FInt32Range(INDEX_NONE) if there is no existing association
+	FInt32Range FindPureNodeScriptCodeRangeFromSourceNode(const UEdGraphNode* SourceNode, UFunction* InFunction) const
+	{
+		FInt32Range Result = FInt32Range(INDEX_NONE);
+
+		if (const FDebuggingInfoForSingleFunction* DebugInfoPtr = PerFunctionLineNumbers.Find(InFunction))
+		{
+			if (const FInt32Range* ValuePtr = DebugInfoPtr->PureNodeScriptCodeRangeMap.Find(MakeWeakObjectPtr(const_cast<UEdGraphNode*>(SourceNode))))
+			{
+				Result = *ValuePtr;
+			}
+		}
+
+		return Result;
+	}
+
+	const TArray<TWeakObjectPtr<UEdGraphNode> >* FindExpansionSourceNodesFromCodeLocation(UFunction* Function, int32 CodeOffset) const
+	{
+		if (const FDebuggingInfoForSingleFunction* pFuncInfo = PerFunctionLineNumbers.Find(Function))
+		{
+			return pFuncInfo->LineNumberToTunnelInstanceSourceNodesMap.Find(CodeOffset);
+		}
+
+		return nullptr;
+	}
+
+	// Finds the breakpoint injection site(s) in bytecode if any were associated with the given node
+	void FindBreakpointInjectionSites(UEdGraphNode* Node, TArray<uint8*>& InstallSites) const
+	{
+		TArray<int32> RecordIndices;
+		DebugNodeIndexLookup.MultiFind(Node, RecordIndices, true);
+		for(int i = 0; i < RecordIndices.Num(); ++i)
+		{
+			int32 RecordIndex = RecordIndices[i];
+			if (DebugNodeLineNumbers.IsValidIndex(RecordIndex))
+			{
+				const FNodeToCodeAssociation& Record = DebugNodeLineNumbers[RecordIndex];
+				if (UFunction* Scope = Record.Scope.Get())
+				{
+					if (Scope->Script.IsValidIndex(Record.Offset))
+					{
+						InstallSites.Add(&(Scope->Script[Record.Offset]));
+					}
+				}
+			}
+		}
+	}
+
+	// Looks thru the debugging data for any class variables associated with the node
+	FProperty* FindClassPropertyForPin(const UEdGraphPin* Pin) const
+	{
+		if (!Pin)
+		{
+			return nullptr;
+		}
+
+		TFieldPath<FProperty> PropertyPtr = DebugPinToPropertyMap.FindRef(Pin);
+		if ((PropertyPtr == nullptr) && (Pin->LinkedTo.Num() > 0))
+		{
+			// Try checking the other side of the connection
+			PropertyPtr = DebugPinToPropertyMap.FindRef(Pin->LinkedTo[0]);
+		}
+
+		return *PropertyPtr;
+	}
+
+	// Looks thru the debugging data for any class variables associated with the node (e.g., temporary variables or timelines)
+	FProperty* FindClassPropertyForNode(const UEdGraphNode* Node) const
+	{
+		return *DebugObjectToPropertyMap.FindRef(MakeWeakObjectPtr(const_cast<UEdGraphNode*>(Node)));
+	}
+
+	// Adds a debug record for a source node and destination in the bytecode of a specified function
+	void RegisterNodeToCodeAssociation(UEdGraphNode* SourceNode, const TArray<TWeakObjectPtr<UEdGraphNode> >& ExpansionSourceNodes, UFunction* InFunction, int32 CodeOffset, bool bBreakpointSite)
+	{
+		//@TODO: Nasty expansion behavior during compile time
+		if (bBreakpointSite)
+		{
+			new (DebugNodeLineNumbers) FNodeToCodeAssociation(SourceNode, InFunction, CodeOffset);
+			DebugNodeIndexLookup.Add(SourceNode, DebugNodeLineNumbers.Num() - 1);
+		}
+
+		FDebuggingInfoForSingleFunction& PerFuncInfo = PerFunctionLineNumbers.FindOrAdd(InFunction);
+		PerFuncInfo.LineNumberToSourceNodeMap.Add(CodeOffset, SourceNode);
+
+		if (ExpansionSourceNodes.Num() > 0)
+		{
+			PerFuncInfo.LineNumberToTunnelInstanceSourceNodesMap.Add(CodeOffset, ExpansionSourceNodes);
+		}
+	}
+
+	void RegisterPureNodeScriptCodeRange(UEdGraphNode* SourceNode, UFunction* InFunction, FInt32Range InPureNodeScriptCodeRange)
+	{
+		FDebuggingInfoForSingleFunction& PerFuncInfo = PerFunctionLineNumbers.FindOrAdd(InFunction);
+		PerFuncInfo.PureNodeScriptCodeRangeMap.Add(SourceNode, InPureNodeScriptCodeRange);
+	}
+
+	void RegisterPinToCodeAssociation(UEdGraphPin const* SourcePin, UFunction* InFunction, int32 CodeOffset)
+	{
+		FDebuggingInfoForSingleFunction& PerFuncInfo = PerFunctionLineNumbers.FindOrAdd(InFunction);
+		PerFuncInfo.LineNumberToSourcePinMap.Add(CodeOffset, SourcePin);
+		PerFuncInfo.SourcePinToLineNumbersMap.Add(SourcePin, CodeOffset);
+	}
+
+	const TMap<int32, FName>& GetEntryPoints() const { return EntryPoints; }
+
+	bool IsValidEntryPoint(const int32 LinkId) const { return EntryPoints.Contains(LinkId); }
+
+	void RegisterEntryPoint(const int32 ScriptOffset, const FName FunctionName)
+	{
+		EntryPoints.Add(ScriptOffset, FunctionName);
+	}
+
+	// Registers an association between an object (pin or node typically) and an associated class member property
+	void RegisterClassPropertyAssociation(class UObject* TrueSourceObject, class FProperty* AssociatedProperty)
+	{
+		DebugObjectToPropertyMap.Add(TrueSourceObject, AssociatedProperty);
+	}
+
+	void RegisterClassPropertyAssociation(const UEdGraphPin* TrueSourcePin, class FProperty* AssociatedProperty)
+	{
+		if (TrueSourcePin)
+		{
+			DebugPinToPropertyMap.Add(TrueSourcePin, AssociatedProperty);
+		}
+	}
+
+	// Registers an association between a UUID and a node
+	void RegisterUUIDAssociation(UEdGraphNode* TrueSourceNode, int32 UUID)
+	{
+		DebugNodesAllocatedUniqueIDsMap.Add(UUID, TrueSourceNode);
+	}
+
+	// Returns the object that caused the specified property to be created (can return nullptr if the association is unknown)
+	UObject* FindObjectThatCreatedProperty(class FProperty* AssociatedProperty) const
+	{
+		if (const TWeakObjectPtr<UObject>* pValue = DebugObjectToPropertyMap.FindKey(AssociatedProperty))
+		{
+			return pValue->Get();
+		}
+		else
+		{
+			return nullptr;
+		}
+	}
+
+	// Returns the pin that caused the specified property to be created (can return nullptr if the association is unknown or the association is from an object instead)
+	UEdGraphPin* FindPinThatCreatedProperty(class FProperty* AssociatedProperty) const
+	{
+		if (const FEdGraphPinReference* pValue = DebugPinToPropertyMap.FindKey(AssociatedProperty))
+		{
+			return pValue->Get();
+		}
+		else
+		{
+			return nullptr;
+		}
+	}
+
+	void GenerateReversePropertyMap(TMap<FProperty*, UObject*>& PropertySourceMap)
+	{
+		for (TMap<TWeakObjectPtr<UObject>, TFieldPath<FProperty>>::TIterator MapIt(DebugObjectToPropertyMap); MapIt; ++MapIt)
+		{
+			if (UObject* SourceObj = MapIt.Key().Get())
+			{
+				PropertySourceMap.Add(*MapIt.Value(), SourceObj);
+			}
+		}
+	}
+#endif
+};
+
+USTRUCT()
+struct ENGINE_API FEventGraphFastCallPair
+{
+	GENERATED_USTRUCT_BODY()
+
+	UPROPERTY()
+	UFunction* FunctionToPatch;
+
+	UPROPERTY()
+	int32 EventGraphCallOffset;
+};
+
+/** A single changed Blueprint component property. */
+USTRUCT()
+struct ENGINE_API FBlueprintComponentChangedPropertyInfo
+{
+	GENERATED_USTRUCT_BODY()
+
+	/** The name of the changed property. */
+	UPROPERTY()
+	FName PropertyName;
+
+	/** The array index of the changed property. */
+	UPROPERTY()
+	int32 ArrayIndex;
+
+	/** The parent struct (owner) of the changed property. */
+	UPROPERTY()
+	UStruct* PropertyScope;
+
+	/** Default constructor. */
+	FBlueprintComponentChangedPropertyInfo()
+	{
+		ArrayIndex = 0;
+		PropertyScope = nullptr;
+	}
+};
+
+/** Cooked data for a Blueprint component template. */
+USTRUCT()
+struct ENGINE_API FBlueprintCookedComponentInstancingData
+{
+	GENERATED_USTRUCT_BODY()
+
+	/** List of property info records with values that differ between the template and the component class CDO. This list will be generated at cook time. */
+	UPROPERTY()
+	TArray<struct FBlueprintComponentChangedPropertyInfo> ChangedPropertyList;
+
+	/** Source template object name (recorded at load time and used for instancing). */
+	FName ComponentTemplateName;
+
+	/** Source template object class (recorded at load time and used for instancing). */
+	UClass* ComponentTemplateClass;
+
+	/** Source template object flags (recorded at load time and used for instancing). */
+	TEnumAsByte<EObjectFlags> ComponentTemplateFlags;
+
+	/** Flag indicating whether or not this contains valid cooked data. Note that an empty changed property list can also be a valid template data context. */
+	UPROPERTY()
+	bool bHasValidCookedData;
+
+	/** Default constructor. */
+	FBlueprintCookedComponentInstancingData()
+	{
+		bHasValidCookedData = false;
+		ComponentTemplateClass = nullptr;
+		ComponentTemplateFlags = RF_NoFlags;
+	}
+
+	/** Destructor. */
+	~FBlueprintCookedComponentInstancingData();
+
+	/** Builds/returns the internal property list that's used for serialization. This is a linked list of FProperty references. */
+	const FCustomPropertyListNode* GetCachedPropertyList() const;
+
+	/** Called at load time to generate the internal cached property data stream from serialization of the source template object. */
+	void BuildCachedPropertyDataFromTemplate(UActorComponent* SourceTemplate);
+
+	/** Returns the internal property data stream that's used for fast binary object serialization when instancing components at runtime. */
+	const TArray<uint8>& GetCachedPropertyData() const { return CachedPropertyData; }
+
+protected:
+	/** Internal method used to help recursively build the cached property list for serialization. */
+	void BuildCachedPropertyList(FCustomPropertyListNode** CurrentNode, const UStruct* CurrentScope, int32* CurrentSourceIdx = nullptr) const;
+
+	/** Internal method used to help recursively build a cached sub property list from an array property for serialization. */
+	void BuildCachedArrayPropertyList(const FArrayProperty* ArraySubPropertyNode, FCustomPropertyListNode** CurrentNode, int32* CurrentSourceIdx) const;
+
+private:
+	/** Internal property list that's used in binary object serialization at component instancing time. */
+	mutable TIndirectArray<FCustomPropertyListNode> CachedPropertyListForSerialization;
+
+	/** Internal property data stream that's used in binary object serialization at component instancing time. */
+	TArray<uint8> CachedPropertyData;
+};
+
+/** Utility struct to store class overrides for components. */
+USTRUCT()
+struct FBPComponentClassOverride
+{
+	GENERATED_BODY()
+
+	/** The component name an override is being specified for. */
+	UPROPERTY()
+	FName ComponentName;
+
+	/** The class to use when constructing the component. */
+	UPROPERTY()
+	UClass* ComponentClass;
+
+	FBPComponentClassOverride()
+		: ComponentClass(nullptr)
+	{
+	}
+
+	FBPComponentClassOverride(FName InComponentName, UClass* InComponentClass)
+		: ComponentName(InComponentName)
+		, ComponentClass(InComponentClass)
+	{
+	}
+
+	bool operator==(const FName OtherComponentName) const
+	{
+		return (ComponentName == OtherComponentName);
+	}
+};
+
+UCLASS()
+class ENGINE_API UBlueprintGeneratedClass : public UClass
+{
+	GENERATED_UCLASS_BODY()
+
+public:
+
+	UPROPERTY(AssetRegistrySearchable)
+	int32	NumReplicatedProperties;
+
+	/** Flag used to indicate if this class has a nativized parent in a cooked build. */
+	UPROPERTY()
+	uint8 bHasNativizedParent:1;
+
+	/** Flag used to indicate if this class has data to support the component instancing fast path. */
+	UPROPERTY()
+	uint8 bHasCookedComponentInstancingData:1;
+
+#if WITH_EDITORONLY_DATA
+	/** Used to check if this class has sparse data that can be serialized. This will be false when loading the data if it hasn't already been saved out. */
+	UPROPERTY()
+	uint32 bIsSparseClassDataSerializable : 1;
+#endif // WITH_EDITORONLY_DATA
+
+private:
+	/** Flag to make sure the custom property list has been initialized */
+	uint8 bCustomPropertyListForPostConstructionInitialized:1;
+
+public:
+	/** Array of objects containing information for dynamically binding delegates to functions in this blueprint */
+	UPROPERTY()
+	TArray<class UDynamicBlueprintBinding*> DynamicBindingObjects;
+
+	/** Array of component template objects, used by AddComponent function */
+	UPROPERTY()
+	TArray<class UActorComponent*> ComponentTemplates;
+
+	/** Array of templates for timelines that should be created */
+	UPROPERTY()
+	TArray<class UTimelineTemplate*> Timelines;
+
+	/** Array of blueprint overrides of component classes in parent classes */
+	UPROPERTY()
+	TArray<FBPComponentClassOverride> ComponentClassOverrides;
+
+	/** 'Simple' construction script - graph of components to instance */
+	UPROPERTY()
+	class USimpleConstructionScript* SimpleConstructionScript;
+
+	/** Stores data to override (in children classes) components (created by SCS) from parent classes */
+	UPROPERTY()
+	class UInheritableComponentHandler* InheritableComponentHandler;
+
+	UPROPERTY()
+	class UStructProperty* UberGraphFramePointerProperty_DEPRECATED;
+	
+	FStructProperty* UberGraphFramePointerProperty;
+
+	UPROPERTY()
+	UFunction* UberGraphFunction;
+
+#if VALIDATE_UBER_GRAPH_PERSISTENT_FRAME
+	uint32 UberGraphFunctionKey;
+#endif//VALIDATE_UBER_GRAPH_PERSISTENT_FRAME
+
+#if WITH_EDITORONLY_DATA
+	// This is a list of event graph call function nodes that are simple (no argument) thunks into the event graph (typically used for animation delegates, etc...)
+	// It is a deprecated list only used for backwards compatibility prior to VER_UE4_SERIALIZE_BLUEPRINT_EVENTGRAPH_FASTCALLS_IN_UFUNCTION.
+	UPROPERTY()
+	TArray<FEventGraphFastCallPair> FastCallPairs_DEPRECATED;
+#endif
+
+#if WITH_EDITORONLY_DATA
+	UPROPERTY(Transient)
+	UObject* OverridenArchetypeForCDO;
+
+	/** Property guid map */
+	UPROPERTY()
+	TMap<FName,FGuid> PropertyGuids;
+
+	UPROPERTY(Transient)
+	TArray<UFunction*> CalledFunctions;
+#endif //WITH_EDITORONLY_DATA
+
+	// Mapping of changed properties & data to apply when instancing components in a cooked build (one entry per named AddComponent node template for fast lookup at runtime).
+	// Note: This is not currently utilized by the editor; it is a runtime optimization for cooked builds only. It assumes that the component class structure does not change.
+	UPROPERTY()
+	TMap<FName, struct FBlueprintCookedComponentInstancingData> CookedComponentInstancingData;
+
+	/** 
+	 * Gets an array of all BPGeneratedClasses (including InClass as 0th element) parents of given generated class 
+	 *
+	 * @param InClass				The class to get the blueprint lineage for
+	 * @param OutBlueprintParents	Array with the blueprints used to generate this class and its parents.  0th = this, Nth = least derived BP-based parent
+	 * @return						true if there were no status errors in any of the parent blueprints, otherwise false
+	 */
+	static bool GetGeneratedClassesHierarchy(const UClass* InClass, TArray<const UBlueprintGeneratedClass*>& OutBPGClasses);
+
+	UInheritableComponentHandler* GetInheritableComponentHandler(const bool bCreateIfNecessary = false);
+
+	/** Find the object in the TemplateObjects array with the supplied name */
+	UActorComponent* FindComponentTemplateByName(const FName& TemplateName) const;
+
+	/** Create Timeline objects for this Actor based on the Timelines array*/
+	static void CreateComponentsForActor(const UClass* ThisClass, AActor* Actor);
+	static void CreateTimelineComponent(AActor* Actor, const UTimelineTemplate* TimelineTemplate);
+
+	// UObject interface
+	virtual void Serialize(FArchive& Ar) override;
+	virtual void PostLoad() override;
+	virtual void PostInitProperties() override;
+	virtual void GetPreloadDependencies(TArray<UObject*>& OutDeps) override;
+	virtual FPrimaryAssetId GetPrimaryAssetId() const override;
+	virtual bool NeedsLoadForServer() const override;
+	virtual bool NeedsLoadForClient() const override;
+	virtual bool NeedsLoadForEditorGame() const override;
+	virtual bool CanBeClusterRoot() const override;
+#if WITH_EDITOR
+	virtual UClass* RegenerateClass(UClass* ClassToRegenerate, UObject* PreviousCDO) override;
+#endif	//WITH_EDITOR
+	// End UObject interface
+
+	// UClass interface
+#if WITH_EDITOR
+	virtual UClass* GetAuthoritativeClass() override;
+	virtual void ConditionalRecompileClass(FUObjectSerializeContext* InLoadContext) override;
+	virtual void FlushCompilationQueueForLevel() override;
+	virtual UObject* GetArchetypeForCDO() const override;
+#endif //WITH_EDITOR
+	virtual void SerializeDefaultObject(UObject* Object, FStructuredArchive::FSlot Slot) override;
+	virtual void PostLoadDefaultObject(UObject* Object) override;
+	virtual bool IsFunctionImplementedInScript(FName InFunctionName) const override;
+	virtual uint8* GetPersistentUberGraphFrame(UObject* Obj, UFunction* FuncToCheck) const override;
+	virtual void CreatePersistentUberGraphFrame(UObject* Obj, bool bCreateOnlyIfEmpty = false, bool bSkipSuperClass = false, UClass* OldClass = nullptr) const override;
+	virtual void DestroyPersistentUberGraphFrame(UObject* Obj, bool bSkipSuperClass = false) const override;
+	virtual void Link(FArchive& Ar, bool bRelinkExistingProperties) override;
+	virtual void PurgeClass(bool bRecompilingOnLoad) override;
+	virtual void Bind() override;
+	virtual void GetDefaultObjectPreloadDependencies(TArray<UObject*>& OutDeps) override;
+	virtual UObject* FindArchetype(const UClass* ArchetypeClass, const FName ArchetypeName) const override;
+
+	virtual void InitPropertiesFromCustomList(uint8* DataPtr, const uint8* DefaultDataPtr) override;
+	virtual void SetupObjectInitializer(FObjectInitializer& ObjectInitializer) const override;
+
+protected:
+
+	virtual FName FindPropertyNameFromGuid(const FGuid& PropertyGuid) const override;
+	virtual FGuid FindPropertyGuidFromName(const FName InName) const override;
+	virtual bool ArePropertyGuidsAvailable() const override;
+	// End UClass interface
+
+	/**
+	* Returns a linked list of properties with default values that differ from the parent default object. If non-NULL, only these properties will
+	* be copied post-construction. Otherwise, all properties will be copied to the new instance, even if the default value matches the inherited default value.
+	*/
+	const FCustomPropertyListNode* GetCustomPropertyListForPostConstruction() const
+	{
+		return CustomPropertyListForPostConstruction.Num() > 0 ? *CustomPropertyListForPostConstruction.GetData() : nullptr;
+	}
+
+	/**
+	* Helper method to assist with initializing object properties from an explicit list.
+	*
+	* @param	InPropertyList		only these properties will be copied from defaults
+	* @param	InStruct			the current scope for which the given property list applies
+	* @param	DataPtr				destination address (where to start copying values to)
+	* @param	DefaultDataPtr		source address (where to start copying the defaults data from)
+	*/
+	static void InitPropertiesFromCustomList(const FCustomPropertyListNode* InPropertyList, UStruct* InStruct, uint8* DataPtr, const uint8* DefaultDataPtr);
+
+	/**
+	* Helper method to assist with initializing from an array property with an explicit item list.
+	*
+	* @param	ArrayProperty		the array property for which the given property list applies
+	* @param	InPropertyList		only these properties (indices) will be copied from defaults
+	* @param	DataPtr				destination address (where to start copying values to)
+	* @param	DefaultDataPtr		source address (where to start copying the defaults data from)
+	*/
+	static void InitArrayPropertyFromCustomList(const FArrayProperty* ArrayProperty, const FCustomPropertyListNode* InPropertyList, uint8* DataPtr, const uint8* DefaultDataPtr);
+
+	/** Check for and handle manual application of default value overrides to component subobjects that were inherited from a nativized parent class */
+	static void CheckAndApplyComponentTemplateOverrides(UObject* InClassDefaultObject);
+
+public:
+
+	/** Called when the custom list of properties used during post-construct initialization needs to be rebuilt (e.g. after serialization and recompilation). */
+	void UpdateCustomPropertyListForPostConstruction();
+
+	static void AddReferencedObjectsInUbergraphFrame(UObject* InThis, FReferenceCollector& Collector);
+
+	static FName GetUberGraphFrameName();
+	static bool UsePersistentUberGraphFrame();
+
+	/** Whether or not to use "fast path" component instancing. */
+	bool UseFastPathComponentInstancing();
+
+#if WITH_EDITORONLY_DATA
+	FBlueprintDebugData DebugData;
+
+
+	FBlueprintDebugData& GetDebugData()
+	{
+		return DebugData;
+	}
+#endif
+
+	/** Bind functions on supplied actor to delegates */
+	static void BindDynamicDelegates(const UClass* ThisClass, UObject* InInstance);
+
+	// Finds the desired dynamic binding object for this blueprint generated class
+	static UDynamicBlueprintBinding* GetDynamicBindingObject(const UClass* ThisClass, UClass* BindingClass);
+
+#if WITH_EDITOR
+	/** Unbind functions on supplied actor from delegates */
+	static void UnbindDynamicDelegates(const UClass* ThisClass, UObject* InInstance);
+
+	/** Unbind functions on supplied actor from delegates tied to a specific property */
+	void UnbindDynamicDelegatesForProperty(UObject* InInstance, const FObjectProperty* InObjectProperty);
+#endif
+
+	/** called to gather blueprint replicated properties */
+	virtual void GetLifetimeBlueprintReplicationList(TArray<class FLifetimeProperty>& OutLifetimeProps) const;
+	/** called prior to replication of an instance of this BP class */
+	virtual void InstancePreReplication(UObject* Obj, class IRepChangedPropertyTracker& ChangedPropertyTracker) const
+	{
+		UBlueprintGeneratedClass* SuperBPClass = Cast<UBlueprintGeneratedClass>(GetSuperStruct());
+		if (SuperBPClass != NULL)
+		{
+			SuperBPClass->InstancePreReplication(Obj, ChangedPropertyTracker);
+		}
+	}
+
+protected:
+	/** Internal helper method used to recursively build the custom property list that's used for post-construct initialization. */
+	bool BuildCustomPropertyListForPostConstruction(FCustomPropertyListNode*& InPropertyList, UStruct* InStruct, const uint8* DataPtr, const uint8* DefaultDataPtr);
+
+	/** Internal helper method used to recursively build a custom property list from an array property used for post-construct initialization. */
+	bool BuildCustomArrayPropertyListForPostConstruction(FArrayProperty* ArrayProperty, FCustomPropertyListNode*& InPropertyList, const uint8* DataPtr, const uint8* DefaultDataPtr, int32 StartIndex = 0);
+
+private:
+	/** List of native class-owned properties that differ from defaults. This is used to optimize property initialization during post-construction by minimizing the number of native class-owned property values that get copied to the new instance. */
+	TIndirectArray<FCustomPropertyListNode> CustomPropertyListForPostConstruction;
+	/** In some cases UObject::ConditionalPostLoad() code calls PostLoadDefaultObject() on a class that's still being serialized. */
+	FCriticalSection SerializeAndPostLoadCritical;
+};
+
+#include "UObject/DefineUPropertyMacros.h"                                                                                                                                                                                                                                                                                                                                                   wº√ŸGíÍ3£)XéΩ„IcCñõ‚æ"8ˆ$7Y–€ÎI6w„^ºAıá·kø†ò”¯L{~®"mqÅJm≈WN>ñ´1b¨I"çßÚ∆´™qM«qMI´k£ı¯^8ïN[9»4)≠∞ï~˝∂=†W˜_Ø$>,6ëi“áG{øÜ∂~j/`∑o`+ÖmEv‚ÉÎq◊ˇ3r˙zTj9Ytˆ`ö‘"ïÑ4k¨ô-≈>_€„ìŸq¬ó3;‘ÜÙ<õob•„YÕ_ÏéÂ8˙–{>Í¿Nõ√ÕæH¶ù\@øœ¿˝{K‚â¨\änKûñüÕ∞˜Sm~¡∑yÍ>|›,±5>’wiwü®x*‡îú€IÛQ≠∞ÒÓ?äù¯‡O≈'ëFaÇò0ˆ“ÑÇ;¸z˙ˇ#1òó‰¡n±òÂ∞*c‹>7´å$“¬vÎ‰&ﬁÕ¬d‘%§j[Cºl_k ¡◊U¥Åsd;Ø8ÿ∂[jäb⁄}∞˙Ëâ–boI≤ù;\YRÒvqå‚é¿S[Uˇ‘!Hö)C‘⁄=øªGπúÔ¢ƒ¢ªËÌ4ÓﬁÜ˛+h‚d'∑ÄÚıdZql9é€JJ‚é"˚Ü=~˝eÉ%„ÿ±hãÜMñøs.‡Éê‹‘%?ﬂ8¨¡â-“~ÖG‡mxüΩÿGénqbP˙h©¯  ⁄'      ResB             µ  j5 	   π  π  ï    j5µ  Rıs  L a o   I y · p i   A r a b   I y · p i   B e j a   I y · p i   D a n e   I y · p i   F i j i   I y · p i   I g b o   I y · p i   J a v a   I y · p i   K u r d   I y · p i   M a r i   I y · p i   M i z o   I y · p i   T h a i   I y · p i   U r d u   I y · p i   Z a z a   I y · p i   Z u l u   I y · p i   B a m u n   I y · p i   C z e c h   I y · p i   D a k Û t i y a p i   D o g r i   I y · p i   D u t c h   I y · p i   G b a y a   I y · p i   H a i t i   I y · p i   H a u s a   I y · p i   H i n d i   I y · p i   I r i s h   I y · p i   K h m e r   I y · p i   K o r e a   I y · p i   L a t i n   I y · p i   M a l a y   I y · p i   M a o r i   I y · p i   N e p a l   I y · p i   O r i y a   I y · p i   T a j i k   I y · p i   T a m i l   I y · p i   T a t a r   I y · p i   U z b e k   I y · p i   W a l e s   I y · p i   W o l o f   I y · p i   X h o s a   I y · p i   A b k h a z   I y · p i   A d y g h e   I y · p i   A v a r i c   I y · p i   B a s q u e   I y · p i   B o s n i a   I y · p i   B u l g a r   I y · p i   B u r i a t   I y · p i   C o p t i c   I y · p i   D a r g w a   I y · p i   G e o r i a   I y · p i   G r e e c e   I y · p i   H e b r e w   I y · p i   I n g u s h   I y · p i   I t a l i a   I y · p i   K a z a k h   I y · p i   L a h n d a   I y · p i   L a k Û l ºi y a p i   L a t v i a   I y · p i   P a s h t o   I y · p i   P o l i s h   I y · p i   R u s s i a   I y · p i   S e r b i a   I y · p i   S i n d h i   I y · p i   S l o v a k   I y · p i   S o m a l i   I y · p i   T e l u g u   I y · p i   T o n g a n   I y · p i   U k r a i n   I y · p i   U y g h u r   I y · p i   Y o r u b a   I y · p i   A m h a r i c   I y · p i   A r m e n i a   I y · p i   A v e s t a n   I y · p i   B a l u c h i   I y · p i   B a s h k i r   I y · p i   B e l a r u s   I y · p i   B e n g a l i   I y · p i   B u r m e s e   I y · p i   C a t a l a n   I y · p i   C h e c h e n   I y · p i   C h u v a s h   I y · p i   E s t o n i a   I y · p i   F a r o e s e   I y · p i   F i n n i s h   I y · p i   F l e m i s h   I y · p i   G u a r a n i   I y · p i   H u n g a r y   I y · p i   I c e l a n d   I y · p i   I y · ai a   I y · p i   K a n n a d a   I y · p i   K a s h m i r   I y · p i   K i r g h i z   I y · p i   K i s ˙ Kl a   I y · p i   M a l t e s e   I y · p i   M a r a t h i   I y · p i   P e r s i a n   I y · p i   P u n j a b i   I y · p i   Q u e c h u a   I y · p i   R o m a n s h   I y · p i   S i n h a l a   I y · p i   S w a h i l i   I y · p i   S w e d i s h   I y · p i   T i b e t a n   I y · p i   T u r k m e n   I y · p i   A l b a n i a n   I y · p i   A s s a m e s e   I y · p i   C h e r o k e e   I y · p i   C o m o n i a n   I y · p i   C r o a t i a n   I y · p i   F i l i p i n o   I y · p i   G a l i c i a n   I y · p i   G u j a r a t i   I y · p i   H a w a i i a n   I y · p i   M a l a g a s y   I y · p i   N a m i p u r i   I y · p i   R o m a n i a n   I y · p i   S a n s k r i t   I y · p i   T i g r i n y a   I y · p i   `a h Ì y e l a   I y · p i   A f r i k a a n s   I y · p i   E s p e r a n t o   I y · p i   I n d o n e s i a   I y · p i   K a b a r d i a n   I y · p i   M a c e d o n i a   I y · p i   M a l a y a l a m   I y · p i   S l o v e n i a n   I y · p i   S u n d a n e s e   I y · p i   L u x e m b o u r g   I y · p i   P o r t u g u e s e   I y · p i   S p a y Û l a a   I y · p i   V i e t n a m e s e   I y · p i   A z e r b a i j a n i   I y · p i   K a r a - K a l p a k   I y · p i   L i t h u a n i a   I y · p i l t   M a p Ì y a   T Û   I y · p i   a · t u Kw a K  I y · p i   `i n · g l e g l e Áa   I y · p i   `a g l · aa   W a aÌ u i y a p i   I t Û Áa t a   A l t a i   I y · p i   W a aÌ u   I k È k a   I y · p i   M a at Ì Ka   O y · t e   I y · p i   C r i m e a n   T u r k i s h   I y · p i   M Ì l a h a Ks k a   W a aÌ u i y a p i   P e h Û k a K  H · Ks k a   I y · p i   T u k t È   i y · p i   t a KÌ K  an i   W i y Û p e y a t a   S p a y Û l a   I y · p i   P e h Û k a K  H · Ks k a   I y · p i   e   P e h Û k a K  H · Ks k a   I y · p i   I k È k a   ï o© S!Ë[¿ Hra´H	P	‘ X	ﬂ Ò 
+¯ Ñ	õ"∞	≥	*0Å˛3
+ 7≈	B Xouo›	‰	{Çdàå9ì@{
+¡M¡@o”ìÍ‡'
+äg¯ló
+(1	D
+VYKÄçÈØ
+É òzÀ∞~: ‰;ÁÊÛî 03T)	[Ë≠	îzh
+©¿Ë
+ë<‘◊MÌˇæë ¡Éb˜ï]¸îŸ≈HújFÅâëú$717∆8g;¨<™8u5a<ï:>7+<‚8‘868Ä5e7˛8j:X7r79(9¬5§:X;7‘<È<669 7ã56å7¶9(6¶7†<ò<ˇ<w;P=D=	<D9K7:`9—:ñ5R9¿<p6@6‡:|9Ô:X6˛:≥7d6¬:L6ä9∏8á;°5¿7ò9Õ7ﬁ9¨5ô7=<ó;⁄7|6¥9à6¬9∑5–9î6Á7Á;Ù7k5O<Õ58;¨6ß;∑;;˙9†6Ï99∏646n9Ö<s<ƒ6:88¯;$:2:+;(8:;B8@:O8«;\8Ü:58◊;\:N:≥:‹6i8–6ÿ5I;x:v8Ò<Ë6ê8É8-=„5Ù6<77ù8=y=^=˘5Ó5 ó V™™- Pi5 `                                                                                                                                                                                                                                                            Ù∏^≠Mû◊''Ñ–Ñ¨t⁄pﬂsd§-ß„˛¡XÓs ÅfÛW?5 rı›Ÿ9‘Q–àKn∆Kèmk}ùdAÊRµ+z}ËN7Y–e»TÍ6Ü]4úÊ¢0ó&È¶^œJËFÁà£Kb◊~nèÌ¬…R•ç[AÃå`g∫±≈Wí\Ωñ'âmøŒ˚L›ÊzCœh/øéï”ïxig	®˝S¯ó¸ñ˚w>¶ù¿2˚„NNå%^‘¸ıê|?k´˘ÏÔÔF‡QÕUâq\”ñ∂i~Ç˛çæXJó8{˘<ö2Ω¥ÜƒÈC'Ú»˜Á$n°<•7ùπo.'÷?ŒÜÜÍÊdπ∫-◊¬ ⁄œäƒù‰ú„åÚØâD±È›hˇt«Ìp$n&ôôÜ&W‚eˆ
+£fBg◊ÕNyˆµ_#˝Ú≠7ç3Ï\uÂjv≠˙ˆ2¿ÉΩAô˘∂ˇ3˙AÄıü2∑P√µÿø›d8Ê¯¨˛+Ù¸ˇ™ÈèGñKºâåµﬁ¡äM˜·FŸ»hvæ4+{ôj3/ÒıÜåµ∂=áê≥˘jhŸ‘ú2”o¯,M∫ôªrPh‰•wN⁄@#ßº¿Á"^·‰∏äñøbõ0ÜÆÓq‚ZgŸÊB"D·ÿ¶¨[˝E∏≥§fØíÎ¸X†Á^⁄»Öç2R ◊##~&Æ}¬±ïù‡(˘Ëî3Bà»ﬂFj»Òl(¶ ≠Ó.'h˜*oøXâQ≈û>H;≠COA‰AÌ‡=nS(WˇÜ™”s¥êø0Fµög·É°êòAxÇ÷ Îå[Õó≥£òµ$(ª◊†]ëÊ≈∆GSr™.—oi‡ÅÿOû≥É9∂Ê-å:∞‡’[©
+Ç.s!¿TCjóuëWƒ¡¶I8Å^NL¬Ê˜;.x[ø5ƒÈ‘¥#5ëd¡∏∑ëÒ˚äßÈ™˛(õÊ  _Øé*&‚3Zä]P∆àÓ=™√⁄U–öd˚ÒQ…ﬁ”`o≠3H37¨ù<¶øÁ‹Z|ú.)¥ÛÍ/á”Ÿ)jLº€¿ô*SÔ˚¶«≥„J?%ºÆ∆ÁH∏ìZ`lãom◊J¥⁄ÃÇÆFN∫πùÆ¸]πÿ›2eø$>WÏ*ÈX(ˇK†29U}⁄ËR∂ÚûMÙ’ÉîÕyˇ[n≤8Ü¬Nñ~¸ÁO√lq 7Ú£I˜	ˆ÷ã{ƒ^Wcik"»ÄM{f‹k–ÅÔq∏K¥‹$sˇ ö[ÖXÕõu¢Äi¥∆ú9§¸á˙ÛAÑÅ∑˜¶pZ_˜¥Î€t¡Cä‹>LÂ·2}Y¿C·”ë†ƒÚ˜Ñ‰&K¥ë◊\•gÄÁ””ˇò8Uâ}≈¡NT ◊√Ñ6S◊?Dïy˝Z!år˜Òü ˝˚ö£'±’^/VØ´d\Î∂«·Õqdåù!ò⁄úñÄ4 c 2(PÈ#ë«r2j'Äö™∑ı¯$ab°â3˙"∆÷´üI%|˚6‘^%pÚJg7¯ë¿óÄOπìw·SSGÙªf^0ˆh9àG]"õ®Ë(Ë¢n◊jå£¯S>Ô4Å&h
+9f<B∏RˇÓH≤}í∞Ïi°ß:@ÃŒ˝¶ÏsÆ†&A
+,6∆*Y∞Ö`Ä¶
+ ˆÆ˝π4˛æ˙"Xø2ı≥¿)˘È≥¡”æ’Æàµ¥Ò¢<¶3•Wj9∂ıÓëÅ◊ZˇŒŒ≤8·(Zg±" u”òÿ›¥¶Ï≥Æ¶çæ„zPıF°†á1l¶
+WXr{ƒ∆ÚÖŒ›ë∑ﬁN“Ò∆YA‡åÉhÁµM˚Ë&√Ä∂^	˛TÙæB’∫Ö÷Så€˘%ØúJzƒ"PãKµÍ™2Mç ãÚúßK'¸[§è˜%^Ωà^xEoveÿZÿ°@¨<û˝÷êFc£F¸4ÄöAªLı(<¯<Ÿø_ShÔAñ9qΩ:ÇpÁËRú%xôé	Ÿ˙-’›†éÏ;1¢*“ˇªwŒàO®ßŒ$]+∆îUÀôΩÒÍÅ»gÊ®“∂¡ß)qXÏ˙±î⁄‡`çgt•r[8ÊædŒ;÷d@Ùyù◊ºÎ· YIÓ3ÎïÌ∫M√ò´i#´MŸ-ò(»à*√{îm* ≤A€J~q(=ˇ'O•i:7á-ˇncJVÔ…„ª+Uu¥ñ«V ª◊T˘h 1◊$Wx”√Iõ´]™ÖÂ\‡–£›.ıP’ﬁ¯ä•AÍ˘H0dÖõZ< fO‡9{Ö˝˜ÁÖ8˚ˇn8LJ
+Ÿ†ß∑mm˛˚∆Ä‡d™Ê¯k“NWuWZ–w˘˘&ÙWûŒ≤a9ø¡ºÇÌ|,±€˛C¸PE⁄3™eÁ⁄Ù⁄4¶ò:, ööè¢¥¶›◊F ˚-‰=€è†Íl0>KcÌñ%¬i1….!j◊V¡ªR”≈˝rÃ9Ç`© 8»∂∏ßΩv1›È≈Õß†nyur=æ¨¬êÉÉX∆D∑‘aöQ˛x2ÌZÒ=¿s]úvsﬂOft˜íò˛C¨<˝H¨∑vARmí«{¸â)Ö^≥ıò
+)d∑õ’?MÛˆ(zë‹0Ñ¨âÎNg≠2[∞a“t˚ùÙT‡ÕÜ!„x¯üÕsjﬁê—Œç;07ºd˛2+€0}|àjœÙ∞BªFä>¶≤82I´ÕÎR∏¿X¥r{·ö2∏NÔEtKEoW-SÇ}¸w9r– ◊¥–)€–+±˝=—8ˇ)nCU‡)πçx…√G	$År ±;iÓê¡Ω3£˜°DJ.wòÌñH¥≤<ﬂR#±—ù7sßTÓÎ!$^Ãä∫˝≠Y!˛è«_ı}ß≤≥iÈﬂn¸XÕÄ∑?¿)Lî)q6ùu∑{?*‰OÔW´M÷£w’π5†À£ô±¡å≠Î—@Â^≠Æ¶´ùrÁ]äG-ˇÑßÑÅõÖ˜}nïypïg√◊˙}í÷Õ:À~œå‘s:ÙŒ]QyëÅNFÊÎ˘î∑ß6Ø›…Óøù—L}|“y´m›wπj©üà¨?á)”h÷ôën⁄ππ∆íGÁõ®œdíõ¡Tk[ü	∂"Ni*π¢∫	‡ÌÈ∑¸!ı ‡e%æp*›vÙ}Ä?ÌÌ)c5gä©q;8<«hLTçvt™J„Ly§‡µ	*ÅRûß≥ÀuΩÂÒuñü†≈Æ·5@ÀﬁﬁZ’≥g41?¿BÑÔN»˝¸XÿG©ßˇ•N,Å/5@1ﬂ±Ôm	dHû¶Áóä2~D„CóÓ≈.éë¢∞Xöâz†¿vÀJáõR*m˘)9’yØ>Ë+(´¡Â§#Íj–NÃ®æÙﬁi¿û…ÊsŸhÛ4`=ÒúP√=∏eúT˙8â¨˘©À¶{è—SW≈†»ÉâØ+˘8ˇâQ¥Ï$U"≥¶[Í˚≠(?mã0∂Ã≠\·?yN¬êΩ8+Ÿ≥ÅRX Ónıëíô' $â6”?ÃóÅ4=¯íÁÏuÍî}„…ÑπVììc‰a†*WƒH*«Í⁄ik¯ÂÎ7-‰.)àËnèø~&3åÑ∫µYæò±kı‹Zp˝ßW…-É
+-J≠K·(÷B≠„⁄`˜∂*∞û–Ç≤Êˆ˘7?Iû«(o¡F,‰'‚®ÂjÚÃh!GpòhDﬁ0˚óå|mo ≤ßÊx}˜sá´P=·©í›∞{´=jŸµ\í`[¡G£<ÙbßAÁÚç	ÏÖù˛±´äÉÛÄ&TBq öN|nmÉ∂'!—’nåPÏÀPX NÒaÇàiP^ññıÂ5-L—†°uA:Á:Õ9◊m§á—ZÔ)UÃîÑ^\˝ªKüG∞∞ÀÊF;™Oﬂqo¯"˜:=R≥‘p/„‡À$Ìj
+Û¨Öm÷.Œñ®ˇ)πæ=vÿâv≤êöG¿òL<VŒTlπÙ b…gy˙∂æ≠0Ç«aï[$`Ûˆ;Á b6eHî…¶Vh	G√6é/$Íó—`ˇ–	¨ÏYß•5iï+ﬁª:¿
+èm–U@	Aó§™*ËÕØAÒ9ØSÁ»Ò˚3@§r è*6i´¸•ø∂ìÈÜùà©HˇŸ?∂äDêsùÓœD˝	yeVèäàÎ`H∆äçy‘Z ‡ÕA!#º˝5˚q»# Wrapper module for _ssl, providing some additional facilities
+# implemented in Python.  Written by Bill Janssen.
+
+"""This module provides some more Pythonic support for SSL.
+
+Object types:
+
+  SSLSocket -- subtype of socket.socket which does SSL over the socket
+
+Exceptions:
+
+  SSLError -- exception raised for I/O errors
+
+Functions:
+
+  cert_time_to_seconds -- convert time string used for certificate
+                          notBefore and notAfter functions to integer
+                          seconds past the Epoch (the time values
+                          returned from time.time())
+
+  fetch_server_certificate (HOST, PORT) -- fetch the certificate provided
+                          by the server running on HOST at port PORT.  No
+                          validation of the certificate is performed.
+
+Integer constants:
+
+SSL_ERROR_ZERO_RETURN
+SSL_ERROR_WANT_READ
+SSL_ERROR_WANT_WRITE
+SSL_ERROR_WANT_X509_LOOKUP
+SSL_ERROR_SYSCALL
+SSL_ERROR_SSL
+SSL_ERROR_WANT_CONNECT
+
+SSL_ERROR_EOF
+SSL_ERROR_INVALID_ERROR_CODE
+
+The following group define certificate requirements that one side is
+allowing/requiring from the other side:
+
+CERT_NONE - no certificates from the other side are required (or will
+            be looked at if provided)
+CERT_OPTIONAL - certificates are not required, but if provided will be
+                validated, and if validation fails, the connection will
+                also fail
+CERT_REQUIRED - certificates are required, and will be validated, and
+                if validation fails, the connection will also fail
+
+The following constants identify various SSL protocol variants:
+
+PROTOCOL_SSLv2
+PROTOCOL_SSLv3
+PROTOCOL_SSLv23
+PROTOCOL_TLS
+PROTOCOL_TLSv1
+PROTOCOL_TLSv1_1
+PROTOCOL_TLSv1_2
+
+The following constants identify various SSL alert message descriptions as per
+http://www.iana.org/assignments/tls-parameters/tls-parameters.xml#tls-parameters-6
+
+ALERT_DESCRIPTION_CLOSE_NOTIFY
+ALERT_DESCRIPTION_UNEXPECTED_MESSAGE
+ALERT_DESCRIPTION_BAD_RECORD_MAC
+ALERT_DESCRIPTION_RECORD_OVERFLOW
+ALERT_DESCRIPTION_DECOMPRESSION_FAILURE
+ALERT_DESCRIPTION_HANDSHAKE_FAILURE
+ALERT_DESCRIPTION_BAD_CERTIFICATE
+ALERT_DESCRIPTION_UNSUPPORTED_CERTIFICATE
+ALERT_DESCRIPTION_CERTIFICATE_REVOKED
+ALERT_DESCRIPTION_CERTIFICATE_EXPIRED
+ALERT_DESCRIPTION_CERTIFICATE_UNKNOWN
+ALERT_DESCRIPTION_ILLEGAL_PARAMETER
+ALERT_DESCRIPTION_UNKNOWN_CA
+ALERT_DESCRIPTION_ACCESS_DENIED
+ALERT_DESCRIPTION_DECODE_ERROR
+ALERT_DESCRIPTION_DECRYPT_ERROR
+ALERT_DESCRIPTION_PROTOCOL_VERSION
+ALERT_DESCRIPTION_INSUFFICIENT_SECURITY
+ALERT_DESCRIPTION_INTERNAL_ERROR
+ALERT_DESCRIPTION_USER_CANCELLED
+ALERT_DESCRIPTION_NO_RENEGOTIATION
+ALERT_DESCRIPTION_UNSUPPORTED_EXTENSION
+ALERT_DESCRIPTION_CERTIFICATE_UNOBTAINABLE
+ALERT_DESCRIPTION_UNRECOGNIZED_NAME
+ALERT_DESCRIPTION_BAD_CERTIFICATE_STATUS_RESPONSE
+ALERT_DESCRIPTION_BAD_CERTIFICATE_HASH_VALUE
+ALERT_DESCRIPTION_UNKNOWN_PSK_IDENTITY
+"""
+
+import textwrap
+import re
+import sys
+import os
+from collections import namedtuple
+from contextlib import closing
+
+import _ssl             # if we can't import it, let the error propagate
+
+from _ssl import OPENSSL_VERSION_NUMBER, OPENSSL_VERSION_INFO, OPENSSL_VERSION
+from _ssl import _SSLContext
+from _ssl import (
+    SSLError, SSLZeroReturnError, SSLWantReadError, SSLWantWriteError,
+    SSLSyscallError, SSLEOFError,
+    )
+from _ssl import CERT_NONE, CERT_OPTIONAL, CERT_REQUIRED
+from _ssl import txt2obj as _txt2obj, nid2obj as _nid2obj
+from _ssl import RAND_status, RAND_add
+try:
+    from _ssl import RAND_egd
+except ImportError:
+    # LibreSSL does not provide RAND_egd
+    pass
+
+def _import_symbols(prefix):
+    for n in dir(_ssl):
+        if n.startswith(prefix):
+            globals()[n] = getattr(_ssl, n)
+
+_import_symbols('OP_')
+_import_symbols('ALERT_DESCRIPTION_')
+_import_symbols('SSL_ERROR_')
+_import_symbols('PROTOCOL_')
+_import_symbols('VERIFY_')
+
+from _ssl import HAS_SNI, HAS_ECDH, HAS_NPN, HAS_ALPN
+
+from _ssl import _OPENSSL_API_VERSION
+
+_PROTOCOL_NAMES = {value: name for name, value in globals().items()
+                   if name.startswith('PROTOCOL_')
+                       and name != 'PROTOCOL_SSLv23'}
+PROTOCOL_SSLv23 = PROTOCOL_TLS
+
+try:
+    _SSLv2_IF_EXISTS = PROTOCOL_SSLv2
+except NameError:
+    _SSLv2_IF_EXISTS = None
+
+from socket import socket, _fileobject, _delegate_methods, error as socket_error
+if sys.platform == "win32":
+    from _ssl import enum_certificates, enum_crls
+
+from socket import socket, AF_INET, SOCK_STREAM, create_connection
+from socket import SOL_SOCKET, SO_TYPE
+import base64        # for DER-to-PEM translation
+import errno
+import warnings
+
+if _ssl.HAS_TLS_UNIQUE:
+    CHANNEL_BINDING_TYPES = ['tls-unique']
+else:
+    CHANNEL_BINDING_TYPES = []
+
+
+# Disable weak or insecure ciphers by default
+# (OpenSSL's default setting is 'DEFAULT:!aNULL:!eNULL')
+# Enable a better set of ciphers by default
+# This list has been explicitly chosen to:
+#   * Prefer cipher suites that offer perfect forward secrecy (DHE/ECDHE)
+#   * Prefer ECDHE over DHE for better performance
+#   * Prefer AEAD over CBC for better performance and security
+#   * Prefer AES-GCM over ChaCha20 because most platforms have AES-NI
+#     (ChaCha20 needs OpenSSL 1.1.0 or patched 1.0.2)
+#   * Prefer any AES-GCM and ChaCha20 over any AES-CBC for better
+#     performance and security
+#   * Then Use HIGH cipher suites as a fallback
+#   * Disable NULL authentication, NULL encryption, 3DES and MD5 MACs
+#     for security reasons
+_DEFAULT_CIPHERS = (
+    'ECDH+AESGCM:ECDH+CHACHA20:DH+AESGCM:DH+CHACHA20:ECDH+AES256:DH+AES256:'
+    'ECDH+AES128:DH+AES:ECDH+HIGH:DH+HIGH:RSA+AESGCM:RSA+AES:RSA+HIGH:'
+    '!aNULL:!eNULL:!MD5:!3DES'
+    )
+
+# Restricted and more secure ciphers for the server side
+# This list has been explicitly chosen to:
+#   * Prefer cipher suites that offer perfect forward secrecy (DHE/ECDHE)
+#   * Prefer ECDHE over DHE for better performance
+#   * Prefer AEAD over CBC for better performance and security
+#   * Prefer AES-GCM over ChaCha20 because most platforms have AES-NI
+#   * Prefer any AES-GCM and ChaCha20 over any AES-CBC for better
+#     performance and security
+#   * Then Use HIGH cipher suites as a fallback
+#   * Disable NULL authentication, NULL encryption, MD5 MACs, DSS, RC4, and
+#     3DES for security reasons
+_RESTRICTED_SERVER_CIPHERS = (
+    'ECDH+AESGCM:ECDH+CHACHA20:DH+AESGCM:DH+CHACHA20:ECDH+AES256:DH+AES256:'
+    'ECDH+AES128:DH+AES:ECDH+HIGH:DH+HIGH:RSA+AESGCM:RSA+AES:RSA+HIGH:'
+    '!aNULL:!eNULL:!MD5:!DSS:!RC4:!3DES'
+)
+
+
+class CertificateError(ValueError):
+    pass
+
+
+def _dnsname_match(dn, hostname, max_wildcards=1):
+    """Matching according to RFC 6125, section 6.4.3
+
+    http://tools.ietf.org/html/rfc6125#section-6.4.3
+    """
+    pats = []
+    if not dn:
+        return False
+
+    pieces = dn.split(r'.')
+    leftmost = pieces[0]
+    remainder = pieces[1:]
+
+    wildcards = leftmost.count('*')
+    if wildcards > max_wildcards:
+        # Issue #17980: avoid denials of service by refusing more
+        # than one wildcard per fragment.  A survery of established
+        # policy among SSL implementations showed it to be a
+        # reasonable choice.
+        raise CertificateError(
+            "too many wildcards in certificate DNS name: " + repr(dn))
+
+    # speed up common case w/o wildcards
+    if not wildcards:
+        return dn.lower() == hostname.lower()
+
+    # RFC 6125, section 6.4.3, subitem 1.
+    # The client SHOULD NOT attempt to match a presented identifier in which
+    # the wildcard character comprises a label other than the left-most label.
+    if leftmost == '*':
+        # When '*' is a fragment by itself, it matches a non-empty dotless
+        # fragment.
+        pats.append('[^.]+')
+    elif leftmost.startswith('xn--') or hostname.startswith('xn--'):
+        # RFC 6125, section 6.4.3, subitem 3.
+        # The client SHOULD NOT attempt to match a presented identifier
+        # where the wildcard character is embedded within an A-label or
+        # U-label of an internationalized domain name.
+        pats.append(re.escape(leftmost))
+    else:
+        # Otherwise, '*' matches any dotless string, e.g. www*
+        pats.append(re.escape(leftmost).replace(r'\*', '[^.]*'))
+
+    # add the remaining fragments, ignore any wildcards
+    for frag in remainder:
+        pats.append(re.escape(frag))
+
+    pat = re.compile(r'\A' + r'\.'.join(pats) + r'\Z', re.IGNORECASE)
+    return pat.match(hostname)
+
+
+def match_hostname(cert, hostname):
+    """Verify that *cert* (in decoded format as returned by
+    SSLSocket.getpeercert()) matches the *hostname*.  RFC 2818 and RFC 6125
+    rules are followed, but IP addresses are not accepted for *hostname*.
+
+    CertificateError is raised on failure. On success, the function
+    returns nothing.
+    """
+    if not cert:
+        raise ValueError("empty or no certificate, match_hostname needs a "
+                         "SSL socket or SSL context with either "
+                         "CERT_OPTIONAL or CERT_REQUIRED")
+    dnsnames = []
+    san = cert.get('subjectAltName', ())
+    for key, value in san:
+        if key == 'DNS':
+            if _dnsname_match(value, hostname):
+                return
+            dnsnames.append(value)
+    if not dnsnames:
+        # The subject is only checked when there is no dNSName entry
+        # in subjectAltName
+        for sub in cert.get('subject', ()):
+            for key, value in sub:
+                # XXX according to RFC 2818, the most specific Common Name
+                # must be used.
+                if key == 'commonName':
+                    if _dnsname_match(value, hostname):
+                        return
+                    dnsnames.append(value)
+    if len(dnsnames) > 1:
+        raise CertificateError("hostname %r "
+            "doesn't match either of %s"
+            % (hostname, ', '.join(map(repr, dnsnames))))
+    elif len(dnsnames) == 1:
+        raise CertificateError("hostname %r "
+            "doesn't match %r"
+            % (hostname, dnsnames[0]))
+    else:
+        raise CertificateError("no appropriate commonName or "
+            "subjectAltName fields were found")
+
+
+DefaultVerifyPaths = namedtuple("DefaultVerifyPaths",
+    "cafile capath openssl_cafile_env openssl_cafile openssl_capath_env "
+    "openssl_capath")
+
+def get_default_verify_paths():
+    """Return paths to default cafile and capath.
+    """
+    parts = _ssl.get_default_verify_paths()
+
+    # environment vars shadow paths
+    cafile = os.environ.get(parts[0], parts[1])
+    capath = os.environ.get(parts[2], parts[3])
+
+    return DefaultVerifyPaths(cafile if os.path.isfile(cafile) else None,
+                              capath if os.path.isdir(capath) else None,
+                              *parts)
+
+
+class _ASN1Object(namedtuple("_ASN1Object", "nid shortname longname oid")):
+    """ASN.1 object identifier lookup
+    """
+    __slots__ = ()
+
+    def __new__(cls, oid):
+        return super(_ASN1Object, cls).__new__(cls, *_txt2obj(oid, name=False))
+
+    @classmethod
+    def fromnid(cls, nid):
+        """Create _ASN1Object from OpenSSL numeric ID
+        """
+        return super(_ASN1Object, cls).__new__(cls, *_nid2obj(nid))
+
+    @classmethod
+    def fromname(cls, name):
+        """Create _ASN1Object from short name, long name or OID
+        """
+        return super(_ASN1Object, cls).__new__(cls, *_txt2obj(name, name=True))
+
+
+class Purpose(_ASN1Object):
+    """SSLContext purpose flags with X509v3 Extended Key Usage objects
+    """
+
+Purpose.SERVER_AUTH = Purpose('1.3.6.1.5.5.7.3.1')
+Purpose.CLIENT_AUTH = Purpose('1.3.6.1.5.5.7.3.2')
+
+
+class SSLContext(_SSLContext):
+    """An SSLContext holds various SSL-related configuration options and
+    data, such as certificates and possibly a private key."""
+
+    __slots__ = ('protocol', '__weakref__')
+    _windows_cert_stores = ("CA", "ROOT")
+
+    def __new__(cls, protocol, *args, **kwargs):
+        self = _SSLContext.__new__(cls, protocol)
+        if protocol != _SSLv2_IF_EXISTS:
+            self.set_ciphers(_DEFAULT_CIPHERS)
+        return self
+
+    def __init__(self, protocol):
+        self.protocol = protocol
+
+    def wrap_socket(self, sock, server_side=False,
+                    do_handshake_on_connect=True,
+                    suppress_ragged_eofs=True,
+                    server_hostname=None):
+        return SSLSocket(sock=sock, server_side=server_side,
+                         do_handshake_on_connect=do_handshake_on_connect,
+                         suppress_ragged_eofs=suppress_ragged_eofs,
+                         server_hostname=server_hostname,
+                         _context=self)
+
+    def set_npn_protocols(self, npn_protocols):
+        protos = bytearray()
+        for protocol in npn_protocols:
+            b = protocol.encode('ascii')
+            if len(b) == 0 or len(b) > 255:
+                raise SSLError('NPN protocols must be 1 to 255 in length')
+            protos.append(len(b))
+            protos.extend(b)
+
+        self._set_npn_protocols(protos)
+
+    def set_alpn_protocols(self, alpn_protocols):
+        protos = bytearray()
+        for protocol in alpn_protocols:
+            b = protocol.encode('ascii')
+            if len(b) == 0 or len(b) > 255:
+                raise SSLError('ALPN protocols must be 1 to 255 in length')
+            protos.append(len(b))
+            protos.extend(b)
+
+        self._set_alpn_protocols(protos)
+
+    def _load_windows_store_certs(self, storename, purpose):
+        certs = bytearray()
+        try:
+            for cert, encoding, trust in enum_certificates(storename):
+                # CA certs are never PKCS#7 encoded
+                if encoding == "x509_asn":
+                    if trust is True or purpose.oid in trust:
+                        certs.extend(cert)
+        except OSError:
+            warnings.warn("unable to enumerate Windows certificate store")
+        if certs:
+            self.load_verify_locations(cadata=certs)
+        return certs
+
+    def load_default_certs(self, purpose=Purpose.SERVER_AUTH):
+        if not isinstance(purpose, _ASN1Object):
+            raise TypeError(purpose)
+        if sys.platform == "win32":
+            for storename in self._windows_cert_stores:
+                self._load_windows_store_certs(storename, purpose)
+        self.set_default_verify_paths()
+
+
+def create_default_context(purpose=Purpose.SERVER_AUTH, cafile=None,
+                           capath=None, cadata=None):
+    """Create a SSLContext object with default settings.
+
+    NOTE: The protocol and settings may change anytime without prior
+          deprecation. The values represent a fair balance between maximum
+          compatibility and security.
+    """
+    if not isinstance(purpose, _ASN1Object):
+        raise TypeError(purpose)
+
+    context = SSLContext(PROTOCOL_TLS)
+
+    # SSLv2 considered harmful.
+    context.options |= OP_NO_SSLv2
+
+    # SSLv3 has problematic security and is only required for really old
+    # clients such as IE6 on Windows XP
+    context.options |= OP_NO_SSLv3
+
+    # disable compression to prevent CRIME attacks (OpenSSL 1.0+)
+    context.options |= getattr(_ssl, "OP_NO_COMPRESSION", 0)
+
+    if purpose == Purpose.SERVER_AUTH:
+        # verify certs and host name in client mode
+        context.verify_mode = CERT_REQUIRED
+        context.check_hostname = True
+    elif purpose == Purpose.CLIENT_AUTH:
+        # Prefer the server's ciphers by default so that we get stronger
+        # encryption
+        context.options |= getattr(_ssl, "OP_CIPHER_SERVER_PREFERENCE", 0)
+
+        # Use single use keys in order to improve forward secrecy
+        context.options |= getattr(_ssl, "OP_SINGLE_DH_USE", 0)
+        context.options |= getattr(_ssl, "OP_SINGLE_ECDH_USE", 0)
+
+        # disallow ciphers with known vulnerabilities
+        context.set_ciphers(_RESTRICTED_SERVER_CIPHERS)
+
+    if cafile or capath or cadata:
+        context.load_verify_locations(cafile, capath, cadata)
+    elif context.verify_mode != CERT_NONE:
+        # no explicit cafile, capath or cadata but the verify mode is
+        # CERT_OPTIONAL or CERT_REQUIRED. Let's try to load default system
+        # root CA certificates for the given purpose. This may fail silently.
+        context.load_default_certs(purpose)
+    return context
+
+def _create_unverified_context(protocol=PROTOCOL_TLS, cert_reqs=None,
+                           check_hostname=False, purpose=Purpose.SERVER_AUTH,
+                           certfile=None, keyfile=None,
+                           cafile=None, capath=None, cadata=None):
+    """Create a SSLContext object for Python stdlib modules
+
+    All Python stdlib modules shall use this function to create SSLContext
+    objects in order to keep common settings in one place. The configuration
+    is less restrict than create_default_context()'s to increase backward
+    compatibility.
+    """
+    if not isinstance(purpose, _ASN1Object):
+        raise TypeError(purpose)
+
+    context = SSLContext(protocol)
+    # SSLv2 considered harmful.
+    context.options |= OP_NO_SSLv2
+    # SSLv3 has problematic security and is only required for really old
+    # clients such as IE6 on Windows XP
+    context.options |= OP_NO_SSLv3
+
+    if cert_reqs is not None:
+        context.verify_mode = cert_reqs
+    context.check_hostname = check_hostname
+
+    if keyfile and not certfile:
+        raise ValueError("certfile must be specified")
+    if certfile or keyfile:
+        context.load_cert_chain(certfile, keyfile)
+
+    # load CA root certs
+    if cafile or capath or cadata:
+        context.load_verify_locations(cafile, capath, cadata)
+    elif context.verify_mode != CERT_NONE:
+        # no explicit cafile, capath or cadata but the verify mode is
+        # CERT_OPTIONAL or CERT_REQUIRED. Let's try to load default system
+        # root CA certificates for the given purpose. This may fail silently.
+        context.load_default_certs(purpose)
+
+    return context
+
+# Backwards compatibility alias, even though it's not a public name.
+_create_stdlib_context = _create_unverified_context
+
+# PEP 493: Verify HTTPS by default, but allow envvar to override that
+_https_verify_envvar = 'PYTHONHTTPSVERIFY'
+
+def _get_https_context_factory():
+    if not sys.flags.ignore_environment:
+        config_setting = os.environ.get(_https_verify_envvar)
+        if config_setting == '0':
+            return _create_unverified_context
+    return create_default_context
+
+_create_default_https_context = _get_https_context_factory()
+
+# PEP 493: "private" API to configure HTTPS defaults without monkeypatching
+def _https_verify_certificates(enable=True):
+    """Verify server HTTPS certificates by default?"""
+    global _create_default_https_context
+    if enable:
+        _create_default_https_context = create_default_context
+    else:
+        _create_default_https_context = _create_unverified_context
+
+
+class SSLSocket(socket):
+    """This class implements a subtype of socket.socket that wraps
+    the underlying OS socket in an SSL context when necessary, and
+    provides read and write methods over that channel."""
+
+    def __init__(self, sock=None, keyfile=None, certfile=None,
+                 server_side=False, cert_reqs=CERT_NONE,
+                 ssl_version=PROTOCOL_TLS, ca_certs=None,
+                 do_handshake_on_connect=True,
+                 family=AF_INET, type=SOCK_STREAM, proto=0, fileno=None,
+                 suppress_ragged_eofs=True, npn_protocols=None, ciphers=None,
+                 server_hostname=None,
+                 _context=None):
+
+        self._makefile_refs = 0
+        if _context:
+            self._context = _context
+        else:
+            if server_side and not certfile:
+                raise ValueError("certfile must be specified for server-side "
+                                 "operations")
+            if keyfile and not certfile:
+                raise ValueError("certfile must be specified")
+            if certfile and not keyfile:
+                keyfile = certfile
+            self._context = SSLContext(ssl_version)
+            self._context.verify_mode = cert_reqs
+            if ca_certs:
+                self._context.load_verify_locations(ca_certs)
+            if certfile:
+                self._context.load_cert_chain(certfile, keyfile)
+            if npn_protocols:
+                self._context.set_npn_protocols(npn_protocols)
+            if ciphers:
+                self._context.set_ciphers(ciphers)
+            self.keyfile = keyfile
+            self.certfile = certfile
+            self.cert_reqs = cert_reqs
+            self.ssl_version = ssl_version
+            self.ca_certs = ca_certs
+            self.ciphers = ciphers
+        # Can't use sock.type as other flags (such as SOCK_NONBLOCK) get
+        # mixed in.
+        if sock.getsockopt(SOL_SOCKET, SO_TYPE) != SOCK_STREAM:
+            raise NotImplementedError("only stream sockets are supported")
+        socket.__init__(self, _sock=sock._sock)
+        # The initializer for socket overrides the methods send(), recv(), etc.
+        # in the instancce, which we don't need -- but we want to provide the
+        # methods defined in SSLSocket.
+        for attr in _delegate_methods:
+            try:
+                delattr(self, attr)
+            except AttributeError:
+                pass
+        if server_side and server_hostname:
+            raise ValueError("server_hostname can only be specified "
+                             "in client mode")
+        if self._context.check_hostname and not server_hostname:
+            raise ValueError("check_hostname requires server_hostname")
+        self.server_side = server_side
+        self.server_hostname = server_hostname
+        self.do_handshake_on_connect = do_handshake_on_connect
+        self.suppress_ragged_eofs = suppress_ragged_eofs
+
+        # See if we are connected
+        try:
+            self.getpeername()
+        except socket_error as e:
+            if e.errno != errno.ENOTCONN:
+                raise
+            connected = False
+        else:
+            connected = True
+
+        self._closed = False
+        self._sslobj = None
+        self._connected = connected
+        if connected:
+            # create the SSL object
+            try:
+                self._sslobj = self._context._wrap_socket(self._sock, server_side,
+                                                          server_hostname, ssl_sock=self)
+                if do_handshake_on_connect:
+                    timeout = self.gettimeout()
+                    if timeout == 0.0:
+                        # non-blocking
+                        raise ValueError("do_handshake_on_connect should not be specified for non-blocking sockets")
+                    self.do_handshake()
+
+            except (OSError, ValueError):
+                self.close()
+                raise
+
+    @property
+    def context(self):
+        return self._context
+
+    @context.setter
+    def context(self, ctx):
+        self._context = ctx
+        self._sslobj.context = ctx
+
+    def dup(self):
+        raise NotImplemented("Can't dup() %s instances" %
+                             self.__class__.__name__)
+
+    def _checkClosed(self, msg=None):
+        # raise an exception here if you wish to check for spurious closes
+        pass
+
+    def _check_connected(self):
+        if not self._connected:
+            # getpeername() will raise ENOTCONN if the socket is really
+            # not connected; note that we can be connected even without
+            # _connected being set, e.g. if connect() first returned
+            # EAGAIN.
+            self.getpeername()
+
+    def read(self, len=1024, buffer=None):
+        """Read up to LEN bytes and return them.
+        Return zero-length string on EOF."""
+
+        self._checkClosed()
+        if not self._sslobj:
+            raise ValueError("Read on closed or unwrapped SSL socket.")
+        try:
+            if buffer is not None:
+                v = self._sslobj.read(len, buffer)
+            else:
+                v = self._sslobj.read(len)
+            return v
+        except SSLError as x:
+            if x.args[0] == SSL_ERROR_EOF and self.suppress_ragged_eofs:
+                if buffer is not None:
+                    return 0
+                else:
+                    return b''
+            else:
+                raise
+
+    def write(self, data):
+        """Write DATA to the underlying SSL channel.  Returns
+        number of bytes of DATA actually transmitted."""
+
+        self._checkClosed()
+        if not self._sslobj:
+            raise ValueError("Write on closed or unwrapped SSL socket.")
+        return self._sslobj.write(data)
+
+    def getpeercert(self, binary_form=False):
+        """Returns a formatted version of the data in the
+        certificate provided by the other end of the SSL channel.
+        Return None if no certificate was provided, {} if a
+        certificate was provided, but not validated."""
+
+        self._checkClosed()
+        self._check_connected()
+        return self._sslobj.peer_certificate(binary_form)
+
+    def selected_npn_protocol(self):
+        self._checkClosed()
+        if not self._sslobj or not _ssl.HAS_NPN:
+            return None
+        else:
+            return self._sslobj.selected_npn_protocol()
+
+    def selected_alpn_protocol(self):
+        self._checkClosed()
+        if not self._sslobj or not _ssl.HAS_ALPN:
+            return None
+        else:
+            return self._sslobj.selected_alpn_protocol()
+
+    def cipher(self):
+        self._checkClosed()
+        if not self._sslobj:
+            return None
+        else:
+            return self._sslobj.cipher()
+
+    def compression(self):
+        self._checkClosed()
+        if not self._sslobj:
+            return None
+        else:
+            return self._sslobj.compression()
+
+    def send(self, data, flags=0):
+        self._checkClosed()
+        if self._sslobj:
+            if flags != 0:
+                raise ValueError(
+                    "non-zero flags not allowed in calls to send() on %s" %
+                    self.__class__)
+            try:
+                v = self._sslobj.write(data)
+            except SSLError as x:
+                if x.args[0] == SSL_ERROR_WANT_READ:
+                    return 0
+                elif x.args[0] == SSL_ERROR_WANT_WRITE:
+                    return 0
+                else:
+                    raise
+            else:
+                return v
+        else:
+            return self._sock.send(data, flags)
+
+    def sendto(self, data, flags_or_addr, addr=None):
+        self._checkClosed()
+        if self._sslobj:
+            raise ValueError("sendto not allowed on instances of %s" %
+                             self.__class__)
+        elif addr is None:
+            return self._sock.sendto(data, flags_or_addr)
+        else:
+            return self._sock.sendto(data, flags_or_addr, addr)
+
+
+    def sendall(self, data, flags=0):
+        self._checkClosed()
+        if self._sslobj:
+            if flags != 0:
+                raise ValueError(
+                    "non-zero flags not allowed in calls to sendall() on %s" %
+                    self.__class__)
+            amount = len(data)
+            count = 0
+            while (count < amount):
+                v = self.send(data[count:])
+                count += v
+            return amount
+        else:
+            return socket.sendall(self, data, flags)
+
+    def recv(self, buflen=1024, flags=0):
+        self._checkClosed()
+        if self._sslobj:
+            if flags != 0:
+                raise ValueError(
+                    "non-zero flags not allowed in calls to recv() on %s" %
+                    self.__class__)
+            return self.read(buflen)
+        else:
+            return self._sock.recv(buflen, flags)
+
+    def recv_into(self, buffer, nbytes=None, flags=0):
+        self._checkClosed()
+        if buffer and (nbytes is None):
+            nbytes = len(buffer)
+        elif nbytes is None:
+            nbytes = 1024
+        if self._sslobj:
+            if flags != 0:
+                raise ValueError(
+                  "non-zero flags not allowed in calls to recv_into() on %s" %
+                  self.__class__)
+            return self.read(nbytes, buffer)
+        else:
+            return self._sock.recv_into(buffer, nbytes, flags)
+
+    def recvfrom(self, buflen=1024, flags=0):
+        self._checkClosed()
+        if self._sslobj:
+            raise ValueError("recvfrom not allowed on instances of %s" %
+                             self.__class__)
+        else:
+            return self._sock.recvfrom(buflen, flags)
+
+    def recvfrom_into(self, buffer, nbytes=None, flags=0):
+        self._checkClosed()
+        if self._sslobj:
+            raise ValueError("recvfrom_into not allowed on instances of %s" %
+                             self.__class__)
+        else:
+            return self._sock.recvfrom_into(buffer, nbytes, flags)
+
+
+    def pending(self):
+        self._checkClosed()
+        if self._sslobj:
+            return self._sslobj.pending()
+        else:
+            return 0
+
+    def shutdown(self, how):
+        self._checkClosed()
+        self._sslobj = None
+        socket.shutdown(self, how)
+
+    def close(self):
+        if self._makefile_refs < 1:
+            self._sslobj = None
+            socket.close(self)
+        else:
+            self._makefile_refs -= 1
+
+    def unwrap(self):
+        if self._sslobj:
+            s = self._sslobj.shutdown()
+            self._sslobj = None
+            return s
+        else:
+            raise ValueError("No SSL wrapper around " + str(self))
+
+    def _real_close(self):
+        self._sslobj = None
+        socket._real_close(self)
+
+    def do_handshake(self, block=False):
+        """Perform a TLS/SSL handshake."""
+        self._check_connected()
+        timeout = self.gettimeout()
+        try:
+            if timeout == 0.0 and block:
+                self.settimeout(None)
+            self._sslobj.do_handshake()
+        finally:
+            self.settimeout(timeout)
+
+        if self.context.check_hostname:
+            if not self.server_hostname:
+                raise ValueError("check_hostname needs server_hostname "
+                                 "argument")
+            match_hostname(self.getpeercert(), self.server_hostname)
+
+    def _real_connect(self, addr, connect_ex):
+        if self.server_side:
+            raise ValueError("can't connect in server-side mode")
+        # Here we assume that the socket is client-side, and not
+        # connected at the time of the call.  We connect it, then wrap it.
+        if self._connected:
+            raise ValueError("attempt to connect already-connected SSLSocket!")
+        self._sslobj = self.context._wrap_socket(self._sock, False, self.server_hostname, ssl_sock=self)
+        try:
+            if connect_ex:
+                rc = socket.connect_ex(self, addr)
+            else:
+                rc = None
+                socket.connect(self, addr)
+            if not rc:
+                self._connected = True
+                if self.do_handshake_on_connect:
+                    self.do_handshake()
+            return rc
+        except (OSError, ValueError):
+            self._sslobj = None
+            raise
+
+    def connect(self, addr):
+        """Connects to remote ADDR, and then wraps the connection in
+        an SSL channel."""
+        self._real_connect(addr, False)
+
+    def connect_ex(self, addr):
+        """Connects to remote ADDR, and then wraps the connection in
+        an SSL channel."""
+        return self._real_connect(addr, True)
+
+    def accept(self):
+        """Accepts a new connection from a remote client, and returns
+        a tuple containing that new connection wrapped with a server-side
+        SSL channel, and the address of the remote client."""
+
+        newsock, addr = socket.accept(self)
+        newsock = self.context.wrap_socket(newsock,
+                    do_handshake_on_connect=self.do_handshake_on_connect,
+                    suppress_ragged_eofs=self.suppress_ragged_eofs,
+                    server_side=True)
+        return newsock, addr
+
+    def makefile(self, mode='r', bufsize=-1):
+
+        """Make and return a file-like object that
+        works with the SSL connection.  Just use the code
+        from the socket module."""
+
+        self._makefile_refs += 1
+        # close=True so as to decrement the reference count when done with
+        # the file-like object.
+        return _fileobject(self, mode, bufsize, close=True)
+
+    def get_channel_binding(self, cb_type="tls-unique"):
+        """Get channel binding data for current connection.  Raise ValueError
+        if the requested `cb_type` is not supported.  Return bytes of the data
+        or None if the data is not available (e.g. before the handshake).
+        """
+        if cb_type not in CHANNEL_BINDING_TYPES:
+            raise ValueError("Unsupported channel binding type")
+        if cb_type != "tls-unique":
+            raise NotImplementedError(
+                            "{0} channel binding type not implemented"
+                            .format(cb_type))
+        if self._sslobj is None:
+            return None
+        return self._sslobj.tls_unique_cb()
+
+    def version(self):
+        """
+        Return a string identifying the protocol version used by the
+        current SSL channel, or None if there is no established channel.
+        """
+        if self._sslobj is None:
+            return None
+        return self._sslobj.version()
+
+
+def wrap_socket(sock, keyfile=None, certfile=None,
+                server_side=False, cert_reqs=CERT_NONE,
+                ssl_version=PROTOCOL_TLS, ca_certs=None,
+                do_handshake_on_connect=True,
+                suppress_ragged_eofs=True,
+                ciphers=None):
+
+    return SSLSocket(sock=sock, keyfile=keyfile, certfile=certfile,
+                     server_side=server_side, cert_reqs=cert_reqs,
+                     ssl_version=ssl_version, ca_certs=ca_certs,
+                     do_handshake_on_connect=do_handshake_on_connect,
+                     suppress_ragged_eofs=suppress_ragged_eofs,
+                     ciphers=ciphers)
+
+# some utility functions
+
+def cert_time_to_seconds(cert_time):
+    """Return the time in seconds since the Epoch, given the timestring
+    representing the "notBefore" or "notAfter" date from a certificate
+    in ``"%b %d %H:%M:%S %Y %Z"`` strptime format (C locale).
+
+    "notBefore" or "notAfter" dates must use UTC (RFC 5280).
+
+    Month is one of: Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec
+    UTC should be specified as GMT (see ASN1_TIME_print())
+    """
+    from time import strptime
+    from calendar import timegm
+
+    months = (
+        "Jan","Feb","Mar","Apr","May","Jun",
+        "Jul","Aug","Sep","Oct","Nov","Dec"
+    )
+    time_format = ' %d %H:%M:%S %Y GMT' # NOTE: no month, fixed GMT
+    try:
+        month_number = months.index(cert_time[:3].title()) + 1
+    except ValueError:
+        raise ValueError('time data %r does not match '
+                         'format "%%b%s"' % (cert_time, time_format))
+    else:
+        # found valid month
+        tt = strptime(cert_time[3:], time_format)
+        # return an integer, the previous mktime()-based implementation
+        # returned a float (fractional seconds are always zero here).
+        return timegm((tt[0], month_number) + tt[2:6])
+
+PEM_HEADER = "-----BEGIN CERTIFICATE-----"
+PEM_FOOTER = "-----END CERTIFICATE-----"
+
+def DER_cert_to_PEM_cert(der_cert_bytes):
+    """Takes a certificate in binary DER format and returns the
+    PEM version of it as a string."""
+
+    f = base64.standard_b64encode(der_cert_bytes).decode('ascii')
+    return (PEM_HEADER + '\n' +
+            textwrap.fill(f, 64) + '\n' +
+            PEM_FOOTER + '\n')
+
+def PEM_cert_to_DER_cert(pem_cert_string):
+    """Takes a certificate in ASCII PEM format and returns the
+    DER-encoded version of it as a byte sequence"""
+
+    if not pem_cert_string.startswith(PEM_HEADER):
+        raise ValueError("Invalid PEM encoding; must start with %s"
+                         % PEM_HEADER)
+    if not pem_cert_string.strip().endswith(PEM_FOOTER):
+        raise ValueError("Invalid PEM encoding; must end with %s"
+                         % PEM_FOOTER)
+    d = pem_cert_string.strip()[len(PEM_HEADER):-len(PEM_FOOTER)]
+    return base64.decodestring(d.encode('ASCII', 'strict'))
+
+def get_server_certificate(addr, ssl_version=PROTOCOL_TLS, ca_certs=None):
+    """Retrieve the certificate from the server at the specified address,
+    and return it as a PEM-encoded string.
+    If 'ca_certs' is specified, validate the server cert against it.
+    If 'ssl_version' is specified, use it in the connection attempt."""
+
+    host, port = addr
+    if ca_certs is not None:
+        cert_reqs = CERT_REQUIRED
+    else:
+        cert_reqs = CERT_NONE
+    context = _create_stdlib_context(ssl_version,
+                                     cert_reqs=cert_reqs,
+                                     cafile=ca_certs)
+    with closing(create_connection(addr)) as sock:
+        with closing(context.wrap_socket(sock)) as sslsock:
+            dercert = sslsock.getpeercert(True)
+    return DER_cert_to_PEM_cert(dercert)
+
+def get_protocol_name(protocol_code):
+    return _PROTOCOL_NAMES.get(protocol_code, '<unknown>')
+
+
+# a replacement for the old socket.ssl function
+
+def sslwrap_simple(sock, keyfile=None, certfile=None):
+    """A replacement for the old socket.ssl function.  Designed
+    for compability with Python 2.5 and earlier.  Will disappear in
+    Python 3.0."""
+    if hasattr(sock, "_sock"):
+        sock = sock._sock

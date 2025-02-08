@@ -1,0 +1,647 @@
+ * store, and return a pointer to it, but do not make it public --
+ * just because someone requested something, we do not expand the
+ * available ID list (or spec DAG).
+ *
+ * Caller does NOT own returned object.
+ */
+TransliteratorEntry* TransliteratorRegistry::findInStaticStore(const TransliteratorSpec& src,
+                                                 const TransliteratorSpec& trg,
+                                                 const UnicodeString& variant) {
+    TransliteratorEntry* entry = 0;
+    if (src.isLocale()) {
+        entry = findInBundle(src, trg, variant, UTRANS_FORWARD);
+    } else if (trg.isLocale()) {
+        entry = findInBundle(trg, src, variant, UTRANS_REVERSE);
+    }
+
+    // If we found an entry, store it in the Hashtable for next
+    // time.
+    if (entry != 0) {
+        registerEntry(src.getTop(), trg.getTop(), variant, entry, FALSE);
+    }
+
+    return entry;
+}
+
+// As of 2.0, resource bundle keys cannot contain '_'
+static const UChar TRANSLITERATE_TO[] = {84,114,97,110,115,108,105,116,101,114,97,116,101,84,111,0}; // "TransliterateTo"
+
+static const UChar TRANSLITERATE_FROM[] = {84,114,97,110,115,108,105,116,101,114,97,116,101,70,114,111,109,0}; // "TransliterateFrom"
+
+static const UChar TRANSLITERATE[] = {84,114,97,110,115,108,105,116,101,114,97,116,101,0}; // "Transliterate"
+
+/**
+ * Attempt to find an entry in a single resource bundle.  This is
+ * a one-sided lookup.  findInStaticStore() performs up to two such
+ * lookups, one for the source, and one for the target.
+ *
+ * Do not perform fallback.  Return 0 on failure.
+ *
+ * On success, create a new Entry object, populate it, and return it.
+ * The caller owns the returned object.
+ */
+TransliteratorEntry* TransliteratorRegistry::findInBundle(const TransliteratorSpec& specToOpen,
+                                            const TransliteratorSpec& specToFind,
+                                            const UnicodeString& variant,
+                                            UTransDirection direction)
+{
+    UnicodeString utag;
+    UnicodeString resStr;
+    int32_t pass;
+
+    for (pass=0; pass<2; ++pass) {
+        utag.truncate(0);
+        // First try either TransliteratorTo_xxx or
+        // TransliterateFrom_xxx, then try the bidirectional
+        // Transliterate_xxx.  This precedence order is arbitrary
+        // but must be consistent and documented.
+        if (pass == 0) {
+            utag.append(direction == UTRANS_FORWARD ?
+                        TRANSLITERATE_TO : TRANSLITERATE_FROM, -1);
+        } else {
+            utag.append(TRANSLITERATE, -1);
+        }
+        UnicodeString s(specToFind.get());
+        utag.append(s.toUpper(""));
+        UErrorCode status = U_ZERO_ERROR;
+        ResourceBundle subres(specToOpen.getBundle().get(
+            CharString().appendInvariantChars(utag, status).data(), status));
+        if (U_FAILURE(status) || status == U_USING_DEFAULT_WARNING) {
+            continue;
+        }
+
+        s.truncate(0);
+        if (specToOpen.get() != LocaleUtility::initNameFromLocale(subres.getLocale(), s)) {
+            continue;
+        }
+
+        if (variant.length() != 0) {
+            status = U_ZERO_ERROR;
+            resStr = subres.getStringEx(
+                CharString().appendInvariantChars(variant, status).data(), status);
+            if (U_SUCCESS(status)) {
+                // Exit loop successfully
+                break;
+            }
+        } else {
+            // Variant is empty, which means match the first variant listed.
+            status = U_ZERO_ERROR;
+            resStr = subres.getStringEx(1, status);
+            if (U_SUCCESS(status)) {
+                // Exit loop successfully
+                break;
+            }
+        }
+    }
+
+    if (pass==2) {
+        // Failed
+        return NULL;
+    }
+
+    // We have succeeded in loading a string from the locale
+    // resources.  Create a new registry entry to hold it and return it.
+    TransliteratorEntry *entry = new TransliteratorEntry();
+    if (entry != 0) {
+        // The direction is always forward for the
+        // TransliterateTo_xxx and TransliterateFrom_xxx
+        // items; those are unidirectional forward rules.
+        // For the bidirectional Transliterate_xxx items,
+        // the direction is the value passed in to this
+        // function.
+        int32_t dir = (pass == 0) ? UTRANS_FORWARD : direction;
+        entry->entryType = TransliteratorEntry::LOCALE_RULES;
+        entry->stringArg = resStr;
+        entry->intArg = dir;
+    }
+
+    return entry;
+}
+
+/**
+ * Convenience method.  Calls 3-arg find().
+ */
+TransliteratorEntry* TransliteratorRegistry::find(const UnicodeString& ID) {
+    UnicodeString source, target, variant;
+    UBool sawSource;
+    TransliteratorIDParser::IDtoSTV(ID, source, target, variant, sawSource);
+    return find(source, target, variant);
+}
+
+/**
+ * Top-level find method.  Attempt to find a source-target/variant in
+ * either the dynamic or the static (locale resource) store.  Perform
+ * fallback.
+ * 
+ * Lookup sequence for ss_SS_SSS-tt_TT_TTT/v:
+ *
+ *   ss_SS_SSS-tt_TT_TTT/v -- in hashtable
+ *   ss_SS_SSS-tt_TT_TTT/v -- in ss_SS_SSS (no fallback)
+ * 
+ *     repeat with t = tt_TT_TTT, tt_TT, tt, and tscript
+ *
+ *     ss_SS_SSS-t/ *
+ *     ss_SS-t/ *
+ *     ss-t/ *
+ *     sscript-t/ *
+ *
+ * Here * matches the first variant listed.
+ *
+ * Caller does NOT own returned object.  Return 0 on failure.
+ */
+TransliteratorEntry* TransliteratorRegistry::find(UnicodeString& source,
+                                    UnicodeString& target,
+                                    UnicodeString& variant) {
+    
+    TransliteratorSpec src(source);
+    TransliteratorSpec trg(target);
+    TransliteratorEntry* entry;
+
+    // Seek exact match in hashtable.  Temporary fix for ICU 4.6.
+    // TODO: The general logic for finding a matching transliterator needs to be reviewed.
+    // ICU ticket #8089
+    UnicodeString ID;
+    TransliteratorIDParser::STVtoID(source, target, variant, ID);
+    entry = (TransliteratorEntry*) registry.get(ID);
+    if (entry != 0) {
+        // std::string ss;
+        // std::cout << ID.toUTF8String(ss) << std::endl;
+        return entry;
+    }
+
+    if (variant.length() != 0) {
+        
+        // Seek exact match in hashtable
+        entry = findInDynamicStore(src, trg, variant);
+        if (entry != 0) {
+            return entry;
+        }
+        
+        // Seek exact match in locale resources
+        entry = findInStaticStore(src, trg, variant);
+        if (entry != 0) {
+            return entry;
+        }
+    }
+
+    for (;;) {
+        src.reset();
+        for (;;) {
+            // Seek match in hashtable
+            entry = findInDynamicStore(src, trg, NO_VARIANT);
+            if (entry != 0) {
+                return entry;
+            }
+            
+            // Seek match in locale resources
+            entry = findInStaticStore(src, trg, NO_VARIANT);
+            if (entry != 0) {
+                return entry;
+            }
+            if (!src.hasFallback()) {
+                break;
+            }
+            src.next();
+        }
+        if (!trg.hasFallback()) {
+            break;
+        }
+        trg.next();
+    }
+
+    return 0;
+}
+
+/**
+ * Given an Entry object, instantiate it.  Caller owns result.  Return
+ * 0 on failure.
+ *
+ * Return a non-empty aliasReturn value if the ID points to an alias.
+ * We cannot instantiate it ourselves because the alias may contain
+ * filters or compounds, which we do not understand.  Caller should
+ * make aliasReturn empty before calling.
+ *
+ * The entry object is assumed to reside in the dynamic store.  It may be
+ * modified.
+ */
+Transliterator* TransliteratorRegistry::instantiateEntry(const UnicodeString& ID,
+                                                         TransliteratorEntry *entry,
+                                                         TransliteratorAlias* &aliasReturn,
+                                                         UErrorCode& status) {
+    Transliterator *t = 0;
+    U_ASSERT(aliasReturn == 0);
+
+    switch (entry->entryType) {
+    case TransliteratorEntry::RBT_DATA:
+        t = new RuleBasedTransliterator(ID, entry->u.data);
+        if (t == 0) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+        }
+        return t;
+    case TransliteratorEntry::PROTOTYPE:
+        t = entry->u.prototype->clone();
+        if (t == 0) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+        }
+        return t;
+    case TransliteratorEntry::ALIAS:
+        aliasReturn = new TransliteratorAlias(entry->stringArg, entry->compoundFilter);
+        if (aliasReturn == 0) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+        }
+        return 0;
+    case TransliteratorEntry::FACTORY:
+        t = entry->u.factory.function(ID, entry->u.factory.context);
+        if (t == 0) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+        }
+        return t;
+    case TransliteratorEntry::COMPOUND_RBT:
+        {
+            UVector* rbts = new UVector(entry->u.dataVector->size(), status);
+            // Check for null pointer
+            if (rbts == NULL) {
+            	status = U_MEMORY_ALLOCATION_ERROR;
+            	return NULL;
+            }
+            int32_t passNumber = 1;
+            for (int32_t i = 0; U_SUCCESS(status) && i < entry->u.dataVector->size(); i++) {
+                // TODO: Should passNumber be turned into a decimal-string representation (1 -> "1")?
+                Transliterator* t = new RuleBasedTransliterator(UnicodeString(CompoundTransliterator::PASS_STRING) + UnicodeString(passNumber++),
+                    (TransliterationRuleData*)(entry->u.dataVector->elementAt(i)), FALSE);
+                if (t == 0)
+                    status = U_MEMORY_ALLOCATION_ERROR;
+                else
+                    rbts->addElement(t, status);
+            }
+            if (U_FAILURE(status)) {
+                delete rbts;
+                return 0;
+            }
+            aliasReturn = new TransliteratorAlias(ID, entry->stringArg, rbts, entry->compoundFilter);
+        }
+        if (aliasReturn == 0) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+        }
+        return 0;
+    case TransliteratorEntry::LOCALE_RULES:
+        aliasReturn = new TransliteratorAlias(ID, entry->stringArg,
+                                              (UTransDirection) entry->intArg);
+        if (aliasReturn == 0) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+        }
+        return 0;
+    case TransliteratorEntry::RULES_FORWARD:
+    case TransliteratorEntry::RULES_REVERSE:
+        // Process the rule data into a TransliteratorRuleData object,
+        // and possibly also into an ::id header and/or footer.  Then
+        // we modify the registry with the parsed data and retry.
+        {
+            TransliteratorParser parser(status);
+            
+            // We use the file name, taken from another resource bundle
+            // 2-d array at static init time, as a locale language.  We're
+            // just using the locale mechanism to map through to a file
+            // name; this in no way represents an actual locale.
+            //CharString ch(entry->stringArg);
+            //UResourceBundle *bundle = ures_openDirect(0, ch, &status);
+            UnicodeString rules = entry->stringArg;
+            //ures_close(bundle);
+            
+            //if (U_FAILURE(status)) {
+                // We have a failure of some kind.  Remove the ID from the
+                // registry so we don't keep trying.  NOTE: This will throw off
+                // anyone who is, at the moment, trying to iterate over the
+                // available IDs.  That's acceptable since we should never
+                // really get here except under installation, configuration,
+                // or unrecoverable run time memory failures.
+            //    remove(ID);
+            //} else {
+                
+                // If the status indicates a failure, then we don't have any
+                // rules -- there is probably an installation error.  The list
+                // in the root locale should correspond to all the installed
+                // transliterators; if it lists something that's not
+                // installed, we'll get an error from ResourceBundle.
+                aliasReturn = new TransliteratorAlias(ID, rules,
+                    ((entry->entryType == TransliteratorEntry::RULES_REVERSE) ?
+                     UTRANS_REVERSE : UTRANS_FORWARD));
+                if (aliasReturn == 0) {
+                    status = U_MEMORY_ALLOCATION_ERROR;
+                }
+            //}
+        }
+        return 0;
+    default:
+        U_ASSERT(FALSE); // can't get here
+        return 0;
+    }
+}
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_TRANSLITERATION */
+
+//eof
+                                                                                                                                                                                                                                         îúª¢,x"93ºy(Šs£°÷ÌÕï	$ÁöŞ‘.¥µ¼^`Ù×ı*)ùcV/ù=€§¬•1z ¼$³©3=§p|ÕH’ÍÆØ!S5n×ğó=_s®–²¿´>ñ÷±òËlõú‡ (/Ğ³(Íd±Ã!mäÏu©âáş˜wY£úà­TXqUµ±GËBÅe¾]¹í»óÂ¥mÍL,ÙŞ½Ñ$£mºÿ_hNL°±Ã‹±0‡¥…£‚ÒªÄ€Èññaë¶ÊKÀ8)Ã¤‹Óëz²ÅŸŒŠŞª(fb}|IİÁ`Ø7=	®ú&"m •fh˜•ÌG¢n¸B§5?ƒ€#c*D6´‘{vÅ¿Æ®Ğ‰õCXœòw=a2È¹ªyä/O~l¥!'‘fAxmrk8¡Ù|Ñ¦Å–Ş“‰†+„'Ä¸2<ïaa³ö4d@ò.PÃ'–‡Zq±òQ‡Zn‹£22^áóÑ {MTëë—4)™<Üh?şC¢´?xÇÓl]ÕÎWIØEÎ¶k&¾[^°ÉükY·ÛÀı€Wäcñ)f!nó™Ë	¸gåƒ©#H>¦|fœ”½ŞÜüIhKŸU¦¹ª²V|:ÑËáu/|'­uŒ?Ñƒm·¾ë4ğ$<¾1³-N^-kw/ìæé\ï+p²ºZl¸ntR¦y3p\ìiPgE`!ğQùé¤,Ç€Ø™PÇÓ§©¾³RmArÖ<ø9K\?<]LOğOøÑr/‡Åé;ç»‡Ë´zğö_åşıÛêH÷m9ûÍÃ'ÃçåŠßmÁUi[äåÀ¦Ş"9Úu@m#á2hPèOu´àû°ÔÂ™Cç‹¾
+Ò¿Qe¬çíKõ¿6­Ïƒ8:|ŒëºÌ[½/:Íñ‘°üãªoº‚“Ä³
+ñè2·í~‹Ó1ÿo/™«OuÛv	±K@‹ö/Ly¢i…Ÿ»°#áÕ´HÜ{ª,@êøäĞ~yAEa"kBmÈî)Ö_”!d4Êˆ! ÑÙğrTÚßÁÅÜR&c¯Å4Ok£Àoz¼G÷À…7â;MôT Ãç€@*o'ù¤hsÜÔÒ¯O:ùËY53kÑß±7‹ÄÙªxXDâƒtÛ„Oé‰es¿=|í2€yëyŠğ÷¼ê¢>JôxÁƒP"¶}XÄ¤Dæ‘¤¸:ş—6¹ÌZÊ·èëÉWd?­Ü9i\ƒ¸pÊyàÊÅ×ÉÎ –ˆZoò4Ø±·ˆşê¿ìqP©6ºñvùBøŸ«\ğl¨fVQ)ó·ãQwÏû5;È¨ Š„&},ˆÈJpJ–›ÿáëşÒî¾ÿëçíf*¶´4D:Ñ…Ü€ój^˜Dïâßø3ùvïQÕÃşYz÷õJBÍœ!ØÄ8i`!O¿‹JÙ şzXä¼¿Ñ½m©£ù%¡{òËa‹0ª‰¯\1qlã#7¢™úS/İTìÄ‚Š®åÏK§nTú4uù?ò¶Ñ[“¸(³äíg·B¥q·9Ô÷>YA²¼a7Qs³)'õ4ÜŸ˜Œ‹eÍ8ùQŞ– *¤Œ,ş4¼¢³‹ğÄ¸F·h§15Ø¨×>·œ@ª?<ºsÚ›3çâjÔ7[ÓSúXñ2ø¢ËIï¤áË(Ö:¤½óÏY*ÙšSó†Ô… ½eĞ#éÕ* :léĞ/	ò€-¥<-M^Ş™7—Ø°£í_qs}F¬<×úÈ“dQ	ßP À~
+"¨uT7lOQèddpé‡Kã&OUàUÉm¢¼ßúU/Rº†êœ|•‡ˆ„ü†Ày&zä(aÉxrp˜k™ŠÜ¯¨an]=oI¶ã
+AæºzÌ>bL2ÜXä%¤MO4Õ@Ùßä£7Ï¨"°öÇóšP4`¢ØúdÉNÌT­xeİ­E˜ïh³éŸÑ6¾·˜dÏ‰‡Ä	=’çgã·fï!]ZºËes’œUµÈvÁBsÃĞ×ÿJÁsj†"v¼z­œ¦ú¦˜r¢Ez/èv%÷DÂ*¹ù¡Ò…¹QòÒr…ˆÂ2ÈÑÜ0Ê…’>6ñB%Ç…VG“åÂW5é¬ş£*xêL~­~co)ˆp¹ø†`Ê¦î^ î[InÒÂå'¡!ôª®Rç¡^§§Í}]tªq2¥:.ˆ´ÿ	¿ÓaºÛ¦nLÎÓ¯Îæ6¥ìö‚DÊIİİÛÓÑëYQ\WïoÿvGfm+<K(ĞÇGŒ­ïO1åÁ@³,îoÆ´îõhGNæAîp¾“¡ÔÍ9°hœG#ÃWó¹†)açÒòşfn7gîB›”ıƒxz'æ9`é_€Ì›zlŠ‹‹A8ø(¼xÒz³é½Ym|Ãì!Û1Tº :í/›ÙT>)êŒYÛú÷œ·ó|H¯œ‰;eÎm”X¸N©şä£Êº³½ºjIÆf^ÂCâ#F)£²Iİ€^o'T°2GuàQ¥Ñ£y2ä‹9÷¸u,úUŒsÍ1aí/‘-?³­$ ¼Ë¯hí¥kMy$;êÇâ“—í£<åÌóçÁğ±€ œŞòÅçéoKÅŞĞF”órÆp+H[“
+{¾Èndf“.iv#„›BÅarÁ2R½Ô´.›GîĞ‡Äø&½‰ÎµPs.õàÉe=º–oî9®æ{C5­PÏoÃªlVÆÀà¾dqÔĞƒE}#€õ¦?:©üD¹tO£SXPşÓ|±ÂÅ rLæì€·øoŠï«Ûlß\!‡;WGcyYä¿±ÊE¶ò¬®×Ç{©ñe©j/“U·Hç>„¼µ¢;-•ó%#ú¨´òò¢ÚÎS¨Ÿ©Ú’Š¦&öÉèĞ‚'<e›oÀì¦Uß{u^·×/7ÇäòÖ$$
+?_9êÍ?Aç<u8Fñ`ä5ïÎòÀ¸¿5x9œÆü:Jî¶î‡¿iY8Os>j£wôS¹!¦Ï¹^‚Å ü¹zêå¤0H§üßÔ¼XWÆ4ŞKA(ÊñTpˆåyÿ”J_•¡âSš^AÒÊpÊ¬ßÁÂ5}Ğ.$Eê¸ëÜGSuÇÖ“!v¡À¢%–3+1kÕ¼2Â˜îk¥¢9‚ 3fjQ²Í	jŠâX)©¸%ÈMµÓÜ£ÓgÍè"…?æŒØøgYpÄ²­ U9ô¥;LdyXŞ¢A>½Á	·/.pÚ§}Şîõk³y|•‹l]îCò5ÿA¢7S–:\İ}û#}« &yèBêntt(«orƒâyùNMğ_likañŠ·¶l¸é¢ø0fïNLnynYw(†NlÙßR©å­ö¹)÷]˜ûê”®ŒıU BÎ©Şíe¥6[oúKèb‡Êô —@¬’5ï R)Éİ”‡äí0ö„¤…=„^‡ÿ•:ïVŠ—Oo „>•å(ûõÁŠ—ºài†: ?†$/Ãg?Í1™Éa˜ SZnÉ'¼Åß
+õGCÓï¥©`“Ê@İòÛÎö‹Î4èÃñBœi"Ş*<,oÜ?Ğ´Ù89‡*mja)¦ÛD &ÁÊpPÚëšÊ“4›ÁS¯•ç®èx³âñP=r¶Ÿö‡Êƒ¨d$9Ç€Ç-\â«Å]÷a
+Úé4Èa87ÈÀX-€S»Yú+Ô­LÕvP¸9òZĞÜ6¶6è4¨:6a¬a‡Õ·Mò1à/H;ï»-äÿtè‡°–§6Îgš¼®0ŸÂ9†gAL’æœëÿª¬½ƒ%ëù¦H© †u§9#øË!S[òt§±)ûŸƒv“M¸ù/Ü·³ã—{NŞ|-æ´Óîí0š‡w„ıî
+=‚ûlµ>:
+HúÆ”«:âGşñ÷Ìõ(¼ó_„D†»ŒZ·©ÀÜf"ºG›!ªæÓrà+;UH6¬,Å­âÄa†å6ùE¿7eİ
+ñ‡â÷Lµ†Y±eHLY‘.–œè
+ÇgHªØŸÙµ<¿¿ÌU/*
+*******************************************************************************
+* Copyright (C) 2011-2013, International Business Machines Corporation and
+* others. All Rights Reserved.
+*******************************************************************************
+*/
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "tzgnames.h"
+
+#include "unicode/basictz.h"
+#include "unicode/locdspnm.h"
+#include "unicode/msgfmt.h"
+#include "unicode/rbtz.h"
+#include "unicode/simpletz.h"
+#include "unicode/vtzone.h"
+
+#include "cmemory.h"
+#include "cstring.h"
+#include "mutex.h"
+#include "uhash.h"
+#include "uassert.h"
+#include "umutex.h"
+#include "uresimp.h"
+#include "ureslocs.h"
+#include "zonemeta.h"
+#include "tznames_impl.h"
+#include "olsontz.h"
+#include "ucln_in.h"
+
+U_NAMESPACE_BEGIN
+
+#define ZID_KEY_MAX  128
+
+static const char gZoneStrings[]                = "zoneStrings";
+
+static const char gRegionFormatTag[]            = "regionFormat";
+static const char gFallbackFormatTag[]          = "fallbackFormat";
+
+static const UChar gEmpty[]                     = {0x00};
+
+static const UChar gDefRegionPattern[]          = {0x7B, 0x30, 0x7D, 0x00}; // "{0}"
+static const UChar gDefFallbackPattern[]        = {0x7B, 0x31, 0x7D, 0x20, 0x28, 0x7B, 0x30, 0x7D, 0x29, 0x00}; // "{1} ({0})"
+
+static const double kDstCheckRange      = (double)184*U_MILLIS_PER_DAY;
+
+
+
+U_CDECL_BEGIN
+
+typedef struct PartialLocationKey {
+    const UChar* tzID;
+    const UChar* mzID;
+    UBool isLong;
+} PartialLocationKey;
+
+/**
+ * Hash function for partial location name hash key
+ */
+static int32_t U_CALLCONV
+hashPartialLocationKey(const UHashTok key) {
+    // <tzID>&<mzID>#[L|S]
+    PartialLocationKey *p = (PartialLocationKey *)key.pointer;
+    UnicodeString str(p->tzID);
+    str.append((UChar)0x26)
+        .append(p->mzID, -1)
+        .append((UChar)0x23)
+        .append((UChar)(p->isLong ? 0x4C : 0x53));
+    return str.hashCode();
+}
+
+/**
+ * Comparer for partial location name hash key
+ */
+static UBool U_CALLCONV
+comparePartialLocationKey(const UHashTok key1, const UHashTok key2) {
+    PartialLocationKey *p1 = (PartialLocationKey *)key1.pointer;
+    PartialLocationKey *p2 = (PartialLocationKey *)key2.pointer;
+
+    if (p1 == p2) {
+        return TRUE;
+    }
+    if (p1 == NULL || p2 == NULL) {
+        return FALSE;
+    }
+    // We just check identity of tzID/mzID
+    return (p1->tzID == p2->tzID && p1->mzID == p2->mzID && p1->isLong == p2->isLong);
+}
+
+/**
+ * Deleter for GNameInfo
+ */
+static void U_CALLCONV
+deleteGNameInfo(void *obj) {
+    uprv_free(obj);
+}
+
+/**
+ * GNameInfo stores zone name information in the local trie
+ */
+typedef struct GNameInfo {
+    UTimeZoneGenericNameType    type;
+    const UChar*                tzID;
+} ZNameInfo;
+
+/**
+ * GMatchInfo stores zone name match information used by find method
+ */
+typedef struct GMatchInfo {
+    const GNameInfo*    gnameInfo;
+    int32_t             matchLength;
+    UTimeZoneFormatTimeType   timeType;
+} ZMatchInfo;
+
+U_CDECL_END
+
+// ---------------------------------------------------
+// The class stores time zone generic name match information
+// ---------------------------------------------------
+class TimeZoneGenericNameMatchInfo : public UMemory {
+public:
+    TimeZoneGenericNameMatchInfo(UVector* matches);
+    ~TimeZoneGenericNameMatchInfo();
+
+    int32_t size() const;
+    UTimeZoneGenericNameType getGenericNameType(int32_t index) const;
+    int32_t getMatchLength(int32_t index) const;
+    UnicodeString& getTimeZoneID(int32_t index, UnicodeString& tzID) const;
+
+private:
+    UVector* fMatches;  // vector of MatchEntry
+};
+
+TimeZoneGenericNameMatchInfo::TimeZoneGenericNameMatchInfo(UVector* matches)
+: fMatches(matches) {
+}
+
+TimeZoneGenericNameMatchInfo::~TimeZoneGenericNameMatchInfo() {
+    if (fMatches != NULL) {
+        delete fMatches;
+    }
+}
+
+int32_t
+TimeZoneGenericNameMatchInfo::size() const {
+    if (fMatches == NULL) {
+        return 0;
+    }
+    return fMatches->size();
+}
+
+UTimeZoneGenericNameType
+TimeZoneGenericNameMatchInfo::getGenericNameType(int32_t index) const {
+    GMatchInfo *minfo = (GMatchInfo *)fMatches->elementAt(index);
+    if (minfo != NULL) {
+        return static_cast<UTimeZoneGenericNameType>(minfo->gnameInfo->type);
+    }
+    return UTZGNM_UNKNOWN;
+}
+
+int32_t
+TimeZoneGenericNameMatchInfo::getMatchLength(int32_t index) const {
+    ZMatchInfo *minfo = (ZMatchInfo *)fMatches->elementAt(index);
+    if (minfo != NULL) {
+        return minfo->matchLength;
+    }
+    return -1;
+}
+
+UnicodeString&
+TimeZoneGenericNameMatchInfo::getTimeZoneID(int32_t index, UnicodeString& tzID) const {
+    GMatchInfo *minfo = (GMatchInfo *)fMatches->elementAt(index);
+    if (minfo != NULL && minfo->gnameInfo->tzID != NULL) {
+        tzID.setTo(TRUE, minfo->gnameInfo->tzID, -1);
+    } else {
+        tzID.setToBogus();
+    }
+    return tzID;
+}
+
+// ---------------------------------------------------
+// GNameSearchHandler
+// ---------------------------------------------------
+class GNameSearchHandler : public TextTrieMapSearchResultHandler {
+public:
+    GNameSearchHandler(uint32_t types);
+    virtual ~GNameSearchHandler();
+
+    UBool handleMatch(int32_t matchLength, const CharacterNode *node, UErrorCode &status);
+    UVector* getMatches(int32_t& maxMatchLen);
+
+private:
+    uint32_t fTypes;
+    UVector* fResults;
+    int32_t fMaxMatchLen;
+};
+
+GNameSearchHandler::GNameSearchHandler(uint32_t types)
+: fTypes(types), fResults(NULL), fMaxMatchLen(0) {
+}
+
+GNameSearchHandler::~GNameSearchHandler() {
+    if (fResults != NULL) {
+        delete fResults;
+    }
+}
+
+UBool
+GNameSearchHandler::handleMatch(int32_t matchLength, const CharacterNode *node, UErrorCode &status) {
+    if (U_FAILURE(status)) {
+        return FALSE;
+    }
+    if (node->hasValues()) {
+        int32_t valuesCount = node->countValues();
+        for (int32_t i = 0; i < valuesCount; i++) {
+            GNameInfo *nameinfo = (ZNameInfo *)node->getValue(i);
+            if (nameinfo == NULL) {
+                break;
+            }
+            if ((nameinfo->type & fTypes) != 0) {
+                // matches a requested type
+                if (fResults == NULL) {
+                    fResults = new UVector(uprv_free, NULL, status);
+                    if (fResults == NULL) {
+                        status = U_MEMORY_ALLOCATION_ERROR;
+                    }
+                }
+                if (U_SUCCESS(status)) {
+                    U_ASSERT(fResults != NULL);
+                    GMatchInfo *gmatch = (GMatchInfo *)uprv_malloc(sizeof(GMatchInfo));
+                    if (gmatch == NULL) {
+                        status = U_MEMORY_ALLOCATION_ERROR;
+                    } else {
+                        // add the match to the vector
+                        gmatch->gnameInfo = nameinfo;
+                        gmatch->matchLength = matchLength;
+                        gmatch->timeType = UTZFMT_TIME_TYPE_UNKNOWN;
+                        fResults->addElement(gmatch, status);
+                        if (U_FAILURE(status)) {
+                            uprv_free(gmatch);
+                        } else {
+                            if (matchLength > fMaxMatchLen) {
+                                fMaxMatchLen = matchLength;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return TRUE;
+}
+
+UVector*
+GNameSearchHandler::getMatches(int32_t& maxMatchLen) {
+    // give the ownership to the caller
+    UVector *results = fResults;
+    maxMatchLen = fMaxMatchLen;
+
+    // reset
+    fResults = NULL;
+    fMaxMatchLen = 0;
+    return results;
+}
+
+static UMutex gLock = U_MUTEX_INITIALIZER;
+
+class TZGNCore : public UMemory {
+public:
+    TZGNCore(const Locale& locale, UErrorCode& status);
+    virtual ~TZGNCore();
+
+    UnicodeString& getDisplayName(const TimeZone& tz, UTimeZoneGenericNameType type,
+                        UDate date, UnicodeString& name) const;
+
+    UnicodeString& getGenericLocationName(const UnicodeString& tzCanonicalID, UnicodeString& name) const;
+
+    int32_t findBestMatch(const UnicodeString& text, int32_t start, uint32_t types,
+        UnicodeString& tzID, UTimeZoneFormatTimeType& timeType, UErrorCode& status) const;
+
+private:
+    Locale fLocale;
+    const TimeZoneNames* fTimeZoneNames;
+    UHashtable* fLocationNamesMap;
+    UHashtable* fPartialLocationNamesMap;
+
+    MessageFormat* fRegionFormat;
+   

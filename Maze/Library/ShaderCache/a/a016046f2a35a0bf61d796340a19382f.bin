@@ -1,0 +1,74 @@
+========================================
+  -->
+  <PropertyGroup>
+    <ResolveWixExtensionReferencesDependsOn>
+      PrepareForBuild
+    </ResolveWixExtensionReferencesDependsOn>
+  </PropertyGroup>
+  <Target
+    Name="ResolveWixExtensionReferences"
+    DependsOnTargets="$(ResolveWixExtensionReferencesDependsOn)"
+    Condition=" '@(WixExtension)' != ''">
+
+    <!--
+    The WixExtensionSearchPaths property is set to find assemblies in the following order:
+
+        (1) $(ReferencePaths) - the reference paths property, which comes from the .USER file.
+        (2) The hintpath from the referenced item itself, indicated by {HintPathFromItem}.
+        (3) Treat the reference's Include as if it were a real file name.
+        (4) Path specified by the WixExtDir property.
+    -->
+    <CreateProperty Condition=" '$(WixExtensionSearchPaths)' == '' " Value="
+      $(ReferencePaths);
+      {HintPathFromItem};
+      {RawFileName};
+      $(WixExtDir)
+      ">
+      <Output TaskParameter="Value" PropertyName="WixExtensionSearchPaths" />
+    </CreateProperty>
+
+    <ResolveWixReferences
+      WixReferences="@(WixExtension)"
+      SearchPaths="$(WixExtensionSearchPaths)"
+      SearchFilenameExtensions=".dll">
+      <Output TaskParameter="ResolvedWixReferences" ItemName="_AllResolvedWixExtensionPaths" />
+    </ResolveWixReferences>
+
+    <!-- Remove duplicate extension items that would cause build errors -->
+    <RemoveDuplicates Inputs="@(_AllResolvedWixExtensionPaths)">
+      <Output TaskParameter="Filtered" ItemName="_ResolvedWixExtensionPaths" />
+    </RemoveDuplicates>
+  </Target>
+
+  <!--
+  ==================================================================================================
+  PreBuildEvent
+
+    Run the pre-build event if there is one.
+  ==================================================================================================
+  -->
+  <PropertyGroup>
+    <PreBuildEventDependsOn>GetTargetPath</PreBuildEventDependsOn>
+  </PropertyGroup>
+  <Target
+    Name="PreBuildEvent"
+    DependsOnTargets="$(PreBuildEventDependsOn)"
+    Condition=" '$(PreBuildEvent)' != '' ">
+
+    <ReplaceString
+      Text="$(PreBuildEvent)"
+      OldValue="!(TargetPath)"
+      NewValue="$(TargetPath)">
+
+      <Output TaskParameter="Text" PropertyName="ExpandedPreBuildEvent" />
+    </ReplaceString>
+
+    <ReplaceString
+      Text="$(ExpandedPreBuildEvent)"
+      OldValue="!(TargetPdbPath)"
+      NewValue="$(TargetPdbPath)">
+
+      <Output TaskParameter="Text" PropertyName="ExpandedPreBuildEvent" />
+    </ReplaceString>
+
+ 

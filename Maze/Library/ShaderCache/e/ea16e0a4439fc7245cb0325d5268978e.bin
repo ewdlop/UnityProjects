@@ -1,0 +1,144 @@
+e.MoveToFirstChild())
+                {
+                    ++level;
+                }
+                else if (contextNode.MoveToNext())
+                {
+
+                }
+                else
+                {
+                    while (level > 0)
+                    {
+                        contextNode.MoveToParent();
+                        --level;
+
+                        if (contextNode.MoveToNext())
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+#if DEBUG_FILTER
+        public override string ToString()
+        {
+            return string.Format("{0}, {1}:{2}", this.type, this.qname.ns, this.qname.name);
+        }
+#endif
+
+    }
+
+    // General purpose selector
+    // Pops all parameters from the value stack
+    internal class SelectOpcode : Opcode
+    {
+        protected NodeSelectCriteria criteria;
+
+        internal SelectOpcode(NodeSelectCriteria criteria)
+            : this(OpcodeID.Select, criteria)
+        {
+        }
+
+        internal SelectOpcode(OpcodeID id, NodeSelectCriteria criteria)
+            : this(id, criteria, OpcodeFlags.None)
+        {
+        }
+
+        internal SelectOpcode(OpcodeID id, NodeSelectCriteria criteria, OpcodeFlags flags)
+            : base(id)
+        {
+            this.criteria = criteria;
+            this.flags |= (flags | OpcodeFlags.Select);
+            if (criteria.IsCompressable && (0 == (this.flags & OpcodeFlags.InitialSelect)))
+            {
+                this.flags |= OpcodeFlags.CompressableSelect;
+            }
+        }
+
+        internal NodeSelectCriteria Criteria
+        {
+            get
+            {
+                return this.criteria;
+            }
+        }
+
+        internal override bool Equals(Opcode op)
+        {
+            if (base.Equals(op))
+            {
+                return this.criteria.Equals(((SelectOpcode)op).criteria);
+            }
+
+            return false;
+        }
+
+        internal override Opcode Eval(ProcessingContext context)
+        {
+            StackFrame topFrame = context.TopSequenceArg;
+            SeekableXPathNavigator node = null;
+            Value[] sequences = context.Sequences;
+
+            for (int i = topFrame.basePtr; i <= topFrame.endPtr; ++i)
+            {
+                // Each NodeSequence will generate a new one, but only if the source FilterSequence isn't empty
+                // If the source FilterSequence is empty, release it and replace it with an empty sequence
+                NodeSequence sourceSeq = sequences[i].Sequence;
+                int sourceSeqCount = sourceSeq.Count;
+                if (sourceSeqCount == 0)
+                {
+                    context.ReplaceSequenceAt(i, NodeSequence.Empty);
+                    context.ReleaseSequence(sourceSeq);
+                }
+                else
+                {
+                    NodeSequenceItem[] items = sourceSeq.Items;
+                    if (sourceSeq.CanReuse(context))
+                    {
+                        node = items[0].GetNavigator();
+                        sourceSeq.Clear();
+                        sourceSeq.StartNodeset();
+
+                        this.criteria.Select(node, sourceSeq);
+
+                        sourceSeq.StopNodeset();
+                    }
+                    else
+                    {
+                        NodeSequence newSeq = null;
+                        for (int item = 0; item < sourceSeqCount; ++item)
+                        {
+                            node = items[item].GetNavigator();
+                            Fx.Assert(null != node, "");
+                            if (null == newSeq)
+                            {
+                                newSeq = context.CreateSequence();
+                            }
+                            newSeq.StartNodeset();
+                            this.criteria.Select(node, newSeq);
+                            newSeq.StopNodeset();
+                        }
+                        context.ReplaceSequenceAt(i, (null != newSeq) ? newSeq : NodeSequence.Empty);
+                        context.ReleaseSequence(sourceSeq);
+                    }
+                }
+            }
+
+            return this.next;
+        }
+
+        internal override Opcode Eval(NodeSequence sequence, SeekableXPathNavigator node)
+        {
+            if (this.next == null || 0 == (this.next.Flags & OpcodeFlags.CompressableSelect))
+            {
+                // The next opcode is not a compressible select. Complete the select operation and return the next opcode
+                sequence.StartNodeset();
+                this.criteria.Select(node, sequence);
+                sequence.StopNodeset();
+                return this.next;
+            }
+
+  

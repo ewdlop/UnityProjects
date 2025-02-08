@@ -1,0 +1,335 @@
+			{
+				if(!bTransactionBegun)
+				{
+					InterpEd->BeginMoveSelectedKeys();
+					bTransactionBegun = true;
+				}
+
+				float DeltaTime = -DeltaX / InterpEd->PixelsPerSec;
+				InterpEd->MoveSelectedKeys(DeltaTime);
+			}
+		}
+		else if(bNavigating)
+		{
+			float DeltaTime = -DeltaX / InterpEd->NavPixelsPerSecond;
+			InterpEd->ViewStartTime += DeltaTime;
+			InterpEd->ViewEndTime += DeltaTime;
+			InterpEd->SyncCurveEdView();
+		}
+		else if(bGrabbingMarker)
+		{
+			float DeltaTime = -DeltaX / InterpEd->PixelsPerSec;
+			InterpEd->UnsnappedMarkerPos += DeltaTime;
+
+			if(InterpEd->GrabbedMarkerType == EMatineeMarkerType::ISM_SeqEnd)
+			{
+				InterpEd->SetInterpEnd( InterpEd->SnapTime(InterpEd->UnsnappedMarkerPos, false) );
+			}
+			else if(InterpEd->GrabbedMarkerType == EMatineeMarkerType::ISM_LoopStart || InterpEd->GrabbedMarkerType == EMatineeMarkerType::ISM_LoopEnd)
+			{
+				InterpEd->MoveLoopMarker( InterpEd->SnapTime(InterpEd->UnsnappedMarkerPos, false), InterpEd->GrabbedMarkerType == EMatineeMarkerType::ISM_LoopStart );
+			}
+		}
+		else if(bPanning)
+		{
+			const bool bInvertPanning = InterpEd->IsInvertPanToggled();
+
+			float DeltaTime = (bInvertPanning ? -DeltaX : DeltaX) / InterpEd->PixelsPerSec;
+			InterpEd->ViewStartTime -= DeltaTime;
+			InterpEd->ViewEndTime -= DeltaTime;
+
+			// Handle vertical scrolling if the user moved the mouse up or down.
+			// Vertical scrolling is handled by modifying the scroll bar attributes
+			// because the scroll bar drives the vertical position of the viewport. 
+			if( DeltaY != 0 )
+			{
+				// Account for the 'Drag Moves Canvas' option, which determines if panning 
+				// is inverted, when figuring out the desired destination thumb position.
+				const int32 TargetThumbPosition = bInvertPanning ? ThumbPos_Vert - DeltaY : ThumbPos_Vert + DeltaY;
+
+				// Figure out which window we are panning
+				TSharedPtr<SMatineeViewport> WindowToPan = bIsDirectorTrackWindow ? InterpEd->DirectorTrackWindow : InterpEd->TrackWindow;
+
+				// Determine the maximum scroll position in order to prevent the user from scrolling beyond the 
+				// valid scroll range. The max scroll position is not equivalent to the max range of the scroll 
+				// bar. We must subtract the size of the thumb because the thumb position is the top of the thumb.
+				int32 MaxThumbPosition = ComputeGroupListContentHeight(); 
+
+				// Make sure the max thumb position is not negative. This is possible if the amount 
+				// of scrollable space is less than the scroll bar (i.e. no scrolling possible). 
+				MaxThumbPosition = FMath::Max<int32>( 0, MaxThumbPosition );
+
+				// For some reason, the thumb position is always negated. So, instead 
+				// of clamping from zero - max, we clamp from -max to zero.  
+				ThumbPos_Vert = FMath::Clamp<int32>( TargetThumbPosition, -MaxThumbPosition, 0 );
+
+				// Redraw the scroll bar so that it is at its new position. 
+				WindowToPan->AdjustScrollBar();
+			}
+
+			InterpEd->SyncCurveEdView();
+		}
+	}
+}
+
+bool FMatineeViewportClient::InputAxis(FViewport* InViewport, int32 ControllerId, FKey Key, float Delta, float DeltaTime, int32 NumSamples, bool bGamepad)
+{
+	if ( Key == EKeys::MouseX || Key == EKeys::MouseY )
+	{
+		int32 X = InViewport->GetMouseX();
+		int32 Y = InViewport->GetMouseY();
+		MouseMove(InViewport, X, Y);
+		return true;
+	}
+	return false;
+}
+
+EMouseCursor::Type FMatineeViewportClient::GetCursor(FViewport* InViewport,int32 X,int32 Y)
+{
+	EMouseCursor::Type Result = EMouseCursor::Crosshairs;
+
+	if(DragObject==nullptr)
+	{
+		HHitProxy*	HitProxy = InViewport->GetHitProxy(X,Y);
+		
+		if(HitProxy)
+		{
+			Result = HitProxy->GetMouseCursor();
+		}
+	}
+	else
+	{
+		Result = EMouseCursor::Default;
+	}
+
+	return Result;
+}
+
+void FMatineeViewportClient::Tick(float DeltaSeconds)
+{
+	// Only the main track window is allowed to tick the root object.  We never want the InterpEd object to be
+	// ticked more than once per frame.
+	if( !bIsDirectorTrackWindow )
+	{
+		InterpEd->TickInterp(DeltaSeconds);
+	}
+
+	// If curve editor is shown - sync us with it.
+	if(InterpEd->CurveEd->GetVisibility() == EVisibility::Visible)
+	{
+		InterpEd->ViewStartTime = InterpEd->CurveEd->GetStartIn();
+		InterpEd->ViewEndTime = InterpEd->CurveEd->GetEndIn();
+	}
+
+	if(bNavigating || bPanning)
+	{
+		const int32 ScrollBorderSize = 20;
+		const float	ScrollBorderSpeed = 500.f;
+		const int32 PosX = Viewport->GetMouseX();
+		const int32 PosY = Viewport->GetMouseY();
+		const int32 SizeX = Viewport->GetSizeXY().X;
+		const int32 SizeY = Viewport->GetSizeXY().Y;
+
+		float DeltaTime = FMath::Clamp(DeltaSeconds, 0.01f, 1.0f);
+
+		if(PosX < ScrollBorderSize)
+		{
+			ScrollAccum.X += (1.f - ((float)PosX/(float)ScrollBorderSize)) * ScrollBorderSpeed * DeltaTime;
+		}
+		else if(PosX > SizeX - ScrollBorderSize)
+		{
+			ScrollAccum.X -= ((float)(PosX - (SizeX - ScrollBorderSize))/(float)ScrollBorderSize) * ScrollBorderSpeed * DeltaTime;
+		}
+		else
+		{
+			ScrollAccum.X = 0.f;
+		}
+
+		// Apply integer part of ScrollAccum to the curve editor view position.
+		const int32 DeltaX = FMath::FloorToInt(ScrollAccum.X);
+		ScrollAccum.X -= DeltaX;
+
+		if(bNavigating)
+		{
+			DeltaTime = -DeltaX / InterpEd->NavPixelsPerSecond;
+			InterpEd->ViewStartTime += DeltaTime;
+			InterpEd->ViewEndTime += DeltaTime;
+
+			InterpEd->SyncCurveEdView();
+		}
+		else
+		{
+			DeltaTime = -DeltaX / InterpEd->PixelsPerSec;
+			InterpEd->ViewStartTime -= DeltaTime;
+			InterpEd->ViewEndTime -= DeltaTime;
+			InterpEd->SyncCurveEdView();
+		}
+	}
+
+	Viewport->Draw();
+
+	//check to see if we need to update the scrollbars due to a size change
+	int32 CurrentHeight = Viewport->GetSizeXY().Y;
+	if (CurrentHeight != PrevViewportHeight)
+	{
+		PrevViewportHeight = CurrentHeight;
+		InterpEd->UpdateTrackWindowScrollBars();
+	}
+}
+
+
+void FMatineeViewportClient::Serialize(FArchive& Ar) 
+{ 
+	// Drag object may be a instance of UObject, so serialize it if it is.
+	if(DragObject && DragObject->GetUObject())
+	{
+		UObject* DragUObject = DragObject->GetUObject();
+		Ar << DragUObject;
+	}
+}
+
+/** Exec handler */
+void FMatineeViewportClient::Exec(const TCHAR* Cmd)
+{
+	const TCHAR* Str = Cmd;
+
+	if(FParse::Command(&Str, TEXT("MATINEE")))
+	{
+		if(FParse::Command(&Str, TEXT("Undo")))
+		{
+			InterpEd->InterpEdUndo();
+		}
+		else if(FParse::Command(&Str, TEXT("Redo")))
+		{
+			InterpEd->InterpEdRedo();
+		}
+		else if(FParse::Command(&Str, TEXT("Cut")))
+		{
+			InterpEd->CopySelectedGroupOrTrack(true);
+		}
+		else if(FParse::Command(&Str, TEXT("Copy")))
+		{
+			InterpEd->CopySelectedGroupOrTrack(false);
+		}
+		else if(FParse::Command(&Str, TEXT("Paste")))
+		{
+			InterpEd->PasteSelectedGroupOrTrack();
+		}
+		else if(FParse::Command(&Str, TEXT("Play")))
+		{
+			InterpEd->StartPlaying( false, true );
+		}
+		else if(FParse::Command(&Str, TEXT("PlayReverse")))
+		{
+			InterpEd->StartPlaying( false, false );
+		}
+		else if(FParse::Command(&Str, TEXT("Stop")))
+		{
+			if(InterpEd->MatineeActor->bIsPlaying)
+			{
+				InterpEd->StopPlaying();
+			}
+		}
+		else if(FParse::Command(&Str, TEXT("Rewind")))
+		{
+			InterpEd->SetInterpPosition(0.f);
+		}
+		else if(FParse::Command(&Str, TEXT("TogglePlayPause")))
+		{
+			if(InterpEd->MatineeActor->bIsPlaying)
+			{
+				InterpEd->StopPlaying();
+			}
+			else
+			{
+				// Start playback and retain whatever direction we were already playing
+				InterpEd->StartPlaying( false, true );
+			}
+		}
+		else if( FParse::Command( &Str, TEXT( "ZoomIn" ) ) )
+		{
+			const bool bZoomToTimeCursorPos = true;
+			InterpEd->ZoomView( 1.0f / FMatinee::InterpEditor_ZoomIncrement, bZoomToTimeCursorPos );
+		}
+		else if( FParse::Command( &Str, TEXT( "ZoomOut" ) ) )
+		{
+			const bool bZoomToTimeCursorPos = true;
+			InterpEd->ZoomView( FMatinee::InterpEditor_ZoomIncrement, bZoomToTimeCursorPos );
+		}
+		else if(FParse::Command(&Str, TEXT("DeleteSelection")))
+		{
+			InterpEd->DeleteSelection();
+		}
+		else if(FParse::Command(&Str, TEXT("MarkInSection"))) 
+		{
+			InterpEd->MoveLoopMarker(InterpEd->MatineeActor->InterpPosition, true);
+		}
+		else if(FParse::Command(&Str, TEXT("MarkOutSection"))) 
+		{
+			InterpEd->MoveLoopMarker(InterpEd->MatineeActor->InterpPosition, false);
+		}
+		else if(FParse::Command(&Str, TEXT("CropAnimationBeginning")))
+		{
+			InterpEd->CropAnimKey(true);
+		}
+		else if(FParse::Command(&Str, TEXT("CropAnimationEnd")))
+		{
+			InterpEd->CropAnimKey(false);
+		}
+		else if(FParse::Command(&Str, TEXT("IncrementPosition")))
+		{
+			InterpEd->IncrementSelection();
+		}
+		else if(FParse::Command(&Str, TEXT("DecrementPosition")))
+		{
+			InterpEd->DecrementSelection();
+		}
+		else if(FParse::Command(&Str, TEXT("MoveToNextKey")))
+		{
+			InterpEd->SelectNextKey();
+		}
+		else if(FParse::Command(&Str, TEXT("MoveToPrevKey")))
+		{
+			InterpEd->SelectPreviousKey();
+		}
+		else if(FParse::Command(&Str, TEXT("SplitAnimKey")))
+		{
+			InterpEd->SplitAnimKey();
+		}
+		else if(FParse::Command(&Str, TEXT("ToggleSnap")))
+		{
+			InterpEd->SetSnapEnabled(!InterpEd->bSnapEnabled);
+		}
+		else if(FParse::Command(&Str, TEXT("ToggleSnapTimeToFrames")))
+		{
+			InterpEd->SetSnapTimeToFrames(!InterpEd->bSnapTimeToFrames);
+		}
+		else if(FParse::Command(&Str, TEXT("ToggleFixedTimeStepPlayback")))
+		{
+			InterpEd->SetFixedTimeStepPlayback( !InterpEd->bFixedTimeStepPlayback );
+		}
+		else if(FParse::Command(&Str, TEXT("TogglePreferFrameNumbers")))
+		{
+			InterpEd->SetPreferFrameNumbers( !InterpEd->bPreferFrameNumbers );
+		}
+		else if(FParse::Command(&Str, TEXT("ToggleShowTimeCursorPosForAllKeys")))
+		{
+			InterpEd->SetShowTimeCursorPosForAllKeys( !InterpEd->bShowTimeCursorPosForAllKeys );
+		}
+		else if(FParse::Command(&Str, TEXT("MoveActiveUp")))
+		{
+			InterpEd->MoveActiveUp();
+		}
+		else if(FParse::Command(&Str, TEXT("MoveActiveDown")))
+		{
+			InterpEd->MoveActiveDown();
+		}
+		else if(FParse::Command(&Str, TEXT("AddKey")))
+		{
+			InterpEd->AddKey();
+		}
+		else if(FParse::Command(&Str, TEXT("DuplicateSelectedKeys")) )
+		{
+			InterpEd->DuplicateSelectedKeys();
+		}
+		else if(FParse::Command(&Str

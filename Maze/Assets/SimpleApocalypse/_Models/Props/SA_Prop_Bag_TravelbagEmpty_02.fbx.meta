@@ -1,0 +1,51 @@
+//===-- InlineAsm.cpp - Implement the InlineAsm class ---------------------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements the InlineAsm class.
+//
+//===----------------------------------------------------------------------===//
+
+#include "llvm/IR/InlineAsm.h"
+#include "ConstantsContext.h"
+#include "LLVMContextImpl.h"
+#include "llvm/IR/DerivedTypes.h"
+#include <algorithm>
+#include <cctype>
+using namespace llvm;
+
+// Implement the first virtual method in this class in this file so the
+// InlineAsm vtable is emitted here.
+InlineAsm::~InlineAsm() {
+}
+
+
+InlineAsm *InlineAsm::get(FunctionType *Ty, StringRef AsmString,
+                          StringRef Constraints, bool hasSideEffects,
+                          bool isAlignStack, AsmDialect asmDialect) {
+  InlineAsmKeyType Key(AsmString, Constraints, hasSideEffects, isAlignStack,
+                       asmDialect);
+  LLVMContextImpl *pImpl = Ty->getContext().pImpl;
+  return pImpl->InlineAsms.getOrCreate(PointerType::getUnqual(Ty), Key);
+}
+
+InlineAsm::InlineAsm(PointerType *Ty, const std::string &asmString,
+                     const std::string &constraints, bool hasSideEffects,
+                     bool isAlignStack, AsmDialect asmDialect)
+  : Value(Ty, Value::InlineAsmVal),
+    AsmString(asmString), Constraints(constraints),
+    HasSideEffects(hasSideEffects), IsAlignStack(isAlignStack),
+    Dialect(asmDialect) {
+
+  // Do various checks on the constraint string and type.
+  assert(Verify(getFunctionType(), constraints) &&
+         "Function type not legal for constraints!");
+}
+
+void InlineAsm::destroyConstant() {
+  getType()->getContext().pImpl->InlineAsm

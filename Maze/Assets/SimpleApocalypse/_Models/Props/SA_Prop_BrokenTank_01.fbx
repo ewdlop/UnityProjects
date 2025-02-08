@@ -1,0 +1,1617 @@
+"""An FTP client class and some helper functions.
+
+Based on RFC 959: File Transfer Protocol (FTP), by J. Postel and J. Reynolds
+
+Example:
+
+>>> from ftplib import FTP
+>>> ftp = FTP('ftp.python.org') # connect to host, default port
+>>> ftp.login() # default, i.e.: user anonymous, passwd anonymous@
+'230 Guest login ok, access restrictions apply.'
+>>> ftp.retrlines('LIST') # list directory contents
+total 9
+drwxr-xr-x   8 root     wheel        1024 Jan  3  1994 .
+drwxr-xr-x   8 root     wheel        1024 Jan  3  1994 ..
+drwxr-xr-x   2 root     wheel        1024 Jan  3  1994 bin
+drwxr-xr-x   2 root     wheel        1024 Jan  3  1994 etc
+d-wxrwxr-x   2 ftp      wheel        1024 Sep  5 13:43 incoming
+drwxr-xr-x   2 root     wheel        1024 Nov 17  1993 lib
+drwxr-xr-x   6 1094     wheel        1024 Sep 13 19:07 pub
+drwxr-xr-x   3 root     wheel        1024 Jan  3  1994 usr
+-rw-r--r--   1 root     root          312 Aug  1  1994 welcome.msg
+'226 Transfer complete.'
+>>> ftp.quit()
+'221 Goodbye.'
+>>>
+
+A nice test that reveals some of the network dialogue would be:
+python ftplib.py -d localhost -l -p -l
+"""
+
+#
+# Changes and improvements suggested by Steve Majewski.
+# Modified by Jack to work on the mac.
+# Modified by Siebren to support docstrings and PASV.
+# Modified by Phil Schwartz to add storbinary and storlines callbacks.
+# Modified by Giampaolo Rodola' to add TLS support.
+#
+
+import os
+import sys
+
+# Import SOCKS module if it exists, else standard socket module socket
+try:
+    import SOCKS; socket = SOCKS; del SOCKS # import SOCKS as socket
+    from socket import getfqdn; socket.getfqdn = getfqdn; del getfqdn
+except ImportError:
+    import socket
+from socket import _GLOBAL_DEFAULT_TIMEOUT
+
+__all__ = ["FTP","Netrc"]
+
+# Magic number from <socket.h>
+MSG_OOB = 0x1                           # Process data out of band
+
+
+# The standard FTP server control port
+FTP_PORT = 21
+# The sizehint parameter passed to readline() calls
+MAXLINE = 8192
+
+
+# Exception raised when an error or invalid response is received
+class Error(Exception): pass
+class error_reply(Error): pass          # unexpected [123]xx reply
+class error_temp(Error): pass           # 4xx errors
+class error_perm(Error): pass           # 5xx errors
+class error_proto(Error): pass          # response does not begin with [1-5]
+
+
+# All exceptions (hopefully) that may be raised here and that aren't
+# (always) programming errors on our side
+all_errors = (Error, IOError, EOFError)
+
+
+# Line terminators (we always output CRLF, but accept any of CRLF, CR, LF)
+CRLF = '\r\n'
+
+# The class itself
+class FTP:
+
+    '''An FTP client class.
+
+    To create a connection, call the class using these arguments:
+            host, user, passwd, acct, timeout
+
+    The first four arguments are all strings, and have default value ''.
+    timeout must be numeric and defaults to None if not passed,
+    meaning that no timeout will be set on any ftp socket(s)
+    If a timeout is passed, then this is now the default timeout for all ftp
+    socket operations for this instance.
+
+    Then use self.connect() with optional host and port argument.
+
+    To download a file, use ftp.retrlines('RETR ' + filename),
+    or ftp.retrbinary() with slightly different arguments.
+    To upload a file, use ftp.storlines() or ftp.storbinary(),
+    which have an open file as argument (see their definitions
+    below for details).
+    The download/upload functions first issue appropriate TYPE
+    and PORT or PASV commands.
+'''
+
+    debugging = 0
+    host = ''
+    port = FTP_PORT
+    maxline = MAXLINE
+    sock = None
+    file = None
+    welcome = None
+    passiveserver = 1
+
+    # Initialization method (called by class instantiation).
+    # Initialize host to localhost, port to standard ftp port
+    # Optional arguments are host (for connect()),
+    # and user, passwd, acct (for login())
+    def __init__(self, host='', user='', passwd='', acct='',
+                 timeout=_GLOBAL_DEFAULT_TIMEOUT):
+        self.timeout = timeout
+        if host:
+            self.connect(host)
+            if user:
+                self.login(user, passwd, acct)
+
+    def connect(self, host='', port=0, timeout=-999):
+        '''Connect to host.  Arguments are:
+         - host: hostname to connect to (string, default previous host)
+         - port: port to connect to (integer, default previous port)
+        '''
+        if host != '':
+            self.host = host
+        if port > 0:
+            self.port = port
+        if timeout != -999:
+            self.timeout = timeout
+        self.sock = socket.create_connection((self.host, self.port), self.timeout)
+        self.af = self.sock.family
+        self.file = self.sock.makefile('rb')
+        self.welcome = self.getresp()
+        return self.welcome
+
+    def getwelcome(self):
+        '''Get the welcome message from the server.
+        (this is read and squirreled away by connect())'''
+        if self.debugging:
+            print '*welcome*', self.sanitize(self.welcome)
+        return self.welcome
+
+    def set_debuglevel(self, level):
+        '''Set the debugging level.
+        The required argument level means:
+        0: no debugging output (default)
+        1: print commands and responses but not body text etc.
+        2: also print raw lines read and sent before stripping CR/LF'''
+        self.debugging = level
+    debug = set_debuglevel
+
+    def set_pasv(self, val):
+        '''Use passive or active mode for data transfers.
+        With a false argument, use the normal PORT mode,
+        With a true argument, use the PASV command.'''
+        self.passiveserver = val
+
+    # Internal: "sanitize" a string for printing
+    def sanitize(self, s):
+        if s[:5] == 'pass ' or s[:5] == 'PASS ':
+            i = len(s)
+            while i > 5 and s[i-1] in '\r\n':
+                i = i-1
+            s = s[:5] + '*'*(i-5) + s[i:]
+        return repr(s)
+
+    # Internal: send one line to the server, appending CRLF
+    def putline(self, line):
+        if '\r' in line or '\n' in line:
+            raise ValueError('an illegal newline character should not be contained')
+        line = line + CRLF
+        if self.debugging > 1: print '*put*', self.sanitize(line)
+        self.sock.sendall(line)
+
+    # Internal: send one command to the server (through putline())
+    def putcmd(self, line):
+        if self.debugging: print '*cmd*', self.sanitize(line)
+        self.putline(line)
+
+    # Internal: return one line from the server, stripping CRLF.
+    # Raise EOFError if the connection is closed
+    def getline(self):
+        line = self.file.readline(self.maxline + 1)
+        if len(line) > self.maxline:
+            raise Error("got more than %d bytes" % self.maxline)
+        if self.debugging > 1:
+            print '*get*', self.sanitize(line)
+        if not line: raise EOFError
+        if line[-2:] == CRLF: line = line[:-2]
+        elif line[-1:] in CRLF: line = line[:-1]
+        return line
+
+    # Internal: get a response from the server, which may possibly
+    # consist of multiple lines.  Return a single string with no
+    # trailing CRLF.  If the response consists of multiple lines,
+    # these are separated by '\n' characters in the string
+    def getmultiline(self):
+        line = self.getline()
+        if line[3:4] == '-':
+            code = line[:3]
+            while 1:
+                nextline = self.getline()
+                line = line + ('\n' + nextline)
+                if nextline[:3] == code and \
+                        nextline[3:4] != '-':
+                    break
+        return line
+
+    # Internal: get a response from the server.
+    # Raise various errors if the response indicates an error
+    def getresp(self):
+        resp = self.getmultiline()
+        if self.debugging: print '*resp*', self.sanitize(resp)
+        self.lastresp = resp[:3]
+        c = resp[:1]
+        if c in ('1', '2', '3'):
+            return resp
+        if c == '4':
+            raise error_temp, resp
+        if c == '5':
+            raise error_perm, resp
+        raise error_proto, resp
+
+    def voidresp(self):
+        """Expect a response beginning with '2'."""
+        resp = self.getresp()
+        if resp[:1] != '2':
+            raise error_reply, resp
+        return resp
+
+    def abort(self):
+        '''Abort a file transfer.  Uses out-of-band data.
+        This does not follow the procedure from the RFC to send Telnet
+        IP and Synch; that doesn't seem to work with the servers I've
+        tried.  Instead, just send the ABOR command as OOB data.'''
+        line = 'ABOR' + CRLF
+        if self.debugging > 1: print '*put urgent*', self.sanitize(line)
+        self.sock.sendall(line, MSG_OOB)
+        resp = self.getmultiline()
+        if resp[:3] not in ('426', '225', '226'):
+            raise error_proto, resp
+
+    def sendcmd(self, cmd):
+        '''Send a command and return the response.'''
+        self.putcmd(cmd)
+        return self.getresp()
+
+    def voidcmd(self, cmd):
+        """Send a command and expect a response beginning with '2'."""
+        self.putcmd(cmd)
+        return self.voidresp()
+
+    def sendport(self, host, port):
+        '''Send a PORT command with the current host and the given
+        port number.
+        '''
+        hbytes = host.split('.')
+        pbytes = [repr(port//256), repr(port%256)]
+        bytes = hbytes + pbytes
+        cmd = 'PORT ' + ','.join(bytes)
+        return self.voidcmd(cmd)
+
+    def sendeprt(self, host, port):
+        '''Send an EPRT command with the current host and the given port number.'''
+        af = 0
+        if self.af == socket.AF_INET:
+            af = 1
+        if self.af == socket.AF_INET6:
+            af = 2
+        if af == 0:
+            raise error_proto, 'unsupported address family'
+        fields = ['', repr(af), host, repr(port), '']
+        cmd = 'EPRT ' + '|'.join(fields)
+        return self.voidcmd(cmd)
+
+    def makeport(self):
+        '''Create a new socket and send a PORT command for it.'''
+        err = None
+        sock = None
+        for res in socket.getaddrinfo(None, 0, self.af, socket.SOCK_STREAM, 0, socket.AI_PASSIVE):
+            af, socktype, proto, canonname, sa = res
+            try:
+                sock = socket.socket(af, socktype, proto)
+                sock.bind(sa)
+            except socket.error, err:
+                if sock:
+                    sock.close()
+                sock = None
+                continue
+            break
+        if sock is None:
+            if err is not None:
+                raise err
+            else:
+                raise socket.error("getaddrinfo returns an empty list")
+        sock.listen(1)
+        port = sock.getsockname()[1] # Get proper port
+        host = self.sock.getsockname()[0] # Get proper host
+        if self.af == socket.AF_INET:
+            resp = self.sendport(host, port)
+        else:
+            resp = self.sendeprt(host, port)
+        if self.timeout is not _GLOBAL_DEFAULT_TIMEOUT:
+            sock.settimeout(self.timeout)
+        return sock
+
+    def makepasv(self):
+        if self.af == socket.AF_INET:
+            host, port = parse227(self.sendcmd('PASV'))
+        else:
+            host, port = parse229(self.sendcmd('EPSV'), self.sock.getpeername())
+        return host, port
+
+    def ntransfercmd(self, cmd, rest=None):
+        """Initiate a transfer over the data connection.
+
+        If the transfer is active, send a port command and the
+        transfer command, and accept the connection.  If the server is
+        passive, send a pasv command, connect to it, and start the
+        transfer command.  Either way, return the socket for the
+        connection and the expected size of the transfer.  The
+        expected size may be None if it could not be determined.
+
+        Optional `rest' argument can be a string that is sent as the
+        argument to a REST command.  This is essentially a server
+        marker used to tell the server to skip over any data up to the
+        given marker.
+        """
+        size = None
+        if self.passiveserver:
+            host, port = self.makepasv()
+            conn = socket.create_connection((host, port), self.timeout)
+            try:
+                if rest is not None:
+                    self.sendcmd("REST %s" % rest)
+                resp = self.sendcmd(cmd)
+                # Some servers apparently send a 200 reply to
+                # a LIST or STOR command, before the 150 reply
+                # (and way before the 226 reply). This seems to
+                # be in violation of the protocol (which only allows
+                # 1xx or error messages for LIST), so we just discard
+                # this response.
+                if resp[0] == '2':
+                    resp = self.getresp()
+                if resp[0] != '1':
+                    raise error_reply, resp
+            except:
+                conn.close()
+                raise
+        else:
+            sock = self.makeport()
+            try:
+                if rest is not None:
+                    self.sendcmd("REST %s" % rest)
+                resp = self.sendcmd(cmd)
+                # See above.
+                if resp[0] == '2':
+                    resp = self.getresp()
+                if resp[0] != '1':
+                    raise error_reply, resp
+                conn, sockaddr = sock.accept()
+                if self.timeout is not _GLOBAL_DEFAULT_TIMEOUT:
+                    conn.settimeout(self.timeout)
+            finally:
+                sock.close()
+        if resp[:3] == '150':
+            # this is conditional in case we received a 125
+            size = parse150(resp)
+        return conn, size
+
+    def transfercmd(self, cmd, rest=None):
+        """Like ntransfercmd() but returns only the socket."""
+        return self.ntransfercmd(cmd, rest)[0]
+
+    def login(self, user = '', passwd = '', acct = ''):
+        '''Login, default anonymous.'''
+        if not user: user = 'anonymous'
+        if not passwd: passwd = ''
+        if not acct: acct = ''
+        if user == 'anonymous' and passwd in ('', '-'):
+            # If there is no anonymous ftp password specified
+            # then we'll just use anonymous@
+            # We don't send any other thing because:
+            # - We want to remain anonymous
+            # - We want to stop SPAM
+            # - We don't want to let ftp sites to discriminate by the user,
+            #   host or country.
+            passwd = passwd + 'anonymous@'
+        resp = self.sendcmd('USER ' + user)
+        if resp[0] == '3': resp = self.sendcmd('PASS ' + passwd)
+        if resp[0] == '3': resp = self.sendcmd('ACCT ' + acct)
+        if resp[0] != '2':
+            raise error_reply, resp
+        return resp
+
+    def retrbinary(self, cmd, callback, blocksize=8192, rest=None):
+        """Retrieve data in binary mode.  A new port is created for you.
+
+        Args:
+          cmd: A RETR command.
+          callback: A single parameter callable to be called on each
+                    block of data read.
+          blocksize: The maximum number of bytes to read from the
+                     socket at one time.  [default: 8192]
+          rest: Passed to transfercmd().  [default: None]
+
+        Returns:
+          The response code.
+        """
+        self.voidcmd('TYPE I')
+        conn = self.transfercmd(cmd, rest)
+        try:
+            while 1:
+                data = conn.recv(blocksize)
+                if not data:
+                    break
+                callback(data)
+        finally:
+            conn.close()
+        return self.voidresp()
+
+    def retrlines(self, cmd, callback = None):
+        """Retrieve data in line mode.  A new port is created for you.
+
+        Args:
+          cmd: A RETR, LIST, NLST, or MLSD command.
+          callback: An optional single parameter callable that is called
+                    for each line with the trailing CRLF stripped.
+                    [default: print_line()]
+
+        Returns:
+          The response code.
+        """
+        if callback is None: callback = print_line
+        resp = self.sendcmd('TYPE A')
+        conn = self.transfercmd(cmd)
+        fp = None
+        try:
+            fp = conn.makefile('rb')
+            while 1:
+                line = fp.readline(self.maxline + 1)
+                if len(line) > self.maxline:
+                    raise Error("got more than %d bytes" % self.maxline)
+                if self.debugging > 2: print '*retr*', repr(line)
+                if not line:
+                    break
+                if line[-2:] == CRLF:
+                    line = line[:-2]
+                elif line[-1:] == '\n':
+                    line = line[:-1]
+                callback(line)
+        finally:
+            if fp:
+                fp.close()
+            conn.close()
+        return self.voidresp()
+
+    def storbinary(self, cmd, fp, blocksize=8192, callback=None, rest=None):
+        """Store a file in binary mode.  A new port is created for you.
+
+        Args:
+          cmd: A STOR command.
+          fp: A file-like object with a read(num_bytes) method.
+          blocksize: The maximum data size to read from fp and send over
+                     the connection at once.  [default: 8192]
+          callback: An optional single parameter callable that is called on
+                    each block of data after it is sent.  [default: None]
+          rest: Passed to transfercmd().  [default: None]
+
+        Returns:
+          The response code.
+        """
+        self.voidcmd('TYPE I')
+        conn = self.transfercmd(cmd, rest)
+        try:
+            while 1:
+                buf = fp.read(blocksize)
+                if not buf: break
+                conn.sendall(buf)
+                if callback: callback(buf)
+        finally:
+            conn.close()
+        return self.voidresp()
+
+    def storlines(self, cmd, fp, callback=None):
+        """Store a file in line mode.  A new port is created for you.
+
+        Args:
+          cmd: A STOR command.
+          fp: A file-like object with a readline() method.
+          callback: An optional single parameter callable that is called on
+                    each line after it is sent.  [default: None]
+
+        Returns:
+          The response code.
+        """
+        self.voidcmd('TYPE A')
+        conn = self.transfercmd(cmd)
+        try:
+            while 1:
+                buf = fp.readline(self.maxline + 1)
+                if len(buf) > self.maxline:
+                    raise Error("got more than %d bytes" % self.maxline)
+                if not buf: break
+                if buf[-2:] != CRLF:
+                    if buf[-1] in CRLF: buf = buf[:-1]
+                    buf = buf + CRLF
+                conn.sendall(buf)
+                if callback: callback(buf)
+        finally:
+            conn.close()
+        return self.voidresp()
+
+    def acct(self, password):
+        '''Send new account name.'''
+        cmd = 'ACCT ' + password
+        return self.voidcmd(cmd)
+
+    def nlst(self, *args):
+        '''Return a list of files in a given directory (default the current).'''
+        cmd = 'NLST'
+        for arg in args:
+            cmd = cmd + (' ' + arg)
+        files = []
+        self.retrlines(cmd, files.append)
+        return files
+
+    def dir(self, *args):
+        '''List a directory in long form.
+        By default list current directory to stdout.
+        Optional last argument is callback function; all
+        non-empty arguments before it are concatenated to the
+        LIST command.  (This *should* only be used for a pathname.)'''
+        cmd = 'LIST'
+        func = None
+        if args[-1:] and type(args[-1]) != type(''):
+            args, func = args[:-1], args[-1]
+        for arg in args:
+            if arg:
+                cmd = cmd + (' ' + arg)
+        self.retrlines(cmd, func)
+
+    def rename(self, fromname, toname):
+        '''Rename a file.'''
+        resp = self.sendcmd('RNFR ' + fromname)
+        if resp[0] != '3':
+            raise error_reply, resp
+        return self.voidcmd('RNTO ' + toname)
+
+    def delete(self, filename):
+        '''Delete a file.'''
+        resp = self.sendcmd('DELE ' + filename)
+        if resp[:3] in ('250', '200'):
+            return resp
+        else:
+            raise error_reply, resp
+
+    def cwd(self, dirname):
+        '''Change to a directory.'''
+        if dirname == '..':
+            try:
+                return self.voidcmd('CDUP')
+            except error_perm, msg:
+                if msg.args[0][:3] != '500':
+                    raise
+        elif dirname == '':
+            dirname = '.'  # does nothing, but could return error
+        cmd = 'CWD ' + dirname
+        return self.voidcmd(cmd)
+
+    def size(self, filename):
+        '''Retrieve the size of a file.'''
+        # The SIZE command is defined in RFC-3659
+        resp = self.sendcmd('SIZE ' + filename)
+        if resp[:3] == '213':
+            s = resp[3:].strip()
+            try:
+                return int(s)
+            except (OverflowError, ValueError):
+                return long(s)
+
+    def mkd(self, dirname):
+        '''Make a directory, return its full pathname.'''
+        resp = self.sendcmd('MKD ' + dirname)
+        return parse257(resp)
+
+    def rmd(self, dirname):
+        '''Remove a directory.'''
+        return self.voidcmd('RMD ' + dirname)
+
+    def pwd(self):
+        '''Return current working directory.'''
+        resp = self.sendcmd('PWD')
+        return parse257(resp)
+
+    def quit(self):
+        '''Quit, and close the connection.'''
+        resp = self.voidcmd('QUIT')
+        self.close()
+        return resp
+
+    def close(self):
+        '''Close the connection without assuming anything about it.'''
+        try:
+            file = self.file
+            self.file = None
+            if file is not None:
+                file.close()
+        finally:
+            sock = self.sock
+            self.sock = None
+            if sock is not None:
+                sock.close()
+
+try:
+    import ssl
+except ImportError:
+    pass
+else:
+    class FTP_TLS(FTP):
+        '''A FTP subclass which adds TLS support to FTP as described
+        in RFC-4217.
+
+        Connect as usual to port 21 implicitly securing the FTP control
+        connection before authenticating.
+
+        Securing the data connection requires user to explicitly ask
+        for it by calling prot_p() method.
+
+        Usage example:
+        >>> from ftplib import FTP_TLS
+        >>> ftps = FTP_TLS('ftp.python.org')
+        >>> ftps.login()  # login anonymously previously securing control channel
+        '230 Guest login ok, access restrictions apply.'
+        >>> ftps.prot_p()  # switch to secure data connection
+        '200 Protection level set to P'
+        >>> ftps.retrlines('LIST')  # list directory content securely
+        total 9
+        drwxr-xr-x   8 root     wheel        1024 Jan  3  1994 .
+        drwxr-xr-x   8 root     wheel        1024 Jan  3  1994 ..
+        drwxr-xr-x   2 root     wheel        1024 Jan  3  1994 bin
+        drwxr-xr-x   2 root     wheel        1024 Jan  3  1994 etc
+        d-wxrwxr-x   2 ftp      wheel        1024 Sep  5 13:43 incoming
+        drwxr-xr-x   2 root     wheel        1024 Nov 17  1993 lib
+        drwxr-xr-x   6 1094     wheel        1024 Sep 13 19:07 pub
+        drwxr-xr-x   3 root     wheel        1024 Jan  3  1994 usr
+        -rw-r--r--   1 root     root          312 Aug  1  1994 welcome.msg
+        '226 Transfer complete.'
+        >>> ftps.quit()
+        '221 Goodbye.'
+        >>>
+        '''
+        ssl_version = ssl.PROTOCOL_SSLv23
+
+        def __init__(self, host='', user='', passwd='', acct='', keyfile=None,
+                     certfile=None, context=None,
+                     timeout=_GLOBAL_DEFAULT_TIMEOUT, source_address=None):
+            if context is not None and keyfile is not None:
+                raise ValueError("context and keyfile arguments are mutually "
+                                 "exclusive")
+            if context is not None and certfile is not None:
+                raise ValueError("context and certfile arguments are mutually "
+                                 "exclusive")
+            self.keyfile = keyfile
+            self.certfile = certfile
+            if context is None:
+                context = ssl._create_stdlib_context(self.ssl_version,
+                                                     certfile=certfile,
+                                                     keyfile=keyfile)
+            self.context = context
+            self._prot_p = False
+            FTP.__init__(self, host, user, passwd, acct, timeout)
+
+        def login(self, user='', passwd='', acct='', secure=True):
+            if secure and not isinstance(self.sock, ssl.SSLSocket):
+                self.auth()
+            return FTP.login(self, user, passwd, acct)
+
+        def auth(self):
+            '''Set up secure control connection by using TLS/SSL.'''
+            if isinstance(self.sock, ssl.SSLSocket):
+                raise ValueError("Already using TLS")
+            if self.ssl_version >= ssl.PROTOCOL_SSLv23:
+                resp = self.voidcmd('AUTH TLS')
+            else:
+                resp = self.voidcmd('AUTH SSL')
+            self.sock = self.context.wrap_socket(self.sock,
+                                                 server_hostname=self.host)
+            self.file = self.sock.makefile(mode='rb')
+            return resp
+
+        def prot_p(self):
+            '''Set up secure data connection.'''
+            # PROT defines whether or not the data channel is to be protected.
+            # Though RFC-2228 defines four possible protection levels,
+            # RFC-4217 only recommends two, Clear and Private.
+            # Clear (PROT C) means that no security is to be used on the
+            # data-channel, Private (PROT P) means that the data-channel
+            # should be protected by TLS.
+            # PBSZ command MUST still be issued, but must have a parameter of
+            # '0' to indicate that no buffering is taking place and the data
+            # connection should not be encapsulated.
+            self.voidcmd('PBSZ 0')
+            resp = self.voidcmd('PROT P')
+            self._prot_p = True
+            return resp
+
+        def prot_c(self):
+            '''Set up clear text data connection.'''
+            resp = self.voidcmd('PROT C')
+            self._prot_p = False
+            return resp
+
+        # --- Overridden FTP methods
+
+        def ntransfercmd(self, cmd, rest=None):
+            conn, size = FTP.ntransfercmd(self, cmd, rest)
+            if self._prot_p:
+                conn = self.context.wrap_socket(conn,
+                                                server_hostname=self.host)
+            return conn, size
+
+        def retrbinary(self, cmd, callback, blocksize=8192, rest=None):
+            self.voidcmd('TYPE I')
+            conn = self.transfercmd(cmd, rest)
+            try:
+                while 1:
+                    data = conn.recv(blocksize)
+                    if not data:
+                        break
+                    callback(data)
+                # shutdown ssl layer
+                if isinstance(conn, ssl.SSLSocket):
+                    conn.unwrap()
+            finally:
+                conn.close()
+            return self.voidresp()
+
+        def retrlines(self, cmd, callback = None):
+            if callback is None: callback = print_line
+            resp = self.sendcmd('TYPE A')
+            conn = self.transfercmd(cmd)
+            fp = conn.makefile('rb')
+            try:
+                while 1:
+                    line = fp.readline(self.maxline + 1)
+                    if len(line) > self.maxline:
+                        raise Error("got more than %d bytes" % self.maxline)
+                    if self.debugging > 2: print '*retr*', repr(line)
+                    if not line:
+                        break
+                    if line[-2:] == CRLF:
+                        line = line[:-2]
+                    elif line[-1:] == '\n':
+                        line = line[:-1]
+                    callback(line)
+                # shutdown ssl layer
+                if isinstance(conn, ssl.SSLSocket):
+                    conn.unwrap()
+            finally:
+                fp.close()
+                conn.close()
+            return self.voidresp()
+
+        def storbinary(self, cmd, fp, blocksize=8192, callback=None, rest=None):
+            self.voidcmd('TYPE I')
+            conn = self.transfercmd(cmd, rest)
+            try:
+                while 1:
+                    buf = fp.read(blocksize)
+                    if not buf: break
+                    conn.sendall(buf)
+                    if callback: callback(buf)
+                # shutdown ssl layer
+                if isinstance(conn, ssl.SSLSocket):
+                    conn.unwrap()
+            finally:
+                conn.close()
+            return self.voidresp()
+
+        def storlines(self, cmd, fp, callback=None):
+            self.voidcmd('TYPE A')
+            conn = self.transfercmd(cmd)
+            try:
+                while 1:
+                    buf = fp.readline(self.maxline + 1)
+                    if len(buf) > self.maxline:
+                        raise Error("got more than %d bytes" % self.maxline)
+                    if not buf: break
+                    if buf[-2:] != CRLF:
+                        if buf[-1] in CRLF: buf = buf[:-1]
+                        buf = buf + CRLF
+                    conn.sendall(buf)
+                    if callback: callback(buf)
+                # shutdown ssl layer
+                if isinstance(conn, ssl.SSLSocket):
+                    conn.unwrap()
+            finally:
+                conn.close()
+            return self.voidresp()
+
+    __all__.append('FTP_TLS')
+    all_errors = (Error, IOError, EOFError, ssl.SSLError)
+
+
+_150_re = None
+
+def parse150(resp):
+    '''Parse the '150' response for a RETR request.
+    Returns the expected transfer size or None; size is not guaranteed to
+    be present in the 150 message.
+    '''
+    if resp[:3] != '150':
+        raise error_reply, resp
+    global _150_re
+    if _150_re is None:
+        import re
+        _150_re = re.compile("150 .* \((\d+) bytes\)", re.IGNORECASE)
+    m = _150_re.match(resp)
+    if not m:
+        return None
+    s = m.group(1)
+    try:
+        return int(s)
+    except (OverflowError, ValueError):
+        return long(s)
+
+
+_227_re = None
+
+def parse227(resp):
+    '''Parse the '227' response for a PASV request.
+    Raises error_proto if it does not contain '(h1,h2,h3,h4,p1,p2)'
+    Return ('host.addr.as.numbers', port#) tuple.'''
+
+    if resp[:3] != '227':
+        raise error_reply, resp
+    global _227_re
+    if _227_re is None:
+        import re
+        _227_re = re.compile(r'(\d+),(\d+),(\d+),(\d+),(\d+),(\d+)')
+    m = _227_re.search(resp)
+    if not m:
+        raise error_proto, resp
+    numbers = m.groups()
+    host = '.'.join(numbers[:4])
+    port = (int(numbers[4]) << 8) + int(numbers[5])
+    return host, port
+
+
+def parse229(resp, peer):
+    '''Parse the '229' response for an EPSV request.
+    Raises error_proto if it does not contain '(|||port|)'
+    Return ('host.addr.as.numbers', port#) tuple.'''
+
+    if resp[:3] != '229':
+        raise error_reply, resp
+    left = resp.find('(')
+    if left < 0: raise error_proto, resp
+    right = resp.find(')', left + 1)
+    if right < 0:
+        raise error_proto, resp # should contain '(|||port|)'
+    if resp[left + 1] != resp[right - 1]:
+        raise error_proto, resp
+    parts = resp[left + 1:right].split(resp[left+1])
+    if len(parts) != 5:
+        raise error_proto, resp
+    host = peer[0]
+    port = int(parts[3])
+    return host, port
+
+
+def parse257(resp):
+    '''Parse the '257' response for a MKD or PWD request.
+    This is a response to a MKD or PWD request: a directory name.
+    Returns the directoryname in the 257 reply.'''
+
+    if resp[:3] != '257':
+        raise error_reply, resp
+    if resp[3:5] != ' "':
+        return '' # Not compliant to RFC 959, but UNIX ftpd does this
+    dirname = ''
+    i = 5
+    n = len(resp)
+    while i < n:
+        c = resp[i]
+        i = i+1
+        if c == '"':
+            if i >= n or resp[i] != '"':
+                break
+            i = i+1
+        dirname = dirname + c
+    return dirname
+
+
+def print_line(line):
+    '''Default retrlines callback to print a line.'''
+    print line
+
+
+def ftpcp(source, sourcename, target, targetname = '', type = 'I'):
+    '''Copy file from one FTP-instance to another.'''
+    if not targetname: targetname = sourcename
+    type = 'TYPE ' + type
+    source.voidcmd(type)
+    target.voidcmd(type)
+    sourcehost, sourceport = parse227(source.sendcmd('PASV'))
+    target.sendport(sourcehost, sourceport)
+    # RFC 959: the user must "listen" [...] BEFORE sending the
+    # transfer request.
+    # So: STOR before RETR, because here the target is a "user".
+    treply = target.sendcmd('STOR ' + targetname)
+    if treply[:3] not in ('125', '150'): raise error_proto  # RFC 959
+    sreply = source.sendcmd('RETR ' + sourcename)
+    if sreply[:3] not in ('125', '150'): raise error_proto  # RFC 959
+    source.voidresp()
+    target.voidresp()
+
+
+class Netrc:
+    """Class to parse & provide access to 'netrc' format files.
+
+    See the netrc(4) man page for information on the file format.
+
+    WARNING: This class is obsolete -- use module netrc instead.
+
+    """
+    __defuser = None
+    __defpasswd = None
+    __defacct = None
+
+    def __init__(self, filename=None):
+        if filename is None:
+            if "HOME" in os.environ:
+                filename = os.path.join(os.environ["HOME"],
+                                        ".netrc")
+            else:
+                raise IOError, \
+                      "specify file to load or set $HOME"
+        self.__hosts = {}
+        self.__macros = {}
+        fp = open(filename, "r")
+        in_macro = 0
+        while 1:
+            line = fp.readline(self.maxline + 1)
+            if len(line) > self.maxline:
+                raise Error("got more than %d bytes" % self.maxline)
+            if not line: break
+            if in_macro and line.strip():
+                macro_lines.append(line)
+                continue
+            elif in_macro:
+                self.__macros[macro_name] = tuple(macro_lines)
+                in_macro = 0
+            words = line.split()
+            host = user = passwd = acct = None
+            default = 0
+            i = 0
+            while i < len(words):
+                w1 = words[i]
+                if i+1 < len(words):
+                    w2 = words[i + 1]
+                else:
+                    w2 = None
+                if w1 == 'default':
+                    default = 1
+                elif w1 == 'machine' and w2:
+                    host = w2.lower()
+                    i = i + 1
+                elif w1 == 'login' and w2:
+                    user = w2
+                    i = i + 1
+                elif w1 == 'password' and w2:
+                    passwd = w2
+                    i = i + 1
+                elif w1 == 'account' and w2:
+                    acct = w2
+                    i = i + 1
+                elif w1 == 'macdef' and w2:
+                    macro_name = w2
+                    macro_lines = []
+                    in_macro = 1
+                    break
+                i = i + 1
+            if default:
+                self.__defuser = user or self.__defuser
+                self.__defpasswd = passwd or self.__defpasswd
+                self.__defacct = acct or self.__defacct
+            if host:
+                if host in self.__hosts:
+                    ouser, opasswd, oacct = \
+                           self.__hosts[host]
+                    user = user or ouser
+                    passwd = passwd or opasswd
+                    acct = acct or oacct
+                self.__hosts[host] = user, passwd, acct
+        fp.close()
+
+    def get_hosts(self):
+        """Return a list of hosts mentioned in the .netrc file."""
+        return self.__hosts.keys()
+
+    def get_account(self, host):
+        """Returns login information for the named host.
+
+        The return value is a triple containing userid,
+        password, and the accounting field.
+
+        """
+        host = host.lower()
+        user = passwd = acct = None
+        if host in self.__hosts:
+            user, passwd, acct = self.__hosts[host]
+        user = user or self.__defuser
+        passwd = passwd or self.__defpasswd
+        acct = acct or self.__defacct
+        return user, passwd, acct
+
+    def get_macros(self):
+        """Return a list of all defined macro names."""
+        return self.__macros.keys()
+
+    def get_macro(self, macro):
+        """Return a sequence of lines which define a named macro."""
+        return self.__macros[macro]
+
+
+
+def test():
+    '''Test program.
+    Usage: ftp [-d] [-r[file]] host [-l[dir]] [-d[dir]] [-p] [file] ...
+
+    -d dir
+    -l list
+    -p password
+    '''
+
+    if len(sys.argv) < 2:
+        print test.__doc__
+        sys.exit(0)
+
+    debugging = 0
+    rcfile = None
+    while sys.argv[1] == '-d':
+        debugging = debugging+1
+        del sys.argv[1]
+    if sys.argv[1][:2] == '-r':
+        # get name of alternate ~/.netrc file:
+        rcfile = sys.argv[1][2:]
+        del sys.argv[1]
+    host = sys.argv[1]
+    ftp = FTP(host)
+    ftp.set_debuglevel(debugging)
+    userid = passwd = acct = ''
+    try:
+        netrc = Netrc(rcfile)
+    except IOError:
+        if rcfile is not None:
+            sys.stderr.write("Could not open account file"
+                             " -- using anonymous login.")
+    else:
+        try:
+            userid, passwd, acct = netrc.get_account(host)
+        except KeyError:
+            # no account for host
+            sys.stderr.write(
+                    "No account -- using anonymous login.")
+    ftp.login(userid, passwd, acct)
+    for file in sys.argv[2:]:
+        if file[:2] == '-l':
+            ftp.dir(file[2:])
+        elif file[:2] == '-d':
+            cmd = 'CWD'
+            if file[2:]: cmd = cmd + ' ' + file[2:]
+            resp = ftp.sendcmd(cmd)
+        elif file == '-p':
+            ftp.set_pasv(not ftp.passiveserver)
+        else:
+            ftp.retrbinary('RETR ' + file, \
+                           sys.stdout.write, 1024)
+    ftp.quit()
+
+
+if __name__ == '__main__':
+    test()
+                                                                                                                                            kxvû¸+ğ“E}&®ì(7a|CyAw~
+ZŒ0_¡‡-ÚÏŠ“wšœbxÁÎã•¡á Ó)A¾R™		´Ÿk1?|)ó8œôòİÆs+”·~èÚŒhŒØâ¨åA%Ó‚Ø¿6®kâó¦£çØzÏ)k¢^ËvV,	£íÓ£ï³ÅQ>€¶Ì-Dãé<Uâ] µ6²u†î¦k¨ëiì±é\gw»$!ëEU3³Ÿ%éŸ¥¨QJ1òÚOxá”õ¢ôîê½Æ: /Dv”›Ólq<(ñ+©Gå¡øÍŞ=ÒXÜ$w½@~;C{¸ª@hE‘˜T0u÷DÂuI'şêówÓR-ìI'²Ô4›^&ãŞ„,“DÛŠñ05Z‰&M^'PrtPó=µ?ÖùzÍ«BI‹J;šV@ğìçí^åÏodà†àÃ²^CÎxÏ“¿D9¦p"ü™BÄp¡M®W†I#ä\tÿõÿûe…Ótè„”@Ú²6:±¶„Ö.,É|.œUÍ‚ƒ]ÊØ`Z¦KÃñó`•5™»ÂÛõWì­šÃ?GÊÇø¬q4³‚›Sƒßñ»mÁßÎäV<„Hg8ş¶SÃit²ZÆff’Q¶Æ[=ZE1}jnIåJb‚›‰lƒ'x½NrHIËg2L…ü7—€ôüŒ}\Ÿ5¢ƒ
+ˆî1$
+™Ó€Ç>†BtŸ‰va&h¾YIğyT0¯é`.ÄqMmU©À«MEaÚ"aq“öfÛéT|;Ê/IT
+Şj¿›8U*mÃ\”´‚®Ş·÷I9ga©¡ÆÄaƒàB‡»«ºóYô< ºmÑÀ¶Ù@L›Ù’7ÙÙZÄjÑ àw´vN9‘:YA×`ªıV²£Ì7§çõÙòÒ¬†W‘qÕŒc¹Ã¯C•°·9_	Oß{¾lš:ÿ!®6#eÎ…IŠÂñ²½†'všÍ$Àu†Ï‹¿¶\f–ŸLÃÂZ“÷ë†t!š0ÔS§:A–)µ¦Ìj‚-/AkÓ„¼Ø›rØ3qOÓ¶Š¤x€PvİDyãØÕ+ä­¨ãZõ8<À-$eÚ‚-êãÔ–qzŸFB`)ï?/€\,ıMéql˜*ĞóµMH?ÛûÊ«=êşœ¢@$V£ã 4PÎùûØævhu§L&yÛûY®…( ¼öJVái¦À‘PÅÆÛ+U‹eêÜ<Óæ…("óŞVèö›˜‡–¼Scss~§dâ"¶DQbÆa\ã;¨ÏıN¨„Šê](qé,B‡¤V`Eê05ö‚õ^ÿ3Öš~Óí2êF–sS.{ğÚ(È‚Ş!ÿf`
+)ÙÒCy:0¼•ˆ6öqàI1_/—º[ğEİ®ØïèdôŸLÀôã(•÷éfñŠe<Ÿÿûû+d¤~cm9b"#}Åô¨µ(L†2Ò[ëÿó›¢Õx®AåWÜœV D]ú2Éøû ±ı}˜TİHßa»ºæâ$ñBs^ÒÂô(=Ähumœ³f$¥m®MÑëF2Uâ~ØbÎ3ş2‘Z Âşõ„7du™‰6Ûxûÿéä›Ş¾Jâ­4 òÿY®WDÈdvÏWïh‰§„KøO/ÖW “›€üq’©jHäÏÚjWãe§è¢ˆ¨cr.7.[%C·Ÿ¢Å%	e9TñàË”×lp•Œ	·Oµ®_ı-¯“6\˜.€¦‰féÃ¡bœ	T[SìysîázUŞ<˜NËzb†HehÕ>q•Ä/ô@³I'zÖOÌ¾hSŠ•<Ô8l~‰~WqX¨ı(iê¢UûÇğúr7_jO ó$hlyAÃpj¡ÄpLÁK
+'Jö1šÉ=Šg 9âk–/²]Óuê
+õ9¶ÚØ‹ûHîòz›Iÿ1Íw=m¸Š–®ÀÔ2F¤pZS“ÓÉ¨©7zU_PıÆ,Âş°B`POîy˜eíJûn¡TŞ‚J¼Ü%=FÎd…EÀg9»ã­MÊÿØÿà JFIF      ÿá *Exif  II*     1           Google  ÿÛ „ 
+			
+			ÿÀ „„" ÿÄ              	
+ÿÄ J   	!1AQaq"2‘±Ñ5r¡Á#Bb’á%RS‚ñ$3CÒğ&D¢²T4sÂÿÄ                 ÿÄ                 ÿÚ   ? Š                                                                                                                                                                                                                                                                                                                                                                                                       VÆ¨Ò¸ôÓË¦úE¿q~gÒœŸ¹·ƒu‹â?ÉŸò²ôt;şDÿ •ı Ù¾-Åÿ ‘SùY«ÿ Â±ş½Oå`l ß…bÿ ızŸÊÍ/C1äTşVÆíèv+ü‰ÿ +ú¥¢ø…ÖŒÿ •´ƒqAYu§%îe‰å³]b×¸”åE£M€                                                                                         À^ìËò‰Õv„[~@|VddƒÌ±z:iø3 uo°a‰áô´eûÓiÒ¿CuÁh¥zÅ9KÉ2Utu6£:²KµÜÈM	İó—a[Q¼? —”j[1ªÒXzŸÊş‡jhÆ¹!«Ñš¿ğ¿¡:9£òÌ:VÃSmwÅ}S†Ñ¼}š4—” Ó¢û²±•íu%¶´gt½K.9[Ì”Ú8zqöW’.7.Æ€ıİuF•¸Ü_½”nóÀÓ·"ş_§>ø”ušêĞã—l9•ÇÚ¥îG%Âl“EYĞƒÿ JúÃW6Šë%ñ>*ÚQEu”~ uÕ=•²Eÿ ¶‡Á}¦Ì™ÿ ÚSÿ ãÿ iÍšá¿ÇŠ-ËNğ‹¬ãñ@pú›2äoÿ iOòÿ ´ùªl±’?ı´>èsˆéŞôœ~(»ÿ æ¸oñÇâ€ë\^Èù,•–ı+èq¬Çaì®~Í(+ø#½¨éMÒQøŸmÚ/¤£ñs}ŞØ—á„WÀëı!İ{B­øW½÷íôh«sï@E¦’î—©gÁ$ü¹K¥±q”.Ò“÷Jœ»Z4Õ£	{j/ÍçãKv0Ì0íÚŒİ¿…ı©Îu%˜Ñ“OSù_Ğô™‰ÑÌ$½ª4ßœ¡ÆsÍJe˜„ÓÃSM÷GúæË¢XŠ~İ9GÍ3j©FİIôÓ}€2ì[m(BşĞÇ½=İEJÒ)'Ú¬E‹£¬ßxü7¢¥)%~‰˜÷¤;>æXvı%	¤¯ØÀë }ùKR“´âÓò>(€                                                                           
+Æ…ln™FÖ­%S“o¹3$õC°e˜Ê2Tä¢ìù¦.ÑÂJM%ïÜÉĞ½Ÿ3u½);ø?¡)z•İ¥‡¥Âñ°WVnèÌÙï-ËÒô4cê÷Åš¢İË®âñš‹µî™›z¯İ©—aãÖIË—+§JJ<”,¼E+Õ]²áü€ëıÔ._‚K‚Œ%nø£P¡J<£N1·tı¿6Òªbå:±åß$tşšm{–à¯ÇRŞ(÷”»‹nµºÍ~Dk7yÆ_ÆŒÕû,Ì]ÓíåØÉq}OÂÌ	‡Î´ïA^¥HrñGÍö¡Êè_¬9x¯©šQ¶®sŠoŠ³Iöq3­soc«ß´¹ÿ ú8úU·®OE;V…ü×Ôé­&ŞSƒ‹~Š¢~ò+ãjTç:ùÉ³çtüP}¥Ğ§û)_Şu¾w½70| ¤ıæ´V2ğ21ûÌ3iôM«úœo¼8Ÿkşc=/‚*êø 2AmÙ›ÿ ÿ 3>z»pfÏ÷ßó3½'‚“Á‘¶ßÍ—ï¿ægÒöìÍÿ Æÿ ™˜İé<ô¡ÁïÎ!ûÏùI€Ş]›Cªoı_ÔÃµWÁô¾óÉ7¦f”Ô—¼ì}Ş‡RMzY5ï#Sğ4¤ÉhÖò¼$šô•^grh¦ß=d¯ZüH€ÅOÅèb§q¨ãå&€ôi”mK•×·XsñG>Éu†®“§RüQæÓ&ÖÎ:…¸+O—ñ3²4clìç
+×fÒìâ`z"UïÒkâq—|®B–o,ÆÅ¯´Iö_™”:²Şs€•£^jş,	¯F”¹Jœ_œı¥ÚËñ©ñĞ‚¿_UB¶ÅËq¶à©wM¥Ô+ÅJcîhMÖfíœ·N’J|İ­c	u½»AËìÔœ’¿DM
+ÉóRâ÷šêTO“…×ŠL6ºi³c¿¦¥%oô:Ê¾
+Qm8´×z=,é¶¡rìÁ5ZŒ}nè£uÕ»WUIàà¸Ÿ5d-8”2Ï\æy{”½œUß$ÌeÎôZµ	¸Nœ“]é³TéÛ©¤                                                                   À
+ÅÆC¢Uñ-*0”ÛîW3gÍŞøÌÏ‚U¡*k“æ¬"èş…bqŒiÒ”¸¹&Ì¿Ô~îœv=Â¬¡(ÅÙ´Ñ$š‡Øs/Ê¡Zœ*ÉwÙó2O,Ê©QFîJÀbî¥öËp0‹ÄRŒæ’ê—S%òÃá#Ã‡§«v[çcr¯RÊòµ‘Áô³\xdêW„ZO“’N¥×5ciÇi.’nucwÉ!®ıåø|œ(µSª\<şF	koLÃ0rô35/4µë/lŒ_Åz°•»¤Œ>ÖöôÊ3r†ª¿5ıÈÎ´ëˆmÖ¯RwëwÈØ¹w»‘šÈÛo6ÆIªuå?ò¹Óö²ñ¸ŸùÕå+ø¿©Æc;t))°5µ~mó4 kôÏÀÒäP                U#Z®ü`
+šÔWylÉrbã0ßòkJ6ñS¸µu¶oƒ’S¯)ÃÍıLyŒÊÊwê¥j‹z]*n0ÄõvWfbj×m,¿0áµXFıí|¬»Ù½dÚi‹¡gFµH[¥˜š²í*ÃVIÂ¬e~é#x§S—%r õE·Nc—¸ªµ'QE÷¶g^¤7›PÆ8S¬Ô$ø¹|ÀïFèâ¢ãˆ§GÆßC5Ë°®Y„
+Q…I'Ñ.¾gph~ºòüd"á^m.JKêsÜ5DÕák0!?^[¸1¸R¬#)A]¤‘†úI xœ4å
+”§k´ÑéÏ—S­ĞŒ£ÜÕÌw×¦Å9vk	z*p§6º¤—0<øÊ6(gNĞ›»qyoèÂU7É\Ã=!ĞÌFN5©Ê;sVbÀ                                                             H¬as›jïTØ¼Ê¬iĞ§&ÛK£ˆ`ğRœ”b›o¥ŒÔfÆ™†g89Q’¥&½k>ŒÍM–7mFĞ¯˜BÍZVh‘=Ğ,6_J4hÒŠI%u~_ 1‹gmßø²êÖŒg;&âÕÿ C,²¼¢ğÑ§irä¬}Vç{.æp}?×.§)×©’oª›Ê|›mYm§ºûËğŸ¦«Ê+¥Ñ;Ho-.:y|øŸ5É‘ã¬ı¡sÖmÖ«$¤ú)?€´ó¯BçKøïtšfëGi<Ç4¨å*Õ ÛJV÷u:šswçÏÍÜĞß¸øœ\äïRR“ñwe™5Øi¸®E                              UH ±}åì>*Qwƒ”_ƒ³, ;WV{Cæ9eE(V©$­h¹w{ÌöÔóÙTp£‹|	Y6ÈµL×»òåäÀô“«Í¡²ì}8z*Ğ”¥nW]§hÓ©x§¬Ï5Zµ×Î?+š•²i;¤äÉÙ¿y<Â|6²æÀ”lÇ-¥V<5¡‰÷«˜³´&ÁXÖ©J1„ìÚI[ô;ÃWZëÁæTã:"î»ÑÏã+óRºğuï±>a–NndéE¾i>ˆÆL~_*rp’jK­ÏOz[¡˜|u)Q­J2RM]Å]\©wmÒœg_Í§+%ï š`k7Sx¼²¬©×§%f×FpBİ@Ò                                                        ^¡„”šQNMö%svÑ]­‹©ta)¶íÉ\’­·sÊ§£Æcaêr|2^şĞ1›f=ŠqÙÅXMÓ’§tİÓéşÄ¼j#d<»(¥Mú(ºé&İ—S¶t'Wø\¾’§…§$’vKèoõf—­.@kìµ¬—wèm™æ‘ÒÃÓsHÅGŸ6‘Ôú÷Úk“Ò”åVI{7Wù‘C´Æğ\^e)ÓÁÎPƒm]_§‡x±´®ñ
+5(PšuUÒiö‘}­í«ó<ÖsS­%I·ewĞéü×7©^n¥i¹Mõo™ññöª£çvîß_êh”®P                                        XÊÆ¨u½íÿ †€qê›jË*”*ÒtÓWW}	;Ù›xÆPÄÍ*®É¶ûHcSì>¬»2Æ¥)¸ÍtkŸtwJ¨âiª”êFJJüš}MŞ.Ë¥Ó Ÿf½¾ñ™\á]IT¦š\ïÓÇ¸–@íS‚Î)FQ«É®—W¸N»öQË³zUéEVi´ìº‘µÃ˜Ü¦¤êÆœ+¶¬ŸBwéT‹õ£ÏÄÙ´¿BpØêN*œgšçoÔ0Xœ Ú”\ZìjÅ‚VöÀİÍÊ¦/Q]ğÅ{ú"1tÃB«àêÊjr‡·5`8ğ                                                  R‰‡ª­MâóJğ¥Bœ¥4›K¡Ì6vÙ£œâ!S“¦ä®ìúS³&É8,‹èã:Î)¶ÕÚP:—dpùe:xŒTæÒ•¤¹ß©›8L$iÅBœT º%É{‹É{—qÂõ‡­<.]JU1#ß6—8Ï)aàêU’„R½Û±‚;Wo
+ÃåÑ,ÕI´ãê»ó÷×¶ğêØ©ÔÂ`¤ı5ÅÙĞì×8«Zn¥iÊr“»mßáÜ8Ö¶¼1Ù­iÔ­V|oÔ¿.}ç]_¸£‘@€                                             ÀR}ç;Õ¸ñ¹]hT¡Vji¸ß—.ãL	Ù7x•r§‡ÅÍS’´[“·?yŸ¹‘QÄÂ5)IN-'tîy}Ë³:”¦§JR„¢îšvÿ s;öCŞˆÀÎ&ér\R}€M|<fœf” ú§Í{Ì8ÚÛa.mJ¥l4#
+Š-Ú)+³#õg­ì&gJ50õ#>$›³G<—wxk5¿¨Ì^S^t«S”cÒ“O™ÖMŠöÙcŸaæ8Æª‹³²M¿©
+ÛJl³‹ÉqR§/D›³³µ€ÇÀUÄ                                              
+Å°Œ˜Ù?dœVuˆ§)Sj…ÕÛNÖ7-v:ÅgxŠujS’ šnë“W&ÛSºšÂäøhQ¡N*J)6’½ìÓ¨­Ÿpy£N>“…);+Şİ‡jø¾¿"“š\ßûÙµ×x<“Q:‘uœ_
+M]09¦¿v‰Áä¸yÊ­H©¤ì®ºÛÌ…­§öÆÆç5êR…IGv•¤ù«ö{¯½£±¹Ş"¤ªÔ—¢r|1»éô:{‹°s—[óo´¶                                                     \Krñ4 2/f­®1¹-zpu%*J÷“v_KM³®Òø<ëN¤}%•Õ×[sø»ÓÔ†¿ñ™."¡RJš’âİ¬¤Î½¼şg[ë£Q˜<ë*UéÇ…¤ì¯~Ï¡Ô;)m“„ÎğôàêEWI'v®Ù””ê)$Ó÷÷Û^lwŠÉ±*S¦İ¶šNÖ1M¯Èô×­]Tasl4èb)Å·“iw§¶VÅ¸œ½Jôi·‡m¾K•€Ãğjœzß“î4€                                         ª@ø™K±ŞÈ¸œïN¤éÉPŒ“w\š6“6ZÄç˜ºmÓ—¡Œ•Û\š';Rú›ÃdøZthÂ*j)I¤¯{õê—T¸l£N
+q‹QJM%ÖÇ7­UE6ıæ©N×fm§¶•š…J4f¥]¦¸Sç~€nÛ_m…Épõ!N¤eZQi$îÓd)ëo[ø¬ß:øŠ’”e&ãİ’úŸ²µ—‰Í11Š’’”®¢ß%ıN) l                                                          
+¦PÍ5e­VWˆ…|5IEFIÉ&ì×i4;m³†Î0ôèÖ©VŒT_³oŞA\drÓüF]ˆ†#9C‚I´¯àÀôëBº’RO—TÎ)¬ÍYá³L4èb!^-&ÒíF$ìG¶íÚ<>"j5¢”lß6ú|Ìã…DÒk·šöÒØç“bjW£NN„›|—$®b,£ñî=3ëgUlÛR…xE¹E¤ÚğäAÎØ{&b2LUJ§/C)6¬¹$.®%                                       ‘Ü;êc)Ò¥ãÆ¸¹ZçÕ~®kæ˜ºxjr”¤“²¿+“¿±ÎË˜|‹J¤©¯´Ê)ÉÛšvùÜi³¦¡0Ù&
+•:p¥p\NÜîvóvæú•Kâÿ #ö´Úg‘`ª^kí/…_ìÛ#kÌ>I…©TOÓJ)«ŞÄkGY¸Œ×Sˆœ›“v‹}wú|¿\ÚáÄç8º˜ŒDÛNRq‹|­~G_I€”Š                                                              ¬dPÊµw¬F[‰§ŠÃÊQ”vN×çÑ“i±NÙ43œ5:Uª%‰QI¦ùÜ‚(Èæº¨Ö'(ÅSÄáæâÔ“’M«¤ş`zjŒ¯æu¾5%†Î°u(Õ„]N	p»+ß°ë]¶§Ãç˜:quÚTR’m^ö2fQø¯Ì9ÛMlñ‰É1•#R›TÜß³µhôEµ–ÍXl÷UºkíƒàvWnß25ÃªÌFQŒ©†¯¥.Õ¹\@                                  ¸ä9LEXÒ¤œ§'d‘ğBôëØ‰İ·²±µ¡˜âiµNI).¼ïÚEîõØŞ
+4ñøšµ’Mq.}ı¦Ç±®]–,`ğ§ÂšQ„z%ĞÚ4ãKèàpõ+Ö’„a5wnˆ¯ÍxaòlZµgQE¸¦ùŞÄm5´.#=ÆÔœæİ%7Â®ídÎÄÛojªÙÎ6¥
+U¡§7O“HÅ0(Ù@                        , wÊô^½oùP”¼Aª¿C¼5k²Îc’½	¨¾Şô2çV»¯g$«b_7ÅÈç££•ä¯Rk½#Fc’Ê’\JÏ¹’!®Ì>K£Ô]ú:Õ·+7st÷KcŠ«)Â<1o’Š€                                 L ·6x×¾##ÆÓ«JmCŠ<JîÖ¹<{8ëÿ àéT„âêğ®%~w±ç
+,ÉöŸ¯’c©Âu%èjN1w|’ äú¿uŒÛÿ cêy¦:…5é ›ä¹ô¹—º¹Óª9†•z3ŒÔãìïnG#Äac5(Í)B\š}<€òó¤Ú9SVtjÅÆqmY«tfÒI–ò½	Ï3ÂSõ%y5ïì#B¥6¯tÓ]S@                               TPßt?Eªbñ4¨SNN¤ã]ÌåÙgÊÙŞaK†Ta4çË•¯ÌıWjæW„§‡¡£+/™ÑÛìÙK#ËéÍÁzZ°M¶¹«™B¡ÍcŠŒ#)I¨Æ7nş‰-ãÛfÏ9å¸J–Qn2q~îÃ*öÿ Ú–S©‡£Q}¦QjÉóébt›HêbëTÄUmÔ›»w¸mZ­¶ÛnMİ·Õ–Ä˜                       ,kú+ù«½Ics)(Ğ¥'_F¹œÛDu?Æ´¨R”¯n‰™ÿ ³Îí:•¸%‡
+åÕª­”2Ì©GÑÓŒÜ{â€‹ÍGîåÅã&›‚v½ÓFyê£w–_—¨¹¨Í«]5ÒÆYĞ¥­(¥İ¾Hù³|Ê4)Ê­I¥N*îıÀqšz=–e´*Táw'ØGNÛÂ=¤Àå³Isàúvvß[x9Êxïq”¢ıİ„fãñó©7:ÊRm¶İú¸i&•b1u\EIÔ”ıi_áÜlò}Å.                          UD
+ìp²ÿ ~ær@qÚP§'~œ˜jÀì#ÔV7KÒÔƒŒm~jÇ[´       ×	¾V½Óäh	";º6Ë©‚­»QÊj1r}9Û´˜|>a	Á©Fi>^*ç—Œ:¬+ÓmNâM;Y»»k
+y–\EOøˆ¤’oŸp}¬£™aªa«ÅJ2RJş(Í´vq«’ægÀÕ	ËÕåÊ×ø‚ef:í›³µû.¨¸¤§	4íÍÚì=,¡Éµ¡u08ºØj‘qôsqWíHã                              +ªìív±%²6Puë}¿OÔOŠ]İ-~ó¶lÔÕ\ë1¥‡‚m)EË—eÏAºÕÅ<³/¡†„Te
+iI¥ÕØkG£òŒb’^à:ôÖ}<§/­Š””e»&ìù#cqÊ”Y»F1»l‡må{VË‰–SöJêV|¹r`bfÒ:è«æq›pâ|*îİN¤“*Õ½æ                     V.F”"äßbWæŒnr}Õş#QS¥NMÉÙ4™‘7ìAÎ'	Jœ¡®©®D¬ìı±N_”Ó‹­J3ª’æÒëı Á™·nâkÊ±p~Ù»®ÂJuU²öY•F>Š”\ÒWv]NÙÂaU4¡N)At±yS]y¦ZÉp¯ĞÕví5¶hœìÒïEjé''ì¥vÈáŞ1¶jÂÂXOZiÆ\/ÃŸC)vÁ×í,-«'$ªT„”yó»º Xzw[0ÅÕÄV“—IJ7çdß$€Ø3,|êÎU&Ü¥6Ûmß©òÀ                       j…;ò]NI£Ú½Åâd•:3•ßb@8ÒGÕ‡ÊªKÙƒ—’3T;½qÙ‡œ%Ú½ÓFxjovö ñQŒšµïfJh> ñ¸ÛpQš¿ğ³%5g»[2Ä8ÊP’.¨—İÔ.W„IRÃÁ5Ûeô9Ş©®qJ>€À]XîĞÃSQûTÕ¯tw¤6PÈrÊ2¯8B*”\›j)rù™	‹Ç(ÂS¨ÔcÛm÷A¼SmŸI)åØZñ›‹÷>€tNÛ›Cáñx™a2õJœœ$ãnÏ#%#]jí·&Û”›m¾÷Ô´        bÎËÔ.¶êäØú8¨IÆ*IÉ'ÊÉfj\Àô™³¦·iç9u,Ld¥7u~}Ï•;®ÒI¦¼"7pmO<¿"¥¨I¤®ùwG•æ‘¯N5©´á8İ4Yï<ÙC†_oÁÓäıj–_Ø‹ª´š|/ªm?qéÃYzO0À×ÃÔŠ“©NQûçãjÍGUÉ3*´§£9ÉÇ—{¸$
+Ê%                           èa¥'Å6åÉ%âZ¦¹™±F¨åšç4)ÊT“M»rëı ‘­Ùû/G…†gV?´šM'×¥ÿ "@/vŸ³h~‹SÀáéa©¤¡Ù%à’5é6C†«Zm%N—?7mÛ´e<Ÿ.«AI*µ`ÒçÏš wH³ê˜Šõ+U“”§)JïÅ³!6ßÚ®u™TŠ“tèÍ¥Ï“µÑŒÒ—O (                    5Fín½ˆÙßdÌvoZ¥/C&¯+;X§ĞXâó
+±…
+RšoªM’²fíøASÅãb»¾=“û7ìmÉ(ÂR§	Ô²nêöfGS¤’JŒWbVeÑ]Âàà¡†¥p«rVfú¡hÔ¢»ŠDT (|õ1
+0œßî©;ù+—jÎÖó±Ô»Oke™]j×·eû¿¨1¼Ÿhif8é`á&áFm;>\ŸC\¹[¸åËÒ'ŠÇâ1ß«wğ8´ß0(                    
+¨›æ‹huldÕ:0”¤Ú\“cŒNa¢:¬Æc%FŒ¦Ÿrfbìİ»»œ%‹¦áÓ»VäI®§6DËrˆÆÔáRQK¬oÏàoìñ»g”*bbé®Mñrù’)ª2Ü²1ã¥
+[›K¯ÀïÜ>V§ÃÉ%ò/¨¾Ş`|fIFŠµp‡áV>åÅÚjQ@>‰wjÕI^öK©ªO±u1³l­¦èdx
+œ5ÚZQM_ ;¼lšy~xL-Eé¤œd¢ùóäC6g“ÄÖ©^¤›œåw{Öf±«æ˜ª¸ªò“s“i7Ñ_¸â2•À£`           >ü£7°«NN2ƒ‹ºğw';wŞÒÍpğ“šu©E'wÏ’ıH$Œí ¶7×İL“3§.&©Õœc.|¹´€ô7Û~ä`îò˜£™`ç˜SŠô”£~KŸ%úó3B4¦ÌğiúJq“·{>Í#È!‹£SQ'	ÆÍ?€_1¸BR„ÓN¦Ÿƒ±ò™=·¶¦^UœÕ8Z”œÒå×áŞc%UÌ                          û@ú08T”ayÉÙ"kwiìá]ehZ¼¸ZºæFnÅú¢©™føwÀåJ¼¹]uí=hŞÓÂP¥F’áŒceŞ’_07KŞÏ¹˜)¼ßh¿ìü
+ÃaçûJ‰ÆI>|ù¥¥úMO†«Z«QŒc&›vçn_™çßl-rÕÍslEçÅJŠ½×P:3Œ”ç*’ç)ÉÉ¿|ÅeÜP                  õ`2ùT’Œbääì¬®}ú1¢õqUcJ”œš\•ú’‡±nï+ªx¼|=NRJKßÚJl}°#1©O‹¦Õ§ÍvïªÍPá2Š£‡§‰9(«òÿ Î§&ÑÍ£„¥4 £N*Ü—ĞİcHC¶ı{A    Î&7·™„×t»Ğd.Ò•ÿ >Fq$F†÷<kx8Ç²ëæHpİ7â[.ÇÙ~e                   »K'Ñ^ıÆé£š+[R4éBRrvä®HîÈ»¹êVôxœl?dìí%ïíµ	²a›Ô„¡J^µ~O§À•İ¶ÀeÔéÕ­ë+6šíñ27WÚ¬Áåt•<-(«$›I_ú¹Âüù >|
+8ªp‚‚Š²²Hú¡º»š®   ¡IÍ¯Hô‚LEY(Æœ\İºÃµ×­ÊF®&¤Ò”bÚM®âö¨Ú¶{©UÎN’o†7å×àwNßû^ÔÍq“Âáª5BÆV|ŸeŒ&l
+I”             ~…w)®±’kÍ;–
+Åö2{®vxÜ3Áâjzô×S}İ×$&ö»ïµ9;-ër®UšáåpÓ•H©«Ùu=	êÿ L)ãğtkR’’” İùğóüÀÅ­âÛ;SÌ2Ê¸ªpOİÒçÒäæy\èÎtê+N.Í{ÿ ¡ê8É©âiÔ¥QqBIÅ§Óš±Ûwêjyvq^¤aÃFrvv²ëı@Æª£çsH                      ö““PK›i/ye™³öÏ0Íp´ã(úX¹rì¿@%3u~¢¾Í‚–*½?^\âÚïî$ÇŠévHâÚ³Ñ:xŒ"£jpâ·{Hßó|Öju+M¥¸›~$Şy¯5ƒËŒÒ«+¦“çÏ‘	øœD¦å9;É»·ÚÙ’ûzkŠys^›t¡'n|º¿•ŒbœmÈ7                 $#“h&€â3
+ğ¡B“œ’ºW±¹j¿UxœÏ
+8zrš”’m.„Ïlo°æ(¡Oˆ„eY¥/YsL!±VÀÔpéâ±°R›JV’íëÚg¦ES§G’H»
+I%’ŠVIw€ÆİP      ²5wº`ZÁÆ^+æIF&V·™‚[Ú´mÔÉ•D½›ş@B”}—æZ.)z­x–À         U (
+Øp@W„  
+¨DÍÕ¤1y­xR¥Jn2iq$ìr½œv`ÆgXšiR—¢âW•¬MÎ,à²<4§	Uá\ÚM§o˜E²~ÀØ\®”+c!ÔiJÍ+®ßq™ØiB4éÅF	rK°¿÷ôìF´»€¤ —CP   
+0ÍŸO4b+$¸¸b›~â2·‘í‰èbòüOi8Ï…üoc%¶àÚ†–C—Î0šujÅ¤“æ›äAœi¥lv&®&´¥'RnJîö¿bdÅb\¤ç'yM¶ïŞÙ`6                 ½F«¤šwOÄ™MÖ÷XœÂW©z‘åß>NÄ3A_‘»ëjynq‡\n4§4¥Ï—UóĞ½¸Õ#7 j5c2×ˆ£Nõ#vÚ\ùs¹šÚ9ÓÅĞ¥Zœ”£(©rïhøôßFéãp•èÔŠ’”&•ûì˜|^Ó”¡%iFV~ãç;ƒj]Ï.ÍñPpqƒ«'\ºA&                      k‹ä×o"K7MjaW«WZ¢Ü¢Úîéo‚#%Ë\EqæçRøµÊç ­‹5O³)¡%U§>Vëı@ïéC—ıÛ%äŒiÛóZk/É+(O†¬¢ì¯Ï¡“1V”¤ú[äCvõuÊ®a,9Ş
+÷Iò² ³ŒÒxŠ•+Tw”Û~,ÛîjjŞóH               @;T: ÄæØ˜QÃÓ”¯$¥dß+Ojƒ›baB„$Û’M¤ík“²È8\N­Jqx—İÒºväÙcl.I†§Z­8Ê¼¢›º»LÊºpîén‚
+üÿ #X         -b!{y¶®¯e“U¥ñ8©Kòş‡~Øø±¸Ô§:sWU£ÏÅæL2'†ÅV Õœ&âlÒFpmù²}|¿[J›têÉË’ñ¹„õ03í‹^à>`}˜Lª¤åÃI¿kÌòiÒvœ\|°      §-§R*^Ë|üŒİÔ†Èx\Ş„gFQr·4`ÔNçÔ&Ó8Ü’½7JmÒR\JïÙ¿gs™îÑ®“áƒ~ã®t—w^g¸Q“÷2QöYÚw`á(¸úNuÊ÷±ßrªŸX~H;M²m‡o„ì¿…ı¨Ò=¯…—XI5àÏL™æ‚áqIª”aÏøWĞègì'”ã¡6©¨ÔiÛÕ]@óèéµÕ/²nÉ¬óNR¦Ö‰7&¬dFg»7ı«ğ?²ñ÷rµÉ;Ô¶¥ğ¹.
+Š|)9$¯{òêCPØ<—
+T©Ç$œ¬¯s´ï+ûÊ @   (À¤§c†ëSXTr¼\Mi(¥Zï¶Ç,ÄWQ‹”İ£w~Fo,ÚÒX‰Ï,¡SÕ…Óá@1Ck- kgY…kÍÊ„j>~V¿gät,ŸÀÕ>Ûõï4                   ¹öe¸éQœ*ÁÚQwOÈøÍQWäóîáÖÒÇä´áRw«Mİô±–tÕ’ø›üÈQİ…®™a³:x9ÎÔäÕ•ùZä×KÖp’ékÚu.©Æ2Œ9É©I¥ãÏõ"Ö]-Ûvz2ÚÓUôóLªºiIÓ§&¹_¥Ï<ºY”z]z-[‚¬ãğnÀl€0                   Õ^ş“Rv÷{ê©æ™µ(ğñ*sŒº4w)ô:TW/GN1·‘;¤5TáZ¦.¤}¤Úmxr%G‹ö–ìá†ë—J~Ç•â1³….OÜyİ×æŸË2Ì«â¿¯%)¼£]‹—O¥iU…¾+—Ìƒ¯Mw&úÊÿ î‰Îæ               ‘Î5Qª¼FkŠ§‡¡	KŠIq%Ë©ğê÷WØŒÇ=JNrI´ºk°îÇT2l,+b)©b%Ó’æ®ù±ÎÈlN­jiâ\S»JéÛêe4c~o“AG¿³¡¬P           £E5°OXZ³Âf”]]5$ÓI´¹x˜S§;³èÕ­)QŠPnë’$PO¨r—p?©½İX<.!ÏMJ)t²#óy6ƒá²üááğÑQ‚¿%Ë¡;Ô¤Ü¤ŸNDïR÷ô¼äÔ3I®¯S@    å:…°|l©´]|‹J^‘ıÉ)Fü¹¿…‰õÔş³)fØXºRMJ*ö}¶<ÊÅßÜIîë¥åéc•ÖŸ¨¬•ß¸	b‹º(¨¤ïÌ¢’º·KC›ÿ 	­"¢ÀP¨     uy«.¥ÂÌ®ü€Æİ¸uí§)¬£4«J-.|ú¥ºMW^®"¬œ§97Ï¹¶H&÷--ª³‡R|°€£`                   a; sMé´²ü}Jvá”yø9#ÑÏºeöì£ˆ½Ü¡Íÿ ¥iåS¥»	¨İ…®õŠÀC åySŠVò_ĞäÌp—R›ıøJ6óL€í¼µFò¼Ö£ááU§'ÓÍ“ÿ )zé.–dfïpÕ[®©b©Çœm¥Ü¹ş D´¡ÉxšMsîî4                   >¬>tâ¹¹8¯‹>zp¹Úû1hö†kB¯iFV÷6»
+jê8<“W…)Îšo¿’FGİÌ}8N3«-û._B‚Và¥k{‹ºqšz»U»pQ›÷ÛØµ‹öœÎJñ…ïoáV0"ªä¼ÖÚ_O¥˜f˜‰·u“KÜÎ¦r€             7İÑ
+ØÚğ¡BRœ’äº\øò,¦"¤iS‹”¤ÒåÏ©/[¿ö"†œ1ØÊiÊIJ*Kê3Ø;bÊ9V¬U5*²JK‰sM™Å
+k¢K….FŒ=’ŒRPJÉyÀ                @ ,Ñöåî çzŸßÒó‘8Ô}¹{ˆ9Ş©÷ô¼äÖêh5Öêh      ±‘Ø:Ö$òÌÂ†"¯^
+Mw\ëÒï¤çİoÉéƒR^±ÙVŸ§M6ülsÚO’0³vÆ²+-†»ú8/É¤Ÿ;xp        ³mùY¢Ö~@BFölÃ‹<á¿N&`ÍeÓÉ‘½/Å¤2ò—Íq‰ê¼€                     \¢ºù367Zkì™Ï£”­	Û¯N|¿C	;Pšq,¿2¡U;^pOß._0=*ÆIÚ¢æ¸y¶>¯áÉqSáNP¤Úø?èvFªó¿´åxjÉßŠoÏÿ ,nZg“}£Z‡_IIÆÀyÌ°j°’³Œæ¾hÛÎîÚëWŸÙÙ½jiYJR•½ÿ Ôé9ÆÖòH                 ”'gîfhî´Ğß´g±©%xÇ‡³¹ÜÂÙÇ’ñ%¿u¬T)GÃÍ¤î•JV”bº[ätÚZ~°9F"³©NKòg~×¯àÈêŞç§†£F/œÒV¿û9+Š½Y¾|U*?Œ™·ç~½÷4             .á°îRQŠ»nÉ/ÚFkl²\ÛO^ìñió\ºÜêİİ±#©(f8Ú³å(©/i*ù~4áT×8.—ñèÎŒÒÁĞ§‡£pIrø¼cn@U.Â¡    \¥À¨)qp*
+\\
+€       Ín^âwª}ı/9GÛ—¸ƒêŸKÎ@aMn¦ƒ]n¦€        %“ta)zX·ÉB_"N£í¿".w;ûU¿¾D£Çşcòğ       -~óò.H³UûOø@ wyµkéü¥óF$âº¯$eNòZ—Ò
+Rù£±]W’È                     õáëZ¤%şAügÈjŠíîĞ&ÁšÄXÌ…&îéÓK¯‚ú/zî=Š$dî„Ó×YVÃÊ\á’÷kN?´“ş,ogĞÏCœF¬cêÊıüş†ÕíäLvõXªØYbøoÁ¾Kúãõğ@h                 ¬P£.®­ÛâÉöİÓ¢K£ô$×­4¿$An«òO´c¨Rµø¦¾hôE³ı›'ÃRµ­ÿ ÕÙÔªúœo÷nş0ïXÓïµc©ÓNêœ­o$É’¯W‡U÷B«øE{vÍÒ÷‰Îq½Ô*I~l†œ½Uï-†À           ‚7½Ñš˜¼E,=4ÜªMG—ˆ™³&¢«çXúTaéq.'n]IñÔN§¨ä˜xjQWJ<MysüÎ’Ø7eêY&jÁzj‘R»\Õù™mÖşà+[‘­* €T¥ÊJv6m&ÒšXJn¥i¨Å+İ´ğælyÆ˜áèÍ©ù³¶†ŞƒÀÆqÂÕSš¿$×R;u­·Öe˜J\.Pùs·êÔfûBetºâi§ø—Ôùr­¤2ºßi§üËêyæÍõ§˜W“”±|”™óàu‹¤Ô£‰«Ë¾@zaÈt¶†'ÆkÁÜŞ¸ˆ$Ù»o¬n]^•:Ò”©¹$Ûw·>Ògu;­J®"”Ô¥(§$ŸN@sôTÓj       4}¹{ˆ9Ş©÷ô¼äN5n^âwª}ı/9…5ºšuºš       Vw;¯Z·á—È”hûoÈ‹­ÏÕoÃ/‘(±öß€       Q–1~Ìÿ ùä|ØçêÏğ¿¼j_ú‚§”¾hÅÜOUäŒŞ'/ïúRÿ ìŒ`Äöy -                      )Ë”‹a03uŞ}“4œ[²©$¾)"n¾Ñzj¢ıäŸÄó™²•¼.o†çn:‘_™èƒ#Äqà¨KüT©¿Š@tİš,±Z=‰åyF7øÅı=ÕèğJ¤TÜ~Ç¥m~d¿hÊ14­~*ÿ –yØ×>}›0¯JÖ´ßÍÁÁYD               æsE³U)Y ;“d\ŸÓçØ8Zë‹õ‰è—E²åCFšåêGäˆİÛ‘zm!Ã»r‹æÿ ØŸŒO'MxÛäÖvl°Ùv*mÙú)ÛŞ8:ÛÌİl×7ÎõæOÖØšAè2šÎöâ„¾G­,ÄñbëË¾¬ŸæÍ>¬          U5Bùv»%ï$‹vVÊj­öì];FŠ]İ-s¶pÕlã1£Fœ\£ÅÎÊü¯ÚzÔî­©e¸
+)ÅFJœT¬­ÌmG”U4­$’òVGĞŠE|M@ )p*h”ÊT—û˜ãµ>ÖL“R>’.µ­%{ÍõÑ¯ìQFs¯R*ÉµÍ!µğ<^aR¥,Ú£Í]>Ã¢uï´®;:­SÒU—¡r|1»é—aÓ··ˆNa˜T«':“r”İäÙò¹®ãH .  ù7Ú­fJèínU•Z¸JÓn+Õß‡".©ôfpîµ¬Ög;‰|wë7Ùbâ-Söcä‹À      f·/q;Õ>ş—œ‰Æ£íËÜAÎõO¿¥ç 0¦·SA®·S@       €@JÖçj·á—È”XûoÈ‹­ÏÕoÃ/‘(±öß€       RGË˜ûÂşGÕ#åÌ¿åÏğ¿¼:_ßõ<¥óF1âz¯$dŞğÇııSÊ_4c&#³Éh                       ›@±Î–a…šıÚôşi~§£İIgK”á%{¿CıÉk²ZÖÄR—uH?ƒG ]‡t‹Óå4¹ß†ı ïÌëªÒ©MöÁ¯ÈóÙ·Iè3üL-ewóg¡Ì;¼çî ›yÖú- «;r“’üÀÄJæZ5Ö•Ù               [5µÉy[®to‹2…kt’çï&›½j‹èEêïÒ[£ıI`Æ®pü@bFòÌ÷Ğd×½¸”‘8êüS”»äßæM÷|Óƒ(¥úßóm·oWŞ°         í*´’»•’÷ò4SÎûØÓS’Î3j4\[‚qo»¯ôG·elÂ°Xhæ5¡ëUÕ×z$+û,l	¢pÀá(á ’8pòò98ÙXI *OáÚûŠ¹w{ÌjÚçjÜ6E„©Ô‹­(´’|ÓoÚÿ kÜ.G†©N#*Ò‹JÏšv!\zéÅç™Õ¯RN.MÅ6ú\·®-oâs|UJõêJQ”›Šo’G_6x»
+     Ê}›Û®>óŸâ_$a>ŒÍıÖÿ yÏñ/’o)ûòEâÕ?b>Kä]       4}¹{ˆ9Ş©÷ô¼äN5n^âwª}ı/9…5ºšuºš       V·<{U¿¾D¢ÇÛ~D]nxö«~|‰E¶ü€¼       ’è|¹Ÿü¹şò>©t>\ÉşÎ…ü€€MáTò—ÍËˆê¼‘“{Ã~ş©å/š1“Ùä€´                       å
+¶’}Í2qw\i§Êä¯~¯š å.OÌ˜]Î¹¯úrøI} ‘<·SÍó½kG?ã¥Zİ¯™0ØEëÏÌŒì97ìåRİàE"Eq\Ÿ¸Ğ               »/ey–‹Ò^¢ó[7Fe7ÂJvèßÌ’ÊÜÜ|[ °ÿ İU%âşd‚Ğçñ7wÅævÁP…ûb¾,ˆ‹z¾òS·ÁbÛ…%üQù¢,oêûÀ´        ªœnÀÕw²\Ûåbd÷]ìı>H%9$Ók™û8èö–m†ÃZêRMüWõ=jƒAá–à(áb’áŠìí²™¥{>âá¦”l¬jsLäVr:Ã^úä¡“àªb*Í&¢ÚM«ŞÀq=©¶”ÃäX*“ã^•ÅÙ]^ö §^ÚñÅgXº•ªÎNO†-òµÎG´öÑøœóU¹¿@¥ê«»Zÿ .‡FJ]ÀQ²€      rŸFfşë¼çø—ÉAO£3u¿ŞsüKä€›Ú~Ä|—ÈºZ§ìGÉ|‹       f·/q;Õ>ş—œ‰Æ£íËÜAÎõO¿¥ç 0¦·SA®·S@       €@JÖçj·á—È”XûoÈ‹­ÏÕoÃ/‘(±öß€       RGË˜ûü/ä}R>lrõgø_ÈŞ¿¿êyKæŒcÄõ^HÉıâkûş§”¿û#1=W’Ğ                       ±^«óD«nmÌÿ g‰‡Œ¾dTÇÙ~h’ıĞ8Çµ—|˜ÕK““ñ#Ë{6SıÚê[±’_’ófoiÃq¹x0!2Õ~âÑzŸ³/qd              ~^Âóe‚ü½…ø€šĞ4ÿ ¹ª?ÔÏl#å/6`èHÿ qÍÿ êÌíÀt—›(÷»b/è×ñÇæF'îûÉ+ŞÕQñÃñ/™»ïØ       «‡•Í)fW€•Z¥³•—›D7Xê3íˆæ>Ã½íÜÉ„ª®×ƒ1Kw.­¿³òX§Jj.ş2³ºùy³L¤Tøó,Â4¡*³iB*í¿ 68Ó:85LUi(ÆnÍÛ¢ ãn]­ëg8Ê”(TkI4Ÿ'ÙŞwvñ}³%^¬òüOÙóRá}ÜŸB6ªTm¶İÜ¹¿x[ì4€        Ê}›û­şóŸâ_$a>ŒÍıÖÿ yÏñ/’oiûò_"éjŸ±%ò.€      š>Ü½ÄïTûú^r'·/q;Õ>ş—œ€ÂšİMºİM       +[=ªß†_"Qcí¿".·<{U¿¾D¢ÇÛ~@^       F|øÕêËğ¿‘ô2Æ%r—á  'xÄ¿êyKæŒ]Äöy#)·FÚASÊ_4bÖ+ªò@Y                       r>ËóDî’¯jõWñ28£ì¿2CwPTk?ÄÆbŸª¼Ñ„ûÙ)ÿ éé?Äf¶3Ø^ã·°Çÿ NMøËä€ƒŠkÔ—š,éûóE€              ù{Í–Òö˜Kº
+§÷%Eü_©X%Ê^lÀĞ5¿º*/ÔÏü?GæLïpÃÙÓÅ™võ}ä£ï}ÃÚ4ŸñÇæˆ¹ıßx€       j¦ù£²vzÑ·ŠÎ0t’ºu“~W·êu²+™»ƒWŸjÌá[†şkò`M–€hìpx:¢­jp¿›Šg(á,z/R+¹GòEùËóLçğ·3wˆmy§	,jUjÅÅğ¾ò2imvĞÈòúµjÍ)Jáçg{	®ílVÍ±Õ«Õ›”Ip]ß—`'8ÎjW«:Õdå)ÊR»wêïù\ÛŠÉ”          å>ŒÍıÖÿ yÏñ/’0‚ŸFfşë¼çø—É7´ıˆù/‘tµOØ’ù@      Ín^âwª}ı/9GÛ—¸ƒêŸKÎ@aMn¦ƒ]n¦€       €•­ÏÕoÃ/‘(±öß‘[=ªß†_"Qcí¿ /        £,ÔıïÂşEæ[—YyûÉãm!©å/š1WÕy#,7˜BÚC?Ã/š1?Õy ,€                       ¹eù’-ºb…ññ2:£ì¿4I>èŠ­[ñ0%Ã½Uî0³{_ı;5ø¾Fjâ:{ÑƒûÙêpµá !"Ÿ±/4X/Söeæ‹               ²~ªó-ÛõW˜º3K/œ;Ûù’0ù[Å‘gºg6µ7öş¤¥âåÎˆÌß•ÿ ÃÑŸñGæˆ›~Ç¼™ğyuòº3·OÑØıŸxÀ       ]²üÑ)»4ENëÉtriûù_|»Ù5›¦´{Ğåu]¹É/š<©Ï›]Æßç°ÃRj­F0Mİø+Ÿ]w5â`òM¬áƒÂÏ/ÃÎÕÚiÙóî
+·mCW7ÇTÂBoĞRŸ'ÉÙ˜s'Ø_Çæ«9T›âœÛ}çÌØ            )ôfoî·ûÎ‰|‘„ú37÷[ıç?Ä¾H	½§ìGÉ|‹¥ª~Ä|—Èº        hûr÷s½SïéyÈœj>Ü½ÄïTûú^r
+ku4ëu4       ­nxö«~|‰E¶üˆºÜñíVü2ù‹mùx       –â½gä\e¨{oÈŞwiÿ ¾hÄ|_UäŒÀŞ‹i¿¾hÃüWUä€²                       ì}—æ‰EÜå•ñ<Dû¥/È‹˜¿Uù’å¹»-¶;vËó—õJ_6×‰€›ÚsOî‡OÁ™ó†Ÿ­?24÷±æßğ®ûÀ‰8?Uû‹F¸¾OÜh               U¾E
+Å_%º¿?áÅÆ•ú¾òb1ŞÕ?Åô ›v–‘ú<ö&ùJQù“³ö©ş/ ]½C#ôÙ2åÓˆƒŠ±³qîg í»´{íEEkğÆL€ÿ Ãˆ«ê’_˜h       >¬ºêÁwÎ+óDñîæÊ=R¼cĞ‚,™~Ş—ÿ Ùš'çakG*ƒ|£èâÛììµuç¬ÊYF_ˆÅÊIJ1vWí±çÃh]mÔÎs*Ø©6âäÔWgVföôM¦g,TòÌ<ïMİJÏ—wĞY;{Ğ©+³H             \§Ñ™¿ºßï9ş%òFSèÌßİo÷œÿ ù &öŸ±%ò.–©ûò_"è       €@Y£íËÜAÎõO¿¥ç"q¨ûr÷s½SïéyÈ)­ÔĞk­ÔĞ        µ¹ãÚ­øeò%>Ûò"ësÇµ[ğËäJ,}·äà       [ƒõß‘pµmù[Ò©[Heå/š0çÕy#4÷«Ñ¶~ß„¾fb5ä€´                       @j‡>]ìš­ÒÙ¡Ë*»{I|ÑùeÕ§ùÅ|Z'¯w¦ıŸ*+qB? Iƒöêy¢&7®ç·­*Wí|‰gÂ/^§¸„]éÚIÇÎ’|“|¿óÜ§É”+8Ø               æsE³U)Y ;óbçĞéŞ×—ÊKêzÂUU!Jk¶*_5š‚ÎşÏšájŞÜ3ıQè›R¹ÿ Úrêo{Á/Éğkÿ !ûNW‰V½©ÍşGœÍ`á83T?Ã^hôÃœaı&ÒTª¯ş,ó´Ö<6uŒV²•Y5ñĞ¨ŸWæP¬™@     ß•¯ÛÓüqù¢k5?­JYv‰T›šU}áçÎü$&`±<5#?ğÉ?ƒ;·J6­S$$ÔxxZ¿€s¬6«˜ã+â+7&ç;6ïË‹—äqÍN§WŞi              å>ŒÍıÖÿ yÏñ/’0‚ŸFfşë¼çø—É7´ıˆù/‘tµOØ’ù@      Ín^âwª}ı/9GÛ—¸ƒêŸKÎ@aMn¦ƒ]n¦€       €•­ÏÕoÃ/‘(±öß‘[=ªß†_"Qcí¿ /        ¡í¿"éfŸ¶ü€„]ìT­ßñ=YôòFvïl£lí?ò0F·è€Ğ        XÄ
+$;[TZ’¯˜Æ¥UtÕîÕ“±Â´×
+uåJôÛ‹ó@qà         æ‹a¸±˜x÷Ö¦¿4z+Ù‡G~Í”ay[Šœ_ä¿SÏî¡ò'‰Í°‘µÒ­ıÍ4;	è²ü4.4×ä˜õIğqÍôJÿ w„ç^›H±÷Jÿ ›ş„ïkG9û>½[Û†£<ïm9¤iÍñ5o{É¯ÍÕØ•Ì´k«+³@                nStªS¨¿vIüèOa!XÃN÷i+ÿ *úxê>Q÷“]ºÏOò¨aœ®Ò\€ÎJtoFK¾3_È/Ş? ÿ eÌÜømé&ÿ Ruæí(®û‘e¾Aÿ ş>"înßX¸òF“\¥É/3@                        )ôfoî·ûÎ‰|‘„ú37÷[ıç?Ä¾H	½§ìGÉ|‹¥ª~Ä|—Èº        hûr÷s½SïéyÈœj>Ü½ÄïTûú^r
+ku4ëu4       ­nxö«~|‰E¶üˆºÜñíVü2ù‹mùx       iûoËè^Eš~Ûòúûİ(ÿ |Eø¿‘€U?BB÷¼Rşô‹#Îl
+       j…;HÄî½›öqÅç¸ÊTéÓ’¥Ç9[•¯Ï™¿ìÍ²~3;ÄÓ‹§%EµëYØ˜_j£/Ñªs’„jÆ›´İ¯uşû†Û_PÁè–UG„áûEX(Ï†×»Vw·2/±¸™NN¤å96üÛ;“j½tÕÎ3:òœÜ©Â¤”9İ[Ãât”Ÿ`          5F<™¤×N\ŸˆQ»ëB¾×›Eğß‚qı<ø|7ÿ "¾	;¹ïA¸ñUñ%v¯ü+úÚäãÙdNmy¬>A‹ìø9+<íibëW«Q»Şr~ë²ow˜iâ£“ÕÃ©YÊ/—¸ƒ*Rå/ -                  ÕÜ­ÓšÃ’ÌÖRõyYx?üd{Ğ—?s2+`ı4û{F£vO…uñş z¬¿i&b6ñ½]}·,•Nú8?ÊæWd9¢¯B×ïBëás‰ë«G–/)ÅÓjíÑ›^`y£ÄáíRqî”—Áµú9Ëu—£ÒÂcñ4ä­jµ-äÛ©Ä€                        ¹O£3u¿ŞsüKäŒ §Ñ™¿ºßï9ş%ò@Mí?b>Kä]-Sö#ä¾EĞ       €³GÛ—¸ƒêŸKÎDãQöåî ãzŸßÒóU[© ×W©         %cs»õ«~|‰GüÇäE¾çwëVü2ÿ êÉG‹õßÀ       bŸüÉy}å¨{oÈsŞñEÿ iEöØÉ4Şß„¾)HŒ     ŒNM¡zˆÇT*Täå&’²`qì.S’ŒSrnÉ#2öKØ_šÖ§SMÆƒiİ§kõ²î)IÓÄæ0²å%Ä½äœh–‡PÀP=5Å%t’~ğ8Ş¨µ+ƒÉğĞ¡Bœx¡yÛŸ%Ş`ôM§¢şÍÃÔõÓj\/½Ùô3ojtÓÈòÚ¸‡5Æã+&ùô<şëX53<}|\äåÇ'k»Ù7Ø
+©+İ·y7Îå²²e           ¡GÖŠïkóv,œ‡C2Ib±t)A_Š¤òâ@M&ìİ[ı“/U¸mé!×Í¯M~Ò_…~‡Zlå£’á •Ÿ¡‹±3,r¥JUŸîÂì–Şã¬)G,eÉ®kİÌYFŞôe6ñ:ûvw9'u%×Å·Yôò@[                  7ÍÏ'…ÄQ­gA¿+ó63S©ÓÀH;+iRÆdXJ—¼½Ÿ>Ş´±˜.:2¤ÿ z|Lİk­ÏµaVÊş=/Ü‰ ¿í?ÒïÕÇö~ní)¹>ó*G§‘-ÚuC,G2~¤Sm/©Í>Ài                       rŸFfşë¼çø—ÉAO£3uÇŞsüKä€›Ú~Ä|—ÈºZ§ìGÉ|‹         X¢ıy{ˆ;Ş©Mÿ oIÛ•åÌœn¾ò;·œlÇ,^y•qN7m%v9Tf’ş'âå¦¤šjÌ°     N*('&û<csœjÇTø¬Ï
+4iÉ©I+¨»u;£g-ŒqÙÅX)Rœ"ÚæÓJÄ½ìí²%£*p•d—­eÔ!°ÌsÈpÊ¥EiT‡?z2ÑGŸ€Š·+Z+’5P       Ücë?"á¦HËŞ© uª§^rIv+ö)*M]>Mv3Ó~²õg†Ìğó¡Z
+NI¤Úğ#7^»¯jF¤ëá½†ÛJ?À"ø5ìW˜Ò“JŒİ¿…ı
+d{æ5d“£5ş—ôÔMÓ.ÑšõZP§)_¹6gÎ­÷]â±2Œ§x®Mß‘›:™İıË¸^"©kw0#/P›
+ãóYÂ^QÕîš%;g}ˆğU8Jµ(Ê´mÕ.¿Ã"4{D0ØHğá©F§$o.7êºÔRŠ"¬­Ü9Î¡†§:Õ]©Å]¶Ï¾R]CwmiO/ÃTË¨MzY§Åóé`0Ãx–ÓÕ3<}L%—ÃÅ´ìùuøQ.\«™Î¬å:ÊR»møŸ             éG¯‘“{¿õ}ı¡B7Qq}<LcéïD¤î˜Õ©ÖxéÁÚJéµáÈ	FÊ2ÕG
++÷ ¢½ÇÚHÖ%ÅÔnÍQiyÛú‹7ûEøYƒÛÎuµö,Ã)[ÒÃ¥ûĞÕ§ÚE<f2½Y»Ş¤íåüg.Î·¬ß{›-                   5Óíò4 3[v&µ–_›8NVF¹>œù2ppø¥:jªıè¦¼™æ[VšO<;V«U§{w9/©è»Q:]nS…œeÅ/C/>@l;WhL1Ù&*)ÍRn/·¡çsKr)áq5¨ÍYÆR\û®zyÍ2Ø×§:3^¬£f@îñMT<»:¨áS“—4¹^àbh5Õ#@                      )ôfon¸ûÎ‰|‘„0èıÆsî¯Á¹fS²é%ò@M¥?b>H¼Y‚õRğEà        4¸›^èı,]Ğ­(M5gâ¬nÌÒĞ½·Âõğ˜š¸Ì&éÉ¹pÅrë~Ä`nk“T£'‘q’|ÓG¨ È(âiºU©ÆjJÜÒ}L)ÚwÇ_§+¾­ÌFá&liÖîœÎœ¥è©IÆü¬™À!°†sÅoC/å@1›„»†Â9´¢›lÍ½İÉ™T’ô´¤¢íØÌ¹ÔŞìl$-S’jÎÖ05s³–c©NŒÜ[ëgĞ‘íš7iR‚§‰Å¤š³q—uŒçÕÎ£ğ\hÒƒìMÅ\ìÃü6ŠîJÀqíĞ&œiaéB)+¤®ìrHÅöó*‘T
+€         ¥Š€)o‰n¥+«M&»‹ ¦¦á_Z4ßœ¡Jz9…](Ó^Q_Cvá]Ã…wj–1V‚QòFµÛfk±@(¢—€”»;XgÓí;£—áªb+IG‚«òè€ëÍ¨5çC%ËëNsQªàøùŞÜˆ×>µëgÚ˜ŠÒnò—ßeù~GvíÉµ-\÷:p›ô4äÕ“äìb“`Š            ]'Ï˜†C”KZ+¹IG—‹=	ìY 0ÀäXeÂ”å·n|¢¾¤7ìª÷˜çtc(^œ\níÊ÷ş„üäY<0Ô©Ğ‚´c/…€ú¥](zGû±oàBÎõm,va
+0•ãM´ÒğD¼ëcI¡ƒËq5%.©O‡Í¦yĞ×6—O™bjNM¯K5$Ø£ä€                    .S¨ÓR]bÓøt&7u>º/<-IúÔ×
+M÷Ş¥ÙŞdŞÂúè–UšR‡•j‰>~@zŠ´¤ß{Ğ5%N_SŞpNîÜúÍ–c•l=*‰ßÒBø£Œk›@£™åõğ_Š/ãf™•½èĞv~Ñz¹y^iˆÂğ´£'n^,ë*‘³H                  ±¸d9g¦­
+]8İõÍ¶FÆÂŒ+S„ªFI>JàcĞ;0Ô>ÏSù_Ğ×•j?VVXzŸÊş€uí{¥Í»$‰Oİªj”ç[Z)İÆëÃ—ètÎ›½±˜êôªU„£É9][‘0Ú©Õf*ÂSÃÑ‚Œ£¤×kšEúÍxH¯‰¨        FŠ€…vÜÖ ±9'ÉÂşi?Ğ±ıŸK¯¢ÿ 
+ú}Êfä£o%c[Wğ.\£…»nT                   j­EfÛIG›`YÇc£J¤ß
+‚m¶íĞˆíãÛdı¦£Ëğu=‡Ã>ÙÛĞïá;iÃBx,Eéšq“‹çİØC®sœT¯VuªKŠs“roÄ–µFÛmŞM¶Ùh             ¶¹#L3Ÿj?Ac™ağ©6§5~^(	KİY©ÓÁÃ0œ-'k6»_û'Q]Å®ÆuæÏú·S—PÂ¥oV-ùğÿ SÖÄ*tªI»()Ëà®oJ×;Àà#Bœí*‹…¤ûî¿RqÜ¤æúÉ¶üßS,7ë¾YgV‡ãFvëË“ş†%Ê\­Ü                     ÍÓGó—CJ¼y:u#%î6³R—+xè`½wG8Êáy':PŠµùòädÕ'g/27gëùåøØà¥+F´ì“}ïô&ÂU8£ºJÏÜÕÀŠ}ê{=*\Y8ûWm¥ïd_ğòoÄô´æ©aœe•°òIµ5çnŸ‘ç§[z,¿0Äa¤šP¨Ò¿uÀá€¬‘@                >Œ.PœgiE¦½ÄŸìµ†¿2Œ$ùF.vò]z‘p™¼hÎ‘TÂ×§ˆ¤ÜeNJ\ºvé2Z¤Ê+EMa©8É]4—Gîeü¦rªnñÂÒ÷¥ôFì-¶íÆ…<..j5¢”R“æÚäg¶	ÅIY§ÍX9nMFŠµq‚îŠ±÷%ñ*’ì@Š€                     p ¡P          Š“ê*TååÌÃ½·vÁ¡”á*Q¡Qzw¬Ÿ3”íyµf%ÁÕŒj/´8µ¦¯{k­kbs|ULMyÉ©6Ô[ä¹÷| Ú´ûN«æŠ˜ŠÓrsm¤ß‰ÆdÊÊE              ¸y_Ä’-Ö[=¬UU˜Tü·tÚñ0Wz%,n6†	¿IQEÛ¸ô²F¦¡“et©$£)Æ._İ¿vİŒÇıµõÍŸ*©QI)N2K¿š±4]¸›èıÄ5ï@Ú	âñRËá+Æœ¬Ò}ÏıÀÁ0Òb±U±2æêTrø›,™^.V4€                      +	Y” rm]é\ğXÊ¨¶9©ró=ì{®xçYU*ÜIÊ1Š|ùô<êE7ÈÏÙÛEUÁãéåó¨Ôi+¾V¸YNš—ï_ó"/zfÍëSûB„?æJò²ñçú’æ¤§Á(»¯jèëM¡µOG8ËkQ©)Fpº¿4›Í|£ËÆæ“k‹W•2ì}z"ãÔ—Õ¹€                	€ı¡ú__^Œ<Ü'{&×Ä—í‰vï££OŒ¨•t”}gî!’27mÒZØJ±¯Bn"î¬ş`z€Ë³(ÔŠ”eÄŸ>GÚ™ïKÑás	úÜ£y?wi&ú5¦41T£Z•HÊ2WI4úÈA¦,Ô                   6
+0Ÿ&+1Œ]¥%6|¹şONUªÉB0M»»t"‡m]àõV5RËjr§+IÆ]ÀK}:É®NşEÓ6/Ûã§O‹¨•wey>ßyØ,tf”¢Ô”¬ÓNı@ûAB       
+,Ö¬’»ä»ÀÕR¢^6mWµf$ÂÔN¢ôÜ/…&¯{r6İ«¶ÀÂd¸z‘U"ê¸µ5{®½vâó¬Tëb*76áİ­Ø]úíÅgx¹×¯9pñK†7v·g.>gZÊBR(               Ô—/IËõg Õ1øÊ4)EËŠ¤¬¯ÊêàfîëİœV;ñµ¡êÒ—[]Ï“&AÑJ*1ıÛ/räuËºœ£“å”a¨ÎtâçË¾Çoôr“ä­{ùÔ{Skn9>W[åi8É.|ú{õ±¦ÓÌqõñrmñÊşë»|ÌßŞ‡´uZøÉå´§zQ½ìù[¡2MrLåwr€                        XÊÇ"Ğ=.©€ÅRÄÓv”|»®¾‡5A|€ô;±»¡›åTdê)VQI«óèwÿ £ı×Ñ§&Afî­¢g•æp£Z£T&ãdß.o¡8Ù.oE(Wƒ¼'«xÿ ¸¯½eÏKÂS³^´øWÆö÷‘7Z‹MÅõ‹iû™éÛXzO‚­†©ı%7~ò ö½Ùú®G˜ÕTêNN.Ü¹»Ğ ¬¢P                 L /á1r„”á''tÑ—{0mßŒÊªB*¤§I4•Ûä¼{Œ=5^ı@ôa©§p9µMU‚“KÕº¹İx\Rš¼l×yæƒVúåÇeµaRi¨E¯Vü½Ä•lË¼®¸0ø·ÀÕ“rù'ŠABu¹‚ÆÂ.…XM´º5ÚsˆTñà4©®             €¹ğf¹¬)S•J’PŒm·n…Ì~>ã)Ô’Œ"›»äFğ»¸TòüN|âåîì‹oÛ²U§<¿RÉ^2”_¹ô#S”äç6å96Û}åÌÏ3iÊ¥I9NNí³äl×Fô–¶¬kP›„âïuuĞ“ıŠ÷†©z<>~¿(©Iûº²*Ó>œ2Tä§NN3\ÓNÏÜ¨Òz8šq)ÆjI;§szL…Œv÷­‚©K	Œ›pä¸äıÄ¼jóXølÆŒ*áêFm¤ÚM09‚˜ËâT
+€P
+”l£‘´i‘ÒÃÁÎ´Ôb¹İ»tqÄâ£å6£Õ³6ÊÛƒ•P#*­8®Îı;<N¬Û3xm<4j`°SR“¼x¢ş„Té›â1Õ¥WRSrm«»ÛÈÛYúÖÅfµç[RR‹“qM»%Øp™H9               XÄtá~]®Ö÷’ºûe¿_íøºw‹õ¡uËÂ×÷?²Ö¢kgy*Q‹pŒ¢äíÊ×=j›WôòÜ4"“§ºŞÀrèÑKÔ\’I%à—Ú¿\Tòœª½N5¼…^Ï£;ƒ2Ì#Fœ«IÚ0‹nş(ï)ÚBY=á°õ_¡ƒjJ/—.Vu›§53,e\UGw&ß>ëœNR+%ò4€                           öeÙ„éÔ…H6¥]rèîMöï-¨!š`©àªM:´¢—7Ï§ûl¤wÌzî­’f4ªÓ“Pœâ§Ï½¥p=>·îF(íã³e,ß.«ˆ„¯NV\úC¾5G¬ª9zRR”©ÅÉ'~g1Æa#R2„ÕàÕšóËŞ’èíL-j”kEÆP“V~ÚI-ŞQ²$¨Ue†§û.mğ¯a“]oÊÜ¬                   ¹vfàÜ_zm~eyjokÇ'’à©9Å5ÉË³âHÎÏ;È¨b”6j’æìC¬eárå’Nñ““hKz®Ü=/AV2¿Š9ük+'ty¾Õ¦Ó¹VãèjÉ¨¾Ù>†qj?y¿°±Ó·DîÀ–52·1ïW»be¸øÇÑÕİ¿yİ–i*±RH´ûšwšuÓèî\RP)r      (À6|ØÜlaNmF	]¶WŠŒ"å'h¥vÙ»zmÃ*˜,%KÔiÇÕ@6¾¶îT#S‚åÎ-Åû»œÏ3º˜Š’«VNS›níß©{Hô®*¬«Ö“”æÛæîm-€l  & )Ôi¦›RïNÆWl•¶¾/%¯N•Z’•Òm»ÙšU?÷Òf¦5÷ƒÍèB¥
+‘”ÜWºäÎÕŒÏ9›<m7È±ôu$èñ.%Äù+öxA³6ÖØ<æ„jGÒÙq+® d©¢U<O‡3Î)Ò¦’JüÚ1'i}»09m)Ó¥R.²M+5Ô‚Ö~º°y]ÏV1i6¹¢%¶¸Ş	ˆÆÎ¦	6©s\Iöt1ç^ÛTfÕIª•%WvJO§Ğé.·æûÀúqøùÔ“YJr•ÛmİİŸ%À                 n&KSR©EÊriYx»ñ»{dyã1óE?ØÅ§ë._˜‘»ãf:y^_KV	WšOšçĞÌ„ú>şGÏ—à#J§M%«$ºwY}G.ÁÖ¯VJ<0“ßV— 1¿o­¦!“à*aa5ékC…YóWDçy¼ëV©V¤œ¥RR•Û¿Vw6Öºú¯æUe)7NI(+òätK                              5Â¥¹ö¦š~F€€‘}Ú›[ıºÀâê^3|0â}§^âa0Ø¨Ô„gœf”“^'—Ï'†­N½6ã(I5olw|ma×>"¢ôĞJ)IóåÈ³Ö^€ÑÌğ•p•¢¥E¥u~m#¶Îu²lÆ·6¨97n]OBÍtó¹Ğ[YìÙC=ÀTŠ‚ôÑŒšvW|ºyçvEw­ıW×Ê±•pÕ¡(¨É¤ÚëfpF€                      ÕØF7í±¤É´cX¸¼ÿ ‡­(Û§7õ;÷V›xæ¸GÕ«)A[µô1v3±YNı@–íQoGÂÚ4ñÖåÕ™O {dåøŞU‚âş$yëV\Ów7ì£O1”,éWœmÒÍéƒ+ÓŒ-T¥Ğwş%õ7z”%ìÉ?yç{B6¾Í°­q×œ¢¼_ÔÉM Ş‡V‡
+ª¥.—v`Lº—TÈôĞèØLG
+•£æw¾ˆí•—b½hFÿ Ä¾ d­ÅÎ¾Ê5Õ—UI¬E?æ_S}Ãiî~Íh?z’2Ízê)ÊNÉ.nçÁ ¤ÕÔâÒëÌÃ­·6Ñ¡”açB…E*³N6‹»MòìaÛ—mÚ9u˜L5DêÉ8ú¯š~ât»K«c«Oˆ›œ¤Ûæûİíîè_Ó7¯˜b*b1”œäÚMŞÉö/qÆå (Ø       Q—aØ:Ÿ×&+'ÄÂ­
+EI9E7c¯`föµwŠc1XEF„ÜjpÙ»¿‰‡zI¥uñ•\EG9¾|Ûú›?‘¥°*åØP                 bQ¿V:½­™béa¨ÂRã’M¥Òàv6ÊÚ€­œæ#Àİ%ÄíË¯û“ñª-ZÑÊpT°´b¢”RvVæ—iÔì½C"ÀSs‚uç»µÍ%n¾wEJ±Œe);(İ¶ü9‘-¼Çk¿O7—àê[…ğÍÅö'Ï¡•{{íQO'ÀÎ•‹ÓÍ8Ù>|ùyu¥ºKSˆ©ˆ©&å97ÏÄ¦­fîß´Ûmù–Ã`                                
+¦v^¡5Ã_&ÇÒÄÓœ”—oÉó:ÌÕ=ìÙ¯ü>{§Z3¤QÕùŞÇp¿Ÿ_" 6-Ú~¶K¥N¥F°òjé¾K™:úºÓê9&Œ”£(§Éßª÷ì{O4ÃK…¦•h§'Â¹¶ˆ\Ò­«„­:bã(I®jİPXœ<g	$á$Ó¿‰{Ãv"SŒ±øÇ>ñéï&õæyl©NTæšqm;ø                         ªl ®]æ¤×‰ v•wx¶¼™¹á´›fµUå&låx€ç¹>»3:¶&£K¾OêvVm£™ĞµêNVñş¦;ÜªhÈÊ÷f4á(ÚO‰5{ÿ Sõ¬|Fg‰#9KŠWQo’8ªšîüÍYH                               >Œ
+S”aw&’·ˆ^ä515aF”\¥9(òçÔ˜ıŞ[Ã.£f.šu$”£Ä¹«U»Çb.'~6Ÿ«íÃ‰{×_q)˜)Â4à’„"’·€ÔmÊÜ—³äuv¿õá‡É0U1'>hßìs-8Ó:X<ñ5d£E¾nİûríWW8ÆÔ£B£û<[\Ÿ'ÏıÀê-£õá_;Ì*â'9:|O†7åÔêI2³ğ4€                                   ª2÷[£$wöÛ50©àq• mF-¾]İ¤~—ğ˜©BJq|2‹M5Ş€õ£ùõ<MW¥%*sI«;õ5æùE:ô¥F¬T©ÔM;óêE¶ï¹mÁ—ãjrVŒ\ŸÔ”Ì³2…jq©	)Bjé§ŞImû°¤ğÓ;MºM¹IE{ûÜÅá%	8ÉYÅÙ§Èõ¤:9KFt+ÅNœ•üQ{{ì=W^¦7Mº¹5ïì@Gà.â0î-©'¹4ú–€                                                             \£E¶’W}‰u¸zM$®ß$‘!›l3SVÜe6¨&¤¸—¿´ã	ìK[2ÄÓÅâ©µ‡MJÒ\­Ô™ıÑ:8*Ãáà¡N).\º+ ÑúXj0ÃÑŠ:jÊÊÅÜÛ6§B”«Tj4à›mòè]Çc£Nsj0Šm¶ûˆÊŞ	·*§à059»ÆN/è[oÛ‚Xª“Ëğ5?ew¸¿sèG4ê;¶İÛæßŸ_y0ÇÊ¤åRoŠSm¶ùõ>P                                        7›9©B¤jÒ“Œã$ùréÏàKÀûtF¼a‚ÆÔJQ´S“ëñ"=3vÑİ!«…«
+ôe(ÊRäíĞPxÂ`§œd®š6ı-ÑÚ2¡ˆ‚œdšæ¯ÔM…¶ğ†*ÂcjpÔVŠâ}mÈ‘¬»1…X)Á©FJé¯!ßnMêàjTÆàé¹R“ráŠä¾|ãğ§'¦¤Ÿ4ûPºC£ÔqT¥F¼#8Í5Í^×"ŸmıßÓ¡*˜Ü8£+É¨®€F@7ó#©‡œ©Ô‹Œ“³LÛ€                                                         }¹NQ:ÓTáå&’KÄ8L¦Ôb›“|’í3ÇbƒëfuiâñtÜiE©ZJÉ¯yÊ6$Ø
+¦2¥<^:Ÿ"Ô’’êº’Ó¢º+CF0ğŒ#¥ÉZöÆ„h6/¡
+xFŒRvVèoX¼\a)4¢•Ûe1¸ØÓ‹œšIsm‘÷·.İT°4ªapuª´âø_;¾@|[yíË9àğuœ“‹á}/Ë°ˆ­!Ò¸ª³­ZNR”›çâ_Ò½*­Œ­<EyÊRœ›æïk÷$¤                                          + nº?ŸÕÃU…z2pœÕº~„ªì1·ÄkFRÓåÄıİ¤J¦}ù6sSR5iIÂqwM;ê*Í¡ZœjS’”d“Ms+™e´êÂTªÅNM;«õ"‡aİà’§(a3	òºŠr~îÒT4kJèâéF­)ÆPšº³O¨é¶®ï¨UL^³¼šKèE™èM|iQ­EµÍ5ĞôıRŠ”\d¸£%fŸs0ßk=ƒ°¹­9ÖÂÓJ½›ä—_pRĞ;S\Z„ÆeçJµ9roŸ±Õ’€                                                     H¬bvF©õ%‹ÍkBr¼šçfÑ]­Œ«4`å)4¹&ú’›±Fïx¥O˜BÖ´’k¯Äí½‘vÃå´á_M:ÖOš]}æmáğ±„T ¸c’·.H—'É©Ğ§4¢¡$•’]Ùc
+Psœ”cvß#äÏ´–œªUšŒ ®îíĞŒ¹7‚ó/Ÿ>qn/İØ2Û“oHaaS	‚©zœãê¿qúQ¥±•§^¼œ¥7~m¿‡c?Ò
+¸ª²­ZNs“»»¹¶É€“(                                              ˜ _Âbå	)Á¸É;¦ŒãØÛoŠùmHa±³s¤ÚŒ\›²øô0T×öó¿cÓ«õ»…Ì¨Â­‘—NÉ«ó9ï5ĞóÕ³V×XÜ’¼xêNt®¹7Ñ}	•Ùëjüs‡„½,UV—«u{½ëëf|uBjT¢«´í+.¯äCÖÓ›ãrz³œ)ÊtîÚ²o‘<ô+&¸•¹›.•èVNT±4ã>$ÕÚé~à<ÂãòùÓvšq}Í)+û\îáV©‹ÁF÷»QŠéáÈ=6Õf/9F½)AEµÍ08`                                               },¦íäû’9&‡jÛœcB”§ÄÒäŸi$#nâsôx¬lxRjN2_³³VÅxÜæ¬%*r„.Ÿ4Ò±0û>l¯ÉhCöQuÒW•—UıNÑĞİÂ`)Æ–” ã®—6r
+Õl®íÈ|ßUåc…ëZ8l¾ŒªV©ğ¦ìÚ]¯¨pY>s•Xº©?Vê÷!³ií²q™ÕiÆIÂ•ÚäítqíŸ¼¶>sÂà&ãÜdâİ¿#qØùÔ›œäå9;¶ËS©~m·&îÛ-¶°                                                   O¼çz°Öş3*¯
+Ô*M$Óàâväp2±`L®È›Âèc£
+8é¨O”}fºô3ã$Ò:X˜ª”¤¥Í4Ï/ÙfgRŒÕJrp”ZjÍ®†jìÃ¼‚:¹·E4®ßgNĞ&ò­8É54¥ØÕÑúüØó/ÎiÉú8S›M«+]œ‹TJà3jPtjÇ‰¥utvô*©$Ô¹x›Cì-ËjÎTiJTS|Òv±ŠY®O:3pœZk­Ñé÷Hôb†2œ¨Ö§FJ×qOàa6ÑÛ¹0˜šs«‚‚ôîÉs¸œâPï}ol˜ås›«J\)»z¯§ÀéF
+Qm8µnõ`>p                                      	 *¢]£„”šJ-ß¹\îmSìµ˜f“‡¡¥.×î°:.ÊçVJ‹m÷#(6~Ø‹™Õƒ©JJ‹k›NÖøí³níì5B®:Ò$šçs94WCğøQ£Bœcº¨«ûÀèŸ6.Ëòjpœ¡ÔI6š½™‘´)F1J	A.Ä¬ŠÊi]·eãĞê½kmÊ©NUêE4•Ğ‘›ç´¨EÎ¤”b¹¶Ù‚û\oÃåğ,E:œÕ¢ïÌÄ¨·‡â±s©‡ÁMú&Úº}ãóŒæ­yÊ­Y¹ÊM·vØÛ[:îÆæõåV½IÙİğq;s÷tØ“(                                                         Õ{÷#H±õ]¯l~UR2ÃÖ’Œ_8İôø’³&ò,5hS¡Š’ô­$Û}¤=)ğ˜ÉS’œ$ã%Ñ®@zsÑ?Ãc)*”êÅñ$ìší9%Yr»<új#mÃ*©V¬êSVäîùy³ÖßØ,ÎJ‘¦ù^îÀdş›ê§™AÇF2º·EñéÌÁ]¡÷hCé'€ŠK›VF~äz[†Ä¤éTŒïÜÓ7¾7Øsõ³²Î?+œ£:S’MóágLârÊöâãæ¬ziÒİTåøØµˆ¡	9vÙ\Âí{nÍ£ŒãFZJÉü …ÖŸ×Äøü¶RQ¥9¥~i6cîm¡Xšô´¥w¦Ä
+Ê%,                             H
+oyV‡b+[ÑS”¯Ü™ß:ŸØË0Ì¥ÊŒàŸk‹_ é†Ë§?b.^Jçnê¯f\~g8Æ¦®×>ÚI~¢wcÒÂğTÅZ]¾Flhv§òìb¨P§¹Ù^ëÜìñ»1Qôu1ÑMrvhÏ=Ôî-‚XZ1M+^ËéÈæŠo¥•›9Ò|>7V¤anöñVW\ÓFÁ¥o‡ÂSs©V1áO“k°Æ 6óÁepš§R3jıd_kómìÃ5œ•“§M·É]r=ö–Ş;…ÃBt0ÓNªM&Ÿi×Ú0ÍªM×­/G&í¾—ó:ç˜N¬œêIÊOµó>g +{xš@                                                             . ¸»Ï¿)ÏkÑw£RpißÕv6à˜c¨]½qùSŒjÊu"šM·~_Jõ·¾zz±„¤—&Ò –-wnY›V¤ÔéÔ”y«I¯ÊöÓ†é¾“£8Êë±£ÊRïV<şj—nÌÏ-p§dınÂBu¼s‰PXºŠ2vêÀÎLßEp•ÓU¨ÓúŞ7f=ëcal»1Rp„)¹^Ü­ú³¡úïÀã¬èÔƒ¿Š9ìkİ]M{€ˆ]pnÅ«…s–9ö«s1Mö_Í0“jXyğ«óág£‰¨¿i)y¤Î3¥¸ÁcbãR„.ûxı ó=œhÍZÕ!(¿mV'³Y»r¼j”¢£;òµŒJÖìj””¾Ë.¶²28JXÉM7Ø7Ã6ı¬¿…ı¦Ïu9ŒÃßÒR’·ƒ‚êÄåóƒ³Œ“òe‡I÷04®p@,          , Q PÕ'ÜËØ|¤ì¢ß¹óX¯	Íò=Qc1ôt¤ïàş‡jèVÄ¹¾*JÔegü/è9ØÜò«]Úœ[~‘½VîÊ«W‡í0áïº2ÛVÛ¹r¼Œ¦”¤­Ê×t3f|Ó4£‡›‹·>ô2ãT²ëâœ".¿"W4OV,TiĞ…×o¡Ê  ½”£ä’ù‹º¥Ø+/Ë”\ã
+6¿+ş†Fdº#ƒÃ¤¨Ñ§++G™ºÊµ•Ü×¾ÇÒısà°WuªA[ÅÏc)w£bÏ´Ã†MÖœcn·fëÓx®,-U)«òM}HôÖæßbç)Fé;Û¯»pOĞÖŒçù&ˆÕ×Şğvhç
+2•8İ¤Ó·êbk×­':µ'7.nòoò¹·¶»€Ü³!ÄWw¯Vu.îøÍµË¸ÒØ Ø                                                                     J~Ê%xË…®Ôìÿ "È¶tiœÓ.áô5¥en²fcêWy•Xp,lß.·dpÆ¥‚Wí°ã«}¿2¼bŒUHñ>öŒˆÑİ`á±0R…XY®ôy—Ê4‚¶\Tj8¿ş§oè.×¹¾ÅzyJ²írø°=SÄEôü™ô:Şû«=ç’£Â±¾—½Ì°Õîò¿¢¸£íÕ 34Ñúˆ¸Ô¥~×ô:ßH¶VÊq7ô”W>è£ëÑm~àqI5^
+ÿ Ä¾§6¡¤ØYû5¢ü¤€Å];İÃ•UNT`“òF?iì)»úyr$÷‰‡X»ûÏ£Ó¿ğ	Zg»34§w;yQœì3šÑoŠœ¾ôæß'^&ÙŒÑ,=On”ò_@<êg4cèûT§ü¬â9«1túÑŸò¿¡èï©œ¶§·Báô6vÌ™5Okş?@<åVÑ,DzÒŸò³ã–MWü©ÿ +=cv6Èçÿ B+İfdÒöiCà€€ìš¿åËàÃÊªÿ —/ƒ'¡îşÊùşÊ?ô>:Û½ò×Òœ~èÿ eUÿ ._?²jÿ —/ƒ'nïlµu§‚>Å»û+ÿ .?ô–MWü©+>º:'ˆ—JSşVO†_°nOj”>ä¸-28[ö~è Yv«ñU:QŸò³–äû5ãë?V”ÿ •“ß€Ù‹%§Óş?CÀê_-§ìaà¾@ ›(Øw4¬Ò9sğgjhnììÒ¥œàíäÉ¤Áè~Ÿ±JÜ¾†é4¬¡ËÃm¡Û°j+zhyò2@÷nåt’•h&ùv#2½<¿ÂYÄbcÖNŞğ:ŸG6PÊpÖôtW.ø£²²¡†:Q^*+è[­¤˜h_Š´U»ä¥öÀá“n¼¿‰}@ìµ]wX±SÖvófëxÆ_ƒR\q“]Í£¬Íè›‰aÛ]mk*ùşáğÑsXrïhÇÍcíç•à”“©«ôh‡İ<Û7ÆJIW”`ü_Õ7œé-|L¯Z¤¤ü[ú"ÚêŞi)©¬ûÒ³0ÏOö£Í3/KZI;òRgQJ>7¨ÜEiIñJNMö·vZãğ4€                                                                              	šFi kŠ^'Ñ‚Í*Rw§9GÉŸ Lo”k‹3 Ó§Šª­ÙwoĞííÛ{3Âµé*Îvñf5úGŞïF´7z­ZVU!+ræÓ;ÏD·¥áëYJÈ‡[Ç¹Šušö[^L	óÑ¹òüE¸«B7ïhìÜ“i®¯şæŸó/©ç6†uˆ³V¢ò“_©¹àôûOÙÄÕ_ëÒ5me³é^ıKêntï.•bıèó«’m™Ñåö‰»úœÛ*ÛK3§ûóêş z¥¤¸gÒqøŸU<Ş›è×ÄÜğ|Îâ~õõ9ygìIû×Ô	ÆY”_jøšÖ=x‹Kz>f¿éËâ¿î>º{Õs5ÿ J_ÿ p_,‘¡æQï_*oUÌßı)|WıÇÉSzFfÿ éËâ¿îl*fô×V¾'ËWI0ë¬ãñ!/¼×3—îI{×Ôã¸ıá9œÿ Ä½ëêåVÓœzÔŠ÷¯©·×ÖÆ]j¼ú—ÔÜÓm\Î¥ıy¯õS„ç[Gfu¹zy«ÿ ú>YŞÑÙ]+ÿ ÄÓşeõ:ßJvàËè'ÃZŞˆ'ÆkSÚÄÕê6ÊÙæ!ûUj?9¿¨¦ÑpÔ.¢Ó:/L÷¬Ô«uN·zL*µäı¦ß›s%ôón\Ëß£©8^ı­=œkŸ4®Û*«¿bnß©Á™_HûÀúñÙ½Z¯ö“”¼Ùò´¼M€5F£F–À                                                                                          qp OÀ Zšî+éqlwÒ/ğJ¿ÂZ ]ô«ü#Ò/ğ–€="î(æ» 
+¹.â€ ¸¸                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ÿÙ                                                                                                                                                               # Copyright (C) 2001-2007 Python Software Foundation
+# Author: Ben Gertzfield, Barry Warsaw
+# Contact: email-sig@python.org
+
+__all__ = [
+    'Charset',
+    'add_alias',
+    'add_charset',
+    'add_codec',
+    ]
+
+from functools import partial
+
+import email.base64mime
+import email.quoprimime
+
+from email import errors
+from email.encoders import encode_7or8bit
+
+
+
+# Flags for types of header encodings
+QP          = 1 # Quoted-Printable
+BASE64      = 2 # Base64
+SHORTEST    = 3 # the shorter of QP and base64, but only for headers
+
+# In "=?charset?q?hello_world?=", the =?, ?q?, and ?= add up to 7
+RFC2047_CHROME_LEN = 7
+
+DEFAULT_CHARSET = 'us-ascii'
+UNKNOWN8BIT = 'unknown-8bit'
+EMPTYSTRING = ''
+
+
+
+# Defaults
+CHARSETS = {
+    # input        header enc  body enc output conv
+    'iso-8859-1':  (QP,        QP,      None),
+    'iso-8859-2':  (QP,        QP,      None),
+    'iso-8859-3':  (QP,        QP,      None),
+    'iso-8859-4':  (QP,        QP,      None),
+    # iso-8859-5 is Cyrillic, and not especially used
+    # iso-8859-6 is Arabic, also not particularly used
+    # iso-8859-7 is Greek, QP will not make it readable
+    # iso-8859-8 is Hebrew, QP will not make it readable
+    'iso-8859-9':  (QP,        QP,      None),
+    'iso-8859-10': (QP,        QP,      None),
+    # iso-8859-11 is Thai, QP will not make it readable
+    'iso-8859-13': (QP,        QP,      None),
+    'iso-8859-14': (QP,        QP,      None),
+    'iso-8859-15': (QP,        QP,      None),
+    'iso-8859-16': (QP,        QP,      None),
+    'windows-1252':(QP,        QP,      None),
+    'viscii':      (QP,        QP,      None),
+    'us-ascii':    (None,      None,    None),
+    'big5':        (BASE64,    BASE64,  None),
+    'gb2312':      (BASE64,    BASE64,  None),
+    'euc-jp':      (BASE64,    None,    'iso-2022-jp'),
+    'shift_jis':   (BASE64,    None,    'iso-2022-jp'),
+    'iso-2022-jp': (BASE64,    None,    None),
+    'koi8-r':      (BASE64,    BASE64,  None),
+    'utf-8':       (SHORTEST,  BASE64, 'utf-8'),
+    }
+
+# Aliases for other commonly-used names for character sets.  Map
+# them to the real ones used in email.
+ALIASES = {
+    'latin_1': 'iso-8859-1',
+    'latin-1': 'iso-8859-1',
+    'latin_2': 'iso-8859-2',
+    'latin-2': 'iso-8859-2',
+    'latin_3': 'iso-8859-3',
+    'latin-3': 'iso-8859-3',
+    'latin_4': 'iso-8859-4',
+    'latin-4': 'iso-8859-4',
+    'latin_5': 'iso-8859-9',
+    'latin-5': 'iso-8859-9',
+    'latin_6': 'iso-8859-10',
+    'latin-6': 'iso-8859-10',
+    'latin_7': 'iso-8859-13',
+    'latin-7': 'iso-8859-13',
+    'latin_8': 'iso-8859-14',
+    'latin-8': 'iso-8859-14',
+    'latin_9': 'iso-8859-15',
+    'latin-9': 'iso-8859-15',
+    'latin_10':'iso-8859-16',
+    'latin-10':'iso-8859-16',
+    'cp949':   'ks_c_5601-1987',
+    'euc_jp':  'euc-jp',
+    'euc_kr':  'euc-kr',
+    'ascii':   'us-ascii',
+    }
+
+
+# Map charsets to their Unicode codec strings.
+CODEC_MAP = {
+    'gb2312':      'eucgb2312_cn',
+    'big5':        'big5_tw',
+    # Hack: We don't want *any* conversion for stuff marked us-ascii, as all
+    # sorts of garbage might be sent to us in the guise of 7-bit us-ascii.
+    # Let that stuff pass through without conversion to/from Unicode.
+    'us-ascii':    None,
+    }
+
+
+
+# Convenience functions for extending the above mappings
+def add_charset(charset, header_enc=None, body_enc=None, output_charset=None):
+    """Add character set properties to the global registry.
+
+    charset is the input character set, and must be the canonical name of a
+    character set.
+
+    Optional header_enc and body_enc is either Charset.QP for
+    quoted-printable, Charset.BASE64 for base64 encoding, Charset.SHORTEST for
+    the shortest of qp or base64 encoding, or None for no encoding.  SHORTEST
+    is only valid for header_enc.  It describes how message headers and
+    message bodies in the input charset are to be encoded.  Default is no
+    encoding.
+
+    Optional output_charset is the character set that the output should be
+    in.  Conversions will proceed from input charset, to Unicode, to the
+    output charset when the method Charset.convert() is called.  The default
+    is to output in the same character set as the input.
+
+    Both input_charset and output_charset must have Unicode codec entries in
+    the module's charset-to-codec mapping; use add_codec(charset, codecname)
+    to add codecs the module does not know about.  See the codecs module's
+    documentation for more information.
+    """
+    if body_enc == SHORTEST:
+        raise ValueError('SHORTEST not allowed for body_enc')
+    CHARSETS[charset] = (header_enc, body_enc, output_charset)
+
+
+def add_alias(alias, canonical):
+    """Add a character set alias.
+
+    alias is the alias name, e.g. latin-1
+    canonical is the character set's canonical name, e.g. iso-8859-1
+    """
+    ALIASES[alias] = canonical
+
+
+def add_codec(charset, codecname):
+    """Add a codec that map characters in the given charset to/from Unicode.
+
+    charset is the canonical name of a character set.  codecname is the name
+    of a Python codec, as appropriate for the second argument to the unicode()
+    built-in, or to the encode() method of a Unicode string.
+    """
+    CODEC_MAP[charset] = codecname
+
+
+
+# Convenience function for encoding strings, taking into account
+# that they might be unknown-8bit (ie: have surrogate-escaped bytes)
+def _encode(string, codec):
+    if codec == UNKNOWN8BIT:
+        return string.encode('ascii', 'surrogateescape')
+    else:
+        return string.encode(codec)
+
+
+
+class Charset:
+    """Map character sets to their email properties.
+
+    This class provides information about the requirements imposed on email
+    for a specific character set.  It also provides convenience routines for
+    converting between character sets, given the availability of the
+    applicable codecs.  Given a character set, it will do its best to provide
+    information on how to use that character set in an email in an
+    RFC-compliant way.
+
+    Certain character sets must be encoded with quoted-printable or base64
+    when used in email headers or bodies.  Certain character sets must be
+    converted outright, and are not allowed in email.  Instances of this
+    module expose the following information about a character set:
+
+    input_charset: The initial character set specified.  Common aliases
+                   are converted to their `official' email names (e.g. latin_1
+                   is converted to iso-8859-1).  Defaults to 7-bit us-ascii.
+
+    header_encoding: If the character set must be encoded before it can be
+                     used in an email header, this attribute will be set to
+                     Charset.QP (for quoted-printable), Charset.BASE64 (for
+                     base64 encoding), or Charset.SHORTEST for the shortest of
+                     QP or BASE64 encoding.  Otherwise, it will be None.
+
+    body_encoding: Same as header_encoding, but describes the encoding for the
+                   mail message's body, which indeed may be different than the
+                   header encoding.  Charset.SHORTEST is not allowed for
+                   body_encoding.
+
+    output_charset: Some character sets must be converted before they can be
+                    used in email headers or bodies.  If the input_charset is
+                    one of them, this attribute will contain the name of the
+                    charset output will be converted to.  Otherwise, it will
+                    be None.
+
+    input_codec: The name of the Python codec used to convert the
+                 input_charset to Unicode.  If no conversion codec is
+                 necessary, this attribute will be None.
+
+    output_codec: The name of the Python codec used to convert Unicode
+                  to the output_charset.  If no conversion codec is necessary,
+                  this attribute will have the same value as the input_codec.
+    """
+    def __init__(self, input_charset=DEFAULT_CHARSET):
+        # RFC 2046, $4.1.2 says charsets are not case sensitive.  We coerce to
+        # unicode because its .lower() is locale insensitive.  If the argument
+        # is already a unicode, we leave it at that, but ensure that the
+        # charset is ASCII, as the standard (RFC XXX) requires.
+        try:
+            if isinstance(input_charset, str):
+                input_charset.encode('ascii')
+            else:
+                input_charset = str(input_charset, 'ascii')
+        except UnicodeError:
+            raise errors.CharsetError(input_charset)
+        input_charset = input_charset.lower()
+        # Set the input charset after filtering through the aliases
+        self.input_charset = ALIASES.get(input_charset, input_charset)
+        # We can try to guess which encoding and conversion to use by the
+        # charset_map dictionary.  Try that first, but let the user override
+        # it.
+        henc, benc, conv = CHARSETS.get(self.input_charset,
+                                        (SHORTEST, BASE64, None))
+        if not conv:
+            conv = self.input_charset
+        # Set the attributes, allowing the arguments to override the default.
+        self.header_encoding = henc
+        self.body_encoding = benc
+        self.output_charset = ALIASES.get(conv, conv)
+        # Now set the codecs.  If one isn't defined for input_charset,
+        # guess and try a Unicode codec with the same name as input_codec.
+        self.input_codec = CODEC_MAP.get(self.input_charset,
+                                         self.input_charset)
+        self.output_codec = CODEC_MAP.get(self.output_charset,
+                                          self.output_charset)
+
+    def __str__(self):
+        return self.input_charset.lower()
+
+    __repr__ = __str__
+
+    def __eq__(self, other):
+        return str(self) == str(other).lower()
+
+    def get_body_encoding(self):
+        """Return the content-transfer-encoding used for body encoding.
+
+        This is either the string `quoted-printable' or `base64' depending on
+        the encoding used, or it is a function in which case you should call
+        the function with a single argument, the Message object being
+        encoded.  The function should then set the Content-Transfer-Encoding
+        header itself to whatever is appropriate.
+
+        Returns "quoted-printable" if self.body_encoding is QP.
+        Returns "base64" if self.body_encoding is BASE64.
+        Returns conversion function otherwise.
+        """
+        assert self.body_encoding != SHORTEST
+        if self.body_encoding == QP:
+            return 'quoted-printable'
+        elif self.body_encoding == BASE64:
+            return 'base64'
+        else:
+            return encode_7or8bit
+
+    def get_output_charset(self):
+        """Return the output character set.
+
+        This is self.output_charset if that is not None, otherwise it is
+        self.input_charset.
+        """
+        return self.output_charset or self.input_charset
+
+    def header_encode(self, string):
+        """Header-encode a string by converting it first to bytes.
+
+        The type of encoding (base64 or quoted-printable) will be based on
+        this charset's `header_encoding`.
+
+        :param string: A unicode string for the header.  It must be possible
+            to encode this string to bytes using the character set's
+            output codec.
+        :return: The encoded string, with RFC 2047 chrome.
+        """
+        codec = self.output_codec or 'us-ascii'
+        header_bytes = _encode(string, codec)
+        # 7bit/8bit encodings return the string unchanged (modulo conversions)
+        encoder_module = self._get_encoder(header_bytes)
+        if encoder_module is None:
+            return string
+        return encoder_module.header_encode(header_bytes, codec)
+
+    def header_encode_lines(self, string, maxlengths):
+        """Header-encode a string by converting it first to bytes.
+
+        This is similar to `header_encode()` except that the string is fit
+        into maximum line lengths as given by the argument.
+
+        :param string: A unicode string for the header.  It must be possible
+            to encode this string to bytes using the character set's
+            output codec.
+        :param maxlengths: Maximum line length iterator.  Each element
+            returned from this iterator will provide the next maximum line
+            length.  This parameter is used as an argument to built-in next()
+            and should never be exhausted.  The maximum line lengths should
+            not count the RFC 2047 chrome.  These line lengths are only a
+            hint; the splitter does the best it can.
+        :return: Lines of encoded strings, each with RFC 2047 chrome.
+        """
+        # See which encoding we should use.
+        codec = self.output_codec or 'us-ascii'
+        header_bytes = _encode(string, codec)
+        encoder_module = self._get_encoder(header_bytes)
+        encoder = partial(encoder_module.header_encode, charset=codec)
+        # Calculate the number of characters that the RFC 2047 chrome will
+        # contribute to each line.
+        charset = self.get_output_charset()
+        extra = len(charset) + RFC2047_CHROME_LEN
+        # Now comes the hard part.  We must encode bytes but we can't split on
+        # bytes because some character sets are variable length and each
+        # encoded word must stand on its own.  So the problem is you have to
+        # encode to bytes to figure out this word's length, but you must split
+        # on characters.  This causes two problems: first, we don't know how
+        # many octets a specific substring of unicode characters will get
+        # encoded to, and second, we don't know how many ASCII characters
+        # those octets will get encoded to.  Unless we try it.  Which seems
+        # inefficient.  In the interest of being correct rather than fast (and
+        # in the hope that there will be few encoded headers in any such
+        # message), brute force it. :(
+        lines = []
+        current_line = []
+        maxlen = next(maxlengths) - extra
+        for character in string:
+            current_line.append(character)
+            this_line = EMPTYSTRING.join(current_line)
+            length = encoder_module.header_length(_encode(this_line, charset))
+            if length > maxlen:
+                # This last character doesn't fit so pop it off.
+                current_line.pop()
+                # Does nothing fit on the first line?
+                if not lines and not current_line:
+                    lines.append(None)
+                else:
+                    separator = (' ' if lines else '')
+                    joined_line = EMPTYSTRING.join(current_line)
+                    header_bytes = _encode(joined_line, codec)
+                    lines.append(encoder(header_bytes))
+                current_line = [character]
+                maxlen = next(maxlengths) - extra
+        joined_line = EMPTYSTRING.join(current_line)
+        header_bytes = _encode(joined_line, codec)
+        lines.append(encoder(header_bytes))
+        return lines
+
+    def _get_encoder(self, header_bytes):
+        if self.header_encoding == BASE64:
+            return email.base64mime
+        elif self.header_encoding == QP:
+            return email.quoprimime
+        elif self.header_encoding == SHORTEST:
+            len64 = email.base64mime.header_length(header_bytes)
+            lenqp = email.quoprimime.header_length(header_bytes)
+            if len64 < lenqp:
+                return email.base64mime
+            else:
+                return email.quoprimime
+        else:
+            return None
+
+    def body_encode(self, string):
+        """Body-encode a string by converting it first to bytes.
+
+        The type of encoding (base64 or quoted-printable) will be based on
+        self.body_encoding.  If body_encoding is None, we assume the
+        output charset is a 7bit encoding, so re-encoding the decoded
+        string using the ascii codec produces the correct string version
+        of the content.
+        """
+        if not string:
+            return string
+        if self.body_encoding is BASE64:
+            if isinstance(string, str):
+                string = string.encode(self.output_charset)
+            return email.base64mime.body_encode(string)
+        elif self.body_encoding is QP:
+            # quopromime.body_encode takes a string, but operates on it as if
+            # it were a list of byte codes.  For a (minimal) history on why
+            # this is so, see changeset 0cf700464177.  To correctly encode a
+            # character set, then, we must turn it into pseudo bytes via the
+            # latin1 charset, which will encode any byte as a single code point
+            # between 0 and 255, which is what body_encode is expecting.
+            if isinstance(string, str):
+                string = string.encode(self.output_charset)
+            string = string.decode('latin1')
+            return email.quoprimime.body_encode(string)
+        else:
+            if isinstance(string, str):
+                string = string.encode(self.output_charset).decode('ascii')
+            return string
+                                                                                                                                                                                                                                                                                                                                                                           ÿ…9~9K|ëÕ>˜DUm¤óÔ–µ|ù&i£«SY!ÿİTBT97ôØ
+úy[»¸¸³K†—´Uª Î*G¤> Û_‡%ÊÕà|@ÇÌœo|
+`Çk	y½:%ºÕàì?P¼½¼·h®”ºÂ“–^•ü?u‚lÄÔ“Ğ¶ÙøåûÙ÷U¡ã c
+<Ç%˜
+¥İ³K×`]’± ó/QáÛ$h 'Äƒ‘úÓhÇ=ÂQ•4ªß#¥Û‘i8N3l&®¯÷³ÍŠ¢©º/¾^MM¤|¥³³ìÖ$†J6¹¢:CVâÄ†çnÔª,!Ü¾Ä\‡Ö6¬4»g}ìmíÀ»J("k—Á
+ÍïgMR…èÌ1$Ò‰ÿ:ıËæ§Û§M¹Øò,D]5ÍæløO ıŒÙ’Ñ••ìï=jzXRˆ mT¥‡‡„;C•£Ş¤Uê±¶Ğ%ñÃ°ŸâÅ8ŠÂr¥RŸûcxY’|ºŒş"~L¼*³Ä€oÄÉO×,>TJæ;‡šLöBkÄ2ÚCÂÔèáÙ,IØÜ“RšÁ,œÊëôT×D„ÁdGñQ¼„›½mş3­Widwiâ˜œ›70F5v$~Â„a>©k¡Â"}ô‹‡Oöı%¾3Æñ<sè;z‡‘Q.6‡{½“·rÊ¡}BMS¶y… ^hW¶¿Çe ~¸HÍ/è!7,wìó¹&Ò9Û7–bøh¨_À R²EÌ&f ¶À1B›¶¼âQ(îÓöûÅh8äÊƒÁ¨­q¬íD›7µïGÑ’Î±¨í¡ğ¡Aw;ñ~P¡‚Zå·°öƒ;Œ¬şrs¥a'ğŒĞ¶PH9Ó–/@‰£­I:HSóÉKL »ç¡‹zÈ\aİ“7‹¿,­©Í˜:Î‘wuQœ‘+j‘ gšcgÚc}¶ş>™TCq<(İ	ƒp32-£è¯Ì{
+ßt!ÇNˆBƒyC}üFèñZÕlù+ª˜c±€yO²ÑR„
+pÌ€‹×{ÔÈ\
+„€ÈÑ±EÎ[èw¬kÜ˜,Ô¾+î!ƒâYŠîEÙUÄWšÅ˜}Ú¿~%[;e~ÆÒÎòïÊ9a³Êåá¨û}ˆ‹t[oÆójrŞiÙ¨9ÚåŸ@şn£<Ì}s3³®ïJN¹³ÀeQ5°Klë™ëÄÒ­¼ =ÜX5†€*+ûHÉß}ÌC.Ì³”—ˆ%•K›j6 vû—//5­oBû‰²ùÌ~1Yğf9à²í`VNÊÇpR×éY×^³şÊzâ£…;Z¢{£²d(ˆ\x!xOğÎjø0âş}Œ[1³sÌÌ=dE)ØEÕ`+tëÚ$û`Œ*EÁÁ¸b¬°İ›|û5/ZÖj¡ñÎÀæ–J5};ËjPÓáğ|L—İ±Néûh.5'V^C¹%`@ôÑG+7t˜ì«~èG2Ç‡Ï¹yÄœ2R]p–ÅÎw­?…³µnSİöKlüeÿ¿z4ØòRæyräSë? `Ñ¶¼7çXÇø!47Ñ-÷çšèKøw/2¹Q˜çí³#7at}Ì¦P5¦)ÆÍd"ÂÇMi&f6V o8ğ^uªç„û4²WŞsÇj0#”ö4ûª5Kğ“bŸ/ØïbúBjË3†ÉòŸP=^Í ×¸¥n™ŸÍA‰@ÿm‰à¯Æä^Úu [Ü¨¹«\‚ğäÒ~œzxÉ¹´T !*ã´B†ê+dú€0‰NH‰Ñ× ÚÊ£ü«a™û_æN+’R[àwh‚Š`5Ó[h4 û òT¤ÊÙØ¤8=¬„¯x×yO7¹=3;	2üÓ“nêàBÔ®Ÿ¢TPD<€=Äñ~e†³‡z´(xÜi²Ãn¯ª	ZT˜=ÜÙÄfÁPò5(ç>ö =“kZı…Û=D°*o ½µ üW%•°CÑUX¡ÜtqÃQTÇ‡X‘%UNì!
+æóW¸ âòË9Òq9{[rØ™OZõà1”(À¤xˆ†íÖ1´}¶…'$aƒïzá€Øœ¥n<h¦¤ÏX7¥N«U™KÜ
+Y“Ü_ÏFãî»ñŞí7&Ã•«±Aë‚KòÏŠH[½…:¥}£^éÑèpgÉO¸©-Å2š üóÛï.øì¹ÓÁ7i!nEÑŞ–±€CÊekV€˜MÕØ'Æ wà

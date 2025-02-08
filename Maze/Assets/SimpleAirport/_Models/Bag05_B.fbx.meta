@@ -1,0 +1,45 @@
+egate() {
+            // This is intentionally non-static to speed up creation - in particular MakeUpdateDelegate
+            // as static generic methods are more expensive than instance methods.  We call a ref helper
+            // so we only access the generic static field once.
+            return GetUpdateDelegate(ref _CachedUpdate);
+        }
+
+        private T GetUpdateDelegate(ref T addr) {
+            if (addr == null) {
+                // reduce creation cost by not using Interlocked.CompareExchange.  Calling I.CE causes
+                // us to spend 25% of our creation time in JIT_GenericHandle.  Instead we'll rarely
+                // create 2 delegates with no other harm caused.
+                addr = MakeUpdateDelegate();
+            }
+            return addr;
+        }
+
+        /// <summary>
+        /// Clears the rule cache ... used by the call site tests.
+        /// </summary>
+        private void ClearRuleCache() {
+            // make sure it initialized/atomized etc...
+            Binder.GetRuleCache<T>();
+
+            var cache = Binder.Cache;
+
+            if (cache != null) {
+                lock (cache) {
+                    cache.Clear();
+                }
+            }
+        }
+
+        const int MaxRules = 10;
+        internal void AddRule(T newRule) {
+            T[] rules = Rules;
+            if (rules == null) {
+                Rules = new[] { newRule };
+                return;
+            }
+
+            T[] temp;
+            if (rules.Length < (MaxRules - 1)) {
+                temp = new T[rules.Length + 1];
+                Array

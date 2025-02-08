@@ -1,0 +1,216 @@
+B, At, DL, D, MuxR)
+    .addReg(PredR)
+    .addReg(TR, 0, TSR)
+    .addReg(FR, 0, FSR);
+  return MuxR;
+}
+
+void HexagonEarlyIfConversion::updatePhiNodes(MachineBasicBlock *WhereB,
+      const FlowPattern &FP) {
+  // Visit all PHI nodes in the WhereB block and generate MUX instructions
+  // in the split block. Update the PHI nodes with the values of the MUX.
+  auto NonPHI = WhereB->getFirstNonPHI();
+  for (auto I = WhereB->begin(); I != NonPHI; ++I) {
+    MachineInstr *PN = &*I;
+    // Registers and subregisters corresponding to TrueB, FalseB and SplitB.
+    unsigned TR = 0, TSR = 0, FR = 0, FSR = 0, SR = 0, SSR = 0;
+    for (int i = PN->getNumOperands()-2; i > 0; i -= 2) {
+      const MachineOperand &RO = PN->getOperand(i), &BO = PN->getOperand(i+1);
+      if (BO.getMBB() == FP.SplitB)
+        SR = RO.getReg(), SSR = RO.getSubReg();
+      else if (BO.getMBB() == FP.TrueB)
+        TR = RO.getReg(), TSR = RO.getSubReg();
+      else if (BO.getMBB() == FP.FalseB)
+        FR = RO.getReg(), FSR = RO.getSubReg();
+      else
+        continue;
+      PN->RemoveOperand(i+1);
+      PN->RemoveOperand(i);
+    }
+    if (TR == 0)
+      TR = SR, TSR = SSR;
+    else if (FR == 0)
+      FR = SR, FSR = SSR;
+
+    assert(TR || FR);
+    unsigned MuxR = 0, MuxSR = 0;
+
+    if (TR && FR) {
+      unsigned DR = PN->getOperand(0).getReg();
+      const TargetRegisterClass *RC = MRI->getRegClass(DR);
+      MuxR = buildMux(FP.SplitB, FP.SplitB->getFirstTerminator(), RC,
+                      FP.PredR, TR, TSR, FR, FSR);
+    } else if (TR) {
+      MuxR = TR;
+      MuxSR = TSR;
+    } else {
+      MuxR = FR;
+      MuxSR = FSR;
+    }
+
+    PN->addOperand(MachineOperand::CreateReg(MuxR, false, false, false, false,
+                                             false, false, MuxSR));
+    PN->addOperand(MachineOperand::CreateMBB(FP.SplitB));
+  }
+}
+
+void HexagonEarlyIfConversion::convert(const FlowPattern &FP) {
+  MachineBasicBlock *TSB = nullptr, *FSB = nullptr;
+  MachineBasicBlock::iterator OldTI = FP.SplitB->getFirstTerminator();
+  assert(OldTI != FP.SplitB->end());
+  DebugLoc DL = OldTI->getDebugLoc();
+
+  if (FP.TrueB) {
+    TSB = *FP.TrueB->succ_begin();
+    predicateBlockNB(FP.SplitB, OldTI, FP.TrueB, FP.PredR, true);
+  }
+  if (FP.FalseB) {
+    FSB = *FP.FalseB->succ_begin();
+    MachineBasicBlock::iterator At = FP.SplitB->getFirstTerminator();
+    predicateBlockNB(FP.SplitB, At, FP.FalseB, FP.PredR, false);
+  }
+
+  // Regenerate new terminators in the split block and update the successors.
+  // First, remember any information that may be needed later and remove the
+  // existing terminators/successors from the split block.
+  MachineBasicBlock *SSB = nullptr;
+  FP.SplitB->erase(OldTI, FP.SplitB->end());
+  while (FP.SplitB->succ_size() > 0) {
+    MachineBasicBlock *T = *FP.SplitB->succ_begin();
+    // It's possible that the split block had a successor that is not a pre-
+    // dicated block. This could only happen if there was only one block to
+    // be predicated. Example:
+    //   split_b:
+    //     if (p) jump true_b
+    //     jump unrelated2_b
+    //   unrelated1_b:
+    //     ...
+    //   unrelated2_b:  ; can have other predecessors, so it's not "false_b"
+    //     jump other_b
+    //   true_b:        ; only reachable from split_b, can be predicated
+    //     ...
+    //
+    // Find this successor (SSB) if it exists.
+    if (T != FP.TrueB && T != FP.FalseB) {
+      assert(!SSB);
+      SSB = T;
+    }
+    FP.SplitB->removeSuccessor(FP.SplitB->succ_begin());
+  }
+
+  // Insert new branches and update the successors of the split block. This
+  // may create unconditional branches to the layout successor, etc., but
+  // that will be cleaned up later. For now, make sure that correct code is
+  // generated.
+  if (FP.JoinB) {
+    assert(!SSB || SSB == FP.JoinB);
+    BuildMI(*FP.SplitB, FP.SplitB->end(), DL, HII->get(Hexagon::J2_jump))
+      .addMBB(FP.JoinB);
+    FP.SplitB->addSuccessor(FP.JoinB);
+  } else {
+    bool HasBranch = false;
+    if (TSB) {
+      BuildMI(*FP.SplitB, FP.SplitB->end(), DL, HII->get(Hexagon::J2_jumpt))
+        .addReg(FP.PredR)
+        .addMBB(TSB);
+      FP.SplitB->addSuccessor(TSB);
+      HasBranch = true;
+    }
+    if (FSB) {
+      const MCInstrDesc &D = HasBranch ? HII->get(Hexagon::J2_jump)
+                                       : HII->get(Hexagon::J2_jumpf);
+      MachineInstrBuilder MIB = BuildMI(*FP.SplitB, FP.SplitB->end(), DL, D);
+      if (!HasBranch)
+        MIB.addReg(FP.PredR);
+      MIB.addMBB(FSB);
+      FP.SplitB->addSuccessor(FSB);
+    }
+    if (SSB) {
+      // This cannot happen if both TSB and FSB are set. [TF]SB are the
+      // successor blocks of the TrueB and FalseB (or null of the TrueB
+      // or FalseB block is null). SSB is the potential successor block
+      // of the SplitB that is neither TrueB nor FalseB.
+      BuildMI(*FP.SplitB, FP.SplitB->end(), DL, HII->get(Hexagon::J2_jump))
+        .addMBB(SSB);
+      FP.SplitB->addSuccessor(SSB);
+    }
+  }
+
+  // What is left to do is to update the PHI nodes that could have entries
+  // referring to predicated blocks.
+  if (FP.JoinB) {
+    updatePhiNodes(FP.JoinB, FP);
+  } else {
+    if (TSB)
+      updatePhiNodes(TSB, FP);
+    if (FSB)
+      updatePhiNodes(FSB, FP);
+    // Nothing to update in SSB, since SSB's predecessors haven't changed.
+  }
+}
+
+void HexagonEarlyIfConversion::removeBlock(MachineBasicBlock *B) {
+  DEBUG(dbgs() << "Removing block " << PrintMB(B) << "\n");
+
+  // Transfer the immediate dominator information from B to its descendants.
+  MachineDomTreeNode *N = MDT->getNode(B);
+  MachineDomTreeNode *IDN = N->getIDom();
+  if (IDN) {
+    MachineBasicBlock *IDB = IDN->getBlock();
+
+    using GTN = GraphTraits<MachineDomTreeNode *>;
+    using DTNodeVectType = SmallVector<MachineDomTreeNode *, 4>;
+
+    DTNodeVectType Cn(GTN::child_begin(N), GTN::child_end(N));
+    for (DTNodeVectType::iterator I = Cn.begin(), E = Cn.end(); I != E; ++I) {
+      MachineBasicBlock *SB = (*I)->getBlock();
+      MDT->changeImmediateDominator(SB, IDB);
+    }
+  }
+
+  while (B->succ_size() > 0)
+    B->removeSuccessor(B->succ_begin());
+
+  for (auto I = B->pred_begin(), E = B->pred_end(); I != E; ++I)
+    (*I)->removeSuccessor(B, true);
+
+  Deleted.insert(B);
+  MDT->eraseNode(B);
+  MFN->erase(B->getIterator());
+}
+
+void HexagonEarlyIfConversion::eliminatePhis(MachineBasicBlock *B) {
+  DEBUG(dbgs() << "Removing phi nodes from block " << PrintMB(B) << "\n");
+  MachineBasicBlock::iterator I, NextI, NonPHI = B->getFirstNonPHI();
+  for (I = B->begin(); I != NonPHI; I = NextI) {
+    NextI = std::next(I);
+    MachineInstr *PN = &*I;
+    assert(PN->getNumOperands() == 3 && "Invalid phi node");
+    MachineOperand &UO = PN->getOperand(1);
+    unsigned UseR = UO.getReg(), UseSR = UO.getSubReg();
+    unsigned DefR = PN->getOperand(0).getReg();
+    unsigned NewR = UseR;
+    if (UseSR) {
+      // MRI.replaceVregUsesWith does not allow to update the subregister,
+      // so instead of doing the use-iteration here, create a copy into a
+      // "non-subregistered" register.
+      const DebugLoc &DL = PN->getDebugLoc();
+      const TargetRegisterClass *RC = MRI->getRegClass(DefR);
+      NewR = MRI->createVirtualRegister(RC);
+      NonPHI = BuildMI(*B, NonPHI, DL, HII->get(TargetOpcode::COPY), NewR)
+        .addReg(UseR, 0, UseSR);
+    }
+    MRI->replaceRegWith(DefR, NewR);
+    B->erase(I);
+  }
+}
+
+void HexagonEarlyIfConversion::replacePhiEdges(MachineBasicBlock *OldB,
+      MachineBasicBlock *NewB) {
+  for (auto I = OldB->succ_begin(), E = OldB->succ_end(); I != E; ++I) {
+    MachineBasicBlock *SB = *I;
+    MachineBasicBlock::iterator P, N = SB->getFirstNonPHI();
+    for (P = SB->begin(); P != N; ++P) {
+      MachineInstr &PN = *P;
+      for (MachineOperand &MO : PN.operands())
+        if

@@ -1,0 +1,139 @@
+p wait lock.
+						};
+					};
+				ch.Open ();
+			} finally {
+				creator_handle.Set ();
+			}
+
+				ProcessRequestOrInput (ch);
+			}
+
+			void ProcessRequestOrInput (IChannel ch)
+			{
+				var reply = ch as IReplyChannel;
+				var input = ch as IInputChannel;
+
+				if (reply != null) {
+					if (owner.ReceiveSynchronously) {
+						RequestContext rc;
+						if (reply.TryReceiveRequest (owner.timeouts.ReceiveTimeout, out rc))
+							ProcessRequest (reply, rc);
+					} else {
+						reply.BeginTryReceiveRequest (owner.timeouts.ReceiveTimeout, TryReceiveRequestDone, reply);
+					}
+				} else if (input != null) {
+					if (owner.ReceiveSynchronously) {
+						Message msg;
+						if (input.TryReceive (owner.timeouts.ReceiveTimeout, out msg))
+							ProcessInput (input, msg);
+					} else {
+						input.BeginTryReceive (owner.timeouts.ReceiveTimeout, TryReceiveDone, input);
+					}
+				}
+			}
+
+			void TryReceiveRequestDone (IAsyncResult result)
+			{
+				RequestContext rc;
+				var reply = (IReplyChannel) result.AsyncState;
+				if (reply.EndTryReceiveRequest (result, out rc))
+					ProcessRequest (reply, rc);
+				else
+					reply.Close ();
+			}
+
+			void TryReceiveDone (IAsyncResult result)
+			{
+				Message msg;
+				var input = (IInputChannel) result.AsyncState;
+				try {
+					if (input.EndTryReceive (result, out msg))
+						ProcessInput (input, msg);
+					else
+						input.Close ();
+				} catch (ObjectDisposedException) {
+					input.Close ();
+				}
+			}
+
+			void ProcessRequest (IReplyChannel reply, RequestContext rc)
+			{
+				try {
+					var req = rc.RequestMessage;
+					var ed = FindEndpointDispatcher (req);
+					new InputOrReplyRequestProcessor (ed.DispatchRuntime, reply).ProcessReply (rc);
+				} catch (Exception ex) {
+					Message res;
+					if (ProcessErrorWithHandlers (reply, ex, out res))
+						return;
+
+					if ((!(ex is SocketException)) && 
+					    (!(ex is XmlException)) &&
+					    (!(ex is IOException)) &&
+					    rc != null)
+						rc.Reply (res);
+					
+					reply.Close (owner.DefaultCloseTimeout); // close the channel
+				} finally {
+					if (rc != null)
+						rc.Close ();
+
+					reply.Close (owner.DefaultCloseTimeout); // close the channel
+				}
+			}
+
+			bool ProcessErrorWithHandlers (IChannel ch, Exception ex, out Message res)
+			{
+				res = null;
+
+				foreach (var eh in owner.ErrorHandlers)
+					if (eh.HandleError (ex))
+						return true; // error is handled appropriately.
+
+				Logger.Error ("An error occured, to be handled", ex);
+
+				foreach (var eh in owner.ErrorHandlers)
+					eh.ProvideFault (ex, owner.MessageVersion, ref res);
+				if (res == null) {
+					var conv = ch.GetProperty<FaultConverter> () ?? FaultConverter.GetDefaultFaultConverter (owner.MessageVersion);
+					if (!conv.TryCreateFaultMessage (ex, out res))
+						res = Message.CreateMessage (owner.MessageVersion, new FaultCode ("Receiver"), ex.Message, owner.MessageVersion.Addressing.FaultNamespace);
+				}
+
+				return false;
+			}
+
+			void ProcessInput (IInputChannel input, Message message)
+			{
+				try {
+					EndpointDispatcher candidate = null;
+					candidate = FindEndpointDispatcher (message);
+					new InputOrReplyRequestProcessor (candidate.DispatchRuntime, input).ProcessInput (message);
+				}
+				catch (Exception ex) {
+					Message dummy;
+					ProcessErrorWithHandlers (input, ex, out dummy);
+				} finally {
+					// unless it is closed by session/call manager, move it back to the loop to receive the next message.
+					if (loop && input.State != CommunicationState.Closed)
+						ProcessRequestOrInput (input);
+				}
+			}
+
+			EndpointDispatcher FindEndpointDispatcher (Message message) {
+				EndpointDispatcher candidate = null;
+				bool hasEndpointMatch = false;
+				foreach (var endpoint in owner.Endpoints) {
+					if (endpoint.AddressFilter.Match (message)) {
+						hasEndpointMatch = true;
+						if (!endpoint.ContractFilter.Match (message))
+							continue;
+						var newdis = endpoint;
+						if (candidate == null || candidate.FilterPriority < newdis.FilterPriority)
+							candidate = newdis;
+						else if (candidate.FilterPriority == newdis.FilterPriority)
+							throw new MultipleFilterMatchesException ();
+					}
+				}
+				if (candidate == nu

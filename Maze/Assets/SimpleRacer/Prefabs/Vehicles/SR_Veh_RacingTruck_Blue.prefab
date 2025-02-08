@@ -1,0 +1,222 @@
+
+				else if (MetaDataScope == ENiagaraParameterScope::Input) // Do not expose inputs as configurable values
+				{
+					continue;
+				}
+				else if (MetaDataScope == ENiagaraParameterScope::ScriptPersistent || MetaDataScope == ENiagaraParameterScope::ScriptTransient || MetaDataScope == ENiagaraParameterScope::Output)
+				{
+					//@todo(ng) Skip script alias parameters until we can resolve them!
+					continue;
+				}
+				ViewedParameters.Add(FNiagaraScriptVariableAndViewInfo(Iter.Value()->Variable, MetaData));
+			}
+		}
+	}
+
+	TArray<FNiagaraVariable> UserVars;
+	SystemViewModel->GetSystem().GetExposedParameters().GetParameters(UserVars);
+	for (const FNiagaraVariable& Var : UserVars)
+	{
+		FNiagaraVariableMetaData MetaData;
+		FNiagaraEditorUtilities::GetParameterMetaDataFromName(Var.GetName(), MetaData);
+		ViewedParameters.Add(FNiagaraScriptVariableAndViewInfo(Var, MetaData));
+	}
+	CachedViewedParameters = ViewedParameters;
+	return ViewedParameters;
+}
+
+void FNiagaraSystemToolkitParameterPanelViewModel::PostUndo(bool bSuccess)
+{
+	Refresh();
+}
+
+void FNiagaraSystemToolkitParameterPanelViewModel::RefreshSelectedEmitterScriptGraphs()
+{
+	SelectedEmitterScriptGraphs.Reset();
+
+	const TArray<FGuid>& SelectedEmitterHandleIds = OverviewSelectionViewModel->GetSelectedEmitterHandleIds();
+
+	if (SelectedEmitterHandleIds.Num() > 0)
+	{
+		const TArray<TSharedRef<FNiagaraEmitterHandleViewModel>>& EmitterHandleViewModels = SystemViewModel->GetEmitterHandleViewModels();
+		for (const TSharedRef<FNiagaraEmitterHandleViewModel>& EmitterHandleViewModel : EmitterHandleViewModels)
+		{
+			if (SelectedEmitterHandleIds.Contains(EmitterHandleViewModel->GetId()))
+			{
+				SelectedEmitterScriptGraphs.Add(static_cast<UNiagaraScriptSource*>(EmitterHandleViewModel->GetEmitterHandle()->GetInstance()->GraphSource)->NodeGraph);
+			}
+		}
+	}
+
+	Refresh();
+}
+
+TArray<TWeakObjectPtr<UNiagaraGraph>> FNiagaraSystemToolkitParameterPanelViewModel::GetEditableEmitterScriptGraphs() const
+{
+	if (SystemViewModel->GetEditMode() == ENiagaraSystemViewModelEditMode::SystemAsset)
+	{
+		return SelectedEmitterScriptGraphs;
+	}
+	else
+	{
+		TArray<TWeakObjectPtr<UNiagaraGraph>> EditableEmitterScriptGraphs;
+		EditableEmitterScriptGraphs.Add(static_cast<UNiagaraScriptSource*>(SystemViewModel->GetEmitterHandleViewModels()[0]->GetEmitterHandle()->GetInstance()->GraphSource)->NodeGraph);
+		return EditableEmitterScriptGraphs;
+	}
+}
+
+///////////////////////////////////////////////////////////////////////////////
+/// Script Toolkit Parameter Panel View Model								///
+///////////////////////////////////////////////////////////////////////////////
+
+FNiagaraScriptToolkitParameterPanelViewModel::FNiagaraScriptToolkitParameterPanelViewModel(TSharedPtr<FNiagaraScriptViewModel> InScriptViewModel)
+{
+	ScriptViewModel = InScriptViewModel;
+	VariableObjectSelection = ScriptViewModel->GetVariableSelection();
+}
+
+FNiagaraScriptToolkitParameterPanelViewModel::~FNiagaraScriptToolkitParameterPanelViewModel()
+{
+	UNiagaraGraph* NiagaraGraph = static_cast<UNiagaraGraph*>(ScriptViewModel->GetGraphViewModel()->GetGraph());
+	NiagaraGraph->RemoveOnGraphChangedHandler(OnGraphChangedHandle);
+	NiagaraGraph->RemoveOnGraphNeedsRecompileHandler(OnGraphNeedsRecompileHandle);
+	NiagaraGraph->RegisterPinVisualWidgetProvider(nullptr);
+	NiagaraGraph->OnSubObjectSelectionChanged().Remove(OnSubObjectSelectionHandle);
+
+}
+
+void FNiagaraScriptToolkitParameterPanelViewModel::InitBindings()
+{
+	UNiagaraGraph* NiagaraGraph = static_cast<UNiagaraGraph*>(ScriptViewModel->GetGraphViewModel()->GetGraph());
+	OnGraphChangedHandle = NiagaraGraph->AddOnGraphChangedHandler(
+		FOnGraphChanged::FDelegate::CreateRaw(this, &FNiagaraScriptToolkitParameterPanelViewModel::HandleOnGraphChanged));
+	OnGraphNeedsRecompileHandle = NiagaraGraph->AddOnGraphNeedsRecompileHandler(
+		FOnGraphChanged::FDelegate::CreateRaw(this, &FNiagaraScriptToolkitParameterPanelViewModel::HandleOnGraphChanged));
+	ScriptVisualPinHandle = NiagaraGraph->RegisterPinVisualWidgetProvider(UNiagaraGraph::FOnGetPinVisualWidget::CreateSP(this, &FNiagaraScriptToolkitParameterPanelViewModel::GetScriptParameterVisualWidget));
+	OnSubObjectSelectionHandle = NiagaraGraph->OnSubObjectSelectionChanged().AddSP(this, &FNiagaraScriptToolkitParameterPanelViewModel::HandleGraphSubObjectSelectionChanged);
+}
+
+void FNiagaraScriptToolkitParameterPanelViewModel::Refresh() const
+{
+	OnParameterPanelViewModelRefreshed.ExecuteIfBound();
+}
+
+void FNiagaraScriptToolkitParameterPanelViewModel::HandleGraphSubObjectSelectionChanged(const UObject* Obj)
+{
+	OnParameterPanelViewModelExternalSelectionChanged.Broadcast(Obj);
+}
+
+const UNiagaraScriptVariable* FNiagaraScriptToolkitParameterPanelViewModel::AddParameter(FNiagaraVariable& VariableToAdd, const FNiagaraVariableMetaData& InVariableMetaDataToAssign)
+{
+	ENiagaraScriptParameterUsage InVariableUsage = InVariableMetaDataToAssign.GetUsage();
+	if (InVariableUsage == ENiagaraScriptParameterUsage::InputOutput)
+	{
+		ensureMsgf(false, TEXT("Unexpected usage encountered when adding parameter through parameter panel view model!"));
+	}
+	else
+	{
+		FScopedTransaction AddParameter(LOCTEXT("AddParameterFromParameterPanel", "Add Parameter"));
+		UNiagaraGraph::FAddParameterOptions AddParameterOptions = UNiagaraGraph::FAddParameterOptions();
+
+		AddParameterOptions.NewParameterScopeName = InVariableMetaDataToAssign.GetScopeName();
+		AddParameterOptions.NewParameterUsage = InVariableMetaDataToAssign.GetUsage();
+		AddParameterOptions.bMakeParameterNameUnique = true;
+
+		UNiagaraGraph* Graph = ScriptViewModel->GetGraphViewModel()->GetGraph();
+		Graph->Modify();
+		const UNiagaraScriptVariable* NewScriptVariable = Graph->AddParameter(VariableToAdd, AddParameterOptions);
+		Refresh();
+		return NewScriptVariable;
+	}
+	return nullptr;
+}
+
+void FNiagaraScriptToolkitParameterPanelViewModel::DeleteParameter(const FNiagaraVariable& TargetVariableToRemove, const FNiagaraVariableMetaData& TargetVariableMetaData)
+{
+	FScopedTransaction RemoveParametersWithPins(LOCTEXT("RemoveParametersWithPins", "Remove parameter and referenced pins"));
+	UNiagaraGraph* Graph = ScriptViewModel->GetGraphViewModel()->GetGraph();
+	Graph->Modify();
+	Graph->RemoveParameter(TargetVariableToRemove);
+}
+
+bool FNiagaraScriptToolkitParameterPanelViewModel::GetCanDeleteParameterAndToolTip(const FNiagaraVariable& TargetVariableToRemove, const FNiagaraVariableMetaData& TargetVariableMetaData, FText& OutCanDeleteParameterToolTip) const
+{
+	OutCanDeleteParameterToolTip = LOCTEXT("ScriptToolkitParameterPanelViewModel_DeleteParameter", "Delete this Parameter and remove any usages from the graph.");
+	return true;
+}
+
+void FNiagaraScriptToolkitParameterPanelViewModel::RenameParameter(const FNiagaraVariable& TargetVariableToRename, const FNiagaraVariableMetaData& TargetVariableMetaData, const FText& NewVariableNameText) const
+{
+	FScopedTransaction RenameParameterAndReferencedPins(LOCTEXT("RenameParameterAndReferencedPins", "Rename parameter and referenced pins"));
+
+	FName NewVariableName;
+	if (TargetVariableMetaData.GetIsUsingLegacyNameString())
+	{
+		NewVariableName = FName(*NewVariableNameText.ToString());
+	}
+	else
+	{
+		FString TargetVariableNamespaceString;
+		checkf(FNiagaraEditorUtilities::GetVariableMetaDataNamespaceString(TargetVariableMetaData, TargetVariableNamespaceString), TEXT("Tried to get namespace string for parameter using legacy name string edit mode!"));
+		NewVariableName = FName(*(TargetVariableNamespaceString + NewVariableNameText.ToString()));
+	}
+
+	
+	UNiagaraGraph* Graph = ScriptViewModel->GetGraphViewModel()->GetGraph();
+	Graph->Modify();
+
+	Graph->RenameParameter(TargetVariableToRename, NewVariableName, false, TargetVariableMetaData.GetScopeName());
+}
+
+void FNiagaraScriptToolkitParameterPanelViewModel::ChangeParameterScope(const FNiagaraVariable& TargetVariableToModify, const FNiagaraVariableMetaData& TargetVariableMetaData, const ENiagaraParameterScope NewVariableScope) const
+{
+	if (!FNiagaraEditorUtilities::IsScopeUserAssignable(TargetVariableMetaData.GetScopeName()))
+	{
+		FNiagaraEditorUtilities::WarnWithToastAndLog(FText::Format(LOCTEXT("ScopeNotUserAssignable","The selected scope {0} cannot be assigned by a user"), FText::FromName(TargetVariableMetaData.GetScopeName())));
+		return;
+	}
+
+	if (ensureMsgf(TargetVariableMetaData.GetUsage() != ENiagaraScriptParameterUsage::Output, TEXT("Tried to change scope of output parameter!")))
+	{
+		FScopedTransaction ChangeParameterScopeAndReferencedPins(LOCTEXT("ChangeParameterScopeAndReferencedPins", "Change parameter scope, Rename parameter and referenced pins"));
+
+		const FName TargetScopeName = FNiagaraEditorUtilities::GetScopeNameForParameterScope(NewVariableScope);
+		FString NewNamespaceString;
+		if (ensureMsgf(FNiagaraEditorUtilities::GetVariableMetaDataNamespaceStringForNewScope(TargetVariableMetaData, TargetScopeName, NewNamespaceString), TEXT("Tried to change scope of parameter with override name mode enabled!")))
+		{
+			FString NewNameString = NewNamespaceString;
+			NewNamespaceString.Append(FNiagaraEditorUtilities::GetNamespacelessVariableNameString(TargetVariableToModify.GetName()));
+			const FName NewVariableHLSLTokenName = FName(*NewNamespaceString);
+
+			UNiagaraGraph* Graph = ScriptViewModel->GetGraphViewModel()->GetGraph();
+			Graph->Modify();
+			Graph->RenameParameter(TargetVariableToModify, NewVariableHLSLTokenName, false, TargetScopeName);
+		}
+	}
+}
+
+bool FNiagaraScriptToolkitParameterPanelViewModel::CanModifyParameter(const FNiagaraVariable& TargetVariableToModify, const FNiagaraVariableMetaData& TargetVariableMetaData) const
+{
+	//@todo return false for parameter library entries
+	return true;
+}
+
+bool FNiagaraScriptToolkitParameterPanelViewModel::GetCanRenameParameterAndToolTip(const FNiagaraVariable& TargetVariableToRename, const FNiagaraVariableMetaData& TargetVariableMetaData, TOptional<const FText> NewVariableNameText, FText& OutCanRenameParameterToolTip) const
+{
+	if (TargetVariableMetaData.GetIsStaticSwitch())
+	{
+		OutCanRenameParameterToolTip = LOCTEXT("ScriptToolkitParameterPanelViewModel_RenameParameter_StaticSwitch", "Cannot rename static switches through the parameter panel. Rename the static switch through the associated node's selected details panel.");
+		return false;
+	}
+
+	if (NewVariableNameText.IsSet())
+	{
+		if (NewVariableNameText->IsEmptyOrWhitespace())
+		{
+			OutCanRenameParameterToolTip = LOCTEXT("ScriptToolkitParameterPanelViewModel_RenameParameter_NameNone", "Parameter must have a name.");
+			return false;
+		}
+
+		FName NewName = FName(*NewVariableNameText->ToString());
+		TArray<FName> AliasScopeNames;
+		auto FindParameterNameAlias = [this](const TArray<FName>& AliasScopeNames, const FName& NewName)->const FNiagaraScriptVariableAndViewInfo* /* OutMatched

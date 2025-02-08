@@ -1,0 +1,55 @@
+                    s_AutomaticSaveEnabled = s_Enabled && config.AutomaticSaveEnabled;
+                                s_InitializedEnabled = true;
+                            }
+                            if (initProviders && s_Enabled && (!s_InitializedProviders || !s_InitializeDefaultProvider)) {
+                                InitProviders(config);
+                            }
+                        }
+                        catch (Exception e) {
+                            s_InitException = e;
+                        }
+
+                        s_Initialized = true;
+                    }
+                }
+            }
+        }
+
+        private static void Initialize(bool throwIfNotEnabled)
+        {
+            InitializeEnabled(true);
+            if (s_InitException != null)
+                throw s_InitException;
+            if (throwIfNotEnabled && !s_Enabled)
+                throw new ProviderException(SR.GetString(SR.Profile_not_enabled));
+        }
+
+        //////////////////////////////////////////////////////////////////////
+        //////////////////////////////////////////////////////////////////////
+        //////////////////////////////////////////////////////////////////////
+        static private void InitProviders(ProfileSection config)
+        {
+            if (!s_InitializedProviders) {
+                s_Providers = new ProfileProviderCollection();
+                if (config.Providers != null) {
+                    ProvidersHelper.InstantiateProviders(config.Providers, s_Providers, typeof(ProfileProvider));
+                }
+                s_InitializedProviders = true;
+            }
+
+            bool canInitializeDefaultProvider = (!HostingEnvironment.IsHosted || BuildManager.PreStartInitStage == PreStartInitStage.AfterPreStartInit);
+            if (!s_InitializeDefaultProvider && canInitializeDefaultProvider) {
+                s_Providers.SetReadOnly();
+
+                if (config.DefaultProvider == null)
+                    throw new ProviderException(SR.GetString(SR.Profile_default_provider_not_specified));
+
+                s_Provider = (ProfileProvider)s_Providers[config.DefaultProvider];
+                if (s_Provider == null)
+                    throw new ConfigurationErrorsException(SR.GetString(SR.Profile_default_provider_not_found), config.ElementInformation.Properties["providers"].Source, config.ElementInformation.Properties["providers"].LineNumber);
+
+                s_InitializeDefaultProvider = true;
+            }
+        }
+
+        ///////

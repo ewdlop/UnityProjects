@@ -1,0 +1,44 @@
+s |= _FUNCFLAG_USE_ERRNO
+        if kw.pop("use_last_error", False):
+            flags |= _FUNCFLAG_USE_LASTERROR
+        if kw:
+            raise ValueError("unexpected keyword argument(s) %s" % kw.keys())
+        try:
+            return _win_functype_cache[(restype, argtypes, flags)]
+        except KeyError:
+            class WinFunctionType(_CFuncPtr):
+                _argtypes_ = argtypes
+                _restype_ = restype
+                _flags_ = flags
+            _win_functype_cache[(restype, argtypes, flags)] = WinFunctionType
+            return WinFunctionType
+    if WINFUNCTYPE.__doc__:
+        WINFUNCTYPE.__doc__ = CFUNCTYPE.__doc__.replace("CFUNCTYPE", "WINFUNCTYPE")
+
+elif _os.name == "posix":
+    from _ctypes import dlopen as _dlopen
+
+from _ctypes import sizeof, byref, addressof, alignment, resize
+from _ctypes import get_errno, set_errno
+from _ctypes import _SimpleCData
+
+def _check_size(typ, typecode=None):
+    # Check if sizeof(ctypes_type) against struct.calcsize.  This
+    # should protect somewhat against a misconfigured libffi.
+    from struct import calcsize
+    if typecode is None:
+        # Most _type_ codes are the same as used in struct
+        typecode = typ._type_
+    actual, required = sizeof(typ), calcsize(typecode)
+    if actual != required:
+        raise SystemError("sizeof(%s) wrong: %d instead of %d" % \
+                          (typ, actual, required))
+
+class py_object(_SimpleCData):
+    _type_ = "O"
+    def __repr__(self):
+        try:
+            return super(py_object, self).__repr__()
+        except ValueError:
+            return "%s(<NULL>)" % type(self).__name__
+_check_size(py_object, "P")

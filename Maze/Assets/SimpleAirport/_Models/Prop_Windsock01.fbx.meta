@@ -1,0 +1,45 @@
+the selection is all from the same action and only from step node
+			auto OnEachAction = [&bAreFilterFromSameAction, &bIsSelectionOnlyFilters, ClickedAction] (UDataprepActionAsset* Action, bool bIsFromActionNode) -> bool
+				{
+					if ( bIsFromActionNode )
+					{
+						bIsSelectionOnlyFilters = false;
+						return true;
+					}
+					else
+					{
+						bAreFilterFromSameAction &= Action == ClickedAction;
+					}
+					return false;
+				};
+
+			// Check if the selection is only filters
+			auto OnEachStepForFilterOnly = [&bIsSelectionOnlyFilters, &Filters](UDataprepParameterizableObject* StepObject, UDataprepActionStep* ActionStep) -> bool
+				{
+					if ( UDataprepFilter* Filter = Cast<UDataprepFilter>( StepObject ) )
+					{
+						Filters.Add( Filter );
+					}
+					else
+					{
+						bIsSelectionOnlyFilters = false;
+					}
+					return false;
+				};
+
+			DataprepGraphEditorUtils::ForEachActionAndStep( SelectedNodes, OnEachAction, OnEachStepForFilterOnly );
+
+			if ( bIsSelectionOnlyFilters )
+			{
+				MenuBuilder->BeginSection( FName( TEXT("FilterSection") ), LOCTEXT("FilterSection", "Filter") );
+				{
+					FUIAction InverseFilterAction;
+					InverseFilterAction.ExecuteAction.BindLambda( [Filters]()
+						{
+							FScopedTransaction Transaction( LOCTEXT("InverseFilterTransaction", "Inverse the filter") );
+							for ( UDataprepFilter* Filter : Filters )
+							{
+								Filter->SetIsExcludingResult( !Filter->IsExcludingResult() );
+							}
+						});
+					MenuBuilder->AddMenuEntry(LOCTEXT("

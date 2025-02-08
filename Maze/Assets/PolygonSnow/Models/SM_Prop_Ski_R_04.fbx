@@ -1,0 +1,444 @@
+yId;
+                }
+
+                ProcessReceiveMessageTrace(executionContext, receivedActivityId);
+            }
+        }
+
+        void ProcessReceiveMessageTrace(NativeActivityContext executionContext, Guid receivedActivityId)
+        {
+            if (TraceUtility.MessageFlowTracing)
+            {
+                try
+                {
+                    // 
+                    ReceiveMessageRecord messageFlowTrackingRecord = new ReceiveMessageRecord(MessagingActivityHelper.MessageCorrelationReceiveRecord)
+                    {
+                        E2EActivityId = receivedActivityId
+                    };
+                    executionContext.Track(messageFlowTrackingRecord);
+
+                    if (receivedActivityId != Guid.Empty && DiagnosticTraceBase.ActivityId != receivedActivityId)
+                    {
+                        DiagnosticTraceBase.ActivityId = receivedActivityId;
+                    }
+
+                    FxTrace.Trace.SetAndTraceTransfer(executionContext.WorkflowInstanceId, true);
+
+                    if (TraceUtility.ActivityTracing)
+                    {
+                        if (TD.StartSignpostEventIsEnabled())
+                        {
+                            TD.StartSignpostEvent(new DictionaryTraceRecord(new Dictionary<string, string>(3) {
+                                                    { MessagingActivityHelper.ActivityName, this.DisplayName },
+                                                    { MessagingActivityHelper.ActivityType, MessagingActivityHelper.MessagingActivityTypeActivityExecution },
+                                                    { MessagingActivityHelper.ActivityInstanceId, executionContext.ActivityInstanceId }
+                        }));
+                        }
+                    }
+                    else if (TD.WfMessageReceivedIsEnabled())
+                    {
+                        TD.WfMessageReceived(new EventTraceActivity(receivedActivityId), executionContext.WorkflowInstanceId);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (Fx.IsFatal(ex))
+                    {
+                        throw;
+                    }
+                    FxTrace.Exception.AsInformation(ex);
+                }
+            }
+        }
+
+        void RequireContextCallback(NativeActivityTransactionContext transactionContext, object state)
+        {
+            Fx.Assert(transactionContext != null, "TransactionContext is null");
+
+            ReceiveMessageState receiveMessageState = state as ReceiveMessageState;
+            Fx.Assert(receiveMessageState != null, "ReceiveMessageState is null");
+
+            transactionContext.SetRuntimeTransaction(receiveMessageState.CurrentTransaction);
+
+            NativeActivityContext executionContext = transactionContext as NativeActivityContext;
+            Fx.Assert(executionContext != null, "Failed to cast ActivityTransactionContext to NativeActivityContext");
+            ServerScheduleOnReceivedMessage(executionContext, receiveMessageState.Instance);
+        }
+
+        // Phase 4: Set up the Message as OutArgument and invoke the OnReceivedMessage activity action
+        void ServerScheduleOnReceivedMessage(NativeActivityContext executionContext, ReceiveMessageInstanceData instance)
+        {
+            Fx.Assert(instance.CorrelationResponseContext != null, "Server side receive must have CorrelationResponseContext");
+
+            // if we infer the contract as Message the first input parameter will be the requestMessage from the client
+            Message request = instance.CorrelationResponseContext.WorkflowOperationContext.Inputs[0] as Message;
+            Fx.Assert(request != null, "WorkflowOperationContext.Inputs[0] must be of type Message");
+            Fx.Assert(request.State == MessageState.Created, "The request message must be in Created state");
+            this.Message.Set(executionContext, request);
+
+            // update instance->CorrelationResponseContext with the MessageVersion information, this is later used by 
+            // ToReply formatter to construct the reply message
+            instance.CorrelationResponseContext.MessageVersion = ((Message)instance.CorrelationResponseContext.WorkflowOperationContext.Inputs[0]).Version;
+
+            // initialize the relevant correlation handle(s) with the 'anonymous' response context
+            CorrelationHandle ambientHandle = instance.GetAmbientCorrelation(executionContext);
+            CorrelationHandle correlatesWithHandle = (this.CorrelatesWith == null) ? null : this.CorrelatesWith.Get(executionContext);
+
+            // populate instance keys first
+            MessagingActivityHelper.InitializeCorrelationHandles(executionContext, correlatesWithHandle, ambientHandle, this.correlationInitializers,
+                instance.CorrelationResponseContext.WorkflowOperationContext.OperationContext.IncomingMessageProperties);
+
+            // for the request/reply handle
+            // then store the response context in the designated correlation handle
+            // first check for an explicit association
+            CorrelationHandle channelCorrelationHandle = CorrelationHandle.GetExplicitRequestReplyCorrelation(executionContext, this.correlationInitializers);
+
+            
+            if (this.IsOneWay)
+            {
+                // this is one way, verify that the channelHandle is null
+                if (channelCorrelationHandle != null)
+                {
+                    throw FxTrace.Exception.AsError(new InvalidOperationException(SR2.RequestReplyHandleShouldNotBePresentForOneWay));
+                }
+
+                // we need to enter the nopersistzone using the NoPersistHandle and exit it in the formatter
+                if (this.NoPersistHandle != null)
+                {
+                    NoPersistHandle noPersistHandle = this.NoPersistHandle.Get(executionContext);
+                    if (noPersistHandle != null)
+                    {
+                        noPersistHandle.Enter(executionContext);
+                    }
+                }
+            }
+            else 
+            {
+                // first check for an explicit association
+                if (channelCorrelationHandle != null)
+                {
+                    if (!channelCorrelationHandle.TryRegisterResponseContext(executionContext, instance.CorrelationResponseContext))
+                    {
+                        throw FxTrace.Exception.AsError(new InvalidOperationException(SR2.TryRegisterRequestContextFailed));
+                    }
+                }
+                else// if that fails, use ambient handle. we should never initialize CorrelatesWith with response context
+                {
+                    Fx.Assert(ambientHandle != null, "Ambient handle should not be null for two-way server side receive/sendReply");
+                    if (!ambientHandle.TryRegisterResponseContext(executionContext, instance.CorrelationResponseContext))
+                    {
+                        // With a two-way contract, the request context must be initialized
+                        throw FxTrace.Exception.AsError(new InvalidOperationException(
+                            SR2.ReceiveMessageNeedsToPairWithSendMessageForTwoWayContract(this.OperationName)));
+                    }
+                }
+
+                // validate that NoPersistHandle is null, we should have nulled it out in Receive->SetIsOneWay during ContractInference
+                Fx.Assert(this.NoPersistHandle == null, "NoPersistHandle should be null in case of two-way");
+            }
+        
+            // for the duplex handle: we want to save the callback context in the correlation handle
+            if (instance.CorrelationCallbackContext != null)
+            {
+                // Pass the CorrelationCallbackContext to correlation handle.
+                CorrelationHandle callbackHandle = CorrelationHandle.GetExplicitCallbackCorrelation(executionContext, this.correlationInitializers);
+
+                // if that is not set, then try the ambientHandle, we will not use the CorrelatesWith handle  to store callback context
+                if (callbackHandle == null)
+                {
+                    callbackHandle = ambientHandle;
+                }
+                if (callbackHandle != null)
+                {
+                    callbackHandle.CallbackContext = instance.CorrelationCallbackContext;
+                }
+            }
+
+            FinalizeScheduleOnReceivedMessage(executionContext, instance);
+        }
+
+        void ClientScheduleOnReceivedMessage(NativeActivityContext executionContext, ReceiveMessageInstanceData instance)
+        {
+            Fx.Assert(instance.CorrelationRequestContext != null, "Client side receive must have CorrelationRequestContext");
+
+            // client side: retrieve the reply from the request context
+            if (instance.CorrelationRequestContext.TryGetReply())
+            {
+                // Reply has already come back because one of the following happened:
+                // (1) Receive reply completed synchronously
+                // (2) Async receive reply completed very quickly and channel callback already happened by now
+                ClientScheduleOnReceiveMessageCore(executionContext, instance);
+                FinalizeScheduleOnReceivedMessage(executionContext, instance);
+            }
+            else
+            {
+                // Async path: wait for reply to come back
+                VolatileReceiveMessageInstance volatileInstance = new VolatileReceiveMessageInstance { Instance = instance };
+                this.receiveMessageInstance.Set(executionContext, volatileInstance);
+
+                if (onClientReceiveMessageComplete == null)
+                {
+                    onClientReceiveMessageComplete = new CompletionCallback(ClientScheduleOnReceiveMessageCallback);
+                }
+
+                executionContext.ScheduleActivity(this.waitForReply, onClientReceiveMessageComplete);
+            }
+        }
+
+        void ClientScheduleOnReceiveMessageCallback(NativeActivityContext executionContext, ActivityInstance completedInstance)
+        {
+            VolatileReceiveMessageInstance volatileInstance = this.receiveMessageInstance.Get(executionContext);
+            ReceiveMessageInstanceData instance = volatileInstance.Instance;
+
+            if (instance.CorrelationRequestContext.TryGetReply())
+            {
+                ClientScheduleOnReceiveMessageCore(executionContext, instance);
+            }
+            FinalizeScheduleOnReceivedMessage(executionContext, instance);
+        }
+
+        void ClientScheduleOnReceiveMessageCore(NativeActivityContext executionContext, ReceiveMessageInstanceData instance)
+        {
+            Fx.Assert(instance.CorrelationRequestContext.Reply != null, "Reply message cannot be null!");
+
+            // Initialize CorrelationContext and CorrelationCallbackContext
+            instance.InitializeContextAndCallbackContext();
+
+            CorrelationHandle ambientHandle = instance.GetAmbientCorrelation(executionContext);
+
+            if (instance.CorrelationRequestContext.CorrelationKeyCalculator != null)
+            {
+                // Client side reply do not use CorrelatesWith to initialize correlation
+                instance.CorrelationRequestContext.Reply = MessagingActivityHelper.InitializeCorrelationHandles(executionContext,
+                    null, ambientHandle, this.correlationInitializers,
+                    instance.CorrelationRequestContext.CorrelationKeyCalculator, instance.CorrelationRequestContext.Reply);
+            }
+
+            // for the duplex-case 
+            // we would receive the Server Context in the Request-Reply message, we have to save the Server Context so that subsequent sends from the client to
+            // the server can use this context to reach the correct Server instance
+            if (instance.CorrelationContext != null)
+            {
+                // Pass the CorrelationContext to correlation handle.
+                // Correlation handle will have to be in the correlation Initializers collection
+                CorrelationHandle contextHandle = CorrelationHandle.GetExplicitContextCorrelation(executionContext, this.correlationInitializers);
+
+                // if that is not set, then try the ambient handle
+                if (contextHandle == null)
+                {
+                    // get the cached ambient handle, we only use explicit handle or ambient handle to store the context
+                    contextHandle = ambientHandle;
+                }
+                if (contextHandle != null)
+                {
+                    contextHandle.Context = instance.CorrelationContext;
+                }
+            }
+
+            // set the Message with what is in the correlationRequestContext 
+            // this Message needs to be closed later by the formatter
+            Message request = instance.CorrelationRequestContext.Reply;
+            this.Message.Set(executionContext, request);
+        }
+
+        void FinalizeScheduleOnReceivedMessage(NativeActivityContext executionContext, ReceiveMessageInstanceData instance)
+        {
+            ProcessReceiveMessageTrace(executionContext, instance);
+
+            IList<IReceiveMessageCallback> receiveMessageCallbacks = MessagingActivityHelper.GetCallbacks<IReceiveMessageCallback>(executionContext.Properties);
+            if (receiveMessageCallbacks != null && receiveMessageCallbacks.Count > 0)
+            {
+                OperationContext operationContext = instance.GetOperationContext();
+                // invoke the callback that user might have added in the AEC in the previous activity 
+                // e.g. distributed compensation activity will add this so that they can convert a message back to
+                // an execution property
+                foreach (IReceiveMessageCallback receiveMessageCallback in receiveMessageCallbacks)
+                {
+                    receiveMessageCallback.OnReceiveMessage(operationContext, executionContext.Properties);
+                }
+            }
+
+            // call this method with or without callback
+            this.FinalizeReceiveMessageCore(executionContext, instance);
+        }
+
+        protected override void CacheMetadata(NativeActivityMetadata metadata)
+        {
+            RuntimeArgument correlatesWithArgument = new RuntimeArgument(Constants.CorrelatesWith, Constants.CorrelationHandleType, ArgumentDirection.In);
+            if (this.CorrelatesWith == null)
+            {
+                this.CorrelatesWith = new InArgument<CorrelationHandle>();
+            }
+            metadata.Bind(this.CorrelatesWith, correlatesWithArgument);
+            metadata.AddArgument(correlatesWithArgument);
+
+            if (this.correlationInitializers != null)
+            {
+                int count = 0;
+                foreach (CorrelationInitializer correlation in this.correlationInitializers)
+                {
+                    if (correlation.CorrelationHandle != null)
+                    {
+                        RuntimeArgument argument = new RuntimeArgument(Constants.Parameter + count,
+                            correlation.CorrelationHandle.ArgumentType, correlation.CorrelationHandle.Direction, true);
+                        metadata.Bind(correlation.CorrelationHandle, argument);
+                        metadata.AddArgument(argument);
+                        count++;
+                    }
+                }
+            }
+
+            RuntimeArgument receiveMessageArgument = new RuntimeArgument(Constants.Message, Constants.MessageType, ArgumentDirection.Out);
+            if (this.Message == null)
+            {
+                this.Message = new OutArgument<Message>();
+            }
+            metadata.Bind(this.Message, receiveMessageArgument);
+            metadata.AddArgument(receiveMessageArgument);
+
+            RuntimeArgument noPersistHandleArgument = new RuntimeArgument(Constants.NoPersistHandle, Constants.NoPersistHandleType, ArgumentDirection.In);
+            if (this.NoPersistHandle == null)
+            {
+                this.NoPersistHandle = new InArgument<NoPersistHandle>();
+            }
+            metadata.Bind(this.NoPersistHandle, noPersistHandleArgument);
+            metadata.AddArgument(noPersistHandleArgument);
+
+            metadata.AddImplementationVariable(this.receiveMessageInstance);
+            metadata.AddImplementationVariable(this.extensionReceiveBookmark);
+
+            metadata.AddImplementationChild(this.waitForReply);
+        }
+
+        // Phase 5: Useful for the both client and server side receive. It passes down the response context if it is two way or 
+        // throw the exception right back to the workflow if it is not expected. 
+        void FinalizeReceiveMessageCore(NativeActivityContext executionContext, ReceiveMessageInstanceData instance)
+        {
+            if (instance != null)
+            {
+                if (instance.CorrelationRequestContext != null && instance.CorrelationRequestContext.Reply != null)
+                {
+                    // This should be closed by the formatter after desrializing the message
+                    // clean this reply message up for a following receive
+                    //instance.CorrelationRequestContext.Reply.Close();
+                }
+                else if (instance.CorrelationResponseContext != null)
+                {
+                    // this is only for the server side
+                    if (this.IsOneWay)
+                    {
+                        // mark this workflow service operation as complete
+                        instance.CorrelationResponseContext.WorkflowOperationContext.SetOperationCompleted();
+
+                        if (instance.CorrelationResponseContext.Exception != null)
+                        {
+                            // We got an unexpected exception while running the OnReceivedMessage action
+                            throw FxTrace.Exception.AsError(instance.CorrelationResponseContext.Exception);
+                        }
+                    }
+                }
+
+                //reset the trace
+                this.ResetTrace(executionContext, instance);
+            }
+        }
+
+        void ResetTrace(NativeActivityContext executionContext, ReceiveMessageInstanceData instance)
+        {
+            this.ResetTrace(executionContext, instance.AmbientActivityId);
+
+            if (TraceUtility.ActivityTracing)
+            {
+                instance.AmbientActivityId = Guid.Empty;
+            }
+        }
+
+        void ResetTrace(NativeActivityContext executionContext, Guid ambientActivityId)
+        {
+            if (TraceUtility.ActivityTracing)
+            {
+                if (TD.StopSignpostEventIsEnabled())
+                {
+                    TD.StopSignpostEvent(new DictionaryTraceRecord(new Dictionary<string, string>(3) {
+                                                { MessagingActivityHelper.ActivityName, this.DisplayName },
+                                                { MessagingActivityHelper.ActivityType, MessagingActivityHelper.MessagingActivityTypeActivityExecution },
+                                                { MessagingActivityHelper.ActivityInstanceId, executionContext.ActivityInstanceId }
+                        }));
+                }
+                FxTrace.Trace.SetAndTraceTransfer(ambientActivityId, true);
+            }
+            else if (TD.WfMessageReceivedIsEnabled())
+            {
+                TD.WfMessageReceived(new EventTraceActivity(executionContext.WorkflowInstanceId), ambientActivityId);
+            }
+        }
+
+        void ExecuteUsingExtension(SendReceiveExtension sendReceiveExtension, NativeActivityContext executionContext)
+        {
+            Fx.Assert(sendReceiveExtension != null, "SendReceiveExtension should be available here.");
+
+            CorrelationHandle followingCorrelation = null;
+            if (!this.TryGetCorrelatesWithHandle(executionContext, out followingCorrelation))
+            {
+                followingCorrelation = CorrelationHandle.GetAmbientCorrelation(executionContext);
+                if (followingCorrelation == null)
+                {
+                    if (!this.IsOneWay)
+                    {
+                        if (!this.correlationInitializers.TryGetRequestReplyCorrelationHandle(executionContext, out followingCorrelation))
+                        {
+                            throw FxTrace.Exception.AsError(new InvalidOperationException(
+                                SR2.ReceiveMessageNeedsToPairWithSendMessageForTwoWayContract(this.OperationName)));
+                        }
+                    }
+                }
+            }
+
+            Bookmark bookmark = executionContext.CreateBookmark(this.OnReceiveMessageFromExtension);
+            this.extensionReceiveBookmark.Set(executionContext, bookmark);
+
+            InstanceKey correlatesWithValue = null;
+            if (followingCorrelation != null)
+            {
+                if (this.IsReceiveReply && followingCorrelation.TransientInstanceKey != null)
+                {
+                    correlatesWithValue = followingCorrelation.TransientInstanceKey;
+                }
+                else
+                {
+                    correlatesWithValue = followingCorrelation.InstanceKey;
+                }
+            }
+            sendReceiveExtension.RegisterReceive(this.GetReceiveSettings(), correlatesWithValue, bookmark);
+        }
+
+        void OnReceiveMessageFromExtension(NativeActivityContext executionContext, Bookmark bookmark, object state)
+        {
+            SendReceiveExtension sendReceiveExtension = executionContext.GetExtension<SendReceiveExtension>();
+            if (sendReceiveExtension == null)
+            {
+                throw FxTrace.Exception.AsError(new InvalidOperationException(SR2.SendReceiveExtensionNotFound));
+            }
+
+            // Now that the bookmark has been resumed, clear out the workflow variable holding its value.
+            this.extensionReceiveBookmark.Set(executionContext, null);
+
+            MessageContext messageContext = state as MessageContext;
+            if (messageContext == null)
+            {
+                throw FxTrace.Exception.AsError(new InvalidOperationException(SR2.InvalidDataFromReceiveBookmarkState(this.OperationName)));
+            }
+
+            this.Message.Set(executionContext, messageContext.Message);
+            this.ProcessReceiveMessageTrace(executionContext, messageContext.EndToEndTracingId);
+            this.InitializeCorrelationHandles(executionContext, messageContext.Message.Properties, messageContext.EndToEndTracingId);
+            this.ResetTrace(executionContext, InternalReceiveMessage.TraceCorrelationActivityId);
+        }
+
+        void InitializeCorrelationHandles(NativeActivityContext executionContext, MessageProperties messageProperties, Guid e2eTracingId)
+        {
+            CorrelationHandle ambientHandle = CorrelationHandle.GetAmbientCorrelation(executionContext);
+            HostSettings hostSettings = executionContext.GetExtension<SendReceiveExtension>().HostSettings;
+
+            if (this.IsReceiveRepl

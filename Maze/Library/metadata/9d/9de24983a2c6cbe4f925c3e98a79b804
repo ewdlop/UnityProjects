@@ -1,0 +1,441 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "ConcertSyncSessionTypes.h"
+#include "ConcertLogGlobal.h"
+
+#include "Misc/PackageName.h"
+
+#define LOCTEXT_NAMESPACE "ConcertSyncActivitySummary"
+
+namespace ActivitySummaryUtil
+{
+const FText BoldTextFormat = INVTEXT("<ActivityText.Bold>{0}</>");
+
+FText ToRichTextBold(const FText& InArgs, bool bToRichText)
+{
+	return bToRichText ? FText::Format(BoldTextFormat, InArgs) : InArgs;
+}
+
+FText ToRichTextBold(const FString& InArgs, bool bToRichText)
+{
+	return ToRichTextBold(FText::FromString(InArgs), bToRichText);
+}
+
+FText ToRichTextBold(const FName& InArgs, bool bToRichText)
+{
+	return ToRichTextBold(FText::FromName(InArgs), bToRichText);
+}
+
+void DebugPrintExportedObject(const FConcertExportedObject& Object)
+{
+	FString ObjectOuterName = FPackageName::ObjectPathToObjectName(Object.ObjectId.ObjectOuterPathName.ToString());
+	FName PackageName = FName(*FPackageName::ObjectPathToPackageName(Object.ObjectId.ObjectOuterPathName.ToString()));
+	UE_LOG(LogConcert, Display, TEXT("==============================OBJECT==============================="));
+	UE_LOG(LogConcert, Display, TEXT("Object ClassPath: %s"), *Object.ObjectId.ObjectClassPathName.ToString());
+	UE_LOG(LogConcert, Display, TEXT("Object Name: %s"), *Object.ObjectId.ObjectName.ToString());
+	UE_LOG(LogConcert, Display, TEXT("Object OuterPathName: %s"), *Object.ObjectId.ObjectOuterPathName.ToString());
+	UE_LOG(LogConcert, Display, TEXT("Object OwnerName: %s"), ObjectOuterName.StartsWith(TEXT("PersistentLevel")) ? *FPackageName::ObjectPathToObjectName(ObjectOuterName) : *ObjectOuterName);
+	UE_LOG(LogConcert, Display, TEXT("Package: %s"), *PackageName.ToString());
+
+	if (Object.ObjectData.bAllowCreate)
+	{
+		UE_LOG(LogConcert, Display, TEXT("AllowCreate: Yes"));
+	}
+	if (Object.ObjectData.bIsPendingKill)
+	{
+		UE_LOG(LogConcert, Display, TEXT("PendingKill: Yes"));
+	}
+	if (!Object.ObjectData.NewPackageName.IsNone())
+	{
+		UE_LOG(LogConcert, Display, TEXT("NewName: %s"), *Object.ObjectData.NewPackageName.ToString());
+	}
+	if (!Object.ObjectData.NewName.IsNone())
+	{
+		UE_LOG(LogConcert, Display, TEXT("NewName: %s"), *Object.ObjectData.NewName.ToString());
+	}
+	if (!Object.ObjectData.NewOuterPathName.IsNone())
+	{
+		UE_LOG(LogConcert, Display, TEXT("NewOuterPathName: %s"), *Object.ObjectData.NewOuterPathName.ToString());
+	}
+	if (!Object.ObjectData.NewExternalPackageName.IsNone())
+	{
+		UE_LOG(LogConcert, Display, TEXT("NewPackageName: %s"), *Object.ObjectData.NewExternalPackageName.ToString());
+	}
+	if (Object.SerializedAnnotationData.Num())
+	{
+		UE_LOG(LogConcert, Display, TEXT("Has Annotation"));
+	}
+	for (const FConcertSerializedPropertyData& Prop : Object.PropertyDatas)
+	{
+		UE_LOG(LogConcert, Display, TEXT("Property: %s"), *Prop.PropertyName.ToString());
+	}
+}
+
+void DebugPrintExportedObject(const FString& Pathname, const FConcertExportedObject* Objects)
+{
+	if (Objects->ObjectData.bAllowCreate)
+	{
+		UE_LOG(LogConcert, Display, TEXT("ObjectPathname: %s, AllowCreate: Yes"), *Pathname);
+	}
+	else if (Objects->ObjectData.bIsPendingKill)
+	{
+		UE_LOG(LogConcert, Display, TEXT("ObjectPathname: %s, PendingKill: Yes"), *Pathname);
+	}
+	else
+	{
+		UE_LOG(LogConcert, Display, TEXT("ObjectPathname: %s"), *Pathname);
+	}
+}
+
+void DebugPrintExportedObjects(const FString::ElementType* Title, const TArray<TPair<const FString*, const FConcertExportedObject*>>& Objects)
+{
+	if (Objects.Num())
+	{
+		UE_LOG(LogConcert, Display, TEXT("========================== %s =========================="), Title);
+		for (const TPair<const FString*, const FConcertExportedObject*>& Pair : Objects)
+		{
+			DebugPrintExportedObject(*Pair.Key, Pair.Value);
+		}
+	}
+}
+
+void DebugPrintExportedObjects(const FString::ElementType* Title, const TArray<TPair<FString, const FConcertExportedObject*>>& Objects)
+{
+	if (Objects.Num())
+	{
+		UE_LOG(LogConcert, Display, TEXT("========================== %s =========================="), Title);
+		for (const TPair<FString, const FConcertExportedObject*>& Pair : Objects)
+		{
+			DebugPrintExportedObject(Pair.Key, Pair.Value);
+		}
+	}
+}
+
+FName GetObjectDisplayName(const FString& OuterPathName, const FName& ObjectName)
+{
+	FName ObjectDisplayName;
+
+	// If this top object is a component of an actor or a sequence (Ex its outer path is an actor like /Game/FooMap.FooMap:PersistentLevel.Cube_1 -> OwnerName == "Cube_1")
+	FString ObjectOwnerName = FPackageName::ObjectPathToObjectName(FPackageName::ObjectPathToObjectName(OuterPathName)); // Run twice to split at both a potential : and potential .
+	if (ObjectOwnerName.Len() && ObjectOwnerName != TEXT("PersistentLevel"))
+	{
+		// Prefix the object name with its owner name (actor/sequence). (When adding an audio component to a cube for example, return "Cube_2.Audio rather than "Audio".
+		ObjectDisplayName = *(ObjectOwnerName + TEXT(".") + ObjectName.ToString());
+	}
+	else
+	{
+		// The object is an actor/sequence (not a component of an actor or a sequence)
+		ObjectDisplayName = ObjectName;
+	}
+
+	return ObjectDisplayName;
+}
+
+FName GetObjectDisplayName(const FString& ObjectPathName)
+{
+	const FString ObjectName = FPackageName::ObjectPathToObjectName(FPackageName::ObjectPathToObjectName(ObjectPathName)); // Run twice to split at both a potential : and potential .
+	if (!ObjectName.Len() || ObjectName == ObjectPathName)
+	{
+		// This is just a package name
+		return *ObjectPathName;
+	}
+
+	const FString OuterPathName = ObjectPathName.LeftChop(ObjectName.Len() + 1); // +1 for the delimiter between the outer and the object
+	return GetObjectDisplayName(OuterPathName, *ObjectName);
+}
+
+} // namespace ActivitySummaryUtil
+
+
+FText FConcertSyncActivitySummary::ToDisplayText(const FText InUserDisplayName, const bool InUseRichText) const
+{
+	return InUserDisplayName.IsEmpty()
+		? CreateDisplayText(InUseRichText)
+		: CreateDisplayTextForUser(InUserDisplayName, InUseRichText);
+}
+
+FText FConcertSyncActivitySummary::CreateDisplayText(const bool InUseRichText) const
+{
+	return LOCTEXT("CreateDisplayText_NotImplemented", "CreateDisplayText not implemented!");
+}
+
+FText FConcertSyncActivitySummary::CreateDisplayTextForUser(const FText InUserDisplayName, const bool InUseRichText) const
+{
+	return CreateDisplayText(InUseRichText);
+}
+
+
+FConcertSyncConnectionActivitySummary FConcertSyncConnectionActivitySummary::CreateSummaryForEvent(const FConcertSyncConnectionEvent& InEvent)
+{
+	FConcertSyncConnectionActivitySummary ActivitySummary;
+	ActivitySummary.ConnectionEventType = InEvent.ConnectionEventType;
+	return ActivitySummary;
+}
+
+FText FConcertSyncConnectionActivitySummary::CreateDisplayText(const bool InUseRichText) const
+{
+	FText FormatPattern;
+	switch (ConnectionEventType)
+	{
+	case EConcertSyncConnectionEventType::Connected:
+		FormatPattern = LOCTEXT("CreateDisplayText_Connection_Connected", "Joined the session.");
+		break;
+	case EConcertSyncConnectionEventType::Disconnected:
+		FormatPattern = LOCTEXT("CreateDisplayText_Connection_Disconnected", "Left the session.");
+		break;
+	default:
+		checkf(false, TEXT("Unhandled EConcertSyncConnectionEventType in FConcertSyncConnectionActivitySummary!"));
+		break;
+	}
+	return FormatPattern;
+}
+
+FText FConcertSyncConnectionActivitySummary::CreateDisplayTextForUser(const FText InUserDisplayName, const bool InUseRichText) const
+{
+	FText FormatPattern;
+	switch (ConnectionEventType)
+	{
+	case EConcertSyncConnectionEventType::Connected:
+		FormatPattern = LOCTEXT("CreateDisplayTextForUser_Connection_Connected", "{UserName} joined the session.");
+		break;
+	case EConcertSyncConnectionEventType::Disconnected:
+		FormatPattern = LOCTEXT("CreateDisplayTextForUser_Connection_Disconnected", "{UserName} left the session.");
+		break;
+	default:
+		checkf(false, TEXT("Unhandled EConcertSyncConnectionEventType in FConcertSyncConnectionActivitySummary!"));
+		break;
+	}
+
+	FFormatNamedArguments Arguments;
+	Arguments.Add(TEXT("UserName"), ActivitySummaryUtil::ToRichTextBold(InUserDisplayName, InUseRichText));
+	return FText::Format(FormatPattern, Arguments);
+}
+
+
+FConcertSyncLockActivitySummary FConcertSyncLockActivitySummary::CreateSummaryForEvent(const FConcertSyncLockEvent& InEvent)
+{
+	const FString ResourceNameStr = InEvent.ResourceNames.Num() > 0 ? InEvent.ResourceNames[0].ToString() : FString();
+
+	FConcertSyncLockActivitySummary ActivitySummary;
+	ActivitySummary.LockEventType = InEvent.LockEventType;
+	ActivitySummary.PrimaryResourceName = ActivitySummaryUtil::GetObjectDisplayName(ResourceNameStr);
+	ActivitySummary.PrimaryPackageName = *FPackageName::ObjectPathToPackageName(ResourceNameStr);
+	ActivitySummary.NumResources = InEvent.ResourceNames.Num();
+	return ActivitySummary;
+}
+
+FText FConcertSyncLockActivitySummary::CreateDisplayText(const bool InUseRichText) const
+{
+	const bool bHasPackage = !PrimaryPackageName.IsNone() && PrimaryResourceName != PrimaryPackageName;
+
+	FText FormatPattern;
+	if (NumResources == 1)
+	{
+		switch (LockEventType)
+		{
+		case EConcertSyncLockEventType::Locked:
+			FormatPattern = bHasPackage 
+				? LOCTEXT("CreateDisplayText_Lock_LockedOneWithPackage", "Locked {PrimaryResourceName} in {PrimaryPackageName}.") 
+				: LOCTEXT("CreateDisplayText_Lock_LockedOne", "Locked {PrimaryResourceName}.");
+			break;
+		case EConcertSyncLockEventType::Unlocked:
+			FormatPattern = bHasPackage 
+				? LOCTEXT("CreateDisplayText_Lock_UnlockedOneWithPackage", "Unlocked {PrimaryResourceName} in {PrimaryPackageName}.") 
+				: LOCTEXT("CreateDisplayText_Lock_UnlockedOne", "Unlocked {PrimaryResourceName}.");
+			break;
+		default:
+			checkf(false, TEXT("Unhandled EConcertSyncLockEventType in FConcertSyncLockActivitySummary!"));
+			break;
+		}
+	}
+	else
+	{
+		switch (LockEventType)
+		{
+		case EConcertSyncLockEventType::Locked:
+			FormatPattern = bHasPackage 
+				? LOCTEXT("CreateDisplayText_Lock_LockedManyWithPackage", "Locked {PrimaryResourceName} in {PrimaryPackageName}, plus {NumOtherResources} other {NumOtherResources}|plural(one=resource,other=resources).") 
+				: LOCTEXT("CreateDisplayText_Lock_LockedMany", "Locked {PrimaryResourceName}, plus {NumOtherResources} other {NumOtherResources}|plural(one=resource,other=resources).");
+			break;
+		case EConcertSyncLockEventType::Unlocked:
+			FormatPattern = bHasPackage 
+				? LOCTEXT("CreateDisplayText_Lock_UnlockedManyWithPackage", "Unlocked {PrimaryResourceName} in {PrimaryPackageName}, plus {NumOtherResources} other {NumOtherResources}|plural(one=resource,other=resources).") 
+				: LOCTEXT("CreateDisplayText_Lock_UnlockedMany", "Unlocked {PrimaryResourceName}, plus {NumOtherResources} other {NumOtherResources}|plural(one=resource,other=resources).");
+			break;
+		default:
+			checkf(false, TEXT("Unhandled EConcertSyncLockEventType in FConcertSyncLockActivitySummary!"));
+			break;
+		}
+	}
+
+	FFormatNamedArguments Arguments;
+	Arguments.Add(TEXT("PrimaryResourceName"), ActivitySummaryUtil::ToRichTextBold(PrimaryResourceName, InUseRichText));
+	Arguments.Add(TEXT("PrimaryPackageName"), ActivitySummaryUtil::ToRichTextBold(PrimaryPackageName, InUseRichText));
+	Arguments.Add(TEXT("NumOtherResources"), NumResources - 1);
+	return FText::Format(FormatPattern, Arguments);
+}
+
+FText FConcertSyncLockActivitySummary::CreateDisplayTextForUser(const FText InUserDisplayName, const bool InUseRichText) const
+{
+	const bool bHasPackage = !PrimaryPackageName.IsNone() && PrimaryResourceName != PrimaryPackageName;
+
+	FText FormatPattern;
+	if (NumResources == 1)
+	{
+		switch (LockEventType)
+		{
+		case EConcertSyncLockEventType::Locked:
+			FormatPattern = bHasPackage 
+				? LOCTEXT("CreateDisplayTextForUser_Lock_LockedOneWithPackage", "{UserName} locked {PrimaryResourceName} in {PrimaryPackageName}.") 
+				: LOCTEXT("CreateDisplayTextForUser_Lock_LockedOne", "{UserName} locked {PrimaryResourceName}.");
+			break;
+		case EConcertSyncLockEventType::Unlocked:
+			FormatPattern = bHasPackage 
+				? LOCTEXT("CreateDisplayTextForUser_Lock_UnlockedOneWithPackage", "{UserName} unlocked {PrimaryResourceName} in {PrimaryPackageName}.") 
+				: LOCTEXT("CreateDisplayTextForUser_Lock_UnlockedOne", "{UserName} unlocked {PrimaryResourceName}.");
+			break;
+		default:
+			checkf(false, TEXT("Unhandled EConcertSyncLockEventType in FConcertSyncLockActivitySummary!"));
+			break;
+		}
+	}
+	else
+	{
+		switch (LockEventType)
+		{
+		case EConcertSyncLockEventType::Locked:
+			FormatPattern = bHasPackage 
+				? LOCTEXT("CreateDisplayTextForUser_Lock_LockedManyWithPackage", "{UserName} locked {PrimaryResourceName} in {PrimaryPackageName}, plus {NumOtherResources} other {NumOtherResources}|plural(one=resource,other=resources).") 
+				: LOCTEXT("CreateDisplayTextForUser_Lock_LockedMany", "{UserName} locked {PrimaryResourceName}, plus {NumOtherResources} other {NumOtherResources}|plural(one=resource,other=resources).");
+			break;
+		case EConcertSyncLockEventType::Unlocked:
+			FormatPattern = bHasPackage 
+				? LOCTEXT("CreateDisplayTextForUser_Lock_UnlockedManyWithPackage", "{UserName} unlocked {PrimaryResourceName} in {PrimaryPackageName}, plus {NumOtherResources} other {NumOtherResources}|plural(one=resource,other=resources).") 
+				: LOCTEXT("CreateDisplayTextForUser_Lock_UnlockedMany", "{UserName} unlocked {PrimaryResourceName}, plus {NumOtherResources} other {NumOtherResources}|plural(one=resource,other=resources).");
+			break;
+		default:
+			checkf(false, TEXT("Unhandled EConcertSyncLockEventType in FConcertSyncLockActivitySummary!"));
+			break;
+		}
+	}
+
+	FFormatNamedArguments Arguments;
+	Arguments.Add(TEXT("UserName"), ActivitySummaryUtil::ToRichTextBold(InUserDisplayName, InUseRichText));
+	Arguments.Add(TEXT("PrimaryResourceName"), ActivitySummaryUtil::ToRichTextBold(PrimaryResourceName, InUseRichText));
+	Arguments.Add(TEXT("PrimaryPackageName"), ActivitySummaryUtil::ToRichTextBold(PrimaryPackageName, InUseRichText));
+	Arguments.Add(TEXT("NumOtherResources"), NumResources - 1);
+	return FText::Format(FormatPattern, Arguments);
+}
+
+
+FConcertSyncTransactionActivitySummary FConcertSyncTransactionActivitySummary::CreateSummaryForEvent(const FConcertSyncTransactionEvent& InEvent)
+{
+	auto FillActivitySummary = [&InEvent](const EConcertSyncTransactionActivitySummaryType InTransactionSummaryType, const FName InPrimaryObjectName, const FName InPrimaryPackageName, const FName InNewObjectName, const int32 InNumActions, FConcertSyncTransactionActivitySummary& OutActivitySummary)
+	{
+		OutActivitySummary.TransactionSummaryType = InTransactionSummaryType;
+		OutActivitySummary.TransactionTitle = InEvent.Transaction.Title;
+		OutActivitySummary.PrimaryObjectName = InPrimaryObjectName;
+		OutActivitySummary.PrimaryPackageName = InPrimaryPackageName;
+		OutActivitySummary.NewObjectName = InNewObjectName;
+		OutActivitySummary.NumActions = InNumActions;
+	};
+
+	auto CalculateActivitySummary = [&InEvent, &FillActivitySummary](FConcertSyncTransactionActivitySummary& OutActivitySummary)
+	{
+		// The algorithm extracts the main stories from a transaction. Usually, the interesting parts of a transaction is when something are created, renamed,
+		// deleted or modified. Multiple objects can be changed in the same transaction. While the algorithm below is good enough, it may not be perfect. Transactions
+		// recorded for different type of objects have different exported object patterns and the algorithm relies on pattern to extract the most accurate stories.
+
+		// This string is reused many times in the algorithm below.
+		static const FString PersistentLevel(TEXT("PersistentLevel"));
+		static const FName PersistentLevelFName(*PersistentLevel);
+
+		// DEBUG: Uncomment to delimit the logs for this execution of the function.
+		//UE_LOG(LogConcert, Display, TEXT("==============================BEGIN TRANSACTION==============================="));
+
+		// Keeps objects of interest.
+		TArray<TPair<FString, const FConcertExportedObject*>> PotentialObjects;
+
+		// Find objects that can be used to generate the story, eliminating those knowns to be irrelevant.
+		for (const FConcertExportedObject& Object : InEvent.Transaction.ExportedObjects)
+		{
+			// DEBUG: Uncomment to see exported objects to debug when a transaction doesn't produce the expected story.
+			//ActivitySummaryUtil::DebugPrintExportedObject(Object);
+
+			if (Object.ObjectId.ObjectName == PersistentLevelFName)
+			{
+				continue; // Ignore changes on the 'PersistentLevel' itself because we want to tell how it changed instead.
+			}
+			else if (Object.ObjectId.ObjectClassPathName == TEXT("/Script/Engine.Model"))
+			{
+				continue; // Ignore changes to "Engine.Model" class of objects. From observation, it seems they never carry an interesting story by themselves. (Could be false in the future)
+			}
+			else if (!Object.ObjectData.NewOuterPathName.IsNone()) // Owner name changed?
+			{
+				// Happens when an object is renamed and a sub-component outer pathname is updated to reflect its owner new name.
+				// This is a 'by product' effect of renaming an object. Top story will be the top object being renamed.
+				continue;
+			}
+			else if (!Object.ObjectData.NewName.IsNone() && !Object.ObjectData.bAllowCreate) // Something was renamed, but not as part of the creation. (Some objects (ex: 'Cube') get renamed on creation)
+			{
+				// This transaction is a rename of an object.
+				FString ObjectOuterPathname = Object.ObjectId.ObjectOuterPathName.ToString();
+				FName PackageName(*FPackageName::ObjectPathToPackageName(ObjectOuterPathname));
+				FName OldObjectDisplayName = ActivitySummaryUtil::GetObjectDisplayName(ObjectOuterPathname, Object.ObjectId.ObjectName);
+				FName NewObjectDisplayName = ActivitySummaryUtil::GetObjectDisplayName(ObjectOuterPathname, Object.ObjectData.NewName);
+				FillActivitySummary(EConcertSyncTransactionActivitySummaryType::Renamed, OldObjectDisplayName, PackageName, NewObjectDisplayName, 1, OutActivitySummary);
+
+				// Assuming it is not possible to get a 'rename' with other kind of transactions (delete, create, transform, etc), everything else in the transaction is not interesting or
+				// linked to the object rename. Since we captured the story of the transaction and we don't expect to find any other, return.
+				return;
+			}
+
+			// Some objects, for example the basic Cube, gets renamed on creation from a generic name like 'StaticMeshActor_1" to a more specific name like 'Cube_1".
+			FName ObjectName = Object.ObjectData.NewName.IsNone() ? Object.ObjectId.ObjectName : Object.ObjectData.NewName;
+
+			// Keep the selected object with 'pathname-like' name, analog to a file pathname, so that objects with the same outer get different 'pathname'. (Ex. /Game/Map.Map:PersistentLevel.Cube1, /Game/Map.Map:PersistentLevel.Sphere1)
+			PotentialObjects.Emplace(Object.ObjectId.ObjectOuterPathName.ToString() + TEXT(".") + ObjectName.ToString(), &Object);
+		}
+
+		// Build object hierarchies, putting sub-object after their top level object. (ex: /Game/Map.Map:PersistentLevel.Cube1, /Game/Map.Map:PersistentLevel.Cube1.Audio, /Game/Map.Map:PersistentLevel.Cube1.StaticMesh, /Game/Map.Map:PersistentLevel.Sphere1, ...)
+		PotentialObjects.Sort([](const TPair<FString, const FConcertExportedObject*>& Lhs, const TPair<FString, const FConcertExportedObject*>& Rhs) { return Lhs.Key < Rhs.Key; });
+
+		// DEBUG: Print the potential objects once sorted.
+		//ActivitySummaryUtil::DebugPrintExportedObjects(TEXT("Potential"), PotentialObjects);
+
+		// Contains the object selected to generate a story. (Retaining sort order of PotentialObjects)
+		TArray<TPair<const FString*, const FConcertExportedObject*>> DeletedObjects;
+		TArray<TPair<const FString*, const FConcertExportedObject*>> CreatedObjects;
+		TArray<TPair<const FString*, const FConcertExportedObject*>> ModifiedObjects;
+
+		// Classify the objects by type of transaction.
+		for (const TPair<FString, const FConcertExportedObject*>& PotentialPair : PotentialObjects)
+		{
+			if (PotentialPair.Value->ObjectData.bIsPendingKill) // Something was deleted?
+			{
+				DeletedObjects.Emplace(&PotentialPair.Key, PotentialPair.Value);
+			}
+			else if (PotentialPair.Value->ObjectData.bAllowCreate) // Something was created?
+			{
+				CreatedObjects.Emplace(&PotentialPair.Key, PotentialPair.Value);
+			}
+			else // Something was modified.
+			{
+				// If the modified object is the 'Level' itself, ignore it, we are more interested to say how it was modified.
+				FString OuterPathname(PotentialPair.Value->ObjectId.ObjectOuterPathName.ToString());
+				if (OuterPathname == FPackageName::ObjectPathToPackageName(OuterPathname))
+				{
+					continue; // Ex. /Game/Map == /Game/Map -> Skip
+				}
+
+				ModifiedObjects.Emplace(&PotentialPair.Key, PotentialPair.Value);
+			}
+		}
+
+		// DEBUG: Print the classified objects.
+		//ActivitySummaryUtil::DebugPrintExportedObjects(TEXT("Deleted"), DeletedObjects);
+		//ActivitySummaryUtil::DebugPrintExportedObjects(TEXT("Created"), CreatedObjects);
+		//ActivitySummaryUtil::DebugPrintExportedObjects(TEXT("Modified"), ModifiedObjects);
+
+		// Contains selected objects to generate stories.
+		TArray<TPair<const FString*, c

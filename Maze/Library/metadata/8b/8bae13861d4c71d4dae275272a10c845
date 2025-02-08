@@ -1,0 +1,101 @@
+ugInfo: Ensure that for variable is stored in a local and tag it with the user-defined name
+            if (this.qil.IsDebug && ndFor.DebugName != null) {
+                this.helper.DebugStartScope();
+
+                // Ensure that values are stored in a local variable with a user-defined name
+                this.iterCurr.EnsureLocalNoCache("$$$for");
+                this.iterCurr.Storage.LocalLocation.SetLocalSymInfo(ndFor.DebugName);
+            }
+            else {
+                // Ensure that values are not stored on the stack
+                this.iterCurr.EnsureNoStackNoCache("$$$for");
+            }
+
+            if (patt.MatchesPattern(OptimizerPatternName.IsPositional)) {
+                // Increment position
+                this.helper.Emit(OpCodes.Ldloc, locPos);
+                this.helper.Emit(OpCodes.Ldc_I4_1);
+                this.helper.Emit(OpCodes.Add);
+                this.helper.Emit(OpCodes.Stloc, locPos);
+
+                if (patt.MatchesPattern(OptimizerPatternName.MaxPosition)) {
+                    // Short-circuit rest of loop if max position has already been reached
+                    this.helper.Emit(OpCodes.Ldloc, locPos);
+                    this.helper.LoadInteger((int) patt.GetArgument(OptimizerPatternArgument.MaxPosition));
+                    this.helper.Emit(OpCodes.Bgt, this.iterCurr.ParentIterator.GetLabelNext());
+                }
+
+                this.iterCurr.LocalPosition = locPos;
+            }
+
+            EndNestedIterator(ndFor.Binding);
+            this.iterCurr.SetIterator(this.iterNested);
+        }
+
+        /// <summary>
+        /// Bind values in the "ndLet" expression to a non-stack location that can later be referenced.
+        /// </summary>
+        public void StartLetBinding(QilIterator ndLet) {
+            Debug.Assert(!ndLet.XmlType.IsSingleton);
+
+            // Construct nested iterator
+            StartNestedIterator(ndLet);
+
+            // Allow base internal class to dispatch based on QilExpression node type
+            NestedVisit(ndLet.Binding, GetItemStorageType(ndLet), !ndLet.XmlType.IsSingleton);
+
+            // DebugInfo: Open variable scope
+            // DebugInfo: Ensure that for variable is stored in a local and tag it with the user-defined name
+            if (this.qil.IsDebug && ndLet.DebugName != null) {
+                this.helper.DebugStartScope();
+
+                // Ensure that cache is stored in a local variable with a user-defined name
+                this.iterCurr.EnsureLocal("$$$cache");
+                this.iterCurr.Storage.LocalLocation.SetLocalSymInfo(ndLet.DebugName);
+            }
+            else {
+                // Ensure that cache is not stored on the stack
+                this.iterCurr.EnsureNoStack("$$$cache");
+            }
+
+            EndNestedIterator(ndLet);
+        }
+
+        /// <summary>
+        /// Mark iterator variables as out-of-scope.
+        /// </summary>
+        private void EndBinding(QilIterator ndIter) {
+            Debug.Assert(ndIter != null);
+
+            // Variables go out of scope here
+            if (this.qil.IsDebug && ndIter.DebugName != null)
+                this.helper.DebugEndScope();
+        }
+
+        /// <summary>
+        /// Generate code for QilNodeType.PositionOf.
+        /// </summary>
+        protected override QilNode VisitPositionOf(QilUnary ndPos) {
+            QilIterator ndIter = ndPos.Child as QilIterator;
+            LocalBuilder locPos;
+            Debug.Assert(ndIter.NodeType == QilNodeType.For);
+
+            locPos = XmlILAnnotation.Write(ndIter).CachedIteratorDescriptor.LocalPosition;
+            Debug.Assert(locPos != null);
+            this.iterCurr.Storage = StorageDescriptor.Local(locPos, typeof(int), false);
+
+            return ndPos;
+        }
+
+        /// <summary>
+        /// Generate code for QilNodeType.Sort.
+        /// </summary>
+        protected override QilNode VisitSort(QilLoop ndSort) {
+            Type itemStorageType = GetItemStorageType(ndSort);
+            LocalBuilder locCache, locKeys;
+            Label lblOnEndSort = this.helper.DefineLabel();
+            Debug.Assert(ndSort.Variable.NodeType == QilNodeType.For);
+
+            // XmlQuerySequence<T> cache;
+            // cache = XmlQuerySequence.CreateOrReuse(cache);
+            XmlILSto

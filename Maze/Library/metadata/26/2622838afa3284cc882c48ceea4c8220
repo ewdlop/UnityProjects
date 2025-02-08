@@ -1,0 +1,184 @@
+ram_count * sizeof (stackval));
+			}
+
+			OBJREF (o) = mono_gc_alloc_obj (vtable, m_class_get_instance_size (vtable->klass));
+			if (G_UNLIKELY (!o)) {
+				mono_error_set_out_of_memory (error, "Could not allocate %i bytes", m_class_get_instance_size (vtable->klass));
+				goto throw_error_label;
+			}
+
+			sp [0].data.o = o;
+			if (is_inlined) {
+				sp [1].data.o = o;
+				sp += param_count + 2;
+			} else {
+				InterpMethod *ctor_method = (InterpMethod*) frame->imethod->data_items [imethod_index];
+				frame->ip = ip;
+
+				child_frame = alloc_frame (context, &vtable, frame, ctor_method, sp, NULL);
+				interp_exec_method_newobj_fast (child_frame, context, error);
+				CHECK_RESUME_STATE (context);
+				sp [0].data.o = o;
+				sp++;
+			}
+			ip += 4;
+
+			MINT_IN_BREAK;
+		}
+		MINT_IN_CASE(MINT_NEWOBJ_VT_FAST)
+		MINT_IN_CASE(MINT_NEWOBJ_VTST_FAST) {
+			int dummy;
+			// This is split up to:
+			//  - conserve stack
+			//  - keep exception handling and resume mostly in the main function
+
+			frame->ip = ip;
+			child_frame = alloc_frame (context, &dummy, frame, (InterpMethod*) frame->imethod->data_items [ip [1]], NULL, NULL);
+			guint16 const param_count = ip [2];
+
+			if (param_count) {
+				sp -= param_count;
+				memmove (sp + 1, sp, param_count * sizeof (stackval));
+			}
+			child_frame->stack_args = sp;
+			gboolean const vtst = *ip == MINT_NEWOBJ_VTST_FAST;
+			if (vtst) {
+				memset (vt_sp, 0, ip [3]);
+				sp->data.p = vt_sp;
+				ip += 4;
+
+				interp_exec_method_newobj_vtst_fast (child_frame, context, error);
+
+				CHECK_RESUME_STATE (context);
+				sp->data.p = vt_sp;
+
+			} else {
+				ip += 3;
+				mono_interp_newobj_vt (child_frame, context, error);
+				CHECK_RESUME_STATE (context);
+			}
+			++sp;
+			MINT_IN_BREAK;
+		}
+
+		MINT_IN_CASE(MINT_NEWOBJ) {
+			int dummy;
+			// This is split up to:
+			//  - conserve stack
+			//  - keep exception handling and resume mostly in the main function
+
+			frame->ip = ip;
+
+			guint32 const token = ip [1];
+			ip += 2; // FIXME: Do this after throw?
+
+			child_frame = alloc_frame (context, &dummy, frame, (InterpMethod*)frame->imethod->data_items [token], NULL, NULL);
+			MonoMethodSignature* const csig = mono_method_signature_internal (child_frame->imethod->method);
+
+			g_assert (csig->hasthis);
+			if (csig->param_count) {
+				sp -= csig->param_count;
+				memmove (sp + 1, sp, csig->param_count * sizeof (stackval));
+			}
+
+			child_frame->stack_args = sp;
+
+			MonoException* const exc = mono_interp_newobj (child_frame, context, error, vt_sp);
+			if (exc)
+				THROW_EX (exc, ip);
+			CHECK_RESUME_STATE (context);
+			++sp;
+			MINT_IN_BREAK;
+		}
+		MINT_IN_CASE(MINT_NEWOBJ_MAGIC) {
+			frame->ip = ip;
+			ip += 2;
+
+			MINT_IN_BREAK;
+		}
+		MINT_IN_CASE(MINT_INTRINS_BYREFERENCE_CTOR) {
+			MonoMethodSignature *csig;
+			guint32 token;
+
+			frame->ip = ip;
+			token = ip [1];
+			ip += 2;
+
+			InterpMethod *cmethod = (InterpMethod*)frame->imethod->data_items [token];
+			csig = mono_method_signature_internal (cmethod->method);
+
+			g_assert (csig->hasthis);
+			sp -= csig->param_count;
+
+			gpointer arg0 = sp [0].data.p;
+
+			gpointer *byreference_this = (gpointer*)vt_sp;
+			*byreference_this = arg0;
+
+			/* Followed by a VTRESULT opcode which will push the result on the stack */
+			++sp;
+			MINT_IN_BREAK;
+		}
+		MINT_IN_CASE(MINT_INTRINS_BYREFERENCE_GET_VALUE) {
+			gpointer *byreference_this = (gpointer*)sp [-1].data.p;
+			sp [-1].data.p = *byreference_this;
+			++ip;
+			MINT_IN_BREAK;
+		}
+		MINT_IN_CASE(MINT_INTRINS_UNSAFE_ADD_BYTE_OFFSET) {
+			sp -= 2;
+			sp [0].data.p = (guint8*)sp [0].data.p + sp [1].data.nati;
+			sp ++;
+			++ip;
+			MINT_IN_BREAK;
+		}
+		MINT_IN_CASE(MINT_INTRINS_UNSAFE_BYTE_OFFSET) {
+			sp -= 2;
+			sp [0].data.nati = (guint8*)sp [1].data.p - (guint8*)sp [0].data.p;
+			sp ++;
+			++ip;
+			MINT_IN_BREAK;
+		}
+		MINT_IN_CASE(MINT_INTRINS_RUNTIMEHELPERS_OBJECT_HAS_COMPONENT_SIZE) {
+			MonoObject *obj = sp [-1].data.o;
+			sp [-1].data.i = (obj->vtable->flags & MONO_VT_FLAG_ARRAY_OR_STRING) != 0;
+			++ip;
+			MINT_IN_BREAK;
+		}
+		MINT_IN_CASE(MINT_CASTCLASS_INTERFACE)
+		MINT_IN_CASE(MINT_ISINST_INTERFACE) {
+			MonoObject* const o = sp [-1].data.o;
+			if (o) {
+				MonoClass* const c = (MonoClass*)frame->imethod->data_items [ip [1]];
+				gboolean isinst;
+				if (MONO_VTABLE_IMPLEMENTS_INTERFACE (o->vtable, m_class_get_interface_id (c))) {
+					isinst = TRUE;
+				} else if (m_class_is_array_special_interface (c) || mono_object_is_transparent_proxy (o)) {
+					/* slow path */
+					isinst = mono_interp_isinst (o, c); // FIXME: do not swallow the error
+				} else {
+					isinst = FALSE;
+				}
+
+				if (!isinst) {
+					gboolean const isinst_instr = *ip == MINT_ISINST_INTERFACE;
+					if (isinst_instr)
+						sp [-1].data.p = NULL;
+					else
+						goto invalid_cast_label;
+				}
+			}
+			ip += 2;
+			MINT_IN_BREAK;
+		}
+		MINT_IN_CASE(MINT_CASTCLASS_COMMON)
+		MINT_IN_CASE(MINT_ISINST_COMMON) {
+			MonoObject* const o = sp [-1].data.o;
+			if (o) {
+				MonoClass* const c = (MonoClass*)frame->imethod->data_items [ip [1]];
+				gboolean isinst = mono_class_has_parent_fast (o->vtable->klass, c);
+
+				if (!isinst) {
+					gboolean const isinst_instr = *ip == MINT_ISINST_COMMON;
+					if (isinst_instr)
+						sp [-1].data.p =

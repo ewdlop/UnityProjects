@@ -1,0 +1,1726 @@
+# Process this file with autoconf to produce a configure script.
+#AC_PREREQ([2.62])
+
+# This line is parsed by tools besides autoconf, such as msvc/mono.winconfig.targets.
+# It should remain in the format they expect.
+#
+AC_INIT(mono, [6.12.0],
+        [https://github.com/mono/mono/issues/new])
+
+AC_CONFIG_SRCDIR([Makefile.am])
+AC_CONFIG_MACRO_DIR([m4])
+
+AC_CANONICAL_SYSTEM
+AC_CANONICAL_HOST
+
+# Gross hack to enable 'make dist' on automake 1.9+tar 1.14.
+# The extra brackets are to foil regex-based scans.
+m4_ifdef([_A][M_PROG_TAR],[_A][M_SET_OPTION([tar-ustar])])
+
+AM_INIT_AUTOMAKE([1.9 dist-xz tar-ustar no-dist-gzip foreign subdir-objects]
+                 m4_esyscmd([case `automake --version | head -n 1` in    # parallel-tests is default in automake 1.13+, we need to explicitly enable it
+                             *1.11*|*1.12*) echo parallel-tests;;        # for 1.11 and 1.12 but not below as those versions don't recognize the flag
+                             esac]))                                     # TODO: remove this hack once we require automake 1.11+
+
+AC_CONFIG_HEADERS([config.h])
+AM_MAINTAINER_MODE
+m4_ifdef([AM_EXTRA_RECURSIVE_TARGETS], AM_EXTRA_RECURSIVE_TARGETS([test]))
+m4_ifdef([AM_EXTRA_RECURSIVE_TARGETS], AM_EXTRA_RECURSIVE_TARGETS([test-bundle]))
+
+API_VER=2.0
+AC_SUBST(API_VER)
+
+AC_PROG_LN_S
+
+m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
+
+MONO_VERSION_MAJOR=`echo $VERSION | cut -d . -f 1`
+MONO_VERSION_MINOR=`echo $VERSION | cut -d . -f 2`
+MONO_VERSION_BUILD=`echo $VERSION | cut -d . -f 3`
+
+#
+# This is the version of the corlib-runtime interface. When
+# making changes to this interface (by changing the layout
+# of classes the runtime knows about, changing icall signature or
+# semantics etc), change this variable.
+#
+# This must be unique relative to corlib interface and semantics.
+#
+# If you change corlib such that a runtime change is required, or
+# vice versa, change this string. Examples include removing icalls,
+# adding icalls, changing icall signatures, and changing type layouts
+# that both sides know.
+#
+# It is an arbitrary string and should be parsed as such.
+# A guid works and is encouraged.
+#
+# Generate it with uuidgen. For example:
+# perl -pi.bak -e "s/^MONO_CORLIB_VERSION=\S+/MONO_CORLIB_VERSION=`uuidgen`/" configure.ac
+#
+# There is no ordering of corlib versions, no old or new,
+# an exact match is required between corlib and runtime.
+#
+# This line is parsed by tools besides autoconf, such as msvc/mono.winconfig.targets.
+# It should remain in the format they expect.
+#
+MONO_CORLIB_VERSION=1A5E0066-58DC-428A-B21C-0AD6CDAE2789
+
+#
+# Put a quoted #define in config.h.
+# Substitute @MONO_CORLIB_VERSION@ unquoted.
+#
+AC_DEFINE_UNQUOTED(MONO_CORLIB_VERSION,"$MONO_CORLIB_VERSION",[Version of the corlib-runtime interface])
+AC_SUBST(MONO_CORLIB_VERSION)
+
+case $host_os in
+*cygwin* )
+		 echo "Run configure using ./configure --host=i686-w64-mingw32 or --host=x86_64-w64-mingw32"
+		 exit 1
+esac
+
+# In case of cygwin, override LN_S, irrespective of what it determines.
+# The build uses cygwin, but the actual runtime doesn't.
+case $host_os in
+*cygwin* ) LN_S='cp -p';;
+esac
+
+#
+# libgc defaults
+#
+libgc_configure_args=
+
+# These variables are the CPPFLAGS/CFLAGS passed to libgc's configure
+# libgc should inherit the original CFLAGS/CPPFLAGS passed to configure, i.e. -O0
+CPPFLAGS_FOR_LIBGC=$CPPFLAGS
+CFLAGS_FOR_LIBGC=$CFLAGS
+CPPFLAGS_FOR_BTLS=$CPPFLAGS
+CFLAGS_FOR_BTLS=$CFLAGS
+
+# libgc uses some deprecated APIs
+CFLAGS_FOR_LIBGC="$CFLAGS -Wno-deprecated-declarations"
+
+#
+# These are the flags that need to be stored in the mono.pc file for 
+# compiling code that will embed Mono
+#
+libmono_cflags=""
+libmono_ldflags=""
+AC_SUBST(libmono_cflags)
+AC_SUBST(libmono_ldflags)
+
+# Variable to have relocatable .pc files (lib, or lib64)
+# realpath isn't always available, and requires that all but the tip of the provided
+# path exists. Fall back to the old behaviour, but realpath allows depth >1
+# e.g. Debian puts Mono in /usr/bin and libs in /usr/lib/x86_64-linux-gnu/ which is
+# too deep for the old method to work
+reloc_libdir=`realpath --relative-to=${prefix} ${libdir} 2> /dev/null || basename ${libdir}`
+AC_SUBST(reloc_libdir)
+
+# Set to yes if Unix sockets cannot be created in an anonymous namespace
+need_link_unlink=no
+
+#Set to extra linker flags to be passed to the runtime binaries (mono /mono-sgen)
+extra_runtime_ldflags=""
+
+# Thread configuration inspired by sleepycat's db
+AC_MSG_CHECKING([host platform characteristics])
+
+libgc_threads=no
+has_dtrace=no
+parallel_mark=yes
+ikvm_native=yes
+
+host_win32=no
+target_win32=no
+target_wasm=no
+platform_android=no
+platform_tizen=no
+platform_ios=no
+host_darwin=no
+host_linux=no
+build_darwin=no
+
+case "$host" in
+	wasm32*)
+		CFLAGS="$CFLAGS -D_REENTRANT -D_GNU_SOURCE -s WASM=1"
+		CPPFLAGS="$CPPFLAGS -D_REENTRANT -DUSE_MMAP -s WASM=1"
+		libgc_threads=pthreads
+		platform_wasm=yes
+		# FIXME:
+		RID="osx-x64"
+		COREARCH="wasm32"
+		CORETARGETS="-p:TargetsUnix=true -p:TargetsOSX=true"
+		build_darwin=yes
+		;;
+	*-mingw*|*-*-cygwin*)
+		AC_DEFINE(DISABLE_PORTABILITY,1,[Disable the io-portability layer])
+		AC_DEFINE(HOST_NO_SYMLINKS,1,[This platform does not support symlinks])
+		host_win32=yes
+		mono_cv_clang=no
+		if test "x$cross_compiling" = "xno"; then
+			if test "x$host" = "x$build" -a "x$host" = "x$target"; then
+				target_win32=yes
+			fi
+		else
+			if test "x$host" = "x$target"; then
+				target_win32=yes
+			fi
+		fi
+		HOST_CC="gcc"
+		RID="win-x86"
+		CORETARGETS="-p:TargetsWindows=true"
+		COREARCH="x86"
+		# Boehm not supported on 64-bit Windows.
+		case "$host" in
+		x86_64-*-* | amd64-*-*)
+			with_gc=sgen
+			RID="win-x64"
+			COREARCH="x64"
+			;;
+		esac
+
+		# Windows 7 or later is required
+		WIN32_CPPFLAGS="-DWINVER=0x0601 -D_WIN32_WINNT=0x0601 -D_WIN32_IE=0x0501 -D_UNICODE -DUNICODE -DWIN32_THREADS -DFD_SETSIZE=1024"
+		CPPFLAGS="$CPPFLAGS $WIN32_CPPFLAGS"
+		WIN32_LDFLAGS="-lbcrypt -lmswsock -lws2_32 -lole32 -loleaut32 -lpsapi -lversion -ladvapi32 -lwinmm -lkernel32 -liphlpapi -static-libgcc"
+		LDFLAGS="$LDFLAGS $WIN32_LDFLAGS"
+		libmono_cflags="-mms-bitfields -mwindows"
+		libmono_ldflags="-mms-bitfields -mwindows"
+		libgc_threads=win32
+		with_sigaltstack=no
+		with_tls=pthread
+		with_sgen_default_concurrent=yes
+		LN_S=cp
+		;;
+	*-*-*netbsd*)
+		CPPFLAGS="$CPPFLAGS -D_REENTRANT -DGC_NETBSD_THREADS -D_GNU_SOURCE"
+		libmono_cflags="-D_REENTRANT"
+		LDFLAGS="$LDFLAGS -pthread"
+		CPPFLAGS="$CPPFLAGS -DHOST_BSD"
+		libmono_ldflags="-pthread"
+		need_link_unlink=yes
+		libgc_threads=pthreads
+		with_sigaltstack=no
+		use_sigposix=yes
+		with_sgen_default_concurrent=yes
+		;;
+	*-*-kfreebsd*-gnu)
+		CPPFLAGS="$CPPFLAGS -DGC_FREEBSD_THREADS -D_GNU_SOURCE -D_REENTRANT -DUSE_MMAP -DUSE_MUNMAP -DTHREAD_LOCAL_ALLOC -pthread"
+		libmono_cflags="-D_REENTRANT -DTHREAD_LOCAL_ALLOC -pthread"
+		libmono_ldflags="-lpthread -pthread"
+		libgc_threads=pthreads
+		need_link_unlink=yes
+		with_sigaltstack=no
+		use_sigposix=yes
+		with_sgen_default_concurrent=yes
+		;;
+	*-*-*freebsd*)
+		dnl For close_my_fds
+		LDFLAGS="$LDFLAGS -lutil"
+		if test "x$PTHREAD_CFLAGS" = "x"; then
+			CPPFLAGS="$CPPFLAGS -DGC_FREEBSD_THREADS"
+			libmono_cflags=
+		else
+			CPPFLAGS="$CPPFLAGS $PTHREAD_CFLAGS -DGC_FREEBSD_THREADS"
+			libmono_cflags="$PTHREAD_CFLAGS"
+		fi
+		if test "x$PTHREAD_LIBS" = "x"; then
+			LDFLAGS="$LDFLAGS -pthread -L/usr/local/lib"
+			libmono_ldflags="-pthread"
+		else
+			LDFLAGS="$LDFLAGS $PTHREAD_LIBS -L/usr/local/lib"
+			libmono_ldflags="$PTHREAD_LIBS"
+		fi
+		CPPFLAGS="$CPPFLAGS -DHOST_BSD -D_WITH_GETLINE"
+		need_link_unlink=yes
+		AC_DEFINE(PTHREAD_POINTER_ID, 1, [pthread is a pointer])
+		libgc_threads=pthreads
+		use_sigposix=yes
+		has_dtrace=yes
+		case "$host" in
+		aarch64-*)
+			support_boehm=no
+			with_gc=sgen
+			;;
+		riscv*)
+			support_boehm=no
+			with_gc=sgen
+			;;
+		esac
+		with_sgen_default_concurrent=yes
+		;;
+	*-*-*openbsd*)
+		CPPFLAGS="$CPPFLAGS -D_THREAD_SAFE -DGC_OPENBSD_THREADS -DHOST_BSD -D_REENTRANT -DUSE_MMAP"
+		LDFLAGS="${LDFLAGS} -Wl,-zwxneeded"
+		if test "x$disable_munmap" != "xyes"; then
+		CPPFLAGS="$CPPFLAGS -DUSE_MUNMAP"
+		fi
+		libmono_cflags="-D_THREAD_SAFE -D_REENTRANT"
+		LDFLAGS="$LDFLAGS -pthread"
+		need_link_unlink=yes
+		AC_DEFINE(PTHREAD_POINTER_ID)
+		libgc_threads=pthreads
+		with_tls=pthread
+		with_sigaltstack=no
+		use_sigposix=yes
+		with_sgen_default_concurrent=yes
+		;;
+	*-*-linux-android*)
+		platform_android=yes
+		AC_DEFINE(HOST_ANDROID,1,[Targeting the Android platform])
+		AC_DEFINE(TARGET_ANDROID,1,[Targeting the Android platform])
+
+		CPPFLAGS="$CPPFLAGS -DGC_LINUX_THREADS -D_GNU_SOURCE -D_REENTRANT -DUSE_MMAP"
+		if test "x$disable_munmap" != "xyes"; then
+			CPPFLAGS="$CPPFLAGS -DUSE_MUNMAP"
+		fi
+		libmono_cflags="-D_REENTRANT"
+		libgc_threads=pthreads
+		use_sigposix=yes
+
+		with_tls=pthread
+		with_sigaltstack=no
+		with_static_mono=no
+
+		# Android doesn't support boehm, as it's missing <link.h>
+		support_boehm=no
+		with_gc=sgen
+
+		# isinf(3) requires -lm
+		LDFLAGS="$LDFLAGS -lm"
+
+		# Bionic's <pthread.h> sets PTHREAD_STACK_MIN=2*PAGE_SIZE; doesn't define
+		# PAGE_SIZE; breaks mono/io-layer/collection.c
+		# Bionic doesn't provide S_IWRITE; breaks io-layer/io.c
+		CFLAGS="$CFLAGS -DPAGE_SIZE=4096 -DS_IWRITE=S_IWUSR"
+		CXXFLAGS="$CXXFLAGS -DPAGE_SIZE=4096 -DS_IWRITE=S_IWUSR"
+
+		# FIXME? Only if __ANDROID_API__ < 24?
+		# FILE32API means "long", which is stuck at 32bits for 32bit ABI (64bits for 64bit ABI).
+		# ABI 24 introduces the "o" for "file offset" variations, which can be widened to 64bits for 32bit ABI (and still 64bits for 64bit).
+		# Android itself uses FILE32API, and mono should use system zlib on Android anyway.
+		ZLIB_CFLAGS="$ZLIB_CFLAGS -DUSE_FILE32API"
+
+		# to bypass the underscore linker check, can't work when cross-compiling
+		mono_cv_uscore=yes
+		mono_cv_clang=no
+		;;
+	*-*-linux*)
+		host_linux=yes
+		CPPFLAGS="$CPPFLAGS -DGC_LINUX_THREADS -D_GNU_SOURCE -D_REENTRANT -DUSE_MMAP"
+		if test "x$disable_munmap" != "xyes"; then
+			CPPFLAGS="$CPPFLAGS -DUSE_MUNMAP"
+		fi
+		libmono_cflags="-D_REENTRANT"
+		libgc_threads=pthreads
+		CORETARGETS="-p:TargetsUnix=true"
+		use_sigposix=yes
+		if test "x$cross_compiling" != "xno"; then
+                	# to bypass the underscore linker check, not
+                	# available during cross-compilation
+                	mono_cv_uscore=no
+                fi
+		case "$host" in
+		*-tizen-linux-*)
+			platform_tizen=yes
+			;;
+		esac
+		case "$host" in
+		ppc64-*)
+			RID="linux-ppc64"
+			;;
+		ppc64le-*)
+			RID="linux-ppc64el"
+			;;
+		mipsel-*)
+			RID="linux-mipsel"
+			;;
+		x86-*)
+			RID="linux-x86"
+			COREARCH="x86"
+			;;
+		x86_64-*)
+			RID="linux-x64"
+			COREARCH="x64"
+			;;
+		arm-*)
+			# deal with this in the FPU detection section, since
+			# we cannot determine FPU from triplet and don't want
+			# to duplicate the logic
+			;;
+		aarch64-*)
+			support_boehm=no
+			with_gc=sgen
+			RID="linux-arm64"
+			COREARCH="arm64"
+			;;
+		powerpc*-*-linux*)
+			# https://bugzilla.novell.com/show_bug.cgi?id=504411
+			disable_munmap=yes
+			;;
+		powerpc*-*-freebsd*)
+			# https://bugzilla.novell.com/show_bug.cgi?id=504411
+			disable_munmap=yes
+			;;
+		riscv*)
+			support_boehm=no
+			with_gc=sgen
+			;;
+		esac
+		with_sgen_default_concurrent=yes
+		;;
+	*-*-nacl*)
+		echo "nacl no longer supported."
+		exit 1
+		;;
+	*-*-hpux*)
+		CPPFLAGS="$CPPFLAGS -DGC_HPUX_THREADS -D_HPUX_SOURCE -D_XOPEN_SOURCE_EXTENDED -D_REENTRANT"
+		# +ESdbgasm only valid on bundled cc on RISC
+		# silently ignored for ia64
+		if test $GCC != "yes"; then
+			CFLAGS="$CFLAGS +ESdbgasm"
+			# Arrange for run-time dereferencing of null
+			# pointers to produce a SIGSEGV signal.
+			LDFLAGS="$LDFLAGS -z"
+		fi
+		CFLAGS="$CFLAGS +ESdbgasm"
+		LDFLAGS="$LDFLAGS -z"
+		libmono_cflags="-D_REENTRANT"
+		libmono_ldflags="-lpthread"
+		libgc_threads=pthreads
+		need_link_unlink=yes
+		use_sigposix=yes
+		;;
+	*-*-solaris*)
+		CPPFLAGS="$CPPFLAGS -DGC_SOLARIS_THREADS -DGC_SOLARIS_PTHREADS -D_REENTRANT -D_POSIX_PTHREAD_SEMANTICS -DUSE_MMAP -DUSE_MUNMAP -DHOST_SOLARIS"
+		need_link_unlink=yes
+		libmono_cflags="-D_REENTRANT"
+		libgc_threads=pthreads
+		has_dtrace=yes
+		use_sigposix=yes
+		enable_solaris_tar_check=yes
+		;;
+	*-*-darwin*)
+		parallel_mark="Disabled_Currently_Hangs_On_MacOSX"
+		host_darwin=yes
+		target_mach=yes
+		CPPFLAGS="$CPPFLAGS -D_THREAD_SAFE -DGC_MACOSX_THREADS -DUSE_MMAP -DUSE_MUNMAP"
+		libmono_cflags="-D_THREAD_SAFE"
+		need_link_unlink=yes
+		AC_DEFINE(PTHREAD_POINTER_ID)
+		AC_DEFINE(USE_MACH_SEMA, 1, [...])
+		CORETARGETS="-p:TargetsUnix=true -p:TargetsOSX=true"
+		libgc_threads=pthreads
+		has_dtrace=yes
+		if test "x$cross_compiling" = "xyes"; then
+			has_broken_apple_cpp=yes
+		fi
+		dnl Snow Leopard is horribly broken -- it reports itself as i386-apple-darwin*, but
+		dnl its gcc defaults to 64-bit mode.  They have also deprecated the usage of ucontext
+		dnl we need to set some flags to build our 32-bit binaries on 10.6 properly
+		case "$host" in
+			dnl Snow Leopard and newer config.guess reports as this
+			i*86-*-darwin*)
+				BROKEN_DARWIN_FLAGS="-arch i386"
+				BROKEN_DARWIN_CPPFLAGS=""
+				CPPFLAGS="$CPPFLAGS $BROKEN_DARWIN_CPPFLAGS"
+				CFLAGS="$CFLAGS $BROKEN_DARWIN_FLAGS"
+				CXXFLAGS="$CXXFLAGS $BROKEN_DARWIN_FLAGS"
+				CCASFLAGS="$CCASFLAGS $BROKEN_DARWIN_FLAGS"
+				CPPFLAGS_FOR_LIBGC="$CPPFLAGS_FOR_LIBGC $BROKEN_DARWIN_CPPFLAGS"
+				CFLAGS_FOR_LIBGC="$CFLAGS_FOR_LIBGC $BROKEN_DARWIN_FLAGS"
+				with_sgen_default_concurrent=yes
+				RID="osx-x86"
+				COREARCH="x86"
+				;;
+			x*64-*-darwin*)
+				with_sgen_default_concurrent=yes
+				RID="osx-x64"
+				COREARCH="x64"
+				;;
+			arm*-darwin*)
+				platform_ios=yes
+				has_dtrace=no
+				;;
+			aarch64*-darwin*)
+				platform_ios=yes
+				;;
+		esac
+		;;
+	*-*-haiku*)
+		dnl BSD_SOURCE is for getifaddrs
+		CPPFLAGS="$CPPFLAGS -D_BSD_SOURCE -D_REENTRANT -D_THREAD_SAFE"
+		libmono_cflags="-D_REENTRANT -D_THREAD_SAFE"
+		LIBS="$LIBS -lnetwork -ltextencoding"
+		need_link_unlink=yes
+		AC_DEFINE(PTHREAD_POINTER_ID)
+		dnl Haiku does not support static TLS with __thread
+		with_tls=pthread
+		libgc_threads=pthreads
+		use_sigposix=yes
+		with_sigaltstack=no
+		;;
+	*-*-fuchsia*)
+		AC_DEFINE(DISABLE_PORTABILITY,1,[Disable the io-portability layer])
+		AC_DEFINE(HOST_FUCHSIA,1,[Targeting the Fuchsia platform])
+		fuchsia=true
+		with_tls=pthread
+		with_sigaltstack=yes
+		with_static_mono=no
+		support_boehm=no
+		with_gc=sgen
+		mono_cv_uscore=yes
+		mono_cv_clang=no
+		;;
+	*-*-aix*|*-*-os400*)
+		AC_DEFINE(HOST_AIX,1,[Targeting the AIX and PASE platforms])
+		host_aix=yes
+		dnl IMPORTANT: For svr4 sonames on AIX, you should set
+		dnl `OBJECT_MODE=64` when configuring.
+		dnl libtool cannot generate functioning svr4 sonames on
+		dnl 64-bit without it.
+		dnl Unfortunately, everything is complicated by the fact that
+		dnl gcc doesn't respect this variable. (otherwise we could set
+		dnl it for build time for configure and make)
+		dnl On IBM i PASE using IBM's packages, GCC *does* respect this
+		dnl variable, and builds are 64-bit by default. svr4 sonames
+		dnl must still be specified when configuring on i, however.
+		dnl As such, because Mono doesn't support 32-bit AIX or PASE,
+		dnl set up a 64-bit build (assming GCC; XLC not supported)
+		dnl regardless of what variable is used.
+		case $host_os in
+			aix*)
+			if test "x$OBJECT_MODE" = "x64" && test "x$CC" = "x" && test "x$CXX" = "x"; then
+				dnl HACK: Set -maix64 at the GCC invocation
+				dnl level explicitly to work around the fact
+				dnl GCC in default maix32 mode explodes when
+				dnl binutils respects OBJECT_MODE.
+				dnl When that check occurs, flags are not
+				dnl passed to to the compiler, so GCC has no
+				dnl chance to change its mode.
+				dnl Otherwise, it may enter a state where it
+				dnl runs, but uses the libtool "compile"
+				dnl wrapper, which subtly breaks other things.
+				dnl This should propagate to all uses of CC.
+				dnl This is only set if not manually set.
+				CC="gcc -maix64"
+				CXX="g++ -maix64"
+				echo
+			fi
+			;;
+			dnl Not needed on i because it defaults to 64-bit and
+			dnl has a GCC smart enough to respect OBJECT_MODE.
+		esac
+		dnl We still set this for *FLAGS, however, because we may not
+		dnl be setting OBJECT_MODE.
+		LDFLAGS="$LDFLAGS -maix64"
+		CPPFLAGS="$CPPFLAGS -maix64 -DGC_AIX_THREADS -D_ALL_SOURCE -pthread -D_THREAD_SAFE -D_LARGE_FILES -D_REENTRANT"
+		libmono_cflags="-pthread -D_THREAD_SAFE -D_REENTRANT"
+		dnl Would you believe GNU nm doesn't know how to process AIX libraries?
+		dnl Hardcode IBM binutils in case GNU ones end up on our path. Also
+		dnl specifiy 64-bit mode for tools. (OBJECT_MODE is finicky with cmake.)
+		dnl XXX: We should stop the hardcoding madness
+		AR="/usr/bin/ar -X64"
+		NM="/usr/bin/nm -X64"
+		STRIP="/usr/bin/strip -X64"
+		RANLIB="/usr/bin/ranlib -X64"
+		dnl SGen is the future (changes to Boehm support code would be
+		dnl required if you wish to re-enable Boehm)
+		support_boehm=no
+		with_gc=sgen
+		need_link_unlink=yes
+		use_sigposix=yes
+		dnl Similar limitation to macOS about the first thread and the
+		dnl guard page, except sometimes the runtime hangs. Disable for
+		dnl now until cause can be determined or it seems OK enough.
+		with_sigaltstack=no
+		dnl use pthread TLS, __thread has issues with the compiler flags we use
+		with_tls=pthread
+		dnl ppc Linux is the same? test further
+		disable_munmap=yes
+		RID="aix-ppc64"
+		CORETARGETS="-p:TargetsUnix=true"
+		;;
+	*)
+		AC_MSG_WARN([*** Please add $host to configure.ac checks!])
+		;;
+esac
+
+AC_MSG_RESULT(ok)
+
+if test x$need_link_unlink = xyes; then
+   AC_DEFINE(NEED_LINK_UNLINK, 1, [Define if Unix sockets cannot be created in an anonymous namespace])
+fi
+
+if test x$host_win32 = xyes; then
+   AC_DEFINE(HOST_WIN32, 1, [Host Platform is Win32])
+fi
+
+if test x$target_win32 = xyes; then
+   AC_DEFINE(TARGET_WIN32, 1, [Target Platform is Win32])
+fi
+
+if test x$host_darwin = xyes; then
+   AC_DEFINE(HOST_DARWIN, 1, [Host Platform is Darwin])
+fi
+
+# Defined for all targets/platforms using classic Windows API support.
+AC_DEFINE(HAVE_CLASSIC_WINAPI_SUPPORT, 1, [Use classic Windows API support])
+AC_DEFINE(HAVE_UWP_WINAPI_SUPPORT, 0, [Don't use UWP Windows API support])
+
+AC_SUBST(extra_runtime_ldflags)
+AM_CONDITIONAL(HOST_WIN32, test x$host_win32 = xyes)
+AM_CONDITIONAL(TARGET_WIN32, test x$target_win32 = xyes)
+AM_CONDITIONAL(HOST_LINUX, echo x$target_os | grep -q linux)
+AM_CONDITIONAL(HOST_DARWIN, test x$host_darwin = xyes)
+AM_CONDITIONAL(HOST_SIGPOSIX, test x$use_sigposix = xyes)
+AM_CONDITIONAL(HOST_ANDROID, test x$platform_android = xyes)
+AM_CONDITIONAL(HOST_TIZEN, test x$platform_tizen = xyes)
+AM_CONDITIONAL(HOST_IOS, test x$platform_ios = xyes)
+AM_CONDITIONAL(HOST_WASM, test x$platform_wasm = xyes)
+AM_CONDITIONAL(HOST_AIX, test x$host_aix = xyes)
+
+if test -z "$HOST_DARWIN_TRUE"; then :
+PLATFORM_AOT_SUFFIX=.dylib
+PLATFORM_AOT_PREFIX=lib
+fi
+
+if test -z "$HOST_LINUX_TRUE"; then :
+PLATFORM_AOT_SUFFIX=.so
+PLATFORM_AOT_PREFIX=lib
+fi
+
+if test -z "$HOST_WIN32_TRUE"; then :
+PLATFORM_AOT_SUFFIX=.dll
+PLATFORM_AOT_PREFIX=
+fi
+
+AC_SUBST(PLATFORM_AOT_SUFFIX)
+AC_SUBST(PLATFORM_AOT_PREFIX)
+
+if test -z "$HOST_WASM_TRUE"; then :
+AC_DEFINE(HAVE_UTIME)
+AC_DEFINE(HAVE_UTIMES)
+fi
+
+## PLATFORM_AOT_SUFFIX not so simple for windows :-)
+
+AC_CHECK_TOOL(CC, gcc, gcc)
+AC_PROG_CC
+AC_CHECK_TOOL(CXX, g++, g++)
+AC_PROG_CXX
+AM_PATH_PYTHON([3.2])
+AM_PROG_AS
+AC_PROG_INSTALL
+AC_PROG_AWK
+AM_PROG_CC_C_O
+dnl We should use AM_PROG_AS, but it's not available on automake/aclocal 1.4
+: ${CCAS='$(CC)'}
+# Set ASFLAGS if not already set.
+: ${CCASFLAGS='$(CFLAGS)'}
+AC_SUBST(CCAS)
+AC_SUBST(CCASFLAGS)
+
+if test "x$CXX" = "xno"; then
+	AC_MSG_ERROR([No c++ compiler found. You need to install a c++ compiler])
+fi
+
+# AC_PROG_CXX helpfully sets CXX to g++ even if no c++ compiler is found so check
+# GXX instead. See http://lists.gnu.org/archive/html/bug-autoconf/2002-04/msg00056.html
+if test "x$CXX" = "xg++"; then
+	if test "x$GXX" != "xyes"; then
+		# automake/libtool is so broken, it requires g++ even if the c++ sources
+		# are inside automake conditionals
+		AC_MSG_ERROR([You need to install g++])
+	fi
+fi
+
+dnl may require a specific autoconf version
+dnl AC_PROG_CC_FOR_BUILD
+dnl CC_FOR_BUILD not automatically detected
+CC_FOR_BUILD=$CC
+CFLAGS_FOR_BUILD=$CFLAGS
+BUILD_EXEEXT=
+if test "x$cross_compiling" = "xyes"; then
+	CC_FOR_BUILD=cc
+	CFLAGS_FOR_BUILD=
+	BUILD_EXEEXT=""
+fi
+AC_SUBST(CC_FOR_BUILD)
+AC_SUBST(CFLAGS_FOR_BUILD)
+AC_SUBST(HOST_CC)
+AC_SUBST(BUILD_EXEEXT)
+
+AM_CONDITIONAL(CROSS_COMPILING, [test x$cross_compiling = xyes])
+AM_CONDITIONAL(USE_BATCH_FILES, [test x$host_win32 = xyes -a x$cross_compiling = xyes])
+
+# Set STDC_HEADERS
+AC_HEADER_STDC
+AC_LIBTOOL_WIN32_DLL
+# This causes monodis to not link correctly
+#AC_DISABLE_FAST_INSTALL
+
+#lookup makedev() header
+AC_HEADER_MAJOR
+
+AM_PROG_LIBTOOL
+# Use dolt (http://dolt.freedesktop.org/) instead of libtool for building.
+DOLT
+
+export_ldflags=`(./libtool --config; echo eval echo \\$export_dynamic_flag_spec) | sh`
+AC_SUBST(export_ldflags)
+
+# Test whenever ld supports -version-script
+AC_PROG_LD
+AC_PROG_LD_GNU
+
+AC_CHECK_HEADERS(sys/filio.h sys/sockio.h netdb.h utime.h sys/utime.h semaphore.h sys/un.h linux/rtc.h sys/syscall.h sys/mkdev.h sys/uio.h sys/param.h sys/sysctl.h libproc.h sys/prctl.h copyfile.h gnu/lib-names.h)
+AC_CHECK_HEADERS(sys/param.h sys/socket.h sys/ipc.h sys/utsname.h alloca.h ucontext.h pwd.h sys/select.h netinet/tcp.h netinet/in.h unistd.h sys/types.h link.h asm/sigcontext.h sys/inotify.h arpa/inet.h complex.h unwind.h)
+
+# zlib/configure checks for unistd.h existence and defines HAVE_UNISTD_H on the compiler
+# command line (not config.h) if it is present.
+AC_CHECK_HEADER(unistd.h,
+    [HAVE_UNISTD_H=1
+     ZLIB_CFLAGS="$ZLIB_CFLAGS -DHAVE_UNISTD_H"],
+    [HAVE_UNISTD_H=0])
+
+AC_SUBST(HAVE_UNISTD_H)
+
+AC_CHECK_HEADERS([linux/netlink.h linux/rtnetlink.h],
+                  [], [], [#include <stddef.h>
+		  #include <sys/socket.h>
+		  #include <linux/socket.h>])
+
+AC_CHECK_HEADERS(sys/user.h, [], [],
+[
+#ifdef HAVE_SYS_PARAM_H
+# include <sys/param.h>
+#endif
+])
+
+AC_CHECK_HEADERS(linux/serial.h)
+
+case "$host" in
+	# Use bundled zlib on Windows to be sure it is static.
+	*-mingw*|*-cygwin*)
+		have_sys_zlib=no
+		zlib_msg="bundled zlib"
+		;;
+	# Use bundled zlib on RISC-V for now to make cross-compiling easier.
+	riscv*)
+		have_sys_zlib=no
+		zlib_msg="bundled zlib"
+		;;
+	*)
+		AC_CHECK_HEADER(zlib.h, [have_sys_zlib=yes], [have_sys_zlib=no])
+		if test x$have_sys_zlib = xyes; then
+			AC_TRY_COMPILE([#include <zlib.h>], [
+				#if defined(ZLIB_VERNUM) && (ZLIB_VERNUM >= 0x1230)
+				#else
+				#error No good zlib found
+				#endif
+			],[
+				AC_MSG_RESULT(Using system zlib)
+				zlib_msg="system zlib"
+				have_sys_zlib=yes
+			],[
+				AC_MSG_RESULT(zlib too old, using embedded zlib)
+				have_sys_zlib=no
+				zlib_msg="bundled zlib"
+			])
+		else
+			AC_MSG_RESULT(zlib not found, using embedded zlib)
+			have_sys_zlib=no
+			zlib_msg="bundled zlib"
+		fi
+		;;
+esac
+
+AC_ARG_WITH(static-zlib, [  --with-static-zlib=PATH    use the specified static zlib instead of -lz],[STATIC_ZLIB_PATH=$with_static_zlib],[STATIC_ZLIB_PATH=])
+if test "x$STATIC_ZLIB_PATH" != "x"; then
+	have_static_zlib=yes
+	have_sys_zlib=no
+	zlib_msg="static zlib from $STATIC_ZLIB_PATH"
+	AC_SUBST(STATIC_ZLIB_PATH)
+fi
+
+AM_CONDITIONAL(HAVE_STATIC_ZLIB, test x$have_static_zlib = xyes)
+AM_CONDITIONAL(HAVE_SYS_ZLIB, test x$have_sys_zlib = xyes)
+if test x$have_static_zlib = xyes; then
+	AC_DEFINE(HAVE_STATIC_ZLIB, 1, [Use static zlib])
+fi
+if test x$have_sys_zlib = xyes; then
+	AC_DEFINE(HAVE_SYS_ZLIB, 1, [Use OS-provided zlib])
+fi
+# for mono/metadata/debug-symfile.c
+AC_CHECK_HEADERS(elf.h)
+
+# for support
+AC_CHECK_HEADERS(poll.h)
+AC_CHECK_HEADERS(sys/poll.h)
+AC_CHECK_HEADERS(sys/wait.h)
+AC_CHECK_HEADERS(grp.h)
+AC_CHECK_HEADERS(syslog.h)
+AC_CHECK_FUNCS(vsyslog)
+
+# for mono/dis
+AC_CHECK_HEADERS(wchar.h)
+
+# for Linux statfs support
+AC_CHECK_HEADERS(linux/magic.h)
+
+# For Android NDK unified headers
+if test x$platform_android = xyes; then
+	AC_CHECK_HEADERS(machine/endian.h sys/endian.h)
+	AC_CHECK_HEADERS(android/legacy_signal_inlines.h, [have_android_signal_inlines=yes], [have_android_signal_inlines=no])
+	AC_CHECK_HEADERS(android/ndk-version.h)
+
+	# Make sure SIGRT{MIN,MAX} work - they will fail to work with unified headers if building for
+	# API level < 21 *and* android/legacy_signal_inlines.h doesn't declare (and define) the required
+	# libc APIs to obtain values for SIGRT{MIN,MAX}. We perform the check only if android/legacy_signal_inlines.h
+	# is found because in other cases the macros will either work (for NDK < 14) or fail if the legacy header
+	# doesn't contain the required definitions (NDK 14)
+	if test x$have_android_signal_inlines = xyes; then
+		AC_MSG_CHECKING([Whether Android SIGRTMIN/SGRTMAX macros are valid])
+		AC_COMPILE_IFELSE([
+			AC_LANG_PROGRAM([#include <signal.h>
+				#include <android/legacy_signal_inlines.h>],[
+				int i;
+				for (i = SIGRTMIN + 1; i < SIGRTMAX; ++i) {
+				}
+			])],[
+				AC_MSG_RESULT(yes)
+				android_sigrtminmax_work=yes
+			],[
+				AC_MSG_RESULT(no)
+				android_sigrtminmax_work=no
+			]
+		)
+
+		if test x$android_sigrtminmax_work = xno; then
+			AC_MSG_ERROR([Android SIGRTMIN/SIGRTMAX macros don't work in this NDK])
+		fi
+	fi
+
+	# Attempt to detect whether we're using Android NDK unified headers
+	AC_CHECK_HEADERS(android/api-level.h, [have_android_api_level=yes], [have_android_api_level=no])
+	AC_CHECK_HEADERS(android/versioning.h, [have_android_versioning=yes], [have_android_versioning=no])
+
+	android_unified_headers=no
+	if test x$have_android_api_level = xyes; then
+		if test x$have_android_versioning = xyes; then
+			AC_MSG_CHECKING([whether using Android NDK unified headers])
+
+			# Both macros are defined only in the NDK unified headers
+			AC_COMPILE_IFELSE([
+				AC_LANG_PROGRAM([
+					#include <android/api-level.h>
+					#include <android/versioning.h>
+				],[
+					#if __ANDROID_API_O__ == 26 && defined(__INTRODUCED_IN)
+					#else
+						#error __ANDROID_API_O__ != 26 or the __INTRODUCED_IN macro not defined
+					#endif
+				])],[
+					AC_MSG_RESULT(yes)
+					android_unified_headers=yes
+				],[
+					AC_MSG_RESULT(no)
+					android_unified_headers=no
+				]
+			)
+		fi
+	fi
+
+	if test x$android_unified_headers = xyes; then
+		AC_DEFINE(ANDROID_UNIFIED_HEADERS, 1, [Whether Android NDK unified headers are used])
+	fi
+fi # Android
+
+# not 64 bit clean in cross-compile
+AC_CHECK_SIZEOF(void *)
+AC_CHECK_SIZEOF(long)
+
+AC_CHECK_SIZEOF(int)
+AC_CHECK_SIZEOF(long long)
+
+AC_CACHE_CHECK([for clang],
+	mono_cv_clang,[
+	AC_TRY_COMPILE([], [
+		#ifdef __clang__
+		#else
+		#error "FAILED"
+		#endif
+	],
+	[mono_cv_clang=yes],
+	[mono_cv_clang=no],
+	[])
+])
+
+AC_ARG_ENABLE(visibility-hidden,
+[  --disable-visibility-hidden    disable usage of -fvisiblity=hidden],
+   disable_visibility_hidden=yes, disable_visibility_hidden=no)
+
+WARN=''
+if test x"$GCC" = xyes; then
+		WARN='-Wall -Wunused -Wmissing-declarations -Wpointer-arith -Wno-cast-qual -Wwrite-strings -Wno-switch -Wno-switch-enum -Wno-unused-value -Wno-attributes'
+		CFLAGS="$CFLAGS -Wmissing-prototypes -Wstrict-prototypes -Wnested-externs -Wno-format-zero-length"
+
+		# We require C99 with some GNU extensions, e.g. `linux` macro
+		CFLAGS="$CFLAGS -std=gnu99"
+
+		# The runtime code does not respect ANSI C strict aliasing rules
+		CFLAGS="$CFLAGS -fno-strict-aliasing"
+
+		# We rely on signed overflow to behave
+		CFLAGS="$CFLAGS -fwrapv"
+
+		CFLAGS="$CFLAGS -DMONO_DLL_EXPORT"
+		if test x"$disable_visibility_hidden" = xno; then
+		   # Don't export any symbols by default
+		   SHARED_CFLAGS="-fvisibility=hidden"
+		   CXXFLAGS="$CXXFLAGS -fvisibility=hidden"
+		fi
+
+		ORIG_CFLAGS=$CFLAGS
+		# Check for the normal version, since gcc ignores unknown -Wno options
+		CFLAGS="$CFLAGS -Wunused-but-set-variable -Werror"
+		AC_MSG_CHECKING(for -Wno-unused-but-set-variable option to gcc)
+		AC_TRY_COMPILE([],[
+		], [
+		   AC_MSG_RESULT(yes)
+		   CFLAGS="$ORIG_CFLAGS -Wno-unused-but-set-variable"
+		], [
+		   AC_MSG_RESULT(no)
+		   CFLAGS=$ORIG_CFLAGS
+		])
+
+		if test "x$mono_cv_clang" = "xyes"; then
+	   	   # https://bugzilla.samba.org/show_bug.cgi?id=8118
+	   	   WARN="$WARN -Qunused-arguments"
+		   WARN="$WARN -Wno-unused-function -Wno-tautological-compare -Wno-parentheses-equality -Wno-self-assign -Wno-return-stack-address -Wno-constant-logical-operand"
+		   # We rely on zero length arrays in structs
+		   WARN="$WARN -Wno-zero-length-array"
+		fi
+else
+	# The Sun Forte compiler complains about inline functions that access static variables
+	# so disable all inlining.
+	case "$host" in
+	*-*-solaris*)
+		CFLAGS="$CFLAGS -Dinline="
+		;;
+	esac
+fi
+CFLAGS="$WARN $CFLAGS -g"
+CFLAGS_FOR_LIBGC="$CFLAGS_FOR_LIBGC -g"
+CPPFLAGS="$WARN $CPPFLAGS -g"
+
+# Where's the 'mcs' source tree?
+if test -d $srcdir/mcs; then
+  mcsdir=mcs
+else
+  mcsdir=../mcs
+fi
+
+AC_ARG_WITH(mcs-path, [  --with-mcs-path=/path/to/mcs      Specify an alternate mcs source tree],
+	if test x$with_mcs_path != "x" -a -d $with_mcs_path ; then
+		mcsdir=$with_mcs_path
+	fi
+)
+
+AC_ARG_WITH(jumptables, [  --with-jumptables=yes,no      enable/disable support for jumptables (ARM-only for now) (defaults to no)],[],[with_jumptables=no])
+
+AC_ARG_WITH(core,       [  --with-core=only       controls whether to build Mono as a .NET Core runtime (defaults to no)],[],[with_core=no])
+if test x$with_core = xonly; then
+    AC_DEFINE(ENABLE_NETCORE,1,[Enables the support for .NET Core Features in the MonoVM])
+    with_runtime_preset=netcore
+fi
+AM_CONDITIONAL(ENABLE_NETCORE, test x$with_core = xonly)
+
+#
+# A sanity check to catch cases where the package was unpacked
+# with an ancient tar program (Solaris)
+#
+AC_ARG_ENABLE(solaris-tar-check,
+[  --disable-solaris-tar-check    disable solaris tar check],
+   do_solaris_tar_check=no, do_solaris_tar_check=yes)
+
+if test x"$do_solaris_tar_check" = xyes -a x"$enable_solaris_tar_check" = xyes; then
+   	AC_MSG_CHECKING(integrity of package)
+	if test -f $mcsdir/class/System.Runtime.Serialization.Formatters.Soap/System.Runtime.Serialization.Formatters.Soap/SoapTypeMapper.cs
+   	then
+		AC_MSG_RESULT(ok)
+   	else
+		errorm="Your mono distribution is incomplete;  if unpacking from a tar file, make sure you use GNU tar;  see http://www.mono-project.com/IncompletePackage for more details"
+		AC_MSG_ERROR([$errorm])
+	fi
+fi
+
+if test "x$with_mcs_path" != "x"; then
+mcs_topdir=$(cd "$mcsdir" && pwd)
+mcs_topdir_from_srcdir=$mcs_topdir
+else
+mcs_topdir=$(cd "$srcdir/$mcsdir" && pwd)
+mcs_topdir_from_srcdir='$(top_builddir)'/$mcsdir
+fi
+
+# Convert mcs_topdir* paths to Windows syntax.
+if test x$cross_compiling$host_win32 = xnoyes; then
+  mcs_topdir=$(cygpath -m $mcs_topdir)
+  case $mcs_topdir_from_srcdir in
+    /cygdrive/*)
+	mcs_topdir_from_srcdir=$(cygpath -m $mcs_topdir_from_srcdir)
+	;;
+  esac
+fi
+
+AC_SUBST([mcs_topdir])
+AC_SUBST([mcs_topdir_from_srcdir])
+
+# gettext: prepare the translation directories. 
+# we do not configure the full gettext, as we consume it dynamically from C#
+AM_PO_SUBDIRS
+
+if test "x$USE_NLS" = "xyes"; then
+   AC_CHECK_PROG(HAVE_MSGFMT, msgfmt,yes,no)
+
+   if test "x$HAVE_MSGFMT" = "xno"; then
+	  AC_MSG_ERROR([msgfmt not found. You need to install the 'gettext' package, or pass --enable-nls=no to configure.])
+   fi
+fi
+
+AC_PATH_PROG(PKG_CONFIG, pkg-config, no)
+
+pkg_config_path=
+AC_ARG_WITH(crosspkgdir, [  --with-crosspkgdir=/path/to/pkg-config/dir      Change pkg-config dir to custom dir],
+	if test x$with_crosspkgdir = "x"; then
+		if test -s $PKG_CONFIG_PATH; then
+			pkg_config_path=$PKG_CONFIG_PATH
+		fi
+	else
+		pkg_config_path=$with_crosspkgdir
+		PKG_CONFIG_PATH=$pkg_config_path
+		export PKG_CONFIG_PATH
+	fi
+)
+
+AC_ARG_ENABLE(ninja,[  --enable-ninja    Enable using ninja where available], enable_ninja=$enableval)
+AC_CHECK_PROG(HAVE_NINJA, ninja, yes, no)
+AM_CONDITIONAL(NINJA, test x$enable_ninja = xyes -a x$HAVE_NINJA != xno)
+
+AC_ARG_ENABLE(werror, [  --enable-werror Pass -Werror to the C compiler], werror_flag=$enableval, werror_flag=no)
+if test x$werror_flag = xyes; then
+	WERROR_CFLAGS="-Werror"
+fi
+AC_SUBST([WERROR_CFLAGS])
+AC_SUBST([SHARED_CFLAGS])
+
+GLIB_CFLAGS='-I$(top_srcdir)/mono/eglib -I$(top_builddir)/mono/eglib'
+  
+AC_SUBST(GLIB_CFLAGS)
+
+# Enable support for fast thread-local storage
+# Some systems have broken support, so we allow to disable it.
+AC_ARG_WITH(tls, [  --with-tls=__thread,pthread    select Thread Local Storage implementation (defaults to __thread)],[],[with_tls=__thread])
+
+# Enable support for using sigaltstack for SIGSEGV and stack overflow handling
+# This does not work on some platforms (bug #55253)
+AC_ARG_WITH(sigaltstack, [  --with-sigaltstack=yes,no      enable/disable support for sigaltstack (defaults to yes)],[],[with_sigaltstack=yes])
+
+AC_ARG_WITH(static_mono, [  --with-static_mono=yes,no      link mono statically to libmono (faster) (defaults to yes)],[],[with_static_mono=yes])
+AC_ARG_WITH(shared_mono, [  --with-shared_mono=yes,no      build a shared libmono library (defaults to yes)],[],[with_shared_mono=yes])
+# Same as --with-shared_mono=no
+AC_ARG_ENABLE(libraries, [  --disable-libraries disable the build of libmono], enable_libraries=$enableval, enable_libraries=yes)
+
+if test "x$enable_static" = "xno"; then
+   with_static_mono=no
+fi
+
+if test "x$enable_shared" = "xno"; then
+   with_shared_mono=no
+fi
+
+if test "x$enable_libraries" = "xno"; then
+   with_shared_mono=no
+fi
+
+AM_CONDITIONAL(DISABLE_LIBRARIES, test x$enable_libraries = xno)
+
+if test "x$host_win32" = "xyes"; then
+   # Boehm GC requires the runtime to be in its own dll
+   with_static_mono=no
+fi
+
+AM_CONDITIONAL(STATIC_MONO, test x$with_static_mono != xno)
+AM_CONDITIONAL(SHARED_MONO, test x$with_shared_mono != xno)
+AC_ARG_ENABLE(mcs-build, [  --disable-mcs-build disable the build of the mcs directory], try_mcs_build=$enableval, enable_mcs_build=yes)
+AC_ARG_ENABLE(support-build, [  --disable-support-build disable the build of the support directory], try_support_build=$enableval, enable_support_build=yes)
+
+AC_ARG_WITH(xen_opt,   [  --with-xen_opt=yes,no          Enable Xen-specific behaviour (defaults to yes)],[],[with_xen_opt=yes])
+if test "x$with_xen_opt" = "xyes" -a "x$mono_cv_clang" = "xno"; then
+	AC_DEFINE(MONO_XEN_OPT, 1, [Xen-specific behaviour])
+	ORIG_CFLAGS=$CFLAGS
+	CFLAGS="$CFLAGS -mno-tls-direct-seg-refs"
+	AC_MSG_CHECKING(for -mno-tls-direct-seg-refs option to gcc)
+	AC_TRY_COMPILE([], [
+	], [
+	   AC_MSG_RESULT(yes)
+	   # Pass it to libgc as well
+	   CFLAGS_FOR_LIBGC="$CFLAGS_FOR_LIBGC -mno-tls-direct-seg-refs"
+	], [
+	   AC_MSG_RESULT(no)
+	   CFLAGS=$ORIG_CFLAGS
+	])
+fi
+
+AC_ARG_ENABLE(small-config, [  --enable-small-config Enable tweaks to reduce requirements (and capabilities)], enable_small_config=$enableval, enable_small_config=no)
+
+if test x$enable_small_config = xyes; then
+	AC_DEFINE(MONO_SMALL_CONFIG,1,[Reduce runtime requirements (and capabilities)])
+	CFLAGS_FOR_LIBGC="$CFLAGS_FOR_LIBGC -DSMALL_CONFIG"
+fi
+
+AC_ARG_ENABLE(system-aot, [  --enable-system-aot  Enable the Ahead-Of-Time compilation of system assemblies during the build (on by default on some platforms)], enable_system_aot=$enableval, enable_system_aot=default)
+
+DISABLED_FEATURES=none
+csc_compiler=default
+endian=unknown
+AC_C_BIGENDIAN([endian=big],[endian=little],[endian=unknown])
+AC_MSG_CHECKING([CSharp compiler to use])
+AC_ARG_WITH(csc, [  --with-csc=mcs,roslyn,default      Configures the CSharp compiler to use],[
+   if test x$withval = xmcs; then
+       csc_compiler=mcs
+   elif test x$withval = xroslyn; then
+       csc_compiler=roslyn
+   elif test x$withval = xdefault; then
+       :
+   else
+       AC_MSG_ERROR([You must supply one of "mcs", "roslyn" or "default" to the --with-csc option])
+   fi
+],[csc_compiler=default])
+
+if test $csc_compiler = default; then
+   if test $endian = big; then
+      csc_compiler=mcs
+   elif test $endian = little; then
+      case "$host" in
+        powerpc*) csc_compiler=mcs ;;
+        *) csc_compiler=roslyn ;;
+      esac
+   else
+      csc_compiler=mcs
+   fi
+fi
+AC_MSG_RESULT($csc_compiler)
+
+AC_ARG_WITH(jemalloc,             [  --with-jemalloc=yes,no               If jemalloc is enabled (defaults to no)],                                     [], [with_jemalloc=no])
+AC_ARG_WITH(jemalloc-always,      [  --with-jemalloc_always=yes,no        If jemalloc is enabled and always used (defaults to yes)],                    [], [with_jemalloc_always=no])
+AC_ARG_WITH(jemalloc-assert,      [  --with-jemalloc_assert=yes,no        If jemalloc performs runtime checks for memory correctness (defaults to no)], [], [with_jemalloc_assert=no])
+
+
+if test x$target_win32 = xyes; then
+with_jemalloc=no
+with_jemalloc_assert=no
+with_jemalloc_always=no
+fi
+
+AM_CONDITIONAL(MONO_JEMALLOC_ASSERT, [test "x$with_jemalloc_assert" = "xyes"])
+if test "x$with_jemalloc_assert" = "xyes"; then
+JEMALLOC_CFLAGS+=" -DMONO_JEMALLOC_ASSERT"
+AC_DEFINE(MONO_JEMALLOC_ASSERT, 1, [Make jemalloc assert for mono])
+AC_SUBST(MONO_JEMALLOC_ASSERT, 1)
+fi
+
+AM_CONDITIONAL(MONO_JEMALLOC_DEFAULT, [test "x$with_jemalloc_always" = "xyes"])
+if test "x$with_jemalloc_always" = "xyes"; then
+with_jemalloc=yes
+JEMALLOC_CFLAGS+=" -DMONO_JEMALLOC_DEFAULT"
+AC_DEFINE(MONO_JEMALLOC_DEFAULT, 1, [Make jemalloc default for mono])
+AC_SUBST(MONO_JEMALLOC_DEFAULT, 1)
+fi
+
+AM_CONDITIONAL(MONO_JEMALLOC_ENABLED, [test "x$with_jemalloc" = "xyes"])
+if test "x$with_jemalloc" = "xyes"; then
+JEMALLOC_LDFLAGS="-L`pwd`/mono/utils/jemalloc/jemalloc/lib -ljemalloc_pic"
+JEMALLOC_CFLAGS+=" -DMONO_JEMALLOC_ENABLED -I `pwd`/mono/utils/jemalloc/jemalloc/include"
+JEMALLOC_AUTOCONF_FLAGS=" --build=$target --host=$host"
+
+if test "x$target_mach" = "xyes"; then
+	JEMALLOC_CPPFLAGS=" -stdlib=libc++ "
+fi
+
+AC_DEFINE(MONO_JEMALLOC_ENABLED, 1, [Enable jemalloc usage for mono])
+AC_SUBST(MONO_JEMALLOC_ENABLED, 1)
+
+AC_SUBST(JEMALLOC_CFLAGS)
+AC_SUBST(JEMALLOC_CPPFLAGS)
+AC_SUBST(JEMALLOC_LDFLAGS)
+AC_SUBST(JEMALLOC_AUTOCONF_FLAGS)
+fi
+
+# Terminology:
+# Crash privacy - Attempts to not send identifying information in the crash dump / to protect the obscurity of the program control flow
+# MERP - The MS telemetry profile. Not for general use.
+# Structured crashes - crashes at runtime that trigger a stack walk by mono that happens cooperatively
+
+# Structured crashes are not merp crashes. Structured crashes are json dumps made by mono during crashes. Merp upload is going to use the dumping code is a very specific way, and is enabled at runtime with an icall.
+
+#--with-crash_privacy=yes --with-structured_crashes=no means we don't wanna dump in non-merp-enabled builds, and we want to not send symbol strings. This is going to be the default pair of settings for VS4Mac.
+#--with-crash_privacy=yes --with-structured_crashes=yes means you want to see crashes on your console, and you want to not see unmanaged symbol names. This is an option for proprietary apps that have manual bugs filed.
+#--with-crash_privacy=no --with-structured_crashes=no means you want to see no crash dumps on failure and you don't care about privacy. This is how you'd set a "don't want it, don't care" configuration.
+#--with-crash_privacy=no --with-structured_crashes=yes means you want full crashes and you want to see them in the terminal, not on telemetry. This is going to be how we build for CI.
+
+AC_ARG_WITH(crash-privacy,       [  --with-crash_privacy=yes,no         If you want your crashes to not include names of symbols present in the binary. ], [], [with_crash_privacy=yes])
+AC_ARG_WITH(structured-crashes,  [  --with-structured_crashes=yes,no    If you want your unmanaged crashes to result in a small crash dump file. ],        [], [with_structured_crashes=yes])
+AC_ARG_ENABLE(crash-reporting,  [  --disable-crash-reporting            Enable or Disable crash reporting subsystem],        [crash_reporting=$enableval], [crash_reporting=yes])
+
+if test "x$with_crash_privacy" = "xyes"; then
+AC_DEFINE(MONO_PRIVATE_CRASHES,1,[Do not include names of unmanaged functions in the crash dump])
+fi
+
+if test "x$with_structured_crashes" = "xno"; then
+AC_DEFINE(DISABLE_STRUCTURED_CRASH,1,[Do not create structured crash files during unmanaged crashes])
+fi
+
+case "$host" in
+	*-mingw*|*-*-cygwin*)
+		crash_reporting=no
+		;;
+esac
+
+if test "x$crash_reporting" != "xyes"; then
+CFLAGS="$CFLAGS -DDISABLE_CRASH_REPORTING=1"
+CXXFLAGS="$CXXFLAGS -DDISABLE_CRASH_REPORTING=1"
+fi
+
+AC_ARG_ENABLE(monodroid, [ --enable-monodroid Enable runtime support for Monodroid (Xamarin.Android)], enable_monodroid=$enableval, enable_monodroid=no)
+AM_CONDITIONAL(ENABLE_MONODROID, test x$enable_monodroid = xyes)
+
+AC_ARG_ENABLE(monotouch, [ --enable-monotouch Enable runtime support for Monotouch (Xamarin.iOS and Xamarin.Mac)], enable_monotouch=$enableval, enable_monotouch=no)
+AM_CONDITIONAL(ENABLE_MONOTOUCH, test x$enable_monotouch = xyes)
+
+if test x$enable_monodroid = xyes; then
+	AC_DEFINE(ENABLE_MONODROID, 1, [Enable runtime support for Monodroid (Xamarin.Android)])
+fi
+
+if test x$enable_monotouch = xyes; then
+	AC_DEFINE(ENABLE_MONOTOUCH, 1, [Enable runtime support for Monotouch (Xamarin.iOS and Xamarin.Mac)])
+fi
+
+AC_ARG_ENABLE(cxx, [  --enable-cxx   compile some code as C++])
+AM_CONDITIONAL(ENABLE_CXX, test x$enable_cxx = xyes)
+
+# mono/corefx/native has a lot of invalid C++98 in its headers
+# dotnet/corefx/native looks a lot better, i.e. 44e5bdafb8d989a220c9cf1b94f31a64a6e4f052
+# use these C99 print macros in the command line, since glib may not win first inttypes include
+#CXXFLAGS_COMMON=' -std=gnu++98 -fno-exceptions -fno-rtti '
+CXXFLAGS_COMMON=' -std=gnu++0x -fno-exceptions -fno-rtti '
+CXXFLAGS_COMMON="$CXXFLAGS_COMMON -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS"
+# "c++0x" instead of C++11, for compat with Centos6/gcc4.4
+
+# -stdlib=libc++ is needed by clang for iOS 6.0 (-miphoneos-version-min=6.0)
+# to support C++11 headers but it does not seem to harm elsewhere, so over-approximate
+# and add it whenever we're running clang on Darwin.
+if test "x$mono_cv_clang" = xyes -a x$host_darwin = xyes; then
+	CXXFLAGS_COMMON="$CXXFLAGS_COMMON -stdlib=libc++"
+fi
+
+AC_SUBST(CXXFLAGS_COMMON)
+
+if test "x$enable_cxx" = "xyes"; then
+
+	CXX_ADD_CFLAGS=" -xc++ $CXXFLAGS_COMMON "
+
+	# -std=gnu99 -xc++ is not allowed and errors.
+	CXX_REMOVE_CFLAGS=-std=gnu99
+	# These give warnings and should be removed. They are C-only.
+	# i.e. C++ never allows these, they are always errors and their warningness is not controllable.
+	CXX_REMOVE_CFLAGS="$CXX_REMOVE_CFLAGS -Wmissing-prototypes -Wstrict-prototypes -Wnested-externs"
+	# Likewise with CentOS 6 gcc 4.4.
+	CXX_REMOVE_CFLAGS="$CXX_REMOVE_CFLAGS -Werror-implicit-function-declaration"
+
+	# The C-only-ness of -Wno-format-zero-length varies with gcc version.
+	# It is C-only prior to 4.7. Using it with C++ prior to 4.7
+	# generates a warning every time we run gcc which is very unsightly.
+	# The warning is for e.g. sprintf(foo, "") which can just be
+	# foo[0] = 0 but Mono's use is more elaborate, not as easy to "fix",
+	# and completely legal and valid.
+	# We have to switch to C++ and not just use -xc++ because of -std=gnu99 (error when combined with -xc++).
+	# Alternatively, just run $CXX -xc++ -c /dev/null.
+	AC_LANG_PUSH(C++)
+	ORIG_CXXFLAGS=$CXXFLAGS
+	CXXFLAGS="$CXXFLAGS -Werror -Wno-format-zero-length -xc++ "
+	AC_MSG_CHECKING(or C-only-ness of -Wno-format-zero-length)
+	AC_TRY_COMPILE([ ], [ ], [ AC_MSG_RESULT(yes) ],
+				 [ AC_MSG_RESULT(no)
+				   CXX_REMOVE_CFLAGS="$CXX_REMOVE_CFLAGS -Wno-format-zero-length" ])
+	CXXFLAGS=$ORIG_CXXFLAGS
+	AC_LANG_POP(C++)
+fi
+AC_SUBST(CXX_ADD_CFLAGS)
+AC_SUBST(CXX_REMOVE_CFLAGS)
+
+#
+# Set the build profiles and options before things which use them
+#
+
+AC_ARG_WITH(profile4_x,          [  --with-profile4_x=yes,no            If you want to install the 4.x FX (defaults to yes)],                       [], [with_profile4_x=default])
+AC_ARG_WITH(monodroid,           [  --with-monodroid=yes,no             If you want to build the MonoDroid assemblies (defaults to no)],            [], [with_monodroid=default])
+AC_ARG_WITH(monotouch,           [  --with-monotouch=yes,no             If you want to build the Xamarin.iOS assemblies (defaults to no)],          [], [with_monotouch=default])
+AC_ARG_WITH(monotouch_watch,     [  --with-monotouch_watch=yes,no       If you want to build the Xamarin.WatchOS assemblies (defaults to no)],      [], [with_monotouch_watch=default])
+AC_ARG_WITH(monotouch_tv,        [  --with-monotouch_tv=yes,no          If you want to build the Xamarin.TVOS assemblies (defaults to no)],         [], [with_monotouch_tv=default])
+AC_ARG_WITH(bitcode,             [  --with-bitcode=yes,no               If bitcode is enabled (defaults to no)],                                    [], [with_bitcode=default])
+AC_ARG_WITH(xammac,              [  --with-xammac=yes,no                If you want to build the Xamarin.Mac assemblies (defaults to no)],          [], [with_xammac=default])
+AC_ARG_WITH(testing_aot_full_interp,  [  --with-testing_aot_full_interp=yes,no    If you want to build the testing_aot_full_interp assemblies (defaults to no)],   [], [with_testing_aot_full_interp=default])
+AC_ARG_WITH(testing_aot_hybrid,  [  --with-testing_aot_hybrid=yes,no    If you want to build the testing_aot_hybrid assemblies (defaults to no)],   [], [with_testing_aot_hybrid=default])
+AC_ARG_WITH(testing_aot_full,    [  --with-testing_aot_full=yes,no      If you want to build the testing_aot_full assemblies (defaults to no)],     [], [with_testing_aot_full=default])
+AC_ARG_WITH(winaot,              [  --with-winaot=yes,no                If you want to build the Windows friendly AOT assemblies (defaults to no)], [], [with_winaot=default])
+AC_ARG_WITH(testing_winaot_interp,    [  --with-testing_winaot_interp=yes,no      If you want to build the Windows friendly AOT + Interpreter testing assemblies (defaults to no)], [], [with_testing_winaot_interp=default])
+AC_ARG_WITH(orbis,               [  --with-orbis=yes,no                 If you want to build the Orbis assemblies (defaults to no)], [], [with_orbis=default])
+AC_ARG_WITH(unreal,              [  --with-unreal=yes,no                If you want to build the Unreal assemblies (defaults to no)], [], [with_unreal=default])
+AC_ARG_WITH(wasm,                [  --with-wasm=yes,no                  If you want to build the WebAssembly (defaults to no)], [], [with_wasm=default])
+
+
+AC_ARG_WITH(runtime-preset, [  --with-runtime-preset=net_4_x,all,aot,aot_llvm,hybridaot,hybridaot_llvm,fullaot,fullaot_llvm,winaot,winaotinterp,winaot_llvm,winaotinterp_llvm,bitcode,bitcodeinterp,unreal,fullaotinterp,fullaotinterp_llvm  Which default profile to build (defaults to net_4_x)],  [], [with_runtime_preset=net_4_x])
+AC_ARG_WITH(spectre-mitigation,             [  --with-spectre-mitigation=yes,no   If you want to build the runtime with compiler flags that enable Spectre mitigation (defaults to no)], [], [with_spectre_mitigation=default])
+AC_ARG_WITH(spectre-indirect-branch-choice,   [  --with-spectre-indirect-branch-choice=keep,thunk,inline,extern   Convert indirect branches to the specified kind of thunk (defaults to inline)], [], [with_spectre_indirect_branch_choice=inline])
+AC_ARG_WITH(spectre-function-return-choice, [  --with-spectre-function-return-choice=keep,thunk,inline,extern   Convert function return instructions to the specified kind of thunk (defaults to inline)], [], [with_spectre_function_return_choice=inline])
+
+dnl
+dnl Spectre compiler mitigation flag checks
+dnl
+if test "x$with_spectre_mitigation" = "xyes"; then
+   AC_MSG_NOTICE([Compiler Spectre mitigation support checks])
+   SPECTRE_CFLAGS=
+   SPECTRE_INDIRECT_BRANCH_KIND=
+   case "x$with_spectre_indirect_branch_choice" in
+       xkeep) SPECTRE_INDIRECT_BRANCH_KIND=keep ;;
+       xthunk) SPECTRE_INDIRECT_BRANCH_KIND=thunk ;;
+       xinline) SPECTRE_INDIRECT_BRANCH_KIND=thunk-inline ;;
+       xextern) SPECTRE_INDIRECT_BRANCH_KIND=thunk-extern ;;
+       *) AC_MSG_ERROR([Invalid indirect jump thunk kind ($with_spectre_indirect_branch_choice)]) ;;
+   esac
+
+   SPECTRE_FUNCTION_RETURN_KIND=""
+   case "x$with_spectre_function_return_choice" in
+       xkeep) SPECTRE_FUNCTION_RETURN_KIND=keep ;;
+       xthunk) SPECTRE_FUNCTION_RETURN_KIND=thunk ;;
+       xinline) SPECTRE_FUNCTION_RETURN_KIND=thunk-inline ;;
+       xextern) SPECTRE_FUNCTION_RETURN_KIND=thunk-extern ;;
+       *) AC_MSG_ERROR([Invalid function return thunk kind ($with_spectre_function_return_choice)]) ;;
+   esac
+
+   AX_CHECK_COMPILE_FLAG(
+	[ -mindirect-branch=$SPECTRE_INDIRECT_BRANCH_KIND ],
+	[ SPECTRE_CFLAGS="$SPECTRE_CFLAGS -mindirect-branch=$SPECTRE_INDIRECT_BRANCH_KIND" ]
+   )
+
+   AX_CHECK_COMPILE_FLAG(
+	[ -mfunction-return=$SPECTRE_FUNCTION_RETURN_KIND ],
+	[ SPECTRE_CFLAGS="$SPECTRE_CFLAGS -mfunction-return=$SPECTRE_FUNCTION_RETURN_KIND" ]
+   )
+
+   if test "x$SPECTRE_CFLAGS" != "x" ; then
+        CFLAGS="$CFLAGS $SPECTRE_CFLAGS"
+	CXXFLAGS="$CXXFLAGS $SPECTRE_CFLAGS"
+	spectre_mitigation_status="mitigation enabled"
+   fi
+else
+	spectre_mitigation_status="no mitigation"
+fi
+
+dnl
+dnl Profile defaults
+dnl
+TEST_PROFILE=default
+enable_llvm_default=no
+
+with_profile4_x_default=no
+with_monodroid_default=no
+with_monotouch_default=no
+with_monotouch_watch_default=no
+with_monotouch_tv_default=no
+with_xammac_default=no
+with_testing_aot_full_interp_default=no
+with_testing_aot_hybrid_default=no
+with_testing_aot_full_default=no
+with_winaot_default=no
+with_testing_winaot_interp_default=no
+with_orbis_default=no
+with_unreal_default=no
+with_wasm_default=no
+
+with_bitcode_default=no
+enable_cooperative_suspend_default=no
+enable_hybrid_suspend_default=no
+
+# For the sake of clearer error messages, these numbers should all be different from each other.
+INVARIANT_AOT_OPTIONS=nimt-trampolines=2000,ntrampolines=10000,nrgctx-fetch-trampolines=256,ngsharedvt-trampolines=4400,nftnptr-arg-trampolines=4000,nrgctx-trampolines=21000
+
+AOT_BUILD_ATTRS=$INVARIANT_AOT_OPTIONS
+
+MONO_LLVM_PATH_OPTION=llvm-path="`pwd`/llvm/usr/bin"
+
+if test x$cross_compiling = xyes -o x$enable_mcs_build = xno; then
+   DISABLE_MCS_DOCS_default=yes
+elif test x$with_runtime_preset = xnetcore; then
+   # Keep in sync with winconfig.h netcore configuration.
+   DISABLE_MCS_DOCS_default=yes
+   BTLS_SUPPORTED=no
+   enable_mcs_build=no
+   enable_support_build=no
+
+   mono_feature_disable_remoting='yes'
+   mono_feature_disable_reflection_emit_save='yes'
+   mono_feature_disable_appdomains='yes'
+   mono_feature_disable_cleanup='yes'
+   mono_feature_disable_assembly_remapping='yes'
+   mono_feature_disable_security='yes'
+   mono_feature_disable_mdb='yes'
+   mono_feature_disable_com='yes'
+   mono_feature_disable_gac='yes'
+   mono_feature_disable_perfcounters='yes'
+   mono_feature_disable_attach='yes'
+   mono_feature_disable_dllmap='yes'
+   disable_mono_native=yes
+   support_boehm=no
+elif test x$with_runtime_preset = xnet_4_x; then
+   with_profile4_x_default=yes
+   TEST_PROFILE=net_4_x
+elif test x$with_runtime_preset = xall; then
+   with_profile4_x_default=yes
+   with_monodroid_default=yes
+   with_monotouch_default=yes
+   with_monotouch_watch_default=yes
+   with_monotouch_tv_default=yes
+   with_xammac_default=yes
+   with_winaot_default=yes
+   with_testing_winaot_interp_default=yes
+   with_orbis_default=yes
+   with_unreal_default=yes
+   with_wasm_default=yes
+   with_testing_aot_full_interp_default=yes
+   with_testing_aot_hybrid_default=yes
+   with_testing_aot_full_default=yes
+   TEST_PROFILE=net_4_x
+elif test x$with_runtime_preset = xbitcode; then
+   DISABLE_MCS_DOCS_default=yes
+   with_testing_aot_full_default=yes
+   with_bitcode_default=yes
+   enable_cooperative_suspend_default=yes
+   # FIXME: use TEST_PROFILE=testing_aot_full
+   TEST_PROFILE=testing_aot_bitcode
+   PLATFORM_TEST_HARNESS_EXCLUDES=BitcodeNotSupported
+   enable_llvm_default=yes
+
+   mono_feature_disable_com='yes'
+   mono_feature_disable_remoting='yes'
+   mono_feature_disable_reflection_emit_save='yes'
+   mono_feature_disable_reflection_emit='yes'
+   mono_feature_disable_appdomains='yes'
+
+   # We need at least clang++-6.0 to read the LLVM IR produced by the runtime
+   AOT_BUILD_FLAGS="--runtime=mobile --aot=llvmonly,clangxx=clang++-6.0,$INVARIANT_AOT_OPTIONS"
+   AOT_RUN_FLAGS="--runtime=mobile --llvmonly"
+   AOT_MODE="llvmonly"
+elif test x$with_runtime_preset = xbitcodeinterp; then
+   with_testing_aot_full_interp_default=yes
+   with_bitcode_default=yes
+   enable_cooperative_suspend_default=yes
+   # FIXME: use TEST_PROFILE=testing_aot_full_interp
+   TEST_PROFILE=testing_aot_bitcode_interp
+   PLATFORM_TEST_HARNESS_EXCLUDES=BitcodeNotSupported
+   enable_llvm_default=yes
+
+   # mscorlib.dll aot compilation crashes
+   mono_feature_disable_com='yes'
+
+   # We need at least clang++-6.0 to read the LLVM IR produced by the runtime
+   AOT_BUILD_FLAGS="--aot=llvmonly,interp,clangxx=clang++-6.0,$INVARIANT_AOT_OPTIONS"
+   AOT_RUN_FLAGS="--llvmonly-interp"
+elif test x$with_runtime_preset = xfullaot; then
+   DISABLE_MCS_DOCS_default=yes
+   with_testing_aot_full_default=yes
+   TEST_PROFILE=testing_aot_full
+
+   mono_feature_disable_com='yes'
+   mono_feature_disable_remoting='yes'
+   mono_feature_disable_reflection_emit_save='yes'
+   mono_feature_disable_reflection_emit='yes'
+   mono_feature_disable_appdomains='yes'
+
+   AOT_BUILD_FLAGS="--runtime=mobile -O=gsharedvt --aot=full,$INVARIANT_AOT_OPTIONS"
+   AOT_RUN_FLAGS="--runtime=mobile --full-aot"
+   AOT_MODE="full"
+elif test x$with_runtime_preset = xfullaot_llvm; then
+   DISABLE_MCS_DOCS_default=yes
+   with_testing_aot_full_default=yes
+   TEST_PROFILE=testing_aot_full
+
+   mono_feature_disable_com='yes'
+   mono_feature_disable_remoting='yes'
+   mono_feature_disable_reflection_emit_save='yes'
+   mono_feature_disable_reflection_emit='yes'
+   mono_feature_disable_appdomains='yes'
+
+   AOT_BUILD_FLAGS="--runtime=mobile -O=gsharedvt --llvm --aot=full,$INVARIANT_AOT_OPTIONS"
+   AOT_RUN_FLAGS="--runtime=mobile --full-aot"
+   AOT_MODE="full"
+elif test x$with_runtime_preset = xhybridaot; then
+   DISABLE_MCS_DOCS_default=yes
+   with_testing_aot_hybrid_default=yes
+   TEST_PROFILE=testing_aot_hybrid 
+
+   AOT_BUILD_FLAGS="--runtime=mobile --aot=hybrid,$INVARIANT_AOT_OPTIONS"
+   AOT_RUN_FLAGS="--runtime=mobile --hybrid-aot"
+elif test x$with_runtime_preset = xhybridaot_llvm; then
+   DISABLE_MCS_DOCS_default=yes
+   with_testing_aot_hybrid_default=yes
+   TEST_PROFILE=testing_aot_hybrid
+
+   AOT_BUILD_FLAGS="--runtime=mobile --llvm --aot=hybrid,$INVARIANT_AOT_OPTIONS"
+   AOT_RUN_FLAGS="--runtime=mobile --hybrid-aot"
+elif test x$with_runtime_preset = xfullaotinterp; then
+   with_testing_aot_full_interp_default=yes
+   TEST_PROFILE=testing_aot_full_interp
+
+   # mscorlib.dll aot compilation crashes
+   mono_feature_disable_com='yes'
+
+   AOT_BUILD_FLAGS="--aot=full,interp,$INVARIANT_AOT_OPTIONS"
+   AOT_RUN_FLAGS="--full-aot-interp"
+elif test x$with_runtime_preset = xfullaotinterp_llvm; then
+   with_testing_aot_full_interp_default=yes
+   TEST_PROFILE=testing_aot_full_interp
+
+   # mscorlib.dll aot compilation crashes
+   mono_feature_disable_com='yes'
+
+   AOT_BUILD_FLAGS="-O=gsharedvt --llvm --aot=full,interp,$INVARIANT_AOT_OPTIONS"
+   AOT_RUN_FLAGS="--full-aot-interp"
+elif test x$with_runtime_preset = xaot; then
+   with_profile4_x_default=yes
+
+   AOT_BUILD_FLAGS="--aot=$INVARIANT_AOT_OPTIONS"
+   AOT_RUN_FLAGS=""
+
+   DISABLE_MCS_DOCS_default=yes
+elif test x$with_runtime_preset = xaot_llvm; then
+   with_profile4_x_default=yes
+
+   AOT_BUILD_FLAGS="--llvm --aot=$INVARIANT_AOT_OPTIONS"
+   AOT_RUN_FLAGS=""
+
+   DISABLE_MCS_DOCS_default=yes
+elif test x$with_runtime_preset = xwinaot; then
+   DISABLE_MCS_DOCS_default=yes
+   with_winaot_default=yes
+   TEST_PROFILE=winaot
+
+   mono_feature_disable_com='yes'
+   mono_feature_disable_remoting='yes'
+   mono_feature_disable_reflection_emit_save='yes'
+   mono_feature_disable_reflection_emit='yes'
+   mono_feature_disable_appdomains='yes'
+
+   AOT_BUILD_FLAGS="--runtime=mobile -O=gsharedvt --aot=full,$INVARIANT_AOT_OPTIONS"
+   AOT_RUN_FLAGS="--runtime=mobile --full-aot"
+   AOT_MODE="full"
+elif test x$with_runtime_preset = xwinaotinterp; then
+   DISABLE_MCS_DOCS_default=yes
+   with_testing_winaot_interp_default=yes
+   TEST_PROFILE=testing_winaot_interp
+
+   mono_feature_disable_com='yes'
+   mono_feature_disable_remoting='yes'
+   mono_feature_disable_appdomains='yes'
+
+   AOT_BUILD_FLAGS="--aot=full,interp,$INVARIANT_AOT_OPTIONS"
+   AOT_RUN_FLAGS="--full-aot-interp"
+elif test x$with_runtime_preset = xwinaotinterp_llvm; then
+   DISABLE_MCS_DOCS_default=yes
+   with_testing_winaot_interp_default=yes
+   TEST_PROFILE=testing_winaot_interp
+
+   mono_feature_disable_com='yes'
+   mono_feature_disable_remoting='yes'
+   mono_feature_disable_appdomains='yes'
+
+   INVARIANT_AOT_OPTIONS="llvmllc=-mattr=sse4.1,$INVARIANT_AOT_OPTIONS"
+   AOT_BUILD_FLAGS="-O=gsharedvt --llvm --aot=full,interp,$INVARIANT_AOT_OPTIONS"
+   AOT_RUN_FLAGS="--full-aot-interp"
+elif test x$with_runtime_preset = xwinaot_llvm; then
+   DISABLE_MCS_DOCS_default=yes
+   with_winaot_default=yes
+   TEST_PROFILE=winaot
+
+   mono_feature_disable_com='yes'
+   mono_feature_disable_remoting='yes'
+   mono_feature_disable_reflection_emit_save='yes'
+   mono_feature_disable_reflection_emit='yes'
+   mono_feature_disable_appdomains='yes'
+
+   INVARIANT_AOT_OPTIONS="llvmllc=-mattr=sse4.1,$INVARIANT_AOT_OPTIONS"
+   AOT_BUILD_FLAGS="--runtime=mobile -O=gsharedvt --llvm --aot=full,$INVARIANT_AOT_OPTIONS"
+   AOT_RUN_FLAGS="--runtime=mobile --full-aot"
+   AOT_MODE="full"
+elif test x$with_runtime_preset = xorbis; then
+   DISABLE_MCS_DOCS_default=yes
+   with_orbis_default=yes
+   TEST_PROFILE=orbis
+
+   mono_feature_disable_com='yes'
+   mono_feature_disable_remoting='yes'
+   mono_feature_disable_reflection_emit_save='yes'
+   mono_feature_disable_reflection_emit='yes'
+   mono_feature_disable_appdomains='yes'
+
+   AOT_BUILD_FLAGS="--runtime=mobile --aot=full,$INVARIANT_AOT_OPTIONS"
+   AOT_RUN_FLAGS="--runtime=mobile --full-aot"
+   AOT_MODE="full"
+elif test x$with_runtime_preset = xunreal; then
+   DISABLE_MCS_DOCS_default=yes
+   with_unreal_default=yes
+   TEST_PROFILE=unreal
+
+   mono_feature_disable_com='yes'
+   mono_feature_disable_remoting='yes'
+   mono_feature_disable_appdomains='no'
+
+   AOT_BUILD_FLAGS="--runtime=mobile --aot=hybrid,$INVARIANT_AOT_OPTIONS"
+   AOT_RUN_FLAGS="--runtime=mobile --hybrid-aot"
+elif test x$with_runtime_preset = xwasm; then
+   DISABLE_MCS_DOCS_default=yes
+   with_wasm_default=yes
+   TEST_PROFILE=wasm
+
+   mono_feature_disable_com='yes'
+   mono_feature_disable_remoting='yes'
+   mono_feature_disable_reflection_emit_save='yes'
+   mono_feature_disable_reflection_emit='yes'
+   mono_feature_disable_appdomains='yes'
+
+   AOT_BUILD_FLAGS="--runtime=mobile --aot=full,$INVARIANT_AOT_OPTIONS"
+   AOT_RUN_FLAGS="--runtime=mobile --full-aot"
+else
+   TEST_PROFILE=net_4_x
+   with_profile4_x_default=yes
+fi
+
+if test "x$AOT_BUILD_FLAGS" != "x"; then :
+   AC_SUBST(AOT_BUILD_FLAGS)
+   AC_SUBST(AOT_RUN_FLAGS)
+   # For llvmonlycheck + fullaotcheck
+   AC_SUBST(INVARIANT_AOT_OPTIONS)
+fi
+
+AC_SUBST(TEST_PROFILE)
+
+if test "x$with_profile4_x" = "xdefault"; then
+   with_profile4_x=$with_profile4_x_default
+fi
+if test "x$with_monodroid" = "xdefault"; then
+   with_monodroid=$with_monodroid_default
+fi
+if test "x$with_monotouch" = "xdefault"; then
+   with_monotouch=$with_monotouch_default
+fi
+if test "x$with_monotouch_watch" = "xdefault"; then
+   with_monotouch_watch=$with_monotouch_watch_default
+fi
+if test "x$with_monotouch_tv" = "xdefault"; then
+   with_monotouch_tv=$with_monotouch_tv_default
+fi
+if test "x$with_bitcode" = "xdefault"; then
+   with_bitcode=$with_bitcode_default
+fi
+if test "x$with_xammac" = "xdefault"; then
+   with_xammac=$with_xammac_default
+fi
+if test "x$with_testing_aot_full_interp" = "xdefault"; then
+   with_testing_aot_full_interp=$with_testing_aot_full_interp_default
+fi
+if test "x$with_testing_aot_hybrid" = "xdefault"; then
+   with_testing_aot_hybrid=$with_testing_aot_hybrid_default
+fi
+if test "x$with_testing_aot_full" = "xdefault"; then
+   with_testing_aot_full=$with_testing_aot_full_default
+fi
+if test "x$with_winaot" = "xdefault"; then
+   with_winaot=$with_winaot_default
+fi
+if test "x$with_testing_winaot_interp" = "xdefault"; then
+   with_testing_winaot_interp=$with_testing_winaot_interp_default
+fi
+if test "x$with_orbis" = "xdefault"; then
+   with_orbis=$with_orbis_default
+fi
+if test "x$with_unreal" = "xdefault"; then
+   with_unreal=$with_unreal_default
+fi
+if test "x$with_wasm" = "xdefault"; then
+   with_wasm=$with_wasm_default
+fi
+
+
+AM_CONDITIONAL(INSTALL_4_x, [test "x$with_profile4_x" = "xyes"])
+AM_CONDITIONAL(INSTALL_MONODROID, [test "x$with_monodroid" != "xno"])
+AM_CONDITIONAL(INSTALL_MONOTOUCH, [test "x$with_monotouch" != "xno"])
+AM_CONDITIONAL(INSTALL_MONOTOUCH_WATCH, [test "x$with_monotouch_watch" != "xno"])
+AM_CONDITIONAL(INSTALL_MONOTOUCH_TV, [test "x$with_monotouch_tv" != "xno"])
+AM_CONDITIONAL(BITCODE, test "x$with_bitcode" = "xyes")
+AM_CONDITIONAL(INSTALL_XAMMAC, [test "x$with_xammac" != "xno"])
+AM_CONDITIONAL(INSTALL_TESTING_AOT_FULL_INTERP, [test "x$with_testing_aot_full_interp" != "xno"])
+AM_CONDITIONAL(INSTALL_TESTING_AOT_HYBRID, [test "x$with_testing_aot_hybrid" != "xno"])
+AM_CONDITIONAL(INSTALL_TESTING_AOT_FULL, [test "x$with_testing_aot_full" != "xno"])
+AM_CONDITIONAL(INSTALL_WINAOT, [test "x$with_winaot" != "xno"])
+AM_CONDITIONAL(INSTALL_TESTING_WINAOT_INTERP, [test "x$with_testing_winaot_interp" != "xno"])
+AM_CONDITIONAL(INSTALL_ORBIS, [test "x$with_orbis" != "xno"])
+AM_CONDITIONAL(INSTALL_UNREAL, [test "x$with_unreal" != "xno"])
+AM_CONDITIONAL(INSTALL_WASM, [test "x$with_wasm" != "xno"])
+AM_CONDITIONAL(INSTALL_NETCORE, [test "x$with_core" != "xno"])
+
+AM_CONDITIONAL(HYBRID_AOT_TESTS, [test "x$TEST_PROFILE" = "xtesting_aot_hybrid"] || [test "x$TEST_PROFILE" = "xunreal"])
+AM_CONDITIONAL(FULL_AOT_TESTS, [test "x$TEST_PROFILE" = "xtesting_aot_full"] || [test "x$TEST_PROFILE" = "xtesting_aot_bitcode"] || [test "x$TEST_PROFILE" = "xwinaot"] || [test "x$TEST_PROFILE" = "xorbis"] || [test "x$TEST_PROFILE" = "xwasm"])
+AM_CONDITIONAL(FULL_AOT_INTERP_TESTS, [test "x$TEST_PROFILE" = "xtesting_aot_full_interp"] || [test "x$TEST_PROFILE" = "xtesting_aot_bitcode_interp"] || [test "x$TEST_PROFILE" = "xtesting_winaot_interp"])
+AM_CONDITIONAL(DEFAULT_TESTS, [test "x$TEST_PROFILE" = "xnet_4_x"])
+
+default_profile=net_4_x
+if test -z "$INSTALL_MONODROID_TRUE"; then :
+   default_profile=monodroid
+fi
+if test -z "$INSTALL_MONOTOUCH_TRUE"; then :
+   default_profile=monotouch
+fi
+if test -z "$INSTALL_XAMMAC_TRUE"; then :
+   default_profile=xammac
+fi
+if test -z "$INSTALL_TESTING_AOT_FULL_INTERP_TRUE"; then :
+   default_profile=testing_aot_full_interp
+fi
+if test -z "$INSTALL_TESTING_AOT_HYBRID_TRUE"; then :
+   default_profile=testing_aot_hybrid
+fi
+if test -z "$INSTALL_TESTING_AOT_FULL_TRUE"; then :
+   default_profile=testing_aot_full
+fi
+if test -z "$INSTALL_WINAOT_TRUE"; then :
+   default_profile=winaot
+fi
+if test -z "$INSTALL_TESTING_WINAOT_INTERP_TRUE"; then :
+   default_profile=testing_winaot_interp
+fi
+if test -z "$INSTALL_ORBIS_TRUE"; then :
+   default_profile=orbis
+fi
+if test -z "$INSTALL_UNREAL_TRUE"; then :
+   default_profile=unreal
+fi
+if test -z "$INSTALL_WASM_TRUE"; then :
+   default_profile=wasm
+fi
+if test -z "$INSTALL_4_x_TRUE"; then :
+   default_profile=net_4_x
+fi
+DEFAULT_PROFILE=$default_profile
+AC_SUBST(DEFAULT_PROFILE)

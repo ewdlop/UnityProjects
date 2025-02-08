@@ -1,0 +1,127 @@
+store i8 192, i8* %X3
+  
+  %X = getelementptr i8, i8* %p, i32 4
+  %Y = load i8, i8* %X
+  br label %loop
+
+loop:
+  %i = phi i32 [4, %entry], [192, %loop]
+  %X2 = getelementptr i8, i8* %p, i32 %i
+  %Y2 = load i8, i8* %X2
+  
+; CHECK: loop:
+; CHECK-NEXT: %Y2 = phi i8 [ %Y, %entry ], [ 0, %loop ]
+; CHECK-NOT: load i8
+  
+  %cond = call i1 @cond2()
+
+  %Z = bitcast i8 *%X3 to i32*
+  store i32 0, i32* %Z
+  br i1 %cond, label %loop, label %out
+  
+out:
+  %R = add i8 %Y, %Y2
+  ret i8 %R
+}
+
+define i8 @phi_trans5(i8* %p) {
+; CHECK-LABEL: @phi_trans5(
+entry:
+  
+  %X4 = getelementptr i8, i8* %p, i32 2
+  store i8 19, i8* %X4
+  
+  %X = getelementptr i8, i8* %p, i32 4
+  %Y = load i8, i8* %X
+  br label %loop
+
+loop:
+  %i = phi i32 [4, %entry], [3, %cont]
+  %X2 = getelementptr i8, i8* %p, i32 %i
+  %Y2 = load i8, i8* %X2  ; Ensure this load is not being incorrectly replaced.
+  %cond = call i1 @cond2()
+  br i1 %cond, label %cont, label %out
+
+cont:
+  %Z = getelementptr i8, i8* %X2, i32 -1
+  %Z2 = bitcast i8 *%Z to i32*
+  store i32 50462976, i32* %Z2  ;; (1 << 8) | (2 << 16) | (3 << 24)
+
+
+; CHECK: store i32
+; CHECK-NEXT: getelementptr i8, i8* %p, i32 3
+; CHECK-NEXT: load i8, i8*
+  br label %loop
+  
+out:
+  %R = add i8 %Y, %Y2
+  ret i8 %R
+}
+
+
+; PR6642
+define i32 @memset_to_load() nounwind readnone {
+entry:
+  %x = alloca [256 x i32], align 4                ; <[256 x i32]*> [#uses=2]
+  %tmp = bitcast [256 x i32]* %x to i8*           ; <i8*> [#uses=1]
+  call void @llvm.memset.p0i8.i64(i8* %tmp, i8 0, i64 1024, i32 4, i1 false)
+  %arraydecay = getelementptr inbounds [256 x i32], [256 x i32]* %x, i32 0, i32 0 ; <i32*>
+  %tmp1 = load i32, i32* %arraydecay                   ; <i32> [#uses=1]
+  ret i32 %tmp1
+; CHECK-LABEL: @memset_to_load(
+; CHECK: ret i32 0
+}
+
+
+;;===----------------------------------------------------------------------===;;
+;; Load -> Load forwarding in partial alias case.
+;;===----------------------------------------------------------------------===;;
+
+define i32 @load_load_partial_alias(i8* %P) nounwind ssp {
+entry:
+  %0 = bitcast i8* %P to i32*
+  %tmp2 = load i32, i32* %0
+  %add.ptr = getelementptr inbounds i8, i8* %P, i64 1
+  %tmp5 = load i8, i8* %add.ptr
+  %conv = zext i8 %tmp5 to i32
+  %add = add nsw i32 %tmp2, %conv
+  ret i32 %add
+
+; TEMPORARILYDISABLED-LABEL: @load_load_partial_alias(
+; TEMPORARILYDISABLED: load i32, i32*
+; TEMPORARILYDISABLED-NOT: load
+; TEMPORARILYDISABLED: lshr i32 {{.*}}, 8
+; TEMPORARILYDISABLED-NOT: load
+; TEMPORARILYDISABLED: trunc i32 {{.*}} to i8
+; TEMPORARILYDISABLED-NOT: load
+; TEMPORARILYDISABLED: ret i32
+}
+
+
+; Cross block partial alias case.
+define i32 @load_load_partial_alias_cross_block(i8* %P) nounwind ssp {
+entry:
+  %xx = bitcast i8* %P to i32*
+  %x1 = load i32, i32* %xx, align 4
+  %cmp = icmp eq i32 %x1, 127
+  br i1 %cmp, label %land.lhs.true, label %if.end
+
+land.lhs.true:                                    ; preds = %entry
+  %arrayidx4 = getelementptr inbounds i8, i8* %P, i64 1
+  %tmp5 = load i8, i8* %arrayidx4, align 1
+  %conv6 = zext i8 %tmp5 to i32
+  ret i32 %conv6
+
+if.end:
+  ret i32 52
+; TEMPORARILY_DISABLED-LABEL: @load_load_partial_alias_cross_block(
+; TEMPORARILY_DISABLED: land.lhs.true:
+; TEMPORARILY_DISABLED-NOT: load i8
+; TEMPORARILY_DISABLED: ret i32 %conv6
+}
+
+
+;;===----------------------------------------------------------------------===;;
+;; Load Widening
+;; We explicitly choose NOT to widen. And are testing to make sure we don't.
+;;===-----------------------------------------------

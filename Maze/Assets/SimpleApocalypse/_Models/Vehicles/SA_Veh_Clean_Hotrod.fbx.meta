@@ -1,0 +1,67 @@
+entsNamespace = compiler.ResolveXmlNamespace(input.Value);
+                    }
+                }
+                while (input.MoveToNextAttribute());
+                input.ToParent();
+            }
+            if (implementsNamespace == null) {
+                throw XsltException.Create(Res.Xslt_MissingAttribute, input.Atoms.ImplementsPrefix);
+            }
+            if (!input.Recurse() || input.NodeType != XPathNodeType.Text) {
+                throw XsltException.Create(Res.Xslt_ScriptEmpty);
+            }
+            compiler.AddScript(input.Value, lang, implementsNamespace, input.BaseURI, input.LineNumber);
+            input.ToParent();
+        }
+#endif
+
+        internal override void Execute(Processor processor, ActionFrame frame) {
+            Debug.Assert(processor != null && frame != null);
+
+            switch (frame.State) {
+            case Initialized:
+                if (this.containedActions != null && this.containedActions.Count > 0) {
+                    processor.PushActionFrame(frame);
+                    frame.State = ProcessingChildren;
+                }
+                else {
+                    frame.Finished();
+                }
+                break;                              // Allow children to run
+
+            case ProcessingChildren:
+                frame.Finished();
+                break;
+
+            default:
+                Debug.Fail("Invalid Container action execution state");
+                break;
+            }
+        }
+
+        internal Action GetAction(int actionIndex) {
+            Debug.Assert(actionIndex == 0 || this.containedActions != null);
+
+            if (this.containedActions != null && actionIndex < this.containedActions.Count) {
+                return (Action) this.containedActions[actionIndex];
+            }
+            else {
+                return null;
+            }
+        }
+
+        internal void CheckDuplicateParams(XmlQualifiedName name) {
+            if (this.containedActions != null) {
+                foreach(CompiledAction action in this.containedActions) {
+                    WithParamAction param = action as WithParamAction;
+                    if (param != null && param.Name == name) {
+                        throw XsltException.Create(Res.Xslt_DuplicateWithParam, name.ToString());
+                    }
+                }
+            }
+        }
+
+        internal override void ReplaceNamespaceAlias(Compiler compiler){
+            if (this.containedActions == null) {
+                return;
+     

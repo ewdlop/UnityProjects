@@ -1,0 +1,104 @@
+///////////////////////////////////////////////////////////////////////////////
+//                                                                           //
+// dxcutil.cpp                                                               //
+// Copyright (C) Microsoft Corporation. All rights reserved.                 //
+// This file is distributed under the University of Illinois Open Source     //
+// License. See LICENSE.TXT for details.                                     //
+//                                                                           //
+// Provides helper code for dxcompiler.                                      //
+//                                                                           //
+///////////////////////////////////////////////////////////////////////////////
+
+#include "dxc/Support/WinIncludes.h"
+#include "dxc/DxilContainer/DxilContainerAssembler.h"
+#include "dxc/Support/Global.h"
+#include "dxc/Support/FileIOHelper.h"
+#include "dxc/dxcapi.h"
+#include "dxcutil.h"
+#include "dxillib.h"
+#include "clang/Basic/Diagnostic.h"
+#include "llvm/Bitcode/ReaderWriter.h"
+#include "llvm/IR/DiagnosticInfo.h"
+#include "llvm/IR/DiagnosticPrinter.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/Cloning.h"
+#include "dxc/Support/dxcapi.impl.h"
+#include "dxc/Support/HLSLOptions.h"
+#include "dxc/DXIL/DxilModule.h"
+
+#include "llvm/Support/Path.h"
+
+using namespace llvm;
+using namespace hlsl;
+
+// This declaration is used for the locally-linked validator.
+HRESULT CreateDxcValidator(_In_ REFIID riid, _Out_ LPVOID *ppv);
+// This internal call allows the validator to avoid having to re-deserialize
+// the module. It trusts that the caller didn't make any changes and is
+// kept internal because the layout of the module class may change based
+// on changes across modules, or picking a different compiler version or CRT.
+HRESULT RunInternalValidator(_In_ IDxcValidator *pValidator,
+                             _In_ llvm::Module *pModule,
+                             _In_ llvm::Module *pDebugModule,
+                             _In_ IDxcBlob *pShader, UINT32 Flags,
+                             _In_ IDxcOperationResult **ppResult);
+
+namespace {
+// AssembleToContainer helper functions.
+
+bool CreateValidator(CComPtr<IDxcValidator> &pValidator) {
+  if (DxilLibIsEnabled()) {
+    DxilLibCreateInstance(CLSID_DxcValidator, &pValidator);
+  }
+  bool bInternalValidator = false;
+  if (pValidator == nullptr) {
+    IFT(CreateDxcValidator(IID_PPV_ARGS(&pValidator)));
+    bInternalValidator = true;
+  }
+  return bInternalValidator;
+}
+
+} // namespace
+
+namespace dxcutil {
+
+AssembleInputs::AssembleInputs(std::unique_ptr<llvm::Module> &&pM,
+                CComPtr<IDxcBlob> &pOutputContainerBlob,
+                IMalloc *pMalloc,
+                hlsl::SerializeDxilFlags SerializeFlags,
+                CComPtr<hlsl::AbstractMemoryStream> &pModuleBitcode,
+                bool bDebugInfo,
+                llvm::StringRef DebugName,
+                clang::DiagnosticsEngine *pDiag,
+                hlsl::DxilShaderHash *pShaderHashOut,
+                AbstractMemoryStream *pReflectionOut,
+                AbstractMemoryStream *pRootSigOut)
+  : pM(std::move(pM)),
+    pOutputContainerBlob(pOutputContainerBlob),
+    pMalloc(pMalloc),
+    SerializeFlags(SerializeFlags),
+    pModuleBitcode(pModuleBitcode),
+    bDebugInfo(bDebugInfo),
+    DebugName(DebugName),
+    pDiag(pDiag),
+    pShaderHashOut(pShaderHashOut),
+    pReflectionOut(pReflectionOut),
+    pRootSigOut(pRootSigOut)
+{}
+
+void GetValidatorVersion(unsigned *pMajor, unsigned *pMinor) {
+  if (pMajor == nullptr || pMinor == nullptr)
+    return;
+
+  CComPtr<IDxcValidator> pValidator;
+  CreateValidator(pValidator);
+
+  CComPtr<IDxcVersionInfo> pVersionInfo;
+  if (SUCCEEDED(pValidator.QueryInterface(&pVersionInfo))) {
+    IFT(pVersionInfo->GetVersion(pMajor, pMinor));
+  } else {
+    // Default to 1.0
+    *pMajor = 1;

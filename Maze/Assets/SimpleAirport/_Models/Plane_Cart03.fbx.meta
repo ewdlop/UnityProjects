@@ -1,0 +1,67 @@
+unable to handle it.
+      llvm_unreachable("unsupported relocation");
+      break;
+    case COFF::IMAGE_REL_ARM_MOV32T:
+      break;
+    case COFF::IMAGE_REL_ARM_BRANCH20T:
+    case COFF::IMAGE_REL_ARM_BRANCH24T:
+    case COFF::IMAGE_REL_ARM_BLX23T:
+      // IMAGE_REL_BRANCH20T, IMAGE_REL_ARM_BRANCH24T, IMAGE_REL_ARM_BLX23T all
+      // perform a 4 byte adjustment to the relocation.  Relative branches are
+      // offset by 4 on ARM, however, because there is no RELA relocations, all
+      // branches are offset by 4.
+      FixedValue = FixedValue + 4;
+      break;
+    }
+  }
+
+  // The fixed value never makes sense for section indices, ignore it.
+  if (Fixup.getKind() == FK_SecRel_2)
+    FixedValue = 0;
+
+  if (TargetObjectWriter->recordRelocation(Fixup))
+    Sec->Relocations.push_back(Reloc);
+}
+
+static std::time_t getTime() {
+  std::time_t Now = time(nullptr);
+  if (Now < 0 || !isUInt<32>(Now))
+    return UINT32_MAX;
+  return Now;
+}
+
+// Create .file symbols.
+void WinCOFFObjectWriter::createFileSymbols(MCAssembler &Asm) {
+  for (const std::string &Name : Asm.getFileNames()) {
+    // round up to calculate the number of auxiliary symbols required
+    unsigned SymbolSize = UseBigObj ? COFF::Symbol32Size : COFF::Symbol16Size;
+    unsigned Count = (Name.size() + SymbolSize - 1) / SymbolSize;
+
+    COFFSymbol *File = createSymbol(".file");
+    File->Data.SectionNumber = COFF::IMAGE_SYM_DEBUG;
+    File->Data.StorageClass = COFF::IMAGE_SYM_CLASS_FILE;
+    File->Aux.resize(Count);
+
+    unsigned Offset = 0;
+    unsigned Length = Name.size();
+    for (auto &Aux : File->Aux) {
+      Aux.AuxType = ATFile;
+
+      if (Length > SymbolSize) {
+        memcpy(&Aux.Aux, Name.c_str() + Offset, SymbolSize);
+        Length = Length - SymbolSize;
+      } else {
+        memcpy(&Aux.Aux, Name.c_str() + Offset, Length);
+        memset((char *)&Aux.Aux + Length, 0, SymbolSize - Length);
+        break;
+      }
+
+      Offset += SymbolSize;
+    }
+  }
+}
+
+static bool isAssociative(const COFFSection &Section) {
+  return Section.Symbol->Aux[0].Aux.SectionDefinition.Selection ==
+         COFF::IMAGE_COMDAT_SELECT_ASSOCIATIVE;
+}

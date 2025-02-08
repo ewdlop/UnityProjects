@@ -1,0 +1,221 @@
+
+
+/* Does "node" have a parent?
+ *
+ * That is, does it point to any node of the schedule other than the root?
+ */
+isl_bool isl_schedule_node_has_parent(__isl_keep isl_schedule_node *node)
+{
+	if (!node)
+		return isl_bool_error;
+	if (!node->ancestors)
+		return isl_bool_error;
+
+	return isl_schedule_tree_list_n_schedule_tree(node->ancestors) != 0;
+}
+
+/* Return the position of "node" among the children of its parent.
+ */
+int isl_schedule_node_get_child_position(__isl_keep isl_schedule_node *node)
+{
+	int n;
+	int has_parent;
+
+	if (!node)
+		return -1;
+	has_parent = isl_schedule_node_has_parent(node);
+	if (has_parent < 0)
+		return -1;
+	if (!has_parent)
+		isl_die(isl_schedule_node_get_ctx(node), isl_error_invalid,
+			"node has no parent", return -1);
+
+	n = isl_schedule_tree_list_n_schedule_tree(node->ancestors);
+	return node->child_pos[n - 1];
+}
+
+/* Does the parent (if any) of "node" have any children with a smaller child
+ * position than this one?
+ */
+isl_bool isl_schedule_node_has_previous_sibling(
+	__isl_keep isl_schedule_node *node)
+{
+	int n;
+	isl_bool has_parent;
+
+	if (!node)
+		return isl_bool_error;
+	has_parent = isl_schedule_node_has_parent(node);
+	if (has_parent < 0 || !has_parent)
+		return has_parent;
+
+	n = isl_schedule_tree_list_n_schedule_tree(node->ancestors);
+
+	return node->child_pos[n - 1] > 0;
+}
+
+/* Does the parent (if any) of "node" have any children with a greater child
+ * position than this one?
+ */
+isl_bool isl_schedule_node_has_next_sibling(__isl_keep isl_schedule_node *node)
+{
+	int n, n_child;
+	isl_bool has_parent;
+	isl_schedule_tree *tree;
+
+	if (!node)
+		return isl_bool_error;
+	has_parent = isl_schedule_node_has_parent(node);
+	if (has_parent < 0 || !has_parent)
+		return has_parent;
+
+	n = isl_schedule_tree_list_n_schedule_tree(node->ancestors);
+	tree = isl_schedule_tree_list_get_schedule_tree(node->ancestors, n - 1);
+	if (!tree)
+		return isl_bool_error;
+	n_child = isl_schedule_tree_list_n_schedule_tree(tree->children);
+	isl_schedule_tree_free(tree);
+
+	return node->child_pos[n - 1] + 1 < n_child;
+}
+
+/* Does "node" have any children?
+ *
+ * Any node other than the leaf nodes is considered to have at least
+ * one child, even if the corresponding isl_schedule_tree does not
+ * have any children.
+ */
+isl_bool isl_schedule_node_has_children(__isl_keep isl_schedule_node *node)
+{
+	if (!node)
+		return isl_bool_error;
+	return !isl_schedule_tree_is_leaf(node->tree);
+}
+
+/* Return the number of children of "node"?
+ *
+ * Any node other than the leaf nodes is considered to have at least
+ * one child, even if the corresponding isl_schedule_tree does not
+ * have any children.  That is, the number of children of "node" is
+ * only zero if its tree is the explicit empty tree.  Otherwise,
+ * if the isl_schedule_tree has any children, then it is equal
+ * to the number of children of "node".  If it has zero children,
+ * then "node" still has a leaf node as child.
+ */
+int isl_schedule_node_n_children(__isl_keep isl_schedule_node *node)
+{
+	int n;
+
+	if (!node)
+		return -1;
+
+	if (isl_schedule_tree_is_leaf(node->tree))
+		return 0;
+
+	n = isl_schedule_tree_n_children(node->tree);
+	if (n == 0)
+		return 1;
+
+	return n;
+}
+
+/* Move the "node" pointer to the ancestor of the given generation
+ * of the node it currently points to, where generation 0 is the node
+ * itself and generation 1 is its parent.
+ */
+__isl_give isl_schedule_node *isl_schedule_node_ancestor(
+	__isl_take isl_schedule_node *node, int generation)
+{
+	int n;
+	isl_schedule_tree *tree;
+
+	if (!node)
+		return NULL;
+	if (generation == 0)
+		return node;
+	n = isl_schedule_node_get_tree_depth(node);
+	if (n < 0)
+		return isl_schedule_node_free(node);
+	if (generation < 0 || generation > n)
+		isl_die(isl_schedule_node_get_ctx(node), isl_error_invalid,
+			"generation out of bounds",
+			return isl_schedule_node_free(node));
+	node = isl_schedule_node_cow(node);
+	if (!node)
+		return NULL;
+
+	tree = isl_schedule_tree_list_get_schedule_tree(node->ancestors,
+							n - generation);
+	isl_schedule_tree_free(node->tree);
+	node->tree = tree;
+	node->ancestors = isl_schedule_tree_list_drop(node->ancestors,
+						    n - generation, generation);
+	if (!node->ancestors || !node->tree)
+		return isl_schedule_node_free(node);
+
+	return node;
+}
+
+/* Move the "node" pointer to the parent of the node it currently points to.
+ */
+__isl_give isl_schedule_node *isl_schedule_node_parent(
+	__isl_take isl_schedule_node *node)
+{
+	if (!node)
+		return NULL;
+	if (!isl_schedule_node_has_parent(node))
+		isl_die(isl_schedule_node_get_ctx(node), isl_error_invalid,
+			"node has no parent",
+			return isl_schedule_node_free(node));
+	return isl_schedule_node_ancestor(node, 1);
+}
+
+/* Move the "node" pointer to the root of its schedule tree.
+ */
+__isl_give isl_schedule_node *isl_schedule_node_root(
+	__isl_take isl_schedule_node *node)
+{
+	int n;
+
+	if (!node)
+		return NULL;
+	n = isl_schedule_node_get_tree_depth(node);
+	if (n < 0)
+		return isl_schedule_node_free(node);
+	return isl_schedule_node_ancestor(node, n);
+}
+
+/* Move the "node" pointer to the child at position "pos" of the node
+ * it currently points to.
+ */
+__isl_give isl_schedule_node *isl_schedule_node_child(
+	__isl_take isl_schedule_node *node, int pos)
+{
+	int n;
+	isl_ctx *ctx;
+	isl_schedule_tree *tree;
+	int *child_pos;
+
+	node = isl_schedule_node_cow(node);
+	if (!node)
+		return NULL;
+	if (!isl_schedule_node_has_children(node))
+		isl_die(isl_schedule_node_get_ctx(node), isl_error_invalid,
+			"node has no children",
+			return isl_schedule_node_free(node));
+
+	ctx = isl_schedule_node_get_ctx(node);
+	n = isl_schedule_tree_list_n_schedule_tree(node->ancestors);
+	child_pos = isl_realloc_array(ctx, node->child_pos, int, n + 1);
+	if (!child_pos)
+		return isl_schedule_node_free(node);
+	node->child_pos = child_pos;
+	node->child_pos[n] = pos;
+
+	node->ancestors = isl_schedule_tree_list_add(node->ancestors,
+				isl_schedule_tree_copy(node->tree));
+	tree = node->tree;
+	if (isl_schedule_tree_has_children(tree))
+		tree = isl_schedule_tree_get_child(tree, pos);
+	else
+		tree = isl_schedule_node_get_le

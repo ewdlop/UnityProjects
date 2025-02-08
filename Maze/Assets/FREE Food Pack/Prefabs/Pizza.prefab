@@ -1,0 +1,67 @@
+riteLine(ReportFile, TCHAR_TO_UTF8(*Line));	
+			Line = FString::Printf( TEXT( "Running %d unknown processors" ), FPlatformMisc::NumberOfCores());
+			WriteLine(ReportFile, TCHAR_TO_UTF8(*Line));
+		}
+		Line = FString::Printf(TEXT("Exception was \"%s\""), SignalDescription);
+		WriteLine(ReportFile, TCHAR_TO_UTF8(*Line));
+		WriteLine(ReportFile);
+
+		WriteLine(ReportFile, "<SOURCE START>");
+		WriteLine(ReportFile, "<SOURCE END>");
+		WriteLine(ReportFile);
+
+		WriteLine(ReportFile, "<CALLSTACK START>");
+		WriteLine(ReportFile, MinidumpCallstackInfo);
+		WriteLine(ReportFile, "<CALLSTACK END>");
+		WriteLine(ReportFile);
+
+		WriteLine(ReportFile, "0 loaded modules");
+
+		WriteLine(ReportFile);
+
+		Line = FString::Printf(TEXT("Report end!"));
+		WriteLine(ReportFile, TCHAR_TO_UTF8(*Line));
+
+		ReportFile->Close();
+		delete ReportFile;
+	}
+}
+
+void FUnixCrashContext::CaptureStackTrace()
+{
+	// Only do work the first time this function is called - this is mainly a carry over from Windows where it can be called multiple times, left intact for extra safety.
+	if (!bCapturedBacktrace)
+	{
+		static const SIZE_T StackTraceSize = 65535;
+		static ANSICHAR StackTrace[StackTraceSize];
+		StackTrace[0] = 0;
+
+		int32 IgnoreCount = NumMinidumpFramesToIgnore;
+		CapturePortableCallStack(IgnoreCount, this);
+
+		// Walk the stack and dump it to the allocated memory (do not ignore any stack frames to be consistent with check()/ensure() handling)
+		FPlatformStackWalk::StackWalkAndDump( StackTrace, StackTraceSize, IgnoreCount, this);
+
+#if !PLATFORM_LINUX
+		printf("StackTrace:\n%s\n", StackTrace);
+#endif
+
+		FCString::Strncat( GErrorHist, UTF8_TO_TCHAR(StackTrace), UE_ARRAY_COUNT(GErrorHist) - 1 );
+		CreateExceptionInfoString(Signal, Info, Context);
+
+		bCapturedBacktrace = true;
+	}
+}
+
+void FUnixCrashContext::GetPortableCallStack(const uint64* StackFrames, int32 NumStackFrames, TArray<FCrashStackFrame>& OutCallStack) const
+{
+	// Update the callstack with offsets from each module
+	OutCallStack.Reset(NumStackFrames);
+	for (int32 Idx = 0; Idx < NumStackFrames; Idx++)
+	{
+		const uint64 StackFrame = StackFrames[Idx];
+
+		// Try to find the module containing this stack frame
+		const FStackWalkModuleInfo* FoundModule = nullptr;
+
+		Dl_info 

@@ -1,0 +1,82 @@
+ct()"
+        # cannot use the old predicate, it violates the claim of the
+        # set_terminator method.
+
+        # return (len(self.ac_in_buffer) <= self.ac_in_buffer_size)
+        return 1
+
+    def writable (self):
+        "predicate for inclusion in the writable for select()"
+        return self.producer_fifo or (not self.connected)
+
+    def close_when_done (self):
+        "automatically close this channel once the outgoing queue is empty"
+        self.producer_fifo.append(None)
+
+    def initiate_send(self):
+        while self.producer_fifo and self.connected:
+            first = self.producer_fifo[0]
+            # handle empty string/buffer or None entry
+            if not first:
+                del self.producer_fifo[0]
+                if first is None:
+                    self.handle_close()
+                    return
+
+            # handle classic producer behavior
+            obs = self.ac_out_buffer_size
+            try:
+                with catch_warnings():
+                    if py3kwarning:
+                        filterwarnings("ignore", ".*buffer", DeprecationWarning)
+                    data = buffer(first, 0, obs)
+            except TypeError:
+                data = first.more()
+                if data:
+                    self.producer_fifo.appendleft(data)
+                else:
+                    del self.producer_fifo[0]
+                continue
+
+            # send the data
+            try:
+                num_sent = self.send(data)
+            except socket.error:
+                self.handle_error()
+                return
+
+            if num_sent:
+                if num_sent < len(data) or obs < len(first):
+                    self.producer_fifo[0] = first[num_sent:]
+                else:
+                    del self.producer_fifo[0]
+            # we tried to send some actual data
+            return
+
+    def discard_buffers (self):
+        # Emergencies only!
+        self.ac_in_buffer = ''
+        del self.incoming[:]
+        self.producer_fifo.clear()
+
+class simple_producer:
+
+    def __init__ (self, data, buffer_size=512):
+        self.data = data
+        self.buffer_size = buffer_size
+
+    def more (self):
+        if len (self.data) > self.buffer_size:
+            result = self.data[:self.buffer_size]
+            self.data = self.data[self.buffer_size:]
+            return result
+        else:
+            result = self.data
+            self.data = ''
+            return result
+
+class fifo:
+    def __init__ (self, list=None):
+        if not list:
+            self.list = deque()
+ 

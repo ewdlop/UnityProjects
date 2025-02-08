@@ -1,0 +1,92 @@
+                // just create empty tables so that we don't end up trying to read the file
+                        // on every access to InitializeConfigInfo()
+                        if (machineNameHT == null)
+                            machineNameHT = new Dictionary<string, string>();
+                        if (machineOidHT == null)
+                            machineOidHT = new Dictionary<string, string>();
+
+                    }
+                }
+            }
+
+#else
+            if (machineNameHT == null)
+                machineNameHT = new Dictionary<string, string>();
+            if (machineOidHT == null)
+                machineOidHT = new Dictionary<string, string>();
+
+#endif //FEATURE_CRYPTO
+        }
+
+        /// <summary>
+        ///     Add a set of name -> algorithm mappings to be used for the current AppDomain.  These mappings
+        ///     take precidense over the built-in mappings and the mappings in machine.config.  This API is
+        ///     critical to prevent partial trust code from hooking trusted crypto operations.
+        /// </summary>
+        [SecurityCritical]
+        public static void AddAlgorithm(Type algorithm, params string[] names) {
+            if (algorithm == null)
+                throw new ArgumentNullException("algorithm");
+            if (!algorithm.IsVisible)
+                throw new ArgumentException(Environment.GetResourceString("Cryptography_AlgorithmTypesMustBeVisible"), "algorithm");
+            if (names == null)
+                throw new ArgumentNullException("names");
+            Contract.EndContractBlock();
+
+            string[] algorithmNames = new string[names.Length];
+            Array.Copy(names, algorithmNames, algorithmNames.Length);
+
+            // Pre-check the algorithm names for validity so that we don't add a few of the names and then
+            // throw an exception if we find an invalid name partway through the list.
+            foreach (string name in algorithmNames) {
+                if (String.IsNullOrEmpty(name)) {
+                    throw new ArgumentException(Environment.GetResourceString("Cryptography_AddNullOrEmptyName"));
+                }
+            }
+
+            // Everything looks valid, so we're safe to take the table lock and add the name mappings.
+            lock (InternalSyncObject) {
+                foreach (string name in algorithmNames) {
+                    appNameHT[name] = algorithm;
+                }
+            }
+        }
+
+        [System.Security.SecuritySafeCritical]  // auto-generated
+        public static object CreateFromName (string name, params object[] args) {
+            if (name == null)
+                throw new ArgumentNullException("name");
+            Contract.EndContractBlock();
+
+            Type retvalType = null;
+            Object retval;
+
+            // First we'll do the machine-wide stuff, initializing if necessary
+            InitializeConfigInfo();
+
+            // Check to see if we have an applicaiton defined mapping
+            lock (InternalSyncObject) {
+                retvalType = appNameHT.GetValueOrDefault(name);
+            }
+
+            // If we don't have a application defined mapping, search the machine table
+            if (retvalType == null) {
+                BCLDebug.Assert(machineNameHT != null, "machineNameHT != null");
+                String retvalTypeString = machineNameHT.GetValueOrDefault(name);
+                if (retvalTypeString != null) {
+                    retvalType = Type.GetType(retvalTypeString, false, false);
+                    if (retvalType != null && !retvalType.IsVisible) 
+                        retvalType = null;
+                }
+            }
+
+            // If we didn't find it in the machine-wide table,  look in the default table
+            if (retvalType == null) {
+                // We allow the default table to Types and Strings
+                // Types get used for other stuff in mscorlib.dll
+                // strings get used for delay-loaded stuff like System.Security.dll
+                Object retvalObj  = DefaultNameHT.GetValueOrDefault(name);
+                if (retvalObj != null) {
+                    if (retvalObj is Type) {
+                        retvalType = (Type) retvalObj;
+                    } else if (retvalObj is String) {

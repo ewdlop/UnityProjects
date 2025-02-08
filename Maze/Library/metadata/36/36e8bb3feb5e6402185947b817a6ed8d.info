@@ -1,0 +1,282 @@
+//
+// generic ClientBase.cs
+//
+// Author:
+//	Atsushi Enomoto <atsushi@ximian.com>
+//
+// Copyright (C) 2005-2006 Novell, Inc.  http://www.novell.com
+//
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+// 
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+//
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Reflection;
+using System.ServiceModel.Channels;
+using System.ServiceModel.Description;
+using System.ServiceModel.Dispatcher;
+using System.Threading;
+using System.ServiceModel.MonoInternal;
+
+namespace System.ServiceModel
+{
+	[MonoTODO ("It somehow rejects classes, but dunno how we can do that besides our code wise.")]
+	public abstract class ClientBase<TChannel> :
+		IDisposable,
+		ICommunicationObject where TChannel : class
+	{
+		static InstanceContext initialContxt = new InstanceContext (null);
+
+		ChannelFactory<TChannel> factory;
+		IClientChannel inner_channel;
+
+		protected delegate IAsyncResult BeginOperationDelegate (object[] inValues, AsyncCallback asyncCallback, object state);
+		protected delegate object[] EndOperationDelegate (IAsyncResult result);
+
+		protected ClientBase ()
+			: this (initialContxt)
+		{
+		}
+
+		protected ClientBase (string endpointConfigurationName)
+			: this (initialContxt, endpointConfigurationName)
+		{
+		}
+
+		protected ClientBase (Binding binding, EndpointAddress remoteAddress)
+			: this (initialContxt, binding, remoteAddress)
+		{
+		}
+
+		protected ClientBase (string endpointConfigurationName, EndpointAddress remoteAddress)
+			: this (initialContxt, endpointConfigurationName, remoteAddress)
+		{
+		}
+
+		protected ClientBase (string endpointConfigurationName, string remoteAddress)
+			: this (initialContxt, endpointConfigurationName, remoteAddress)
+		{
+		}
+
+		protected ClientBase (InstanceContext callbackInstance)
+			: this (callbackInstance, "*")
+		{
+		}
+
+		protected ClientBase (InstanceContext callbackInstance, string endpointConfigurationName)
+		{
+			if (callbackInstance == null)
+				throw new ArgumentNullException ("instanceContext");
+			if (endpointConfigurationName == null)
+				throw new ArgumentNullException ("endpointConfigurationName");
+
+			Initialize (callbackInstance, endpointConfigurationName, null);
+		}
+
+		protected ClientBase (InstanceContext callbackInstance,
+			string endpointConfigurationName, EndpointAddress remoteAddress)
+		{
+			if (callbackInstance == null)
+				throw new ArgumentNullException ("instanceContext");
+			if (endpointConfigurationName == null)
+				throw new ArgumentNullException ("endpointConfigurationName");
+			if (remoteAddress == null)
+				throw new ArgumentNullException ("remoteAddress");
+
+			Initialize (callbackInstance, endpointConfigurationName, remoteAddress);
+		}
+
+		protected ClientBase (InstanceContext callbackInstance,
+			string endpointConfigurationName, string remoteAddress)
+		{
+			if (callbackInstance == null)
+				throw new ArgumentNullException ("instanceContext");
+			if (remoteAddress == null)
+				throw new ArgumentNullException ("endpointAddress");
+			if (endpointConfigurationName == null)
+				throw new ArgumentNullException ("endpointConfigurationName");
+
+			Initialize (callbackInstance, endpointConfigurationName, new EndpointAddress (remoteAddress));
+		}
+
+		protected ClientBase (InstanceContext callbackInstance,
+			Binding binding, EndpointAddress remoteAddress)
+		{
+			if (callbackInstance == null)
+				throw new ArgumentNullException ("instanceContext");
+			if (binding == null)
+				throw new ArgumentNullException ("binding");
+			if (remoteAddress == null)
+				throw new ArgumentNullException ("remoteAddress");
+
+			Initialize (callbackInstance, binding, remoteAddress);
+		}
+
+		protected ClientBase (ServiceEndpoint endpoint)
+			: this (null, endpoint)
+		{
+		}
+
+		protected ClientBase (InstanceContext callbackInstance, ServiceEndpoint endpoint)
+			: this (callbackInstance, new ChannelFactory<TChannel> (endpoint))
+		{
+		}
+
+		internal ClientBase (ChannelFactory<TChannel> factory)
+			: this (null, factory)
+		{
+		}
+
+		internal ClientBase (InstanceContext instance, ChannelFactory<TChannel> factory)
+		{
+			// FIXME: use instance
+			ChannelFactory = factory;
+		}
+
+		internal virtual void Initialize (InstanceContext instance,
+			string endpointConfigurationName, EndpointAddress remoteAddress)
+		{
+			// FIXME: use instance
+			ChannelFactory = new ChannelFactory<TChannel> (endpointConfigurationName, remoteAddress);
+		}
+
+		internal virtual void Initialize (InstanceContext instance,
+			Binding binding, EndpointAddress remoteAddress)
+		{
+			// FIXME: use instance
+			ChannelFactory = new ChannelFactory<TChannel> (binding, remoteAddress);
+		}
+
+		public ChannelFactory<TChannel> ChannelFactory {
+			get { return factory; }
+			internal set {
+				factory = value;
+				factory.OwnerClientBase = this;
+			}
+		}
+
+		public ClientCredentials ClientCredentials {
+			get { return ChannelFactory.Credentials; }
+		}
+
+		public ServiceEndpoint Endpoint {
+			get { return factory.Endpoint; }
+		}
+
+		public IClientChannel InnerChannel {
+			get {
+				if (inner_channel == null)
+					inner_channel = (IClientChannel) (object) CreateChannel ();
+				return inner_channel;
+			}
+		}
+
+		protected TChannel Channel {
+			get { return (TChannel) (object) InnerChannel; }
+		}
+
+		public CommunicationState State {
+			get { return inner_channel != null ? inner_channel.State : CommunicationState.Created; }
+		}
+
+		public void Abort ()
+		{
+			InnerChannel.Abort ();
+		}
+
+		public void Close ()
+		{
+			InnerChannel.Close ();
+		}
+
+		public void DisplayInitializationUI ()
+		{
+			InnerChannel.DisplayInitializationUI ();
+		}
+
+		protected T GetDefaultValueForInitialization<T> ()
+		{
+			return default (T);
+		}
+
+		//IAsyncResult delegate_async;
+
+		void RunCompletedCallback (SendOrPostCallback callback, InvokeAsyncCompletedEventArgs args)
+		{
+			callback (args);
+		}
+
+		protected void InvokeAsync (BeginOperationDelegate beginOperationDelegate,
+			object [] inValues, EndOperationDelegate endOperationDelegate,
+			SendOrPostCallback operationCompletedCallback, object userState)
+		{
+			if (beginOperationDelegate == null)
+				throw new ArgumentNullException ("beginOperationDelegate");
+			if (endOperationDelegate == null)
+				throw new ArgumentNullException ("endOperationDelegate");
+			//if (delegate_async != null)
+			//	throw new InvalidOperationException ("Another async operation is in progress");
+
+			AsyncCallback cb = delegate (IAsyncResult ar) {
+				object [] results = null;
+				Exception error = null;
+				bool cancelled = false; // FIXME: fill it in case it is cancelled
+				try {
+					results = endOperationDelegate (ar);
+				} catch (Exception ex) {
+					error = ex;
+				}
+				try {
+					if (operationCompletedCallback != null)
+						RunCompletedCallback (operationCompletedCallback, new InvokeAsyncCompletedEventArgs (results, error, cancelled, userState));
+				} catch (Exception ex) {
+					//Console.WriteLine ("Exception during operationCompletedCallback" + ex);
+					throw;
+				}
+				//Console.WriteLine ("System.ServiceModel.ClientBase<TChannel>: web service invocation is successfully done (operationCompletedCallback may not be).");
+			};
+			begin_async_result = beginOperationDelegate (inValues, cb, userState);
+		}
+		IAsyncResult begin_async_result;
+
+		void IDisposable.Dispose ()
+		{
+			Close ();
+		}
+
+		protected virtual TChannel CreateChannel ()
+		{
+			return ChannelFactory.CreateChannel ();
+		}
+
+		public void Open ()
+		{
+			InnerChannel.Open ();
+		}
+
+		#region ICommunicationObject implementation
+
+		IAsyncResult ICommunicationObject.BeginOpen (
+			AsyncCallback callback, object state)
+		{
+			return InnerChannel.BeginOpen (callback, state);
+		}
+
+		I

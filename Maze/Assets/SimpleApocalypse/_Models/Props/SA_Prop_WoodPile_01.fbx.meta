@@ -1,0 +1,67 @@
+ay.size() ; i++)
+	{
+		mActorArray[i]->renderDataUnLock();
+	}
+	mActorListLock.unlockReader();
+}
+
+void ApexContext::removeAllActors()
+{
+	while (mActorArray.size())
+	{
+		mActorArray.back()->release();
+	}
+	mActorArrayCallBacks.clear();
+}
+
+RenderableIterator* ApexContext::createRenderableIterator()
+{
+	if (mIterator)
+	{
+		PX_ALWAYS_ASSERT(); // Only one per context at a time, please
+		return NULL;
+	}
+	else
+	{
+		mIterator = PX_NEW(ApexRenderableIterator)(*this);
+		return mIterator;
+	}
+}
+void ApexContext::releaseRenderableIterator(RenderableIterator& iter)
+{
+	if (mIterator == DYNAMIC_CAST(ApexRenderableIterator*)(&iter))
+	{
+		mIterator->destroy();
+		mIterator = NULL;
+	}
+	else
+	{
+		PX_ASSERT(mIterator == DYNAMIC_CAST(ApexRenderableIterator*)(&iter));
+	}
+}
+
+ApexRenderableIterator::ApexRenderableIterator(ApexContext& _ctx) :
+	ctx(&_ctx),
+	curActor(0),
+	mLockedActor(NULL)
+{
+	// Make copy of list of renderable actors currently in the context.
+	// If an actor is later removed, we mark it as NULL in our cached
+	// array.  If an actor is added, we do _NOT_ add it to our list since
+	// it would be quite dangerous to call dispatchRenderResources() on an
+	// actor that has never had updateRenderResources() called to it.
+
+	mCachedActors.reserve(ctx->mActorArray.size());
+	ctx->mActorListLock.lockWriter();
+	for (uint32_t i = 0 ; i < ctx->mActorArray.size() ; i++)
+	{
+		Renderable* renderable = ctx->mActorArray[ i ]->getRenderable();
+		if (renderable)
+		{
+			mCachedActors.pushBack(ctx->mActorArray[ i ]);
+		}
+	}
+	ctx->mActorListLock.unlockWriter();
+}
+
+void ApexRenderableIterator::removeCachedActor(ApexActo

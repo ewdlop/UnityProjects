@@ -1,0 +1,78 @@
+OTE: Do not increase above 8.5 mins without altering watchdog scripts to match
+					const double kCrashTimeOut = 8 * 60.0;
+
+					const double kCrashSleepInterval = 1.0;
+					if (!UnixCrashReporterTracker::WaitForProcWithTimeout(RunningProc, kCrashTimeOut, kCrashSleepInterval))
+					{
+						FPlatformProcess::TerminateProc(RunningProc);
+					}
+
+					FPlatformProcess::CloseProc(RunningProc);
+				}
+			}
+		}
+	}
+
+#endif
+
+	if (!bReportingNonCrash)
+	{
+		// remove the handler for this signal and re-raise it (which should generate the proper core dump)
+		// print message to stdout directly, it may be too late for the log (doesn't seem to be printed during a crash in the thread) 
+		printf("Engine crash handling finished; re-raising signal %d for the default handler. Good bye.\n", Signal);
+		fflush(stdout);
+
+		struct sigaction ResetToDefaultAction;
+		FMemory::Memzero(ResetToDefaultAction);
+		ResetToDefaultAction.sa_handler = SIG_DFL;
+		sigfillset(&ResetToDefaultAction.sa_mask);
+		sigaction(Signal, &ResetToDefaultAction, nullptr);
+
+		raise(Signal);
+	}
+}
+
+/**
+ * Good enough default crash reporter.
+ */
+void DefaultCrashHandler(const FUnixCrashContext & Context)
+{
+	printf("DefaultCrashHandler: Signal=%d\n", Context.Signal);
+
+	// Stop the heartbeat thread so that it doesn't interfere with crashreporting
+	FThreadHeartBeat::Get().Stop();
+
+	// at this point we should already be using malloc crash handler (see PlatformCrashHandler)
+	const_cast<FUnixCrashContext&>(Context).CaptureStackTrace();
+	if (GLog)
+	{
+		GLog->SetCurrentThreadAsMasterThread();
+		GLog->Flush();
+	}
+	if (GWarn)
+	{
+		GWarn->Flush();
+	}
+	if (GError)
+	{
+		GError->Flush();
+		GError->HandleError();
+	}
+
+	return Context.GenerateCrashInfoAndLaunchReporter();
+}
+
+/** Global pointer to crash handler */
+void (* GCrashHandlerPointer)(const FGenericCrashContext & Context) = NULL;
+
+extern int32 CORE_API GMaxNumberFileMappingCache;
+
+extern thread_local const TCHAR* GCrashErrorMessage;
+extern thread_local ECrashContextType GCrashErrorType;
+
+namespace
+{
+	ANSICHAR AnsiInternalBuffer[64] = { 0 };
+
+	// Taken from AndroidPlatformCrashContext.cpp, we need to avoid allocations while in the signal handler
+	const ANSICHAR* ItoANSI(uint64 Val, uint64 Base)

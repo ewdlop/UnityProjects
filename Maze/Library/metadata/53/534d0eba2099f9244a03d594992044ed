@@ -1,0 +1,217 @@
+ible, 1)
+
+        # Scroll down to line 1.
+        cc.text.yview(1)
+        cc.update_code_context()
+        eq(cc.info, [(0, -1, '', False)])
+        eq(cc.topvisible, 2)
+        eq(cc.context.get('1.0', 'end-1c'), '')
+
+        # Scroll down to line 2.
+        cc.text.yview(2)
+        cc.update_code_context()
+        eq(cc.info, [(0, -1, '', False), (2, 0, 'class C1():', 'class')])
+        eq(cc.topvisible, 3)
+        eq(cc.context.get('1.0', 'end-1c'), 'class C1():')
+
+        # Scroll down to line 3.  Since it's a comment, nothing changes.
+        cc.text.yview(3)
+        cc.update_code_context()
+        eq(cc.info, [(0, -1, '', False), (2, 0, 'class C1():', 'class')])
+        eq(cc.topvisible, 4)
+        eq(cc.context.get('1.0', 'end-1c'), 'class C1():')
+
+        # Scroll down to line 4.
+        cc.text.yview(4)
+        cc.update_code_context()
+        eq(cc.info, [(0, -1, '', False),
+                     (2, 0, 'class C1():', 'class'),
+                     (4, 4, '    def __init__(self, a, b):', 'def')])
+        eq(cc.topvisible, 5)
+        eq(cc.context.get('1.0', 'end-1c'), 'class C1():\n'
+                                            '    def __init__(self, a, b):')
+
+        # Scroll down to line 11.  Last 'def' is removed.
+        cc.text.yview(11)
+        cc.update_code_context()
+        eq(cc.info, [(0, -1, '', False),
+                     (2, 0, 'class C1():', 'class'),
+                     (7, 4, '    def compare(self):', 'def'),
+                     (8, 8, '        if a > b:', 'if'),
+                     (10, 8, '        elif a < b:', 'elif')])
+        eq(cc.topvisible, 12)
+        eq(cc.context.get('1.0', 'end-1c'), 'class C1():\n'
+                                            '    def compare(self):\n'
+                                            '        if a > b:\n'
+                                            '        elif a < b:')
+
+        # No scroll.  No update, even though context_depth changed.
+        cc.update_code_context()
+        cc.context_depth = 1
+        eq(cc.info, [(0, -1, '', False),
+                     (2, 0, 'class C1():', 'class'),
+                     (7, 4, '    def compare(self):', 'def'),
+                     (8, 8, '        if a > b:', 'if'),
+                     (10, 8, '        elif a < b:', 'elif')])
+        eq(cc.topvisible, 12)
+        eq(cc.context.get('1.0', 'end-1c'), 'class C1():\n'
+                                            '    def compare(self):\n'
+                                            '        if a > b:\n'
+                                            '        elif a < b:')
+
+        # Scroll up.
+        cc.text.yview(5)
+        cc.update_code_context()
+        eq(cc.info, [(0, -1, '', False),
+                     (2, 0, 'class C1():', 'class'),
+                     (4, 4, '    def __init__(self, a, b):', 'def')])
+        eq(cc.topvisible, 6)
+        # context_depth is 1.
+        eq(cc.context.get('1.0', 'end-1c'), '    def __init__(self, a, b):')
+
+    def test_jumptoline(self):
+        eq = self.assertEqual
+        cc = self.cc
+        jump = cc.jumptoline
+
+        if not cc.context:
+            cc.toggle_code_context_event()
+
+        # Empty context.
+        cc.text.yview('2.0')
+        cc.update_code_context()
+        eq(cc.topvisible, 2)
+        cc.context.mark_set('insert', '1.5')
+        jump()
+        eq(cc.topvisible, 1)
+
+        # 4 lines of context showing.
+        cc.text.yview('12.0')
+        cc.update_code_context()
+        eq(cc.topvisible, 12)
+        cc.context.mark_set('insert', '3.0')
+        jump()
+        eq(cc.topvisible, 8)
+
+        # More context lines than limit.
+        cc.context_depth = 2
+        cc.text.yview('12.0')
+        cc.update_code_context()
+        eq(cc.topvisible, 12)
+        cc.context.mark_set('insert', '1.0')
+        jump()
+        eq(cc.topvisible, 8)
+
+        # Context selection stops jump.
+        cc.text.yview('5.0')
+        cc.update_code_context()
+        cc.context.tag_add('sel', '1.0', '2.0')
+        cc.context.mark_set('insert', '1.0')
+        jump()  # Without selection, to line 2.
+        eq(cc.topvisible, 5)
+
+    @mock.patch.object(codecontext.CodeContext, 'update_code_context')
+    def test_timer_event(self, mock_update):
+        # Ensure code context is not active.
+        if self.cc.context:
+            self.cc.toggle_code_context_event()
+        self.cc.timer_event()
+        mock_update.assert_not_called()
+
+        # Activate code context.
+        self.cc.toggle_code_context_event()
+        self.cc.timer_event()
+        mock_update.assert_called()
+
+    def test_font(self):
+        eq = self.assertEqual
+        cc = self.cc
+
+        orig_font = cc.text['font']
+        test_font = 'TkTextFont'
+        self.assertNotEqual(orig_font, test_font)
+
+        # Ensure code context is not active.
+        if cc.context is not None:
+            cc.toggle_code_context_event()
+
+        self.font_override = test_font
+        # Nothing breaks or changes with inactive code context.
+        cc.update_font()
+
+        # Activate code context, previous font change is immediately effective.
+        cc.toggle_code_context_event()
+        eq(cc.context['font'], test_font)
+
+        # Call the font update, change is picked up.
+        self.font_override = orig_font
+        cc.update_font()
+        eq(cc.context['font'], orig_font)
+
+    def test_highlight_colors(self):
+        eq = self.assertEqual
+        cc = self.cc
+
+        orig_colors = dict(self.highlight_cfg)
+        test_colors = {'background': '#222222', 'foreground': '#ffff00'}
+
+        def assert_colors_are_equal(colors):
+            eq(cc.context['background'], colors['background'])
+            eq(cc.context['foreground'], colors['foreground'])
+
+        # Ensure code context is not active.
+        if cc.context:
+            cc.toggle_code_context_event()
+
+        self.highlight_cfg = test_colors
+        # Nothing breaks with inactive code context.
+        cc.update_highlight_colors()
+
+        # Activate code context, previous colors change is immediately effective.
+        cc.toggle_code_context_event()
+        assert_colors_are_equal(test_colors)
+
+        # Call colors update with no change to the configured colors.
+        cc.update_highlight_colors()
+        assert_colors_are_equal(test_colors)
+
+        # Call the colors update with code context active, change is picked up.
+        self.highlight_cfg = orig_colors
+        cc.update_highlight_colors()
+        assert_colors_are_equal(orig_colors)
+
+
+class HelperFunctionText(unittest.TestCase):
+
+    def test_get_spaces_firstword(self):
+        get = codecontext.get_spaces_firstword
+        test_lines = (
+            ('    first word', ('    ', 'first')),
+            ('\tfirst word', ('\t', 'first')),
+            ('  \u19D4\u19D2: ', ('  ', '\u19D4\u19D2')),
+            ('no spaces', ('', 'no')),
+            ('', ('', '')),
+            ('# TEST COMMENT', ('', '')),
+            ('    (continuation)', ('    ', ''))
+            )
+        for line, expected_output in test_lines:
+            self.assertEqual(get(line), expected_output)
+
+        # Send the pattern in the call.
+        self.assertEqual(get('    (continuation)',
+                             c=re.compile(r'^(\s*)([^\s]*)')),
+                         ('    ', '(continuation)'))
+
+    def test_get_line_info(self):
+        eq = self.assertEqual
+        gli = codecontext.get_line_info
+        lines = code_sample.splitlines()
+
+        # Line 1 is not a BLOCKOPENER.
+        eq(gli(lines[0]), (codecontext.INFINITY, '', False))
+        # Line 2 is a BLOCKOPENER without an indent.
+        eq(gli(lines[1]), (0, 'class C1():', 'class'))
+        # Line 3 is not a BLOCKOPENER and does not return the indent level.
+        eq(gli(lines[2]), (codecontext.INFINITY, '    # Class comment.', False))
+        # Line 4 is a BLOCKOPENER and is indented.
+        eq(gli(line

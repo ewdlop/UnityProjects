@@ -1,0 +1,73 @@
+//===- ValueMapper.cpp - Interface shared by lib/Transforms/Utils ---------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+//
+// This file defines the MapValue function, which is shared by various parts of
+// the lib/Transforms/Utils library.
+//
+//===----------------------------------------------------------------------===//
+
+#include "llvm/Transforms/Utils/ValueMapper.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/None.h"
+#include "llvm/ADT/Optional.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/Argument.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/CallSite.h"
+#include "llvm/IR/Constant.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/GlobalAlias.h"
+#include "llvm/IR/GlobalObject.h"
+#include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/Instruction.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Metadata.h"
+#include "llvm/IR/Operator.h"
+#include "llvm/IR/Type.h"
+#include "llvm/IR/Value.h"
+#include "llvm/Support/Casting.h"
+#include <cassert>
+#include <limits>
+#include <memory>
+#include <utility>
+
+using namespace llvm;
+
+// Out of line method to get vtable etc for class.
+void ValueMapTypeRemapper::anchor() {}
+void ValueMaterializer::anchor() {}
+
+namespace {
+
+/// A basic block used in a BlockAddress whose function body is not yet
+/// materialized.
+struct DelayedBasicBlock {
+  BasicBlock *OldBB;
+  std::unique_ptr<BasicBlock> TempBB;
+
+  DelayedBasicBlock(const BlockAddress &Old)
+      : OldBB(Old.getBasicBlock()),
+        TempBB(BasicBlock::Create(Old.getContext())) {}
+};
+
+struct WorklistEntry {
+  enum EntryKind {
+    MapGlobalInit,
+    MapAppendingVar,
+    MapGlobalAliasee,
+    RemapFunction
+  };
+  str

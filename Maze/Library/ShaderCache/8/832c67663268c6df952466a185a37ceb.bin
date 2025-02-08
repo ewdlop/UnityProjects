@@ -1,0 +1,20 @@
+       const std::string &ShowFunction, bool TextFormat,
+                            raw_fd_ostream &OS) {
+  auto ReaderOrErr = InstrProfReader::create(Filename);
+  std::vector<uint32_t> Cutoffs = std::move(DetailedSummaryCutoffs);
+  if (ShowDetailedSummary && Cutoffs.empty()) {
+    Cutoffs = {800000, 900000, 950000, 990000, 999000, 999900, 999990};
+  }
+  InstrProfSummaryBuilder Builder(std::move(Cutoffs));
+  if (Error E = ReaderOrErr.takeError())
+    exitWithError(std::move(E), Filename);
+
+  auto Reader = std::move(ReaderOrErr.get());
+  bool IsIRInstr = Reader->isIRLevelProfile();
+  size_t ShownFunctions = 0;
+  int NumVPKind = IPVK_Last - IPVK_First + 1;
+  std::vector<ValueSitesStats> VPStats(NumVPKind);
+
+  auto MinCmp = [](const std::pair<std::string, uint64_t> &v1,
+                   const std::pair<std::string, uint64_t> &v2) {
+    return v1.second > v2.second;

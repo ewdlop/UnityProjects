@@ -1,0 +1,140 @@
+eevaluate ();
+				}
+				return evaluatedItemsIgnoringCondition;
+			}
+		}
+		
+		internal IDictionary <string, BuildItemGroup> EvaluatedItemsByName {
+			get {
+				// FIXME: do we need to do this here?
+				if (needToReevaluate) {
+					needToReevaluate = false;
+					Reevaluate ();
+				}
+				return evaluatedItemsByName;
+			}
+		}
+
+		internal IEnumerable EvaluatedItemsByNameAsDictionaryEntries {
+			get {
+				if (EvaluatedItemsByName.Count == 0)
+					yield break;
+
+				foreach (KeyValuePair<string, BuildItemGroup> pair in EvaluatedItemsByName) {
+					foreach (BuildItem bi in pair.Value)
+						yield return new DictionaryEntry (pair.Key, bi.ConvertToITaskItem (null, ExpressionOptions.ExpandItemRefs));
+				}
+			}
+		}
+
+		internal IDictionary <string, BuildItemGroup> EvaluatedItemsByNameIgnoringCondition {
+			get {
+				// FIXME: do we need to do this here?
+				if (needToReevaluate) {
+					needToReevaluate = false;
+					Reevaluate ();
+				}
+				return evaluatedItemsByNameIgnoringCondition;
+			}
+		}
+
+		// For batching implementation
+		Dictionary<string, BuildItemGroup> perBatchItemsByName;
+		Dictionary<string, BuildItemGroup> commonItemsByName;
+
+		struct Batch {
+			public Dictionary<string, BuildItemGroup> perBatchItemsByName;
+			public Dictionary<string, BuildItemGroup> commonItemsByName;
+
+			public Batch (Dictionary<string, BuildItemGroup> perBatchItemsByName, Dictionary<string, BuildItemGroup> commonItemsByName)
+			{
+				this.perBatchItemsByName = perBatchItemsByName;
+				this.commonItemsByName = commonItemsByName;
+			}
+		}
+
+		Stack<Batch> Batches {
+			get { return batches; }
+		}
+
+		internal void PushBatch (Dictionary<string, BuildItemGroup> perBatchItemsByName, Dictionary<string, BuildItemGroup> commonItemsByName)
+		{
+			batches.Push (new Batch (perBatchItemsByName, commonItemsByName));
+			SetBatchedItems (perBatchItemsByName, commonItemsByName);
+		}
+
+		internal void PopBatch ()
+		{
+			batches.Pop ();
+			if (batches.Count > 0) {
+				Batch b = batches.Peek ();
+				SetBatchedItems (b.perBatchItemsByName, b.commonItemsByName);
+			} else {
+				SetBatchedItems (null, null);
+			}
+		}
+
+		void SetBatchedItems (Dictionary<string, BuildItemGroup> perBatchItemsByName, Dictionary<string, BuildItemGroup> commonItemsByName)
+		{
+			this.perBatchItemsByName = perBatchItemsByName;
+			this.commonItemsByName = commonItemsByName;
+		}
+
+		// Honors batching
+		internal bool TryGetEvaluatedItemByNameBatched (string itemName, out BuildItemGroup group)
+		{
+			if (perBatchItemsByName != null && perBatchItemsByName.TryGetValue (itemName, out group))
+				return true;
+
+			if (commonItemsByName != null && commonItemsByName.TryGetValue (itemName, out group))
+				return true;
+
+			group = null;
+			return EvaluatedItemsByName.TryGetValue (itemName, out group);
+		}
+
+		internal string GetMetadataBatched (string itemName, string metadataName)
+		{
+			BuildItemGroup group = null;
+			if (itemName == null) {
+				//unqualified, all items in a batch(bucket) have the
+				//same metadata values
+				group = GetFirst<BuildItemGroup> (perBatchItemsByName.Values);
+				if (group == null)
+					group = GetFirst<BuildItemGroup> (commonItemsByName.Values);
+			} else {
+				//qualified
+				TryGetEvaluatedItemByNameBatched (itemName, out group);
+			}
+
+			if (group != null) {
+				foreach (BuildItem item in group) {
+					if (item.HasMetadata (metadataName))
+						return item.GetEvaluatedMetadata (metadataName);
+				}
+			}
+			return String.Empty;
+		}
+
+		internal IEnumerable<BuildItemGroup> GetAllItemGroups ()
+		{
+			if (perBatchItemsByName == null && commonItemsByName == null)
+				foreach (BuildItemGroup group in EvaluatedItemsByName.Values)
+					yield return group;
+
+			if (perBatchItemsByName != null)
+				foreach (BuildItemGroup group in perBatchItemsByName.Values)
+					yield return group;
+
+			if (commonItemsByName != null)
+				foreach (BuildItemGroup group in commonItemsByName.Values)
+					yield return group;
+		}
+
+		T GetFirst<T> (ICollection<T> list)
+		{
+			if (list == null)
+				return default (T);
+
+			foreach (T t in list)
+				ret

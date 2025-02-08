@@ -1,0 +1,172 @@
+a,b)
+#else
+#define CHECK_ADD_OVERFLOW_NAT(a,b) CHECK_ADD_OVERFLOW64(a,b)
+#define CHECK_ADD_OVERFLOW_NAT_UN(a,b) CHECK_ADD_OVERFLOW64_UN(a,b)
+#endif
+
+/* Resolves to TRUE if the operands would overflow */
+#define CHECK_MUL_OVERFLOW(a,b) \
+	((gint32)(a) == 0) || ((gint32)(b) == 0) ? 0 : \
+	(((gint32)(a) > 0) && ((gint32)(b) == -1)) ? FALSE : \
+	(((gint32)(a) < 0) && ((gint32)(b) == -1)) ? (a == G_MININT32) : \
+	(((gint32)(a) > 0) && ((gint32)(b) > 0)) ? (gint32)(a) > ((G_MAXINT32) / (gint32)(b)) : \
+	(((gint32)(a) > 0) && ((gint32)(b) < 0)) ? (gint32)(a) > ((G_MININT32) / (gint32)(b)) : \
+	(((gint32)(a) < 0) && ((gint32)(b) > 0)) ? (gint32)(a) < ((G_MININT32) / (gint32)(b)) : \
+	(gint32)(a) < ((G_MAXINT32) / (gint32)(b))
+
+#define CHECK_MUL_OVERFLOW_UN(a,b) \
+	((guint32)(a) == 0) || ((guint32)(b) == 0) ? 0 : \
+	(guint32)(b) > ((G_MAXUINT32) / (guint32)(a))
+
+#define CHECK_MUL_OVERFLOW64(a,b) \
+	((gint64)(a) == 0) || ((gint64)(b) == 0) ? 0 : \
+	(((gint64)(a) > 0) && ((gint64)(b) == -1)) ? FALSE : \
+	(((gint64)(a) < 0) && ((gint64)(b) == -1)) ? (a == G_MININT64) : \
+	(((gint64)(a) > 0) && ((gint64)(b) > 0)) ? (gint64)(a) > ((G_MAXINT64) / (gint64)(b)) : \
+	(((gint64)(a) > 0) && ((gint64)(b) < 0)) ? (gint64)(a) > ((G_MININT64) / (gint64)(b)) : \
+	(((gint64)(a) < 0) && ((gint64)(b) > 0)) ? (gint64)(a) < ((G_MININT64) / (gint64)(b)) : \
+	(gint64)(a) < ((G_MAXINT64) / (gint64)(b))
+
+#define CHECK_MUL_OVERFLOW64_UN(a,b) \
+	((guint64)(a) == 0) || ((guint64)(b) == 0) ? 0 : \
+	(guint64)(b) > ((G_MAXUINT64) / (guint64)(a))
+
+#if SIZEOF_VOID_P == 4
+#define CHECK_MUL_OVERFLOW_NAT(a,b) CHECK_MUL_OVERFLOW(a,b)
+#define CHECK_MUL_OVERFLOW_NAT_UN(a,b) CHECK_MUL_OVERFLOW_UN(a,b)
+#else
+#define CHECK_MUL_OVERFLOW_NAT(a,b) CHECK_MUL_OVERFLOW64(a,b)
+#define CHECK_MUL_OVERFLOW_NAT_UN(a,b) CHECK_MUL_OVERFLOW64_UN(a,b)
+#endif
+
+static MonoObject*
+interp_runtime_invoke (MonoMethod *method, void *obj, void **params, MonoObject **exc, MonoError *error)
+{
+	InterpFrame *frame;
+	ThreadContext *context = get_context ();
+	MonoMethodSignature *sig = mono_method_signature_internal (method);
+	MonoClass *klass = mono_class_from_mono_type_internal (sig->ret);
+	stackval result;
+	MonoMethod *target_method = method;
+
+	error_init (error);
+	if (exc)
+		*exc = NULL;
+
+	MonoDomain *domain = mono_domain_get ();
+
+	if (method->flags & METHOD_ATTRIBUTE_PINVOKE_IMPL)
+		target_method = mono_marshal_get_native_wrapper (target_method, FALSE, FALSE);
+	MonoMethod *invoke_wrapper = mono_marshal_get_runtime_invoke_full (target_method, FALSE, TRUE);
+
+	//* <code>MonoObject *runtime_invoke (MonoObject *this_obj, void **params, MonoObject **exc, void* method)</code>
+
+	result.data.vt = alloca (mono_class_instance_size (klass));
+	stackval args [4];
+
+	if (sig->hasthis)
+		args [0].data.p = obj;
+	else
+		args [0].data.p = NULL;
+	args [1].data.p = params;
+	args [2].data.p = exc;
+	args [3].data.p = target_method;
+
+	InterpMethod *imethod = mono_interp_get_imethod (domain, invoke_wrapper, error);
+	mono_error_assert_ok (error);
+	frame = alloc_frame (context, &result, NULL, imethod, args, &result);
+
+	interp_exec_method (frame, context, error);
+
+	if (context->has_resume_state) {
+		// This can happen on wasm !?
+		MonoException *thrown_exc = (MonoException*) mono_gchandle_get_target_internal (context->exc_gchandle);
+		if (exc)
+			*exc = (MonoObject*)thrown_exc;
+		else
+			mono_error_set_exception_instance (error, thrown_exc);
+		return NULL;
+	}
+	return (MonoObject*)result.data.p;
+}
+
+typedef struct {
+	InterpMethod *rmethod;
+	gpointer this_arg;
+	gpointer res;
+	gpointer args [16];
+	gpointer *many_args;
+} InterpEntryData;
+
+/* Main function for entering the interpreter from compiled code */
+static void
+interp_entry (InterpEntryData *data)
+{
+	InterpFrame *frame;
+	InterpMethod *rmethod;
+	ThreadContext *context;
+	stackval result;
+	stackval *args;
+	stackval *retval;
+	MonoMethod *method;
+	MonoMethodSignature *sig;
+	MonoType *type;
+	gpointer orig_domain = NULL, attach_cookie;
+	int i;
+
+	if ((gsize)data->rmethod & 1) {
+		/* Unbox */
+		data->this_arg = mono_object_unbox_internal ((MonoObject*)data->this_arg);
+		data->rmethod = (InterpMethod*)(gpointer)((gsize)data->rmethod & ~1);
+	}
+	rmethod = data->rmethod;
+
+	if (rmethod->needs_thread_attach)
+		orig_domain = mono_threads_attach_coop (mono_domain_get (), &attach_cookie);
+
+	context = get_context ();
+
+	method = rmethod->method;
+	sig = mono_method_signature_internal (method);
+
+	// FIXME: Optimize this
+
+	//printf ("%s\n", mono_method_full_name (method, 1));
+
+	args = g_newa (stackval, sig->param_count + (sig->hasthis ? 1 : 0));
+	if (sig->hasthis)
+		args [0].data.p = data->this_arg;
+
+	gpointer *params;
+	if (data->many_args)
+		params = data->many_args;
+	else
+		params = data->args;
+	for (i = 0; i < sig->param_count; ++i) {
+		int a_index = i + (sig->hasthis ? 1 : 0);
+		if (sig->params [i]->byref) {
+			args [a_index].data.p = params [i];
+			continue;
+		}
+		type = rmethod->param_types [i];
+		switch (type->type) {
+		case MONO_TYPE_VALUETYPE:
+			args [a_index].data.p = params [i];
+			break;
+		case MONO_TYPE_GENERICINST:
+			if (MONO_TYPE_IS_REFERENCE (type))
+				args [a_index].data.p = *(gpointer*)params [i];
+			else
+				args [a_index].data.vt = params [i];
+			break;
+		default:
+			stackval_from_data (type, &args [a_index], params [i], FALSE);
+			break;
+		}
+	}
+
+	memset (&result, 0, sizeof (result));
+	retval = &result;
+	frame = alloc_frame (context, &result, NULL, data->rmethod, args, retval);
+
+	type = rmetho

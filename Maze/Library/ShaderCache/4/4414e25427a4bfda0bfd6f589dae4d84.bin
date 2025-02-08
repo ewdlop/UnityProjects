@@ -1,0 +1,178 @@
+//
+// MonoTests.System.Xml.XsdValidatingReaderTests.cs
+//
+// Author:
+//	Atsushi Enomoto <ginga@kit.hi-ho.ne.jp>
+//
+// (C)2003 Atsushi Enomoto
+// (C)2005-2007 Novell, Inc.
+//
+using System;
+using System.IO;
+using System.Net;
+using System.Xml;
+using System.Xml.Schema;
+using NUnit.Framework;
+
+using MonoTests.Helpers;
+
+namespace MonoTests.System.Xml
+{
+	[TestFixture]
+	public class XsdValidatingReaderTests
+	{
+		public XsdValidatingReaderTests ()
+		{
+		}
+
+		XmlReader xtr;
+		XmlValidatingReader xvr;
+
+		private XmlValidatingReader PrepareXmlReader (string xml)
+		{
+			XmlReader reader = new XmlTextReader (xml, XmlNodeType.Document, null);
+//			XmlDocument doc = new XmlDocument ();
+//			doc.LoadXml (xml);
+//			XmlReader reader = new XmlNodeReader (doc);
+
+			return new XmlValidatingReader (reader);
+		}
+
+		[Test]
+		public void TestEmptySchema ()
+		{
+			string xml = "<root/>";
+			xvr = PrepareXmlReader (xml);
+			xvr.ValidationType = ValidationType.Schema;
+			xvr.Read ();	// Is is missing schema component.
+		}
+
+		[Test]
+		public void TestSimpleValidation ()
+		{
+			string xml = "<root/>";
+			xvr = PrepareXmlReader (xml);
+			Assert.AreEqual (ValidationType.Auto, xvr.ValidationType);
+			XmlSchema schema = new XmlSchema ();
+			XmlSchemaElement elem = new XmlSchemaElement ();
+			elem.Name = "root";
+			schema.Items.Add (elem);
+			xvr.Schemas.Add (schema);
+			xvr.Read ();	// root
+			Assert.AreEqual (ValidationType.Auto, xvr.ValidationType);
+			xvr.Read ();	// EOF
+
+			xml = "<hoge/>";
+			xvr = PrepareXmlReader (xml);
+			xvr.Schemas.Add (schema);
+			try {
+				xvr.Read ();
+				Assert.Fail ("element mismatch is incorrectly allowed");
+			} catch (XmlSchemaException) {
+			}
+
+			xml = "<hoge xmlns='urn:foo' />";
+			xvr = PrepareXmlReader (xml);
+			xvr.Schemas.Add (schema);
+			try {
+				xvr.Read ();
+				Assert.Fail ("Element in different namespace is incorrectly allowed.");
+			} catch (XmlSchemaException) {
+			}
+		}
+
+		[Test]
+		public void TestReadTypedValueSimple ()
+		{
+			string xml = "<root>12</root>";
+			XmlSchema schema = new XmlSchema ();
+			XmlSchemaElement elem = new XmlSchemaElement ();
+			elem.Name = "root";
+			elem.SchemaTypeName = new XmlQualifiedName ("integer", XmlSchema.Namespace);
+			schema.Items.Add (elem);
+
+			// Lap 1:
+			
+			xvr = PrepareXmlReader (xml);
+			xvr.Schemas.Add (schema);
+			// Read directly from root.
+			object o = xvr.ReadTypedValue ();
+			Assert.AreEqual (ReadState.Initial, xvr.ReadState);
+			Assert.IsNull (o);
+
+			xvr.Read ();	// element root
+			Assert.AreEqual (XmlNodeType.Element, xvr.NodeType);
+			Assert.IsNotNull (xvr.SchemaType);
+			Assert.IsTrue (xvr.SchemaType is XmlSchemaDatatype);
+			o = xvr.ReadTypedValue ();	// read "12"
+			Assert.AreEqual (XmlNodeType.EndElement, xvr.NodeType);
+			Assert.IsNotNull (o);
+			Assert.AreEqual (typeof (decimal), o.GetType ());
+			decimal n = (decimal) o;
+			Assert.AreEqual (12, n);
+			Assert.IsTrue (!xvr.EOF);
+			Assert.AreEqual ("root", xvr.Name);
+			Assert.IsNull (xvr.SchemaType);	// EndElement's type
+
+			// Lap 2:
+
+			xvr = PrepareXmlReader (xml);
+			xvr.Schemas.Add (schema);
+			xvr.Read ();	// root
+			XmlSchemaDatatype dt = xvr.SchemaType as XmlSchemaDatatype;
+			Assert.IsNotNull (dt);
+			Assert.AreEqual (typeof (decimal), dt.ValueType);
+			Assert.AreEqual (XmlTokenizedType.None, dt.TokenizedType);
+			xvr.Read ();	// text "12"
+			Assert.IsNull (xvr.SchemaType);
+			o = xvr.ReadTypedValue ();
+			// ReadTypedValue is different from ReadString().
+			Assert.IsNull (o);
+		}
+
+		[Test]
+		[Ignore ("XML Schema validator should not be available for validating non namespace-aware XmlReader that handled colon as a name character")]
+		public void TestNamespacesFalse ()
+		{
+			// This tests if Namespaces=false is specified, then
+			// the reader's NamespaceURI should be always string.Empty and
+			// validation should be done against such schema that has target ns as "".
+			string xml = "<x:root xmlns:x='urn:foo' />";
+			xvr = PrepareXmlReader (xml);
+			xvr.Namespaces = false;
+			Assert.AreEqual (ValidationType.Auto, xvr.ValidationType);
+			XmlSchema schema = new XmlSchema ();
+			schema.TargetNamespace = "urn:foo";
+			XmlSchemaElement elem = new XmlSchemaElement ();
+			elem.Name = "root";
+			schema.Items.Add (elem);
+			xvr.Schemas.Add (schema);
+			xvr.Read ();	// root
+			Assert.IsTrue (!xvr.Namespaces);
+			Assert.AreEqual ("x:root", xvr.Name);
+			// LocalName may contain colons.
+			Assert.AreEqual ("x:root", xvr.LocalName);
+			// NamespaceURI is not supplied.
+			Assert.AreEqual ("", xvr.NamespaceURI);
+		}
+
+		[Test]
+		public void TestReadTypedAttributeValue ()
+		{
+			string xml = "<root attr='12'></root>";
+			XmlSchema schema = new XmlSchema ();
+			XmlSchemaElement elem = new XmlSchemaElement ();
+			elem.Name = "root";
+			XmlSchemaComplexType ct = new XmlSchemaComplexType ();
+			XmlSchemaAttribute attr = new XmlSchemaAttribute ();
+			attr.Name = "attr";
+			attr.SchemaTypeName = new XmlQualifiedName ("int", XmlSchema.Namespace);
+			ct.Attributes.Add (attr);
+			elem.SchemaType = ct;
+			schema.Items.Add (elem);
+
+			xvr = PrepareXmlReader (xml);
+			xvr.Schemas.Add (schema);
+			xvr.Read ();
+			Assert.AreEqual ("root", xvr.Name);
+			Assert.IsTrue (xvr.Mov

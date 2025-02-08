@@ -1,0 +1,493 @@
+            UErrorCode& status) {
+  return makeInstance(desiredLocale, style, false, status);
+}
+
+NumberFormat*
+NumberFormat::makeInstance(const Locale& desiredLocale,
+                           UNumberFormatStyle style,
+                           UBool mustBeDecimalFormat,
+                           UErrorCode& status) {
+    if (U_FAILURE(status)) return NULL;
+
+    if (style < 0 || style >= UNUM_FORMAT_STYLE_COUNT) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return NULL;
+    }
+
+    // Some styles are not supported. This is a result of merging
+    // the @draft ICU 4.2 NumberFormat::EStyles into the long-existing UNumberFormatStyle.
+    // Ticket #8503 is for reviewing/fixing/merging the two relevant implementations:
+    // this one and unum_open().
+    // The UNUM_PATTERN_ styles are not supported here
+    // because this method does not take a pattern string.
+    if (!isStyleSupported(style)) {
+        status = U_UNSUPPORTED_ERROR;
+        return NULL;
+    }
+
+#if U_PLATFORM_USES_ONLY_WIN32_API
+    if (!mustBeDecimalFormat) {
+        char buffer[8];
+        int32_t count = desiredLocale.getKeywordValue("compat", buffer, sizeof(buffer), status);
+
+        // if the locale has "@compat=host", create a host-specific NumberFormat
+        if (U_SUCCESS(status) && count > 0 && uprv_strcmp(buffer, "host") == 0) {
+            Win32NumberFormat *f = NULL;
+            UBool curr = TRUE;
+
+            switch (style) {
+            case UNUM_DECIMAL:
+                curr = FALSE;
+                // fall-through
+
+            case UNUM_CURRENCY:
+            case UNUM_CURRENCY_ISO: // do not support plural formatting here
+            case UNUM_CURRENCY_PLURAL:
+            case UNUM_CURRENCY_ACCOUNTING:
+                f = new Win32NumberFormat(desiredLocale, curr, status);
+
+                if (U_SUCCESS(status)) {
+                    return f;
+                }
+
+                delete f;
+                break;
+            default:
+                break;
+            }
+        }
+    }
+#endif
+    // Use numbering system cache hashtable
+    umtx_initOnce(gNSCacheInitOnce, &nscacheInit);
+
+    // Get cached numbering system
+    LocalPointer<NumberingSystem> ownedNs;
+    NumberingSystem *ns = NULL;
+    if (NumberingSystem_cache != NULL) {
+        // TODO: Bad hash key usage, see ticket #8504.
+        int32_t hashKey = desiredLocale.hashCode();
+
+        Mutex lock(&nscacheMutex);
+        ns = (NumberingSystem *)uhash_iget(NumberingSystem_cache, hashKey);
+        if (ns == NULL) {
+            ns = NumberingSystem::createInstance(desiredLocale,status);
+            uhash_iput(NumberingSystem_cache, hashKey, (void*)ns, &status);
+        }
+    } else {
+        ownedNs.adoptInstead(NumberingSystem::createInstance(desiredLocale,status));
+        ns = ownedNs.getAlias();
+    }
+
+    // check results of getting a numbering system
+    if (U_FAILURE(status)) {
+        return NULL;
+    }
+
+    if (mustBeDecimalFormat && ns->isAlgorithmic()) {
+        status = U_UNSUPPORTED_ERROR;
+        return NULL;
+    }
+
+    LocalPointer<DecimalFormatSymbols> symbolsToAdopt;
+    UnicodeString pattern;
+    LocalUResourceBundlePointer ownedResource(ures_open(NULL, desiredLocale.getName(), &status));
+    if (U_FAILURE(status)) {
+        // We don't appear to have resource data available -- use the last-resort data
+        status = U_USING_FALLBACK_WARNING;
+        // When the data is unavailable, and locale isn't passed in, last resort data is used.
+        symbolsToAdopt.adoptInstead(new DecimalFormatSymbols(status));
+        if (symbolsToAdopt.isNull()) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+            return NULL;
+        }
+
+        // Creates a DecimalFormat instance with the last resort number patterns.
+        pattern.setTo(TRUE, gLastResortNumberPatterns[style], -1);
+    }
+    else {
+        // Loads the decimal symbols of the desired locale.
+        symbolsToAdopt.adoptInstead(new DecimalFormatSymbols(desiredLocale, status));
+        if (symbolsToAdopt.isNull()) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+            return NULL;
+        }
+
+        UResourceBundle *resource = ownedResource.orphan();
+        UResourceBundle *numElements = ures_getByKeyWithFallback(resource, gNumberElements, NULL, &status);
+        resource = ures_getByKeyWithFallback(numElements, ns->getName(), resource, &status);
+        resource = ures_getByKeyWithFallback(resource, gPatterns, resource, &status);
+        ownedResource.adoptInstead(resource);
+
+        int32_t patLen = 0;
+        const UChar *patResStr = ures_getStringByKeyWithFallback(resource, gFormatKeys[style], &patLen, &status);
+
+        // Didn't find a pattern specific to the numbering system, so fall back to "latn"
+        if ( status == U_MISSING_RESOURCE_ERROR && uprv_strcmp(gLatn,ns->getName())) {  
+            status = U_ZERO_ERROR;
+            resource = ures_getByKeyWithFallback(numElements, gLatn, resource, &status);
+            resource = ures_getByKeyWithFallback(resource, gPatterns, resource, &status);
+            patResStr = ures_getStringByKeyWithFallback(resource, gFormatKeys[style], &patLen, &status);
+        }
+
+        ures_close(numElements);
+
+        // Creates the specified decimal format style of the desired locale.
+        pattern.setTo(TRUE, patResStr, patLen);
+    }
+    if (U_FAILURE(status)) {
+        return NULL;
+    }
+    if(style==UNUM_CURRENCY || style == UNUM_CURRENCY_ISO || style == UNUM_CURRENCY_ACCOUNTING){
+        const UChar* currPattern = symbolsToAdopt->getCurrencyPattern();
+        if(currPattern!=NULL){
+            pattern.setTo(currPattern, u_strlen(currPattern));
+        }
+    }
+
+
+    NumberFormat *f;
+    if (ns->isAlgorithmic()) {
+        UnicodeString nsDesc;
+        UnicodeString nsRuleSetGroup;
+        UnicodeString nsRuleSetName;
+        Locale nsLoc;
+        URBNFRuleSetTag desiredRulesType = URBNF_NUMBERING_SYSTEM;
+
+        nsDesc.setTo(ns->getDescription());
+        int32_t firstSlash = nsDesc.indexOf(gSlash);
+        int32_t lastSlash = nsDesc.lastIndexOf(gSlash);
+        if ( lastSlash > firstSlash ) {
+            CharString nsLocID;
+
+            nsLocID.appendInvariantChars(nsDesc.tempSubString(0, firstSlash), status);
+            nsRuleSetGroup.setTo(nsDesc,firstSlash+1,lastSlash-firstSlash-1);
+            nsRuleSetName.setTo(nsDesc,lastSlash+1);
+
+            nsLoc = Locale::createFromName(nsLocID.data());
+
+            UnicodeString SpelloutRules = UNICODE_STRING_SIMPLE("SpelloutRules");
+            if ( nsRuleSetGroup.compare(SpelloutRules) == 0 ) {
+                desiredRulesType = URBNF_SPELLOUT;
+            }
+        } else {
+            nsLoc = desiredLocale;
+            nsRuleSetName.setTo(nsDesc);
+        }
+
+        RuleBasedNumberFormat *r = new RuleBasedNumberFormat(desiredRulesType,nsLoc,status);
+        if (r == NULL) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+            return NULL;
+        }
+        r->setDefaultRuleSet(nsRuleSetName,status);
+        f = r;
+    } else {
+        // replace single currency sign in the pattern with double currency sign
+        // if the style is UNUM_CURRENCY_ISO
+        if (style == UNUM_CURRENCY_ISO) {
+            pattern.findAndReplace(UnicodeString(TRUE, gSingleCurrencySign, 1),
+                                   UnicodeString(TRUE, gDoubleCurrencySign, 2));
+        }
+
+        // "new DecimalFormat()" does not adopt the symbols if its memory allocation fails.
+        DecimalFormatSymbols *syms = symbolsToAdopt.orphan();
+        f = new DecimalFormat(pattern, syms, style, status);
+        if (f == NULL) {
+            delete syms;
+            status = U_MEMORY_ALLOCATION_ERROR;
+            return NULL;
+        }
+    }
+
+    f->setLocaleIDs(ures_getLocaleByType(ownedResource.getAlias(), ULOC_VALID_LOCALE, &status),
+                    ures_getLocaleByType(ownedResource.getAlias(), ULOC_ACTUAL_LOCALE, &status));
+    if (U_FAILURE(status)) {
+        delete f;
+        return NULL;
+    }
+    return f;
+}
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+//eof
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                   »W’
+¶X–h5½…>óŞÊªª4iŒ<Áq±®‡Ä>:¢ñôõ¯»‚?%;—ŸrAã•ÙcêYÿë£ 6–á×Õ§ÒåR¥–àT*X—ÑN‡ìë4xèCüº|»¤A¶x¥£L/oA­ç/;KîF÷z~İÍc¡+Í‚M2}±GU£YXîúï\™—#@=G/`É”¾£‹¾èÏˆî¯íÚ	¶Ü×ş˜ R¡4%v–*œÜªUx‡tñgD+<´bÊˆSô5
+£¿ğ²«¶çê[¶¼D@oä€l±–?|ˆ(ÎÆ
+à"jæ©²H¾²ƒÉÖ·º‹äHHÄÍ@`,çMğÛ‰·É/ÇœLY›ï‘ Ìƒ6¤­Äîb8£²„‘!;9çÒåº;cİ™$K€¡9ıöâSÍD3‰ÕXÖ”ÓİöK4Ìü?ï÷î´Pûùüv"ôÖÔa]®¤{!»—?Ï)\cñ€‘¤¡¢GÄ@ùö³Ô6
+£¤!ë:j»0äËŸï€7îOÃ0p†°:şNRñ!íK6Çù,z³úzP^Æn?Añ,”ğZİî¾`X4Ÿ@œÔÃ9Èõ ‰DËGh{µ; Ku3µÚ%ReÉ~])³’#©½0Nqq{eóÿÎ8ó¹½íÿÅº“%˜St8Ù5(U*ş¯òèï%q©ÿéŞÒèdğ˜ßA§¹tËªµÄ§Á¿Çc+Øª6Ï¾.Dóü›` ÿ²˜öã€‚mF[bi¸S|J\eoDÑ£°;qG ÛùÑœR#ï‚h¯”±şĞJ1‰mÅôÈ‹ş¦õ’dM<ƒXßº§ÏS¥L¨,P„"Æ~{sêIÖ|ßÒ†ÿ7XA©2Ú•:f^íÎDãú¯t>ÓL&@b‹{]½.şåY©gÇ"7axC·â—ëE(›¹¦pIùXÉ ÏéİqŞâÊÿuc3æb¯º5S[²Êï\s÷‚Õ„BÙD³sI¶¥‡µ'Z¾56[åR°ş]K jNjb¤)%[ĞHº·ı+u«JÈk³‹q,²ÑË3Eõ
+Wñ1nßÑÎYû"§ JÚ \v®¡·‹Áæïõ«ÄxÓÜ¢¥ª:_º5E1ã·;o±~ç¿e?ÏF­%
+U<{ç¬Aôp¹äíôé#M­òÑ.±a€
+)¯—î!e]#¯ß.G%ÓQ-}¹Z">e	 ™<Pû•’OÓ·£BŠŞ(¥BğwÎ‚tEåÌÕç|uŒ„M Óp[&ƒC…€Ê„dMÅ%œg(xËä;Ò‡\êÆ2Rÿ‘¶M_Á‡NHslŸ¹q1Sr²0gjI.ıWÈöö€}Â‹%Ö-mÔó‘ßÑPåR¡’oË`'™£j6I N,r¶GMOKõL"¹0Î+úë?¹ıGªÊñÜk¸kY‹¢<t†´Õ2Â°±©iÉá,e7`õò¹Úd§S¿³ë{mÊnÀïY'ÅÖ¦â 9¨üIŒ¡Acøv>%µNÌ¨1MTY/pà#Ï#Ü§ÏëR X´wëÇ¢ë»¶fá¡EÊİ‡(¿÷c\ú)W
+¡3gôü±ƒJŸª'Dİ#Å‡‘ğL}X K+ì¼›QQ)RÁW@tº»O=O–ö£ëíM(µ“¥$ÒLÄ‰ä$Ÿ—KáŠ“@ElVËâWııñt_sĞ…¾³r³±qOñxŞ®ãU³ÉÒ@¾·0`ÁtGˆë+%¢ïwñnà,L«sè¬~<5e)Ø†¸ò;3Cı=ç¸°İ†!÷	Ó¡-Ø,	¼êìxI&v¼z(Ä!ÎşbšX0!~5äµ0¶	ãe[K‰g½–ú‚óUµEãKºBöSìæÖ{âúıÅ Ü¿hÂœİY
+HA£Åáî:–\QÊ7¾F"ãmûÊL¦!hÀÁéõ7ù"Ä‚N„‹n&İyá:¿¯Æ2ª;œ:.%~öÅ=”Ñ Ü¡I‰åİeAÌ$ïk¨R(†0º:õ=G•×cé£ ÊCGıÖ¼ŞQZª{ÏÜÈ¹§*|Ò,“ÿ‡‡ñä!­;	9–&´_ˆ'W‹|Û¥¶óa[OqÒ¡k|hOÃí¯ƒEJñ7:]‰×ét_9ï3İtíÀg{…Yz}xß{EvÉM<¬Xò€FÀ ½Ã>ô!'w`P„¶Q¿%1ó§¶­èÿÄ»h*@Q¥½09ÓáKD÷>ô#V?8=®¨;¸¸©XúöÌôk‚¥Â-èk$“
+rµL%™¹±qÆQßá‘ä©‚ÖüÔ?µöM´0ÿìÏèìŠHâê]F1£Ï•»=P¨rsüĞyaTx¿(.Y)Â-qÑ[¸‰”æêªş íÛÙ¡œ;|pnRªBÆŞ-5…YZ.ºª{PYBäÔúaW©HÃ,sÚ­…[ŞÃéaárºpÀ5nŒ£h\æ$ú(&%±ÅÅ Û¹|nM'¿TŸüín–ĞÛ¥úõU|0ƒõŞ4£ô“óÛœ7hÊ¿ı§ñ¨võÀÄ	¿:ß´l‚ç£¯'òÎ Åå9‚v#SW`ùá¤Ûë²³˜@£-}ÄÂ‡$³õû>¢”Õ£ÜF^‰»ŸÿİR&òÇD¸÷>¯|¦ •Á³äB…Cr'âûß?ş@ÃVÔ’ÎoÀìåÔÅÃôpûöIìÑ‹às¸Äümõf€“²–äÅ1ÇÄtÀ­+K0Û)~Eõ‚›bb„prÓi™¥&«¨İ"±®i½ÏFæo±ìxœ”pÇ{÷ì9y7~›uøRjSäŸV°åU_Á“.‡îX)ü|r—yêÈóA]3°®_¾‘ëcñqz_±ù‹7´…)3‹oàÀõÛ¤…Ú&Õü¾‘°N’6¸ËvyØÚN W\Ûè?ƒìË„±‚®~_	ƒ“…¾cÃYû>b<­¸0¥‹X³I%Ì
+MÇeX®ÙşgÔ*AœÆ*Ÿœ¹ch
+
+ñÑw"Ü Ö&QùÈÀ(²µùCÁœÙŸ
+î»:¦`ÜGlH|MeX¨"ÔhV¡(äjVã|øÉMÛ'à%x
+'#8\­qÛy4òb¹ÊK0CêE±é	0Úº/ã¬úì˜¼Ûìğü·¤Î3¢‘ó(ÇÄÅÅ–éÈIšÒÎ7‰“—#'@{8Ğ…=Ğ
+Êâÿmš•’‡í ZAy1Q~HpùFç4*Ø:H.3İ9ÎmõÛ¸æ8HÌQ–°`ğ8YS¾k^ Y;è¡o1p?üíf§KH#wmOB!Ø¨¸üˆ½DÚmÛ6¹9³ã^9f+UÓÆ®¦™ÏºcF©ÚéÊRÏçÿøz%¾û|Ã„TüH[¬goäUŒòFÅÎN„¦ˆ“ÕğÏÉ—8ù”ÖÎğ…[Åñ#Ç©^úÇ;_$W@–ˆÔ§oÍ‰hú$zàÚ¨3Ø`P¦²›ùI»wôjøgÓq+£#‘ğÛÉF¢ETÔm‡cıÀsW-@‡¥½¼°=Í’È:%bãÇqãè¸2½úVYH=T_EoÙìÿCó|HÀhu5C+×-H®‹Xii&d™^A_õšî«Æ¼,ŞuÀº)1Â÷dgÅNÊw4§Œ<‡ŞE¦ [6â’Ó&e˜^£ÔâOuË¢©‘‘Ê®KÉm.X¥#KÄwÜÚ‘è>áøxÑ
+¤wéÈíóÕì­}ºıXJŞ¿ØÙmğŸcı¢µÌç/Œ!Ô“s p Ú*³÷	5¤=äûºü>­ÿ’ŠGun İ•Dş:AûqXc‡èzzVF ã…§ J£Ù¶.H™~Øwø Ã‹BëTCDEïX¦ª×ò`pOÑZ4)2€`…êLcárM98aÃP¾ï4lè]!R£œ¹$¾®#”–…İË5ÎŸ…ùŞÉN˜pÄëåæ°Láà‘Ï±U_ÿÔ¸ÅóG-¨ Á€:ãûütF;Ùûu4-ù¨;@A"ÒÉSÙ	ÿPD—\±ı¹|4Ü¢} ŒÖ– ƒfJ8	aµ‹_CfjNÙ{ÔØ 6©·l˜&-¹şV!'hA™Bl¢œÁ½
+üËıdÍ™¤"½É2‰fmß¬Å:ãD°ï	 ¸õ®şi«¦í*õªüã×JŠ¦4•öİ.Á!3¢'ÙcòQ­fîù9aƒÏ=|aÃHˆ>~|wØj0“0ã¡O)àAHyiìUã¥-
+¹ùÃò&Ï¸Èø İî‚2‰¦°‹ÉĞƒñ1 õ¬]
+•š°—¡ ;õ'm‹ÛÁf»2Àû?pg
+f)j–ÎìXJä÷|?% ì&Í¼á0YÅó¤İÜ‰|ƒ¨tp+ıOS‚ÑABX0}Ü2aÑãµx*A.Û[Õ—\ªÙ$rã?¦5Öy±a2azV”A½-%TäHØà¼dİ0~ìCãw“˜Úº»#Û#&¥,ˆ‰ÿëF<UgÂNÍÿÛ5•f•­d°rÜ_ğóüĞaÕE`ı§n5"M;lDÒ Ë`—W†=Aº5ZFD/ôP
+gÕ ş¶ÛŒå]¨vFêb„Õ|xo6“#àÄ;4¿ÎIĞoÑ–huHO`â=ö.#ÙÎyöüAaªÑÔáWÚôC:ï¥nĞ™ÏºÍZ2ËP/*
+**********************************************************************
+* Copyright (c) 2003-2013, International Business Machines
+* Corporation and others.  All Rights Reserved.
+**********************************************************************
+* Author: Alan Liu
+* Created: July 21 2003
+* Since: ICU 2.8
+**********************************************************************
+*/
+
+#include "utypeinfo.h"  // for 'typeid' to work
+
+#include "olsontz.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/ures.h"
+#include "unicode/simpletz.h"
+#include "unicode/gregocal.h"
+#include "gregoimp.h"
+#include "cmemory.h"
+#include "uassert.h"
+#include "uvector.h"
+#include <float.h> // DBL_MAX
+#include "uresimp.h" // struct UResourceBundle
+#include "zonemeta.h"
+#include "umutex.h"
+
+#ifdef U_DEBUG_TZ
+# include <stdio.h>
+# include "uresimp.h" // for debugging
+
+static void debug_tz_loc(const char *f, int32_t l)
+{
+  fprintf(stderr, "%s:%d: ", f, l);
+}
+
+static void debug_tz_msg(const char *pat, ...)
+{
+  va_list ap;
+  va_start(ap, pat);
+  vfprintf(stderr, pat, ap);
+  fflush(stderr);
+}
+// must use double parens, i.e.:  U_DEBUG_TZ_MSG(("four is: %d",4));
+#define U_DEBUG_TZ_MSG(x) {debug_tz_loc(__FILE__,__LINE__);debug_tz_msg x;}
+#else
+#define U_DEBUG_TZ_MSG(x)
+#endif
+
+static UBool arrayEqual(const void *a1, const void *a2, int32_t size) {
+    if (a1 == NULL && a2 == NULL) {
+        return TRUE;
+    }
+    if ((a1 != NULL && a2 == NULL) || (a1 == NULL && a2 != NULL)) {
+        return FALSE;
+    }
+    if (a1 == a2) {
+        return TRUE;
+    }
+
+    return (uprv_memcmp(a1, a2, size) == 0);
+}
+
+U_NAMESPACE_BEGIN
+
+#define kTRANS          "trans"
+#define kTRANSPRE32     "transPre32"
+#define kTRANSPOST32    "transPost32"
+#define kTYPEOFFSETS    "typeOffsets"
+#define kTYPEMAP        "typeMap"
+#define kLINKS          "links"
+#define kFINALRULE      "finalRule"
+#define kFINALRAW       "finalRaw"
+#define kFINALYEAR      "finalYear"
+
+#define SECONDS_PER_DAY (24*60*60)
+
+static const int32_t ZEROS[] = {0,0};
+
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(OlsonTimeZone)
+
+/**
+ * Default constructor.  Creates a time zone with an empty ID and
+ * a fixed GMT offset of zero.
+ */
+/*OlsonTimeZone::OlsonTimeZone() : finalYear(INT32_MAX), finalMillis(DBL_MAX), finalZone(0), transitionRulesInitialized(FALSE) {
+    clearTransitionRules();
+    constructEmpty();
+}*/
+
+/**
+ * Construct a GMT+0 zone with no transitions.  This is done when a
+ * constructor fails so the resultant object is well-behaved.
+ */
+void OlsonTimeZone::constructEmpty() {
+    canonicalID = NULL;
+
+    transitionCountPre32 = transitionCount32 = transitionCountPost32 = 0;
+    transitionTimesPre32 = transitionTimes32 = transitionTimesPost32 = NULL;
+
+    typeMapData = NULL;
+
+    typeCount = 1;
+    typeOffsets = ZEROS;
+
+    finalZone = NULL;
+}
+
+/**
+ * Construct from a resource bundle
+ * @param top the top-level zoneinfo resource bundle.  This is used
+ * to lookup the rule that `res' may refer to, if there is one.
+ * @param res the resource bundle of the zone to be constructed
+ * @param ec input-output error code
+ */
+OlsonTimeZone::OlsonTimeZone(const UResourceBundle* top,
+                             const UResourceBundle* res,
+                             const UnicodeString& tzid,
+                             UErrorCode& ec) :
+  BasicTimeZone(tzid), finalZone(NULL)
+{
+    clearTransitionRules();
+    U_DEBUG_TZ_MSG(("OlsonTimeZone(%s)\n", ures_getKey((UResourceBundle*)res)));
+    if ((top == NULL || res == NULL) && U_SUCCESS(ec)) {
+        ec = U_ILLEGAL_ARGUMENT_ERROR;
+    }
+    if (U_SUCCESS(ec)) {
+        // TODO -- clean up -- Doesn't work if res points to an alias
+        //        // TODO remove nonconst casts below when ures_* API is fixed
+        //        setID(ures_getKey((UResourceBundle*) res)); // cast away const
+
+        int32_t len;
+        UResourceBundle r;
+        ures_initStackObject(&r);
+
+        // Pre-32bit second transitions
+        ures_getByKey(res, kTRANSPRE32, &r, &ec);
+        transitionTimesPre32 = ures_getIntVector(&r, &len, &ec);
+        transitionCountPre32 = len >> 1;
+        if (ec == U_MISSING_RESOURCE_ERROR) {
+            // No pre-32bit transitions
+            transitionTimesPre32 = NULL;
+            transitionCountPre32 = 0;
+            ec = U_ZERO_ERROR;
+        } else if (U_SUCCESS(ec) && (len < 0 || len > 0x7FFF || (len & 1) != 0) /* len must be even */) {
+            ec = U_INVALID_FORMAT_ERROR;
+        }
+
+        // 32bit second transitions
+        ures_getByKey(res, kTRANS, &r, &ec);
+        transitionTimes32 = ures_getIntVector(&r, &len, &ec);
+        transitionCount32 = len;
+        if (ec == U_MISSING_RESOURCE_ERROR) {
+            // No 32bit transitions
+            transitionTimes32 = NULL;
+            transitionCount32 = 0;
+            ec = U_ZERO_ERROR;
+        } else if (U_SUCCESS(ec) && (len < 0 || len > 0x7FFF)) {
+            ec = U_INVALID_FORMAT_ERROR;
+        }
+
+        // Post-32bit second transitions
+        ures_getByKey(res, kTRANSPOST32, &r, &ec);
+        transitionTimesPost32 = ures_getIntVector(&r, &len, &ec);
+        transitionCountPost32 = len >> 1;
+        if (ec == U_MISSING_RESOURCE_ERROR) {
+            // No pre-32bit transitions
+            transitionTimesPost32 = NULL;
+            transitionCountPost32 = 0;
+            ec = U_ZERO_ERROR;
+        } else if (U_SUCCESS(ec) && (len < 0 || len > 0x7FFF || (len & 1) != 0) /* len must be even */) {
+            ec = U_INVALID_FORMAT_ERROR;
+        }
+
+        // Type offsets list must be of even size, with size >= 2
+        ures_getByKey(res, kTYPEOFFSETS, &r, &ec);
+        typeOffsets = ures_getIntVector(&r, &len, &ec);
+        if (U_SUCCESS(ec) && (len < 2 || len > 0x7FFE || (len & 1) != 0)) {
+            ec = U_INVALID_FORMAT_ERROR;
+        }
+        typeCount = (int16_t) len >> 1;
+
+        // Type map data must be of the same size as the transition count
+        typeMapData =  NULL;
+        if (transitionCount() > 0) {
+            ures_getByKey(res, kTYPEMAP, &r, &ec);
+            typeMapData = ures_getBinary(&r, &len, &ec);
+            if (ec == U_MISSING_RESOURCE_ERROR) {
+                // no type mapping data
+                ec = U_INVALID_FORMAT_ERROR;
+            } else if (U_SUCCESS(ec) && len != transitionCount()) {
+                ec = U_INVALID_FORMAT_ERROR;
+            }
+        }
+
+        // Process final rule and data, if any
+        const UChar *ruleIdUStr = ures_getStringByKey(res, kFINALRULE, &len, &ec);
+        ures_getByKey(res, kFINALRAW, &r, &ec);
+        int32_t ruleRaw = ures_getInt(&r, &ec);
+        ures_getByKey(res, kFINALYEAR, &r, &ec);
+        int32_t ruleYear = ures_getInt(&r, &ec);
+        if (U_SUCCESS(ec)) {
+            UnicodeString ruleID(TRUE, ruleIdUStr, len);
+            UResourceBundle *rule = TimeZone::loadRule(top, ruleID, NULL, ec);
+            const int32_t *ruleData = ures_getIntVector(rule, &len, &ec); 
+            if (U_SUCCESS(ec) && len == 11) {
+                UnicodeString emptyStr;
+                finalZone = new SimpleTimeZone(
+                    ruleRaw * U_MILLIS_PER_SECOND,
+                    emptyStr,
+                    (int8_t)ruleData[0], (int8_t)ruleData[1], (int8_t)ruleData[2],
+                    ruleData[3] * U_MILLIS_PER_SECOND,
+                    (SimpleTimeZone::TimeMode) ruleData[4],
+                    (int8_t)ruleData[5], (int8_t)ruleData[6], (int8_t)ruleData[7],
+                    ruleData[8] * U_MILLIS_PER_SECOND,
+                    (SimpleTimeZone::TimeMode) ruleData[9],
+                    ruleData[10] * U_MILLIS_PER_SECOND, ec);
+                if (finalZone == NULL) {
+                    ec = U_MEMORY_ALLOCATION_ERROR;
+                } else {
+                    finalStartYear = ruleYear;
+
+                    // Note: Setting finalStartYear to the finalZone is problematic.  When a date is around
+                    // year boundary, SimpleTimeZone may return false result when DST is observed at the 
+                    // beginning of year.  We could apply safe margin (day or two), but when one of recurrent
+                    // rules falls around year boundary, it could return false result.  Without setting the
+                    // start year, finalZone works fine around the year boundary of the start year.
+
+                    // finalZone->setStartYear(finalStartYear);
+
+
+                    // Compute the millis for Jan 1, 0:00 GMT of the finalYear
+
+                    // Note: finalStartMillis is used for detecting either if
+                    // historic transition data or finalZone to be used.  In an
+                    // extreme edge case - for example, two transitions fall into
+                    // small windows of time around the year boundary, this may
+                    // result incorrect offset computation.  But I think it will
+                    // never happen practically.  Yoshito - Feb 20, 2010
+                    finalStartMillis = Grego::fieldsToDay(finalStartYear, 0, 1) * U_MILLIS_PER_DAY;
+                }
+            } else {
+                ec = U_INVALID_FORMAT_ERROR;
+            }
+            ures_close(rule);
+        } else if (ec == U_MISSING_RESOURCE_ERROR) {
+            // No final zone
+            ec = U_ZERO_ERROR;
+        }
+        ures_close(&r);
+
+        // initialize canonical ID
+      

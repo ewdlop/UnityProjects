@@ -1,0 +1,96 @@
+
+	// If a thread reaches 1) after the thread pool signaled wake up,
+	// the wake up sync gets reset and all other threads which have not
+	// passed 4) already will wait forever.
+	// The code below makes sure that on shutdown, the wake up signal gets
+	// sent again after it was reset
+	//
+	if (mShuttingDown)
+	{
+		mWorkReady.set();
+	}
+}
+
+
+CpuWorkerThread::CpuWorkerThread()
+	:	mQueueEntryPool(TASK_QUEUE_ENTRY_POOL_SIZE)
+	,	mThreadId(0)
+{
+}
+
+
+CpuWorkerThread::~CpuWorkerThread()
+{
+}
+
+
+void CpuWorkerThread::initialize(DefaultCpuDispatcher* ownerDispatcher)
+{
+	mOwner = ownerDispatcher;
+}
+
+
+bool CpuWorkerThread::tryAcceptJobToLocalQueue(PxBaseTask& task, shdfnd::Thread::Id taskSubmitionThread)
+{
+	if (taskSubmitionThread == mThreadId)
+	{
+		SharedQueueEntry* entry = mQueueEntryPool.getEntry(&task);
+		if (entry)
+		{
+			mLocalJobList.push(*entry);
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	return false;
+}
+
+
+PxBaseTask* CpuWorkerThread::giveUpJob()
+{
+	return TaskQueueHelper::fetchTask(mLocalJobList, mQueueEntryPool);
+}
+
+
+void CpuWorkerThread::execute()
+{
+	mThreadId = getId();
+
+	while (!quitIsSignalled())
+	{
+		mOwner->resetWakeSignal();
+
+		PxBaseTask* task = TaskQueueHelper::fetchTask(mLocalJobList, mQueueEntryPool);
+
+		if (!task)
+		{
+			task = mOwner->getJob();
+		}
+
+		if (!task)
+		{
+			task = mOwner->stealJob();
+		}
+
+		if (task)
+		{
+#if PHYSX_PROFILE_SDK
+			if (mApexPvdClient!=NULL)
+			{
+				PX_PROFILE_ZONE(task->getName(), task->getContextId());
+				task->run();
+			}
+			else
+			{
+				task->run();
+			}
+#else
+			task->run();
+#endif
+			task->release();
+		}
+		el

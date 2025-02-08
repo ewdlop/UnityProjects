@@ -1,0 +1,54 @@
+                 &bytesSent);
+                    GC.KeepAlive(socket); // small extra safe guard against handle getting collected/finalized while P/Invoke in progress
+
+                    sent = checked((int)bytesSent);
+                }
+            }
+            finally
+            {
+                // Free GC handles.
+                for (int i = 0; i < iovCount; i++)
+                {
+                    if (handles[i].IsAllocated)
+                    {
+                        handles[i].Free();
+                    }
+                }
+            }
+
+            if (errno != Interop.Error.SUCCESS)
+            {
+                return -1;
+            }
+
+            // Update position.
+            int endIndex = bufferIndex, endOffset = offset, unconsumed = sent;
+            for (; endIndex < buffers.Count && unconsumed > 0; endIndex++, endOffset = 0)
+            {
+                int space = buffers[endIndex].Count - endOffset;
+                if (space > unconsumed)
+                {
+                    endOffset += unconsumed;
+                    break;
+                }
+                unconsumed -= space;
+            }
+
+            bufferIndex = endIndex;
+            offset = endOffset;
+
+            return sent;
+        }
+
+        private static unsafe long SendFile(SafeCloseSocket socket, SafeFileHandle fileHandle, ref long offset, ref long count, out Interop.Error errno)
+        {
+            long bytesSent; 
+            errno = Interop.Sys.SendFile(socket, fileHandle, offset, count, out bytesSent);
+            offset += bytesSent;
+            count -= bytesSent;
+            return bytesSent;
+        }
+
+        private static unsafe int Receive(SafeCloseSocket socket, SocketFlags flags, IList<ArraySegment<byte>> buffers, byte[] socketAddress, ref int socketAddressLen, out SocketFlags receivedFlags, out Interop.Error errno)
+        {
+       

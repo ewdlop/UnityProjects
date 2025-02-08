@@ -1,0 +1,233 @@
+/* crypto/ts/ts.h */
+/*
+ * Written by Zoltan Glozik (zglozik@opentsa.org) for the OpenSSL project
+ * 2002, 2003, 2004.
+ */
+/* ====================================================================
+ * Copyright (c) 2006 The OpenSSL Project.  All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in
+ *    the documentation and/or other materials provided with the
+ *    distribution.
+ *
+ * 3. All advertising materials mentioning features or use of this
+ *    software must display the following acknowledgment:
+ *    "This product includes software developed by the OpenSSL Project
+ *    for use in the OpenSSL Toolkit. (http://www.OpenSSL.org/)"
+ *
+ * 4. The names "OpenSSL Toolkit" and "OpenSSL Project" must not be used to
+ *    endorse or promote products derived from this software without
+ *    prior written permission. For written permission, please contact
+ *    licensing@OpenSSL.org.
+ *
+ * 5. Products derived from this software may not be called "OpenSSL"
+ *    nor may "OpenSSL" appear in their names without prior written
+ *    permission of the OpenSSL Project.
+ *
+ * 6. Redistributions of any form whatsoever must retain the following
+ *    acknowledgment:
+ *    "This product includes software developed by the OpenSSL Project
+ *    for use in the OpenSSL Toolkit (http://www.OpenSSL.org/)"
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE OpenSSL PROJECT ``AS IS'' AND ANY
+ * EXPRESSED OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE OpenSSL PROJECT OR
+ * ITS CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+ * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
+ * OF THE POSSIBILITY OF SUCH DAMAGE.
+ * ====================================================================
+ *
+ * This product includes cryptographic software written by Eric Young
+ * (eay@cryptsoft.com).  This product includes software written by Tim
+ * Hudson (tjh@cryptsoft.com).
+ *
+ */
+
+#ifndef HEADER_TS_H
+# define HEADER_TS_H
+
+# include <openssl/opensslconf.h>
+# include <openssl/symhacks.h>
+# ifndef OPENSSL_NO_BUFFER
+#  include <openssl/buffer.h>
+# endif
+# ifndef OPENSSL_NO_EVP
+#  include <openssl/evp.h>
+# endif
+# ifndef OPENSSL_NO_BIO
+#  include <openssl/bio.h>
+# endif
+# include <openssl/stack.h>
+# include <openssl/asn1.h>
+# include <openssl/safestack.h>
+
+# ifndef OPENSSL_NO_RSA
+#  include <openssl/rsa.h>
+# endif
+
+# ifndef OPENSSL_NO_DSA
+#  include <openssl/dsa.h>
+# endif
+
+# ifndef OPENSSL_NO_DH
+#  include <openssl/dh.h>
+# endif
+
+#ifdef  __cplusplus
+extern "C" {
+#endif
+
+# ifdef WIN32
+/* Under Win32 this is defined in wincrypt.h */
+#  undef X509_NAME
+# endif
+
+# include <openssl/x509.h>
+# include <openssl/x509v3.h>
+
+/*-
+MessageImprint ::= SEQUENCE  {
+     hashAlgorithm                AlgorithmIdentifier,
+     hashedMessage                OCTET STRING  }
+*/
+
+typedef struct TS_msg_imprint_st {
+    X509_ALGOR *hash_algo;
+    ASN1_OCTET_STRING *hashed_msg;
+} TS_MSG_IMPRINT;
+
+/*-
+TimeStampReq ::= SEQUENCE  {
+   version                  INTEGER  { v1(1) },
+   messageImprint           MessageImprint,
+     --a hash algorithm OID and the hash value of the data to be
+     --time-stamped
+   reqPolicy                TSAPolicyId                OPTIONAL,
+   nonce                    INTEGER                    OPTIONAL,
+   certReq                  BOOLEAN                    DEFAULT FALSE,
+   extensions               [0] IMPLICIT Extensions    OPTIONAL  }
+*/
+
+typedef struct TS_req_st {
+    ASN1_INTEGER *version;
+    TS_MSG_IMPRINT *msg_imprint;
+    ASN1_OBJECT *policy_id;     /* OPTIONAL */
+    ASN1_INTEGER *nonce;        /* OPTIONAL */
+    ASN1_BOOLEAN cert_req;      /* DEFAULT FALSE */
+    STACK_OF(X509_EXTENSION) *extensions; /* [0] OPTIONAL */
+} TS_REQ;
+
+/*-
+Accuracy ::= SEQUENCE {
+                seconds        INTEGER           OPTIONAL,
+                millis     [0] INTEGER  (1..999) OPTIONAL,
+                micros     [1] INTEGER  (1..999) OPTIONAL  }
+*/
+
+typedef struct TS_accuracy_st {
+    ASN1_INTEGER *seconds;
+    ASN1_INTEGER *millis;
+    ASN1_INTEGER *micros;
+} TS_ACCURACY;
+
+/*-
+TSTInfo ::= SEQUENCE  {
+    version                      INTEGER  { v1(1) },
+    policy                       TSAPolicyId,
+    messageImprint               MessageImprint,
+      -- MUST have the same value as the similar field in
+      -- TimeStampReq
+    serialNumber                 INTEGER,
+     -- Time-Stamping users MUST be ready to accommodate integers
+     -- up to 160 bits.
+    genTime                      GeneralizedTime,
+    accuracy                     Accuracy                 OPTIONAL,
+    ordering                     BOOLEAN             DEFAULT FALSE,
+    nonce                        INTEGER                  OPTIONAL,
+      -- MUST be present if the similar field was present
+      -- in TimeStampReq.  In that case it MUST have the same value.
+    tsa                          [0] GeneralName          OPTIONAL,
+    extensions                   [1] IMPLICIT Extensions  OPTIONAL   }
+*/
+
+typedef struct TS_tst_info_st {
+    ASN1_INTEGER *version;
+    ASN1_OBJECT *policy_id;
+    TS_MSG_IMPRINT *msg_imprint;
+    ASN1_INTEGER *serial;
+    ASN1_GENERALIZEDTIME *time;
+    TS_ACCURACY *accuracy;
+    ASN1_BOOLEAN ordering;
+    ASN1_INTEGER *nonce;
+    GENERAL_NAME *tsa;
+    STACK_OF(X509_EXTENSION) *extensions;
+} TS_TST_INFO;
+
+/*-
+PKIStatusInfo ::= SEQUENCE {
+    status        PKIStatus,
+    statusString  PKIFreeText     OPTIONAL,
+    failInfo      PKIFailureInfo  OPTIONAL  }
+
+From RFC 1510 - section 3.1.1:
+PKIFreeText ::= SEQUENCE SIZE (1..MAX) OF UTF8String
+        -- text encoded as UTF-8 String (note:  each UTF8String SHOULD
+        -- include an RFC 1766 language tag to indicate the language
+        -- of the contained text)
+*/
+
+/* Possible values for status. See ts_resp_print.c && ts_resp_verify.c. */
+
+# define TS_STATUS_GRANTED                       0
+# define TS_STATUS_GRANTED_WITH_MODS             1
+# define TS_STATUS_REJECTION                     2
+# define TS_STATUS_WAITING                       3
+# define TS_STATUS_REVOCATION_WARNING            4
+# define TS_STATUS_REVOCATION_NOTIFICATION       5
+
+/*
+ * Possible values for failure_info. See ts_resp_print.c && ts_resp_verify.c
+ */
+
+# define TS_INFO_BAD_ALG                 0
+# define TS_INFO_BAD_REQUEST             2
+# define TS_INFO_BAD_DATA_FORMAT         5
+# define TS_INFO_TIME_NOT_AVAILABLE      14
+# define TS_INFO_UNACCEPTED_POLICY       15
+# define TS_INFO_UNACCEPTED_EXTENSION    16
+# define TS_INFO_ADD_INFO_NOT_AVAILABLE  17
+# define TS_INFO_SYSTEM_FAILURE          25
+
+typedef struct TS_status_info_st {
+    ASN1_INTEGER *status;
+    STACK_OF(ASN1_UTF8STRING) *text;
+    ASN1_BIT_STRING *failure_info;
+} TS_STATUS_INFO;
+
+DECLARE_STACK_OF(ASN1_UTF8STRING)
+DECLARE_ASN1_SET_OF(ASN1_UTF8STRING)
+
+/*-
+TimeStampResp ::= SEQUENCE  {
+     status                  PKIStatusInfo,
+     timeStampToken          TimeStampToken     OPTIONAL }
+*/
+
+typedef struct TS_resp_st {
+    TS_STATUS_INFO *status_info;
+    PKCS7 *token;
+    TS_TST_INFO *tst_info;

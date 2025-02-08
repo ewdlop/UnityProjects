@@ -1,0 +1,331 @@
+;
+		bmap = isl_basic_map_gauss(bmap, &progress);
+		/* requires equalities in normal form */
+		bmap = normalize_divs(bmap, &progress);
+		bmap = isl_basic_map_remove_duplicate_constraints(bmap,
+								&progress, 1);
+		if (bmap && progress)
+			ISL_F_CLR(bmap, ISL_BASIC_MAP_REDUCED_COEFFICIENTS);
+	}
+	return bmap;
+}
+
+struct isl_basic_set *isl_basic_set_simplify(struct isl_basic_set *bset)
+{
+	return bset_from_bmap(isl_basic_map_simplify(bset_to_bmap(bset)));
+}
+
+
+isl_bool isl_basic_map_is_div_constraint(__isl_keep isl_basic_map *bmap,
+	isl_int *constraint, unsigned div)
+{
+	unsigned pos;
+
+	if (!bmap)
+		return isl_bool_error;
+
+	pos = 1 + isl_space_dim(bmap->dim, isl_dim_all) + div;
+
+	if (isl_int_eq(constraint[pos], bmap->div[div][0])) {
+		int neg;
+		isl_int_sub(bmap->div[div][1],
+				bmap->div[div][1], bmap->div[div][0]);
+		isl_int_add_ui(bmap->div[div][1], bmap->div[div][1], 1);
+		neg = isl_seq_is_neg(constraint, bmap->div[div]+1, pos);
+		isl_int_sub_ui(bmap->div[div][1], bmap->div[div][1], 1);
+		isl_int_add(bmap->div[div][1],
+				bmap->div[div][1], bmap->div[div][0]);
+		if (!neg)
+			return isl_bool_false;
+		if (isl_seq_first_non_zero(constraint+pos+1,
+					    bmap->n_div-div-1) != -1)
+			return isl_bool_false;
+	} else if (isl_int_abs_eq(constraint[pos], bmap->div[div][0])) {
+		if (!isl_seq_eq(constraint, bmap->div[div]+1, pos))
+			return isl_bool_false;
+		if (isl_seq_first_non_zero(constraint+pos+1,
+					    bmap->n_div-div-1) != -1)
+			return isl_bool_false;
+	} else
+		return isl_bool_false;
+
+	return isl_bool_true;
+}
+
+isl_bool isl_basic_set_is_div_constraint(__isl_keep isl_basic_set *bset,
+	isl_int *constraint, unsigned div)
+{
+	return isl_basic_map_is_div_constraint(bset, constraint, div);
+}
+
+
+/* If the only constraints a div d=floor(f/m)
+ * appears in are its two defining constraints
+ *
+ *	f - m d >=0
+ *	-(f - (m - 1)) + m d >= 0
+ *
+ * then it can safely be removed.
+ */
+static isl_bool div_is_redundant(__isl_keep isl_basic_map *bmap, int div)
+{
+	int i;
+	unsigned pos = 1 + isl_space_dim(bmap->dim, isl_dim_all) + div;
+
+	for (i = 0; i < bmap->n_eq; ++i)
+		if (!isl_int_is_zero(bmap->eq[i][pos]))
+			return isl_bool_false;
+
+	for (i = 0; i < bmap->n_ineq; ++i) {
+		isl_bool red;
+
+		if (isl_int_is_zero(bmap->ineq[i][pos]))
+			continue;
+		red = isl_basic_map_is_div_constraint(bmap, bmap->ineq[i], div);
+		if (red < 0 || !red)
+			return red;
+	}
+
+	for (i = 0; i < bmap->n_div; ++i) {
+		if (isl_int_is_zero(bmap->div[i][0]))
+			continue;
+		if (!isl_int_is_zero(bmap->div[i][1+pos]))
+			return isl_bool_false;
+	}
+
+	return isl_bool_true;
+}
+
+/*
+ * Remove divs that don't occur in any of the constraints or other divs.
+ * These can arise when dropping constraints from a basic map or
+ * when the divs of a basic map have been temporarily aligned
+ * with the divs of another basic map.
+ */
+static __isl_give isl_basic_map *remove_redundant_divs(
+	__isl_take isl_basic_map *bmap)
+{
+	int i;
+
+	if (!bmap)
+		return NULL;
+
+	for (i = bmap->n_div-1; i >= 0; --i) {
+		isl_bool redundant;
+
+		redundant = div_is_redundant(bmap, i);
+		if (redundant < 0)
+			return isl_basic_map_free(bmap);
+		if (!redundant)
+			continue;
+		bmap = isl_basic_map_drop_div(bmap, i);
+	}
+	return bmap;
+}
+
+/* Mark "bmap" as final, without checking for obviously redundant
+ * integer divisions.  This function should be used when "bmap"
+ * is known not to involve any such integer divisions.
+ */
+__isl_give isl_basic_map *isl_basic_map_mark_final(
+	__isl_take isl_basic_map *bmap)
+{
+	if (!bmap)
+		return NULL;
+	ISL_F_SET(bmap, ISL_BASIC_SET_FINAL);
+	return bmap;
+}
+
+/* Mark "bmap" as final, after removing obviously redundant integer divisions.
+ */
+__isl_give isl_basic_map *isl_basic_map_finalize(__isl_take isl_basic_map *bmap)
+{
+	bmap = remove_redundant_divs(bmap);
+	bmap = isl_basic_map_mark_final(bmap);
+	return bmap;
+}
+
+struct isl_basic_set *isl_basic_set_finalize(struct isl_basic_set *bset)
+{
+	return bset_from_bmap(isl_basic_map_finalize(bset_to_bmap(bset)));
+}
+
+/* Remove definition of any div that is defined in terms of the given variable.
+ * The div itself is not removed.  Functions such as
+ * eliminate_divs_ineq depend on the other divs remaining in place.
+ */
+static __isl_give isl_basic_map *remove_dependent_vars(
+	__isl_take isl_basic_map *bmap, int pos)
+{
+	int i;
+
+	if (!bmap)
+		return NULL;
+
+	for (i = 0; i < bmap->n_div; ++i) {
+		if (isl_int_is_zero(bmap->div[i][0]))
+			continue;
+		if (isl_int_is_zero(bmap->div[i][1+1+pos]))
+			continue;
+		bmap = isl_basic_map_mark_div_unknown(bmap, i);
+		if (!bmap)
+			return NULL;
+	}
+	return bmap;
+}
+
+/* Eliminate the specified variables from the constraints using
+ * Fourier-Motzkin.  The variables themselves are not removed.
+ */
+__isl_give isl_basic_map *isl_basic_map_eliminate_vars(
+	__isl_take isl_basic_map *bmap, unsigned pos, unsigned n)
+{
+	int d;
+	int i, j, k;
+	unsigned total;
+	int need_gauss = 0;
+
+	if (n == 0)
+		return bmap;
+	if (!bmap)
+		return NULL;
+	total = isl_basic_map_total_dim(bmap);
+
+	bmap = isl_basic_map_cow(bmap);
+	for (d = pos + n - 1; d >= 0 && d >= pos; --d)
+		bmap = remove_dependent_vars(bmap, d);
+	if (!bmap)
+		return NULL;
+
+	for (d = pos + n - 1;
+	     d >= 0 && d >= total - bmap->n_div && d >= pos; --d)
+		isl_seq_clr(bmap->div[d-(total-bmap->n_div)], 2+total);
+	for (d = pos + n - 1; d >= 0 && d >= pos; --d) {
+		int n_lower, n_upper;
+		if (!bmap)
+			return NULL;
+		for (i = 0; i < bmap->n_eq; ++i) {
+			if (isl_int_is_zero(bmap->eq[i][1+d]))
+				continue;
+			eliminate_var_using_equality(bmap, d, bmap->eq[i], 0, NULL);
+			isl_basic_map_drop_equality(bmap, i);
+			need_gauss = 1;
+			break;
+		}
+		if (i < bmap->n_eq)
+			continue;
+		n_lower = 0;
+		n_upper = 0;
+		for (i = 0; i < bmap->n_ineq; ++i) {
+			if (isl_int_is_pos(bmap->ineq[i][1+d]))
+				n_lower++;
+			else if (isl_int_is_neg(bmap->ineq[i][1+d]))
+				n_upper++;
+		}
+		bmap = isl_basic_map_extend_constraints(bmap,
+				0, n_lower * n_upper);
+		if (!bmap)
+			goto error;
+		for (i = bmap->n_ineq - 1; i >= 0; --i) {
+			int last;
+			if (isl_int_is_zero(bmap->ineq[i][1+d]))
+				continue;
+			last = -1;
+			for (j = 0; j < i; ++j) {
+				if (isl_int_is_zero(bmap->ineq[j][1+d]))
+					continue;
+				last = j;
+				if (isl_int_sgn(bmap->ineq[i][1+d]) ==
+				    isl_int_sgn(bmap->ineq[j][1+d]))
+					continue;
+				k = isl_basic_map_alloc_inequality(bmap);
+				if (k < 0)
+					goto error;
+				isl_seq_cpy(bmap->ineq[k], bmap->ineq[i],
+						1+total);
+				isl_seq_elim(bmap->ineq[k], bmap->ineq[j],
+						1+d, 1+total, NULL);
+			}
+			isl_basic_map_drop_inequality(bmap, i);
+			i = last + 1;
+		}
+		if (n_lower > 0 && n_upper > 0) {
+			bmap = isl_basic_map_normalize_constraints(bmap);
+			bmap = isl_basic_map_remove_duplicate_constraints(bmap,
+								    NULL, 0);
+			bmap = isl_basic_map_gauss(bmap, NULL);
+			bmap = isl_basic_map_remove_redundancies(bmap);
+			need_gauss = 0;
+			if (!bmap)
+				goto error;
+			if (ISL_F_ISSET(bmap, ISL_BASIC_MAP_EMPTY))
+				break;
+		}
+	}
+	ISL_F_CLR(bmap, ISL_BASIC_MAP_NORMALIZED);
+	if (need_gauss)
+		bmap = isl_basic_map_gauss(bmap, NULL);
+	return bmap;
+error:
+	isl_basic_map_free(bmap);
+	return NULL;
+}
+
+struct isl_basic_set *isl_basic_set_eliminate_vars(
+	struct isl_basic_set *bset, unsigned pos, unsigned n)
+{
+	return bset_from_bmap(isl_basic_map_eliminate_vars(bset_to_bmap(bset),
+								pos, n));
+}
+
+/* Eliminate the specified n dimensions starting at first from the
+ * constraints, without removing the dimensions from the space.
+ * If the set is rational, the dimensions are eliminated using Fourier-Motzkin.
+ * Otherwise, they are projected out and the original space is restored.
+ */
+__isl_give isl_basic_map *isl_basic_map_eliminate(
+	__isl_take isl_basic_map *bmap,
+	enum isl_dim_type type, unsigned first, unsigned n)
+{
+	isl_space *space;
+
+	if (!bmap)
+		return NULL;
+	if (n == 0)
+		return bmap;
+
+	if (first + n > isl_basic_map_dim(bmap, type) || first + n < first)
+		isl_die(bmap->ctx, isl_error_invalid,
+			"index out of bounds", goto error);
+
+	if (ISL_F_ISSET(bmap, ISL_BASIC_MAP_RATIONAL)) {
+		first += isl_basic_map_offset(bmap, type) - 1;
+		bmap = isl_basic_map_eliminate_vars(bmap, first, n);
+		return isl_basic_map_finalize(bmap);
+	}
+
+	space = isl_basic_map_get_space(bmap);
+	bmap = isl_basic_map_project_out(bmap, type, first, n);
+	bmap = isl_basic_map_insert_dims(bmap, type, first, n);
+	bmap = isl_basic_map_reset_space(bmap, space);
+	return bmap;
+error:
+	isl_basic_map_free(bmap);
+	return NULL;
+}
+
+__isl_give isl_basic_set *isl_basic_set_eliminate(
+	__isl_take isl_basic_set *bset,
+	enum isl_dim_type type, unsigned first, unsigned n)
+{
+	return isl_basic_map_eliminate(bset, type, first, n);
+}
+
+/* Remove all constraints from "bmap" that reference any unknown local
+ * variables (directly or indirectly).
+ *
+ * Dropping all constraints on a local variable will make it redundant,
+ * so it will get removed implicitly by
+ * isl_basic_map_drop_constraints_involving_dims.  Some other local
+ * variables may also end up becoming redundant if they only appear
+ * in constraints together with the unknown local var

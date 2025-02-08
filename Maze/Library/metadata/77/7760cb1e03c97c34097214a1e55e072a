@@ -1,0 +1,189 @@
+import collections
+import copyreg
+import dbm
+import io
+import functools
+import os
+import pickle
+import pickletools
+import shutil
+import struct
+import sys
+import threading
+import unittest
+import weakref
+from textwrap import dedent
+from http.cookies import SimpleCookie
+
+from test import support
+from test.support import (
+    TestFailed, TESTFN, run_with_locale, no_tracing,
+    _2G, _4G, bigmemtest, reap_threads, forget,
+    )
+
+from pickle import bytes_types
+
+requires_32b = unittest.skipUnless(sys.maxsize < 2**32,
+                                   "test is only meaningful on 32-bit builds")
+
+# Tests that try a number of pickle protocols should have a
+#     for proto in protocols:
+# kind of outer loop.
+protocols = range(pickle.HIGHEST_PROTOCOL + 1)
+
+
+# Return True if opcode code appears in the pickle, else False.
+def opcode_in_pickle(code, pickle):
+    for op, dummy, dummy in pickletools.genops(pickle):
+        if op.code == code.decode("latin-1"):
+            return True
+    return False
+
+# Return the number of times opcode code appears in pickle.
+def count_opcode(code, pickle):
+    n = 0
+    for op, dummy, dummy in pickletools.genops(pickle):
+        if op.code == code.decode("latin-1"):
+            n += 1
+    return n
+
+
+class UnseekableIO(io.BytesIO):
+    def peek(self, *args):
+        raise NotImplementedError
+
+    def seekable(self):
+        return False
+
+    def seek(self, *args):
+        raise io.UnsupportedOperation
+
+    def tell(self):
+        raise io.UnsupportedOperation
+
+
+# We can't very well test the extension registry without putting known stuff
+# in it, but we have to be careful to restore its original state.  Code
+# should do this:
+#
+#     e = ExtensionSaver(extension_code)
+#     try:
+#         fiddle w/ the extension registry's stuff for extension_code
+#     finally:
+#         e.restore()
+
+class ExtensionSaver:
+    # Remember current registration for code (if any), and remove it (if
+    # there is one).
+    def __init__(self, code):
+        self.code = code
+        if code in copyreg._inverted_registry:
+            self.pair = copyreg._inverted_registry[code]
+            copyreg.remove_extension(self.pair[0], self.pair[1], code)
+        else:
+            self.pair = None
+
+    # Restore previous registration for code.
+    def restore(self):
+        code = self.code
+        curpair = copyreg._inverted_registry.get(code)
+        if curpair is not None:
+            copyreg.remove_extension(curpair[0], curpair[1], code)
+        pair = self.pair
+        if pair is not None:
+            copyreg.add_extension(pair[0], pair[1], code)
+
+class C:
+    def __eq__(self, other):
+        return self.__dict__ == other.__dict__
+
+class D(C):
+    def __init__(self, arg):
+        pass
+
+class E(C):
+    def __getinitargs__(self):
+        return ()
+
+class H(object):
+    pass
+
+# Hashable mutable key
+class K(object):
+    def __init__(self, value):
+        self.value = value
+
+    def __reduce__(self):
+        # Shouldn't support the recursion itself
+        return K, (self.value,)
+
+import __main__
+__main__.C = C
+C.__module__ = "__main__"
+__main__.D = D
+D.__module__ = "__main__"
+__main__.E = E
+E.__module__ = "__main__"
+__main__.H = H
+H.__module__ = "__main__"
+__main__.K = K
+K.__module__ = "__main__"
+
+class myint(int):
+    def __init__(self, x):
+        self.str = str(x)
+
+class initarg(C):
+
+    def __init__(self, a, b):
+        self.a = a
+        self.b = b
+
+    def __getinitargs__(self):
+        return self.a, self.b
+
+class metaclass(type):
+    pass
+
+class use_metaclass(object, metaclass=metaclass):
+    pass
+
+class pickling_metaclass(type):
+    def __eq__(self, other):
+        return (type(self) == type(other) and
+                self.reduce_args == other.reduce_args)
+
+    def __reduce__(self):
+        return (create_dynamic_class, self.reduce_args)
+
+def create_dynamic_class(name, bases):
+    result = pickling_metaclass(name, bases, dict())
+    result.reduce_args = (name, bases)
+    return result
+
+# DATA0 .. DATA4 are the pickles we expect under the various protocols, for
+# the object returned by create_data().
+
+DATA0 = (
+    b'(lp0\nL0L\naL1L\naF2.0\n'
+    b'ac__builtin__\ncomple'
+    b'x\np1\n(F3.0\nF0.0\ntp2\n'
+    b'Rp3\naL1L\naL-1L\naL255'
+    b'L\naL-255L\naL-256L\naL'
+    b'65535L\naL-65535L\naL-'
+    b'65536L\naL2147483647L'
+    b'\naL-2147483647L\naL-2'
+    b'147483648L\na(Vabc\np4'
+    b'\ng4\nccopy_reg\n_recon'
+    b'structor\np5\n(c__main'
+    b'__\nC\np6\nc__builtin__'
+    b'\nobject\np7\nNtp8\nRp9\n'
+    b'(dp10\nVfoo\np11\nL1L\ns'
+    b'Vbar\np12\nL2L\nsbg9\ntp'
+    b'13\nag13\naL5L\na.'
+)
+
+# Disassembly of DATA0
+DATA0_DIS = """\
+    0: (    MARK
+    1: l        LIST

@@ -1,0 +1,180 @@
+)" />
+  </Target>
+
+  <!--
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  IncrementalClean Targets
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  -->
+
+  <!--
+  ==================================================================================================
+  IncrementalClean
+
+    Remove files that were produced in a prior build but weren't produced in the current build.
+    The reason is that if, for example, the name of the .msi/.msm has changed we want to delete the
+    old copy.
+
+    Leave the Clean cache file containing only the files produced in the current build.
+  ==================================================================================================
+  -->
+  <Target
+    Name="IncrementalClean"
+    DependsOnTargets="_CleanGetCurrentAndPriorFileWrites">
+
+    <!-- Subtract list of files produced in this build from list of files produced in prior builds. -->
+    <CreateItem Include="@(_CleanPriorFileWrites)" Exclude="@(_CleanCurrentFileWrites)">
+      <Output TaskParameter="Include" ItemName="_CleanOrphanFileWrites" />
+    </CreateItem>
+
+    <!-- Find all files in the final output directory. -->
+    <FindUnderPath Path="$(OutDir)" Files="@(_CleanOrphanFileWrites)">
+      <Output TaskParameter="InPath" ItemName="_CleanOrphanFileWritesInOutput" />
+    </FindUnderPath>
+
+    <!-- Find all files in the intermediate output directory. -->
+    <FindUnderPath Path="$(IntermediateOutputPath)" Files="@(_CleanOrphanFileWrites)">
+      <Output TaskParameter="InPath" ItemName="_CleanOrphanFileWritesInIntermediate" />
+    </FindUnderPath>
+
+    <!-- Delete the orphaned files. -->
+    <Delete
+      Files="@(_CleanOrphanFileWritesInIntermediate);@(_CleanOrphanFileWritesInOutput)"
+      TreatErrorsAsWarnings="true">
+
+      <Output TaskParameter="DeletedFiles" ItemName="_CleanOrphanFilesDeleted" />
+    </Delete>
+
+    <!-- Create a list of everything that wasn't deleted. -->
+    <CreateItem Include="@(_CleanPriorFileWrites);@(_CleanCurrentFileWrites)" Exclude="@(_CleanOrphanFilesDeleted)">
+      <Output TaskParameter="Include" ItemName="_CleanRemainingFileWritesAfterIncrementalClean" />
+    </CreateItem>
+
+    <!-- Remove duplicates. -->
+    <RemoveDuplicates Inputs="@(_CleanRemainingFileWritesAfterIncrementalClean)">
+      <Output TaskParameter="Filtered" ItemName="_CleanUniqueRemainingFileWritesAfterIncrementalClean" />
+    </RemoveDuplicates>
+
+    <!-- Make sure the directory exists. -->
+    <MakeDir Directories="$(IntermediateOutputPath)" />
+
+    <!-- Write new list of current files back to disk, replacing the existing list.-->
+    <WriteLinesToFile
+      File="$(IntermediateOutputPath)$(CleanFile)"
+      Lines="@(_CleanUniqueRemainingFileWritesAfterIncrementalClean)"
+      Overwrite="true" />
+
+  </Target>
+
+  <!--
+  ==================================================================================================
+  _CleanGetCurrentAndPriorFileWrites
+
+    Get the list of files built in a prior build and the current build.
+  ==================================================================================================
+  -->
+  <Target
+    Name="_CleanGetCurrentAndPriorFileWrites">
+
+    <!-- Read the list of files produced by a prior build from disk. -->
+    <ReadLinesFromFile File="$(IntermediateOutputPath)$(CleanFile)">
+      <Output TaskParameter="Lines" ItemName="_CleanPriorFileWrites" />
+    </ReadLinesFromFile>
+
+    <!-- Find all files in the final output directory. -->
+    <FindUnderPath Path="$(OutDir)" Files="@(FileWrites)">
+      <Output TaskParameter="InPath" ItemName="_CleanCurrentFileWritesInOutput" />
+    </FindUnderPath>
+
+    <!-- Find all files in the intermediate output directory. -->
+    <FindUnderPath Path="$(IntermediateOutputPath)" Files="@(FileWrites)">
+      <Output TaskParameter="InPath" ItemName="_CleanCurrentFileWritesInIntermediate" />
+    </FindUnderPath>
+
+    <!-- Remove duplicates from files produced in this build. -->
+    <RemoveDuplicates Inputs="@(_CleanCurrentFileWritesInOutput);@(_CleanCurrentFileWritesInIntermediate)">
+      <Output TaskParameter="Filtered" ItemName="_CleanCurrentFileWrites" />
+    </RemoveDuplicates>
+
+  </Target>
+
+  <!--
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  Clean Targets
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  -->
+
+  <!--
+  ==================================================================================================
+  Clean
+
+    Delete all intermediate and final build outputs.
+  ==================================================================================================
+  -->
+  <PropertyGroup>
+    <CleanDependsOn>
+      BeforeClean;
+      CleanReferencedProjects;
+      CoreClean;
+      AfterClean
+    </CleanDependsOn>
+  </PropertyGroup>
+  <Target
+    Name="Clean"
+    DependsOnTargets="$(CleanDependsOn)" />
+
+  <!--
+  ==================================================================================================
+  BeforeClean
+
+    Redefine this target in your project in order to run tasks just before Clean.
+  ==================================================================================================
+  -->
+  <Target Name="BeforeClean" />
+
+  <!--
+  ==================================================================================================
+  AfterClean
+
+    Redefine this target in your project in order to run tasks just after Clean.
+  ==================================================================================================
+  -->
+  <Target Name="AfterClean" />
+
+  <!--
+  ==================================================================================================
+  CleanReferencedProjects
+
+    Call Clean target on all Referenced Projects.
+  ==================================================================================================
+  -->
+  <Target
+    Name="CleanReferencedProjects">
+
+    <!-- TODO -->
+    <!--
+    When building the project directly from the command-line, clean those referenced projects that
+    exist on disk. For IDE builds and command-line .SLN builds, the solution build manager takes
+    care of this.
+    -->
+    <!--MSBuild
+      Projects="@(_MSBuildProjectReferenceExistent)"
+      Targets="Clean"
+      Condition=" '$(BuildingInsideVisualStudio)' != 'true' and '$(BuildingSolutionFile)' != 'true' and '@(_MSBuildProjectReferenceExistent)' != '' " /-->
+
+  </Target>
+
+  <!--
+  ==================================================================================================
+  CoreClean
+
+    Cleans all of the compile and link outputs as well as any intermediate files generated along
+    the way.
+  ==================================================================================================
+  -->
+  <PropertyGroup>
+    <CoreCleanDependsOn></Co

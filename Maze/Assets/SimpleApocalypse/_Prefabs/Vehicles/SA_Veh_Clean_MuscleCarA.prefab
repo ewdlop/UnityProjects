@@ -1,0 +1,243 @@
+ngleScale = 0 (
+        displayGroup = "Shaping"
+        doc = """Rescales the angular distribution of the IES profile.
+        TODO: clarify semantics"""
+    )
+    bool shaping:ies:normalize = false (
+        displayGroup = "Shaping"
+        doc = """Normalizes the IES profile so that it affects the shaping
+        of the light while preserving the overall energy output."""
+    )
+}
+
+class "ShadowAPI" (
+    inherits = </APISchemaBase>
+    doc = """Controls to refine a light's shadow behavior.  These are
+    non-physical controls that are valuable for visual lighting work."""
+) {
+    bool shadow:enable = true (
+        displayGroup = "Shadows"
+        doc = """Enables shadows to be cast by this light."""
+    )
+    color3f shadow:color = (0, 0, 0) (
+        displayGroup = "Shadows"
+        doc = """The color of shadows cast by the light.  This is a
+        non-physical control.  The default is to cast black shadows."""
+    )
+    float shadow:distance = -1.0 (
+        displayGroup = "Shadows"
+        doc = """The maximum distance shadows are cast.
+        The default value (-1) indicates no limit.
+        """
+    )
+    float shadow:falloff = -1.0 (
+        displayGroup = "Shadows"
+        doc = """The near distance at which shadow falloff begins.
+        The default value (-1) indicates no falloff.
+        """
+    )
+    float shadow:falloffGamma = 1.0 (
+        displayGroup = "Shadows"
+        doc = """A gamma (i.e., exponential) control over shadow strength
+        with linear distance within the falloff zone.
+        This requires the use of shadowDistance and shadowFalloff."""
+    )
+}
+
+class LightFilter "LightFilter" (
+    inherits = </Xformable>
+    doc = """A light filter modifies the effect of a light.
+    Lights refer to filters via relationships so that filters may be
+    shared.
+
+    <b>Linking</b>
+
+    Filters can be linked to geometry.  Linking controls which geometry
+    a light-filter affects, when considering the light filters attached
+    to a light illuminating the geometry.
+
+    Linking is specified as a collection (UsdCollectionAPI) which can
+    be accessed via GetFilterLinkCollection().
+    Note however that there are extra semantics in how UsdLuxLightFilter
+    uses its collection: if a collection is empty, the filter is treated
+    as linked to <i>all</i> geometry for the respective purpose.
+    UsdCollectionAPI and UsdCollectionAPI::MembershipQuery are unaware
+    of this filter-specific interpretation.
+    """
+    customData = {
+        string extraIncludes = """
+#include "pxr/usd/usd/collectionAPI.h" """
+    }
+    prepend apiSchemas = ["CollectionAPI:filterLink"]
+) {
+    uniform bool collection:filterLink:includeRoot = 1 (
+        customData = {
+            token apiName = ""
+        }
+    )
+}
+
+class DistantLight "DistantLight" (
+    inherits = </Light>
+    doc = """Light emitted from a distant source along the -Z axis.
+    Also known as a directional light."""
+) {
+    float angle = 0.53 (
+        doc = """Angular size of the light in degrees.
+        As an example, the Sun is approximately 0.53 degrees as seen from Earth.
+        Higher values broaden the light and therefore soften shadow edges.
+        """
+    )
+    float intensity = 50000 (
+        doc = """Scales the emission of the light linearly.
+        The DistantLight has a high default intensity to approximate the Sun."""
+    )
+}
+
+class DiskLight "DiskLight" (
+    inherits = </Light>
+    doc = """Light emitted from one side of a circular disk.
+    The disk is centered in the XY plane and emits light along the -Z axis."""
+) {
+    float radius = 0.5 (
+        doc = "Radius of the disk."
+    )
+}
+
+class RectLight "RectLight" (
+    inherits = </Light>
+    doc = """Light emitted from one side of a rectangle.
+    The rectangle is centered in the XY plane and emits light along the -Z axis.
+    The rectangle is 1 unit in length in the X and Y axis.  In the default 
+    position, a texture file's min coordinates should be at (+X, +Y) and 
+    max coordinates at (-X, -Y)."""
+) {
+    float width = 1 (
+        doc = "Width of the rectangle, in the local X axis."
+    )
+    float height = 1 (
+        doc = "Height of the rectangle, in the local Y axis."
+    )
+    asset texture:file (
+        doc = """A color texture to use on the rectangle."""
+    )
+}
+
+class SphereLight "SphereLight" (
+    inherits = </Light>
+    doc = """Light emitted outward from a sphere."""
+) {
+    float radius = 0.5 (
+        doc = "Radius of the sphere."
+    )
+    bool treatAsPoint = false (
+        doc = """A hint that this light can be treated as a 'point'
+        light (effectively, a zero-radius sphere) by renderers that
+        benefit from non-area lighting. Renderers that only support
+        area lights can disregard this."""
+    )
+}
+
+class CylinderLight "CylinderLight" (
+    inherits = </Light>
+    doc = """Light emitted outward from a cylinder.
+    The cylinder is centered at the origin and has its major axis on the X axis.
+    The cylinder does not emit light from the flat end-caps.
+    """
+) {
+    float length = 1 (
+        doc = "Width of the rectangle, in the local X axis."
+    )
+    float radius = 0.5 (
+        doc = "Radius of the cylinder."
+    )
+    bool treatAsLine = false (
+        doc = """A hint that this light can be treated as a 'line'
+        light (effectively, a zero-radius cylinder) by renderers that
+        benefit from non-area lighting. Renderers that only support
+        area lights can disregard this."""
+    )
+}
+
+class GeometryLight "GeometryLight" (
+    inherits = </Light>
+    doc = """Light emitted outward from a geometric prim (UsdGeomGprim),
+    which is typically a mesh."""
+) {
+    rel geometry (
+        doc = """Relationship to the geometry to use as the light source."""
+    )
+}
+
+class DomeLight "DomeLight" (
+    inherits = </Light>
+    doc = """Light emitted inward from a distant external environment,
+    such as a sky or IBL light probe.  The orientation of a dome light with a
+    latlong texture is expected to match the OpenEXR specification for latlong 
+    environment maps.  From the OpenEXR documentation:
+    
+    -------------------------------------------------------------------------
+    Latitude-Longitude Map:
+    
+    The environment is projected onto the image using polar coordinates
+    (latitude and longitude).  A pixel's x coordinate corresponds to
+    its longitude, and the y coordinate corresponds to its latitude.
+    Pixel (dataWindow.min.x, dataWindow.min.y) has latitude +pi/2 and
+    longitude +pi; pixel (dataWindow.max.x, dataWindow.max.y) has
+    latitude -pi/2 and longitude -pi.
+    
+    In 3D space, latitudes -pi/2 and +pi/2 correspond to the negative and
+    positive y direction.  Latitude 0, longitude 0 points into positive
+    z direction; and latitude 0, longitude pi/2 points into positive x
+    direction.
+    
+    The size of the data window should be 2*N by N pixels (width by height),
+    where N can be any integer greater than 0.
+    -------------------------------------------------------------------------
+"""
+) {
+    asset texture:file (
+        doc = """A color texture to use on the dome, such as an HDR (high
+        dynamic range) texture intended for IBL (image based lighting)."""
+    )
+    token texture:format = "automatic" (
+        allowedTokens = ["automatic", "latlong", "mirroredBall", "angular", "cubeMapVerticalCross"]
+        doc = """Specifies the parameterization of the color map file.
+        Valid values are:
+        - automatic: Tries to determine the layout from the file itself.
+          For example, Renderman texture files embed an explicit
+          parameterization.
+        - latlong: Latitude as X, longitude as Y.
+        - mirroredBall: An image of the environment reflected in a
+          sphere, using an implicitly orthogonal projection.
+        - angular: Similar to mirroredBall but the radial dimension
+          is mapped linearly to the angle, providing better sampling
+          at the edges.
+        - cubeMapVerticalCross: A cube map with faces laid out as a
+          vertical cross.
+        """
+    )
+    rel portals (
+        doc = """Optional portals to guide light sampling."""
+    )
+}
+
+class LightPortal "LightPortal" (
+    inherits = </Xformable>
+    doc = """A rectangular portal in the local XY plane that guides sampling
+    of a dome light.  Transmits light in the -Z direction.
+    The rectangle is 1 unit in length."""
+) {
+}
+                                               ÅÜ∆ ep\ûpçzH0 ûmúæH˜ú˚(*ˆ@∏ëÙI	W∆H]4¿oèÉ¬§]∆ aﬁ@ñÚqT m°∆!ëT‡—ˇ%ö†dˇä}Ë(¸POf πÿ0¨q‡hâj@Â™¨bOƒ@8û/÷	º 6/(¿®®„éi>ÿHˆ÷±•£û ∑ûº` ‚Ù”≥+—ép1Ä K¡`t>Ó πØ¿:¨ µ¡è˛‚!p u{Å§œGî56ıol!ìT†≥¿˜Eﬁx1Ä‹¸º†;j;=,¥°Åõ˛Ù5√]’Åã˛§≤k´ßπ-xû"IËf' »D–ÜœF§0+—õ{—C%û–Å÷uôÄ◊§:8¬V?ùŒ :Î,Û.Ú@°*â ‚å+HáHº$˙†£ÛXôœ'ﬁÑ¯¥f(<◊á¨QfÉ‹⁄ |8›|≤q@exù~ÙL!ß3ùGıêﬁJ<€\≤Å∞|)®â©8I÷PËsŒæî40≤Púió $Ω…Ñº}£&ÅN$„Óä@bMH
+0dEy`˝–æ¡◊¥ ?@πÓê≤'l} M––ìp“K$Á,Eòô…ºé°Üá[¿vÄƒKPùÓÄv ¸Rn¯ÖòÏGΩ0‡ÑÜ˛‹9kÙp– d07ÙÒ≈a§ÒBo8†C@π4ºV¢H8Qà@b…C	'Xa]¯4∑JúÅ∫K»@¨œ$K–QàÑ ‰∞“c„ƒÄÃã`! ÑæhK,,@Ï´È$¿ÄNÁÏ8èytXf#ÖìœQ0 Â‡=r#r5˙AÑ¨‰ØóGÛ≤ÄOùπ$–Í0ªa‡ﬂJ,!§¿/åÄ>5t& 7- [∂ „«^HH@,c∫øƒb%Ôp%+*âNIÄSHà[<3#‚ë¯	U•¶@ÿz(ì¿)∏“¿6ëñÏ‘¥VÏe¢JC0∏º±^¨ŸÑ¨Áèd¢áËb1ƒ“[fp„@T∂#¡Öû€–S˙)^¿@œÄ`∞’2ÿy_–BÜ:òäoûÄËêaY{9ÉÃæpÅS∞O≤!˝†ö ‹
+é‘J	bCvLBù B!m•îÎ„‚êÏ∫
+~PåJË‚ ÕzBh`ÕÒÄj„!)(á˜8@6®4†5œ"`ª‚Sï–ÄÖ˝üã%qGä¢P/∏ƒÃ@>¢V,Øè"ä4˘π<D’ò"Çü—cK@π‰"íâ¡„Ä‚˚z§Ü|Z$·+ºŸ$•–!yEÄ√#û¸¿_µÄú
+Åf‹˙>`jRûù’ÖXÖ\RÄ¬T` ˚ﬂGƒ>_‹·¡@5ºë05CRœ`Ø5¨ìØÿ@3)OAWêVËÂékjäw=«Å—CÆò˛Œh•†·÷‰ÜÜ§ê§
+?˚·ä&ï€Å¸)`ﬂ°W:è…ç¯ÄMÆ8=¡F]P¿$h∏˙ûrâ" d}ÛAÅøﬂFÅûè(“PPq∑I+ı3¿o¯˚G 9◊íé5W¨û‘}0‘~•Éh◊ÈY‡ö>ÂÏ¡9a¸äO'^†5HNoY˙„-≠∆—‘K¬úrÆ±8c„¿ÅcÊ!ø ›"i4kª∏∞"8M‚êÖûeﬁM¢Z0€Ç≠•»†´˙î®ÄWmIy ?VûëÅ
+≠é8@CØÛâ˙ÙÇúE dŒ¿¶Øú]›Ï≥@ÿã≤êﬂ∞–ªëÖ˚ÀA&è ÚÒé?˜û…√G}Ù‹C;Å¿è∏‡∫ tvÅN"èÕ%.ü˜`áŸ”⁄–]'ë@’i})-|#/Ê–Ä¡ûè¨ú~_˚™û3Å 7p¿?ªÂØ∞`‡,ro™>Äh4˜™H`ƒˆ'‹!@√ˇh/bËW˜Ä"âe4∆¶qµg]Ÿ™Q2&D»2†´˝MÄîÇ…CÔ<K%†fP˚Í[í»})ÏΩˆyº∑øœè~I¢]J&ü xT¢ﬁ€1H¥e,˘whw*Bú\dèAWÏâ`R«vπ¿:–`b0˝%ØØ©¿}ô{^Ã1$4ê◊ôπ∆U‰±7p≤∞mùqáπ∑˙Á«ûN¢ZPÄÕ#g„ÅÉ˛+E
+?ÒWmòH¸`0∂ÄtCÓ‹(ç ø”Ñ´D∆¡Eq7Ω`  	[Bêî»|ˇZ(¥Y…#⁄h*˛ÄNÄ–ãœÏÉΩ¯íÑ ‹1I:„Å@‚‘N6Ùê[(ÓD
+‰{ıb–ß:≈
+
+ËÈì*◊	D}À∂ºﬁÆëïœ™ﬁ”z¥$MMTKl~hykl.ê˛@uµò√(†»⁄íH9Ö–ã®UF ±$k¿ óqïjH=+˘WÑáQ-0t∏⁄¢Të)“>ù1Õ«ÎUÛHÛø7h∞î›˜
+Q¬ÅúΩ˙–b:Xæ@<:˘¥‚RË)ƒLtwf‡h™ÊÑ0≤(Y÷ÇVRÓrèxMãaBo¶K—)Ω»£¸ëÄvËøq¿\ê–@ ›âÊ7˝ıGñ¯‡ÎÙG?–SÑ0<–ãπ¢¿–v‰gVQƒ[:Ò'>'Ä}pªsÉœΩDØ—Ê?Ú-zSÙ√PªoÂŒ©…|ˆ¬è∫ÚF…ÓAE∫1}DX;cm‡g82 ˘nÑ|<ür*ç√@¢/RÆ(ﬁ<h B˜ '-í†Ø@5,[Ø,Ñ7ˆ£‰ıRs˜ë(¶{T¬@g|‹òﬂÄq|Å	Aé@ ˚®jÙyë∑˝èÊÕ»æfÁájFÄê‹\Â7ΩgG»+ :…“ QÌÜ%&‹Âûp·KP≈8

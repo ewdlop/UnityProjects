@@ -1,0 +1,64 @@
+ionTreeRoot())
+				n->purgeProjectionTrees();
+			n->buildProjectionTrees();
+		}
+
+		mPendingTreeUpdates.clear();
+	}
+
+	//
+	// if there are new/dirty constraints, update groups
+	//
+	const PxU32 nbProjectionConstraintsToUpdate = mPendingGroupUpdates.size();
+
+	if (nbProjectionConstraintsToUpdate)
+	{
+		ScratchAllocatorList<ConstraintSim*> nonProjectionConstraintList(scratchAllocator);
+
+		ConstraintSim* const* projectionConstraintsToUpdate = mPendingGroupUpdates.getEntries();
+
+#if PX_DEBUG
+		// At the beginning the list should only contain constraints with projection.
+		// Further below other constraints, connected to the constraints with projection, will be added too.
+		for(PxU32 i=0; i < nbProjectionConstraintsToUpdate; i++)
+		{
+			PX_ASSERT(projectionConstraintsToUpdate[i]->needsProjection());
+		}
+#endif
+		for(PxU32 i=0; i < nbProjectionConstraintsToUpdate; i++)
+		{
+			processConstraintForGroupBuilding(projectionConstraintsToUpdate[i], nonProjectionConstraintList);
+		}
+
+		ScratchAllocatorList<ConstraintSim*>::Iterator iter = nonProjectionConstraintList.getIterator();
+		ConstraintSim* const* nextConstraint = iter.getNext();
+		while(nextConstraint)
+		{
+			processConstraintForGroupBuilding(*nextConstraint, nonProjectionConstraintList);
+
+			nextConstraint = iter.getNext();
+		}
+
+		// Now find all the newly made groups and build projection trees.
+		// Don't need to iterate over the additionally constraints since the roots are supposed to be
+		// fetchable from any node.
+		for (PxU32 i=0; i < nbProjectionConstraintsToUpdate; i++)
+		{
+			ConstraintSim* c = projectionConstraintsToUpdate[i];
+			BodySim* b = c->getAnyBody();
+			PX_ASSERT(b);
+			PX_ASSERT(b->getConstraintGroup());
+
+			ConstraintGroupNode& root = b->getConstraintGroup()->getRoot();
+			if (!root.hasProjectionTreeRoot())  // Build projection tree only once
+				root.buildProjectionTrees();
+		}
+
+		mPendingGroupUpdates.clear();
+	}
+}
+
+
+//
+// Called if a body or a constraint gets deleted. All projecting constraints of the
+// group (except the deleted one) are moved to the dirty list and all group nodes

@@ -1,0 +1,246 @@
+/*
+ Copyright (c) 2003-2006 Niels Kokholm and Peter Sestoft
+ Permission is hereby granted, free of charge, to any person obtaining a copy
+ of this software and associated documentation files (the "Software"), to deal
+ in the Software without restriction, including without limitation the rights
+ to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ copies of the Software, and to permit persons to whom the Software is
+ furnished to do so, subject to the following conditions:
+ 
+ The above copyright notice and this permission notice shall be included in
+ all copies or substantial portions of the Software.
+ 
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ SOFTWARE.
+*/
+
+using System;
+using C5;
+using NUnit.Framework;
+using SCG=System.Collections.Generic;
+
+
+namespace C5UnitTests.trees.RBDictionary
+{
+  using DictionaryIntToInt = TreeDictionary<int, int>;
+
+  static class Factory
+  {
+    public static IDictionary<K,V> New<K,V>() { return new TreeDictionary<K,V>(); }
+  }
+
+  [TestFixture]
+  public class GenericTesters
+  {
+    [Test]
+    public void TestSerialize()
+    {
+      C5UnitTests.Templates.Extensible.Serialization.DTester<DictionaryIntToInt>();
+    }
+  }
+
+
+  [TestFixture]
+  public class Formatting
+  {
+    IDictionary<int,int> coll;
+    IFormatProvider rad16;
+    [SetUp]
+    public void Init() { coll = Factory.New<int,int>(); rad16 = new RadixFormatProvider(16); }
+    [TearDown]
+    public void Dispose() { coll = null; rad16 = null; }
+    [Test]
+    public void Format()
+    {
+      Assert.AreEqual("[  ]", coll.ToString());
+      coll.Add(23, 67); coll.Add(45, 89);
+      Assert.AreEqual("[ 23 => 67, 45 => 89 ]", coll.ToString());
+      Assert.AreEqual("[ 17 => 43, 2D => 59 ]", coll.ToString(null, rad16));
+      Assert.AreEqual("[ 23 => 67, ... ]", coll.ToString("L14", null));
+      Assert.AreEqual("[ 17 => 43, ... ]", coll.ToString("L14", rad16));
+    }
+  }
+
+  [TestFixture]
+  public class RBDict
+	{
+		private TreeDictionary<string,string> dict;
+
+
+		[SetUp]
+		public void Init() { dict = new TreeDictionary<string,string>(new SC()); }
+
+
+		[TearDown]
+		public void Dispose() { dict = null; }
+
+    [Test]
+    [ExpectedException(typeof(NullReferenceException))]
+    public void NullEqualityComparerinConstructor1()
+    {
+      new TreeDictionary<int,int>(null);
+    }
+
+    [Test]
+    public void Choose()
+    {
+      dict.Add("YES","NO");
+      Assert.AreEqual(new KeyValuePair<string,string>("YES","NO"), dict.Choose());
+    }
+
+    [Test]
+    [ExpectedException(typeof(NoSuchItemException))]
+    public void BadChoose()
+    {
+      dict.Choose();
+    }
+
+		[Test]
+		public void Pred1()
+		{
+			dict.Add("A", "1");
+			dict.Add("C", "2");
+			dict.Add("E", "3");
+			Assert.AreEqual("1", dict.Predecessor("B").Value);
+			Assert.AreEqual("1", dict.Predecessor("C").Value);
+			Assert.AreEqual("1", dict.WeakPredecessor("B").Value);
+			Assert.AreEqual("2", dict.WeakPredecessor("C").Value);
+			Assert.AreEqual("2", dict.Successor("B").Value);
+			Assert.AreEqual("3", dict.Successor("C").Value);
+			Assert.AreEqual("2", dict.WeakSuccessor("B").Value);
+			Assert.AreEqual("2", dict.WeakSuccessor("C").Value);
+    }
+
+    [Test]
+    public void Pred2()
+    {
+      dict.Add("A", "1");
+      dict.Add("C", "2");
+      dict.Add("E", "3");
+      KeyValuePair<String, String> res;
+      Assert.IsTrue(dict.TryPredecessor("B", out res));
+      Assert.AreEqual("1", res.Value);
+      Assert.IsTrue(dict.TryPredecessor("C", out res));
+      Assert.AreEqual("1", res.Value);
+      Assert.IsTrue(dict.TryWeakPredecessor("B", out res));
+      Assert.AreEqual("1", res.Value);
+      Assert.IsTrue(dict.TryWeakPredecessor("C", out res));
+      Assert.AreEqual("2", res.Value);
+      Assert.IsTrue(dict.TrySuccessor("B", out res));
+      Assert.AreEqual("2", res.Value);
+      Assert.IsTrue(dict.TrySuccessor("C", out res));
+      Assert.AreEqual("3", res.Value);
+      Assert.IsTrue(dict.TryWeakSuccessor("B", out res));
+      Assert.AreEqual("2", res.Value);
+      Assert.IsTrue(dict.TryWeakSuccessor("C", out res));
+      Assert.AreEqual("2", res.Value);
+
+      Assert.IsFalse(dict.TryPredecessor("A", out res));
+      Assert.AreEqual(null, res.Key);
+      Assert.AreEqual(null, res.Value);
+
+      Assert.IsFalse(dict.TryWeakPredecessor("@", out res));
+      Assert.AreEqual(null, res.Key);
+      Assert.AreEqual(null, res.Value);
+
+      Assert.IsFalse(dict.TrySuccessor("E", out res));
+      Assert.AreEqual(null, res.Key);
+      Assert.AreEqual(null, res.Value);
+
+      Assert.IsFalse(dict.TryWeakSuccessor("F", out res));
+      Assert.AreEqual(null, res.Key);
+      Assert.AreEqual(null, res.Value);
+    }   
+
+		[Test]
+		public void Initial()
+		{
+			bool res;
+			Assert.IsFalse(dict.IsReadOnly);
+
+			Assert.AreEqual(dict.Count, 0, "new dict should be empty");
+			dict.Add("A", "B");
+			Assert.AreEqual(dict.Count, 1, "bad count");
+			Assert.AreEqual(dict["A"], "B", "Wrong value for dict[A]");
+			dict.Add("C", "D");
+			Assert.AreEqual(dict.Count, 2, "bad count");
+			Assert.AreEqual(dict["A"], "B", "Wrong value");
+			Assert.AreEqual(dict["C"], "D", "Wrong value");
+			res = dict.Remove("A");
+			Assert.IsTrue(res, "bad return value from Remove(A)");
+			Assert.IsTrue(dict.Check());
+			Assert.AreEqual(dict.Count, 1, "bad count");
+			Assert.AreEqual(dict["C"], "D", "Wrong value of dict[C]");
+			res = dict.Remove("Z");
+			Assert.IsFalse(res, "bad return value from Remove(Z)");
+			Assert.AreEqual(dict.Count, 1, "bad count");
+			Assert.AreEqual(dict["C"], "D", "Wrong value of dict[C] (2)");
+			dict.Clear();
+			Assert.AreEqual(dict.Count, 0, "dict should be empty");
+		}
+		[Test]
+		public void Contains()
+		{
+			dict.Add("C", "D");
+			Assert.IsTrue(dict.Contains("C"));
+			Assert.IsFalse(dict.Contains("D"));
+		}
+
+
+		[Test]
+		[ExpectedException(typeof(DuplicateNotAllowedException), ExpectedMessage="Key being added: 'A'")]
+		public void IllegalAdd()
+		{
+			dict.Add("A", "B");
+			dict.Add("A", "B");
+		}
+
+
+		[Test]
+    [ExpectedException(typeof(NoSuchItemException))]
+    public void GettingNonExisting()
+		{
+			Console.WriteLine(dict["R"]);
+		}
+
+
+		[Test]
+		public void Setter()
+		{
+			dict["R"] = "UYGUY";
+			Assert.AreEqual(dict["R"], "UYGUY");
+			dict["R"] = "UIII";
+			Assert.AreEqual(dict["R"], "UIII");
+			dict["S"] = "VVV";
+			Assert.AreEqual(dict["R"], "UIII");
+			Assert.AreEqual(dict["S"], "VVV");
+			//dict.dump();
+		}
+	}
+
+  [TestFixture]
+  public class GuardedSortedDictionaryTest
+  {
+    private GuardedSortedDictionary<string, string> dict;
+
+    [SetUp]
+    public void Init() { 
+      ISortedDictionary<string,string> dict = new TreeDictionary<string, string>(new SC());
+      dict.Add("A", "1");
+      dict.Add("C", "2");
+      dict.Add("E", "3");
+      this.dict = new GuardedSortedDictionary<string, string>(dict);
+    }
+
+    [TearDown]
+    public void Dispose() { dict = null; }
+
+    [Test]
+    public void Pred1()
+    {
+      Assert.AreEqual

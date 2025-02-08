@@ -1,0 +1,101 @@
+t& off)
+		{
+			uint32_t type = off.mOffsetType;
+			mStream << type;
+			mStream << off.mOffset;
+		}
+		template <typename TDataType>
+		void streamify(TDataType* type)
+		{
+			int32_t existMarker = type ? 1 : 0;
+			mStream << existMarker;
+			if(type)
+				type->serialize(*this);
+		}
+		template <typename TArrayType>
+		void streamify(const Array<TArrayType>& type)
+		{
+			mStream << static_cast<uint32_t>(type.size());
+			PVD_FOREACH(idx, type.size()) streamify(const_cast<TArrayType&>(type[idx]));
+		}
+		template <typename TArrayType>
+		void streamifyLinks(const Array<TArrayType>& type)
+		{
+			mStream << static_cast<uint32_t>(type.size());
+			PVD_FOREACH(idx, type.size()) streamifyLinks(const_cast<TArrayType&>(type[idx]));
+		}
+
+	  private:
+		MetaDataWriter& operator=(const MetaDataWriter&);
+	};
+
+	template <typename TStreamType>
+	struct MetaDataReader
+	{
+		PvdObjectModelMetaDataImpl& mMetaData;
+		TStreamType& mStream;
+		MetaDataReader(PvdObjectModelMetaDataImpl& meta, TStreamType& stream) : mMetaData(meta), mStream(stream)
+		{
+		}
+
+		void streamify(NamespacedName& type)
+		{
+			streamify(type.mNamespace);
+			streamify(type.mName);
+		}
+
+		void streamify(String& type)
+		{
+			uint32_t handle;
+			mStream >> handle;
+            type = mMetaData.mStringTable->handleToStr(handle);
+		}
+		void streamify(int32_t& type)
+		{
+			mStream >> type;
+		}
+		void streamify(uint32_t& type)
+		{
+			mStream >> type;
+		}
+		void streamify(bool& type)
+		{
+			uint8_t data;
+			mStream >> data;
+			type = data ? true : false;
+		}
+
+		void streamify(PropertyType::Enum& type)
+		{
+			uint32_t val;
+			mStream >> val;
+			type = static_cast<PropertyType::Enum>(val);
+		}
+		void streamify(NamedValue& type)
+		{
+			streamify(type.mValue);
+			streamify(type.mName);
+		}
+		void streamify(PropertyMessageEntryImpl& type)
+		{
+			type.serialize(*this);
+		}
+		void streamify(PtrOffset& off)
+		{
+			uint32_t type;
+			mStream >> type;
+			mStream >> off.mOffset;
+			off.mOffsetType = static_cast<PtrOffsetType::Enum>(type);
+		}
+		void streamifyLinks(PropDescImpl*& prop)
+		{
+			int32_t propId;
+			streamify(propId);
+			prop = mMetaData.getPropertyImpl(propId);
+		}
+		void streamify(PropertyDescription& prop)
+		{
+			streamify(prop.mPropertyId);
+			prop = mMetaData.getProperty(prop.mPropertyId);
+		}
+		templat

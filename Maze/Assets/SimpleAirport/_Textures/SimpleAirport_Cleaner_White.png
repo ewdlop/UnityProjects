@@ -1,0 +1,215 @@
+rue);
+  for (unsigned i = 0, e = OrigMI->getNumOperands(); i != e; ++i) {
+    const MachineOperand &MO = OrigMI->getOperand(i);
+    if (!MO.isReg() || !MO.getReg() || !MO.readsReg())
+      continue;
+
+    // We can't remat physreg uses, unless it is a constant.
+    if (TargetRegisterInfo::isPhysicalRegister(MO.getReg())) {
+      if (MRI.isConstantPhysReg(MO.getReg()))
+        continue;
+      return false;
+    }
+
+    LiveInterval &li = LIS.getInterval(MO.getReg());
+    const VNInfo *OVNI = li.getVNInfoAt(OrigIdx);
+    if (!OVNI)
+      continue;
+
+    // Don't allow rematerialization immediately after the original def.
+    // It would be incorrect if OrigMI redefines the register.
+    // See PR14098.
+    if (SlotIndex::isSameInstr(OrigIdx, UseIdx))
+      return false;
+
+    if (OVNI != li.getVNInfoAt(UseIdx))
+      return false;
+  }
+  return true;
+}
+
+bool LiveRangeEdit::canRematerializeAt(Remat &RM, VNInfo *OrigVNI,
+                                       SlotIndex UseIdx, bool cheapAsAMove) {
+  assert(ScannedRemattable && "Call anyRematerializable first");
+
+  // Use scanRemattable info.
+  if (!Remattable.count(OrigVNI))
+    return false;
+
+  // No defining instruction provided.
+  SlotIndex DefIdx;
+  assert(RM.OrigMI && "No defining instruction for remattable value");
+  DefIdx = LIS.getInstructionIndex(*RM.OrigMI);
+
+  // If only cheap remats were requested, bail out early.
+  if (cheapAsAMove && !TII.isAsCheapAsAMove(*RM.OrigMI))
+    return false;
+
+  // Verify that all used registers are available with the same values.
+  if (!allUsesAvailableAt(RM.OrigMI, DefIdx, UseIdx))
+    return false;
+
+  return true;
+}
+
+SlotIndex LiveRangeEdit::rematerializeAt(MachineBasicBlock &MBB,
+                                         MachineBasicBlock::iterator MI,
+                                         unsigned DestReg,
+                                         const Remat &RM,
+                                         const TargetRegisterInfo &tri,
+                                         bool Late) {
+  assert(RM.OrigMI && "Invalid remat");
+  TII.reMaterialize(MBB, MI, DestReg, 0, *RM.OrigMI, tri);
+  // DestReg of the cloned instruction cannot be Dead. Set isDead of DestReg
+  // to false anyway in case the isDead flag of RM.OrigMI's dest register
+  // is true.
+  (*--MI).getOperand(0).setIsDead(false);
+  Rematted.insert(RM.ParentVNI);
+  return LIS.getSlotIndexes()->insertMachineInstrInMaps(*MI, Late).getRegSlot();
+}
+
+void LiveRangeEdit::eraseVirtReg(unsigned Reg) {
+  if (TheDelegate && TheDelegate->LRE_CanEraseVirtReg(Reg))
+    LIS.removeInterval(Reg);
+}
+
+bool LiveRangeEdit::foldAsLoad(LiveInterval *LI,
+                               SmallVectorImpl<MachineInstr*> &Dead) {
+  MachineInstr *DefMI = nullptr, *UseMI = nullptr;
+
+  // Check that there is a single def and a single use.
+  for (MachineOperand &MO : MRI.reg_nodbg_operands(LI->reg)) {
+    MachineInstr *MI = MO.getParent();
+    if (MO.isDef()) {
+      if (DefMI && DefMI != MI)
+        return false;
+      if (!MI->canFoldAsLoad())
+        return false;
+      DefMI = MI;
+    } else if (!MO.isUndef()) {
+      if (UseMI && UseMI != MI)
+        return false;
+      // FIXME: Targets don't know how to fold subreg uses.
+      if (MO.getSubReg())
+        return false;
+      UseMI = MI;
+    }
+  }
+  if (!DefMI || !UseMI)
+    return false;
+
+  // Since we're moving the DefMI load, make sure we're not extending any live
+  // ranges.
+  if (!allUsesAvailableAt(DefMI, LIS.getInstructionIndex(*DefMI),
+                          LIS.getInstructionIndex(*UseMI)))
+    return false;
+
+  // We also need to make sure it is safe to move the load.
+  // Assume there are stores between DefMI and UseMI.
+  bool SawStore = true;
+  if (!DefMI->isSafeToMove(nullptr, SawStore))
+    return false;
+
+  DEBUG(dbgs() << "Try to fold single def: " << *DefMI
+               << "       into single use: " << *UseMI);
+
+  SmallVector<unsigned, 8> Ops;
+  if (UseMI->readsWritesVirtualRegister(LI->reg, &Ops).second)
+    return false;
+
+  MachineInstr *FoldMI = TII.foldMemoryOperand(*UseMI, Ops, *DefMI, &LIS);
+  if (!FoldMI)
+    return false;
+  DEBUG(dbgs() << "                folded: " << *FoldMI);
+  LIS.ReplaceMachineInstrInMaps(*UseMI, *FoldMI);
+  UseMI->eraseFromParent();
+  DefMI->addRegisterDead(LI->reg, nullptr);
+  Dead.push_back(DefMI);
+  ++NumDCEFoldedLoads;
+  return true;
+}
+
+bool LiveRangeEdit::useIsKill(const LiveInterval &LI,
+                              const MachineOperand &MO) const {
+  const MachineInstr &MI = *MO.getParent();
+  SlotIndex Idx = LIS.getInstructionIndex(MI).getRegSlot();
+  if (LI.Query(Idx).isKill())
+    return true;
+  const TargetRegisterInfo &TRI = *MRI.getTargetRegisterInfo();
+  unsigned SubReg = MO.getSubReg();
+  LaneBitmask LaneMask = TRI.getSubRegIndexLaneMask(SubReg);
+  for (const LiveInterval::SubRange &S : LI.subranges()) {
+    if ((S.LaneMask & LaneMask).any() && S.Query(Idx).isKill())
+      return true;
+  }
+  return false;
+}
+
+/// Find all live intervals that need to shrink, then remove the instruction.
+void LiveRangeEdit::eliminateDeadDef(MachineInstr *MI, ToShrinkSet &ToShrink,
+                                     AliasAnalysis *AA) {
+  assert(MI->allDefsAreDead() && "Def isn't really dead");
+  SlotIndex Idx = LIS.getInstructionIndex(*MI).getRegSlot();
+
+  // Never delete a bundled instruction.
+  if (MI->isBundled()) {
+    return;
+  }
+  // Never delete inline asm.
+  if (MI->isInlineAsm()) {
+    DEBUG(dbgs() << "Won't delete: " << Idx << '\t' << *MI);
+    return;
+  }
+
+  // Use the same criteria as DeadMachineInstructionElim.
+  bool SawStore = false;
+  if (!MI->isSafeToMove(nullptr, SawStore)) {
+    DEBUG(dbgs() << "Can't delete: " << Idx << '\t' << *MI);
+    return;
+  }
+
+  DEBUG(dbgs() << "Deleting dead def " << Idx << '\t' << *MI);
+
+  // Collect virtual registers to be erased after MI is gone.
+  SmallVector<unsigned, 8> RegsToErase;
+  bool ReadsPhysRegs = false;
+  bool isOrigDef = false;
+  unsigned Dest;
+  // Only optimize rematerialize case when the instruction has one def, since
+  // otherwise we could leave some dead defs in the code.  This case is
+  // extremely rare.
+  if (VRM && MI->getOperand(0).isReg() && MI->getOperand(0).isDef() &&
+      MI->getDesc().getNumDefs() == 1) {
+    Dest = MI->getOperand(0).getReg();
+    unsigned Original = VRM->getOriginal(Dest);
+    LiveInterval &OrigLI = LIS.getInterval(Original);
+    VNInfo *OrigVNI = OrigLI.getVNInfoAt(Idx);
+    // The original live-range may have been shrunk to
+    // an empty live-range. It happens when it is dead, but
+    // we still keep it around to be able to rematerialize
+    // other values that depend on it.
+    if (OrigVNI)
+      isOrigDef = SlotIndex::isSameInstr(OrigVNI->def, Idx);
+  }
+
+  // Check for live intervals that may shrink
+  for (MachineInstr::mop_iterator MOI = MI->operands_begin(),
+         MOE = MI->operands_end(); MOI != MOE; ++MOI) {
+    if (!MOI->isReg())
+      continue;
+    unsigned Reg = MOI->getReg();
+    if (!TargetRegisterInfo::isVirtualRegister(Reg)) {
+      // Check if MI reads any unreserved physregs.
+      if (Reg && MOI->readsReg() && !MRI.isReserved(Reg))
+        ReadsPhysRegs = true;
+      else if (MOI->isDef())
+        LIS.removePhysRegDefAt(Reg, Idx);
+      continue;
+    }
+    LiveInterval &LI = LIS.getInterval(Reg);
+
+    // Shrink read registers, unless it is likely to be expensive and
+    // unlikely to change anything. We typically don't want to shrink the
+    // PIC base register that has lots of uses everywhere.
+    // Always shrink COPY uses that probably come from live range splitting.
+    if ((MI->readsVirtualRe

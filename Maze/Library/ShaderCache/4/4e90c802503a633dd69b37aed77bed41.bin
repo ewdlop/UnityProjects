@@ -1,0 +1,115 @@
+"""Parse (absolute and relative) URLs.
+
+urlparse module is based upon the following RFC specifications.
+
+RFC 3986 (STD66): "Uniform Resource Identifiers" by T. Berners-Lee, R. Fielding
+and L.  Masinter, January 2005.
+
+RFC 2732 : "Format for Literal IPv6 Addresses in URL's by R.Hinden, B.Carpenter
+and L.Masinter, December 1999.
+
+RFC 2396:  "Uniform Resource Identifiers (URI)": Generic Syntax by T.
+Berners-Lee, R. Fielding, and L. Masinter, August 1998.
+
+RFC 2368: "The mailto URL scheme", by P.Hoffman , L Masinter, J. Zwinski, July 1998.
+
+RFC 1808: "Relative Uniform Resource Locators", by R. Fielding, UC Irvine, June
+1995.
+
+RFC 1738: "Uniform Resource Locators (URL)" by T. Berners-Lee, L. Masinter, M.
+McCahill, December 1994
+
+RFC 3986 is considered the current standard and any future changes to
+urlparse module should conform with it.  The urlparse module is
+currently not entirely compliant with this RFC due to defacto
+scenarios for parsing, and for backward compatibility purposes, some
+parsing quirks from older RFCs are retained. The testcases in
+test_urlparse.py provides a good indicator of parsing behavior.
+
+"""
+
+import re
+
+__all__ = ["urlparse", "urlunparse", "urljoin", "urldefrag",
+           "urlsplit", "urlunsplit", "parse_qs", "parse_qsl"]
+
+# A classification of schemes ('' means apply by default)
+uses_relative = ['ftp', 'http', 'gopher', 'nntp', 'imap',
+                 'wais', 'file', 'https', 'shttp', 'mms',
+                 'prospero', 'rtsp', 'rtspu', '', 'sftp',
+                 'svn', 'svn+ssh']
+uses_netloc = ['ftp', 'http', 'gopher', 'nntp', 'telnet',
+               'imap', 'wais', 'file', 'mms', 'https', 'shttp',
+               'snews', 'prospero', 'rtsp', 'rtspu', 'rsync', '',
+               'svn', 'svn+ssh', 'sftp','nfs','git', 'git+ssh']
+uses_params = ['ftp', 'hdl', 'prospero', 'http', 'imap',
+               'https', 'shttp', 'rtsp', 'rtspu', 'sip', 'sips',
+               'mms', '', 'sftp', 'tel']
+
+# These are not actually used anymore, but should stay for backwards
+# compatibility.  (They are undocumented, but have a public-looking name.)
+non_hierarchical = ['gopher', 'hdl', 'mailto', 'news',
+                    'telnet', 'wais', 'imap', 'snews', 'sip', 'sips']
+uses_query = ['http', 'wais', 'imap', 'https', 'shttp', 'mms',
+              'gopher', 'rtsp', 'rtspu', 'sip', 'sips', '']
+uses_fragment = ['ftp', 'hdl', 'http', 'gopher', 'news',
+                 'nntp', 'wais', 'https', 'shttp', 'snews',
+                 'file', 'prospero', '']
+
+# Characters valid in scheme names
+scheme_chars = ('abcdefghijklmnopqrstuvwxyz'
+                'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+                '0123456789'
+                '+-.')
+
+MAX_CACHE_SIZE = 20
+_parse_cache = {}
+
+def clear_cache():
+    """Clear the parse cache."""
+    _parse_cache.clear()
+
+
+class ResultMixin(object):
+    """Shared methods for the parsed result objects."""
+
+    @property
+    def username(self):
+        netloc = self.netloc
+        if "@" in netloc:
+            userinfo = netloc.rsplit("@", 1)[0]
+            if ":" in userinfo:
+                userinfo = userinfo.split(":", 1)[0]
+            return userinfo
+        return None
+
+    @property
+    def password(self):
+        netloc = self.netloc
+        if "@" in netloc:
+            userinfo = netloc.rsplit("@", 1)[0]
+            if ":" in userinfo:
+                return userinfo.split(":", 1)[1]
+        return None
+
+    @property
+    def hostname(self):
+        netloc = self.netloc.split('@')[-1]
+        if '[' in netloc and ']' in netloc:
+            return netloc.split(']')[0][1:].lower()
+        elif ':' in netloc:
+            return netloc.split(':')[0].lower()
+        elif netloc == '':
+            return None
+        else:
+            return netloc.lower()
+
+    @property
+    def port(self):
+        netloc = self.netloc.split('@')[-1].split(']')[-1]
+        if ':' in netloc:
+            port = netloc.split(':')[1]
+            if port:
+                port = int(port, 10)
+                # verify legal port
+         

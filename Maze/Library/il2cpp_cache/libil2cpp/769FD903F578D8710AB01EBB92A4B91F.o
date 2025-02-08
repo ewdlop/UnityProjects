@@ -1,0 +1,86 @@
+   /* TODO: Handle screen resize or workspace change */
+            break;
+
+        default:
+           BApplication::MessageReceived(message);
+           break;
+        }
+    }
+
+    /* Window creation/destruction methods */
+    int32 GetID(SDL_Window *win) {
+        int32 i;
+        for(i = 0; i < _GetNumWindowSlots(); ++i) {
+            if( GetSDLWindow(i) == NULL ) {
+                _SetSDLWindow(win, i);
+                return i;
+            }
+        }
+
+        /* Expand the vector if all slots are full */
+        if( i == _GetNumWindowSlots() ) {
+            _PushBackWindow(win);
+            return i;
+        }
+
+        /* TODO: error handling */
+        return 0;
+    }
+
+    /* FIXME: Bad coding practice, but I can't include SDL_BWin.h here.  Is
+       there another way to do this? */
+    void ClearID(SDL_BWin *bwin); /* Defined in SDL_BeApp.cc */
+
+
+    SDL_Window *GetSDLWindow(int32 winID) {
+        return _window_map[winID];
+    }
+
+#if SDL_VIDEO_OPENGL
+    void SetCurrentContext(BGLView *newContext) {
+        if(_current_context)
+            _current_context->UnlockGL();
+        _current_context = newContext;
+        if (_current_context)
+            _current_context->LockGL();
+    }
+#endif
+
+private:
+    /* Event management */
+    void _HandleBasicWindowEvent(BMessage *msg, int32 sdlEventType) {
+        SDL_Window *win;
+        int32 winID;
+        if(
+            !_GetWinID(msg, &winID)
+        ) {
+            return;
+        }
+        win = GetSDLWindow(winID);
+        SDL_SendWindowEvent(win, sdlEventType, 0, 0);
+    }
+
+    void _HandleMouseMove(BMessage *msg) {
+        SDL_Window *win;
+        int32 winID;
+        int32 x = 0, y = 0;
+        if(
+            !_GetWinID(msg, &winID) ||
+            msg->FindInt32("x", &x) != B_OK || /* x movement */
+            msg->FindInt32("y", &y) != B_OK    /* y movement */
+        ) {
+            return;
+        }
+        win = GetSDLWindow(winID);
+
+		// Simple relative mode support for mouse.
+		if (SDL_GetMouse()->relative_mode) {
+			int winWidth, winHeight, winPosX, winPosY;
+			SDL_GetWindowSize(win, &winWidth, &winHeight);
+			SDL_GetWindowPosition(win, &winPosX, &winPosY);
+			int dx = x - (winWidth / 2);
+			int dy = y - (winHeight / 2);
+			SDL_SendMouseMotion(win, 0, SDL_GetMouse()->relative_mode, dx, dy);
+			set_mouse_position((winPosX + winWidth / 2), (winPosY + winHeight / 2));
+			if (!be_app->IsCursorHidden())
+				be_app->Hid

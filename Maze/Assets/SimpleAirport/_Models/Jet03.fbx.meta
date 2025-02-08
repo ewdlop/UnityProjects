@@ -1,0 +1,64 @@
+  result += components[i];
+    if (i != components.size() - 1 &&
+        !IsPathSeparator(components[i].back(), syntax))
+      result += GetPreferredPathSeparator(syntax);
+  }
+
+  return result;
+}
+
+void FileSpec::PrependPathComponent(llvm::StringRef component) {
+  if (component.empty())
+    return;
+
+  const bool resolve = false;
+  if (m_filename.IsEmpty() && m_directory.IsEmpty()) {
+    SetFile(component, resolve);
+    return;
+  }
+
+  std::string result =
+      join_path_components(m_syntax, {component, m_directory.GetStringRef(),
+                                      m_filename.GetStringRef()});
+  SetFile(result, resolve, m_syntax);
+}
+
+void FileSpec::PrependPathComponent(const FileSpec &new_path) {
+  return PrependPathComponent(new_path.GetPath(false));
+}
+
+void FileSpec::AppendPathComponent(llvm::StringRef component) {
+  if (component.empty())
+    return;
+
+  component = component.drop_while(
+      [this](char c) { return IsPathSeparator(c, m_syntax); });
+
+  std::string result =
+      join_path_components(m_syntax, {m_directory.GetStringRef(),
+                                      m_filename.GetStringRef(), component});
+
+  SetFile(result, false, m_syntax);
+}
+
+void FileSpec::AppendPathComponent(const FileSpec &new_path) {
+  return AppendPathComponent(new_path.GetPath(false));
+}
+
+void FileSpec::RemoveLastPathComponent() {
+  // CLEANUP: Use StringRef for string handling.
+
+  const bool resolve = false;
+  if (m_filename.IsEmpty() && m_directory.IsEmpty()) {
+    SetFile("", resolve);
+    return;
+  }
+  if (m_directory.IsEmpty()) {
+    SetFile("", resolve);
+    return;
+  }
+  if (m_filename.IsEmpty()) {
+    const char *dir_cstr = m_directory.GetCString();
+    const char *last_slash_ptr = ::strrchr(dir_cstr, '/');
+
+    // check for obvious cases before doing the 

@@ -1,0 +1,48 @@
+                                            g_dot_dot_string);
+
+  if (!filenames_equal && !last_component_is_dot)
+    return false;
+
+  if (!full && (a.GetDirectory().IsEmpty() || b.GetDirectory().IsEmpty()))
+    return filenames_equal;
+
+  if (remove_backups == false)
+    return a == b;
+
+  if (a == b)
+    return true;
+
+  return Equal(a.GetNormalizedPath(), b.GetNormalizedPath(), full, false);
+}
+
+FileSpec FileSpec::GetNormalizedPath() const {
+  // Fast path. Do nothing if the path is not interesting.
+  if (!m_directory.GetStringRef().contains(".") &&
+      !m_directory.GetStringRef().contains("//") &&
+      m_filename.GetStringRef() != ".." && m_filename.GetStringRef() != ".")
+    return *this;
+
+  llvm::SmallString<64> path, result;
+  const bool normalize = false;
+  GetPath(path, normalize);
+  llvm::StringRef rest(path);
+
+  // We will not go below root dir.
+  size_t root_dir_start = RootDirStart(path, m_syntax);
+  const bool absolute = root_dir_start != llvm::StringRef::npos;
+  if (absolute) {
+    result += rest.take_front(root_dir_start + 1);
+    rest = rest.drop_front(root_dir_start + 1);
+  } else {
+    if (m_syntax == ePathSyntaxWindows && path.size() > 2 && path[1] == ':') {
+      result += rest.take_front(2);
+      rest = rest.drop_front(2);
+    }
+  }
+
+  bool anything_added = false;
+  llvm::SmallVector<llvm::StringRef, 0> components, processed;
+  rest.split(components, '/', -1, false);
+  processed.reserve(components.size());
+  for (auto component : components) {
+    i

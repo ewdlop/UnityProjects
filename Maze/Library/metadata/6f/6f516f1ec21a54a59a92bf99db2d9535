@@ -1,0 +1,286 @@
+s_for_instance), loc);
+					else
+						del_type_instance_access = del_type;
+				}
+			}
+
+			//
+			// Create custom delegate when no appropriate predefined delegate has been found
+			//
+			Delegate d;
+			if (del_type == null) {
+				TypeSpec rt = isStatement ? ec.BuiltinTypes.Void : type;
+				Parameter[] p = new Parameter[dyn_args_count + 1];
+				p[0] = new Parameter (targs[0], "p0", Parameter.Modifier.NONE, null, loc);
+
+				var site = ec.CreateDynamicSite ();
+				int index = site.Containers == null ? 0 : site.Containers.Count;
+
+				if (mutator != null)
+					rt = mutator.Mutate (rt);
+
+				for (int i = 1; i < dyn_args_count + 1; ++i) {
+					p[i] = new Parameter (targs[i], "p" + i.ToString ("X"), arguments[i - 1].Modifier, null, loc);
+				}
+
+				d = new Delegate (site, new TypeExpression (rt, loc),
+					Modifiers.INTERNAL | Modifiers.COMPILER_GENERATED,
+					new MemberName ("Container" + index.ToString ("X")),
+					new ParametersCompiled (p), null);
+
+				d.CreateContainer ();
+				d.DefineContainer ();
+				d.Define ();
+				d.PrepareEmit ();
+
+				site.AddTypeContainer (d);
+
+				//
+				// Add new container to inflated site container when the
+				// member cache already exists
+				//
+				if (site.CurrentType is InflatedTypeSpec && index > 0)
+					site.CurrentType.MemberCache.AddMember (d.CurrentType);
+
+				del_type = new TypeExpression (d.CurrentType, loc);
+				if (targs_for_instance != null) {
+					del_type_instance_access = null;
+				} else {
+					del_type_instance_access = del_type;
+				}
+			} else {
+				d = null;
+			}
+
+			var site_type_decl = new GenericTypeExpr (module.PredefinedTypes.CallSiteGeneric.TypeSpec, new TypeArguments (del_type), loc);
+			var field = site_container.CreateCallSiteField (site_type_decl, loc);
+			if (field == null)
+				return;
+
+			if (del_type_instance_access == null) {
+				var dt = d.CurrentType.DeclaringType.MakeGenericType (module, context_mvars.Types);
+				del_type_instance_access = new TypeExpression (MemberCache.GetMember (dt, d.CurrentType), loc);
+			}
+
+			var instanceAccessExprType = new GenericTypeExpr (module.PredefinedTypes.CallSiteGeneric.TypeSpec,
+				new TypeArguments (del_type_instance_access), loc);
+
+			if (instanceAccessExprType.ResolveAsType (ec.MemberContext) == null)
+				return;
+
+			bool inflate_using_mvar = context_mvars != null && ec.IsAnonymousStoreyMutateRequired;
+
+			TypeSpec gt;
+			if (inflate_using_mvar || context_mvars == null) {
+				gt = site_container.CurrentType;
+			} else {
+				gt = site_container.CurrentType.MakeGenericType (module, context_mvars.Types);
+			}
+
+			// When site container already exists the inflated version has to be
+			// updated manually to contain newly created field
+			if (gt is InflatedTypeSpec && site_container.AnonymousMethodsCounter > 1) {
+				var tparams = gt.MemberDefinition.TypeParametersCount > 0 ? gt.MemberDefinition.TypeParameters : TypeParameterSpec.EmptyTypes;
+				var inflator = new TypeParameterInflator (module, gt, tparams, gt.TypeArguments);
+				gt.MemberCache.AddMember (field.InflateMember (inflator));
+			}
+
+			FieldExpr site_field_expr = new FieldExpr (MemberCache.GetMember (gt, field), loc);
+
+			BlockContext bc = new BlockContext (ec.MemberContext, null, ec.BuiltinTypes.Void);
+
+			Arguments args = new Arguments (1);
+			args.Add (new Argument (binder));
+			StatementExpression s = new StatementExpression (new SimpleAssign (site_field_expr, new Invocation (new MemberAccess (instanceAccessExprType, "Create"), args)));
+
+			using (ec.With (BuilderContext.Options.OmitDebugInfo, true)) {
+
+				var conditionalAccessReceiver = IsConditionalAccessReceiver;
+				var ca = ec.ConditionalAccess;
+
+				if (conditionalAccessReceiver) {
+					ec.ConditionalAccess = new ConditionalAccessContext (type, ec.DefineLabel ()) {
+						Statement = isStatement
+					};
+
+					//
+					// Emit conditional access expressions before dynamic call
+					// is initialized. It pushes site_field_expr on stack before
+					// the actual instance argument is emited which would cause
+					// jump from non-empty stack.
+					//
+					EmitConditionalAccess (ec);
+				}
+
+				if (s.Resolve (bc)) {
+					Statement init = new If (new Binary (Binary.Operator.Equality, site_field_expr, new NullLiteral (loc)), s, loc);
+					init.Emit (ec);
+				}
+
+				args = new Arguments (1 + dyn_args_count);
+				args.Add (new Argument (site_field_expr));
+				if (arguments != null) {
+					int arg_pos = 1;
+					foreach (Argument a in arguments) {
+						if (a is NamedArgument) {
+							// Name is not valid in this context
+							args.Add (new Argument (a.Expr, a.ArgType));
+						} else {
+							args.Add (a);
+						}
+
+						if (inflate_using_mvar && a.Type != targs[arg_pos].Type)
+							a.Expr.Type = targs[arg_pos].Type;
+
+						++arg_pos;
+					}
+				}
+
+				var target = new DelegateInvocation (new MemberAccess (site_field_expr, "Target", loc).Resolve (bc), args, false, loc).Resolve (bc);
+				if (target != null) {
+					target.Emit (ec);
+				}
+
+				if (conditionalAccessReceiver) {
+					ec.CloseConditionalAccess (!isStatement && type.IsNullableType ? type : null);
+					ec.ConditionalAccess = ca;
+				}
+			}
+		}
+
+		public override void FlowAnalysis (FlowAnalysisContext fc)
+		{
+			arguments.FlowAnalysis (fc);
+		}
+
+		public static MemberAccess GetBinderNamespace (Location loc)
+		{
+			return new MemberAccess (new MemberAccess (
+				new QualifiedAliasMember (QualifiedAliasMember.GlobalAlias, "Microsoft", loc), "CSharp", loc), "RuntimeBinder", loc);
+		}
+
+		protected MemberAccess GetBinder (string name, Location loc)
+		{
+			return new MemberAccess (new TypeExpression (binder_type, loc), name, loc);
+		}
+
+		protected virtual bool IsConditionalAccessReceiver {
+			get {
+				return false;
+			}
+		}
+	}
+
+	//
+	// Dynamic member access compound assignment for events
+	//
+	class DynamicEventCompoundAssign : ExpressionStatement
+	{
+		class IsEvent : DynamicExpressionStatement, IDynamicBinder
+		{
+			string name;
+
+			public IsEvent (string name, Arguments args, Location loc)
+				: base (null, args, loc)
+			{
+				this.name = name;
+				binder = this;
+			}
+
+			public Expression CreateCallSiteBinder (ResolveContext ec, Arguments args)
+			{
+				type = ec.BuiltinTypes.Bool;
+
+				Arguments binder_args = new Arguments (3);
+
+				binder_args.Add (new Argument (new BinderFlags (0, this)));
+				binder_args.Add (new Argument (new StringLiteral (ec.BuiltinTypes, name, loc)));
+				binder_args.Add (new Argument (new TypeOf (ec.CurrentType, loc)));
+
+				return new Invocation (GetBinder ("IsEvent", loc), binder_args);
+			}
+		}
+
+		Expression condition;
+		ExpressionStatement invoke, assign;
+
+		public DynamicEventCompoundAssign (string name, Arguments args, ExpressionStatement assignment, ExpressionStatement invoke, Location loc)
+		{
+			condition = new IsEvent (name, args, loc);
+			this.invoke = invoke;
+			this.assign = assignment;
+			this.loc = loc;
+		}
+
+		public override Expression CreateExpressionTree (ResolveContext ec)
+		{
+			return condition.CreateExpressionTree (ec);
+		}
+
+		protected override Expression DoResolve (ResolveContext rc)
+		{
+			type = rc.BuiltinTypes.Dynamic;
+			eclass = ExprClass.Value;
+			condition = condition.Resolve (rc);
+			return this;
+		}
+
+		public override void Emit (EmitContext ec)
+		{
+			var rc = new ResolveContext (ec.MemberContext);
+			var expr = new Conditional (new BooleanExpression (condition), invoke, assign, loc).Resolve (rc);
+			expr.Emit (ec);
+		}
+
+		public override void EmitStatement (EmitContext ec)
+		{
+			var stmt = new If (condition, new StatementExpression (invoke), new StatementExpression (assign), loc);
+			using (ec.With (BuilderContext.Options.OmitDebugInfo, true)) {
+				stmt.Emit (ec);
+			}
+		}
+
+		public override void FlowAnalysis (FlowAnalysisContext fc)
+		{
+			invoke.FlowAnalysis (fc);
+		}
+	}
+
+	class DynamicConversion : DynamicExpressionStatement, IDynamicBinder
+	{
+		public DynamicConversion (TypeSpec targetType, CSharpBinderFlags flags, Arguments args, Location loc)
+			: base (null, args, loc)
+		{
+			type = targetType;
+			base.flags = flags;
+			base.binder = this;
+		}
+
+		public Expression CreateCallSiteBinder (ResolveContext ec, Arguments args)
+		{
+			Arguments binder_args = new Arguments (3);
+
+			flags |= ec.HasSet (ResolveContext.Options.CheckedScope) ? CSharpBinderFlags.CheckedContext : 0;
+
+			binder_args.Add (new Argument (new BinderFlags (flags, this)));
+			binder_args.Add (new Argument (new TypeOf (type, loc)));
+			binder_args.Add (new Argument (new TypeOf (ec.CurrentType, loc)));
+			return new Invocation (GetBinder ("Convert", loc), binder_args);
+		}
+	}
+
+	class DynamicConstructorBinder : DynamicExpressionStatement, IDynamicBinder
+	{
+		public DynamicConstructorBinder (TypeSpec type, Arguments args, Location loc)
+			: base (null, args, loc)
+		{
+			this.type = type;
+			base.binder = this;
+		}
+
+		public Expression CreateCallSiteBinder (ResolveContext ec, Arguments args)
+		{
+			Arguments binder_args = new Arguments (3);
+
+			binder_args.Add (new Argument (new BinderFlags (0, this)));
+			binder_args.Add (new Argument (new TypeOf (ec.CurrentTyp

@@ -1,0 +1,809 @@
+ase DW_OP_lit29:
+    case DW_OP_lit30:
+    case DW_OP_lit31:
+      stack.push_back(Scalar(op - DW_OP_lit0));
+      break;
+
+    //----------------------------------------------------------------------
+    // OPCODE: DW_OP_regN
+    // OPERANDS: none
+    // DESCRIPTION: Push the value in register n on the top of the stack.
+    //----------------------------------------------------------------------
+    case DW_OP_reg0:
+    case DW_OP_reg1:
+    case DW_OP_reg2:
+    case DW_OP_reg3:
+    case DW_OP_reg4:
+    case DW_OP_reg5:
+    case DW_OP_reg6:
+    case DW_OP_reg7:
+    case DW_OP_reg8:
+    case DW_OP_reg9:
+    case DW_OP_reg10:
+    case DW_OP_reg11:
+    case DW_OP_reg12:
+    case DW_OP_reg13:
+    case DW_OP_reg14:
+    case DW_OP_reg15:
+    case DW_OP_reg16:
+    case DW_OP_reg17:
+    case DW_OP_reg18:
+    case DW_OP_reg19:
+    case DW_OP_reg20:
+    case DW_OP_reg21:
+    case DW_OP_reg22:
+    case DW_OP_reg23:
+    case DW_OP_reg24:
+    case DW_OP_reg25:
+    case DW_OP_reg26:
+    case DW_OP_reg27:
+    case DW_OP_reg28:
+    case DW_OP_reg29:
+    case DW_OP_reg30:
+    case DW_OP_reg31: {
+      reg_num = op - DW_OP_reg0;
+
+      if (ReadRegisterValueAsScalar(reg_ctx, reg_kind, reg_num, error_ptr, tmp))
+        stack.push_back(tmp);
+      else
+        return false;
+    } break;
+    //----------------------------------------------------------------------
+    // OPCODE: DW_OP_regx
+    // OPERANDS:
+    //      ULEB128 literal operand that encodes the register.
+    // DESCRIPTION: Push the value in register on the top of the stack.
+    //----------------------------------------------------------------------
+    case DW_OP_regx: {
+      reg_num = opcodes.GetULEB128(&offset);
+      if (ReadRegisterValueAsScalar(reg_ctx, reg_kind, reg_num, error_ptr, tmp))
+        stack.push_back(tmp);
+      else
+        return false;
+    } break;
+
+    //----------------------------------------------------------------------
+    // OPCODE: DW_OP_bregN
+    // OPERANDS:
+    //      SLEB128 offset from register N
+    // DESCRIPTION: Value is in memory at the address specified by register
+    // N plus an offset.
+    //----------------------------------------------------------------------
+    case DW_OP_breg0:
+    case DW_OP_breg1:
+    case DW_OP_breg2:
+    case DW_OP_breg3:
+    case DW_OP_breg4:
+    case DW_OP_breg5:
+    case DW_OP_breg6:
+    case DW_OP_breg7:
+    case DW_OP_breg8:
+    case DW_OP_breg9:
+    case DW_OP_breg10:
+    case DW_OP_breg11:
+    case DW_OP_breg12:
+    case DW_OP_breg13:
+    case DW_OP_breg14:
+    case DW_OP_breg15:
+    case DW_OP_breg16:
+    case DW_OP_breg17:
+    case DW_OP_breg18:
+    case DW_OP_breg19:
+    case DW_OP_breg20:
+    case DW_OP_breg21:
+    case DW_OP_breg22:
+    case DW_OP_breg23:
+    case DW_OP_breg24:
+    case DW_OP_breg25:
+    case DW_OP_breg26:
+    case DW_OP_breg27:
+    case DW_OP_breg28:
+    case DW_OP_breg29:
+    case DW_OP_breg30:
+    case DW_OP_breg31: {
+      reg_num = op - DW_OP_breg0;
+
+      if (ReadRegisterValueAsScalar(reg_ctx, reg_kind, reg_num, error_ptr,
+                                    tmp)) {
+        int64_t breg_offset = opcodes.GetSLEB128(&offset);
+        tmp.ResolveValue(exe_ctx) += (uint64_t)breg_offset;
+        tmp.ClearContext();
+        stack.push_back(tmp);
+        stack.back().SetValueType(Value::eValueTypeLoadAddress);
+      } else
+        return false;
+    } break;
+    //----------------------------------------------------------------------
+    // OPCODE: DW_OP_bregx
+    // OPERANDS: 2
+    //      ULEB128 literal operand that encodes the register.
+    //      SLEB128 offset from register N
+    // DESCRIPTION: Value is in memory at the address specified by register
+    // N plus an offset.
+    //----------------------------------------------------------------------
+    case DW_OP_bregx: {
+      reg_num = opcodes.GetULEB128(&offset);
+
+      if (ReadRegisterValueAsScalar(reg_ctx, reg_kind, reg_num, error_ptr,
+                                    tmp)) {
+        int64_t breg_offset = opcodes.GetSLEB128(&offset);
+        tmp.ResolveValue(exe_ctx) += (uint64_t)breg_offset;
+        tmp.ClearContext();
+        stack.push_back(tmp);
+        stack.back().SetValueType(Value::eValueTypeLoadAddress);
+      } else
+        return false;
+    } break;
+
+    case DW_OP_fbreg:
+      if (exe_ctx) {
+        if (frame) {
+          Scalar value;
+          if (frame->GetFrameBaseValue(value, error_ptr)) {
+            int64_t fbreg_offset = opcodes.GetSLEB128(&offset);
+            value += fbreg_offset;
+            stack.push_back(value);
+            stack.back().SetValueType(Value::eValueTypeLoadAddress);
+          } else
+            return false;
+        } else {
+          if (error_ptr)
+            error_ptr->SetErrorString(
+                "Invalid stack frame in context for DW_OP_fbreg opcode.");
+          return false;
+        }
+      } else {
+        if (error_ptr)
+          error_ptr->SetErrorStringWithFormat(
+              "NULL execution context for DW_OP_fbreg.\n");
+        return false;
+      }
+
+      break;
+
+    //----------------------------------------------------------------------
+    // OPCODE: DW_OP_nop
+    // OPERANDS: none
+    // DESCRIPTION: A place holder. It has no effect on the location stack
+    // or any of its values.
+    //----------------------------------------------------------------------
+    case DW_OP_nop:
+      break;
+
+    //----------------------------------------------------------------------
+    // OPCODE: DW_OP_piece
+    // OPERANDS: 1
+    //      ULEB128: byte size of the piece
+    // DESCRIPTION: The operand describes the size in bytes of the piece of
+    // the object referenced by the DWARF expression whose result is at the
+    // top of the stack. If the piece is located in a register, but does not
+    // occupy the entire register, the placement of the piece within that
+    // register is defined by the ABI.
+    //
+    // Many compilers store a single variable in sets of registers, or store
+    // a variable partially in memory and partially in registers.
+    // DW_OP_piece provides a way of describing how large a part of a
+    // variable a particular DWARF expression refers to.
+    //----------------------------------------------------------------------
+    case DW_OP_piece: {
+      const uint64_t piece_byte_size = opcodes.GetULEB128(&offset);
+
+      if (piece_byte_size > 0) {
+        Value curr_piece;
+
+        if (stack.empty()) {
+          // In a multi-piece expression, this means that the current piece is
+          // not available.
+          // Fill with zeros for now by resizing the data and appending it
+          curr_piece.ResizeData(piece_byte_size);
+          ::memset(curr_piece.GetBuffer().GetBytes(), 0, piece_byte_size);
+          pieces.AppendDataToHostBuffer(curr_piece);
+        } else {
+          Status error;
+          // Extract the current piece into "curr_piece"
+          Value curr_piece_source_value(stack.back());
+          stack.pop_back();
+
+          const Value::ValueType curr_piece_source_value_type =
+              curr_piece_source_value.GetValueType();
+          switch (curr_piece_source_value_type) {
+          case Value::eValueTypeLoadAddress:
+            if (process) {
+              if (curr_piece.ResizeData(piece_byte_size) == piece_byte_size) {
+                lldb::addr_t load_addr =
+                    curr_piece_source_value.GetScalar().ULongLong(
+                        LLDB_INVALID_ADDRESS);
+                if (process->ReadMemory(
+                        load_addr, curr_piece.GetBuffer().GetBytes(),
+                        piece_byte_size, error) != piece_byte_size) {
+                  if (error_ptr)
+                    error_ptr->SetErrorStringWithFormat(
+                        "failed to read memory DW_OP_piece(%" PRIu64
+                        ") from 0x%" PRIx64,
+                        piece_byte_size, load_addr);
+                  return false;
+                }
+              } else {
+                if (error_ptr)
+                  error_ptr->SetErrorStringWithFormat(
+                      "failed to resize the piece memory buffer for "
+                      "DW_OP_piece(%" PRIu64 ")",
+                      piece_byte_size);
+                return false;
+              }
+            }
+            break;
+
+          case Value::eValueTypeFileAddress:
+          case Value::eValueTypeHostAddress:
+            if (error_ptr) {
+              lldb::addr_t addr = curr_piece_source_value.GetScalar().ULongLong(
+                  LLDB_INVALID_ADDRESS);
+              error_ptr->SetErrorStringWithFormat(
+                  "failed to read memory DW_OP_piece(%" PRIu64
+                  ") from %s address 0x%" PRIx64,
+                  piece_byte_size, curr_piece_source_value.GetValueType() ==
+                                           Value::eValueTypeFileAddress
+                                       ? "file"
+                                       : "host",
+                  addr);
+            }
+            return false;
+
+          case Value::eValueTypeScalar: {
+            uint32_t bit_size = piece_byte_size * 8;
+            uint32_t bit_offset = 0;
+            if (!curr_piece_source_value.GetScalar().ExtractBitfield(
+                    bit_size, bit_offset)) {
+              if (error_ptr)
+                error_ptr->SetErrorStringWithFormat(
+                    "unable to extract %" PRIu64 " bytes from a %" PRIu64
+                    " byte scalar value.",
+                    piece_byte_size,
+                    (uint64_t)curr_piece_source_value.GetScalar()
+                        .GetByteSize());
+              return false;
+            }
+            curr_piece = curr_piece_source_value;
+          } break;
+
+          case Value::eValueTypeVector: {
+            if (curr_piece_source_value.GetVector().length >= piece_byte_size)
+              curr_piece_source_value.GetVector().length = piece_byte_size;
+            else {
+              if (error_ptr)
+                error_ptr->SetErrorStringWithFormat(
+                    "unable to extract %" PRIu64 " bytes from a %" PRIu64
+                    " byte vector value.",
+                    piece_byte_size,
+                    (uint64_t)curr_piece_source_value.GetVector().length);
+              return false;
+            }
+          } break;
+          }
+
+          // Check if this is the first piece?
+          if (op_piece_offset == 0) {
+            // This is the first piece, we should push it back onto the stack so
+            // subsequent
+            // pieces will be able to access this piece and add to it
+            if (pieces.AppendDataToHostBuffer(curr_piece) == 0) {
+              if (error_ptr)
+                error_ptr->SetErrorString("failed to append piece data");
+              return false;
+            }
+          } else {
+            // If this is the second or later piece there should be a value on
+            // the stack
+            if (pieces.GetBuffer().GetByteSize() != op_piece_offset) {
+              if (error_ptr)
+                error_ptr->SetErrorStringWithFormat(
+                    "DW_OP_piece for offset %" PRIu64
+                    " but top of stack is of size %" PRIu64,
+                    op_piece_offset, pieces.GetBuffer().GetByteSize());
+              return false;
+            }
+
+            if (pieces.AppendDataToHostBuffer(curr_piece) == 0) {
+              if (error_ptr)
+                error_ptr->SetErrorString("failed to append piece data");
+              return false;
+            }
+          }
+          op_piece_offset += piece_byte_size;
+        }
+      }
+    } break;
+
+    case DW_OP_bit_piece: // 0x9d ULEB128 bit size, ULEB128 bit offset (DWARF3);
+      if (stack.size() < 1) {
+        if (error_ptr)
+          error_ptr->SetErrorString(
+              "Expression stack needs at least 1 item for DW_OP_bit_piece.");
+        return false;
+      } else {
+        const uint64_t piece_bit_size = opcodes.GetULEB128(&offset);
+        const uint64_t piece_bit_offset = opcodes.GetULEB128(&offset);
+        switch (stack.back().GetValueType()) {
+        case Value::eValueTypeScalar: {
+          if (!stack.back().GetScalar().ExtractBitfield(piece_bit_size,
+                                                        piece_bit_offset)) {
+            if (error_ptr)
+              error_ptr->SetErrorStringWithFormat(
+                  "unable to extract %" PRIu64 " bit value with %" PRIu64
+                  " bit offset from a %" PRIu64 " bit scalar value.",
+                  piece_bit_size, piece_bit_offset,
+                  (uint64_t)(stack.back().GetScalar().GetByteSize() * 8));
+            return false;
+          }
+        } break;
+
+        case Value::eValueTypeFileAddress:
+        case Value::eValueTypeLoadAddress:
+        case Value::eValueTypeHostAddress:
+          if (error_ptr) {
+            error_ptr->SetErrorStringWithFormat(
+                "unable to extract DW_OP_bit_piece(bit_size = %" PRIu64
+                ", bit_offset = %" PRIu64 ") from an addresss value.",
+                piece_bit_size, piece_bit_offset);
+          }
+          return false;
+
+        case Value::eValueTypeVector:
+          if (error_ptr) {
+            error_ptr->SetErrorStringWithFormat(
+                "unable to extract DW_OP_bit_piece(bit_size = %" PRIu64
+                ", bit_offset = %" PRIu64 ") from a vector value.",
+                piece_bit_size, piece_bit_offset);
+          }
+          return false;
+        }
+      }
+      break;
+
+    //----------------------------------------------------------------------
+    // OPCODE: DW_OP_push_object_address
+    // OPERANDS: none
+    // DESCRIPTION: Pushes the address of the object currently being
+    // evaluated as part of evaluation of a user presented expression.
+    // This object may correspond to an independent variable described by
+    // its own DIE or it may be a component of an array, structure, or class
+    // whose address has been dynamically determined by an earlier step
+    // during user expression evaluation.
+    //----------------------------------------------------------------------
+    case DW_OP_push_object_address:
+      if (object_address_ptr)
+        stack.push_back(*object_address_ptr);
+      else {
+        if (error_ptr)
+          error_ptr->SetErrorString("DW_OP_push_object_address used without "
+                                    "specifying an object address");
+        return false;
+      }
+      break;
+
+    //----------------------------------------------------------------------
+    // OPCODE: DW_OP_call2
+    // OPERANDS:
+    //      uint16_t compile unit relative offset of a DIE
+    // DESCRIPTION: Performs subroutine calls during evaluation
+    // of a DWARF expression. The operand is the 2-byte unsigned offset
+    // of a debugging information entry in the current compilation unit.
+    //
+    // Operand interpretation is exactly like that for DW_FORM_ref2.
+    //
+    // This operation transfers control of DWARF expression evaluation
+    // to the DW_AT_location attribute of the referenced DIE. If there is
+    // no such attribute, then there is no effect. Execution of the DWARF
+    // expression of a DW_AT_location attribute may add to and/or remove from
+    // values on the stack. Execution returns to the point following the call
+    // when the end of the attribute is reached. Values on the stack at the
+    // time of the call may be used as parameters by the called expression
+    // and values left on the stack by the called expression may be used as
+    // return values by prior agreement between the calling and called
+    // expressions.
+    //----------------------------------------------------------------------
+    case DW_OP_call2:
+      if (error_ptr)
+        error_ptr->SetErrorString("Unimplemented opcode DW_OP_call2.");
+      return false;
+    //----------------------------------------------------------------------
+    // OPCODE: DW_OP_call4
+    // OPERANDS: 1
+    //      uint32_t compile unit relative offset of a DIE
+    // DESCRIPTION: Performs a subroutine call during evaluation of a DWARF
+    // expression. For DW_OP_call4, the operand is a 4-byte unsigned offset
+    // of a debugging information entry in  the current compilation unit.
+    //
+    // Operand interpretation DW_OP_call4 is exactly like that for
+    // DW_FORM_ref4.
+    //
+    // This operation transfers control of DWARF expression evaluation
+    // to the DW_AT_location attribute of the referenced DIE. If there is
+    // no such attribute, then there is no effect. Execution of the DWARF
+    // expression of a DW_AT_location attribute may add to and/or remove from
+    // values on the stack. Execution returns to the point following the call
+    // when the end of the attribute is reached. Values on the stack at the
+    // time of the call may be used as parameters by the called expression
+    // and values left on the stack by the called expression may be used as
+    // return values by prior agreement between the calling and called
+    // expressions.
+    //----------------------------------------------------------------------
+    case DW_OP_call4:
+      if (error_ptr)
+        error_ptr->SetErrorString("Unimplemented opcode DW_OP_call4.");
+      return false;
+
+    //----------------------------------------------------------------------
+    // OPCODE: DW_OP_stack_value
+    // OPERANDS: None
+    // DESCRIPTION: Specifies that the object does not exist in memory but
+    // rather is a constant value.  The value from the top of the stack is
+    // the value to be used.  This is the actual object value and not the
+    // location.
+    //----------------------------------------------------------------------
+    case DW_OP_stack_value:
+      stack.back().SetValueType(Value::eValueTypeScalar);
+      break;
+
+    //----------------------------------------------------------------------
+    // OPCODE: DW_OP_call_frame_cfa
+    // OPERANDS: None
+    // DESCRIPTION: Specifies a DWARF expression that pushes the value of
+    // the canonical frame address consistent with the call frame information
+    // located in .debug_frame (or in the FDEs of the eh_frame section).
+    //----------------------------------------------------------------------
+    case DW_OP_call_frame_cfa:
+      if (frame) {
+        // Note that we don't have to parse FDEs because this DWARF expression
+        // is commonly evaluated with a valid stack frame.
+        StackID id = frame->GetStackID();
+        addr_t cfa = id.GetCallFrameAddress();
+        if (cfa != LLDB_INVALID_ADDRESS) {
+          stack.push_back(Scalar(cfa));
+          stack.back().SetValueType(Value::eValueTypeLoadAddress);
+        } else if (error_ptr)
+          error_ptr->SetErrorString("Stack frame does not include a canonical "
+                                    "frame address for DW_OP_call_frame_cfa "
+                                    "opcode.");
+      } else {
+        if (error_ptr)
+          error_ptr->SetErrorString("Invalid stack frame in context for "
+                                    "DW_OP_call_frame_cfa opcode.");
+        return false;
+      }
+      break;
+
+    //----------------------------------------------------------------------
+    // OPCODE: DW_OP_form_tls_address (or the old pre-DWARFv3 vendor extension
+    // opcode, DW_OP_GNU_push_tls_address)
+    // OPERANDS: none
+    // DESCRIPTION: Pops a TLS offset from the stack, converts it to
+    // an address in the current thread's thread-local storage block,
+    // and pushes it on the stack.
+    //----------------------------------------------------------------------
+    case DW_OP_form_tls_address:
+    case DW_OP_GNU_push_tls_address: {
+      if (stack.size() < 1) {
+        if (error_ptr) {
+          if (op == DW_OP_form_tls_address)
+            error_ptr->SetErrorString(
+                "DW_OP_form_tls_address needs an argument.");
+          else
+            error_ptr->SetErrorString(
+                "DW_OP_GNU_push_tls_address needs an argument.");
+        }
+        return false;
+      }
+
+      if (!exe_ctx || !module_sp) {
+        if (error_ptr)
+          error_ptr->SetErrorString("No context to evaluate TLS within.");
+        return false;
+      }
+
+      Thread *thread = exe_ctx->GetThreadPtr();
+      if (!thread) {
+        if (error_ptr)
+          error_ptr->SetErrorString("No thread to evaluate TLS within.");
+        return false;
+      }
+
+      // Lookup the TLS block address for this thread and module.
+      const addr_t tls_file_addr =
+          stack.back().GetScalar().ULongLong(LLDB_INVALID_ADDRESS);
+      const addr_t tls_load_addr =
+          thread->GetThreadLocalData(module_sp, tls_file_addr);
+
+      if (tls_load_addr == LLDB_INVALID_ADDRESS) {
+        if (error_ptr)
+          error_ptr->SetErrorString(
+              "No TLS data currently exists for this thread.");
+        return false;
+      }
+
+      stack.back().GetScalar() = tls_load_addr;
+      stack.back().SetValueType(Value::eValueTypeLoadAddress);
+    } break;
+
+    //----------------------------------------------------------------------
+    // OPCODE: DW_OP_GNU_addr_index
+    // OPERANDS: 1
+    //      ULEB128: index to the .debug_addr section
+    // DESCRIPTION: Pushes an address to the stack from the .debug_addr
+    // section with the base address specified by the DW_AT_addr_base
+    // attribute and the 0 based index is the ULEB128 encoded index.
+    //----------------------------------------------------------------------
+    case DW_OP_GNU_addr_index: {
+      if (!dwarf_cu) {
+        if (error_ptr)
+          error_ptr->SetErrorString("DW_OP_GNU_addr_index found without a "
+                                    "compile unit being specified");
+        return false;
+      }
+      uint64_t index = opcodes.GetULEB128(&offset);
+      uint32_t index_size = dwarf_cu->GetAddressByteSize();
+      dw_offset_t addr_base = dwarf_cu->GetAddrBase();
+      lldb::offset_t offset = addr_base + index * index_size;
+      uint64_t value =
+          dwarf_cu->GetSymbolFileDWARF()->get_debug_addr_data().GetMaxU64(
+              &offset, index_size);
+      stack.push_back(Scalar(value));
+      stack.back().SetValueType(Value::eValueTypeFileAddress);
+    } break;
+
+    //----------------------------------------------------------------------
+    // OPCODE: DW_OP_GNU_const_index
+    // OPERANDS: 1
+    //      ULEB128: index to the .debug_addr section
+    // DESCRIPTION: Pushes an constant with the size of a machine address to
+    // the stack from the .debug_addr section with the base address specified
+    // by the DW_AT_addr_base attribute and the 0 based index is the ULEB128
+    // encoded index.
+    //----------------------------------------------------------------------
+    case DW_OP_GNU_const_index: {
+      if (!dwarf_cu) {
+        if (error_ptr)
+          error_ptr->SetErrorString("DW_OP_GNU_const_index found without a "
+                                    "compile unit being specified");
+        return false;
+      }
+      uint64_t index = opcodes.GetULEB128(&offset);
+      uint32_t index_size = dwarf_cu->GetAddressByteSize();
+      dw_offset_t addr_base = dwarf_cu->GetAddrBase();
+      lldb::offset_t offset = addr_base + index * index_size;
+      const DWARFDataExtractor &debug_addr =
+          dwarf_cu->GetSymbolFileDWARF()->get_debug_addr_data();
+      switch (index_size) {
+      case 4:
+        stack.push_back(Scalar(debug_addr.GetU32(&offset)));
+        break;
+      case 8:
+        stack.push_back(Scalar(debug_addr.GetU64(&offset)));
+        break;
+      default:
+        assert(false && "Unhandled index size");
+        return false;
+      }
+    } break;
+
+    default:
+      if (log)
+        log->Printf("Unhandled opcode %s in DWARFExpression.",
+                    DW_OP_value_to_name(op));
+      break;
+    }
+  }
+
+  if (stack.empty()) {
+    // Nothing on the stack, check if we created a piece value from DW_OP_piece
+    // or DW_OP_bit_piece opcodes
+    if (pieces.GetBuffer().GetByteSize()) {
+      result = pieces;
+    } else {
+      if (error_ptr)
+        error_ptr->SetErrorString("Stack empty after evaluation.");
+      return false;
+    }
+  } else {
+    if (log && log->GetVerbose()) {
+      size_t count = stack.size();
+      log->Printf("Stack after operation has %" PRIu64 " values:",
+                  (uint64_t)count);
+      for (size_t i = 0; i < count; ++i) {
+        StreamString new_value;
+        new_value.Printf("[%" PRIu64 "]", (uint64_t)i);
+        stack[i].Dump(&new_value);
+        log->Printf("  %s", new_value.GetData());
+      }
+    }
+    result = stack.back();
+  }
+  return true; // Return true on success
+}
+
+size_t DWARFExpression::LocationListSize(const DWARFCompileUnit *dwarf_cu,
+                                         const DataExtractor &debug_loc_data,
+                                         lldb::offset_t offset) {
+  const lldb::offset_t debug_loc_offset = offset;
+  while (debug_loc_data.ValidOffset(offset)) {
+    lldb::addr_t start_addr = LLDB_INVALID_ADDRESS;
+    lldb::addr_t end_addr = LLDB_INVALID_ADDRESS;
+    if (!AddressRangeForLocationListEntry(dwarf_cu, debug_loc_data, &offset,
+                                          start_addr, end_addr))
+      break;
+
+    if (start_addr == 0 && end_addr == 0)
+      break;
+
+    uint16_t loc_length = debug_loc_data.GetU16(&offset);
+    offset += loc_length;
+  }
+
+  if (offset > debug_loc_offset)
+    return offset - debug_loc_offset;
+  return 0;
+}
+
+bool DWARFExpression::AddressRangeForLocationListEntry(
+    const DWARFCompileUnit *dwarf_cu, const DataExtractor &debug_loc_data,
+    lldb::offset_t *offset_ptr, lldb::addr_t &low_pc, lldb::addr_t &high_pc) {
+  if (!debug_loc_data.ValidOffset(*offset_ptr))
+    return false;
+
+  switch (dwarf_cu->GetSymbolFileDWARF()->GetLocationListFormat()) {
+  case NonLocationList:
+    return false;
+  case RegularLocationList:
+    low_pc = debug_loc_data.GetAddress(offset_ptr);
+    high_pc = debug_loc_data.GetAddress(offset_ptr);
+    return true;
+  case SplitDwarfLocationList:
+    switch (debug_loc_data.GetU8(offset_ptr)) {
+    case DW_LLE_end_of_list:
+      return false;
+    case DW_LLE_startx_endx: {
+      uint64_t index = debug_loc_data.GetULEB128(offset_ptr);
+      low_pc = ReadAddressFromDebugAddrSection(dwarf_cu, index);
+      index = debug_loc_data.GetULEB128(offset_ptr);
+      high_pc = ReadAddressFromDebugAddrSection(dwarf_cu, index);
+      return true;
+    }
+    case DW_LLE_startx_length: {
+      uint64_t index = debug_loc_data.GetULEB128(offset_ptr);
+      low_pc = ReadAddressFromDebugAddrSection(dwarf_cu, index);
+      uint32_t length = debug_loc_data.GetU32(offset_ptr);
+      high_pc = low_pc + length;
+      return true;
+    }
+    default:
+      // Not supported entry type
+      return false;
+    }
+  }
+  assert(false && "Not supported location list type");
+  return false;
+}
+
+static bool print_dwarf_exp_op(Stream &s, const DataExtractor &data,
+                               lldb::offset_t *offset_ptr, int address_size,
+                               int dwarf_ref_size) {
+  uint8_t opcode = data.GetU8(offset_ptr);
+  DRC_class opcode_class;
+  uint64_t uint;
+  int64_t sint;
+
+  int size;
+
+  opcode_class = DW_OP_value_to_class(opcode) & (~DRC_DWARFv3);
+
+  s.Printf("%s ", DW_OP_value_to_name(opcode));
+
+  /* Does this take zero parameters?  If so we can shortcut this function.  */
+  if (opcode_class == DRC_ZEROOPERANDS)
+    return true;
+
+  if (opcode_class == DRC_TWOOPERANDS && opcode == DW_OP_bregx) {
+    uint = data.GetULEB128(offset_ptr);
+    sint = data.GetSLEB128(offset_ptr);
+    s.Printf("%" PRIu64 " %" PRIi64, uint, sint);
+    return true;
+  }
+  if (opcode_class != DRC_ONEOPERAND) {
+    s.Printf("UNKNOWN OP %u", opcode);
+    return false;
+  }
+
+  switch (opcode) {
+  case DW_OP_addr:
+    size = address_size;
+    break;
+  case DW_OP_const1u:
+    size = 1;
+    break;
+  case DW_OP_const1s:
+    size = -1;
+    break;
+  case DW_OP_const2u:
+    size = 2;
+    break;
+  case DW_OP_const2s:
+    size = -2;
+    break;
+  case DW_OP_const4u:
+    size = 4;
+    break;
+  case DW_OP_const4s:
+    size = -4;
+    break;
+  case DW_OP_const8u:
+    size = 8;
+    break;
+  case DW_OP_const8s:
+    size = -8;
+    break;
+  case DW_OP_constu:
+    size = 128;
+    break;
+  case DW_OP_consts:
+    size = -128;
+    break;
+  case DW_OP_fbreg:
+    size = -128;
+    break;
+  case DW_OP_breg0:
+  case DW_OP_breg1:
+  case DW_OP_breg2:
+  case DW_OP_breg3:
+  case DW_OP_breg4:
+  case DW_OP_breg5:
+  case DW_OP_breg6:
+  case DW_OP_breg7:
+  case DW_OP_breg8:
+  case DW_OP_breg9:
+  case DW_OP_breg10:
+  case DW_OP_breg11:
+  case DW_OP_breg12:
+  case DW_OP_breg13:
+  case DW_OP_breg14:
+  case DW_OP_breg15:
+  case DW_OP_breg16:
+  case DW_OP_breg17:
+  case DW_OP_breg18:
+  case DW_OP_breg19:
+  case DW_OP_breg20:
+  case DW_OP_breg21:
+  case DW_OP_breg22:
+  case DW_OP_breg23:
+  case DW_OP_breg24:
+  case DW_OP_breg25:
+  case DW_OP_breg26:
+  case DW_OP_breg27:
+  case DW_OP_breg28:
+  case DW_OP_breg29:
+  case DW_OP_breg30:
+  case DW_OP_breg31:
+    size = -128;
+    break;
+  case DW_OP_pick:
+  case DW_OP_deref_size:
+  case DW_OP_xderef_size:
+    size = 1;
+    break;
+  case DW_OP_skip:
+  case DW_OP_bra:
+    size = -2;
+    break;
+  case DW_OP_call2:
+    size = 2;
+    break;
+  case DW_OP_call4:
+    size = 4;
+    break;
+  case DW_OP_call_ref:
+    size = dwarf_ref_size;
+    break;
+  case DW_OP_piece:
+  case DW_OP_plus_uconst:
+  case DW_OP_regx:
+  case DW_OP_GNU_addr_i

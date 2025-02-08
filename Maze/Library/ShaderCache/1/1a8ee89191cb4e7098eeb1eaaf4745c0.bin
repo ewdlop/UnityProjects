@@ -1,0 +1,155 @@
+             {
+                    if (IsDescendantOfCatch(catchObject, selection.PrimarySelection))
+                    {
+                        UpdateSelection(catchObject);
+                        break;
+                    }
+                }
+            }
+        }
+
+        bool IsDescendantOfTry(ModelItem descendant)
+        {
+            return IsDescendantOf(descendant, "Try");
+        }
+
+        bool IsDescendantOfFinally(ModelItem descendant)
+        {
+            return IsDescendantOf(descendant, "Finally");
+        }
+
+        static bool IsAncestorOf(ModelItem ancester, ModelItem descendant)
+        {
+            if (ancester == null)
+            {
+                return false;
+            }
+
+            ModelItem itr = descendant;
+            while (itr != null)
+            {
+                if (itr == ancester)
+                {
+                    return true;
+                }
+                itr = itr.Parent;
+            }
+            return false;
+        }
+
+        bool IsDescendantOf(ModelItem descendant, string property)
+        {
+            if (descendant == null)
+            {
+                return false;
+            }
+            else
+            {
+                ModelItem propertyValue = this.ModelItem.Properties[property].Value;
+                return IsAncestorOf(propertyValue, descendant);
+            }
+        }
+
+        internal static bool IsDescendantOfCatch(ModelItem catchObject, ModelItem descendant)
+        {
+            Fx.Assert(catchObject != null, "Catch object mustn't be null.");
+            if (catchObject == descendant)
+            {
+                return true;
+            }
+            else
+            {
+                ModelItem activityAction = catchObject.Properties["Action"].Value;
+                if (activityAction != null)
+                {
+                    ModelItem activityActionHandler = activityAction.Properties["Handler"].Value;
+                    if (activityActionHandler != null)
+                    {
+                        return IsAncestorOf(activityActionHandler, descendant);
+                    }
+                }
+                return false;
+            }
+        }
+
+        void UpdateSelection(ModelItem newSelectedCatch)
+        {
+            ModelItem oldSelectedCatch = this.SelectedCatch;
+            this.SelectedCatch = newSelectedCatch;
+
+            this.Dispatcher.BeginInvoke(DispatcherPriority.Normal, (Action)(() =>
+            {
+                if (oldSelectedCatch != null)
+                {
+                    CatchDesigner oldSelectedCatchDesigner = (CatchDesigner)oldSelectedCatch.View;
+                    if (oldSelectedCatchDesigner != null)
+                    {
+                        oldSelectedCatchDesigner.ExpandState = false;
+                        oldSelectedCatchDesigner.PinState = false;
+                    }
+                }
+                if (newSelectedCatch != null)
+                {
+                    CollapseTryView();
+                    CollapseFinallyView();
+                    CatchDesigner newSelectedCatchDesigner = (CatchDesigner)newSelectedCatch.View;
+                    if (newSelectedCatchDesigner != null)
+                    {
+                        newSelectedCatchDesigner.ExpandState = true;
+                        newSelectedCatchDesigner.PinState = true;
+                    }
+                }
+            }));
+        }
+
+        void CreateCatch(Type exceptionType)
+        {
+            if (exceptionType != null)
+            {
+                Type catchType = typeof(Catch<>).MakeGenericType(exceptionType);
+                object catchObject = Activator.CreateInstance(catchType);
+
+                Type activityActionType = typeof(ActivityAction<>).MakeGenericType(exceptionType);
+                object activityAction = Activator.CreateInstance(activityActionType);
+
+                Type argumentType = typeof(DelegateInArgument<>).MakeGenericType(exceptionType);
+                object exceptionArgument = Activator.CreateInstance(argumentType);
+                DelegateInArgument delegateArgument = exceptionArgument as DelegateInArgument;
+                Fx.Assert(null != delegateArgument, "delegate argument must be of DelegateInArgument type!");
+                delegateArgument.Name = "exception";
+
+                catchType.GetProperty(PropertyNames.Action).SetValue(catchObject, activityAction, null);
+                activityActionType.GetProperty(PropertyNames.ActionArgument).SetValue(activityAction, exceptionArgument, null);
+
+                this.ModelItem.Properties["Catches"].Collection.Add(catchObject);
+            }
+        }
+
+        void OnFinallyViewMouseDown(object sender, MouseButtonEventArgs e)
+        {
+            if (e.LeftButton == MouseButtonState.Pressed && e.ClickCount == 2)
+            {
+                SwitchTryCatchDesignerHelper.MakeRootDesigner(this);
+                e.Handled = true;
+            }
+            else if (e.LeftButton == MouseButtonState.Pressed)
+            {
+                ExpandFinallyView();
+                Keyboard.Focus((IInputElement)sender);
+            }
+            else if (e.RightButton == MouseButtonState.Pressed)
+            {
+                if (this.IsExpanded(this.ShowFinallyExpanded))
+                {
+                    Keyboard.Focus((IInputElement)sender);
+                }
+                e.Handled = true;
+            }
+        }
+
+        void OnFinallyViewMouseUp(object sender, MouseButtonEventArgs e)
+        {
+            // avoid context menu upon right-click when it's collapsed
+            if (!IsExpanded(this.ShowFinallyExpanded) && e.RightButton == MouseButtonState.Released)
+            {
+                e.H

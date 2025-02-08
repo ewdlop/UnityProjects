@@ -1,0 +1,98 @@
+ unlike Update() it works when the server is not listening.
+        /// <para>When the server is using externally added connections and the dontListen flag is set, the regular connection flush in the Update() function does not happen. In this case, UpdateConnections can be called to pump the external connections. This is an advanced usage that should not be required unless the server uses custom NetworkConnection classes that do not use the built-in transport layer.</para>
+        /// </summary>
+        // this can be used independantly of Update() - such as when using external connections and not listening.
+        public void UpdateConnections()
+        {
+            for (int i = 0; i < m_Connections.Count; i++)
+            {
+                NetworkConnection conn = m_Connections[i];
+                if (conn != null)
+                    conn.FlushChannels();
+            }
+        }
+
+        /// <summary>
+        /// This function pumps the server causing incoming network data to be processed, and pending outgoing data to be sent.
+        /// <para>This should be called each frame, and is called automatically for the server used by NetworkServer.</para>
+        /// </summary>
+        public void Update()
+        {
+            if (m_ServerHostId == -1)
+                return;
+
+            int connectionId;
+            int channelId;
+            int receivedSize;
+            byte error;
+
+            var networkEvent = NetworkEventType.DataEvent;
+            if (m_RelaySlotId != -1)
+            {
+                networkEvent = NetworkManager.activeTransport.ReceiveRelayEventFromHost(m_ServerHostId, out error);
+                if (NetworkEventType.Nothing != networkEvent)
+                {
+                    if (LogFilter.logDebug) { Debug.Log("NetGroup event:" + networkEvent); }
+                }
+                if (networkEvent == NetworkEventType.ConnectEvent)
+                {
+                    if (LogFilter.logDebug) { Debug.Log("NetGroup server connected"); }
+                }
+                if (networkEvent == NetworkEventType.DisconnectEvent)
+                {
+                    if (LogFilter.logDebug) { Debug.Log("NetGroup server disconnected"); }
+                }
+            }
+
+            do
+            {
+                networkEvent = NetworkManager.activeTransport.ReceiveFromHost(m_ServerHostId, out connectionId, out channelId, m_MsgBuffer, (int)m_MsgBuffer.Length, out receivedSize, out error);
+                if (networkEvent != NetworkEventType.Nothing)
+                {
+                    if (LogFilter.logDev) { Debug.Log("Server event: host=" + m_ServerHostId + " event=" + networkEvent + " error=" + error); }
+                }
+
+                switch (networkEvent)
+                {
+                    case NetworkEventType.ConnectEvent:
+                    {
+                        HandleConnect(connectionId, error);
+                        break;
+                    }
+
+                    case NetworkEventType.DataEvent:
+                    {
+                        HandleData(connectionId, channelId, receivedSize, error);
+                        break;
+                    }
+
+                    case NetworkEventType.DisconnectEvent:
+                    {
+                        HandleDisconnect(connectionId, error);
+                        break;
+                    }
+
+                    case NetworkEventType.Nothing:
+                    {
+                        if (error != 0)
+                        {
+                            OnError(connectionId, error);
+                        }
+                        break;
+                    }
+
+                    default:
+                        if (LogFilter.logError) { Debug.LogError("Unknown network message type received: " + networkEvent); }
+                        break;
+                }
+            }
+            while (networkEvent != NetworkEventType.Nothing);
+
+            UpdateConnections();
+        }
+
+        /// <summary>
+        /// This looks up the network connection object for the specified connection Id.
+        /// </summary>
+        /// <param name="connectionId">The connection id to look up.</param>
+        /// <returns>A NetworkConnection objects, or null if 

@@ -1,0 +1,1188 @@
+//------------------------------------------------------------
+// Copyright (c) Microsoft Corporation.  All rights reserved.
+//------------------------------------------------------------
+
+#pragma warning disable 1634, 1691
+namespace System.Workflow.Activities
+{
+    using System;
+    using System.Collections;
+    using System.Collections.Generic;
+    using System.ComponentModel;
+    using System.Globalization;
+    using System.Reflection;
+    using System.ServiceModel;
+
+    internal sealed class ContractType : Type, ICloneable
+    {
+        private static readonly char[] elementDecorators = new char[] { '[', '*', '&' };
+        private static readonly char[] nameSeparators = new char[] { '.', '+' };
+
+        private Attribute[] attributes = null;
+        private ConstructorInfo[] constructors = null;
+        private EventInfo[] events = null;
+        private FieldInfo[] fields = null;
+        private string fullName;
+        private Guid guid = Guid.Empty;
+        private MethodInfo[] methods = null;
+
+        private string name;
+        private Type[] nestedTypes = Type.EmptyTypes;
+        private PropertyInfo[] properties = null;
+        private TypeAttributes typeAttributes;
+
+        internal ContractType(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+            {
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgument(
+                    "name", SR2.GetString(SR2.Error_ArgumentValueNullOrEmptyString));
+            }
+
+            this.fullName = name;
+
+            this.name = this.fullName;
+
+            // detect first bracket, any name seperators after it are part of a generic parameter...  
+            int idx = name.IndexOf('[');
+
+            // Get the name after the last dot
+            if (idx != -1)
+            {
+                idx = this.name.Substring(0, idx).LastIndexOfAny(nameSeparators);
+            }
+            else
+            {
+                idx = this.name.LastIndexOfAny(nameSeparators);
+            }
+
+            if (idx != -1)
+            {
+                this.name = this.fullName.Substring(idx + 1);
+            }
+
+            this.typeAttributes = TypeAttributes.Interface |
+                TypeAttributes.Sealed |
+                TypeAttributes.Public |
+                TypeAttributes.Abstract;
+
+            this.attributes = new Attribute[] { new ServiceContractAttribute() };
+            this.methods = new MethodInfo[0];
+        }
+
+        public override Assembly Assembly
+        {
+            get
+            {
+                return null;
+            }
+        }
+
+        public override string AssemblyQualifiedName
+        {
+            get
+            {
+                return this.FullName;
+            }
+        }
+
+        public override Type BaseType
+        {
+            get
+            {
+                return null;
+            }
+        }
+
+        public override Type DeclaringType
+        {
+            get
+            {
+                return null;
+            }
+        }
+
+        public override string FullName
+        {
+            get
+            {
+                return this.fullName;
+            }
+        }
+
+        public override Guid GUID
+        {
+            get
+            {
+                if (this.guid == Guid.Empty)
+                {
+                    this.guid = Guid.NewGuid();
+                }
+
+                return this.guid;
+            }
+        }
+
+        public override Module Module
+        {
+            get
+            {
+                return null;
+            }
+        }
+
+        public override string Name
+        {
+            get
+            {
+                return this.name;
+            }
+        }
+
+        public override string Namespace
+        {
+            get
+            {
+                if (this.fullName == Name)
+                {
+                    return string.Empty;
+                }
+
+                return this.fullName.Substring(0, this.fullName.Length - Name.Length - 1);
+            }
+        }
+
+        public override RuntimeTypeHandle TypeHandle
+        {
+            get
+            {
+#pragma warning suppress 56503
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(
+                    new NotImplementedException(SR2.GetString(SR2.Error_RuntimeNotSupported)));
+            }
+        }
+
+        public override Type UnderlyingSystemType
+        {
+            get
+            {
+                return this;
+            }
+        }
+
+        public object Clone()
+        {
+            return this;
+        }
+
+        public override bool Equals(object obj)
+        {
+            if (obj == null)
+            {
+                return false;
+            }
+
+            ContractType contract = obj as ContractType;
+            if (contract == null)
+            {
+                return false;
+            }
+
+            if (string.Compare(this.AssemblyQualifiedName, contract.AssemblyQualifiedName, StringComparison.Ordinal) != 0 ||
+                this.methods.Length != contract.methods.Length)
+            {
+                return false;
+            }
+
+            foreach (MethodInfo methodInfo in this.methods)
+            {
+                if (this.GetMemberHelper<MethodInfo>(BindingFlags.Public | BindingFlags.Instance,
+                    new MemberSignature(methodInfo),
+                    ref contract.methods) == null)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        public override int GetArrayRank()
+        {
+            throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgument(
+                SR2.GetString(SR2.Error_CurrentTypeNotAnArray));
+        }
+
+        public override ConstructorInfo[] GetConstructors(BindingFlags bindingAttr)
+        {
+            return GetMembersHelper<ConstructorInfo>(bindingAttr, ref this.constructors, false);
+        }
+
+        public override object[] GetCustomAttributes(bool inherit)
+        {
+            return GetCustomAttributes(typeof(object), inherit);
+        }
+
+        public override object[] GetCustomAttributes(Type attributeType, bool inherit)
+        {
+            if (attributeType == null)
+            {
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgumentNull("attributeType");
+            }
+
+            return ServiceOperationHelpers.GetCustomAttributes(attributeType, this.attributes);
+        }
+
+        public override MemberInfo[] GetDefaultMembers()
+        {
+            // Get all of the custom attributes
+            DefaultMemberAttribute attr = null;
+
+            for (Type t = this; t != null; t = t.BaseType)
+            {
+                object[] attrs = GetCustomAttributes(typeof(DefaultMemberAttribute), false);
+                if (attrs != null && attrs.Length > 0)
+                {
+                    attr = attrs[0] as DefaultMemberAttribute;
+                }
+
+                if (attr != null)
+                {
+                    break;
+                }
+            }
+
+            if (attr == null)
+            {
+                return new MemberInfo[0];
+            }
+
+            String defaultMember = attr.MemberName;
+            MemberInfo[] members = GetMember(defaultMember);
+            if (members == null)
+            {
+                members = new MemberInfo[0];
+            }
+            return members;
+        }
+
+        public override Type GetElementType()
+        {
+            return null;
+        }
+
+        public override EventInfo GetEvent(string name, BindingFlags bindingAttr)
+        {
+            return GetMemberHelper<EventInfo>(bindingAttr, new MemberSignature(name, null, null), ref this.events);
+        }
+
+        public override EventInfo[] GetEvents(BindingFlags bindingAttr)
+        {
+            return GetMembersHelper<EventInfo>(bindingAttr, ref this.events, true);
+        }
+
+        public override FieldInfo GetField(string name, BindingFlags bindingAttr)
+        {
+            return GetMemberHelper<FieldInfo>(bindingAttr, new MemberSignature(name, null, null), ref this.fields);
+        }
+
+        public override FieldInfo[] GetFields(BindingFlags bindingAttr)
+        {
+            return GetMembersHelper<FieldInfo>(bindingAttr, ref this.fields, true);
+        }
+
+        public override int GetHashCode()
+        {
+            return this.name.GetHashCode();
+        }
+
+        public override Type GetInterface(string name, bool ignoreCase)
+        {
+            if (string.IsNullOrEmpty(name))
+            {
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgument(
+                    "name", SR2.GetString(SR2.Error_ArgumentValueNullOrEmptyString));
+            }
+
+            if (string.Compare(this.name, name, StringComparison.Ordinal) == 0)
+            {
+                return this;
+            }
+            return null;
+        }
+
+        public override Type[] GetInterfaces()
+        {
+            return Type.EmptyTypes;
+        }
+
+        public override MemberInfo[] GetMember(string name, MemberTypes type, BindingFlags bindingAttr)
+        {
+            List<MemberInfo> members = new List<MemberInfo>();
+
+            // Methods
+            if ((type & MemberTypes.Method) != 0)
+            {
+                members.AddRange(GetMembersHelper<MethodInfo>(bindingAttr, new MemberSignature(name, null, null), ref this.methods));
+            }
+
+            // Constructors
+            if ((type & MemberTypes.Constructor) != 0)
+            {
+                members.AddRange(GetMembersHelper<ConstructorInfo>(bindingAttr, new MemberSignature(name, null, null), ref this.constructors));
+            }
+
+            // Properties
+            if ((type & MemberTypes.Property) != 0)
+            {
+                members.AddRange(GetMembersHelper<PropertyInfo>(bindingAttr, new MemberSignature(name, null, null), ref this.properties));
+            }
+
+            // Events
+            if ((type & MemberTypes.Event) != 0)
+            {
+                members.AddRange(GetMembersHelper<EventInfo>(bindingAttr, new MemberSignature(name, null, null), ref this.events));
+            }
+
+            // Fields
+            if ((type & MemberTypes.Field) != 0)
+            {
+                members.AddRange(GetMembersHelper<FieldInfo>(bindingAttr, new MemberSignature(name, null, null), ref this.fields));
+            }
+
+            // Nested types
+            if ((type & MemberTypes.NestedType) != 0)
+            {
+                members.AddRange(GetMembersHelper<Type>(bindingAttr, new MemberSignature(name, null, null), ref this.nestedTypes));
+            }
+
+            return members.ToArray();
+        }
+
+        public override MemberInfo[] GetMembers(BindingFlags bindingAttr)
+        {
+            ArrayList members = new ArrayList();
+
+            members.AddRange(GetMethods(bindingAttr));
+            members.AddRange(GetProperties(bindingAttr));
+            members.AddRange(GetEvents(bindingAttr));
+            members.AddRange(GetFields(bindingAttr));
+            members.AddRange(GetNestedTypes(bindingAttr));
+
+            return (MemberInfo[])members.ToArray(typeof(MemberInfo));
+        }
+
+        public override MethodInfo[] GetMethods(BindingFlags bindingAttr)
+        {
+            return GetMembersHelper<MethodInfo>(bindingAttr, ref this.methods, true);
+        }
+
+        public override Type GetNestedType(string name, BindingFlags bindingAttr)
+        {
+            return null;
+        }
+
+        public override Type[] GetNestedTypes(BindingFlags bindingAttr)
+        {
+            return Type.EmptyTypes;
+        }
+
+        public override PropertyInfo[] GetProperties(BindingFlags bindingAttr)
+        {
+            return GetMembersHelper<PropertyInfo>(bindingAttr, ref this.properties, true);
+        }
+
+        public override object InvokeMember(string name, BindingFlags bindingFlags, Binder binder, object target, object[] providedArgs, ParameterModifier[] modifiers, CultureInfo culture, string[] namedParams)
+        {
+            throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(
+                new NotImplementedException(SR2.GetString(SR2.Error_RuntimeNotSupported)));
+        }
+
+        public override bool IsAssignableFrom(Type type)
+        {
+            if (type == null)
+            {
+                return false;
+            }
+            if (!(type is ContractType))
+            {
+                return false;
+            }
+            return (this.Equals((Object)type));
+        }
+
+        public override bool IsDefined(Type attributeType, bool inherit)
+        {
+            if (attributeType == null)
+            {
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgumentNull("attributeType");
+            }
+            return ServiceOperationHelpers.IsDefined(attributeType, attributes);
+        }
+
+        public override bool IsSubclassOf(Type type)
+        {
+            return false;
+        }
+
+        public override Type MakeByRefType()
+        {
+            return this;
+        }
+
+        public override string ToString()
+        {
+            return this.FullName;
+        }
+
+        internal void AddMethod(ContractMethodInfo methodInfo)
+        {
+            if (methodInfo == null)
+            {
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgumentNull("methodInfo");
+            }
+
+            MemberSignature signature = new MemberSignature(methodInfo);
+            if (this.GetMemberHelper<MethodInfo>(BindingFlags.Public | BindingFlags.Instance,
+                signature,
+                ref this.methods) != null)
+            {
+                return;
+            }
+            else
+            {
+                List<MethodInfo> localMethods = new List<MethodInfo>();
+                if (this.methods != null)
+                {
+                    localMethods.AddRange(this.methods);
+                }
+                localMethods.Add(methodInfo);
+                this.methods = new MethodInfo[localMethods.Count];
+                localMethods.CopyTo(this.methods);
+            }
+        }
+
+        protected override TypeAttributes GetAttributeFlagsImpl()
+        {
+            return typeAttributes;
+        }
+
+        protected override ConstructorInfo GetConstructorImpl(BindingFlags bindingAttr, Binder binder, CallingConventions callConvention, Type[] types, ParameterModifier[] modifiers)
+        {
+            return GetMemberHelper<ConstructorInfo>(bindingAttr, new MemberSignature(null, types, null), ref this.constructors);
+        }
+
+        protected override MethodInfo GetMethodImpl(string name, BindingFlags bindingAttr, Binder binder, CallingConventions callConvention, Type[] types, ParameterModifier[] modifiers)
+        {
+            return GetMemberHelper<MethodInfo>(bindingAttr, new MemberSignature(name, types, null), ref this.methods);
+        }
+
+        protected override PropertyInfo GetPropertyImpl(String name, BindingFlags bindingAttr, Binder binder, Type returnType, Type[] types, ParameterModifier[] modifiers)
+        {
+            return GetMemberHelper<PropertyInfo>(bindingAttr, new MemberSignature(name, types, null), ref this.properties);
+        }
+
+        protected override bool HasElementTypeImpl()
+        {
+
+            int elementCharPosition = Name.LastIndexOfAny(elementDecorators);
+            return (elementCharPosition != -1);
+        }
+
+        protected override bool IsArrayImpl()
+        {
+            int elementCharPosition = Name.LastIndexOfAny(elementDecorators);
+            if ((elementCharPosition != -1) && (Name[elementCharPosition] == '['))
+            {
+                return true;
+            }
+
+            return false;
+
+        }
+
+        protected override bool IsByRefImpl()
+        {
+            return false;
+        }
+
+
+        protected override bool IsCOMObjectImpl()
+        {
+            return false;
+        }
+
+        protected override bool IsContextfulImpl()
+        {
+            return false;
+        }
+
+        protected override bool IsMarshalByRefImpl()
+        {
+            return false;
+        }
+
+        protected override bool IsPointerImpl()
+        {
+            return (this.name[this.name.Length - 1] == '*');
+        }
+
+        protected override bool IsPrimitiveImpl()
+        {
+            return false;
+        }
+
+        private bool FilterMember(MemberInfo memberInfo, BindingFlags bindingFlags)
+        {
+            bool isPublic = false;
+            bool isStatic = false;
+
+            if (this.IsInterface)
+            {
+                isPublic = true;
+                isStatic = false;
+            }
+            else if (memberInfo is MethodBase)
+            {
+                isPublic = (memberInfo as MethodBase).IsPublic;
+                isStatic = (memberInfo as MethodBase).IsStatic;
+            }
+            else if (memberInfo is FieldInfo)
+            {
+                isPublic = (memberInfo as FieldInfo).IsPublic;
+                isStatic = (memberInfo as FieldInfo).IsStatic;
+            }
+            else if (memberInfo is PropertyInfo)
+            {
+                // Property public\static attributes can be fetched using the accessors 
+                PropertyInfo propertyInfo = memberInfo as PropertyInfo;
+                MethodInfo accessorMethod = null;
+                if (propertyInfo.CanRead)
+                {
+                    accessorMethod = propertyInfo.GetGetMethod(true);
+                }
+                else
+                {
+                    accessorMethod = propertyInfo.GetSetMethod(true);
+                }
+                if (accessorMethod != null)
+                {
+                    isPublic = accessorMethod.IsPublic;
+                    isStatic = accessorMethod.IsStatic;
+                }
+            }
+            else if (memberInfo is Type)
+            {
+                isPublic = (memberInfo as Type).IsPublic || (memberInfo as Type).IsNestedPublic;
+                // No static check.
+                return ((((isPublic) && ((bindingFlags & BindingFlags.Public) != 0)) || ((!isPublic) && ((bindingFlags & BindingFlags.NonPublic) != 0))));
+            }
+
+            return ((((isPublic) && ((bindingFlags & BindingFlags.Public) != 0)) || ((!isPublic) && ((bindingFlags & BindingFlags.NonPublic) != 0))) && (((isStatic) && ((bindingFlags & BindingFlags.Static) != 0)) || ((!isStatic) && ((bindingFlags & BindingFlags.Instance) != 0))));
+        }
+
+        //private MemberInfo[] GetBaseMembers(Type type, Type baseType, BindingFlags bindingAttr)
+        //{
+        //    MemberInfo[] members = null;
+        //    if (type == typeof(PropertyInfo))
+        //    {
+        //        members = baseType.GetProperties(bindingAttr);
+        //    }
+        //    else if (type == typeof(EventInfo))
+        //    {
+        //        members = baseType.GetEvents(bindingAttr);
+        //    }
+        //    else if (type == typeof(ConstructorInfo))
+        //    {
+        //        members = baseType.GetConstructors(bindingAttr);
+        //    }
+        //    else if (type == typeof(MethodInfo))
+        //    {
+        //        members = baseType.GetMethods(bindingAttr);
+        //    }
+        //    else if (type == typeof(FieldInfo))
+        //    {
+        //        members = baseType.GetFields(bindingAttr);
+        //    }
+        //    else if (type == typeof(Type))
+        //    {
+        //        members = baseType.GetNestedTypes(bindingAttr);
+        //    }
+
+        //    return members;
+        //}
+
+        // generic method that implements all GetXXX methods
+        private T GetMemberHelper<T>(BindingFlags bindingAttr, MemberSignature memberSignature, ref T[] members)
+            where T : MemberInfo
+        {
+            if (members != null)
+            {
+                // search the local type
+                foreach (T memberInfo in members)
+                {
+                    MemberSignature candididateMemberSignature = new MemberSignature(memberInfo);
+                    if (candididateMemberSignature.FilterSignature(memberSignature) && FilterMember(memberInfo, bindingAttr))
+                    {
+                        return memberInfo;
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        // generic method that implements all GetXXXs methods
+        private T[] GetMembersHelper<T>(BindingFlags bindingAttr, ref T[] members, bool searchBase)
+            where T : MemberInfo
+        {
+            Dictionary<MemberSignature, T> membersDictionary = new Dictionary<MemberSignature, T>();
+
+            if (members != null)
+            {
+                // get local properties
+                foreach (T memberInfo in members)
+                {
+                    MemberSignature memberSignature = new MemberSignature(memberInfo);
+
+                    if ((FilterMember(memberInfo, bindingAttr)) && (!membersDictionary.ContainsKey(memberSignature)))
+                    {
+                        membersDictionary.Add(new MemberSignature(memberInfo), memberInfo);
+                    }
+                }
+            }
+
+            if (searchBase && (bindingAttr & BindingFlags.DeclaredOnly) == 0)
+            {
+                // FlattenHierarchy is required to return static members from base classes.
+                if ((bindingAttr & BindingFlags.FlattenHierarchy) == 0)
+                {
+                    bindingAttr &= ~BindingFlags.Static;
+                }
+
+                //    Type baseType = BaseType;
+                //    if (baseType != null)
+                //    {
+                //        T[] baseMembers = GetBaseMembers(typeof(T), baseType, bindingAttr) as T[];
+
+                //        foreach (T memberInfo in baseMembers)
+                //        {
+                //            // We should not return private members from base classes. Note: Generics requires us to use "as".
+                //            if ((memberInfo is FieldInfo && (memberInfo as FieldInfo).IsPrivate) || (memberInfo is MethodBase && (memberInfo as MethodBase).IsPrivate) || (memberInfo is Type && (memberInfo as Type).IsNestedPrivate))
+                //            {
+                //                continue;
+                //            }
+
+                //            // verify a member with this signature was not already created
+                //            MemberSignature memberSignature = new MemberSignature(memberInfo);
+
+                //            if (!membersDictionary.ContainsKey(memberSignature))
+                //            {
+                //                membersDictionary.Add(memberSignature, memberInfo);
+                //            }
+                //        }
+                //    }
+            }
+
+            List<T> memberCollection = new List<T>(membersDictionary.Values);
+            return memberCollection.ToArray();
+        }
+
+        private T[] GetMembersHelper<T>(BindingFlags bindingAttr, MemberSignature memberSignature, ref T[] members)
+            where T : MemberInfo
+        {
+            List<T> memberCandidates = new List<T>();
+            foreach (T memberInfo in this.GetMembersHelper<T>(bindingAttr, ref members, true))
+            {
+                MemberSignature candididateMemberSignature = new MemberSignature(memberInfo);
+                if (candididateMemberSignature.FilterSignature(memberSignature))
+                {
+                    memberCandidates.Add(memberInfo);
+                }
+            }
+            return memberCandidates.ToArray();
+        }
+
+        internal class MemberSignature
+        {
+            private string name = null;
+            private Type[] parameters = null;
+            private Type returnType = null;
+
+            internal MemberSignature(MemberInfo memberInfo)
+            {
+                this.name = memberInfo.Name;
+
+                if (memberInfo is MethodBase)
+                {
+                    List<Type> typeCollection = new List<Type>();
+
+                    // method/constructor arguments
+                    foreach (ParameterInfo parameterInfo in (memberInfo as MethodBase).GetParameters())
+                    {
+                        typeCollection.Add(parameterInfo.ParameterType);
+                    }
+
+                    this.parameters = typeCollection.ToArray();
+
+                    if (memberInfo is MethodInfo)
+                    {
+                        this.returnType = ((MethodInfo)memberInfo).ReturnType;
+                    }
+                }
+                else if (memberInfo is PropertyInfo)
+                {
+                    PropertyInfo propertyInfo = memberInfo as PropertyInfo;
+                    List<Type> typeCollection = new List<Type>();
+
+                    // indexer arguments
+                    foreach (ParameterInfo parameterInfo in propertyInfo.GetIndexParameters())
+                    {
+                        typeCollection.Add(parameterInfo.ParameterType);
+                    }
+
+                    this.parameters = typeCollection.ToArray();
+
+                    // return type for property
+                    this.returnType = propertyInfo.PropertyType;
+                }
+
+            }
+
+            internal MemberSignature(string name, Type[] parameters, Type returnType)
+            {
+                this.name = name;
+                this.returnType = returnType;
+                if (parameters != null)
+                {
+                    this.parameters = (Type[])parameters.Clone();
+                }
+            }
+
+            public string Name
+            {
+                get
+                {
+                    return name;
+                }
+            }
+
+            public Type[] Parameters
+            {
+                get
+                {
+                    if (parameters == null)
+                    {
+                        return null;
+                    }
+
+                    return (Type[])parameters.Clone();
+                }
+            }
+
+            public Type ReturnType
+            {
+                get
+                {
+                    return returnType;
+                }
+            }
+
+            public override bool Equals(object obj)
+            {
+                MemberSignature memberSignature = obj as MemberSignature;
+
+                if ((memberSignature == null) ||
+                    (this.name != memberSignature.Name) ||
+                    (this.returnType != memberSignature.ReturnType))
+                {
+                    return false;
+                }
+
+                if ((this.Parameters == null) && (memberSignature.Parameters != null) ||
+                    (this.Parameters != null) && (memberSignature.Parameters == null))
+                {
+                    return false;
+                }
+
+                if (this.Parameters != null)
+                {
+                    if (this.parameters.Length != memberSignature.parameters.Length)
+                    {
+                        return false;
+                    }
+
+                    for (int loop = 0; loop < this.parameters.Length; loop++)
+                    {
+                        if (this.parameters[loop] != memberSignature.parameters[loop])
+                        {
+                            return false;
+                        }
+                    }
+                }
+
+                return true;
+            }
+
+            // this method will filter using a mask signautre. only non-null mask members are used to filter 
+            // the signature, the rest are ignored
+            public bool FilterSignature(MemberSignature maskSignature)
+            {
+                if (maskSignature == null)
+                {
+                    throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgumentNull("maskSignature");
+                }
+
+                if (((maskSignature.Name != null) && (this.name != maskSignature.name)) ||
+                    ((maskSignature.returnType != null) && (this.returnType != maskSignature.returnType)))
+                {
+                    return false;
+                }
+
+                if (maskSignature.parameters != null)
+                {
+                    if (this.parameters == null)
+                    {
+                        return false;
+                    }
+
+                    if (this.parameters.Length != maskSignature.parameters.Length)
+                    {
+                        return false;
+                    }
+
+                    for (int loop = 0; loop < this.parameters.Length; loop++)
+                    {
+                        if (!this.parameters[loop].Equals(maskSignature.parameters[loop]))
+                        {
+                            return false;
+                        }
+                    }
+                }
+
+                return true;
+            }
+
+            public override int GetHashCode()
+            {
+                return ToString().GetHashCode();
+            }
+
+            public override string ToString()
+            {
+                string str = string.Empty;
+
+                if (returnType != null)
+                {
+                    str = returnType.FullName + " ";
+                }
+
+                if (name != null && name.Length != 0)
+                {
+                    str += name;
+                }
+
+                if (parameters != null && parameters.Length > 0)
+                {
+                    str += "(";
+
+                    for (int i = 0; i < parameters.Length; i++)
+                    {
+                        if (i > 0)
+                        {
+                            str += ", ";
+                        }
+
+                        if (parameters[i] != null)
+                        {
+                            if (parameters[i].GetType() != null && parameters[i].GetType().IsByRef)
+                            {
+                                str += "ref ";
+                            }
+
+                            str += parameters[i].FullName;
+                        }
+                    }
+
+                    str += ")";
+                }
+
+                return str;
+            }
+        }
+    }
+}
+                                                                                                                                                                                                                                                                                                            	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1&0$UMicrosoft Time-Stamp PCA 20100Ç"0	*ÜHÜ˜ Ç 0Ç
+Ç ©ºwä: Ï¸óı˙iîktT’•
+ ÇÖ˚Ì|hK,_≈√Âa¬v∑>f+[S'1AïŒ	é|a0Y±0DÒ`àÑTC◊M∏8≥B›ì¨÷s0W&Ç£E–ÍıGÅÕø$`2X`FÚXGÜ2Ñtagë_ÅT±œìLí¡ƒ¶]—an(∆˘ÜÄªﬂa¸F¡'$gr!äØKdâPb±]˝w=Wu¨ΩäBM@Q—ú>gıf¿ñD~Ô–K˝nÂö ±®Úz*
+1⁄Në∂à5Ëx∞ÈôÕ<Á/D∫ßÙ‹dΩ§¡ 	ìxÕ¸º¿…D]^úO"M £ÇÊ0Ç‚0	+Ç7 0U’c:\ä1êÛC{|F≈3hZÖmU0	+Ç7
+ S u b C A0UÜ0Uˇ0ˇ0U#0Ä’ˆVÀèË¢\bh—=îê[◊Œöƒ0VUO0M0K†I†GÜEhttp://crl.microsoft.com/pki/crl/products/MicRooCerAut_2010-06-23.crl0Z+N0L0J+0Ü>http://www.microsoft.com/pki/certs/MicRooCerAut_2010-06-23.crt0Å†U ˇÅï0Åí0Åè	+Ç7.0ÅÅ0=+1http://www.microsoft.com/PKI/docs/CPS/default.htm0@+042  L e g a l _ P o l i c y _ S t a t e m e n t . 0	*ÜHÜ˜ Ç ÊàQ‚∆‡ò?Åq=ù£°!o≥Î¶Ãı1æœ‚©˛˙Wm0≥¬≈f…jﬂıÁxΩ«®û%„˘ºÌkTW+QÇD˚πSåÃÙ`ävÃ@@Aõ‹\ˇ\˘^5ò$VKtÔB»Øø∆Ú7}Z?ÚôyJëR Ø8ı/yÅeŸ©µk‰«Œˆ z oK0D$"<œÌ•ñèY)º∂˝·pü2J'˝UØ/˛∂Âé3ªb_ö€W@ÈÒŒôfêåˇjb›≈Jë&‚9ÏJqcù{!m√ú£¢<˙}ñjêx¶m“·ú˘¸8ÿîÙ∆•
+ñÜ§ΩûÆBÉ∏µÄõ"8 µ%ÂdÏ˜Ùø~cY%z.9Wv¢q™äâ∫aßÀöÿGöÄ≈–Õß–Ô}É·;q	ﬂ]tò"a⁄∞PoΩÒ· ﬂÁ1§ì:˜eGxË¯®H´˜ﬁr~akow©ÅÀß	¨9ªÏ∆ÀÿÇ¥rÕÙ∏ÖÄ˚â*T9≤[⁄»Uôzás;Êò-Íç‡3.)ı¿/T'!˜»¨N⁄(∏±©€ñ≤ßB¢…œAM‡Ü˘*ö£f0”ªt2Kﬂc{ıôä/«!ØYµÆ‹D<óPq◊°“≈U„iﬁW¡—ﬁ0¿˝ÃÊM˚ø]OÈù8/ºœX.Ô†P5⁄Ô	'’≥~5∫⁄6€”_èﬁtàI°Ç≠0Çï0Å˛°Å‘§Å—0ÅŒ10	UUS10U
+Washington10URedmond10U
+Microsoft CorCWPAL
+100
+256
+0 0 0
+43 28 14
+57 35 16
+65 35 6
+66 36 7
+67 37 8
+68 38 9
+69 39 10
+70 40 11
+71 41 12
+72 42 13
+73 43 14
+74 44 15
+75 45 16
+76 46 17
+77 47 18
+78 48 19
+79 49 20
+80 50 21
+81 51 22
+82 52 23
+83 53 24
+83 53 24
+84 54 25
+85 55 26
+86 56 27
+87 57 28
+88 58 29
+89 59 30
+90 60 31
+91 61 32
+92 62 33
+93 63 34
+94 64 35
+95 65 36
+96 66 37
+97 67 38
+98 68 39
+99 69 40
+100 70 41
+101 71 42
+102 72 43
+103 73 44
+104 74 45
+105 75 46
+106 76 47
+107 77 48
+107 77 48
+108 78 49
+109 79 50
+110 80 51
+111 81 52
+112 82 53
+113 83 54
+114 84 55
+115 85 56
+116 86 57
+117 87 58
+118 88 59
+119 89 60
+120 90 61
+121 91 62
+122 92 63
+123 93 64
+124 94 65
+125 95 66
+125 95 66
+126 96 67
+127 97 68
+128 98 69
+129 99 70
+130 100 71
+131 101 72
+132 102 73
+133 103 74
+134 104 75
+135 105 76
+136 106 77
+137 107 78
+138 108 79
+139 109 80
+140 110 81
+141 111 82
+142 112 83
+143 113 84
+144 114 85
+145 115 86
+146 116 87
+147 117 88
+148 118 89
+149 119 90
+150 120 91
+151 121 92
+152 122 93
+153 123 94
+154 124 95
+155 125 96
+156 126 97
+157 127 98
+158 128 99
+159 129 100
+160 130 101
+161 131 102
+162 132 103
+163 133 104
+164 134 105
+165 135 106
+166 136 107
+167 137 108
+168 138 109
+169 139 110
+170 140 111
+171 141 112
+172 142 113
+173 143 114
+174 144 115
+175 145 116
+176 146 117
+177 147 118
+178 148 119
+179 149 120
+180 150 121
+181 151 122
+182 152 123
+183 153 124
+184 154 125
+185 155 126
+186 156 127
+187 157 128
+187 157 128
+188 158 129
+189 159 130
+190 160 131
+191 161 132
+192 162 133
+193 163 134
+194 164 135
+195 165 136
+196 166 137
+197 167 138
+198 168 139
+199 169 140
+200 170 141
+201 171 142
+202 172 143
+203 173 144
+204 174 145
+205 175 146
+206 176 147
+207 177 148
+208 178 149
+209 179 150
+210 180 151
+211 181 152
+212 182 153
+213 183 154
+214 184 155
+215 185 156
+216 186 157
+217 187 158
+218 188 159
+219 189 160
+220 190 161
+221 191 162
+222 192 163
+223 193 164
+224 194 165
+225 195 166
+226 196 167
+227 197 168
+228 198 169
+229 199 170
+230 200 171
+231 201 172
+232 202 173
+233 203 174
+234 204 175
+235 205 176
+236 206 177
+237 207 178
+238 208 179
+239 209 180
+240 210 181
+241 211 182
+242 212 183
+243 213 184
+244 214 185
+245 215 186
+246 216 187
+247 217 188
+248 218 189
+249 219 190
+250 220 191
+251 221 192
+252 222 193
+253 223 194
+254 224 195
+255 225 196
+255 225 196
+255 225 196
+255 225 196
+255 225 196
+255 225 197
+255 225 197
+255 225 197
+255 225 197
+255 226 198
+255 226 198
+255 226 198
+255 226 198
+255 226 198
+255 226 199
+255 226 199
+255 226 199
+255 226 199
+255 226 199
+255 227 200
+255 227 200
+255 227 200
+255 227 200
+255 227 200
+255 227 201
+255 227 201
+255 227 201
+255 227 201
+255 227 201
+255 228 202
+255 228 202
+255 228 202
+255 228 202
+255 228 202
+255 228 202
+255 228 203
+255 228 203
+255 228 203
+255 228 203
+255 228 203
+255 229 204
+255 229 204
+255 229 204
+255 229 204
+255 229 204
+255 229 204
+255 229 205
+255 229 205
+255 229 205
+255 229 205
+255 229 205
+255 230 205
+255 230 205
+255 229 205
+255 231 209
+255 233 214
+255 233 217
+255 242 233
+255 255 255
+                                                                                                                                                                                                          –(wZ}fﬂz‰{±ñŒ¶1ÌÔÂ m…D@S;∏›Ò±¡A˚Y…Î•$]v$>◊?÷	Õ˜õ∫Dj+.´≈9‘oXò‘>à´˚7˛ú=ÆﬂÀOœﬂ¯ÁÉY˙j ê}˝ƒ3BEw$g<-ÕÌ	é`üÎâœØ^çmÌC˜DŒõˇíû?%˜¯^ôˇ~*ÕJRQbj—1∫«ë~Õ9{m¬tÛ&t˛!oÿÕ@i9(0©4O_˝Ñ»®»“…Ñ∆Ybîæ≥±öﬂ4•dÑÅønﬂë¢}›1pi3Ÿ’b M√»ÌëTDEÄÉ?Y
+∞Çï‰5¨V x∫N« —Oä´≠j≥Y„WBhK~ıÚÂe„∏¥é÷c<i$øÈYFØ¿†
+îπ˘Å¬©û@· @ââ/-†WÎ’ıË{›zé.ö}ˇ√~˜á—é˚O¿≤DÅAeÜîN`ä§¢äq≠	3àpóÖµ
+ˆtH—:Ù°(:"à˛AØdZö{éù3ÓG‡À¥gñG©{õBs”Ò∆¬ﬂAπ≈‘ÒÚI˘€ﬁbLwA%V®‚œ E›¢X´÷5Ùõ„\@r˜]ç•i‚gR7Cùﬁå∂Ú9œ˚‘ãÄ[Å—->¬æ÷BÏ˙Àï§UèyJl¶QñR`rºéºÊj_Â¢ÒæP‘Íê=’ q”≤ùî•e<'wKYVÉ˛<Ú:a⁄T…ÖÏ‘∏t¨Oààó≥»Ä¸Öı•D»±GˆæÌ·@LÔë&=ˆhl‚;å,ƒ·
+œ6÷†Q	’Ú~ûøE8êﬁWRp(—ﬂXU⁄ì9ã‚‰èvËôi$kÈ∆
+>HÁWSpâík¸o=¶/∂ *340=à$D°â±P®[¿“˛Û≠djã>zóøÂ?N_R•x3=∫Â∂\}¯≤R@¿ÂÑ;◊Qæ◊7G∞4ïºZwu†≥˚¯úZÁ¨vº9K_â¬,•πq„«4H%”.ê–¿÷oêPùâ›üêÓÀÓy%Mïïûº»äìA˙´Èf§Z¬‡ò∑7„òçücºæRà‹˚–ä™ò«òYÖ{ê<AÊ´ÎçÒvG˝eÇ)ﬁæÊã˚ÆHtûÊÔñæ˚˘YH.¬ù≤d§SÑ+`n±U•nu≥±÷~Åú<Üo7˚∞[¨Â:Ä∆Ωv¸0…íN=∫ ∆˙ªç~V…s¶]πZí≤wA∏}˙9¨Ø]7û}∫∆¡-ßùÍH§^êcÃ—Zê'ÏÉ/∏‰Åte’}˚∏Çw¬]ÆXYiÅ>(çVŸ˝t"û]JƒÃªÈÔêtòÑKz

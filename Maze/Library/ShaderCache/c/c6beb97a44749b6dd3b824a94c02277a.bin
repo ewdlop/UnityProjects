@@ -1,0 +1,43 @@
+            activityId = activityToStop.ActivityId;
+
+                // See if there are any orphans that need to be stopped.  
+                ActivityInfo orphan = currentActivity;
+                while (orphan != activityToStop && orphan != null)
+                {
+                    if (orphan.m_stopped != 0)      // Skip dead activities.
+                    {
+                        orphan = orphan.m_creator;
+                        continue;
+                    }
+                    if (orphan.CanBeOrphan())
+                    {
+                        // We can't pop anything after we see a valid orphan, remember this for later when we update m_current.  
+                        if (newCurrentActivity == null)
+                            newCurrentActivity = orphan;
+                    }
+                    else
+                    {
+                        orphan.m_stopped = 1;
+                        Contract.Assert(orphan.m_stopped != 0);
+                    }
+                    orphan = orphan.m_creator;
+                }
+
+                // try to Stop the activity atomically.  Other threads may be trying to do this as well.
+                if (Interlocked.CompareExchange(ref activityToStop.m_stopped, 1, 0) == 0)
+                {
+                    // I succeeded stopping this activity. Now we update our m_current pointer 
+
+                    // If I haven't yet determined the new current activity, it is my creator.
+                    if (newCurrentActivity == null)
+                        newCurrentActivity = activityToStop.m_creator;
+
+                    m_current.Value = newCurrentActivity;
+
+                    if (etwLog.Debug)
+                    {
+                        etwLog.DebugFacilityMessage("OnStopRetActivityState", ActivityInfo.LiveActivities(newCurrentActivity));
+                        etwLog.DebugFacilityMessage("OnStopRet", activityId.ToString());
+                    }
+                    return;
+               

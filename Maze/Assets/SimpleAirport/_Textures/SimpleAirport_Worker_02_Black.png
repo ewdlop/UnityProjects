@@ -1,0 +1,208 @@
+:init(6), cl::Hidden,
+  cl::desc("Size limit in Hexagon early if-conversion"));
+static cl::opt<bool> SkipExitBranches("eif-no-loop-exit", cl::init(false),
+  cl::Hidden, cl::desc("Do not convert branches that may exit the loop"));
+
+namespace {
+
+  struct PrintMB {
+    PrintMB(const MachineBasicBlock *B) : MB(B) {}
+
+    const MachineBasicBlock *MB;
+  };
+  raw_ostream &operator<< (raw_ostream &OS, const PrintMB &P) {
+    if (!P.MB)
+      return OS << "<none>";
+    return OS << '#' << P.MB->getNumber();
+  }
+
+  struct FlowPattern {
+    FlowPattern() = default;
+    FlowPattern(MachineBasicBlock *B, unsigned PR, MachineBasicBlock *TB,
+          MachineBasicBlock *FB, MachineBasicBlock *JB)
+      : SplitB(B), TrueB(TB), FalseB(FB), JoinB(JB), PredR(PR) {}
+
+    MachineBasicBlock *SplitB = nullptr;
+    MachineBasicBlock *TrueB = nullptr;
+    MachineBasicBlock *FalseB = nullptr;
+    MachineBasicBlock *JoinB = nullptr;
+    unsigned PredR = 0;
+  };
+
+  struct PrintFP {
+    PrintFP(const FlowPattern &P, const TargetRegisterInfo &T)
+      : FP(P), TRI(T) {}
+
+    const FlowPattern &FP;
+    const TargetRegisterInfo &TRI;
+    friend raw_ostream &operator<< (raw_ostream &OS, const PrintFP &P);
+  };
+  raw_ostream &operator<<(raw_ostream &OS,
+                          const PrintFP &P) LLVM_ATTRIBUTE_UNUSED;
+  raw_ostream &operator<<(raw_ostream &OS, const PrintFP &P) {
+    OS << "{ SplitB:" << PrintMB(P.FP.SplitB)
+       << ", PredR:" << printReg(P.FP.PredR, &P.TRI)
+       << ", TrueB:" << PrintMB(P.FP.TrueB)
+       << ", FalseB:" << PrintMB(P.FP.FalseB)
+       << ", JoinB:" << PrintMB(P.FP.JoinB) << " }";
+    return OS;
+  }
+
+  class HexagonEarlyIfConversion : public MachineFunctionPass {
+  public:
+    static char ID;
+
+    HexagonEarlyIfConversion() : MachineFunctionPass(ID) {}
+
+    StringRef getPassName() const override {
+      return "Hexagon early if conversion";
+    }
+
+    void getAnalysisUsage(AnalysisUsage &AU) const override {
+      AU.addRequired<MachineBranchProbabilityInfo>();
+      AU.addRequired<MachineDominatorTree>();
+      AU.addPreserved<MachineDominatorTree>();
+      AU.addRequired<MachineLoopInfo>();
+      MachineFunctionPass::getAnalysisUsage(AU);
+    }
+
+    bool runOnMachineFunction(MachineFunction &MF) override;
+
+  private:
+    using BlockSetType = DenseSet<MachineBasicBlock *>;
+
+    bool isPreheader(const MachineBasicBlock *B) const;
+    bool matchFlowPattern(MachineBasicBlock *B, MachineLoop *L,
+          FlowPattern &FP);
+    bool visitBlock(MachineBasicBlock *B, MachineLoop *L);
+    bool visitLoop(MachineLoop *L);
+
+    bool hasEHLabel(const MachineBasicBlock *B) const;
+    bool hasUncondBranch(const MachineBasicBlock *B) const;
+    bool isValidCandidate(const MachineBasicBlock *B) const;
+    bool usesUndefVReg(const MachineInstr *MI) const;
+    bool isValid(const FlowPattern &FP) const;
+    unsigned countPredicateDefs(const MachineBasicBlock *B) const;
+    unsigned computePhiCost(const MachineBasicBlock *B,
+          const FlowPattern &FP) const;
+    bool isProfitable(const FlowPattern &FP) const;
+    bool isPredicableStore(const MachineInstr *MI) const;
+    bool isSafeToSpeculate(const MachineInstr *MI) const;
+
+    unsigned getCondStoreOpcode(unsigned Opc, bool IfTrue) const;
+    void predicateInstr(MachineBasicBlock *ToB, MachineBasicBlock::iterator At,
+          MachineInstr *MI, unsigned PredR, bool IfTrue);
+    void predicateBlockNB(MachineBasicBlock *ToB,
+          MachineBasicBlock::iterator At, MachineBasicBlock *FromB,
+          unsigned PredR, bool IfTrue);
+
+    unsigned buildMux(MachineBasicBlock *B, MachineBasicBlock::iterator At,
+          const TargetRegisterClass *DRC, unsigned PredR, unsigned TR,
+          unsigned TSR, unsigned FR, unsigned FSR);
+    void updatePhiNodes(MachineBasicBlock *WhereB, const FlowPattern &FP);
+    void convert(const FlowPattern &FP);
+
+    void removeBlock(MachineBasicBlock *B);
+    void eliminatePhis(MachineBasicBlock *B);
+    void replacePhiEdges(MachineBasicBlock *OldB, MachineBasicBlock *NewB);
+    void mergeBlocks(MachineBasicBlock *PredB, MachineBasicBlock *SuccB);
+    void simplifyFlowGraph(const FlowPattern &FP);
+
+    const HexagonInstrInfo *HII = nullptr;
+    const TargetRegisterInfo *TRI = nullptr;
+    MachineFunction *MFN = nullptr;
+    MachineRegisterInfo *MRI = nullptr;
+    MachineDominatorTree *MDT = nullptr;
+    MachineLoopInfo *MLI = nullptr;
+    BlockSetType Deleted;
+    const MachineBranchProbabilityInfo *MBPI;
+  };
+
+} // end anonymous namespace
+
+char HexagonEarlyIfConversion::ID = 0;
+
+INITIALIZE_PASS(HexagonEarlyIfConversion, "hexagon-early-if",
+  "Hexagon early if conversion", false, false)
+
+bool HexagonEarlyIfConversion::isPreheader(const MachineBasicBlock *B) const {
+  if (B->succ_size() != 1)
+    return false;
+  MachineBasicBlock *SB = *B->succ_begin();
+  MachineLoop *L = MLI->getLoopFor(SB);
+  return L && SB == L->getHeader() && MDT->dominates(B, SB);
+}
+
+bool HexagonEarlyIfConversion::matchFlowPattern(MachineBasicBlock *B,
+    MachineLoop *L, FlowPattern &FP) {
+  DEBUG(dbgs() << "Checking flow pattern at " << printMBBReference(*B) << "\n");
+
+  // Interested only in conditional branches, no .new, no new-value, etc.
+  // Check the terminators directly, it's easier than handling all responses
+  // from AnalyzeBranch.
+  MachineBasicBlock *TB = nullptr, *FB = nullptr;
+  MachineBasicBlock::const_iterator T1I = B->getFirstTerminator();
+  if (T1I == B->end())
+    return false;
+  unsigned Opc = T1I->getOpcode();
+  if (Opc != Hexagon::J2_jumpt && Opc != Hexagon::J2_jumpf)
+    return false;
+  unsigned PredR = T1I->getOperand(0).getReg();
+
+  // Get the layout successor, or 0 if B does not have one.
+  MachineFunction::iterator NextBI = std::next(MachineFunction::iterator(B));
+  MachineBasicBlock *NextB = (NextBI != MFN->end()) ? &*NextBI : nullptr;
+
+  MachineBasicBlock *T1B = T1I->getOperand(1).getMBB();
+  MachineBasicBlock::const_iterator T2I = std::next(T1I);
+  // The second terminator should be an unconditional branch.
+  assert(T2I == B->end() || T2I->getOpcode() == Hexagon::J2_jump);
+  MachineBasicBlock *T2B = (T2I == B->end()) ? NextB
+                                             : T2I->getOperand(0).getMBB();
+  if (T1B == T2B) {
+    // XXX merge if T1B == NextB, or convert branch to unconditional.
+    // mark as diamond with both sides equal?
+    return false;
+  }
+
+  // Record the true/false blocks in such a way that "true" means "if (PredR)",
+  // and "false" means "if (!PredR)".
+  if (Opc == Hexagon::J2_jumpt)
+    TB = T1B, FB = T2B;
+  else
+    TB = T2B, FB = T1B;
+
+  if (!MDT->properlyDominates(B, TB) || !MDT->properlyDominates(B, FB))
+    return false;
+
+  // Detect triangle first. In case of a triangle, one of the blocks TB/FB
+  // can fall through into the other, in other words, it will be executed
+  // in both cases. We only want to predicate the block that is executed
+  // conditionally.
+  unsigned TNP = TB->pred_size(), FNP = FB->pred_size();
+  unsigned TNS = TB->succ_size(), FNS = FB->succ_size();
+
+  // A block is predicable if it has one predecessor (it must be B), and
+  // it has a single successor. In fact, the block has to end either with
+  // an unconditional branch (which can be predicated), or with a fall-
+  // through.
+  // Also, skip blocks that do not belong to the same loop.
+  bool TOk = (TNP == 1 && TNS == 1 && MLI->getLoopFor(TB) == L);
+  bool FOk = (FNP == 1 && FNS == 1 && MLI->getLoopFor(FB) == L);
+
+  // If requested (via an option), do not consider branches where the
+  // true and false targets do not belong to the same loop.
+  if (SkipExitBranches && MLI->getLoopFor(TB) != MLI->getLoopFor(FB))
+    return false;
+
+  // If neither is predicable, there is nothing interesting.
+  if (!TOk && !FOk)
+    return false;
+
+  MachineBasicBlock *TSB = (TNS > 0) ? *TB->succ_begin() : nullptr;
+  MachineBasicBlock *FSB = (FNS > 0) ? *FB->succ_begin() : nullptr;
+  MachineBasicBlock *JB = nullptr;
+
+  if (TOk) {
+    if (FOk) {
+ 

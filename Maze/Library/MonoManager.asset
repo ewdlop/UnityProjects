@@ -1,0 +1,165 @@
+f < this.dimensions[d]; f++)
+					{
+						this.ExtendTupleSet(d, f);
+					}
+				}
+			}
+
+			private void ExtendTupleSet(int dimension, int feature)
+			{
+				// If tuples for [dimension][feature] already exists, it's no needs to add more tuples.
+				if (this.uncoveredTuples[dimension][feature].Count > 0)
+				{
+					return;
+				}
+
+				// If maximum tuple length for [dimension][feature] is reached, it's no needs to add more tuples.
+				if (this.currentTupleLength[dimension][feature] == MaxTupleLength)
+				{
+					return;
+				}
+
+				this.currentTupleLength[dimension][feature]++;
+
+				int tupleLength = this.currentTupleLength[dimension][feature];
+
+				if (tupleLength == 1)
+				{
+					Tuple tuple = new Tuple();
+
+					tuple.Add(new FeatureInfo(dimension, feature));
+
+					if (this.testCases.IsTupleCovered(tuple))
+					{
+						return;
+					}
+
+					this.uncoveredTuples[dimension][feature].Add(tuple);
+				}
+				else
+				{
+					for (int d = 0; d < this.dimensions.Length; d++)
+					{
+						for (int f = 0; f < this.dimensions[d]; f++)
+						{
+							Tuple tuple = new Tuple();
+							tuple.Add(new FeatureInfo(d, f));
+
+							if (tuple[0].Dimension == dimension)
+							{
+								continue;
+							}
+
+							tuple.Add(new FeatureInfo(dimension, feature));
+
+							if (this.testCases.IsTupleCovered(tuple))
+							{
+								continue;
+							}
+
+							this.uncoveredTuples[dimension][feature].Add(tuple);
+						}
+					}
+				}
+			}
+
+			private Tuple FindTupleToCover()
+			{
+				int tupleLength = MaxTupleLength;
+				int tupleCount = 0;
+				Tuple tuple = null;
+
+				for (int d = 0; d < this.dimensions.Length; d++)
+				{
+					for (int f = 0; f < this.dimensions[d]; f++)
+					{
+						if (this.currentTupleLength[d][f] < tupleLength)
+						{
+							tupleLength = this.currentTupleLength[d][f];
+							tupleCount = this.uncoveredTuples[d][f].Count;
+							tuple = this.uncoveredTuples[d][f][0];
+						}
+						else
+						{
+							if (this.currentTupleLength[d][f] == tupleLength && this.uncoveredTuples[d][f].Count > tupleCount)
+							{
+								tupleCount = this.uncoveredTuples[d][f].Count;
+								tuple = this.uncoveredTuples[d][f][0];
+							}
+						}
+					}
+				}
+
+				return tuple;
+			}
+
+			private TestCase FindGoodTestCase(Tuple tuple)
+			{
+				TestCase bestTest = null;
+				int bestCoverage = -1;
+
+				for (int i = 0; i < 5; i++)
+				{
+					TestCase test = new TestCase(this.dimensions.Length);
+
+					int coverage = this.CreateTestCase(tuple, test);
+
+					if (coverage > bestCoverage)
+					{
+						bestTest = test;
+						bestCoverage = coverage;
+					}
+				}
+
+				return bestTest;
+			}
+
+			private int CreateTestCase(Tuple tuple, TestCase test)
+			{
+				// Create a random test case...
+				for (int i = 0; i < test.Features.Length; i++)
+				{
+					test.Features[i] = (int)(this.random.Next() % this.dimensions[i]);
+				}
+
+				// ...and inject the tuple into it!
+				for (int i = 0; i < tuple.Count; i++)
+				{
+					test.Features[tuple[i].Dimension] = tuple[i].Feature;
+				}
+
+				return this.MaximizeCoverage(test, tuple);
+			}
+
+			private int MaximizeCoverage(TestCase test, Tuple tuple)
+			{
+				int[] dimensionOrder = this.GetMutableDimensions(tuple);
+
+				while (true)
+				{
+					bool progress = false;
+					int totalCoverage = 1;
+
+					// Scramble dimensions.
+					for (int i = dimensionOrder.Length; i > 1; i--)
+					{
+						int j = (int)(this.random.Next() % i);
+						int t = dimensionOrder[i - 1];
+						dimensionOrder[i - 1] = dimensionOrder[j];
+						dimensionOrder[j] = t;
+					}
+
+					// For each dimension that can be modified...
+					for (int i = 0; i < dimensionOrder.Length; i++)
+					{
+						int d = dimensionOrder[i];
+
+#if CLR_2_0 || CLR_4_0
+						List<int> bestFeatures = new List<int>();
+#else
+                        ArrayList bestFeatures = new ArrayList();
+#endif
+
+						int bestCoverage = this.CountTuplesCovered(test, d, test.Features[d]);
+
+						int bestTupleLength = this.currentTupleLength[d][test.Feature

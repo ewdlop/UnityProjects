@@ -1,0 +1,119 @@
+﻿#if !MOBILE && !XAMMAC_4_5
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using NUnit.Framework;
+using System.ServiceModel;
+using System.ServiceModel.Channels;
+using System.ServiceModel.Description;
+using System.ServiceModel.Dispatcher;
+
+using MonoTests.Helpers;
+
+namespace MonoTests.System.ServiceModel.Dispatcher
+{
+	[TestFixture]
+	public class ChannelDispatcherTest
+	{
+		[Test]
+		public void ConstructorNullBindingName ()
+		{
+			new ChannelDispatcher (new MyChannelListener (new Uri ("urn:foo")), null);
+			new ChannelDispatcher (new MyChannelListener (new Uri ("urn:foo")), null, null);
+		}
+
+		[Test]
+		public void ServiceThrottle ()
+		{
+			var cd = new ChannelDispatcher (new MyChannelListener<IReplyChannel> (new Uri ("urn:foo")));
+			var st = cd.ServiceThrottle;
+			Assert.IsNull (st, "#0");
+
+			var uri = new Uri ("http://localhost:" + NetworkHelpers.FindFreePort ());
+			ServiceHost h = new ServiceHost (typeof (TestContract), uri);
+			h.AddServiceEndpoint (typeof (TestContract).FullName, new BasicHttpBinding (), "address");
+			h.ChannelDispatchers.Add (cd);
+			Assert.IsNull (st, "#1");
+			var ed = new EndpointDispatcher (new EndpointAddress (uri), "", "");
+			Assert.IsNull (ed.ChannelDispatcher, "#1-2");
+			ed.DispatchRuntime.Type = typeof (TestContract);
+			cd.Endpoints.Add (ed);
+			Assert.AreEqual (cd, ed.ChannelDispatcher, "#1-3");
+			cd.MessageVersion = MessageVersion.Default;
+
+			{
+				cd.Open (TimeSpan.FromSeconds (10));
+				try {
+					Assert.IsNull (st, "#2");
+					// so, can't really test actual slot values as it is null.
+				} finally {
+					cd.Close (TimeSpan.FromSeconds (10));
+				}
+				return;
+			}
+		}
+
+		[Test]			
+		public void Collection_Add_Remove () {
+			Console.WriteLine ("STart test Collection_Add_Remove");
+			var uri = new Uri ("http://localhost:" + NetworkHelpers.FindFreePort ());
+			ServiceHost h = new ServiceHost (typeof (TestContract), uri);
+			h.AddServiceEndpoint (typeof (TestContract).FullName, new BasicHttpBinding (), "address");
+			MyChannelDispatcher d = new MyChannelDispatcher (new MyChannelListener (uri));
+			h.ChannelDispatchers.Add (d);
+			Assert.IsTrue (d.Attached, "#1");
+			h.ChannelDispatchers.Remove (d);
+			Assert.IsFalse (d.Attached, "#2");
+			h.ChannelDispatchers.Insert (0, d);
+			Assert.IsTrue (d.Attached, "#3");
+			h.ChannelDispatchers.Add (new MyChannelDispatcher (new MyChannelListener (uri)));
+			h.ChannelDispatchers.Clear ();
+			Assert.IsFalse (d.Attached, "#4");
+		}
+
+		[Test]
+		public void EndpointDispatcherAddTest ()
+		{
+			var uri = new Uri ("http://localhost:" + NetworkHelpers.FindFreePort ());
+			MyChannelDispatcher d = new MyChannelDispatcher (new MyChannelListener (uri));
+			d.Endpoints.Add (new EndpointDispatcher (new EndpointAddress (uri), "", ""));
+		}
+
+		[Test]
+		[ExpectedException (typeof (InvalidOperationException))] 
+		public void EndpointDispatcherAddTest2 () {
+			var uri = new Uri ("http://localhost:" + NetworkHelpers.FindFreePort ());
+			MyChannelDispatcher d = new MyChannelDispatcher (new MyChannelListener (uri));
+			d.Endpoints.Add (new EndpointDispatcher (new EndpointAddress (uri), "", ""));
+			d.Open (); // the dispatcher must be attached.
+		}
+
+		[Test]
+		[ExpectedException (typeof (InvalidOperationException))]
+		public void EndpointDispatcherAddTest3 ()
+		{
+			var uri = new Uri ("http://localhost:" + NetworkHelpers.FindFreePort ());
+			ServiceHost h = new ServiceHost (typeof (TestContract), uri);
+			MyChannelDispatcher d = new MyChannelDispatcher (new MyChannelListener (uri));
+			d.Endpoints.Add (new EndpointDispatcher (new EndpointAddress (uri), "", ""));
+			h.ChannelDispatchers.Add (d);
+			d.Open (); // missing MessageVersion
+		}
+
+		[Test]
+		[ExpectedException (typeof (InvalidOperationException))] // i.e. it is thrown synchronously in current thread.
+		public void EndpointDispatcherAddTest4 ()
+		{
+			var uri = new Uri ("http://localhost:" + NetworkHelpers.FindFreePort ());
+			ServiceHost h = new ServiceHost (typeof (TestContract), uri);
+			var listener = new MyChannelListener (uri);
+			MyChannelDispatcher d = new MyChannelDispatcher (listener);
+			var ed = new EndpointDispatcher (new EndpointAddress (uri), "", "");
+			Assert.IsNotNull (ed.DispatchRuntime, "#1");
+			Assert.IsNull (ed.DispatchRuntime.InstanceProvider, "#2");
+			Assert.IsNull (ed.DispatchRuntime.InstanceContextProvider, "#3");
+			Assert.IsNull (ed.DispatchRuntime.InstanceProvider, "#3.2");
+			

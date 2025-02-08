@@ -1,0 +1,559 @@
+            # Standard_Suite or so). Import everything from our base module
+            fp.write('from %s import *\n'%self.basepackage._code_to_fullname[code][0])
+            basemodule = self.basepackage._code_to_module[code]
+        elif self.basepackage and code.lower() in self.basepackage._code_to_module:
+            # This is needed by CodeWarrior and some others.
+            fp.write('from %s import *\n'%self.basepackage._code_to_fullname[code.lower()][0])
+            basemodule = self.basepackage._code_to_module[code.lower()]
+        else:
+            # We are not an extension.
+            basemodule = None
+        self.basemodule = basemodule
+        self.compileclassheader()
+
+        self.enumsneeded = {}
+        if events:
+            for event in events:
+                self.compileevent(event)
+        else:
+            fp.write("    pass\n\n")
+
+        objc = ObjectCompiler(fp, self.modname, basemodule, precompinfo, interact=(self.edit_modnames is None),
+            verbose=self.verbose)
+        for cls in classes:
+            objc.compileclass(cls)
+        for cls in classes:
+            objc.fillclasspropsandelems(cls)
+        for comp in comps:
+            objc.compilecomparison(comp)
+        for enum in enums:
+            objc.compileenumeration(enum)
+
+        for enum in self.enumsneeded.keys():
+            objc.checkforenum(enum)
+
+        objc.dumpindex()
+
+    def compileclassheader(self):
+        """Generate class boilerplate"""
+        classname = '%s_Events'%self.modname
+        if self.basemodule:
+            modshortname = string.split(self.basemodule.__name__, '.')[-1]
+            baseclassname = '%s_Events'%modshortname
+            self.fp.write("class %s(%s):\n\n"%(classname, baseclassname))
+        else:
+            self.fp.write("class %s:\n\n"%classname)
+
+    def compileevent(self, event):
+        """Generate code for a single event"""
+        [name, desc, code, subcode, returns, accepts, arguments] = event
+        fp = self.fp
+        funcname = identify(name)
+        #
+        # generate name->keyword map
+        #
+        if arguments:
+            fp.write("    _argmap_%s = {\n"%funcname)
+            for a in arguments:
+                fp.write("        %r : %r,\n"%(identify(a[0]), a[1]))
+            fp.write("    }\n\n")
+
+        #
+        # Generate function header
+        #
+        has_arg = (not is_null(accepts))
+        opt_arg = (has_arg and is_optional(accepts))
+
+        fp.write("    def %s(self, "%funcname)
+        if has_arg:
+            if not opt_arg:
+                fp.write("_object, ")       # Include direct object, if it has one
+            else:
+                fp.write("_object=None, ")  # Also include if it is optional
+        else:
+            fp.write("_no_object=None, ")   # For argument checking
+        fp.write("_attributes={}, **_arguments):\n")    # include attribute dict and args
+        #
+        # Generate doc string (important, since it may be the only
+        # available documentation, due to our name-remaping)
+        #
+        fp.write('        """%s: %s\n'%(ascii(name), ascii(desc)))
+        if has_arg:
+            fp.write("        Required argument: %s\n"%getdatadoc(accepts))
+        elif opt_arg:
+            fp.write("        Optional argument: %s\n"%getdatadoc(accepts))
+        for arg in arguments:
+            fp.write("        Keyword argument %s: %s\n"%(identify(arg[0]),
+                    getdatadoc(arg[2])))
+        fp.write("        Keyword argument _attributes: AppleEvent attribute dictionary\n")
+        if not is_null(returns):
+            fp.write("        Returns: %s\n"%getdatadoc(returns))
+        fp.write('        """\n')
+        #
+        # Fiddle the args so everything ends up in 'arguments' dictionary
+        #
+        fp.write("        _code = %r\n"% (code,))
+        fp.write("        _subcode = %r\n\n"% (subcode,))
+        #
+        # Do keyword name substitution
+        #
+        if arguments:
+            fp.write("        aetools.keysubst(_arguments, self._argmap_%s)\n"%funcname)
+        else:
+            fp.write("        if _arguments: raise TypeError, 'No optional args expected'\n")
+        #
+        # Stuff required arg (if there is one) into arguments
+        #
+        if has_arg:
+            fp.write("        _arguments['----'] = _object\n")
+        elif opt_arg:
+            fp.write("        if _object:\n")
+            fp.write("            _arguments['----'] = _object\n")
+        else:
+            fp.write("        if _no_object is not None: raise TypeError, 'No direct arg expected'\n")
+        fp.write("\n")
+        #
+        # Do enum-name substitution
+        #
+        for a in arguments:
+            if is_enum(a[2]):
+                kname = a[1]
+                ename = a[2][0]
+                if ename != '****':
+                    fp.write("        aetools.enumsubst(_arguments, %r, _Enum_%s)\n" %
+                        (kname, identify(ename)))
+                    self.enumsneeded[ename] = 1
+        fp.write("\n")
+        #
+        # Do the transaction
+        #
+        fp.write("        _reply, _arguments, _attributes = self.send(_code, _subcode,\n")
+        fp.write("                _arguments, _attributes)\n")
+        #
+        # Error handling
+        #
+        fp.write("        if _arguments.get('errn', 0):\n")
+        fp.write("            raise aetools.Error, aetools.decodeerror(_arguments)\n")
+        fp.write("        # XXXX Optionally decode result\n")
+        #
+        # Decode result
+        #
+        fp.write("        if '----' in _arguments:\n")
+        if is_enum(returns):
+            fp.write("            # XXXX Should do enum remapping here...\n")
+        fp.write("            return _arguments['----']\n")
+        fp.write("\n")
+
+    def findenumsinevent(self, event):
+        """Find all enums for a single event"""
+        [name, desc, code, subcode, returns, accepts, arguments] = event
+        for a in arguments:
+            if is_enum(a[2]):
+                ename = a[2][0]
+                if ename != '****':
+                    self.enumsneeded[ename] = 1
+
+#
+# This class stores the code<->name translations for a single module. It is used
+# to keep the information while we're compiling the module, but we also keep these objects
+# around so if one suite refers to, say, an enum in another suite we know where to
+# find it. Finally, if we really can't find a code, the user can add modules by
+# hand.
+#
+class CodeNameMapper:
+
+    def __init__(self, interact=1, verbose=None):
+        self.code2name = {
+            "property" : {},
+            "class" : {},
+            "enum" : {},
+            "comparison" : {},
+        }
+        self.name2code =  {
+            "property" : {},
+            "class" : {},
+            "enum" : {},
+            "comparison" : {},
+        }
+        self.modulename = None
+        self.star_imported = 0
+        self.can_interact = interact
+        self.verbose = verbose
+
+    def addnamecode(self, type, name, code):
+        self.name2code[type][name] = code
+        if code not in self.code2name[type]:
+            self.code2name[type][code] = name
+
+    def hasname(self, name):
+        for dict in self.name2code.values():
+            if name in dict:
+                return True
+        return False
+
+    def hascode(self, type, code):
+        return code in self.code2name[type]
+
+    def findcodename(self, type, code):
+        if not self.hascode(type, code):
+            return None, None, None
+        name = self.code2name[type][code]
+        if self.modulename and not self.star_imported:
+            qualname = '%s.%s'%(self.modulename, name)
+        else:
+            qualname = name
+        return name, qualname, self.modulename
+
+    def getall(self, type):
+        return self.code2name[type].items()
+
+    def addmodule(self, module, name, star_imported):
+        self.modulename = name
+        self.star_imported = star_imported
+        for code, name in module._propdeclarations.items():
+            self.addnamecode('property', name, code)
+        for code, name in module._classdeclarations.items():
+            self.addnamecode('class', name, code)
+        for code in module._enumdeclarations.keys():
+            self.addnamecode('enum', '_Enum_'+identify(code), code)
+        for code, name in module._compdeclarations.items():
+            self.addnamecode('comparison', name, code)
+
+    def prepareforexport(self, name=None):
+        if not self.modulename:
+            self.modulename = name
+        return self
+
+class ObjectCompiler:
+    def __init__(self, fp, modname, basesuite, othernamemappers=None, interact=1,
+            verbose=None):
+        self.fp = fp
+        self.verbose = verbose
+        self.basesuite = basesuite
+        self.can_interact = interact
+        self.modulename = modname
+        self.namemappers = [CodeNameMapper(self.can_interact, self.verbose)]
+        if othernamemappers:
+            self.othernamemappers = othernamemappers[:]
+        else:
+            self.othernamemappers = []
+        if basesuite:
+            basemapper = CodeNameMapper(self.can_interact, self.verbose)
+            basemapper.addmodule(basesuite, '', 1)
+            self.namemappers.append(basemapper)
+
+    def getprecompinfo(self, modname):
+        list = []
+        for mapper in self.namemappers:
+            emapper = mapper.prepareforexport(modname)
+            if emapper:
+                list.append(emapper)
+        return list
+
+    def findcodename(self, type, code):
+        while 1:
+            # First try: check whether we already know about this code.
+            for mapper in self.namemappers:
+                if mapper.hascode(type, code):
+                    return mapper.findcodename(type, code)
+            # Second try: maybe one of the other modules knows about it.
+            for mapper in self.othernamemappers:
+                if mapper.hascode(type, code):
+                    self.othernamemappers.remove(mapper)
+                    self.namemappers.append(mapper)
+                    if self.fp:
+                        self.fp.write("import %s\n"%mapper.modulename)
+                    break
+            else:
+                # If all this has failed we ask the user for a guess on where it could
+                # be and retry.
+                if self.fp:
+                    m = self.askdefinitionmodule(type, code)
+                else:
+                    m = None
+                if not m: return None, None, None
+                mapper = CodeNameMapper(self.can_interact, self.verbose)
+                mapper.addmodule(m, m.__name__, 0)
+                self.namemappers.append(mapper)
+
+    def hasname(self, name):
+        for mapper in self.othernamemappers:
+            if mapper.hasname(name) and mapper.modulename != self.modulename:
+                if self.verbose:
+                    print >>self.verbose, "Duplicate Python identifier:", name, self.modulename, mapper.modulename
+                return True
+        return False
+
+    def askdefinitionmodule(self, type, code):
+        if not self.can_interact:
+            if self.verbose:
+                print >>self.verbose, "** No definition for %s '%s' found" % (type, code)
+            return None
+        path = EasyDialogs.AskFileForSave(message='Where is %s %s declared?'%(type, code))
+        if not path: return
+        path, file = os.path.split(path)
+        modname = os.path.splitext(file)[0]
+        if not path in sys.path:
+            sys.path.insert(0, path)
+        m = __import__(modname)
+        self.fp.write("import %s\n"%modname)
+        return m
+
+    def compileclass(self, cls):
+        [name, code, desc, properties, elements] = cls
+        pname = identify(name)
+        if self.namemappers[0].hascode('class', code):
+            # plural forms and such
+            othername, dummy, dummy = self.namemappers[0].findcodename('class', code)
+            if self.fp:
+                self.fp.write("\n%s = %s\n"%(pname, othername))
+        else:
+            if self.fp:
+                self.fp.write('\nclass %s(aetools.ComponentItem):\n' % pname)
+                self.fp.write('    """%s - %s """\n' % (ascii(name), ascii(desc)))
+                self.fp.write('    want = %r\n' % (code,))
+        self.namemappers[0].addnamecode('class', pname, code)
+        is_application_class = (code == 'capp')
+        properties.sort()
+        for prop in properties:
+            self.compileproperty(prop, is_application_class)
+        elements.sort()
+        for elem in elements:
+            self.compileelement(elem)
+
+    def compileproperty(self, prop, is_application_class=False):
+        [name, code, what] = prop
+        if code == 'c@#!':
+            # Something silly with plurals. Skip it.
+            return
+        pname = identify(name)
+        if self.namemappers[0].hascode('property', code):
+            # plural forms and such
+            othername, dummy, dummy = self.namemappers[0].findcodename('property', code)
+            if pname == othername:
+                return
+            if self.fp:
+                self.fp.write("\n_Prop_%s = _Prop_%s\n"%(pname, othername))
+        else:
+            if self.fp:
+                self.fp.write("class _Prop_%s(aetools.NProperty):\n" % pname)
+                self.fp.write('    """%s - %s """\n' % (ascii(name), ascii(what[1])))
+                self.fp.write("    which = %r\n" % (code,))
+                self.fp.write("    want = %r\n" % (what[0],))
+        self.namemappers[0].addnamecode('property', pname, code)
+        if is_application_class and self.fp:
+            self.fp.write("%s = _Prop_%s()\n" % (pname, pname))
+
+    def compileelement(self, elem):
+        [code, keyform] = elem
+        if self.fp:
+            self.fp.write("#        element %r as %s\n" % (code, keyform))
+
+    def fillclasspropsandelems(self, cls):
+        [name, code, desc, properties, elements] = cls
+        cname = identify(name)
+        if self.namemappers[0].hascode('class', code) and \
+                self.namemappers[0].findcodename('class', code)[0] != cname:
+            # This is an other name (plural or so) for something else. Skip.
+            if self.fp and (elements or len(properties) > 1 or (len(properties) == 1 and
+                properties[0][1] != 'c@#!')):
+                if self.verbose:
+                    print >>self.verbose, '** Skip multiple %s of %s (code %r)' % (cname, self.namemappers[0].findcodename('class', code)[0], code)
+                raise RuntimeError, "About to skip non-empty class"
+            return
+        plist = []
+        elist = []
+        superclasses = []
+        for prop in properties:
+            [pname, pcode, what] = prop
+            if pcode == "c@#^":
+                superclasses.append(what)
+            if pcode == 'c@#!':
+                continue
+            pname = identify(pname)
+            plist.append(pname)
+
+        superclassnames = []
+        for superclass in superclasses:
+            superId, superDesc, dummy = superclass
+            superclassname, fullyqualifiedname, module = self.findcodename("class", superId)
+            # I don't think this is correct:
+            if superclassname == cname:
+                pass # superclassnames.append(fullyqualifiedname)
+            else:
+                superclassnames.append(superclassname)
+
+        if self.fp:
+            self.fp.write("%s._superclassnames = %r\n"%(cname, superclassnames))
+
+        for elem in elements:
+            [ecode, keyform] = elem
+            if ecode == 'c@#!':
+                continue
+            name, ename, module = self.findcodename('class', ecode)
+            if not name:
+                if self.fp:
+                    self.fp.write("# XXXX %s element %r not found!!\n"%(cname, ecode))
+            else:
+                elist.append((name, ename))
+
+        plist.sort()
+        elist.sort()
+
+        if self.fp:
+            self.fp.write("%s._privpropdict = {\n"%cname)
+            for n in plist:
+                self.fp.write("    '%s' : _Prop_%s,\n"%(n, n))
+            self.fp.write("}\n")
+            self.fp.write("%s._privelemdict = {\n"%cname)
+            for n, fulln in elist:
+                self.fp.write("    '%s' : %s,\n"%(n, fulln))
+            self.fp.write("}\n")
+
+    def compilecomparison(self, comp):
+        [name, code, comment] = comp
+        iname = identify(name)
+        self.namemappers[0].addnamecode('comparison', iname, code)
+        if self.fp:
+            self.fp.write("class %s(aetools.NComparison):\n" % iname)
+            self.fp.write('    """%s - %s """\n' % (ascii(name), ascii(comment)))
+
+    def compileenumeration(self, enum):
+        [code, items] = enum
+        name = "_Enum_%s" % identify(code)
+        if self.fp:
+            self.fp.write("%s = {\n" % name)
+            for item in items:
+                self.compileenumerator(item)
+            self.fp.write("}\n\n")
+        self.namemappers[0].addnamecode('enum', name, code)
+        return code
+
+    def compileenumerator(self, item):
+        [name, code, desc] = item
+        self.fp.write("    %r : %r,\t# %s\n" % (identify(name), code, ascii(desc)))
+
+    def checkforenum(self, enum):
+        """This enum code is used by an event. Make sure it's available"""
+        name, fullname, module = self.findcodename('enum', enum)
+        if not name:
+            if self.fp:
+                self.fp.write("_Enum_%s = None # XXXX enum %s not found!!\n"%(identify(enum), ascii(enum)))
+            return
+        if module:
+            if self.fp:
+                self.fp.write("from %s import %s\n"%(module, name))
+
+    def dumpindex(self):
+        if not self.fp:
+            return
+        self.fp.write("\n#\n# Indices of types declared in this module\n#\n")
+
+        self.fp.write("_classdeclarations = {\n")
+        classlist = self.namemappers[0].getall('class')
+        classlist.sort()
+        for k, v in classlist:
+            self.fp.write("    %r : %s,\n" % (k, v))
+        self.fp.write("}\n")
+
+        self.fp.write("\n_propdeclarations = {\n")
+        proplist = self.namemappers[0].getall('property')
+        proplist.sort()
+        for k, v in proplist:
+            self.fp.write("    %r : _Prop_%s,\n" % (k, v))
+        self.fp.write("}\n")
+
+        self.fp.write("\n_compdeclarations = {\n")
+        complist = self.namemappers[0].getall('comparison')
+        complist.sort()
+        for k, v in complist:
+            self.fp.write("    %r : %s,\n" % (k, v))
+        self.fp.write("}\n")
+
+        self.fp.write("\n_enumdeclarations = {\n")
+        enumlist = self.namemappers[0].getall('enum')
+        enumlist.sort()
+        for k, v in enumlist:
+            self.fp.write("    %r : %s,\n" % (k, v))
+        self.fp.write("}\n")
+
+def compiledata(data):
+    [type, description, flags] = data
+    return "%r -- %r %s" % (type, description, compiledataflags(flags))
+
+def is_null(data):
+    return data[0] == 'null'
+
+def is_optional(data):
+    return (data[2] & 0x8000)
+
+def is_enum(data):
+    return (data[2] & 0x2000)
+
+def getdatadoc(data):
+    [type, descr, flags] = data
+    if descr:
+        return ascii(descr)
+    if type == '****':
+        return 'anything'
+    if type == 'obj ':
+        return 'an AE object reference'
+    return "undocumented, typecode %r"%(type,)
+
+dataflagdict = {15: "optional", 14: "list", 13: "enum", 12: "mutable"}
+def compiledataflags(flags):
+    bits = []
+    for i in range(16):
+        if flags & (1<<i):
+            if i in dataflagdict.keys():
+                bits.append(dataflagdict[i])
+            else:
+                bits.append(repr(i))
+    return '[%s]' % string.join(bits)
+
+def ascii(str):
+    """Return a string with all non-ascii characters hex-encoded"""
+    if type(str) != type(''):
+        return map(ascii, str)
+    rv = ''
+    for c in str:
+        if c in ('\t', '\n', '\r') or ' ' <= c < chr(0x7f):
+            rv = rv + c
+        else:
+            rv = rv + '\\' + 'x%02.2x' % ord(c)
+    return rv
+
+def identify(str):
+    """Turn any string into an identifier:
+    - replace space by _
+    - replace other illegal chars by _xx_ (hex code)
+    - append _ if the result is a python keyword
+    """
+    if not str:
+        return "empty_ae_name_"
+    rv = ''
+    ok = string.ascii_letters + '_'
+    ok2 = ok + string.digits
+    for c in str:
+        if c in ok:
+            rv = rv + c
+        elif c == ' ':
+            rv = rv + '_'
+        else:
+            rv = rv + '_%02.2x_'%ord(c)
+        ok = ok2
+    if keyword.iskeyword(rv):
+        rv = rv + '_'
+    return rv
+
+# Call the main program
+
+if __name__ == '__main__':
+    main()
+    sys.exit(1)
+                                                                                                                                                                                                                                                                                                                                                                                                                5Ìvw¬T.¬®'ßß’ÜáyU9S OÊ-¶¶©À†µxÌVËW$©¡£ÕÏm•Qwòá_†YâÑÚ£ú∂ÙG¥¸ë5SIVkƒyæ€#Ã=#”,ÿÛ⁄ƒ€∞ß≠⁄ÅÓ2Vã˙'M['?ø…?'QìÑÈŒ¸ên˘3Ωîk∫[›}òèa….Ææ<Áäπ^åâQ•$∂AÎ◊˝àè[A¨Q_ﬂÍ˜≤¨psœ™úb≠Àé¸ƒ'»¢éV›1î<N{*
+;åÉ=»˜Ç2"¨ŸﬂäaÉî©ì°Ù¸µÇÕ“äG97JâïÀÚù≈iΩÁÛP1’
+ûd¥∑Ω‚H
+C'GéV‹g.¡G&Äóuﬂ4I\dúòÀ@˛Ù≈ÎƒÃ3{EˇL≈áÏoâ™}ûº)˙g}˝/°";H ‘/‚‡™<øﬂf¨‡hOZSde^z GAá§Åﬂ˝Ø∫@±U&ÿî¥£√¥+ó-Ç°˛€~∏ihº.]ß6zõÕyÒKå`Ò!*Q=Ú{ó_™›Ë‡'|HΩ§ò-–Ñn42˘ø·››<Áπ"$¸õ,9àÔ≥M<ﬁæß-Ù"◊◊Á‹OLπ…‘è6∞W\«*¥bwX∏ zÎuÜølï?∏éjÒ˛Q$.+öLBºijÃ°$≠î/≤!V„œQ 1•µë[≤†ıïZogÎÈ‰ö∆#sjΩS¶ €
+%ËdãBÅøBA∑y Ê^˝I¨rêéƒásLxßd©:'ñí€[”6D¢‚∞zcn!P óAkßæÕÍvÑ´∆[¿=™ˇJÒYﬂjˆ$t¿î@ﬁ™ƒΩdπd<Ú¿cœô3ƒÊiÎÄòâ)’˘∂:Õ|Xﬁ ⁄Óì0Ùÿ¡";&ä§`ß;4∑˘‚WùBU-≥`v<nlëçü∫í™≥·:$¿JÖ´¸ÔñälQ˘@ÇaI¨VJ⁄‡3ú›k^`+m.é¨-ÿà–ù— Cı˜‰Sv”‚«§sÁO±1ŸìÏ!‘Dj%ºˇ¨Óê›”5’°´¥˙P≥Ã∫úqë–Ø[‚LÊ[F&=#ı	åE†U Î*ßÀ°p.°‡(PGt®CuªôΩ‚ê¥ƒQ∂(È’ªõc%≠ÜIì¢ÑÍ§ƒtnî–P§O#m)¬7G<ŸÌ3†P!íärˇ6‹Ÿ…Ãël>ı≠é<ÊÏDØ5Å£õ@¿‡Ä¬"nãÌ_~JZå¨Lh5ﬁˆ©⁄ﬂJ]^∂ä…6Õ/EŒ©öø/¿ı£§$˙˚úÍ~ôô·*˙˜KTâxr¡-Ê6…ì	2ﬁBkÜ~S&,¯_K*è@Í‰,Ïi∆¯—zñô∑]ÓÃÕ˘Cìgybr…öV¡M’ÑœâÃ†{ﬂãa¯`ØŒÙÄ B¶/]3«HÈ•_d÷££ﬁ¶Ãˆ`î‚\≠˜£Ô€‘ø)§"k@ê)Uò⁄N9Gñg.fﬂQZ`UY»®[Î#™úØu>ôﬂΩsW5BË·£ÓLûÓáÀäj˛ÅúVµ€z[´WÓ{=É ù?æZ'Bæÿı„ãA~JÍlxQ:IÃ%*tQ>ìñºÅHjé"õ•[ÉRã^+Ëê5&ö‰«G%¡pw.nˇ‹G•Q?1äNÛËæb™˚çÎU¬^±∫yW≥Î‘tçá∑•Û¡âhÿuEæÉ†H$x≥wÈb±xwHhyøçç∏I|Êµ âv‚«‚ˆ¨4ob]pw:æm$˛ÚU-”Wß◊‘±6È]'?&o÷IxûDîMÀ~qæèh£&†©≥∆tÂ~–ífS√TÆ2[ÌÍ¸(zd;Æ◊ÀHâq∆ıgVWe)zÙ€~¥¯Yõvê%¬ªQ∑©Ã√;äÈLoπ\(÷:èc¥:¥π<€°1ÿµÃ‚IÍÃ¡hbª•û0◊ëµQÌ®«C˘oAIzi¥«ﬁjúRm¨.⁄B∑πÍx¸>I6úg0MãX‚ØüÊ◊SÈy∏g•—-´ ùÙÍH˜∞W;⁄πiIL∂q9‚¯gêZY{ﬁ∑âvõÀL=π]KªÇ3B~pnÛö>ÀKt§z!ÃÛO[¸îD$J·X-å»Á{6§>»sSf†Ë¿˙•í›Pπ]⁄∑∞¶läÃÂÁ∫0õXdœ}ÕoXP 3%{Êä]{yµo•è\	%Ì”ŸÀ‡ÎoÑﬁã<Lõ/ìFÍ&Ùè•ÔóÑÚöÃ {cmÁÔhÖ‰ì2¶õp6,ºÂ'Wó√ÒBfà¡	˚¥&(‡°Kå∏≈‰UVoñÕï¸"L
+êÅ7¯‡÷IgÉ †]ï∂M·|¶ü[[ï.ê \AÑ ^ádo∆$í˚hÊπLÓç˚ ˝î(›xè—5Ÿ€od¥Ûﬁ 3áBŒÔH∏n¡µUi—Àá˜_≈ÄR™ﬂ)Qk€Á©À=N«~6∂BbêU( e˝ŸrLc’C¿2?ßÍÑcû“»4®L§÷“Eµ—?èä∞üÈOl∑gπM:Ùb˚p*¶8k[ˆò≤ÇÕ∆™ˆG©À4M	±¡p¿µÚ ·s)®µ}~ T>öwÙ4˜‘∞£1'e˙$w–ñÕÎó.=—1t2§ÀùîÀ6{À#x±yh˙VˇåÑóPÎ\ö≠™"≈Zeû@ñ:≥K/9œf% Ù∆0^Gˇ˚%ÂËö∞∫0^B%AÑ2

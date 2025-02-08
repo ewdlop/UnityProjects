@@ -1,0 +1,53 @@
+elayedDiagnosticPool &) = delete;
+public:
+  DelayedDiagnosticPool(const DelayedDiagnosticPool *parent) : Parent(parent) {}
+  ~DelayedDiagnosticPool() {
+    for (SmallVectorImpl<DelayedDiagnostic>::iterator
+           i = Diagnostics.begin(), e = Diagnostics.end(); i != e; ++i)
+      i->Destroy();
+  }
+
+  DelayedDiagnosticPool(DelayedDiagnosticPool &&Other)
+    : Parent(Other.Parent), Diagnostics(std::move(Other.Diagnostics)) {
+    Other.Diagnostics.clear();
+  }
+  DelayedDiagnosticPool &operator=(DelayedDiagnosticPool &&Other) {
+    Parent = Other.Parent;
+    Diagnostics = std::move(Other.Diagnostics);
+    Other.Diagnostics.clear();
+    return *this;
+  }
+
+  const DelayedDiagnosticPool *getParent() const { return Parent; }
+
+  /// Does this pool, or any of its ancestors, contain any diagnostics?
+  bool empty() const {
+    return (Diagnostics.empty() && (!Parent || Parent->empty()));
+  }
+
+  /// Add a diagnostic to this pool.
+  void add(const DelayedDiagnostic &diag) {
+    Diagnostics.push_back(diag);
+  }
+
+  /// Steal the diagnostics from the given pool.
+  void steal(DelayedDiagnosticPool &pool) {
+    if (pool.Diagnostics.empty()) return;
+
+    if (Diagnostics.empty()) {
+      Diagnostics = std::move(pool.Diagnostics);
+    } else {
+      Diagnostics.append(pool.pool_begin(), pool.pool_end());
+    }
+    pool.Diagnostics.clear();
+  }
+
+  typedef SmallVectorImpl<DelayedDiagnostic>::const_iterator pool_iterator;
+  pool_iterator pool_begin() const { return Diagnostics.begin(); }
+  pool_iterator pool_end() const { return Diagnostics.end(); }
+  bool pool_empty() const { return Diagnostics.empty(); }
+};
+
+}
+
+/// Add

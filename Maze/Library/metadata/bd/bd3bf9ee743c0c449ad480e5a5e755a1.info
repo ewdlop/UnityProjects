@@ -1,0 +1,90 @@
+xt = b"""\
+http://www.python.org/doc/2.4.1/lib/module-unittest.html
+test case
+    A test case is the smallest unit of testing. [...] You may provide your
+    own implementation that does not subclass from TestCase, of course.
+"""
+        sample_text_error = b"""\
+- http://www.python.org/doc/2.3/lib/module-unittest.html
+?                             ^
++ http://www.python.org/doc/2.4.1/lib/module-unittest.html
+?                             ^^^
+  test case
+-     A test case is the smallest unit of testing. [...]
++     A test case is the smallest unit of testing. [...] You may provide your
+?                                                       +++++++++++++++++++++
++     own implementation that does not subclass from TestCase, of course.
+"""
+        self.maxDiff = None
+        for type_changer in (lambda x: x, lambda x: x.decode('utf8')):
+            try:
+                self.assertMultiLineEqual(type_changer(sample_text),
+                                          type_changer(revised_sample_text))
+            except self.failureException, e:
+                # need to remove the first line of the error message
+                error = str(e).encode('utf8').split('\n', 1)[1]
+
+                # assertMultiLineEqual is hooked up as the default for
+                # unicode strings - so we can't use it for this check
+                self.assertTrue(sample_text_error == error)
+
+    def testAsertEqualSingleLine(self):
+        sample_text = u"laden swallows fly slowly"
+        revised_sample_text = u"unladen swallows fly quickly"
+        sample_text_error = """\
+- laden swallows fly slowly
+?                    ^^^^
++ unladen swallows fly quickly
+? ++                   ^^^^^
+"""
+        try:
+            self.assertEqual(sample_text, revised_sample_text)
+        except self.failureException as e:
+            error = str(e).split('\n', 1)[1]
+            self.assertTrue(sample_text_error == error)
+
+    def testAssertIsNone(self):
+        self.assertIsNone(None)
+        self.assertRaises(self.failureException, self.assertIsNone, False)
+        self.assertIsNotNone('DjZoPloGears on Rails')
+        self.assertRaises(self.failureException, self.assertIsNotNone, None)
+
+    def testAssertRegexpMatches(self):
+        self.assertRegexpMatches('asdfabasdf', r'ab+')
+        self.assertRaises(self.failureException, self.assertRegexpMatches,
+                          'saaas', r'aaaa')
+
+    def testAssertRaisesCallable(self):
+        class ExceptionMock(Exception):
+            pass
+        def Stub():
+            raise ExceptionMock('We expect')
+        self.assertRaises(ExceptionMock, Stub)
+        # A tuple of exception classes is accepted
+        self.assertRaises((ValueError, ExceptionMock), Stub)
+        # *args and **kwargs also work
+        self.assertRaises(ValueError, int, '19', base=8)
+        # Failure when no exception is raised
+        with self.assertRaises(self.failureException):
+            self.assertRaises(ExceptionMock, lambda: 0)
+        # Failure when another exception is raised
+        with self.assertRaises(ExceptionMock):
+            self.assertRaises(ValueError, Stub)
+
+    def testAssertRaisesContext(self):
+        class ExceptionMock(Exception):
+            pass
+        def Stub():
+            raise ExceptionMock('We expect')
+        with self.assertRaises(ExceptionMock):
+            Stub()
+        # A tuple of exception classes is accepted
+        with self.assertRaises((ValueError, ExceptionMock)) as cm:
+            Stub()
+        # The context manager exposes caught exception
+        self.assertIsInstance(cm.exception, ExceptionMock)
+        self.assertEqual(cm.exception.args[0], 'We expect')
+        # *args and **kwargs also work
+        with self.assertRaises(ValueError):
+            int('19', base=8)
+        # Failure when no exception is raised

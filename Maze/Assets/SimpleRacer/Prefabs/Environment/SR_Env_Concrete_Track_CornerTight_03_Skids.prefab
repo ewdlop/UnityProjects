@@ -1,0 +1,91 @@
+	return MAX_VERTS_PER_POLY;
+}
+
+namespace TileCacheFunc
+{
+	inline bool uleft(const unsigned short* a, const unsigned short* b, const unsigned short* c)
+	{
+		return ((int)b[0] - (int)a[0]) * ((int)c[2] - (int)a[2]) -
+			((int)c[0] - (int)a[0]) * ((int)b[2] - (int)a[2]) < 0;
+	}
+}
+
+static int getPolyMergeValue(unsigned short* pa, unsigned short* pb,
+							 const unsigned short* verts, int& ea, int& eb)
+{
+	const int na = countPolyVerts(pa);
+	const int nb = countPolyVerts(pb);
+	
+	// If the merged polygon would be too big, do not merge.
+	if (na+nb-2 > MAX_VERTS_PER_POLY)
+		return -1;
+	
+	// Check if the polygons share an edge.
+	ea = -1;
+	eb = -1;
+	
+	for (int i = 0; i < na; ++i)
+	{
+		unsigned short va0 = pa[i];
+		unsigned short va1 = pa[(i+1) % na];
+		if (va0 > va1)
+			dtSwap(va0, va1);
+		for (int j = 0; j < nb; ++j)
+		{
+			unsigned short vb0 = pb[j];
+			unsigned short vb1 = pb[(j+1) % nb];
+			if (vb0 > vb1)
+				dtSwap(vb0, vb1);
+			if (va0 == vb0 && va1 == vb1)
+			{
+				ea = i;
+				eb = j;
+				break;
+			}
+		}
+	}
+	
+	// No common edge, cannot merge.
+	if (ea == -1 || eb == -1)
+		return -1;
+	
+	// Check to see if the merged polygon would be convex.
+	unsigned short va, vb, vc;
+	
+	va = pa[(ea+na-1) % na];
+	vb = pa[ea];
+	vc = pb[(eb+2) % nb];
+	if (!TileCacheFunc::uleft(&verts[va * 3], &verts[vb * 3], &verts[vc * 3]))
+		return -1;
+	
+	va = pb[(eb+nb-1) % nb];
+	vb = pb[eb];
+	vc = pa[(ea+2) % na];
+	if (!TileCacheFunc::uleft(&verts[va * 3], &verts[vb * 3], &verts[vc * 3]))
+		return -1;
+	
+	va = pa[ea];
+	vb = pa[(ea+1)%na];
+	
+	int dx = (int)verts[va*3+0] - (int)verts[vb*3+0];
+	int dy = (int)verts[va*3+2] - (int)verts[vb*3+2];
+	
+	return dx*dx + dy*dy;
+}
+
+static void mergePolys(unsigned short* pa, unsigned short* pb, int ea, int eb)
+{
+	unsigned short tmp[MAX_VERTS_PER_POLY*2];
+	
+	const int na = countPolyVerts(pa);
+	const int nb = countPolyVerts(pb);
+	
+	// Merge polygons.
+	memset(tmp, 0xff, sizeof(unsigned short)*MAX_VERTS_PER_POLY*2);
+	int n = 0;
+	// Add pa
+	for (int i = 0; i < na-1; ++i)
+		tmp[n++] = pa[(ea+1+i) % na];
+	// Add pb
+	for (int i = 0; i < nb-1; ++i)
+		tmp[n++] = pb[(eb+1+i) % nb];

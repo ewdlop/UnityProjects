@@ -1,0 +1,69 @@
+x);
+	}
+
+	AddExistingName(ModifiedName);
+
+	return ModifiedName;
+}
+
+
+FTransform FDatasmithUtils::ConvertTransform(EModelCoordSystem SourceCoordSystem, const FTransform& LocalTransform)
+{
+	// convert to UE coords
+	static const FTransform RightHanded(FRotator(0.0f, 0.0f, 0.0f), FVector(0.0f, 0.0f, 0.0f), FVector(-1.0f, 1.0f, 1.0f));
+	static const FTransform RightHandedLegacy(FRotator(0.0f, 0.0f, 0.0f), FVector(0.0f, 0.0f, 0.0f), FVector(1.0f, -1.0f, 1.0f));
+	static const FTransform YUpMatrix(FMatrix(FVector(0.0f, 0.0f, 1.0f), FVector(1.0f, 0.0f, 0.0f), FVector(0.0f, 1.0f, 0.0f), FVector(0.0f, 0.0f, 0.0f)));
+	static const FTransform YUpMatrixInv(YUpMatrix.Inverse());
+
+	switch (SourceCoordSystem)
+	{
+	case EModelCoordSystem::ZUp_RightHanded:
+	{
+		return RightHanded * LocalTransform * RightHanded;
+	}
+	case EModelCoordSystem::YUp_LeftHanded:
+	{
+		return YUpMatrix * LocalTransform * YUpMatrixInv;
+	}
+	case EModelCoordSystem::YUp_RightHanded:
+	{
+		return RightHanded * YUpMatrix * LocalTransform * YUpMatrixInv * RightHanded;
+	}
+	case EModelCoordSystem::ZUp_RightHanded_FBXLegacy:
+	{
+		return RightHandedLegacy * LocalTransform * RightHandedLegacy;
+	}
+	default:
+	{
+		return LocalTransform;
+	}
+	}
+}
+
+
+FMatrix FDatasmithUtils::GetSymmetricMatrix(const FVector& Origin, const FVector& Normal)
+{
+	//Calculate symmetry matrix
+	//(Px, Py, Pz) = normal
+	// -Px² + Pz² + Py²  |  - 2 * Px * Py     |  - 2 * Px * Pz
+	// - 2 * Py * Px     |  - Py² + Px² + Pz² |  - 2 * Py * Pz
+	// - 2 * Pz * Px     |  - 2 * Pz * Py     |  - Pz² + Py² + Px²
+
+	FVector LocOrigin = Origin;
+
+	float NormalXSqr, NormalYSqr, NormalZSqr;
+	NormalXSqr = Normal.X * Normal.X;
+	NormalYSqr = Normal.Y * Normal.Y;
+	NormalZSqr = Normal.Z * Normal.Z;
+
+	FMatrix OSymmetricMatrix;
+	OSymmetricMatrix.SetIdentity();
+	FVector Axis0(-NormalXSqr + NormalZSqr + NormalYSqr, -2 * Normal.X * Normal.Y, -2 * Normal.X * Normal.Z);
+	FVector Axis1(-2 * Normal.Y * Normal.X, -NormalYSqr + NormalXSqr + NormalZSqr, -2 * Normal.Y * Normal.Z);
+	FVector Axis2(-2 * Normal.Z * Normal.X, -2 * Normal.Z * Normal.Y, -NormalZSqr + NormalYSqr + NormalXSqr);
+	OSymmetricMatrix.SetAxes(&Axis0, &Axis1, &Axis2);
+
+	FMatrix SymmetricMatrix;
+	SymmetricMatrix.SetIdentity();
+
+	//Translate to 0, 0

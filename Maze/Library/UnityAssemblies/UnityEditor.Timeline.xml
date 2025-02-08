@@ -1,0 +1,53 @@
+				lock (this) {
+						changed.Reset ();
+						ms_wait = RunSchedulerLoop ();
+					}
+					// Wait until due time or a timer is changed and moves from/to the first place in the list.
+					changed.WaitOne (ms_wait);
+				}
+			}
+
+#endif
+			public static Scheduler Instance {
+				get { return instance; }
+			}
+
+			private Scheduler ()
+			{
+				list = new List<Timer> (1024);
+				InitScheduler ();
+			}
+
+			public void Remove (Timer timer)
+			{
+				lock (this) {
+					// If this is the next item due (index = 0), the scheduler will wake up and find nothing.
+					// No need to Pulse ()
+					InternalRemove (timer);
+				}
+			}
+
+			public void Change (Timer timer, long new_next_run)
+			{
+				if (timer.is_dead)
+					timer.is_dead = false;
+
+				bool wake = false;
+				lock (this) {
+					needReSort = true;
+
+					if (!timer.is_added) {
+						timer.next_run = new_next_run;
+						Add(timer);
+						wake = current_next_run > new_next_run;
+					} else {
+						if (new_next_run == Int64.MaxValue) {
+							timer.next_run = new_next_run;
+							InternalRemove (timer);
+							return;
+						}
+
+						if (!timer.disposed) {
+							// We should only change next_run after removing and before adding
+							timer.next_run = new_next_run;
+							// FIX

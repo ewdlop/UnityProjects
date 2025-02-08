@@ -1,0 +1,246 @@
+xt = (ThreadContext *) mono_native_tls_get_value (thread_context_id);
+	if (context == NULL) {
+		context = g_new0 (ThreadContext, 1);
+		/*
+		 * Use two stacks, one for InterpFrame structures, one for data.
+		 * This is useful because InterpFrame structures don't need to be GC tracked.
+		 */
+		frame_stack_init (&context->iframe_stack, 8192);
+		frame_stack_init (&context->data_stack, 8192);
+		set_context (context);
+	}
+	return context;
+}
+
+static void
+interp_free_context (gpointer ctx)
+{
+	ThreadContext *context = (ThreadContext*)ctx;
+
+	frame_stack_free (&context->iframe_stack);
+	frame_stack_free (&context->data_stack);
+	g_free (context);
+}
+
+static void
+mono_interp_error_cleanup (MonoError* error)
+{
+	mono_error_cleanup (error); /* FIXME: don't swallow the error */
+	error_init_reuse (error); // one instruction, so this function is good inline candidate
+}
+
+static MONO_NEVER_INLINE void
+ves_real_abort (int line, MonoMethod *mh,
+		const unsigned short *ip, stackval *stack, stackval *sp)
+{
+	ERROR_DECL (error);
+	MonoMethodHeader *header = mono_method_get_header_checked (mh, error);
+	mono_error_cleanup (error); /* FIXME: don't swallow the error */
+	g_printerr ("Execution aborted in method: %s::%s\n", m_class_get_name (mh->klass), mh->name);
+	g_printerr ("Line=%d IP=0x%04lx, Aborted execution\n", line, ip-(const unsigned short *) header->code);
+	g_printerr ("0x%04x %02x\n", ip-(const unsigned short *) header->code, *ip);
+	mono_metadata_free_mh (header);
+	g_assert_not_reached ();
+}
+
+#define ves_abort() \
+	do {\
+		ves_real_abort(__LINE__, frame->imethod->method, ip, frame->stack, sp); \
+		goto abort_label; \
+	} while (0);
+
+static InterpMethod*
+lookup_imethod (MonoDomain *domain, MonoMethod *method)
+{
+	InterpMethod *imethod;
+	MonoJitDomainInfo *info;
+
+	info = domain_jit_info (domain);
+	mono_domain_jit_code_hash_lock (domain);
+	imethod = (InterpMethod*)mono_internal_hash_table_lookup (&info->interp_code_hash, method);
+	mono_domain_jit_code_hash_unlock (domain);
+	return imethod;
+}
+
+static gpointer
+interp_get_remoting_invoke (MonoMethod *method, gpointer addr, MonoError *error)
+{
+#ifndef DISABLE_REMOTING
+	InterpMethod *imethod;
+
+	if (addr) {
+		imethod = lookup_method_pointer (addr);
+	} else {
+		g_assert (method);
+		imethod = mono_interp_get_imethod (mono_domain_get (), method, error);
+		return_val_if_nok (error, NULL);
+	}
+	g_assert (imethod);
+	g_assert (mono_use_interpreter);
+
+	MonoMethod *remoting_invoke_method = mono_marshal_get_remoting_invoke (imethod->method, error);
+	return_val_if_nok (error, NULL);
+	return mono_interp_get_imethod (mono_domain_get (), remoting_invoke_method, error);
+#else
+	g_assert_not_reached ();
+	return NULL;
+#endif
+}
+
+InterpMethod*
+mono_interp_get_imethod (MonoDomain *domain, MonoMethod *method, MonoError *error)
+{
+	InterpMethod *imethod;
+	MonoJitDomainInfo *info;
+	MonoMethodSignature *sig;
+	int i;
+
+	error_init (error);
+
+	info = domain_jit_info (domain);
+	mono_domain_jit_code_hash_lock (domain);
+	imethod = (InterpMethod*)mono_internal_hash_table_lookup (&info->interp_code_hash, method);
+	mono_domain_jit_code_hash_unlock (domain);
+	if (imethod)
+		return imethod;
+
+	sig = mono_method_signature_internal (method);
+
+	imethod = (InterpMethod*)mono_domain_alloc0 (domain, sizeof (InterpMethod));
+	imethod->method = method;
+	imethod->domain = domain;
+	imethod->param_count = sig->param_count;
+	imethod->hasthis = sig->hasthis;
+	imethod->vararg = sig->call_convention == MONO_CALL_VARARG;
+	imethod->code_type = IMETHOD_CODE_UNKNOWN;
+	if (imethod->method->string_ctor)
+		imethod->rtype = m_class_get_byval_arg (mono_defaults.string_class);
+	else
+		imethod->rtype = mini_get_underlying_type (sig->ret);
+	imethod->param_types = (MonoType**)mono_domain_alloc0 (domain, sizeof (MonoType*) * sig->param_count);
+	for (i = 0; i < sig->param_count; ++i)
+		imethod->param_types [i] = mini_get_underlying_type (sig->params [i]);
+
+	mono_domain_jit_code_hash_lock (domain);
+	if (!mono_internal_hash_table_lookup (&info->interp_code_hash, method))
+		mono_internal_hash_table_insert (&info->interp_code_hash, method, imethod);
+	mono_domain_jit_code_hash_unlock (domain);
+
+	imethod->prof_flags = mono_profiler_get_call_instrumentation_flags (imethod->method);
+
+	return imethod;
+}
+
+#if defined (MONO_CROSS_COMPILE) || defined (HOST_WASM)
+#define INTERP_PUSH_LMF_WITH_CTX_BODY(ext, exit_label) \
+	(ext).kind = MONO_LMFEXT_INTERP_EXIT;
+
+#elif defined(MONO_ARCH_HAS_NO_PROPER_MONOCTX)
+/* some platforms, e.g. appleTV, don't provide us a precise MonoContext
+ * (registers are not accurate), thus resuming to the label does not work. */
+#define INTERP_PUSH_LMF_WITH_CTX_BODY(ext, exit_label) \
+	(ext).kind = MONO_LMFEXT_INTERP_EXIT;
+#elif defined (_MSC_VER)
+#define INTERP_PUSH_LMF_WITH_CTX_BODY(ext, exit_label) \
+	(ext).kind = MONO_LMFEXT_INTERP_EXIT_WITH_CTX; \
+	(ext).interp_exit_label_set = FALSE; \
+	MONO_CONTEXT_GET_CURRENT ((ext).ctx); \
+	if ((ext).interp_exit_label_set == FALSE) \
+		mono_arch_do_ip_adjustment (&(ext).ctx); \
+	if ((ext).interp_exit_label_set == TRUE) \
+		goto exit_label; \
+	(ext).interp_exit_label_set = TRUE;
+#elif defined(MONO_ARCH_HAS_MONO_CONTEXT)
+#define INTERP_PUSH_LMF_WITH_CTX_BODY(ext, exit_label) \
+	(ext).kind = MONO_LMFEXT_INTERP_EXIT_WITH_CTX; \
+	MONO_CONTEXT_GET_CURRENT ((ext).ctx); \
+	MONO_CONTEXT_SET_IP (&(ext).ctx, (&&exit_label)); \
+	mono_arch_do_ip_adjustment (&(ext).ctx);
+#else
+#define INTERP_PUSH_LMF_WITH_CTX_BODY(ext, exit_label) g_error ("requires working mono-context");
+#endif
+
+/* INTERP_PUSH_LMF_WITH_CTX:
+ *
+ * same as interp_push_lmf, but retrieving and attaching MonoContext to it.
+ * This is needed to resume into the interp when the exception is thrown from
+ * native code (see ./mono/tests/install_eh_callback.exe).
+ *
+ * This must be a macro in order to retrieve the right register values for
+ * MonoContext.
+ */
+#define INTERP_PUSH_LMF_WITH_CTX(frame, ext, exit_label) \
+	memset (&(ext), 0, sizeof (MonoLMFExt)); \
+	(ext).interp_exit_data = (frame); \
+	INTERP_PUSH_LMF_WITH_CTX_BODY ((ext), exit_label); \
+	mono_push_lmf (&(ext));
+
+/*
+ * interp_push_lmf:
+ *
+ * Push an LMF frame on the LMF stack
+ * to mark the transition to native code.
+ * This is needed for the native code to
+ * be able to do stack walks.
+ */
+static void
+interp_push_lmf (MonoLMFExt *ext, InterpFrame *frame)
+{
+	memset (ext, 0, sizeof (MonoLMFExt));
+	ext->kind = MONO_LMFEXT_INTERP_EXIT;
+	ext->interp_exit_data = frame;
+
+	mono_push_lmf (ext);
+}
+
+static void
+interp_pop_lmf (MonoLMFExt *ext)
+{
+	mono_pop_lmf (&ext->lmf);
+}
+
+static MONO_NEVER_INLINE InterpMethod*
+get_virtual_method (InterpMethod *imethod, MonoVTable *vtable)
+{
+	MonoMethod *m = imethod->method;
+	MonoDomain *domain = imethod->domain;
+	InterpMethod *ret = NULL;
+
+#ifndef DISABLE_REMOTING
+	if (mono_class_is_transparent_proxy (vtable->klass)) {
+		ERROR_DECL (error);
+		MonoMethod *remoting_invoke_method = mono_marshal_get_remoting_invoke_with_check (m, error);
+		mono_error_assert_ok (error);
+		ret = mono_interp_get_imethod (domain, remoting_invoke_method, error);
+		mono_error_assert_ok (error);
+		return ret;
+	}
+#endif
+
+	if ((m->flags & METHOD_ATTRIBUTE_FINAL) || !(m->flags & METHOD_ATTRIBUTE_VIRTUAL)) {
+		if (m->iflags & METHOD_IMPL_ATTRIBUTE_SYNCHRONIZED) {
+			ERROR_DECL (error);
+			ret = mono_interp_get_imethod (domain, mono_marshal_get_synchronized_wrapper (m), error);
+			mono_error_cleanup (error); /* FIXME: don't swallow the error */
+		} else {
+			ret = imethod;
+		}
+		return ret;
+	}
+
+	mono_class_setup_vtable (vtable->klass);
+
+	int slot = mono_method_get_vtable_slot (m);
+	if (mono_class_is_interface (m->klass)) {
+		g_assert (vtable->klass != m->klass);
+		/* TODO: interface offset lookup is slow, go through IMT instead */
+		gboolean non_exact_match;
+		slot += mono_class_interface_offset_with_variance (vtable->klass, m->klass, &non_exact_match);
+	}
+
+	MonoMethod *virtual_method = m_class_get_vtable (vtable->klass) [slot];
+	if (m->is_inflated && mono_method_get_context (m)->method_inst) {
+		MonoGenericContext context = { NULL, NULL };
+
+		if (mono_class_is_ginst (virtual_method->klass))
+			context.class_inst 

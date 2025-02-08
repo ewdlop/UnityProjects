@@ -1,0 +1,78 @@
+ost
+      if (arg_types[i] & OMP_TGT_MAPTYPE_FROM) {
+        bool Always = arg_types[i] & OMP_TGT_MAPTYPE_ALWAYS;
+        bool CopyMember = false;
+        if ((arg_types[i] & OMP_TGT_MAPTYPE_MEMBER_OF) &&
+            !(arg_types[i] & OMP_TGT_MAPTYPE_PTR_AND_OBJ)) {
+          // Copy data only if the "parent" struct has RefCount==1.
+          short parent_idx = member_of(arg_types[i]);
+          long parent_rc = Device.getMapEntryRefCnt(args[parent_idx]);
+          assert(parent_rc > 0 && "parent struct not found");
+          if (parent_rc == 1) {
+            CopyMember = true;
+          }
+        }
+
+        if (DelEntry || Always || CopyMember) {
+          DP("Moving %" PRId64 " bytes (tgt:" DPxMOD ") -> (hst:" DPxMOD ")\n",
+              arg_sizes[i], DPxPTR(TgtPtrBegin), DPxPTR(HstPtrBegin));
+          int rt = Device.data_retrieve(HstPtrBegin, TgtPtrBegin, arg_sizes[i]);
+          if (rt != OFFLOAD_SUCCESS) {
+            DP("Copying data from device failed.\n");
+            rc = OFFLOAD_FAIL;
+          }
+        }
+      }
+
+      // If we copied back to the host a struct/array containing pointers, we
+      // need to restore the original host pointer values from their shadow
+      // copies. If the struct is going to be deallocated, remove any remaining
+      // shadow pointer entries for this struct.
+      uintptr_t lb = (uintptr_t) HstPtrBegin;
+      uintptr_t ub = (uintptr_t) HstPtrBegin + arg_sizes[i];
+      Device.ShadowMtx.lock();
+      for (ShadowPtrListTy::iterator it = Device.ShadowPtrMap.begin();
+          it != Device.ShadowPtrMap.end(); ++it) {
+        void **ShadowHstPtrAddr = (void**) it->first;
+
+        // An STL map is sorted on its keys; use this property
+        // to quickly determine when to break out of the loop.
+        if ((uintptr_t) ShadowHstPtrAddr < lb)
+          continue;
+        if ((uintptr_t) ShadowHstPtrAddr >= ub)
+          break;
+
+        // If we copied the struct to the host, we need to restore the pointer.
+        if (arg_types[i] & OMP_TGT_MAPTYPE_FROM) {
+          DP("Restoring original host pointer value " DPxMOD " for host "
+              "pointer " DPxMOD "\n", DPxPTR(it->second.HstPtrVal),
+              DPxPTR(ShadowHstPtrAddr));
+          *ShadowHstPtrAddr = it->second.HstPtrVal;
+        }
+        // If the struct is to be deallocated, remove the shadow entry.
+        if (DelEntry) {
+          DP("Removing shadow pointer " DPxMOD "\n", DPxPTR(ShadowHstPtrAddr));
+          Device.ShadowPtrMap.erase(it);
+        }
+      }
+      Device.ShadowMtx.unlock();
+
+      // Deallocate map
+      if (DelEntry) {
+        int rt = Device.deallocTgtPtr(HstPtrBegin, arg_sizes[i], ForceDelete);
+        if (rt != OFFLOAD_SUCCESS) {
+          DP("Deallocating data from device failed.\n");
+          rc = OFFLOAD_FAIL;
+        }
+      }
+    }
+  }
+
+  return rc;
+}
+
+/// Internal function to pass data to/from the target.
+void target_data_update(DeviceTy &Device, int32_t arg_num,
+    void **args_base, void **args, int64_t *arg_sizes, int64_t *arg_types) {
+  // process each input.
+  for (int32_t i = 0; i < arg_

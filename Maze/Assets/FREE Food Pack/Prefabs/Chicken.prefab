@@ -1,0 +1,67 @@
+CornerIndex] = FVertexID(VertexIndex[CornerIndex]);
+			CornerPositions[CornerIndex] = VertexPositions[CornerVertexIDs[CornerIndex]];
+		}
+
+		// Create Vertex instances
+		for (int32 CornerIndex = 0; CornerIndex < CornerCount; CornerIndex++)
+		{
+			CornerVertexInstanceIDs[CornerIndex] = MeshDescription.CreateVertexInstance(CornerVertexIDs[CornerIndex]);
+		}
+
+		// UVs attributes
+		for (int32 UVChannelIndex = 0; UVChannelIndex < DsUVCount; ++UVChannelIndex)
+		{
+			int32 UV[3];
+			DsMesh.GetFaceUV(PolygonIndex, UVChannelIndex, UV[0], UV[1], UV[2]);
+			for (int32 CornerIndex = 0; CornerIndex < CornerCount; ++CornerIndex)
+			{
+				check(UV[CornerIndex] < DsMesh.GetUVCount(UVChannelIndex))
+				FVector2D UVVector = DsMesh.GetUV(UVChannelIndex, UV[CornerIndex]);
+				if (!UVVector.ContainsNaN())
+				{
+					VertexInstanceUVs.Set(CornerVertexInstanceIDs[CornerIndex], UVChannelIndex, UVVector);
+				}
+			}
+		}
+
+		for (int32 CornerIndex = 0; CornerIndex < CornerCount; CornerIndex++)
+		{
+			VertexInstanceNormals[CornerVertexInstanceIDs[CornerIndex]] = DsMesh.GetNormal(3 * PolygonIndex + CornerIndex);
+		}
+
+		// smoothing information
+		FaceSmoothingMasks.Add(DsMesh.GetFaceSmoothingMask(PolygonIndex));
+
+		// Create in-mesh Polygon
+		const FPolygonGroupID PolygonGroupID = GetOrCreatePolygonGroupId(MaterialIndex);
+		const FPolygonID NewPolygonID = MeshDescription.CreatePolygon(PolygonGroupID, CornerVertexInstanceIDs);
+	}
+
+	FStaticMeshOperations::ConvertSmoothGroupToHardEdges(FaceSmoothingMasks, MeshDescription);
+
+	return true;
+}
+
+bool FDatasmithMeshUtils::IsUVChannelValid(const FDatasmithMesh& DsMesh, const int32 Channel)
+{
+	for (int32 FaceIndex = 0, FacesCount = DsMesh.GetFacesCount(); FaceIndex < FacesCount; ++FaceIndex)
+	{
+		int32 UV[3];
+		DsMesh.GetFaceUV(FaceIndex, Channel, UV[0], UV[1], UV[2]);
+
+		FVector2D UVCoords[3] = {
+			DsMesh.GetUV(Channel, UV[0]),
+			DsMesh.GetUV(Channel, UV[1]),
+			DsMesh.GetUV(Channel, UV[2]) };
+
+		float TriangleArea = FMath::Abs(((UVCoords[0].X * (UVCoords[1].Y - UVCoords[2].Y))
+			+ (UVCoords[1].X * (UVCoords[2].Y - UVCoords[0].Y))
+			+ (UVCoords[2].X * (UVCoords[0].Y - UVCoords[1].Y))) * 0.5f);
+
+		if (TriangleArea <= SMALL_NUMBER)
+		{
+			return false;
+		}
+	}
+
+	return true;

@@ -1,0 +1,1310 @@
+ls, void *ptr)
+            : array(as_pointer(ptr)), n(ntrials), i(0) {}
+        void init() {   for(; i < n; ++i) new( &array[i] ) T(); }
+        void init(const void *src) { for(; i < n; ++i) new( &array[i] ) T(*as_const_pointer(src)); }
+        void copy(const void *src) { for(; i < n; ++i) new( &array[i] ) T(as_const_pointer(src)[i]); }
+        void assign(const void *src) { for(; i < n; ++i) array[i] = as_const_pointer(src)[i]; }
+#if __TBB_CPP11_RVALUE_REF_PRESENT
+        void move_assign(const void *src)       { for(; i < n; ++i) array[i]         =  std::move(as_pointer(src)[i]);   }
+        void move_construct(const void *src)    { for(; i < n; ++i) new( &array[i] ) T( std::move(as_pointer(src)[i]) ); }
+#endif
+#if __TBB_MOVE_IF_NOEXCEPT_PRESENT
+        void move_construct_if_noexcept(const void *src)    { for(; i < n; ++i) new( &array[i] ) T( std::move_if_noexcept(as_pointer(src)[i]) ); }
+#endif //__TBB_MOVE_IF_NOEXCEPT_PRESENT
+
+        //TODO: rename to construct_range
+        template<class I> void iterate(I &src) { for(; i < n; ++i, ++src) new( &array[i] ) T( *src ); }
+        ~internal_loop_guide() {
+            if(i < n) {// if an exception was raised, fill the rest of items with zeros
+                internal::handle_unconstructed_elements(array+i, n-i);
+            }
+        }
+    };
+
+    struct push_back_helper : internal::no_copy{
+        struct element_construction_guard : internal::no_copy{
+            pointer element;
+
+            element_construction_guard(pointer an_element) : element (an_element){}
+            void dismiss(){ element = NULL; }
+            ~element_construction_guard(){
+                if (element){
+                    internal::handle_unconstructed_elements(element, 1);
+                }
+            }
+        };
+
+        concurrent_vector & v;
+        size_type k;
+        element_construction_guard g;
+
+        push_back_helper(concurrent_vector & vector) :
+            v(vector),
+            g (static_cast<T*>(v.internal_push_back(sizeof(T),k)))
+        {}
+
+        pointer internal_push_back_result(){ return g.element;}
+        iterator return_iterator_and_dismiss(){
+            pointer ptr = g.element;
+            g.dismiss();
+            return iterator(v, k, ptr);
+        }
+    };
+};
+
+#if __TBB_CPP17_DEDUCTION_GUIDES_PRESENT
+// Deduction guide for the constructor from two iterators
+template<typename I,
+         typename T = typename std::iterator_traits<I>::value_type,
+         typename A = cache_aligned_allocator<T>
+> concurrent_vector(I, I, const A& = A())
+-> concurrent_vector<T, A>;
+
+// Deduction guide for the constructor from a vector and allocator
+template<typename T, typename A1, typename A2>
+concurrent_vector(const concurrent_vector<T, A1> &, const A2 &)
+-> concurrent_vector<T, A2>;
+
+// Deduction guide for the constructor from an initializer_list
+template<typename T, typename A = cache_aligned_allocator<T>
+> concurrent_vector(std::initializer_list<T>, const A& = A())
+-> concurrent_vector<T, A>;
+#endif /* __TBB_CPP17_DEDUCTION_GUIDES_PRESENT */
+
+#if defined(_MSC_VER) && !defined(__INTEL_COMPILER)
+#pragma warning (push)
+#pragma warning (disable: 4701) // potentially uninitialized local variable "old"
+#endif
+template<typename T, class A>
+void concurrent_vector<T, A>::shrink_to_fit() {
+    internal_segments_table old;
+    __TBB_TRY {
+        internal_array_op2 copy_or_move_array =
+#if __TBB_MOVE_IF_NOEXCEPT_PRESENT
+                &move_array_if_noexcept
+#else
+                &copy_array
+#endif
+        ;
+        if( internal_compact( sizeof(T), &old, &destroy_array, copy_or_move_array ) )
+            internal_free_segments( old.table, pointers_per_long_table, old.first_block ); // free joined and unnecessary segments
+    } __TBB_CATCH(...) {
+        if( old.first_block ) // free segment allocated for compacting. Only for support of exceptions in ctor of user T[ype]
+            internal_free_segments( old.table, 1, old.first_block );
+        __TBB_RETHROW();
+    }
+}
+#if defined(_MSC_VER) && !defined(__INTEL_COMPILER)
+#pragma warning (pop)
+#endif // warning 4701 is back
+
+template<typename T, class A>
+void concurrent_vector<T, A>::internal_free_segments(segment_t table[], segment_index_t k, segment_index_t first_block) {
+    // Free the arrays
+    while( k > first_block ) {
+        --k;
+        segment_value_t segment_value = table[k].load<relaxed>();
+        table[k].store<relaxed>(segment_not_used());
+        if( segment_value == segment_allocated() ) // check for correct segment pointer
+            this->my_allocator.deallocate( (segment_value.pointer<T>()), segment_size(k) );
+    }
+    segment_value_t segment_value = table[0].load<relaxed>();
+    if( segment_value == segment_allocated() ) {
+        __TBB_ASSERT( first_block > 0, NULL );
+        while(k > 0) table[--k].store<relaxed>(segment_not_used());
+        this->my_allocator.deallocate( (segment_value.pointer<T>()), segment_size(first_block) );
+    }
+}
+
+template<typename T, class A>
+T& concurrent_vector<T, A>::internal_subscript( size_type index ) const {
+    //TODO: unify both versions of internal_subscript
+    __TBB_ASSERT( index < my_early_size, "index out of bounds" );
+    size_type j = index;
+    segment_index_t k = segment_base_index_of( j );
+    __TBB_ASSERT( my_segment.load<acquire>() != my_storage || k < pointers_per_short_table, "index is being allocated" );
+    //no need in load with acquire (load<acquire>) since thread works in own space or gets
+    //the information about added elements via some form of external synchronization
+    //TODO: why not make a load of my_segment relaxed as well ?
+    //TODO: add an assertion that my_segment[k] is properly aligned to please ITT
+    segment_value_t segment_value =  my_segment[k].template load<relaxed>();
+    __TBB_ASSERT( segment_value != segment_allocation_failed(), "the instance is broken by bad allocation. Use at() instead" );
+    __TBB_ASSERT( segment_value != segment_not_used(), "index is being allocated" );
+    return (( segment_value.pointer<T>()))[j];
+}
+
+template<typename T, class A>
+T& concurrent_vector<T, A>::internal_subscript_with_exceptions( size_type index ) const {
+    if( index >= my_early_size )
+        internal::throw_exception(internal::eid_out_of_range); // throw std::out_of_range
+    size_type j = index;
+    segment_index_t k = segment_base_index_of( j );
+    //TODO: refactor this condition into separate helper function, e.g. fits_into_small_table
+    if( my_segment.load<acquire>() == my_storage && k >= pointers_per_short_table )
+        internal::throw_exception(internal::eid_segment_range_error); // throw std::range_error
+    // no need in load with acquire (load<acquire>) since thread works in own space or gets
+    //the information about added elements via some form of external synchronization
+    //TODO: why not make a load of my_segment relaxed as well ?
+    //TODO: add an assertion that my_segment[k] is properly aligned to please ITT
+    segment_value_t segment_value =  my_segment[k].template load<relaxed>();
+    enforce_segment_allocated(segment_value, internal::eid_index_range_error);
+    return (segment_value.pointer<T>())[j];
+}
+
+template<typename T, class A> template<class I>
+void concurrent_vector<T, A>::internal_assign_iterators(I first, I last) {
+    __TBB_ASSERT(my_early_size == 0, NULL);
+    size_type n = std::distance(first, last);
+    if( !n ) return;
+    internal_reserve(n, sizeof(T), max_size());
+    my_early_size = n;
+    segment_index_t k = 0;
+    //TODO: unify segment iteration code with concurrent_base_v3::helper
+    size_type sz = segment_size( my_first_block );
+    while( sz < n ) {
+        internal_loop_guide loop(sz, my_segment[k].template load<relaxed>().template pointer<void>());
+        loop.iterate(first);
+        n -= sz;
+        if( !k ) k = my_first_block;
+        else { ++k; sz <<= 1; }
+    }
+    internal_loop_guide loop(n, my_segment[k].template load<relaxed>().template pointer<void>());
+    loop.iterate(first);
+}
+
+template<typename T, class A>
+void concurrent_vector<T, A>::initialize_array( void* begin, const void *, size_type n ) {
+    internal_loop_guide loop(n, begin); loop.init();
+}
+
+template<typename T, class A>
+void concurrent_vector<T, A>::initialize_array_by( void* begin, const void *src, size_type n ) {
+    internal_loop_guide loop(n, begin); loop.init(src);
+}
+
+template<typename T, class A>
+void concurrent_vector<T, A>::copy_array( void* dst, const void* src, size_type n ) {
+    internal_loop_guide loop(n, dst); loop.copy(src);
+}
+
+#if __TBB_CPP11_RVALUE_REF_PRESENT
+template<typename T, class A>
+void concurrent_vector<T, A>::move_array( void* dst, const void* src, size_type n ) {
+    internal_loop_guide loop(n, dst); loop.move_construct(src);
+}
+template<typename T, class A>
+void concurrent_vector<T, A>::move_assign_array( void* dst, const void* src, size_type n ) {
+    internal_loop_guide loop(n, dst); loop.move_assign(src);
+}
+#endif
+
+#if __TBB_MOVE_IF_NOEXCEPT_PRESENT
+template<typename T, class A>
+void concurrent_vector<T, A>::move_array_if_noexcept( void* dst, const void* src, size_type n ) {
+    internal_loop_guide loop(n, dst); loop.move_construct_if_noexcept(src);
+}
+#endif //__TBB_MOVE_IF_NOEXCEPT_PRESENT
+
+template<typename T, class A>
+template<typename I>
+void concurrent_vector<T, A>::copy_range( void* dst, const void* p_type_erased_iterator, size_type n ){
+    internal_loop_guide loop(n, dst);
+    loop.iterate( *(static_cast<I*>(const_cast<void*>(p_type_erased_iterator))) );
+}
+
+template<typename T, class A>
+void concurrent_vector<T, A>::assign_array( void* dst, const void* src, size_type n ) {
+    internal_loop_guide loop(n, dst); loop.assign(src);
+}
+
+#if defined(_MSC_VER) && !defined(__INTEL_COMPILER)
+    // Workaround for overzealous compiler warning
+    #pragma warning (push)
+    #pragma warning (disable: 4189)
+#endif
+template<typename T, class A>
+void concurrent_vector<T, A>::destroy_array( void* begin, size_type n ) {
+    T* array = static_cast<T*>(begin);
+    for( size_type j=n; j>0; --j )
+        array[j-1].~T(); // destructors are supposed to not throw any exceptions
+}
+#if defined(_MSC_VER) && !defined(__INTEL_COMPILER)
+    #pragma warning (pop)
+#endif // warning 4189 is back
+
+// concurrent_vector's template functions
+template<typename T, class A1, class A2>
+inline bool operator==(const concurrent_vector<T, A1> &a, const concurrent_vector<T, A2> &b) {
+    //TODO: call size() only once per vector (in operator==)
+    // Simply:    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin());
+    if(a.size() != b.size()) return false;
+    typename concurrent_vector<T, A1>::const_iterator i(a.begin());
+    typename concurrent_vector<T, A2>::const_iterator j(b.begin());
+    for(; i != a.end(); ++i, ++j)
+        if( !(*i == *j) ) return false;
+    return true;
+}
+
+template<typename T, class A1, class A2>
+inline bool operator!=(const concurrent_vector<T, A1> &a, const concurrent_vector<T, A2> &b)
+{    return !(a == b); }
+
+template<typename T, class A1, class A2>
+inline bool operator<(const concurrent_vector<T, A1> &a, const concurrent_vector<T, A2> &b)
+{    return (std::lexicographical_compare(a.begin(), a.end(), b.begin(), b.end())); }
+
+template<typename T, class A1, class A2>
+inline bool operator>(const concurrent_vector<T, A1> &a, const concurrent_vector<T, A2> &b)
+{    return b < a; }
+
+template<typename T, class A1, class A2>
+inline bool operator<=(const concurrent_vector<T, A1> &a, const concurrent_vector<T, A2> &b)
+{    return !(b < a); }
+
+template<typename T, class A1, class A2>
+inline bool operator>=(const concurrent_vector<T, A1> &a, const concurrent_vector<T, A2> &b)
+{    return !(a < b); }
+
+template<typename T, class A>
+inline void swap(concurrent_vector<T, A> &a, concurrent_vector<T, A> &b)
+{    a.swap( b ); }
+
+} // namespace tbb
+
+#if defined(_MSC_VER) && !defined(__INTEL_COMPILER)
+    #pragma warning (pop)
+#endif // warning 4267,4127 are back
+
+#endif /* __TBB_concurrent_vector_H */
+                                               Ôªø<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="14.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="$([MSBuild]::GetDirectoryNameOfFileAbove($(MSBuildThisFileDirectory), dir.props))\dir.props" />
+  <PropertyGroup>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <ProjectGuid>{D5E689FD-4848-4E06-B6ED-35EA09AF9E20}</ProjectGuid>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'netcoreapp-Debug|AnyCPU'" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'netcoreapp-Release|AnyCPU'" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'uap-Debug|AnyCPU'" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'uap-Release|AnyCPU'" />
+  <ItemGroup>
+    <Compile Include="System.Text.Encoding.Forwards.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\System.Runtime\ref\System.Runtime.csproj" />
+  </ItemGroup>
+  <Import Project="$([MSBuild]::GetDirectoryNameOfFileAbove($(MSBuildThisFileDirectory), dir.targets))\dir.targets" />
+</Project>                                                                                                                                                                                                                                                                                                                                                                                                                          HâD$1¿Ë°¸˙ˇLã%J™% 1“Lâ˜Içt$@Ëk˚ˇHã=‘≠% Ë?≈˚ˇHâÂHâ∆HâÔË!˚ˇHâÍIçt$HâﬂËaÄ˚ˇHâÔË…ì˚ˇHãé% HçP H‡   HâHâCHãD$dH3%(   uHÉƒ []A\A]A^√Ëø6˚ˇHâ√È´å¸ˇHâ√È´å¸ˇHâ√È∞å¸ˇêfD  HÉÏHãHã@ËHã|Ë{ı˙ˇÖ¿ï¿HÉƒ√êHã@∂ˆHã@ËHã|ÈÀ8˚ˇêf.Ñ     HÉÏHãHã@ËHã|ËK&˚ˇÖ¿ï¿HÉƒ√êHã@∂ˆHã@ËHã|È[¸ˇêf.Ñ     HÉÏHãHã@ËHã|Ë[T˚ˇÖ¿ï¿HÉƒ√êHã@∂ˆHã@ËHã|È+ó˚ˇêf.Ñ     SHãHâ˚Hç2Û HpËË˘H˚ˇHâÿ[√@ SHãHâ˚Hç≈ HpËË	Q˚ˇHâÿ[√@ SHãHâ˚Hç• HpËËÈP˚ˇHâÿ[√@ SHãHâ˚Hç&0 HpËË…P˚ˇHâÿ[√@ USHâ˚HÉÏ(dHã%(   HâD$1¿HâÂHâÔËú.˚ˇHâÓHâﬂËQ3¸ˇHãT$dH3%(   u
+HÉƒ(Hâÿ[]√Ë5˚ˇfêSHãHâ˚Hç∂/ HpËËYP˚ˇHâÿ[√@ SHãHâ˚HçKÈ HpËË9P˚ˇHâÿ[√@ SHãHâ˚Hç+È HpËËP˚ˇHâÿ[√@ SHãHâ˚HçÆÈ HpËË˘O˚ˇHâÿ[√@ SHãHâ˚HçéÈ HpËËŸO˚ˇHâÿ[√@ SHãHâ˚HçÿË HpËËπO˚ˇHâÿ[√@ SHãHâ˚Hç∏Ë HpËËôO˚ˇHâÿ[√@ È≥W¸ˇêf.Ñ     USHâ˚HÉÏHã0∂% HçP HâHçêX  HâW0Hçê@  HâWHçêp  HâWHçê®  H  HâW HâG(Ë^¸ˇHã-ˇ©% Hç{(Hçµ®   Ë◊M¸ˇHç{ Hçµà   ËW˚ˇHçuHâﬂËkJ˚ˇHç{0Hçµ   ËK¸ˇHÉƒHç{P[]È†˚ˇff.Ñ     êLãIz‡ÈDˇˇˇ@ HÉÔ(È7ˇˇˇÄ    HÉÔ È'ˇˇˇÄ    HÉÔÈˇˇˇÄ    HÉÔÈˇˇˇêfD  SHâ˚Ë◊–˚ˇHâﬂæX   [ÈY˛˙ˇfÑ     LãIz‡Î◊Ä    HÉÔ(Î f.Ñ     HÉÔ Î∫f.Ñ     HÉÔÎ™f.Ñ     HÉÔÎöf.Ñ     Hã1ˆHã@ËHã|È]&¸ˇff.Ñ     fêHÉÏ@∂ˆË≥¸ˇHÖ¿t&Hã§% Hã5†ß% H«¡ˇˇˇˇHâ«HÉƒÈ] ¸ˇD  1¿HÉƒ√êSHÉ? Hâ˚tHâÿ[√êHãqØ% HâGËpµ˚ˇHâﬂHâ∆ËuÍ˚ˇHã;Ë]£˚ˇHã;ËX˚ˇHâÿ[√AVAUATLçfUHâıLâÊSHâ˚Lçµà   Lçk ËãË˚ˇLâˆLâÔËpO˚ˇHçµ®   Hç{(Ë∞.˚ˇHãE HâHã@ËHãï»   HâHãÖ–   HâCHãÖÿ   HâCHãÖ‡   HâC HãÖË   HâC([]A\A]A^√Hâ≈È¢á¸ˇHâ≈Èèá¸ˇê@ AWAVIâˆAUATLçgPUSHâ˚LâÁLçk0HÉÏË¨ˆ˙ˇHã-}ß% LâÔHçµ   Ë5˚ˇLâÚHçuHâﬂË«Á˚ˇLçs Hçµà   Lâ˜Ë§N˚ˇHç{(Hçµ®   Ë‰-˚ˇHã≥% HçP HâHçêX  HâS0Hçê@  HâSHçêp  HâSHçê®  H  HâS HâC(HÉƒ[]A\A]A^A_√Hâ√Èá¸ˇIâ«ÈŸÜ¸ˇIâ∆È„Ü¸ˇHâ√ÈÍÜ¸ˇêAVAUATLçfUHâıLâÊSHâ˚Lçµà   Lçk Ëõ∫˚ˇLâˆLâÔËM˚ˇHçµ®   Hç{(Ë0-˚ˇHãE HâHã@ËHãï»   HâHãÖ–   HâCHãÖÿ   HâCHãÖ‡   HâC HãÖË   HâC([]A\A]A^√Hâ≈ÈÄÜ¸ˇHâ≈ÈmÜ¸ˇê@ AWAVIâˆAUATLçgPUSHâ˚LâÁLçk0HÉÏË,ı˙ˇHã-˝•% LâÔHçµ   Ëñ3˚ˇLâÚHçuHâﬂË◊π˚ˇLçs Hçµà   Lâ˜Ë$M˚ˇHç{(Hçµ®   Ëd,˚ˇHãù±% HçP HâHçêX  HâS0Hçê@  HâSHçêp  HâSHçê®  H  HâS HâC(HÉƒ[]A\A]A^A_√Hâ√ÈÔÖ¸ˇIâ«È∑Ö¸ˇIâ∆È¡Ö¸ˇHâ√È»Ö¸ˇêUHâ˝øX   SHÉÏËm˚ˇHâÓHâ«Hâ√ËˇÈ˙ˇHâﬂËáZ˚ˇHãHXËHÉƒHâÿ[]√Hâ≈È§Ö¸ˇff.Ñ      ATIâ‘UHâıHçvSHâ˚ËÍÚ˚ˇIçT$ Hçµà   Hç{ ËE£˚ˇIçT$(Hçµ®   Hç{(Ë b˚ˇHãE HâHã@ËHãï»   HâHãÖ–   HâCHãÖÿ   HâCHãÖ‡   HâC HãÖË   HâC([]A\√êÑ     ATUHâıSHâ˚HçPË}Û˙ˇLã%N§% Hç{0Iç¥$   ËÂ1˚ˇHâÍIçt$HâﬂË5Ú˚ˇHçU Hç{ Iç¥$à   Ëê¢˚ˇHçU(Hç{(Iç¥$®   Ëka˚ˇHã‰Ø% HçP HâHçêX  HâS0Hçê@  HâSHçêp  HâSHçê®  H  HâS HâC([]A\√fêUHâ˝SHâÛHÉÏËèK˚ˇHçs Hç} Ë—˚ˇHçs(Hç}(ËÂ˚ˇHÉƒH# mac-ce.la - a libtool library file
+# Generated by libtool (GNU libtool) 2.4.2
+#
+# Please DO NOT delete this file!
+# It is necessary for linking the library.
+
+# The name that we can dlopen(3).
+dlname=''
+
+# Names of this library.
+library_names=''
+
+# The name of the static archive.
+old_library='libmac-ce.a'
+
+# Linker flags that can not go in dependency_libs.
+inherited_linker_flags=''
+
+# Libraries that this one depends upon.
+dependency_libs=''
+
+# Names of additional weak libraries provided by this library
+weak_library_names=''
+
+# Version information for libmac-ce.
+current=0
+age=0
+revision=0
+
+# Is this an already installed library?
+installed=yes
+
+# Should we warn about portability when linking against -modules?
+shouldnotlink=yes
+
+# Files to dlopen/dlpreopen
+dlopen=''
+dlpreopen=''
+
+# Directory that this library needs to be installed in:
+libdir='/Users/kmaramara/desktop/svn/apr-dist/lib/iconv'
+                                                                                 ÓŒ©õÔYårÚ´È5ÏzzÒwò+Ω‘ XˆkÖÇÓ≥®,‰ñÑ1◊øGÎ æ~`´”X”Æ‚Ów‘82~NèYC{eo§8îÕß¶P[˛mSˆΩË@3B0ƒ†pôé _BË‰>Ê=˙êi4ƒZ!˙?@pO=v`b∆rifúvã–…π’|‰òVC!'k“+œπ∏Í< 0áJëóœºj@îN’aÑ4Ü£ÌI	7˜{»å¶∫2(˝h‰ıaè}l`(Fœø<Ù˙˙GﬂTI@Ü“ˆ©J∂Åä£˚ËÁOsà$ÎÊÅÄ:O»ÿê 7π%†0êR¸Ë%ÜwˆHJ-˙(¸p`Xö≈}∑|‡F	£6)Ü
+Ω0 bèˆM˘¯ÑZIBâ˜ñ03ÎmGÓ√ @YÜ(ﬂy¿nó :æRL∑$Ö\é¢æd*·ƒÕ◊†Í?≠$òåÃ´ö¶˝Ôü Xî$Ñ¯toˆAˆd¶ùªH…)*¨0Ñ1/ÚÔííHJÒûÁ§|∆‹¯3:>Ë…	◊Çw◊t¢cu^o6Q∑îåŸs‘Zˇ(À—BRΩÂ33^ú
+ßl+I"»E®L-ªs*Úô{éΩËM„üuùJ:†U‚ ﬂqı∏ó±“£ıîpQ’Lñ`ÍÈ†±süœπàiƒ«$ÒV,0¨∆‹˙ß°º8$]ÆÜÈUªà†≥¸lå˘Î“ƒìnjw Ω4 ˛ªn´¥]∆ æ…ˇòxu√ ûâ≥=<2©ŒöÇœÚ˛ Ù≤P≈Æ˜•Üó˛›\¡Á≤hƒ¿Xk©`-Ø¿Ä°K6˝»
+ÅBdﬁî|a041,ìGÏ@LB-=j"õyBa,¢nÁÎÕ§%T#eu^&ÉœΩRo%ø£7
+õ%ëıhb\¨n≠+∫X’ÔÇG[ﬂE…ÙN<ìÉ¢Îª∏b]∆ﬂÕt—b]Su"’Pﬁ®wﬁ+´âÄWp‚‘î| ¨0ÜÅèñûÑ◊±≈ÄÌ,ákı ÄdM	√@vˇ@fl8joÁò`&°|Eˆd$§
+ÁÁ]	ÕD·¬Å@%“¨LÎL[§ˇÒï Ë`WæA+ìCy 3nëÇ*∆ÙÑ!ßù% U= ò≈¿bßJ(ã10æ∂·±Úy8qóD˜îe		=Õ§Â‡Ä˙nõvôT7*Z}Ÿ
+ÑÒÔ6–vÔIï¬^v(">p~òG
+ÿ+0‹ÇJôî¡$PHÀ√ñ!ºÀgs.Ö–`¬∆_âãh‚ˆ±ôö|0\B»„_–‡ëÒì£™Ã¢g÷d⁄z5ˆ#P‚¬*B‰en®'Ú‚_z†≥¸±ˇfG÷í◊Dk€˜±®-ÚÖ5ÕÎÕtJŒ´ù÷£+◊ù£Äuã(√n–Nx∑Ù{‘
+Ω(¿ª√§ß∫…ÿ˘0]±á ¢°®pœâmÉ7uV¢É®``•∏±iHÈwµ'PâÎ2ë˚≤Ø¨ñ0´Ô…u‚Öèºé Ø"öp`¬c4ÑN’C{-…Y6^G&Åñ˚Ó>ÈÍª¢à3Nös®,ˇ)x˝!K?zb~&∑Áﬁ9Û]•æ„/†G%îˆ"H=É•Åî≥ëÇ¡ûÃevCB°Ëø:ÆÏ3f˙SmY1¥1¥CÖFK›üN}–ﬁ|.›   {~>0
+x∏Ä*M®i åCµAh˜r©#]ám©‰á∏3Ëê[˛XU’pIÖ ¬Mÿ Yó1>Ù d	æÖ+£Ãê¿ &ﬁíá™ÛHGı‰ÆÀ'ﬁ.ÌËÙ8$ª»ız(õ|+Ñs†tãîÒx˙†∑¸∆ÚiXUiAùŒ'_'f_®»(ˇá\›<kıÎÎvÃ.è–ì√ÆXƒﬁp¢∞ãúînvΩd≥æº‰nÕŒ£˚†hËøSÄfÌ~•+ﬂP!Äõ?}}d!Ωı»FfÙ(FRèÄv˚õ$¥∫¥0º∑±Tˇ-∫Ôã >1	ﬂ=¿àuÚ–(Å0ÑbÔ¥!tw2ˆKN˘µùPîaß‹Ñ£‹?≥]4ﬂ?{zz?°çªÔá‹“…ú±6‡¬ã)I:‰»ﬁÔ„rıß%u	◊ê2>yBÄLÑ≠ïy–¬GY÷ˇ √Ô1,⁄>‡a£ôu	÷˘Gﬁ8`Íûåu´ÎŒ%£Ù≈îqµò`´?B2Îπ≤Q©»Ô}Äÿx¢ôãŸ7„/–@îíÔL7ˆUŒéä?∂PKÈs+É bûï€¿vB¯ÀæVdÆ˜˜ÚH˙?0 dF´_7ÀøGÄdC˚Î‡†P±πwÖéªç] ~1øÂX3∏Ó`¡¢obQm‹.ÒaÖ∫Øa∂kP‹á"˛ØAo˘¯&ìIÖª™˘¿ÄbÇ{Z@3…s/`LÖ‰ç(ÎÌê˚å∫”Ä˛°π°É˙‘‹pÓË,ˇ5ºY◊—@Nµ6Íº–Iπb8MÍ¿`°`;-n1Ô“CRK‰§[£6Ë-ı!Ñ"»eø:˘®`ô>◊Ö¿0≈aà?\åBÏﬁ§*Áz>€Ä0≈%Í@0—Î2¯øõØ÷p¿ƒ/7¸ö\UŸ»e)∂ÌzbÉKH´‚D“íû»πD Üg/UÉ:{Àı1¥O@;:@q{@Ü#(1ñFæT“R@¡AV†E§i5ûD¨û*ø⁄èË‡& pÎœ√Ø,êƒ‹ç∆_¡°Ö#d6¢@/`-ób1ÿ‘o¿Qy±∆^ 0öí`.·P»H)‘Kæ–p—œ<L∫QïßµÀ ˛H´ö=°§"îÊÄ}}‡òyáÍÄúÆLrã8ŒÆÄ3–Ωfz®ˇ1 d ú†–,BÔä√·Wı«Ä5,§Ñ~i P W»Iÿ4
+P´œ& ü~≈ú>ÍIMCx†◊Çjπh˝—‰¶»fb$¢! ‹1ÿ°«eÚt› (GU’üÂÿ ƒ ØÄ6% Îè9∆åW#^†@Äòñêøô\Aƒk™pEÄfCƒ0*ù∆lEr%‰ÄlÇVV¡WjCC1LycÔ∏¯!§1øÙ±ÿ}ÕÄ`rb8íˆ`ÄÄ<0J ¿4Ω»eé]˜ IÄ§Ñ0ÓV!Äıÿéhø}ƒö ®‡:¿ ƒ7,7Ø¨Ãsb∆‹‰,L,˛tÅP*≤b1‡3¢oòMÿ`o˘¸  :‡QH}…ΩjR g‚jsAÅù)Œú‘„†ó˜YÊPßOY˙‘œÿ€íÖ UW™ˇà£Î_)Ì6∞ì~uknR∞}–û∫êÜ„h, SÙΩÁw2ËÜfœdv:√+\t7¥Ú/P[˛1òm⁄Œm…tüVŸﬁÀåM›Awmò1±⁄Èpp#rI´«-»÷ºÜ«,]‹úe~¥ò7æ%»&Ïîc¯’cø˘ÖT^˝^ˆ≤ ≥{õıã£È
+cŒ≥˜f[⁄∫pbÓÒ4õ˜<ﬁâ+kúk–[ÊêÅº.R2õ›røNtúE◊3¢Á(3OóË†·¬Å—èL–Ã}¢{jûj™_ÜÚ°¡ΩP‡L*mAo¯’{‘ÄjB@Åd 'æºÍN|"ﬁ^›F⁄ı´›Ù8	p¬`ÉÔÍUD∂ÜÅ2k°∂w€Y riH¸Ë
+ çHà µ |∞D@$~ö);ÚèJ≈0Ä;.Í∫Ú¿±ñÇbr %4B‡ ¿Pô…mÀ î≥‰Jzø»
+Hçyæ¯]ﬁŸÇ;=Å∞‡ÎT*Î§k [ÿÀÄŸl©∫≤(;;ò0!ûÖBíP÷¬ŸŸ2JJΩ¬É æêZ%
+!Éé•CPÙP‹ ‘?:õmMÀÿˇ¥1;ã°…6L‡Rˇù\|Óπ:±Ñî·£≥Aãíígz˙w†ª¸≥˛}YU≠›V4`°W–{÷‘˘‰~F∏ﬂ‡„Æ∞fÊ‹ΩûW//------------------------------------------------------------------------------
+// <copyright file="SqlStreamChars.cs" company="Microsoft">
+//     Copyright (c) Microsoft Corporation.  All rights reserved.
+//  </copyright>                                                                
+// <owner current="true" primary="true">junfang</owner>
+// <owner current="true" primary="false">Microsoft</owner>
+// <owner current="true" primary="false">Microsoft</owner>
+//------------------------------------------------------------------------------
+
+//**************************************************************************
+// @File: SqlStreamChars.cs
+//
+// Create by:	JunFang
+//
+// Description: 
+//
+// Notes: 
+//	
+// History:
+//
+//   04/17/01  JunFang	Created.
+//
+// @EndHeader@
+//**************************************************************************
+
+namespace System.Data.SqlTypes 
+	{
+	using System;
+	using System.IO;
+	using System.Runtime.InteropServices;
+	using System.Data.SqlTypes;
+
+	internal abstract class SqlStreamChars: System.Data.SqlTypes.INullable, IDisposable
+		{
+		public abstract bool IsNull { get; }
+
+		public abstract bool CanRead { get; }
+
+		public abstract bool CanSeek { get; }
+
+		public abstract bool CanWrite { get; }
+
+		public abstract long Length { get; }
+
+		public abstract long Position { get; set; }
+
+		// --------------------------------------------------------------
+		//	  Public methods
+		// --------------------------------------------------------------
+		public abstract int Read (char[] buffer, int offset, int count);
+
+		public abstract void Write (char[] buffer, int offset, int count);
+
+		public abstract long Seek (long offset, SeekOrigin origin);
+
+		public abstract void SetLength (long value);
+
+		public abstract void Flush ();
+
+		public virtual void Close(){
+			Dispose(true);
+		}
+
+		void IDisposable.Dispose() {
+            Dispose(true);           
+        }
+
+		protected virtual void Dispose(bool disposing) {           
+		}
+
+		public virtual int ReadChar()
+			{
+			// Reads one char from the stream by calling Read(char[], int, int). 
+			// Will return an char cast to an int or -1 on end of stream.
+			// The performance of the default implementation on Stream is bad,
+			// and any subclass with an internal buffer should override this method.
+			char[] oneCharArray = new char[1];
+			int r = Read(oneCharArray, 0, 1);
+			if (r==0)
+				return -1;
+			return oneCharArray[0];
+			}
+
+		public virtual void WriteChar(char value)
+			{
+			// Writes one char from the stream by calling Write(char[], int, int).  
+			// The performance of the default implementation on Stream is bad,
+			// and any subclass with an internal buffer should override this method.
+			char[] oneCharArray = new char[1];
+			oneCharArray[0] = value;
+			Write(oneCharArray, 0, 1);
+			}
+
+
+		// Private class: the Null SqlStreamChars
+		private class NullSqlStreamChars : SqlStreamChars
+			{
+			// --------------------------------------------------------------
+			//	  Constructor(s)
+			// --------------------------------------------------------------
+
+			internal NullSqlStreamChars()
+				{
+				}
+
+
+			// --------------------------------------------------------------
+			//	  Public properties
+			// --------------------------------------------------------------
+
+			public override bool IsNull 
+				{
+				get 
+					{
+					return true;
+					}
+				}
+
+			public override bool CanRead
+				{
+				get
+					{
+					return false;
+					}
+				}
+
+			public override bool CanSeek
+				{
+				get
+					{
+					return false;
+					}
+				}
+
+			public override bool CanWrite
+				{
+				get
+					{
+					return false;
+					}
+				}
+
+			public override long Length
+				{
+				get
+					{
+					throw new SqlNullValueException();
+					}
+				}
+
+			public override long Position
+				{
+				get
+					{
+					throw new SqlNullValueException();
+					}
+				set
+					{
+					throw new SqlNullValueException();
+					}
+				}
+
+			// --------------------------------------------------------------
+			//	  Public methods
+			// --------------------------------------------------------------
+			public override int Read (char[] buffer, int offset, int count)
+				{
+				throw new SqlNullValueException();
+				}
+
+			public override void Write (char[] buffer, int offset, int count)
+				{
+				throw new SqlNullValueException();
+				}
+
+			public override long Seek (long offset, SeekOrigin origin)
+				{
+				throw new SqlNullValueException();
+				}
+
+			public override void SetLength (long value)
+				{
+				throw new SqlNullValueException();
+				}
+
+			public override void Flush ()
+				{
+				throw new SqlNullValueException();
+				}
+
+			public override void Close ()
+				{
+				}
+
+			} // class NullSqlStreamChars
+
+
+		// The Null instance
+		public static SqlStreamChars Null {
+                    get {
+                        return new NullSqlStreamChars();
+                    }
+		}
+
+		} // class SqlStreamChars
+
+	} // namespace System.Data.SqlTypes 
+                                                                                                                                                                                                         tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿Ë    Hç=    Hç5    Hã    Hã    Ë    Ñ¿tHã    HÖ¿uHã    É8 tHç=    1¿[A^A_È    [A^A_√Hç=    Hç    æa  1…E1¿Ë    Ë     UAVSAâ÷HâÛâ˝Hç=    âÓË    HÖ¿t)æçQ¥É˙.áó   ∏   Hæ  @!A  H£÷sg[A^]√Hç=    âÓË    HÖ¿tæ∏   É˘k#Ö…tnÉ˘Lt“Îw1¿@Ä˝pu»1¿Ä; î¿¡‡[A//---------------------------------------------------------------------
+// <copyright file="SchemaElement.cs" company="Microsoft">
+//      Copyright (c) Microsoft Corporation.  All rights reserved.
+// </copyright>
+//
+// @owner       Microsoft
+// @backupOwner Microsoft
+//---------------------------------------------------------------------
+
+namespace System.Data.EntityModel.SchemaObjectModel
+{
+    using System;
+    using System.Collections.Generic;
+    using System.Data;
+    using System.Data.Entity;
+    using System.Data.Metadata.Edm;
+    using System.Diagnostics;
+    using System.Globalization;
+    using System.IO;
+    using System.Xml;
+    using System.Xml.Linq;
+
+    /// <summary>
+    /// Summary description for SchemaElement.
+    /// </summary>
+    [DebuggerDisplay("Name={Name}")]
+    internal abstract class SchemaElement
+    {
+        // see http://www.w3.org/TR/2006/REC-xml-names-20060816/
+        internal const string XmlNamespaceNamespace = "http://www.w3.org/2000/xmlns/";
+
+
+        #region Instance Fields
+        private SchemaElement _parentElement = null;
+        private Schema _schema = null;
+        private int _lineNumber = 0;
+        private int _linePosition = 0;
+        private string _name = null;
+        private DocumentationElement _documentation = null;
+
+        private List<MetadataProperty> _otherContent;
+
+        #endregion
+
+        #region Static Fields
+        /// <summary></summary>
+        protected const int MaxValueVersionComponent = short.MaxValue;
+        #endregion
+
+        #region Public Properties
+        /// <summary>
+        /// 
+        /// </summary>
+        internal  int LineNumber
+        {
+            get
+            {
+                return _lineNumber;
+            }
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        internal  int LinePosition
+        {
+            get
+            {
+                return _linePosition;
+            }
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        public virtual string Name
+        {
+            get
+            {
+                return _name;
+            }
+            set
+            {
+                _name = value;
+            }
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        internal  DocumentationElement Documentation
+        {
+            get
+            {
+                return _documentation;
+            }
+            set
+            {
+                _documentation = value;
+            }
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        internal  SchemaElement ParentElement
+        {
+            get
+            {
+                return _parentElement;
+            }
+            private set
+            {
+                _parentElement = value;
+            }
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        internal Schema Schema
+        {
+            get
+            {
+                return _schema;
+            }
+            set
+            {
+                _schema = value;
+            }
+        }
+        
+        /// <summary>
+        /// 
+        /// </summary>
+        public  virtual string FQName
+        {
+            get
+            {
+                return Name;
+            }
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        public virtual string Identity
+        {
+            get
+            {
+                return Name;
+            }
+        }
+
+       
+        public List<MetadataProperty> OtherContent
+        {
+            get 
+            {
+                if (_otherContent == null)
+                {
+                    _otherContent = new List<MetadataProperty>();
+                }
+
+                return _otherContent; 
+            }
+        }
+        #endregion
+
+        #region Internal Methods
+        /// <summary>
+        /// Validates this element and its children
+        /// </summary>
+        
+        internal virtual void Validate()
+        {
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="errorCode"></param>
+        /// <param name="severity"></param>
+        /// <param name="lineNumber"></param>
+        /// <param name="linePosition"></param>
+        /// <param name="message"></param>
+        internal void AddError( ErrorCode errorCode, EdmSchemaErrorSeverity severity, int lineNumber, int linePosition, object message )
+        {
+            AddError(errorCode,severity,SchemaLocation,lineNumber,linePosition,message);
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="errorCode"></param>
+        /// <param name="severity"></param>
+        /// <param name="reader"></param>
+        /// <param name="message"></param>
+        internal void AddError( ErrorCode errorCode, EdmSchemaErrorSeverity severity, XmlReader reader, object message )
+        {
+            int lineNumber;
+            int linePosition;
+            GetPositionInfo(reader, out lineNumber, out linePosition);
+            AddError(errorCode,severity,SchemaLocation,lineNumber,linePosition,message);
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="errorCode"></param>
+        /// <param name="severity"></param>
+        /// <param name="message"></param>
+        internal void AddError( ErrorCode errorCode, EdmSchemaErrorSeverity severity, object message )
+        {
+            AddError(errorCode,severity,SchemaLocation,LineNumber,LinePosition,message);
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="errorCode"></param>
+        /// <param name="severity"></param>
+        /// <param name="element"></param>
+        /// <param name="message"></param>
+        internal void AddError( ErrorCode errorCode, EdmSchemaErrorSeverity severity, SchemaElement element, object message )
+        {
+            AddError(errorCode,severity,element.Schema.Location,element.LineNumber,element.LinePosition,message);
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="reader"></param>
+        /// <returns></returns>
+        internal void Parse(XmlReader reader)
+        {
+            GetPositionInfo(reader);
+
+            bool hasEndElement = !reader.IsEmptyElement;
+
+            Debug.Assert(reader.NodeType == XmlNodeType.Element);
+            for ( bool more = reader.MoveToFirstAttribute(); more; more = reader.MoveToNextAttribute() )
+            {
+                ParseAttribute(reader);
+            }
+            HandleAttributesComplete();
+
+            bool done = !hasEndElement;
+            bool skipToNextElement = false;
+            while ( !done )
+            {
+                if ( skipToNextElement )
+                {
+                    skipToNextElement = false;
+                    reader.Skip();
+                    if ( reader.EOF )
+                        break;
+                }
+                else
+                {
+                    if ( !reader.Read() )
+                        break;
+                }
+                switch ( reader.NodeType )
+                {
+                    case XmlNodeType.Element:
+                        skipToNextElement = ParseElement(reader);
+                        break;
+
+                    case XmlNodeType.EndElement:
+                    {
+                        done = true;
+                        break;
+                    }
+
+                    case XmlNodeType.CDATA:
+                    case XmlNodeType.Text:
+                    case XmlNodeType.SignificantWhitespace:
+                        ParseText(reader);
+                        break;
+
+                        // we ignore these childless elements
+                    case XmlNodeType.Whitespace:
+                    case XmlNodeType.XmlDeclaration:
+                    case XmlNodeType.Comment:
+                    case XmlNodeType.Notation:
+                    case XmlNodeType.ProcessingInstruction:
+                    {
+                        break;
+                    }
+
+                        // we ignore these elements that can have children
+                    case XmlNodeType.DocumentType:
+                    case XmlNodeType.EntityReference:
+                    {
+                        skipToNextElement = true;
+                        break;
+                    }
+
+                    default:
+                    {
+                        AddError( ErrorCode.UnexpectedXmlNodeType, EdmSchemaErrorSeverity.Error, reader,
+                            System.Data.Entity.Strings.UnexpectedXmlNodeType(reader.NodeType));
+                        skipToNextElement = true;
+                        break;
+                    }
+                }
+            }
+            HandleChildElementsComplete();
+            if ( reader.EOF && reader.Depth > 0 )
+            {
+                AddError( ErrorCode.MalformedXml, EdmSchemaErrorSeverity.Error, 0, 0,
+                    System.Data.Entity.Strings.MalformedXml(LineNumber,LinePosition));
+            }
+        }
+
+        /// <summary>
+        /// Set the current line number and position for an XmlReader
+        /// </summary>
+        /// <param name="reader">the reader whose position is desired</param>
+        internal void GetPositionInfo(XmlReader reader)
+        {
+            GetPositionInfo(reader,out _lineNumber,out _linePosition);
+        }
+
+        /// <summary>
+        /// Get the current line number and position for an XmlReader
+        /// </summary>
+        /// <param name="reader">the reader whose position is desired</param>
+        /// <param name="lineNumber">the line number</param>
+        /// <param name="linePosition">the line position</param>
+        internal static void GetPositionInfo(XmlReader reader, out int lineNumber, out int linePosition)
+        {
+            IXmlLineInfo xmlLineInfo = reader as IXmlLineInfo;
+            if ( xmlLineInfo != null && xmlLineInfo.HasLineInfo() )
+            {
+                lineNumber = xmlLineInfo.LineNumber;
+                linePosition = xmlLineInfo.LinePosition;
+            }
+            else
+            {
+                lineNumber = 0;
+                linePosition = 0;
+            }
+        }
+        
+        /// <summary>
+        /// 
+        /// </summary>
+        internal virtual void ResolveTopLevelNames()
+        {
+        }
+        internal virtual void ResolveSecondLevelNames()
+        {
+        }
+        #endregion
+
+        #region Protected Methods
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="parentElement"></param>
+        internal SchemaElement(SchemaElement parentElement)
+        {
+            if ( parentElement != null )
+            {
+                ParentElement = parentElement;
+                for ( SchemaElement element = parentElement; element != null; element = element.ParentElement )
+                {
+                    Schema schema = element as Schema;
+                    if ( schema != null )
+                    {
+                        Schema = schema;
+                        break;
+                    }
+                }
+                
+                if (Schema == null)
+                {
+                    throw EntityUtil.InvalidOperation(System.Data.Entity.Strings.AllElementsMustBeInSchema);
+                }
+            }
+        }
+
+        internal SchemaElement(SchemaElement parentElement, string name)
+            : this(parentElement)
+        {
+            _name = name;
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        protected virtual void HandleAttributesComplete()
+        {
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        protected virtual void HandleChildElementsComplete()
+        {
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="reader"></param>
+        /// <param name="field"></param>
+        /// <returns></returns>
+        protected string HandleUndottedNameAttribute(XmlReader reader, string field)
+        {
+            string name = field;
+            Debug.Assert(string.IsNullOrEmpty(field), string.Format(CultureInfo.CurrentCulture, "{0} is already defined", reader.Name));
+
+            bool success = Utils.GetUndottedName(Schema, reader, out name);
+            if ( !success )
+                return name;
+
+            return name;
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="reader"></param>
+        /// <param name="field"></param>
+        /// <param name="errorMessageId"></param>
+        /// <returns></returns>
+        protected ReturnValue<string> HandleDottedNameAttribute(XmlReader reader, string field, Func<object, string> errorFormat)
+        {
+            ReturnValue<string> returnValue = new ReturnValue<string>();
+            Debug.Assert(string.IsNullOrEmpty(field), string.Format(CultureInfo.CurrentCulture, "{0} is already defined", reader.Name));
+
+            string value;
+            if ( !Utils.GetDottedName(Schema,reader,out value) )
+                return returnValue;
+
+            returnValue.Value = value;
+            return returnValue;
+        }
+
+        /// <summary>
+        /// Use to handle an attribute with an int data type
+        /// </summary>
+        /// <param name="reader">the reader positioned at the int attribute</param>
+        /// <param name="field">The int field to be given the value found</param>
+        /// <returns>true if an int value was successfuly extracted from the attribute, false otherwise.</returns>
+        internal bool HandleIntAttribute(XmlReader reader, ref int field)
+        {
+            int value;
+            if ( !Utils.GetInt(Schema, reader, out value) )
+                return false;
+
+            field = value;
+            return true;
+        }
+
+        /// <summary>
+        /// Use to handle an attribute with an int data type
+        /// </summary>
+        /// <param name="reader">the reader positioned at the int attribute</param>
+        /// <param name="field">The int field to be given the value found</param>
+        /// <returns>true if an int value was successfuly extracted from the attribute, false otherwise.</returns>
+        internal bool HandleByteAttribute(XmlReader reader, ref byte field)
+        {
+            byte value;
+            if ( !Utils.GetByte(Schema, reader, out value) )
+                return false;
+
+            field = value;
+            return true;
+        }
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="reader"></param>
+        /// <param name="field"></param>
+        /// <returns></returns>
+        internal bool HandleBoolAttribute(XmlReader reader, ref bool field)
+        {
+            bool value;
+            if ( !Utils.GetBool(Schema,reader,out value) )
+                return false;
+
+            field = value;
+            return true;
+        }
+
+        /// <summary>
+        /// Use this to jump through an element that doesn't need any processing
+        /// </summary>
+        /// <param name="reader">xml reader currently positioned at an element</param>
+        protected virtual void SkipThroughElement(XmlReader reader)
+        {
+            Debug.Assert(reader != null);
+            Parse(reader);
+        }
+
+        protected void SkipElement(XmlReader reader)
+        {
+            using (XmlReader subtree = reader.ReadSubtree())
+            {
+                while (subtree.Read()) ;
+            }
+        }
+
+        #endregion
+
+        #region Protected Properties
+        /// <summary>
+        /// 
+        /// </summary>
+        protected string SchemaLocation
+        {
+            get
+            {
+                if ( Schema != null )
+                    return Schema.Location;
+                return null;
+            }
+        }
+
+        protected virtual bool HandleText(XmlReader reader)
+        {
+            return false;
+        }
+
+        internal virtual SchemaElement Clone(SchemaElement parentElement)
+        {
+            throw Error.NotImplemented();
+        }
+        #endregion
+
+        #region Private Methods
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="reader"></param>
+        /// <returns></returns>
+        private void HandleDocumentationElement(XmlReader reader)
+        {
+            Documentation = new DocumentationElement(this);
+            Documentation.Parse(reader);
+        }
+        
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="reader"></param>
+        protected virtual void HandleNameAttribute(XmlReader reader)
+        {
+            Name = HandleUndottedNameAttribute(reader, Name);
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="errorCode"></param>
+        /// <param name="severity"></param>
+        /// <param name="source"></param>
+        /// <param name="lineNumber"></param>
+        /// <param name="linePosition"></param>
+        /// <param name="message"></param>
+        private void AddError( ErrorCode errorCode, EdmSchemaErrorSeverity severity, string sourceLocation, int lineNumber, int linePosition, object message )
+        {
+            EdmSchemaError error = null;
+            string messageString = message as string;
+            if ( messageString != null )
+                error = new EdmSchemaError( messageString, (int)errorCode, severity, sourceLocation, lineNumber, linePosition );
+            else
+            {
+                Exception ex = message as Exception;
+                if ( ex != null )
+                    error = new EdmSchemaError( ex.Message, (int)errorCode, severity, sourceLocation, lineNumber, linePosition, ex );
+                else
+                    error = new EdmSchemaError( message.ToString(), (int)errorCode, severity, sourceLocation, lineNumber, linePosition );
+            }
+            Schema.AddError(error);
+        }
+
+        /// <summary>
+        /// Call handler for the current attribute
+        /// </summary>
+        /// <param name="reader">XmlReader positioned at the attribute</param>
+        private void ParseAttribute(XmlReader reader)
+        {
+#if false
+            // the attribute value is schema invalid, just skip it; this avoids some duplicate errors at the expense of better error messages...
+            if ( reader.SchemaInfo != null && reader.SchemaInfo.Validity == System.Xml.Schema.XmlSchemaValidity.Invalid )
+                continue;
+#endif
+            string attributeNamespace = reader.NamespaceURI;
+            if (attributeNamespace == XmlConstants.AnnotationNamespace 
+                && reader.LocalName == XmlConstants.UseStrongSpatialTypes
+                && !ProhibitAttribute(attributeNamespace, reader.LocalName) 
+                && HandleAttribute(reader))
+            {
+                return;
+            }
+            else if (!Schema.IsParseableXmlNamespace(attributeNamespace, true))
+            {
+                AddOtherContent(reader);                
+            }
+            else if (!ProhibitAttribute(attributeNamespace, reader.LocalName)&&
+                     HandleAttribute(reader))
+            {
+                return;
+            }
+            else if (reader.SchemaInfo == null || reader.SchemaInfo.Validity != System.Xml.Schema.XmlSchemaValidity.Invalid)
+            {
+                // there's no handler for (namespace,name) and there wasn't a validation error. 
+                // Report an error of our own if the node is in no namespace or if it is in one of our xml schemas tartget namespace.
+                if (string.IsNullOrEmpty(attributeNamespace) || Schema.IsParseableXmlNamespace(attributeNamespace, true))
+                {
+                    AddError(ErrorCode.UnexpectedXmlAttribute, EdmSchemaErrorSeverity.Error, reader, System.Data.Entity.Strings.UnexpectedXmlAttribute(reader.Name));
+                }
+            }
+        }
+
+        protected virtual bool ProhibitAttribute(string namespaceUri, string localName)
+        {
+            return false;
+        }
+
+        /// <summary>
+        /// This overload assumes the default namespace
+        /// </summary>
+        /// <param name="reader"></param>
+        /// <param name="localName"></param>
+        /// <returns></returns>
+        internal static bool CanHandleAttribute(XmlReader reader, string localName)
+        {
+            Debug.Assert(reader.NamespaceURI != null);
+            return reader.NamespaceURI.Length == 0 && reader.LocalName == localName;
+        }
+
+        protected virtual bool HandleAttribute(XmlReader reader)
+        {
+            if(CanHandleAttribute(reader, XmlConstants.Name))
+            {
+                HandleNameAttribute(reader);
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool AddOtherContent(XmlReader reader)
+        {
+            int lineNumber;
+            int linePosition;
+            GetPositionInfo(reader, out lineNumber, out linePosition);
+
+            MetadataProperty property;
+            if (reader.NodeType == XmlNodeType.Element)
+            {
+
+                if (this._schema.SchemaVersion == XmlConstants.EdmVersionForV1 ||
+                    this._schema.SchemaVersion == XmlConstants.EdmVersionForV1_1)
+                {
+                    // skip this element
+                    // we don't support element annotations in v1 and v1.1
+                    return true;
+                }
+
+                // in V1 and V1.1 the codegen can only appear as the attribute annotation and we want to maintain
+                // the same behavior for V2, thus we throw if we encounter CodeGen namespace 
+                // in structural annotation in V2 and furthur version
+                if (this._schema.SchemaVersion >= XmlConstants.EdmVersionForV2 
+                    && reader.NamespaceURI == XmlConstants.CodeGenerationSchemaNamespace)
+                {
+                    Debug.Assert(
+                        XmlConstants.SchemaVersionLatest == XmlConstants.EdmVersionForV3, 
+                        "Please add checking for the latest namespace");
+
+                    AddError(ErrorCode.NoCodeGenNamespaceInStructuralAnnotation, EdmSchemaErrorSeverity.Error, lineNumber, linePosition, Strings.NoCodeGenNamespaceInStructuralAnnotation(XmlConstants.CodeGenerationSchemaNamespace));
+                    return true;
+                }
+
+                Debug.Assert(
+                        !Schema.IsParseableXmlNamespace(reader.NamespaceURI, false),
+                        "Structural annotation cannot use any edm reserved namespaces");
+
+                // using this subtree aproach because when I call 
+                // reader.ReadOuterXml() it positions me at the Node beyond
+                // the end of the node I am starting on
+                // which doesn't work with the parsing logic
+                using (XmlReader subtree = reader.ReadSubtree())
+                {
+                    subtree.Read();
+                    XElement element = XElement.Load(new StringReader(subtree.ReadOuterXml()));
+
+                    property = CreateMetadataPropertyFromOtherNamespaceXmlArtifact(element.Name.NamespaceName, element.Name.LocalName, element);
+                }
+            }
+            else
+            {
+                if (reader.NamespaceURI == XmlNamespaceNamespace)
+                {
+                    // we don't bring in namespace definitions
+                    return true;
+                }
+
+                Debug.Assert(reader.NodeType == XmlNodeType.Attribute, "called an attribute function when not on an attribute");
+                property = CreateMetadataPropertyFromOtherNamespaceXmlArtifact(reader.NamespaceURI, reader.LocalName, reader.Value);
+            }
+
+            if (!OtherContent.Exists(mp => mp.Identity == property.Identity))
+            {
+                OtherContent.Add(property);
+            }
+            else
+            {
+                AddError(ErrorCode.AlreadyDefined, EdmSchemaErrorSeverity.Error, lineNumber, linePosition, Strings.DuplicateAnnotation(property.Identity, this.FQName));
+            }
+            return false;
+        }
+
+        internal static MetadataProperty CreateMetadataPropertyFromOtherNamespaceXmlArtifact(string xmlNamespaceUri, string artifactName, object value)
+        {
+            MetadataProperty property;
+            property = new MetadataProperty(xmlNamespaceUri + ":" + artifactName,
+                                       TypeUsage.Create(EdmProviderManifest.Instance.GetPrimitiveType(PrimitiveTypeKind.String)),
+                                       value);
+            return property;
+        }
+
+        /// <summary>
+        /// Call handler for the current element
+        /// </summary>
+        /// <param name="reader">XmlReader positioned at the element</param>
+        /// <returns>true if element content should be skipped</returns>
+        private bool ParseElement(XmlReader reader)
+        {
+            string elementNamespace = reader.NamespaceURI;
+            // for schema element that right under the schema, we just ignore them, since schema does not
+            // have metadataproperties
+            if (!Schema.IsParseableXmlNamespace(elementNamespace, true) && this.ParentElement != null)
+            {
+                return AddOtherContent(reader);
+            }
+            if (HandleElement(reader))
+            {
+                return false;
+            }
+            else
+            {
+
+                // we need to report an error if the names

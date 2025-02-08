@@ -1,0 +1,179 @@
+_map_offset(bmap, isl_dim_div);
+	n_div = isl_basic_map_dim(bmap, isl_dim_div);
+
+	isl_int_gcd(data->g,
+		    bmap->ineq[l][offset + i], bmap->ineq[u][offset + i]);
+	isl_int_divexact(data->fl, bmap->ineq[l][offset + i], data->g);
+	isl_int_divexact(data->fu, bmap->ineq[u][offset + i], data->g);
+	isl_int_neg(data->fu, data->fu);
+	isl_seq_combine(data->v->el, data->fl, bmap->ineq[u],
+			data->fu, bmap->ineq[l], offset + n_div);
+	isl_int_mul(data->g, data->g, data->fl);
+	isl_int_mul(data->g, data->g, data->fu);
+	isl_int_sub(data->g, data->g, data->fl);
+	isl_int_sub(data->g, data->g, data->fu);
+	isl_int_add_ui(data->g, data->g, 1);
+	isl_int_sub(data->fl, data->v->el[0], data->g);
+
+	isl_seq_gcd(data->v->el + 1, offset - 1 + n_div, &data->g);
+	if (isl_int_is_zero(data->g))
+		return isl_int_is_nonneg(data->fl);
+	if (isl_int_is_one(data->g)) {
+		isl_int_set(data->v->el[0], data->fl);
+		return test_ineq_is_satisfied(bmap, data);
+	}
+	isl_int_fdiv_q(data->fl, data->fl, data->g);
+	isl_int_fdiv_q(data->v->el[0], data->v->el[0], data->g);
+	if (isl_int_eq(data->fl, data->v->el[0]))
+		return isl_bool_true;
+	isl_int_set(data->v->el[0], data->fl);
+	isl_seq_scale_down(data->v->el + 1, data->v->el + 1, data->g,
+			    offset - 1 + n_div);
+
+	return test_ineq_is_satisfied(bmap, data);
+}
+
+/* Remove more kinds of divs that are not strictly needed.
+ * In particular, if all pairs of lower and upper bounds on a div
+ * are such that they allow at least one integer value of the div,
+ * then we can eliminate the div using Fourier-Motzkin without
+ * introducing any spurious solutions.
+ *
+ * If at least one of the two constraints has a unit coefficient for the div,
+ * then the presence of such a value is guaranteed so there is no need to check.
+ * In particular, the value attained by the bound with unit coefficient
+ * can serve as this intermediate value.
+ */
+static __isl_give isl_basic_map *drop_more_redundant_divs(
+	__isl_take isl_basic_map *bmap, __isl_take int *pairs, int n)
+{
+	isl_ctx *ctx;
+	struct test_ineq_data data = { NULL, NULL };
+	unsigned off, n_div;
+	int remove = -1;
+
+	isl_int_init(data.g);
+	isl_int_init(data.fl);
+	isl_int_init(data.fu);
+
+	if (!bmap)
+		goto error;
+
+	ctx = isl_basic_map_get_ctx(bmap);
+	off = isl_basic_map_offset(bmap, isl_dim_div);
+	n_div = isl_basic_map_dim(bmap, isl_dim_div);
+	data.v = isl_vec_alloc(ctx, off + n_div);
+	if (!data.v)
+		goto error;
+
+	while (n > 0) {
+		int i, l, u;
+		int best = -1;
+		isl_bool has_int;
+
+		for (i = 0; i < n_div; ++i) {
+			if (!pairs[i])
+				continue;
+			if (best >= 0 && pairs[best] <= pairs[i])
+				continue;
+			best = i;
+		}
+
+		i = best;
+		for (l = 0; l < bmap->n_ineq; ++l) {
+			if (!isl_int_is_pos(bmap->ineq[l][off + i]))
+				continue;
+			if (isl_int_is_one(bmap->ineq[l][off + i]))
+				continue;
+			for (u = 0; u < bmap->n_ineq; ++u) {
+				if (!isl_int_is_neg(bmap->ineq[u][off + i]))
+					continue;
+				if (isl_int_is_negone(bmap->ineq[u][off + i]))
+					continue;
+				has_int = int_between_bounds(bmap, i, l, u,
+								&data);
+				if (has_int < 0)
+					goto error;
+				if (data.tab && data.tab->empty)
+					break;
+				if (!has_int)
+					break;
+			}
+			if (u < bmap->n_ineq)
+				break;
+		}
+		if (data.tab && data.tab->empty) {
+			bmap = isl_basic_map_set_to_empty(bmap);
+			break;
+		}
+		if (l == bmap->n_ineq) {
+			remove = i;
+			break;
+		}
+		pairs[i] = 0;
+		--n;
+	}
+
+	test_ineq_data_clear(&data);
+
+	free(pairs);
+
+	if (remove < 0)
+		return bmap;
+
+	bmap = isl_basic_map_remove_dims(bmap, isl_dim_div, remove, 1);
+	return isl_basic_map_drop_redundant_divs(bmap);
+error:
+	free(pairs);
+	isl_basic_map_free(bmap);
+	test_ineq_data_clear(&data);
+	return NULL;
+}
+
+/* Given a pair of divs div1 and div2 such that, except for the lower bound l
+ * and the upper bound u, div1 always occurs together with div2 in the form
+ * (div1 + m div2), where m is the constant range on the variable div1
+ * allowed by l and u, replace the pair div1 and div2 by a single
+ * div that is equal to div1 + m div2.
+ *
+ * The new div will appear in the location that contains div2.
+ * We need to modify all constraints that contain
+ * div2 = (div - div1) / m
+ * The coefficient of div2 is known to be equal to 1 or -1.
+ * (If a constraint does not contain div2, it will also not contain div1.)
+ * If the constraint also contains div1, then we know they appear
+ * as f (div1 + m div2) and we can simply replace (div1 + m div2) by div,
+ * i.e., the coefficient of div is f.
+ *
+ * Otherwise, we first need to introduce div1 into the constraint.
+ * Let l be
+ *
+ *	div1 + f >=0
+ *
+ * and u
+ *
+ *	-div1 + f' >= 0
+ *
+ * A lower bound on div2
+ *
+ *	div2 + t >= 0
+ *
+ * can be replaced by
+ *
+ *	m div2 + div1 + m t + f >= 0
+ *
+ * An upper bound
+ *
+ *	-div2 + t >= 0
+ *
+ * can be replaced by
+ *
+ *	-(m div2 + div1) + m t + f' >= 0
+ *
+ * These constraint are those that we would obtain from eliminating
+ * div1 using Fourier-Motzkin.
+ *
+ * After all constraints have been modified, we drop the lower and upper
+ * bound and then drop div1.
+ * Since the new div is only placed in the same location that used
+ * to store div2, b

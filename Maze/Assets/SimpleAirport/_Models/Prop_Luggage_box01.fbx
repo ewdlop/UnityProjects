@@ -1,0 +1,549 @@
+oneIdx = GetBoneIndex(BoneName);
+		PxRigidDynamic* PActor = ApexDestructibleActor->getChunkPhysXActor(BoneIdxToChunkIdx(BoneIdx));
+
+		const_cast<UDestructibleComponent*>(this)->SetupFakeBodyInstance(PActor, BoneIdx);
+	}
+#endif // WITH_APEX
+
+	return (FBodyInstance*)&BodyInstance;
+}
+
+bool UDestructibleComponent::IsAnySimulatingPhysics() const 
+{
+	return !!BodyInstance.bSimulatePhysics;
+}
+
+#if PHYSICS_INTERFACE_PHYSX
+
+bool UDestructibleComponent::IsChunkLarge(PxRigidActor* ChunkActor) const
+{
+#if WITH_APEX
+	check(ChunkActor);
+	return ChunkActor->getWorldBounds().getExtents().maxElement() > LargeChunkThreshold;
+#else
+	return true;
+#endif // WITH_APEX
+}
+
+#endif	//WITH_PHYSX
+
+
+void UDestructibleComponent::OnActorEnableCollisionChanged()
+{
+	ECollisionEnabled::Type NewCollisionType = GetBodyInstance()->GetCollisionEnabled();
+	SetCollisionEnabled(NewCollisionType);
+}
+
+void UDestructibleComponent::SetCollisionEnabled(ECollisionEnabled::Type NewType)
+{
+#if WITH_APEX
+	ExecuteOnPhysicsReadWrite([&]
+	{
+		PxShape** ShapeBuffer;
+		PxU32 ShapeCount = 0;
+		
+		PxU32 NumChunks = GetDestructibleMesh()->GetApexDestructibleAsset()->getChunkCount();
+		
+		const bool bSetQuery = CollisionEnabledHasQuery(NewType);
+		const bool bSetSim = CollisionEnabledHasPhysics(NewType);
+		
+		for(uint32 ChunkIdx = 0; ChunkIdx < NumChunks; ++ChunkIdx)
+		{
+			ShapeCount = ApexDestructibleActor->getChunkPhysXShapes(ShapeBuffer, ChunkIdx);
+			
+			for(uint32 ShapeIdx = 0; ShapeIdx < ShapeCount; ++ShapeIdx)
+			{
+				if(PxShape* Shape = ShapeBuffer[ShapeIdx])
+				{
+					Shape->setFlag(PxShapeFlag::eSCENE_QUERY_SHAPE, bSetQuery);
+					Shape->setFlag(PxShapeFlag::eSIMULATION_SHAPE, bSetSim);
+				}
+			}
+		}
+	});
+
+	EnsurePhysicsStateCreated();
+	OnComponentCollisionSettingsChanged();
+#endif // WITH_APEX
+}
+
+void UDestructibleComponent::SetCollisionProfileName(FName InCollisionProfileName, bool bUpdateOverlaps)
+{
+    FBodyInstance* LocalInstance = GetBodyInstance();
+    if (!LocalInstance)
+    {
+        return;
+    }
+
+	FUObjectThreadContext& ThreadContext = FUObjectThreadContext::Get();
+	if (ThreadContext.ConstructedObject == this)
+	{
+		// If we are in our constructor, defer setup until PostInitProperties as derived classes
+		// may call SetCollisionProfileName more than once.
+		LocalInstance->SetCollisionProfileNameDeferred(InCollisionProfileName);
+	}
+	else
+	{
+		ECollisionEnabled::Type OldCollisionEnabled = LocalInstance->GetCollisionEnabled();
+		LocalInstance->SetCollisionProfileName(InCollisionProfileName);
+
+		ECollisionEnabled::Type NewCollisionEnabled = LocalInstance->GetCollisionEnabled();
+
+		if (OldCollisionEnabled != NewCollisionEnabled)
+		{
+			EnsurePhysicsStateCreated();
+		}
+		OnComponentCollisionSettingsChanged(bUpdateOverlaps);
+	}
+}
+
+
+#if PHYSICS_INTERFACE_PHYSX
+
+void UDestructibleComponent::SetCollisionResponseForActor(PxRigidDynamic* Actor, int32 ChunkIdx, const FCollisionResponseContainer* ResponseOverride /*= NULL*/)
+{
+#if WITH_APEX
+	if (ApexDestructibleActor == NULL)
+	{
+		return;
+	}
+
+	// Get collision channel and response
+	FCollisionFilterData QueryFilterData, SimFilterData;
+	uint8 MoveChannel = GetCollisionObjectType();
+	if(IsCollisionEnabled())
+	{
+		UDestructibleMesh* TheDestructibleMesh = GetDestructibleMesh();
+		AActor* Owner = GetOwner();
+		bool bLargeChunk = IsChunkLarge(Actor);
+		const FCollisionResponseContainer& UseResponse = ResponseOverride == NULL ? (bLargeChunk ? LargeChunkCollisionResponse.GetResponseContainer() : SmallChunkCollisionResponse.GetResponseContainer()) : *ResponseOverride;
+
+		physx::PxU32 SupportDepth = TheDestructibleMesh->ApexDestructibleAsset->getChunkDepth(ChunkIdx);
+
+		const bool bEnableImpactDamage = IsImpactDamageEnabled(TheDestructibleMesh, SupportDepth);
+		CreateShapeFilterData(MoveChannel, FMaskFilter(0), Owner->GetUniqueID(), UseResponse, GetUniqueID(), ChunkIdxToBoneIdx(ChunkIdx), QueryFilterData, SimFilterData, BodyInstance.bUseCCD, BodyInstance.bNotifyRigidBodyCollision || bEnableImpactDamage, false);
+		
+		QueryFilterData.Word3 |= EPDF_SimpleCollision | EPDF_ComplexCollision | EPDF_KinematicKinematicPairs;
+		SimFilterData.Word3 |= EPDF_SimpleCollision | EPDF_ComplexCollision | EPDF_KinematicKinematicPairs;
+
+		SCOPED_SCENE_WRITE_LOCK(Actor->getScene());
+
+		TArray<PxShape*> Shapes;
+		Shapes.AddUninitialized(Actor->getNbShapes());
+
+		int ShapeCount = Actor->getShapes(Shapes.GetData(), Shapes.Num());
+
+		for (int32 i=0; i < ShapeCount; ++i)
+		{
+			PxShape* Shape = Shapes[i];
+
+			Shape->setQueryFilterData(U2PFilterData(QueryFilterData));
+			Shape->setSimulationFilterData(U2PFilterData(SimFilterData));
+			Shape->setFlag(PxShapeFlag::eSCENE_QUERY_SHAPE, true); 
+			Shape->setFlag(PxShapeFlag::eSIMULATION_SHAPE, true); 
+			Shape->setFlag(PxShapeFlag::eVISUALIZATION, true);
+		}
+	}
+#endif
+}
+
+void UDestructibleComponent::SetCollisionResponseForShape(PxShape* Shape, int32 ChunkIdx)
+{
+#if WITH_APEX
+	if(ApexDestructibleActor == nullptr) //since we do deferred deletion it's possible we've already meant to delete this so ignore any simulation callbacks
+	{
+		return;
+	}
+#endif
+
+	// Get collision channel and response
+	FCollisionFilterData QueryFilterData, SimFilterData;
+	uint8 MoveChannel = GetCollisionObjectType();
+	if (IsCollisionEnabled())
+	{
+		AActor* Owner = GetOwner();
+		bool bLargeChunk = IsChunkLarge(Shape->getActor());
+		const FCollisionResponse& ColResponse = bLargeChunk ? LargeChunkCollisionResponse : SmallChunkCollisionResponse;
+		//TODO: we currently assume chunks will not have impact damage as it's very expensive. Should look into exposing this a bit more
+		CreateShapeFilterData(MoveChannel, FMaskFilter(0), (Owner ? Owner->GetUniqueID() : 0), ColResponse.GetResponseContainer(), GetUniqueID(), ChunkIdxToBoneIdx(ChunkIdx), QueryFilterData, SimFilterData, BodyInstance.bUseCCD, BodyInstance.bNotifyRigidBodyCollision, false);
+
+		QueryFilterData.Word3 |= EPDF_SimpleCollision | EPDF_ComplexCollision | EPDF_KinematicKinematicPairs;
+		SimFilterData.Word3 |= EPDF_SimpleCollision | EPDF_ComplexCollision | EPDF_KinematicKinematicPairs;
+
+		SCOPED_SCENE_WRITE_LOCK(Shape->getActor()->getScene());
+
+		// See FBodySetupShapeIterator::ComputeContactOffset(const PxConvexMeshGeometry&) for this calculation. 
+		// Reproduced here to avoid going to the underlying PxConvexMeshGeometry
+		const float MinBoundsExtent = Shape->getActor()->getWorldBounds().getExtents().minElement();
+		Shape->setContactOffset(FMath::Clamp(ContactOffsetFactor * MinBoundsExtent, MinContactOffset, MaxContactOffset));
+
+		Shape->setQueryFilterData(U2PFilterData(QueryFilterData));
+		Shape->setSimulationFilterData(U2PFilterData(SimFilterData));
+		Shape->setFlag(PxShapeFlag::eSCENE_QUERY_SHAPE, true);
+		Shape->setFlag(PxShapeFlag::eSIMULATION_SHAPE, true);
+		Shape->setFlag(PxShapeFlag::eVISUALIZATION, true);
+	}
+}
+
+#endif	//WITH_PHYSX
+
+
+void UDestructibleComponent::SetMaterial(int32 ElementIndex, UMaterialInterface* Material)
+{
+	// Mesh component handles render side materials
+	Super::SetMaterial(ElementIndex, Material);
+
+	// Update physical properties of the chunks in the mesh if the body instance is valid
+	FBodyInstance* BodyInst = GetBodyInstance();
+	if (BodyInst)
+	{
+		BodyInst->UpdatePhysicalMaterials();
+	}
+	
+	// Update physical properties for individual bone instances as well
+	if (SkeletalMesh)
+	{
+		int32 NumBones = SkeletalMesh->RefSkeleton.GetRawBoneNum();
+		for (int32 BoneIdx = 0; BoneIdx < NumBones; ++BoneIdx)
+		{
+			FName BoneName = SkeletalMesh->RefSkeleton.GetBoneName(BoneIdx);
+			FBodyInstance* Instance = GetBodyInstance(BoneName);
+			if (Instance)
+			{
+				Instance->UpdatePhysicalMaterials();
+			}
+		}
+	}
+	
+
+#if WITH_APEX
+	// Set new template parameters for the apex actor, so they take effect before fracturing too.
+	if(ApexDestructibleActor)
+	{
+		nvidia::apex::PhysX3DescTemplate* Template = ApexDestructibleActor->createPhysX3DescTemplate();
+		if(ApexDestructibleActor->getPhysX3Template(*Template))
+		{
+			UPhysicalMaterial* SimpleMaterial = GetBodyInstance()->GetSimplePhysicalMaterial();
+			
+			if(SimpleMaterial)
+			{
+#if WITH_CHAOS || WITH_IMMEDIATE_PHYSX
+                check(false);
+#else
+				const FPhysicsMaterialHandle_PhysX& MaterialHandle = SimpleMaterial->GetPhysicsMaterial();
+				PxMaterial* PhysxMat = MaterialHandle.Material;
+
+				Template->setMaterials(&PhysxMat, 1);
+				ApexDestructibleActor->setPhysX3Template(Template);
+#endif
+			}
+		}
+		Template->release();
+	}
+#endif
+}
+
+PRAGMA_ENABLE_DEPRECATION_WARNINGS
+                            Ö    È¢"    ø±÷   Ô59–(ßÖ   €            $ < c r i t i c a l _ c l o s u r e . h H      Ò¢"    È¢"    X²÷   Ô59–(ßÖ              
+ < d e b u g   H      Ò¢"    È¢"     ²÷   Ô59–(ßÖ  €           
+ < d e b u g   h      !Ö     Ö    è²÷   Ô59–(ßÖ               & < a c t i v i t y _ a n a l y z e r . h       h      !Ö    Ò¢"    P³÷   Ô59–(ßÖ                & < a c t i v i t y _ a n a l y z e r . h       h      !Ö    Ò¢"    ¸³÷   Ô59–(ßÖ   €            & < a c t i v i t y _ a n a l y z e r . h       `      yÖ     Ö     ´÷   ä\9–(ßÖ               $ < a c t i v i t y _ t r a c k e r . h `      yÖ    Ò¢"    €´÷   ä\9–(ßÖ                $ < a c t i v i t y _ t r a c k e r . h `      yÖ    Ò¢"    à´÷   ä\9–(ßÖ   €            $ < a c t i v i t y _ t r a c k e r . h P      ‡Ö     Ö    @µ÷   ä\9–(ßÖ                < a l i a s . h       P      ‡Ö    Ò¢"    µ÷   ä\9–(ßÖ                 < a l i a s . h       P      ‡Ö    Ò¢"    àµ÷   ä\9–(ßÖ   €             < a l i a s . h       h      ˆÖ     Ö    0¶÷   ä\9–(ßÖ               * < a s a n _ i n v a l i d _ a c c e s s . h   h      ˆÖ    Ò¢"    ˜¶÷   ä\9–(ßÖ                * < a s a n _ i n v a l i d _ a c c e s s . h   h      ˆÖ    Ò¢"     ·÷   â„9–(ßÖ   €            * < a s a n _ i n v a l i d _ a c c e s s . h   p      ‰Ö     Ö    h·÷   â„9–(ßÖ               . < c l o s e _ h a n d l e _ h o o k _ w i n . h       p      ‰Ö    Ò¢"    Ø·÷   â„9–(ßÖ                . < c l o s e _ h a n d l e _ h o o k _ w i n . h       p      ‰Ö    Ò¢"    H¸÷   â„9–(ßÖ   €            . < c l o s e _ h a n d l e _ h o o k _ w i n . h       `      ŠÖ     Ö    ¸¸÷   D«9–(ßÖ                < c r a s h _ l o g g i n g . h       `      ŠÖ    Ò¢"    ¹÷   D«9–(ßÖ                 < c r a s h _ l o g g i n g . h       `      ŠÖ    Ò¢"    x¹÷   D«9–(ßÖ   €             < c r a s h _ l o g g i n g . h       P      ‹Ö     Ö    Ø¹÷   D«9–(ßÖ                < d e b u g g e r . h P      ‹Ö    Ò¢"    (º÷   D«9–(ßÖ                 < d e b u g g e r . h P      ‹Ö    Ò¢"    xº÷   D«9–(ßÖ   €             < d e b u g g e r . h p      ŒÖ     Ö    Èº÷   D«9–(ßÖ               . < d u m p _ w i t h o u t _ c r a s h i n g . h       p      ŒÖ    Ò¢"    8»÷   D«9–(ßÖ                . < d u m p _ w i t h o u t _ c r a s h i n g . h       p      ŒÖ    Ò¢"    ¨»÷   ¸Ò9–(ßÖ   €            . < d u m p _ w i t h o u t _ c r a s h i n g . h       `      Ö     Ö    ¼÷   ¸Ò9–(ßÖ               $ < e l f _ r e a d e r _ l i n u x . h `      Ö    Ò¢"    x¼÷   ¸Ò9–(ßÖ                $ < e l f _ r e a d e r _ l i n u x . h `      Ö    Ò¢"    Ø¼÷   ¸Ò9–(ßÖ   €            $ < e l f _ r e a d e r _ l i n u x . h h      ŽÖ     Ö    8½÷   ¸Ò9–(ßÖ               ( < g d i _ d e b u g _ u t i l _ w i n . h     h      ŽÖ    Ò¢"     ½÷   ¸Ò9–(ßÖ                ( < g d i _ d e b u g _ u t i l _ w i n . h     h      ŽÖ    Ò¢"    ¾÷   ¸Ò9–(ßÖ   €            ( < g d i _ d e b u g _ u t i l _ w i n . h     h      Ö     Ö    p¾÷   Îù9–(ßÖ               ( < i n v a l i d _ a c c e s s _ w i n . h     h      Ö    Ò¢"    Ø¾÷   Îù9–(ßÖ                ( < i n v a l i d _ a c c e s s _ w i n . h     h      Ö    Ò¢"    @¿÷   Îù9–(ßÖ   €            ( < i n v a l i d _ a c c e s s _ w i n . h                                                                                             /*
+**********************************************************************
+*   Copyright (c) 2001-2011, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+**********************************************************************
+*   Date        Name        Description
+*   08/10/2001  aliu        Creation.
+**********************************************************************
+*/
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_TRANSLITERATION
+
+#include "unicode/translit.h"
+#include "unicode/resbund.h"
+#include "unicode/uniset.h"
+#include "unicode/uscript.h"
+#include "rbt.h"
+#include "cpdtrans.h"
+#include "nultrans.h"
+#include "transreg.h"
+#include "rbt_data.h"
+#include "rbt_pars.h"
+#include "tridpars.h"
+#include "charstr.h"
+#include "uassert.h"
+#include "locutil.h"
+
+// Enable the following symbol to add debugging code that tracks the
+// allocation, deletion, and use of Entry objects.  BoundsChecker has
+// reported dangling pointer errors with these objects, but I have
+// been unable to confirm them.  I suspect BoundsChecker is getting
+// confused with pointers going into and coming out of a UHashtable,
+// despite the hinting code that is designed to help it.
+// #define DEBUG_MEM
+#ifdef DEBUG_MEM
+#include <stdio.h>
+#endif
+
+// UChar constants
+static const UChar LOCALE_SEP  = 95; // '_'
+//static const UChar ID_SEP      = 0x002D; /*-*/
+//static const UChar VARIANT_SEP = 0x002F; // '/'
+
+// String constants
+static const UChar ANY[] = { 65, 110, 121, 0 }; // Any
+
+// empty string
+#define NO_VARIANT UnicodeString()
+
+/**
+ * Resource bundle key for the RuleBasedTransliterator rule.
+ */
+//static const char RB_RULE[] = "Rule";
+
+U_NAMESPACE_BEGIN
+
+//------------------------------------------------------------------
+// Alias
+//------------------------------------------------------------------
+
+TransliteratorAlias::TransliteratorAlias(const UnicodeString& theAliasID,
+                                         const UnicodeSet* cpdFilter) :
+    ID(),
+    aliasesOrRules(theAliasID),
+    transes(0),
+    compoundFilter(cpdFilter),
+    direction(UTRANS_FORWARD),
+    type(TransliteratorAlias::SIMPLE) {
+}
+
+TransliteratorAlias::TransliteratorAlias(const UnicodeString& theID,
+                                         const UnicodeString& idBlocks,
+                                         UVector* adoptedTransliterators,
+                                         const UnicodeSet* cpdFilter) :
+    ID(theID),
+    aliasesOrRules(idBlocks),
+    transes(adoptedTransliterators),
+    compoundFilter(cpdFilter),
+    direction(UTRANS_FORWARD),
+    type(TransliteratorAlias::COMPOUND) {
+}
+
+TransliteratorAlias::TransliteratorAlias(const UnicodeString& theID,
+                                         const UnicodeString& rules,
+                                         UTransDirection dir) :
+    ID(theID),
+    aliasesOrRules(rules),
+    transes(0),
+    compoundFilter(0),
+    direction(dir),
+    type(TransliteratorAlias::RULES) {
+}
+
+TransliteratorAlias::~TransliteratorAlias() {
+    delete transes;
+}
+
+
+Transliterator* TransliteratorAlias::create(UParseError& pe,
+                                            UErrorCode& ec) {
+    if (U_FAILURE(ec)) {
+        return 0;
+    }
+    Transliterator *t = NULL;
+    switch (type) {
+    case SIMPLE:
+        t = Transliterator::createInstance(aliasesOrRules, UTRANS_FORWARD, pe, ec);
+        if(U_FAILURE(ec)){
+            return 0;
+        }
+        if (compoundFilter != 0)
+            t->adoptFilter((UnicodeSet*)compoundFilter->clone());
+        break;
+    case COMPOUND:
+        {
+            // the total number of transliterators in the compound is the total number of anonymous transliterators
+            // plus the total number of ID blocks-- we start by assuming the list begins and ends with an ID
+            // block and that each pair anonymous transliterators has an ID block between them.  Then we go back
+            // to see whether there really are ID blocks at the beginning and end (by looking for U+FFFF, which
+            // marks the position where an anonymous transliterator goes) and adjust accordingly
+            int32_t anonymousRBTs = transes->size();
+            int32_t transCount = anonymousRBTs * 2 + 1;
+            if (!aliasesOrRules.isEmpty() && aliasesOrRules[0] == (UChar)(0xffff))
+                --transCount;
+            if (aliasesOrRules.length() >= 2 && aliasesOrRules[aliasesOrRules.length() - 1] == (UChar)(0xffff))
+                --transCount;
+            UnicodeString noIDBlock((UChar)(0xffff));
+            noIDBlock += ((UChar)(0xffff));
+            int32_t pos = aliasesOrRules.indexOf(noIDBlock);
+            while (pos >= 0) {
+                --transCount;
+                pos = aliasesOrRules.indexOf(noIDBlock, pos + 1);
+            }
+
+            UVector transliterators(ec);
+            UnicodeString idBlock;
+            int32_t blockSeparatorPos = aliasesOrRules.indexOf((UChar)(0xffff));
+            while (blockSeparatorPos >= 0) {
+                aliasesOrRules.extract(0, blockSeparatorPos, idBlock);
+                aliasesOrRules.remove(0, blockSeparatorPos + 1);
+                if (!idBlock.isEmpty())
+                    transliterators.addElement(Transliterator::createInstance(idBlock, UTRANS_FORWARD, pe, ec), ec);
+                if (!transes->isEmpty())
+                    transliterators.addElement(transes->orphanElementAt(0), ec);
+                blockSeparatorPos = aliasesOrRules.indexOf((UChar)(0xffff));
+            }
+            if (!aliasesOrRules.isEmpty())
+                transliterators.addElement(Transliterator::createInstance(aliasesOrRules, UTRANS_FORWARD, pe, ec), ec);
+            while (!transes->isEmpty())
+                transliterators.addElement(transes->orphanElementAt(0), ec);
+
+            if (U_SUCCESS(ec)) {
+                t = new CompoundTransliterator(ID, transliterators,
+                    (compoundFilter ? (UnicodeSet*)(compoundFilter->clone()) : 0),
+                    anonymousRBTs, pe, ec);
+                if (t == 0) {
+                    ec = U_MEMORY_ALLOCATION_ERROR;
+                    return 0;
+                }
+            } else {
+                for (int32_t i = 0; i < transliterators.size(); i++)
+                    delete (Transliterator*)(transliterators.elementAt(i));
+            }
+        }
+        break;
+    case RULES:
+        U_ASSERT(FALSE); // don't call create() if isRuleBased() returns TRUE!
+        break;
+    }
+    return t;
+}
+
+UBool TransliteratorAlias::isRuleBased() const {
+    return type == RULES;
+}
+
+void TransliteratorAlias::parse(TransliteratorParser& parser,
+                                UParseError& pe, UErrorCode& ec) const {
+    U_ASSERT(type == RULES);
+    if (U_FAILURE(ec)) {
+        return;
+    }
+
+    parser.parse(aliasesOrRules, direction, pe, ec);
+}
+
+//----------------------------------------------------------------------
+// class TransliteratorSpec
+//----------------------------------------------------------------------
+
+/**
+ * A TransliteratorSpec is a string specifying either a source or a target.  In more
+ * general terms, it may also specify a variant, but we only use the
+ * Spec class for sources and targets.
+ *
+ * A Spec may be a locale or a script.  If it is a locale, it has a
+ * fallback chain that goes xx_YY_ZZZ -> xx_YY -> xx -> ssss, where
+ * ssss is the script mapping of xx_YY_ZZZ.  The Spec API methods
+ * hasFallback(), next(), and reset() iterate over this fallback
+ * sequence.
+ *
+ * The Spec class canonicalizes itself, so the locale is put into
+ * canonical form, or the script is transformed from an abbreviation
+ * to a full name.
+ */
+class TransliteratorSpec : public UMemory {
+ public:
+    TransliteratorSpec(const UnicodeString& spec);
+    ~TransliteratorSpec();
+
+    const UnicodeString& get() const;
+    UBool hasFallback() const;
+    const UnicodeString& next();
+    void reset();
+
+    UBool isLocale() const;
+    ResourceBundle& getBundle() const;
+
+    operator const UnicodeString&() const { return get(); }
+    const UnicodeString& getTop() const { return top; }
+
+ private:
+    void setupNext();
+
+    UnicodeString top;
+    UnicodeString spec;
+    UnicodeString nextSpec;
+    UnicodeString scriptName;
+    UBool isSpecLocale; // TRUE if spec is a locale
+    UBool isNextLocale; // TRUE if nextSpec is a locale
+    ResourceBundle* res;
+
+    TransliteratorSpec(const TransliteratorSpec &other); // forbid copying of this class
+    TransliteratorSpec &operator=(const TransliteratorSpec &other); // forbid copying of this class
+};
+
+TransliteratorSpec::TransliteratorSpec(const UnicodeString& theSpec)
+: top(theSpec),
+  res(0)
+{
+    UErrorCode status = U_ZERO_ERROR;
+    Locale topLoc("");
+    LocaleUtility::initLocaleFromName(theSpec, topLoc);
+    if (!topLoc.isBogus()) {
+        res = new ResourceBundle(U_ICUDATA_TRANSLIT, topLoc, status);
+        /* test for NULL */
+        if (res == 0) {
+            return;
+        }
+        if (U_FAILURE(status) || status == U_USING_DEFAULT_WARNING) {
+            delete res;
+            res = 0;
+        }
+    }
+
+    // Canonicalize script name -or- do locale->script mapping
+    status = U_ZERO_ERROR;
+    static const int32_t capacity = 10;
+    UScriptCode script[capacity]={USCRIPT_INVALID_CODE};
+    int32_t num = uscript_getCode(CharString().appendInvariantChars(theSpec, status).data(),
+                                  script, capacity, &status);
+    if (num > 0 && script[0] != USCRIPT_INVALID_CODE) {
+        scriptName = UnicodeString(uscript_getName(script[0]), -1, US_INV);
+    }
+
+    // Canonicalize top
+    if (res != 0) {
+        // Canonicalize locale name
+        UnicodeString locStr;
+        LocaleUtility::initNameFromLocale(topLoc, locStr);
+        if (!locStr.isBogus()) {
+            top = locStr;
+        }
+    } else if (scriptName.length() != 0) {
+        // We are a script; use canonical name
+        top = scriptName;
+    }
+
+    // assert(spec != top);
+    reset();
+}
+
+TransliteratorSpec::~TransliteratorSpec() {
+    delete res;
+}
+
+UBool TransliteratorSpec::hasFallback() const {
+    return nextSpec.length() != 0;
+}
+
+void TransliteratorSpec::reset() {
+    if (spec != top) {
+        spec = top;
+        isSpecLocale = (res != 0);
+        setupNext();
+    }
+}
+
+void

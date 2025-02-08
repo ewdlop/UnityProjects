@@ -1,0 +1,43 @@
+o allocated memory and swapping the LF and NL values.
+ * It allows to support the same EBCDIC charset in both versions without
+ * duplicating the entire installed table.
+ */
+
+/* standard EBCDIC codes */
+#define EBCDIC_LF 0x25
+#define EBCDIC_NL 0x15
+
+/* standard EBCDIC codes with roundtrip flag as stored in Unicode-to-single-byte tables */
+#define EBCDIC_RT_LF 0xf25
+#define EBCDIC_RT_NL 0xf15
+
+/* Unicode code points */
+#define U_LF 0x0a
+#define U_NL 0x85
+
+static UBool
+_EBCDICSwapLFNL(UConverterSharedData *sharedData, UErrorCode *pErrorCode) {
+    UConverterMBCSTable *mbcsTable;
+
+    const uint16_t *table, *results;
+    const uint8_t *bytes;
+
+    int32_t (*newStateTable)[256];
+    uint16_t *newResults;
+    uint8_t *p;
+    char *name;
+
+    uint32_t stage2Entry;
+    uint32_t size, sizeofFromUBytes;
+
+    mbcsTable=&sharedData->mbcs;
+
+    table=mbcsTable->fromUnicodeTable;
+    bytes=mbcsTable->fromUnicodeBytes;
+    results=(const uint16_t *)bytes;
+
+    /*
+     * Check that this is an EBCDIC table with SBCS portion -
+     * SBCS or EBCDIC_STATEFUL with standard EBCDIC LF and NL mappings.
+     *
+     * If not, ignore the option. Options are always ignored if they do not apply

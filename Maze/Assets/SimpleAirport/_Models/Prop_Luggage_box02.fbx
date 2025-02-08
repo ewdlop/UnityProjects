@@ -1,0 +1,720 @@
+ root chunk here as well, so make sure that the parent index is 0, even for the root chunk
+			int32 ParentIdx = FMath::Max(TheDestructibleMesh->ApexDestructibleAsset->getChunkParentIndex(chunkData.index), 0);
+			
+			// We can test a number of flags - we'll play an effect if the chunk was destroyed
+			// As we only get the fractured event here for chunks that come free, we spawn fracture
+			// effects only once per unique parent
+			if((chunkData.flags & apex::ApexChunkFlag::FRACTURED) && !HandledParents.Contains(ParentIdx))
+			{
+				FVector Position = P2UVector(chunkData.worldBounds.getCenter());
+				FFractureEffect& FractureEffect = UseFractureEffects[chunkData.depth];
+				if( FractureEffect.Sound != NULL )
+				{
+					// Spawn sound
+					UGameplayStatics::PlaySoundAtLocation( this, FractureEffect.Sound, Position );
+				}
+				if( FractureEffect.ParticleSystem != NULL )
+				{
+					// Spawn particle system
+					UParticleSystemComponent* ParticleSystemComponent = UGameplayStatics::SpawnEmitterAtLocation( this, FractureEffect.ParticleSystem, Position );
+
+					// Disable shadows, since destructibles tend to generate a lot of these
+					if (ParticleSystemComponent != NULL)
+					{
+						ParticleSystemComponent->CastShadow = false;
+					}
+				}
+
+				HandledParents.Add(ParentIdx);
+			}			
+		}
+	}
+}
+
+void UDestructibleComponent::OnDamageEvent(const apex::DamageEventReportData& InDamageEvent)
+{
+	FVector HitPosition = P2UVector(InDamageEvent.hitPosition);
+	FVector HitDirection = P2UVector(InDamageEvent.hitDirection);
+
+	OnComponentFracture.Broadcast(HitPosition, HitDirection);
+	if (ADestructibleActor * DestructibleActor = Cast<ADestructibleActor>(GetOwner()))
+	{
+		DestructibleActor->OnActorFracture.Broadcast(HitPosition, HitDirection);
+	}
+
+	SpawnFractureEffectsFromDamageEvent(InDamageEvent);
+
+	// After receiving damage, no longer receive decals.
+	if (bReceivesDecals)
+	{
+		bReceivesDecals = false;
+		MarkRenderStateDirty();
+	}
+}
+
+void UDestructibleComponent::OnVisibilityEvent(const apex::ChunkStateEventData & InVisibilityEvent)
+{
+	for (uint32 EventIndex = 0; EventIndex < InVisibilityEvent.stateEventListSize; ++EventIndex)
+	{
+		const apex::DestructibleChunkEvent &  Event = InVisibilityEvent.stateEventList[EventIndex];
+		// Right now the only events are visibility changes.  So as an optimization we won't check for the event type.
+		//				if (Event.event & physx::NxDestructibleChunkEvent::VisibilityChanged)
+		const bool bIsVisible = (Event.event & apex::DestructibleChunkEvent::ChunkVisible) != 0;
+		SetChunkVisible(Event.chunkIndex, bIsVisible);
+	}
+}
+#endif // WITH_APEX
+
+bool UDestructibleComponent::IsFracturedOrInitiallyStatic() const
+{
+	bool bInitiallyStatic = false;
+	bool bFractured = false;
+#if WITH_APEX
+	if (ApexDestructibleActor == nullptr)
+	{
+		return false;
+	}
+
+	bInitiallyStatic = !ApexDestructibleActor->isInitiallyDynamic();
+
+	if (bInitiallyStatic == false)
+	{
+		//If we have only one chunk and its index is 0 we are NOT fractured. Otherwise we must have fractured
+		const physx::PxU32 VisibleChunkCount = ApexDestructibleActor->getNumVisibleChunks();
+		if (VisibleChunkCount == 1)
+		{
+			const physx::PxU16* VisibleChunks = ApexDestructibleActor->getVisibleChunks();
+			bFractured = *VisibleChunks != 0;
+		}
+		else
+		{
+			bFractured = true;
+		}
+	}
+#endif
+	return bFractured || bInitiallyStatic;
+}
+
+bool UDestructibleComponent::ExecuteOnPhysicsReadOnly(TFunctionRef<void()> Func) const
+{
+#if WITH_APEX
+	if (ApexDestructibleActor)
+	{
+		FPhysScene* PhysScene = GetWorld()->GetPhysicsScene();
+		// Destructibles are always dynamic or kinematic, and therefore only go into one of the scenes
+		PxScene* PScene = PhysScene->GetPxScene();
+
+		SCOPED_SCENE_READ_LOCK(PScene);
+		Func();
+
+		return true;
+	}
+#endif
+
+	return false;
+}
+
+bool UDestructibleComponent::ExecuteOnPhysicsReadWrite(TFunctionRef<void()> Func) const
+{
+#if WITH_APEX
+	if (ApexDestructibleActor)
+	{
+		FPhysScene* PhysScene = GetWorld()->GetPhysicsScene();
+		PxScene* PScene = PhysScene->GetPxScene();
+
+		SCOPED_SCENE_WRITE_LOCK(PScene);
+		Func();
+
+		return true;
+	}
+#endif
+
+	return false;
+}
+
+void UDestructibleComponent::RefreshBoneTransforms(FActorComponentTickFunction* TickFunction)
+{
+}
+
+void UDestructibleComponent::SetDestructibleMesh(class UDestructibleMesh* NewMesh)
+{
+#if WITH_APEX
+	uint32 ChunkCount = NewMesh ? NewMesh->ApexDestructibleAsset->getChunkCount() : 0;
+	ChunkInfos.Reset(ChunkCount);
+	ChunkInfos.AddDefaulted(ChunkCount);
+	PhysxChunkUserData.Reset(ChunkCount);
+	PhysxChunkUserData.AddZeroed(ChunkCount);
+#endif // WITH_APEX
+
+	Super::SetSkeletalMesh( NewMesh );
+
+#if WITH_EDITORONLY_DATA
+	// If the SkeletalMesh has changed, update our transient value too.
+	DestructibleMesh = GetDestructibleMesh();
+#endif // WITH_EDITORONLY_DATA
+	
+	RecreatePhysicsState();
+}
+
+class UDestructibleMesh * UDestructibleComponent::GetDestructibleMesh()
+{
+	return Cast<UDestructibleMesh>(SkeletalMesh);
+}
+
+void UDestructibleComponent::SetSkeletalMesh(USkeletalMesh* InSkelMesh, bool bReinitPose)
+{
+	if(InSkelMesh != NULL && !InSkelMesh->IsA(UDestructibleMesh::StaticClass()))
+	{
+		// Issue warning and do nothing if this is not actually a UDestructibleMesh
+		UE_LOG(LogPhysics, Log, TEXT("UDestructibleComponent::SetSkeletalMesh(): Passed-in USkeletalMesh (%s) must be a UDestructibleMesh.  SkeletalMesh not set."), *InSkelMesh->GetPathName() );
+		return;
+	}
+
+	UDestructibleMesh* TheDestructibleMesh = static_cast<UDestructibleMesh*>(InSkelMesh);
+#if WITH_APEX
+	if(TheDestructibleMesh != NULL && TheDestructibleMesh->ApexDestructibleAsset == NULL)
+	{
+		UE_LOG(LogPhysics, Log, TEXT("UDestructibleComponent::SetSkeletalMesh(): Missing ApexDestructibleAsset on '%s'."), *InSkelMesh->GetPathName() );
+		return;
+	}
+
+	SetDestructibleMesh(TheDestructibleMesh);
+
+	if(TheDestructibleMesh != NULL)
+	{
+		// Resize the fracture effects array to the appropriate size
+		FractureEffects.SetNumZeroed(TheDestructibleMesh->ApexDestructibleAsset->getDepthCount());
+	}
+#else
+	SetDestructibleMesh(TheDestructibleMesh);
+#endif // WITH_APEX
+}
+
+FTransform UDestructibleComponent::GetSocketTransform(FName InSocketName, ERelativeTransformSpace TransformSpace) const
+{
+	FTransform ST = Super::GetSocketTransform(InSocketName, TransformSpace);
+
+	int32 BoneIdx = GetBoneIndex(InSocketName);
+
+	// As bones in a destructible might be scaled to 0 when hidden, we force a scale of 1 if we want the socket transform
+	if (BoneIdx > 0 && IsBoneHidden(BoneIdx))
+	{
+		ST.SetScale3D(FVector(1.0f, 1.0f, 1.0f));
+	}
+
+	return ST;
+}
+
+#if WITH_APEX
+void UDestructibleComponent::Pair( int32 ChunkIndex, PxShape* PShape)
+{
+	FApexDestructionCustomPayload* CI;
+	FPhysxUserData* UserData;
+
+	check(ChunkIndex < ChunkInfos.Num());
+
+	CI = &ChunkInfos[ChunkIndex];
+
+	CI->ChunkIndex = ChunkIndex;
+	CI->OwningComponent = this;
+
+	UserData = &PhysxChunkUserData[ChunkIndex];
+	UserData->Set<FCustomPhysXPayload>(UserData, CI);
+
+	PShape->userData = UserData;
+
+	PShape->getActor()->userData = UserData;
+
+	PShape->getActor()->setActorFlag(PxActorFlag::eDISABLE_GRAVITY, !BodyInstance.bEnableGravity);
+
+	// Set collision response to non-root chunks
+	if (GetDestructibleMesh()->ApexDestructibleAsset->getChunkParentIndex(ChunkIndex) >= 0)
+	{
+		SetCollisionResponseForShape(PShape, ChunkIndex);
+	}
+}
+#endif
+
+void UDestructibleComponent::SetChunkVisible( int32 ChunkIndex, bool bInVisible )
+{
+#if WITH_APEX
+	// Bone 0 is a dummy root bone
+	const int32 BoneIndex = ChunkIdxToBoneIdx(ChunkIndex);
+
+	if( bInVisible )
+	{
+		UnHideBone(BoneIndex);
+
+		if (NULL != ApexDestructibleActor)
+		{
+			physx::PxShape** PShapes;
+			const physx::PxU32 PShapeCount = ApexDestructibleActor->getChunkPhysXShapes(PShapes, ChunkIndex);
+			if (PShapeCount > 0)
+			{
+				const physx::PxMat44 ChunkPoseRT = ApexDestructibleActor->getChunkPose(ChunkIndex);	// Unscaled
+				const physx::PxTransform Transform(ChunkPoseRT);
+				if(IsFracturedOrInitiallyStatic())
+				{
+					SetChunkWorldRT(ChunkIndex, P2UQuat(Transform.q), P2UVector(Transform.p));
+				}
+				else
+				{
+					// Not yet fractured, sync the component to the physics body
+					UPrimitiveComponent::SyncComponentToRBPhysics();
+				}
+			}
+		}
+	}
+	else
+	{
+		HideBone(BoneIndex, PBO_None);
+	}
+
+	// Mark the transform as dirty, so the bounds are updated and sent to the render thread
+	MarkRenderTransformDirty();
+
+	// New bone positions need to be sent to render thread
+	MarkRenderDynamicDataDirty();
+#endif
+}
+
+
+void UDestructibleComponent::SetChunksWorldTM(const TArray<FUpdateChunksInfo>& UpdateInfos)
+{
+	const FQuat InvRotation = GetComponentTransform().GetRotation().Inverse();
+
+	for (const FUpdateChunksInfo& UpdateInfo : UpdateInfos)
+	{
+		// Bone 0 is a dummy root bone
+		const int32 BoneIndex = ChunkIdxToBoneIdx(UpdateInfo.ChunkIndex);
+		const FVector WorldTranslation	= UpdateInfo.WorldTM.GetLocation();
+		const FQuat WorldRotation		= UpdateInfo.WorldTM.GetRotation();
+
+		const FQuat BoneRotation = InvRotation*WorldRotation;
+		const FVector BoneTranslation = InvRotation.RotateVector(WorldTranslation - GetComponentTransform().GetTranslation()) / GetComponentTransform().GetScale3D();
+
+		GetEditableComponentSpaceTransforms()[BoneIndex] = FTransform(BoneRotation, BoneTranslation);
+	}
+
+	bNeedToFlipSpaceBaseBuffers = true;
+
+	// Mark the transform as dirty, so the bounds are updated and sent to the render thread
+	MarkRenderTransformDirty();
+
+	// New bone positions need to be sent to render thread
+	MarkRenderDynamicDataDirty();
+
+	//Update bone visibilty and flip the editable space base buffer
+	FinalizeBoneTransform();
+}
+
+void UDestructibleComponent::SetChunkWorldRT( int32 ChunkIndex, const FQuat& WorldRotation, const FVector& WorldTranslation )
+{
+	// Bone 0 is a dummy root bone
+	const int32 BoneIndex = ChunkIdxToBoneIdx(ChunkIndex);
+
+	// Mark the transform as dirty, so the bounds are updated and sent to the render thread
+	MarkRenderTransformDirty();
+
+	// New bone positions need to be sent to render thread
+	MarkRenderDynamicDataDirty();
+
+#if 0
+	// Scale is already applied to the GetComponentTransform() transform, and is carried into the bones _locally_.
+	// So there is no need to set scale in the bone local transforms
+	const FTransform WorldRT(WorldRotation, WorldTranslation, GetComponentTransform().GetScale3D());
+	SpaceBases(BoneIndex) = WorldRT*GetComponentTransform().Inverse();
+#elif 1
+	// More optimal form of the above
+	const FQuat BoneRotation = GetComponentTransform().GetRotation().Inverse()*WorldRotation;
+	const FVector BoneTranslation = GetComponentTransform().GetRotation().Inverse().RotateVector(WorldTranslation - GetComponentTransform().GetTranslation())/GetComponentTransform().GetScale3D();
+	GetEditableComponentSpaceTransforms()[BoneIndex] = FTransform(BoneRotation, BoneTranslation);
+#endif
+}
+
+void UDestructibleComponent::ApplyDamage(float DamageAmount, const FVector& HitLocation, const FVector& ImpulseDir, float ImpulseStrength)
+{
+#if WITH_APEX
+	if (ApexDestructibleActor != NULL)
+	{
+		const FVector& NormalizedImpactDir = ImpulseDir.GetSafeNormal();
+
+		// Transfer damage information to the APEX NxDestructibleActor interface
+		ApexDestructibleActor->applyDamage(DamageAmount, ImpulseStrength, U2PVector( HitLocation ), U2PVector( ImpulseDir ));
+	}
+#endif
+}
+
+void UDestructibleComponent::ApplyRadiusDamage(float BaseDamage, const FVector& HurtOrigin, float DamageRadius, float ImpulseStrength, bool bFullDamage)
+{
+#if WITH_APEX
+	if (ApexDestructibleActor != NULL)
+	{
+		// Transfer damage information to the APEX NxDestructibleActor interface
+		ApexDestructibleActor->applyRadiusDamage(BaseDamage, ImpulseStrength, U2PVector( HurtOrigin ), DamageRadius, bFullDamage ? false : true);
+	}
+#endif
+}
+
+#if WITH_APEX
+int32 ExportPxActorGeometry(const PxRigidDynamic* PActor, TArray<PxShape*>& Shapes, FNavigableGeometryExport& GeomExport)
+{
+	int32 ShapesExportedCount = 0;
+	if (PActor == nullptr)
+	{
+		return ShapesExportedCount;
+	}
+
+	const FTransform PActorGlobalPose = P2UTransform(PActor->getGlobalPose());
+
+	const PxU32 ShapesCount = PActor->getNbShapes();
+	if (ShapesCount > PxU32(Shapes.Num()))
+	{
+		Shapes.AddUninitialized(ShapesCount - Shapes.Num());
+	}
+	const PxU32 RetrievedShapesCount = PActor->getShapes(Shapes.GetData(), Shapes.Num());
+	PxShape* const* ShapePtr = Shapes.GetData();
+	for (PxU32 ShapeIndex = 0; ShapeIndex < RetrievedShapesCount; ++ShapeIndex, ++ShapePtr)
+	{
+		if (*ShapePtr != NULL)
+		{
+			const PxTransform LocalPose = (*ShapePtr)->getLocalPose();
+			FTransform LocalToWorld = P2UTransform(LocalPose);
+			LocalToWorld.Accumulate(PActorGlobalPose);
+
+			switch ((*ShapePtr)->getGeometryType())
+			{
+			case PxGeometryType::eCONVEXMESH:
+			{
+				PxConvexMeshGeometry Geometry;
+				if ((*ShapePtr)->getConvexMeshGeometry(Geometry))
+				{
+					++ShapesExportedCount;
+
+					// @todo address Geometry.scale not being used here
+					GeomExport.ExportPxConvexMesh(Geometry.convexMesh, LocalToWorld);
+				}
+			}
+				break;
+
+			case PxGeometryType::eTRIANGLEMESH:
+			{
+				// @todo address Geometry.scale not being used here
+				PxTriangleMeshGeometry Geometry;
+				if ((*ShapePtr)->getTriangleMeshGeometry(Geometry))
+				{
+					++ShapesExportedCount;
+					if ((Geometry.triangleMesh->getTriangleMeshFlags()) & PxTriangleMeshFlag::e16_BIT_INDICES)
+					{
+						GeomExport.ExportPxTriMesh16Bit(Geometry.triangleMesh, LocalToWorld);
+					}
+					else
+					{
+						GeomExport.ExportPxTriMesh32Bit(Geometry.triangleMesh, LocalToWorld);
+					}
+				}
+			}
+				break;
+
+			default:
+			{
+				UE_LOG(LogPhysics, Log, TEXT("UDestructibleComponent::DoCustomNavigableGeometryExport(): unhandled PxGeometryType, %d.")
+					, int32((*ShapePtr)->getGeometryType()));
+			}
+				break;
+			}
+		}
+	}
+
+	return ShapesExportedCount;
+}
+#endif
+
+DECLARE_DWORD_COUNTER_STAT(TEXT("Num Destructible shapes exported"),STAT_Navigation_DestructiblesShapesExported,STATGROUP_Navigation );
+
+bool UDestructibleComponent::DoCustomNavigableGeometryExport(FNavigableGeometryExport& GeomExport) const
+{
+	bool bExportFromBodySetup = true;
+
+#if WITH_APEX
+	if (ApexDestructibleActor == NULL)
+	{
+#if WITH_EDITORONLY_DATA
+		if (DestructibleMesh && DestructibleMesh->SourceStaticMesh)
+		{
+			GeomExport.ExportRigidBodySetup(*DestructibleMesh->SourceStaticMesh->BodySetup, GetComponentTransform());
+			bExportFromBodySetup = false;
+		}
+#endif	// WITH_EDITORONLY_DATA
+
+		return bExportFromBodySetup;
+	}
+
+	apex::DestructibleActor* DestrActor = const_cast<apex::DestructibleActor*>(ApexDestructibleActor);
+
+	const FTransform ComponentToWorldNoScale(GetComponentTransform().GetRotation(), GetComponentTransform().GetTranslation(), FVector(1.f));
+	TArray<PxShape*> Shapes;
+	Shapes.AddUninitialized(8);
+	PxRigidDynamic** PActorBuffer = NULL;
+	PxU32 PActorCount = 0;
+	if (DestrActor->acquirePhysXActorBuffer(PActorBuffer, PActorCount
+		, apex::DestructiblePhysXActorQueryFlags::Static
+		| apex::DestructiblePhysXActorQueryFlags::Dormant
+		| apex::DestructiblePhysXActorQueryFlags::Dynamic))
+	{
+		uint32 ShapesExportedCount = 0;
+
+		while (PActorCount--)
+		{
+			const PxRigidDynamic* PActor = *PActorBuffer++;
+			int32 NumExported = ExportPxActorGeometry(PActor, Shapes, GeomExport);
+			ShapesExportedCount += NumExported;
+		}
+
+		ApexDestructibleActor->releasePhysXActorBuffer();
+		bExportFromBodySetup = (ShapesExportedCount == 0);
+
+		INC_DWORD_STAT_BY(STAT_Navigation_DestructiblesShapesExported, ShapesExportedCount);
+	}
+
+	// workaround for not fractured actor
+	if (bExportFromBodySetup)
+	{
+		const PxU32 VisibleChunkCount = ApexDestructibleActor->getNumVisibleChunks();
+		if (VisibleChunkCount == 1)
+		{
+			const PxU16* VisibleChunks = ApexDestructibleActor->getVisibleChunks();
+			if (VisibleChunks[0] == 0)
+			{
+				// only root chunk visible = not fractured
+				const PxRigidDynamic* PActor = ApexDestructibleActor->getChunkPhysXActor(0);
+				
+				const int32 NumExported = ExportPxActorGeometry(PActor, Shapes, GeomExport);
+				bExportFromBodySetup = (NumExported == 0);
+			}
+		}
+	}
+#endif // WITH_APEX
+
+	// we don't want a regular geometry export
+	return bExportFromBodySetup;
+}
+
+void UDestructibleComponent::Activate( bool bReset/*=false*/ )
+{
+	if (bReset || ShouldActivate()==true)
+	{
+		SetActiveFlag(true);
+	}
+}
+
+void UDestructibleComponent::Deactivate()
+{
+	if (ShouldActivate()==false)
+	{
+		SetActiveFlag(false);
+	}
+}
+
+void UDestructibleComponent::SetCollisionResponseToChannel(ECollisionChannel Channel, ECollisionResponse NewResponse)
+{
+#if WITH_APEX
+	if(ApexDestructibleActor)
+	{
+		if (DestructibleAsset* Asset = GetDestructibleMesh()->GetApexDestructibleAsset())
+		{
+			PxU32 NumChunks = Asset->getChunkCount();
+
+			for (uint32 ChunkIdx = 0; ChunkIdx < NumChunks; ++ChunkIdx)
+			{
+				PxRigidDynamic* PxActor = ApexDestructibleActor->getChunkPhysXActor(ChunkIdx);
+				int32 BoneIndex = ChunkIdxToBoneIdx(ChunkIdx);
+
+				SetupFakeBodyInstance(PxActor, BoneIndex);
+
+				BodyInstance.SetResponseToChannel(Channel, NewResponse);
+			}
+
+			if (NumChunks > 0)
+			{
+				OnComponentCollisionSettingsChanged();
+			}
+		}
+	}
+#endif
+}
+
+void UDestructibleComponent::SetCollisionResponseToAllChannels(ECollisionResponse NewResponse)
+{
+#if WITH_APEX
+	if(ApexDestructibleActor)
+	{
+		if (DestructibleAsset* Asset = GetDestructibleMesh()->GetApexDestructibleAsset())
+		{
+			PxU32 NumChunks = Asset->getChunkCount();
+
+
+			for(uint32 ChunkIdx = 0; ChunkIdx < NumChunks; ++ChunkIdx)
+			{
+				PxRigidDynamic* PxActor = ApexDestructibleActor->getChunkPhysXActor(ChunkIdx);
+				int32 BoneIndex = ChunkIdxToBoneIdx(ChunkIdx);
+
+				SetupFakeBodyInstance(PxActor, BoneIndex);
+
+				BodyInstance.SetResponseToAllChannels(NewResponse);
+			}
+
+			if(NumChunks > 0)
+			{
+				OnComponentCollisionSettingsChanged();
+			}
+		}
+	}
+#endif
+}
+
+void UDestructibleComponent::SetCollisionResponseToChannels(const FCollisionResponseContainer& NewReponses)
+{
+#if WITH_APEX
+	if(ApexDestructibleActor)
+	{
+		if (DestructibleAsset* Asset = GetDestructibleMesh()->GetApexDestructibleAsset())
+		{
+			PxU32 NumChunks = Asset->getChunkCount();
+
+
+			for(uint32 ChunkIdx = 0; ChunkIdx < NumChunks; ++ChunkIdx)
+			{
+				PxRigidDynamic* PxActor = ApexDestructibleActor->getChunkPhysXActor(ChunkIdx);
+				int32 BoneIndex = ChunkIdxToBoneIdx(ChunkIdx);
+
+				SetupFakeBodyInstance(PxActor, BoneIndex);
+
+				BodyInstance.SetResponseToChannels(NewReponses);
+			}
+
+			if(NumChunks > 0)
+			{
+				OnComponentCollisionSettingsChanged();
+			}
+		}
+	}
+#endif
+}
+
+bool UDestructibleComponent::ShouldUpdateTransform(bool bLODHasChanged) const
+{
+	// We do not want to update bone transforms before physics has finished
+	return false;
+}
+
+bool UDestructibleComponent::LineTraceComponent( FHitResult& OutHit, const FVector Start, const FVector End, const FCollisionQueryParams& Params )
+{
+	bool bHaveHit = false;
+#if WITH_APEX
+	if (ApexDestructibleActor != NULL)
+	{
+		PxF32 HitTime = 0.0f;
+		PxVec3 HitNormal;
+		
+		int32 ChunkIdx = ApexDestructibleActor->rayCast(HitTime, HitNormal, U2PVector(Start), U2PVector(End-Start), apex::DestructibleActorRaycastFlags::AllChunks);
+
+		if (ChunkIdx != apex::ModuleDestructibleConst::INVALID_CHUNK_INDEX && HitTime <= 1.0f)
+		{
+			PxRigidDynamic* PActor = ApexDestructibleActor->getChunkPhysXActor(ChunkIdx);
+
+			if (PActor != NULL)
+			{
+				// Store body instance state
+				FFakeBodyInstanceState PrevState;
+				SetupFakeBodyInstance(PActor, ChunkIdx, &PrevState);
+				
+				bHaveHit = Super::LineTraceComponent(OutHit, Start, End, Params);
+
+				// Reset original body instance
+				ResetFakeBodyInstance(PrevState);
+			}
+		}
+	}
+#endif
+	return bHaveHit;
+}
+
+bool UDestructibleComponent::SweepComponent(FHitResult& OutHit, const FVector Start, const FVector End, const FQuat& ShapeWorldRotation, const FCollisionShape &CollisionShape, bool bTraceComplex/*=false*/)
+{
+	bool bHaveHit = false;
+#if WITH_APEX
+	if (ApexDestructibleActor != NULL)
+	{
+		PxF32 HitTime = 0.0f;
+		PxVec3 HitNormal;
+
+		int32 ChunkIdx = ApexDestructibleActor->obbSweep(HitTime, HitNormal, U2PVector(Start), U2PVector(CollisionShape.GetExtent()), PxMat33(physx::PxIdentity), U2PVector(End - Start), apex::DestructibleActorRaycastFlags::AllChunks);
+
+		if (ChunkIdx != apex::ModuleDestructibleConst::INVALID_CHUNK_INDEX && HitTime <= 1.0f)
+		{
+			PxRigidDynamic* PActor = ApexDestructibleActor->getChunkPhysXActor(ChunkIdx);
+
+			if (PActor != NULL)
+			{
+				// Store body instance state
+				FFakeBodyInstanceState PrevState;
+				SetupFakeBodyInstance(PActor, ChunkIdx, &PrevState);
+
+				bHaveHit = Super::SweepComponent(OutHit, Start, End, ShapeWorldRotation, CollisionShape, bTraceComplex);
+
+				// Reset original body instance
+				ResetFakeBodyInstance(PrevState);
+			}
+		}
+	}
+#endif
+	return bHaveHit;
+}
+
+#if WITH_APEX
+void UDestructibleComponent::SetupFakeBodyInstance( physx::PxRigidActor* NewRigidActor, int32 InstanceIdx, FFakeBodyInstanceState* PrevState )
+{
+	//This code is very dangerous, but at the moment I have no better solution:
+	//Destructible component assigns PxRigidDynamic to the BodyInstance as it needs it.
+	//Destructible PxRigidDynamic actors can be deleted from under us as PhysX sees fit.
+	//Ideally we wouldn't ever have a dangling pointer, but in practice this is hard to avoid.
+	//In theory anyone using BodyInstance on a PrimitiveComponent should be using functions like GetBodyInstance - in which case we properly fix up the dangling pointer
+
+#if WITH_CHAOS || WITH_IMMEDIATE_PHYSX
+    check(PrevState == nullptr);
+#else
+	if (PrevState != NULL)
+	{
+		PrevState->ActorSync = BodyInstance.ActorHandle.SyncActor;
+		PrevState->InstanceIndex = BodyInstance.InstanceBodyIndex;
+	}
+#endif
+
+	const UWorld* World = GetWorld();
+	const FPhysScene* PhysScene = World ? World->GetPhysicsScene() : nullptr;
+
+#if WITH_CHAOS || WITH_IMMEDIATE_PHYSX
+    check(false);
+#else
+	BodyInstance.ActorHandle.SyncActor = NewRigidActor;
+#endif
+	BodyInstance.InstanceBodyIndex = InstanceIdx;
+}
+
+void UDestructibleComponent::ResetFakeBodyInstance( FFakeBodyInstanceState& PrevState )
+{
+#if WITH_CHAOS || WITH_IMMEDIATE_PHYSX
+    check(false);
+#else
+	BodyInstance.ActorHandle.SyncActor = PrevState.ActorSync;
+#endif
+	BodyInstance.InstanceBodyIndex = PrevState.InstanceIndex;
+}
+
+#endif
+
+void UDestructibleComponent::WakeRigidBody(FName BoneName /* = NAME_None */)
+{
+#if WITH_APEX
+	Execu

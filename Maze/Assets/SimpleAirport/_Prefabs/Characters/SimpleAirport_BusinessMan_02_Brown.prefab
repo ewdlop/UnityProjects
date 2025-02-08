@@ -1,0 +1,863 @@
+; RUN:  llc -amdgpu-scalarize-global-loads=false  -march=amdgcn -verify-machineinstrs < %s | FileCheck -check-prefix=GCN -check-prefix=SI %s
+; RUN:  llc -amdgpu-scalarize-global-loads=false  -march=amdgcn -mcpu=tonga -mattr=-flat-for-global -verify-machineinstrs < %s | FileCheck -check-prefix=GCN -check-prefix=VI %s
+
+; GCN-LABEL: {{^}}bfe_u32_arg_arg_arg:
+; GCN: v_bfe_u32
+define amdgpu_kernel void @bfe_u32_arg_arg_arg(i32 addrspace(1)* %out, i32 %src0, i32 %src1, i32 %src2) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.ubfe.i32(i32 %src0, i32 %src1, i32 %src1)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_arg_arg_imm:
+; GCN: v_bfe_u32
+define amdgpu_kernel void @bfe_u32_arg_arg_imm(i32 addrspace(1)* %out, i32 %src0, i32 %src1) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.ubfe.i32(i32 %src0, i32 %src1, i32 123)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_arg_imm_arg:
+; GCN: v_bfe_u32
+define amdgpu_kernel void @bfe_u32_arg_imm_arg(i32 addrspace(1)* %out, i32 %src0, i32 %src2) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.ubfe.i32(i32 %src0, i32 123, i32 %src2)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_imm_arg_arg:
+; GCN: v_bfe_u32
+define amdgpu_kernel void @bfe_u32_imm_arg_arg(i32 addrspace(1)* %out, i32 %src1, i32 %src2) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.ubfe.i32(i32 123, i32 %src1, i32 %src2)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_arg_0_width_reg_offset:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_u32_arg_0_width_reg_offset(i32 addrspace(1)* %out, i32 %src0, i32 %src1) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.ubfe.i32(i32 %src0, i32 %src1, i32 0)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_arg_0_width_imm_offset:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_u32_arg_0_width_imm_offset(i32 addrspace(1)* %out, i32 %src0, i32 %src1) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.ubfe.i32(i32 %src0, i32 8, i32 0)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_zextload_i8:
+; GCN: buffer_load_ubyte
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_u32_zextload_i8(i32 addrspace(1)* %out, i8 addrspace(1)* %in) #0 {
+  %load = load i8, i8 addrspace(1)* %in
+  %ext = zext i8 %load to i32
+  %bfe = call i32 @llvm.amdgcn.ubfe.i32(i32 %ext, i32 0, i32 8)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_zext_in_reg_i8:
+; GCN: buffer_load_dword
+; GCN: v_add_{{[iu]}}32
+; GCN-NEXT: v_and_b32_e32
+; FIXME: Should be using s_add_i32
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_u32_zext_in_reg_i8(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %load = load i32, i32 addrspace(1)* %in, align 4
+  %add = add i32 %load, 1
+  %ext = and i32 %add, 255
+  %bfe = call i32 @llvm.amdgcn.ubfe.i32(i32 %ext, i32 0, i32 8)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_zext_in_reg_i16:
+; GCN: buffer_load_dword
+; GCN: v_add_{{[iu]}}32
+; GCN-NEXT: v_and_b32_e32
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_u32_zext_in_reg_i16(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %load = load i32, i32 addrspace(1)* %in, align 4
+  %add = add i32 %load, 1
+  %ext = and i32 %add, 65535
+  %bfe = call i32 @llvm.amdgcn.ubfe.i32(i32 %ext, i32 0, i32 16)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_zext_in_reg_i8_offset_1:
+; GCN: buffer_load_dword
+; GCN: v_add_{{[iu]}}32
+; GCN: bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_u32_zext_in_reg_i8_offset_1(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %load = load i32, i32 addrspace(1)* %in, align 4
+  %add = add i32 %load, 1
+  %ext = and i32 %add, 255
+  %bfe = call i32 @llvm.amdgcn.ubfe.i32(i32 %ext, i32 1, i32 8)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_zext_in_reg_i8_offset_3:
+; GCN: buffer_load_dword
+; GCN: v_add_{{[iu]}}32
+; GCN-NEXT: v_and_b32_e32 {{v[0-9]+}}, 0xf8
+; GCN-NEXT: bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_u32_zext_in_reg_i8_offset_3(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %load = load i32, i32 addrspace(1)* %in, align 4
+  %add = add i32 %load, 1
+  %ext = and i32 %add, 255
+  %bfe = call i32 @llvm.amdgcn.ubfe.i32(i32 %ext, i32 3, i32 8)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_zext_in_reg_i8_offset_7:
+; GCN: buffer_load_dword
+; GCN: v_add_{{[iu]}}32
+; GCN-NEXT: v_and_b32_e32 {{v[0-9]+}}, 0x80
+; GCN-NEXT: bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_u32_zext_in_reg_i8_offset_7(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %load = load i32, i32 addrspace(1)* %in, align 4
+  %add = add i32 %load, 1
+  %ext = and i32 %add, 255
+  %bfe = call i32 @llvm.amdgcn.ubfe.i32(i32 %ext, i32 7, i32 8)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_zext_in_reg_i16_offset_8:
+; GCN: buffer_load_dword
+; GCN: v_add_{{[iu]}}32
+; GCN-NEXT: bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_u32_zext_in_reg_i16_offset_8(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %load = load i32, i32 addrspace(1)* %in, align 4
+  %add = add i32 %load, 1
+  %ext = and i32 %add, 65535
+  %bfe = call i32 @llvm.amdgcn.ubfe.i32(i32 %ext, i32 8, i32 8)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_test_1:
+; GCN: buffer_load_dword
+; GCN: v_and_b32_e32 {{v[0-9]+}}, 1, {{v[0-9]+}}
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_u32_test_1(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %bfe = call i32 @llvm.amdgcn.ubfe.i32(i32 %x, i32 0, i32 1)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+define amdgpu_kernel void @bfe_u32_test_2(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %shl = shl i32 %x, 31
+  %bfe = call i32 @llvm.amdgcn.ubfe.i32(i32 %shl, i32 0, i32 8)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+define amdgpu_kernel void @bfe_u32_test_3(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %shl = shl i32 %x, 31
+  %bfe = call i32 @llvm.amdgcn.ubfe.i32(i32 %shl, i32 0, i32 1)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_test_4:
+; GCN-NOT: lshl
+; GCN-NOT: shr
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 0
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_u32_test_4(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %shl = shl i32 %x, 31
+  %shr = lshr i32 %shl, 31
+  %bfe = call i32 @llvm.amdgcn.ubfe.i32(i32 %shr, i32 31, i32 1)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_test_5:
+; GCN: buffer_load_dword
+; GCN-NOT: lshl
+; GCN-NOT: shr
+; GCN: v_bfe_i32 {{v[0-9]+}}, {{v[0-9]+}}, 0, 1
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_u32_test_5(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %shl = shl i32 %x, 31
+  %shr = ashr i32 %shl, 31
+  %bfe = call i32 @llvm.amdgcn.ubfe.i32(i32 %shr, i32 0, i32 1)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_test_6:
+; GCN: v_lshlrev_b32_e32 v{{[0-9]+}}, 31, v{{[0-9]+}}
+; GCN: v_lshrrev_b32_e32 v{{[0-9]+}}, 1, v{{[0-9]+}}
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_u32_test_6(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %shl = shl i32 %x, 31
+  %bfe = call i32 @llvm.amdgcn.ubfe.i32(i32 %shl, i32 1, i32 31)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_test_7:
+; GCN: v_lshlrev_b32_e32 v{{[0-9]+}}, 31, v{{[0-9]+}}
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_u32_test_7(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %shl = shl i32 %x, 31
+  %bfe = call i32 @llvm.amdgcn.ubfe.i32(i32 %shl, i32 0, i32 31)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_test_8:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_and_b32_e32 {{v[0-9]+}}, 1, {{v[0-9]+}}
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_u32_test_8(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %shl = shl i32 %x, 31
+  %bfe = call i32 @llvm.amdgcn.ubfe.i32(i32 %shl, i32 31, i32 1)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_test_9:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_lshrrev_b32_e32 v{{[0-9]+}}, 31, v{{[0-9]+}}
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_u32_test_9(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %bfe = call i32 @llvm.amdgcn.ubfe.i32(i32 %x, i32 31, i32 1)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_test_10:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_lshrrev_b32_e32 v{{[0-9]+}}, 1, v{{[0-9]+}}
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_u32_test_10(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %bfe = call i32 @llvm.amdgcn.ubfe.i32(i32 %x, i32 1, i32 31)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_test_11:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_lshrrev_b32_e32 v{{[0-9]+}}, 8, v{{[0-9]+}}
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_u32_test_11(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %bfe = call i32 @llvm.amdgcn.ubfe.i32(i32 %x, i32 8, i32 24)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_test_12:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_lshrrev_b32_e32 v{{[0-9]+}}, 24, v{{[0-9]+}}
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_u32_test_12(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %bfe = call i32 @llvm.amdgcn.ubfe.i32(i32 %x, i32 24, i32 8)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_test_13:
+; V_ASHRREV_U32_e32 {{v[0-9]+}}, 31, {{v[0-9]+}}
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_u32_test_13(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %shl = ashr i32 %x, 31
+  %bfe = call i32 @llvm.amdgcn.ubfe.i32(i32 %shl, i32 31, i32 1)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4 ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_test_14:
+; GCN-NOT: lshr
+; GCN-NOT: {{[^@]}}bfe
+; GCN: s_endpgm
+define amdgpu_kernel void @bfe_u32_test_14(i32 addrspace(1)* %out, i32 addrspace(1)* %in) #0 {
+  %x = load i32, i32 addrspace(1)* %in, align 4
+  %shl = lshr i32 %x, 31
+  %bfe = call i32 @llvm.amdgcn.ubfe.i32(i32 %shl, i32 31, i32 1)
+  store i32 %bfe, i32 addrspace(1)* %out, align 4 ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_constant_fold_test_0:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 0
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+; EG-NOT: BFE
+define amdgpu_kernel void @bfe_u32_constant_fold_test_0(i32 addrspace(1)* %out) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.ubfe.i32(i32 0, i32 0, i32 0)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_constant_fold_test_1:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 0
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+; EG-NOT: BFE
+define amdgpu_kernel void @bfe_u32_constant_fold_test_1(i32 addrspace(1)* %out) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.ubfe.i32(i32 12334, i32 0, i32 0)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_constant_fold_test_2:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 0
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+; EG-NOT: BFE
+define amdgpu_kernel void @bfe_u32_constant_fold_test_2(i32 addrspace(1)* %out) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.ubfe.i32(i32 0, i32 0, i32 1)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_constant_fold_test_3:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 1
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+; EG-NOT: BFE
+define amdgpu_kernel void @bfe_u32_constant_fold_test_3(i32 addrspace(1)* %out) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.ubfe.i32(i32 1, i32 0, i32 1)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_constant_fold_test_4:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], -1
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+; EG-NOT: BFE
+define amdgpu_kernel void @bfe_u32_constant_fold_test_4(i32 addrspace(1)* %out) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.ubfe.i32(i32 4294967295, i32 0, i32 1)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_constant_fold_test_5:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 1
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+; EG-NOT: BFE
+define amdgpu_kernel void @bfe_u32_constant_fold_test_5(i32 addrspace(1)* %out) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.ubfe.i32(i32 128, i32 7, i32 1)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_constant_fold_test_6:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 0x80
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+; EG-NOT: BFE
+define amdgpu_kernel void @bfe_u32_constant_fold_test_6(i32 addrspace(1)* %out) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.ubfe.i32(i32 128, i32 0, i32 8)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_constant_fold_test_7:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 0x7f
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+; EG-NOT: BFE
+define amdgpu_kernel void @bfe_u32_constant_fold_test_7(i32 addrspace(1)* %out) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.ubfe.i32(i32 127, i32 0, i32 8)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_constant_fold_test_8:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 1
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+; EG-NOT: BFE
+define amdgpu_kernel void @bfe_u32_constant_fold_test_8(i32 addrspace(1)* %out) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.ubfe.i32(i32 127, i32 6, i32 8)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_constant_fold_test_9:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 1
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+; EG-NOT: BFE
+define amdgpu_kernel void @bfe_u32_constant_fold_test_9(i32 addrspace(1)* %out) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.ubfe.i32(i32 65536, i32 16, i32 8)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_constant_fold_test_10:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 0
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+; EG-NOT: BFE
+define amdgpu_kernel void @bfe_u32_constant_fold_test_10(i32 addrspace(1)* %out) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.ubfe.i32(i32 65535, i32 16, i32 16)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_constant_fold_test_11:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 10
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+; EG-NOT: BFE
+define amdgpu_kernel void @bfe_u32_constant_fold_test_11(i32 addrspace(1)* %out) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.ubfe.i32(i32 160, i32 4, i32 4)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_constant_fold_test_12:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 0
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+; EG-NOT: BFE
+define amdgpu_kernel void @bfe_u32_constant_fold_test_12(i32 addrspace(1)* %out) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.ubfe.i32(i32 160, i32 31, i32 1)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_constant_fold_test_13:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 1
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+; EG-NOT: BFE
+define amdgpu_kernel void @bfe_u32_constant_fold_test_13(i32 addrspace(1)* %out) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.ubfe.i32(i32 131070, i32 16, i32 16)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_constant_fold_test_14:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 40
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+; EG-NOT: BFE
+define amdgpu_kernel void @bfe_u32_constant_fold_test_14(i32 addrspace(1)* %out) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.ubfe.i32(i32 160, i32 2, i32 30)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_constant_fold_test_15:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 10
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+; EG-NOT: BFE
+define amdgpu_kernel void @bfe_u32_constant_fold_test_15(i32 addrspace(1)* %out) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.ubfe.i32(i32 160, i32 4, i32 28)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_constant_fold_test_16:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 0x7f
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+; EG-NOT: BFE
+define amdgpu_kernel void @bfe_u32_constant_fold_test_16(i32 addrspace(1)* %out) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.ubfe.i32(i32 4294967295, i32 1, i32 7)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_constant_fold_test_17:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 0x7f
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+; EG-NOT: BFE
+define amdgpu_kernel void @bfe_u32_constant_fold_test_17(i32 addrspace(1)* %out) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.ubfe.i32(i32 255, i32 1, i32 31)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}bfe_u32_constant_fold_test_18:
+; GCN-NOT: {{[^@]}}bfe
+; GCN: v_mov_b32_e32 [[VREG:v[0-9]+]], 0
+; GCN: buffer_store_dword [[VREG]],
+; GCN: s_endpgm
+; EG-NOT: BFE
+define amdgpu_kernel void @bfe_u32_constant_fold_test_18(i32 addrspace(1)* %out) #0 {
+  %bfe_u32 = call i32 @llvm.amdgcn.ubfe.i32(i32 255, i32 31, i32 1)
+  store i32 %bfe_u32, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+; Make sure that SimplifyDemandedBits doesn't cause the and to be
+; reduced to the bits demanded by the bfe.
+
+; XXX: The operand to v_bfe_u32 could also just directly be the load register.
+; GCN-LABEL: {{^}}simplify_bfe_u32_multi_use_arg:
+; GCN: buffer_load_dword [[ARG:v[0-9]+]]
+; GCN: v_and_b32_e32 [[AND:v[0-9]+]], 63, [[ARG]]
+; GCN: v_bfe_u32 [[BFE:v[0-9]+]], [[AND]], 2, 2
+; GCN-DAG: buffer_store_dword [[AND]]
+; GCN-DAG: buffer_store_dword [[BFE]]
+; GCN: s_endpgm
+define amdgpu_kernel void @simplify_bfe_u32_multi_use_arg(i32 addrspace(1)* %out0,
+                                            i32 addrspace(1)* %out1,
+                                            i32 addrspace(1)* %in) #0 {
+  %src = load i32, i32 addrspace(1)* %in, align 4
+  %and = and i32 %src, 63
+  %bfe_u32 = call i32 @llvm.amdgcn.ubfe.i32(i32 %and, i32 2, i32 2)
+  store i32 %bfe_u32, i32 addrspace(1)* %out0, align 4
+  store i32 %and, i32 addrspace(1)* %out1, align 4
+  ret void
+}
+
+; GCN-LABEL: {{^}}lshr_and:
+; GCN: s_bfe_u32 {{s[0-9]+}}, {{s[0-9]+}}, 0x30006
+; GCN: buffer_store_dword
+define amdgpu_kernel void @lshr_and(i32 addrspace(1)* %out, i32 %a) #0 {
+  %b = lshr i32 %a, 6
+  %c = and i32 %b, 7
+  store i32 %c, i32 addrspace(1)* %out, align 8
+  ret void
+}
+
+; GCN-LABEL: {{^}}v_lshr_and:
+; GCN: v_bfe_u32 {{v[0-9]+}}, {{s[0-9]+}}, {{v[0-9]+}}, 3
+; GCN: buffer_store_dword
+define amdgpu_kernel void @v_lshr_and(i32 addrspace(1)* %out, i32 %a, i32 %b) #0 {
+  %c = lshr i32 %a, %b
+  %d = and i32 %c, 7
+  store i32 %d, i32 addrspace(1)* %out, align 8
+  ret void
+}
+
+; GCN-LABEL: {{^}}and_lshr:
+; GCN: s_bfe_u32 {{s[0-9]+}}, {{s[0-9]+}}, 0x30006
+; GCN: buffer_store_dword
+define amdgpu_kernel void @and_lshr(i32 addrspace(1)* %out, i32 %a) #0 {
+  %b = and i32 %a, 448
+  %c = lshr i32 %b, 6
+  store i32 %c, i32 addrspace(1)* %out, align 8
+  ret void
+}
+
+; GCN-LABEL: {{^}}and_lshr2:
+; GCN: s_bfe_u32 {{s[0-9]+}}, {{s[0-9]+}}, 0x30006
+; GCN: buffer_store_dword
+define amdgpu_kernel void @and_lshr2(i32 addrspace(1)* %out, i32 %a) #0 {
+  %b = and i32 %a, 511
+  %c = lshr i32 %b, 6
+  store i32 %c, i32 addrspace(1)* %out, align 8
+  ret void
+}
+
+; GCN-LABEL: {{^}}shl_lshr:
+; GCN: s_bfe_u32 {{s[0-9]+}}, {{s[0-9]+}}, 0x150002
+; GCN: buffer_store_dword
+define amdgpu_kernel void @shl_lshr(i32 addrspace(1)* %out, i32 %a) #0 {
+  %b = shl i32 %a, 9
+  %c = lshr i32 %b, 11
+  store i32 %c, i32 addrspace(1)* %out, align 8
+  ret void
+}
+
+declare i32 @llvm.amdgcn.ubfe.i32(i32, i32, i32) #1
+
+attributes #0 = { nounwind }
+attributes #1 = { nounwind readnone }
+                                                                                                                                                                                                                                                                                                                                                                                                                      ¯ï¡@ÑŒtHÉ¯tHãD$(HâT$HçxËﬁà˛ˇHãT$LâˇHâT$Ëºá˛ˇHãT$ãå$  HãD$h1ÌÖ…Ö!	  ãº$  çwÄ    HãMâ¥$  LçmHÉ˘¯Ñ'  É¨$  H9¡tgHÉ˘tHÖ…tLâÔHâT$Ëbà˛ˇHãD$hHãT$HÉ¯¯HâE@ï∆HÖ¿ï¡@ÑŒÑÕ  HÉ¯Ñ√  Hãt$XLâÔHâT$HÉÊ¯Ëà˛ˇHãD$hHãT$HãL$pH«E(   H«E0    HâM H«E8    Î4HãD$hAçMˇâ¬â∆¡Ó	¡Í1Ú! â’H¡ÂL˝HãuH9∆Ö  HãÏT HÉ¬HÖ¿ï¡HÉ¯¯HâT$Pï¬Ñ—tHÉ¯t
+Hã|$8Ëíá˛ˇHãE8Lçm(I9ƒt7HÖ¿ï¡HÉ¯¯ï¬Ñ—tHÉ¯tLâÔËfá˛ˇLâe8IÉ¸tIÉ¸¯tLâÔËná˛ˇHã[H;\$Ö˙ˇˇ1ˆHÉ|$@ tHã|$@Ëké˛ˇHâ∆Hãl$ Lã|$HMâHçú$   Hã|$@HâÈLâ˙Ë≥ıˇˇHâÔLâÚLâ˛Hâú$‡   H«Ñ$Ë       ∆Ñ$    Ë˘‡ˇˇHãº$‡   H9ﬂtË∑Ö˛ˇÄº$0   Ö  ãî$  Hãú$   Ö“uVHâﬂËéÖ˛ˇ1¿Hãº$H  dH3<%(   Öü
+  HÅƒX  []A\A]A^A_√ HãD$hÈS˛ˇˇfD  HÉ¯¯Ö˛˝ˇˇÈ>˛ˇˇêHã=qS Lã%rS H«¿¯ˇˇˇH¡‚H«Ñ$à      Hç,HçOH«Ñ$ê       Mçl$HâÑ$ò   Hâå$Ä   H«Ñ$†       H«Ñ$∏      H«Ñ$¿       H«Ñ$»   ˇˇˇHâå$∞   H«Ñ$–       Î@ HãÑ$ò   HãSH9¬t:HãÑ$»   H9¬t-HãC8HÉ¯¯@ï∆HÖ¿ï¡@ÑŒtHÉ¯tHç{(ËtÖ˛ˇHãSHâ–HÉ¯¯Lâ+ï¡HÖ¿ï¬Ñ—tHÉ¯t	Hç{ËJÖ˛ˇHÉ√@H9›uâIçD$HâÑ$∞   HãÑ$»   HÖ¿ï¡HÉ¯¯ï¬Ñ—tHÉ¯tHçº$∏   ËÖ˛ˇIçD$HâÑ$Ä   HãÑ$ò   HÖ¿ï¡HÉ¯¯ï¬Ñ—tHÉ¯tHçº$à   ËœÑ˛ˇHãú$   È˛ˇˇfêø   E1…HÉ˛¯Ö#  ã¥$  CçTm É∆ç<µ    9◊Éä¯ˇˇDâÍDâÔ+î$  )Ú¡Ô9˙vHã£Q ÈŒ˚ˇˇfD  Hâ»H—ËH	»Hâ¡H¡ÈH	»Hâ¡H¡ÈH	»Hâ¬H¡ÍH	–Hâ¬H¡ÍH	–∫@   HÉ¿É¯@B¬â«âÑ$  H¡ÁË&É˛ˇHâÑ$   MÖˇÑ
+  ãå$  I¡ÂHã=Q H«Ñ$      H«Ñ$∏      Kç,/H¡·HçwH¡H9»tC∫   E1¿H««¯ˇˇˇÎfD  Hãî$∏   É‚H«@    HÉ¿@HâP»HâxÿHâp¿Lâ@‡H9¡u‘Hã•P Mâ˝H«¡¯ˇˇˇH«Ñ$à      H«Ñ$ê       HÉ¿Hâå$ò   HâÑ$Ä   H«Ñ$†       H«Ñ$∏      H«Ñ$¿       H«Ñ$»   ˇˇˇHâÑ$∞   H«Ñ$–       Hâ\$Î@ Hãå$ò   IãEH9»Ñ    Hãå$»   H9»Ñπ   ãî$  Ö“Ñ’†˛ˇçrˇâ¡â¬Hãº$   ¡Í	¡È1—!Òâ H¡‚HçLãCL9¿Ö•  IãE H«C(   H«C0    HâC IãE8HÖ¿HâC8@ï∆HÉ¯¯ï¡@ÑŒtHÉ¯tIãu(Hç{(HÉÊ¯Ë9Ç˛ˇIãE8ÉÑ$  HÖ¿ï¡HÉ¯¯ï¬Ñ—tHÉ¯t	Iç}(ËÇ˛ˇIãMHãBO HÖ…@ï∆HÉ˘¯HçCIâE ï¿@Ñ∆tHÉ˘t	Iç}ËËÅ˛ˇIÉ≈@L9ÌÖ„˛ˇˇHãÑ$»   Hâ⁄Hã\$HçJHÖ¿Hâå$∞   @ï∆HÉ¯¯ï¡@ÑŒtHÉ¯tHãD$0HâT$HçxËìÅ˛ˇHãT$HçBHâÑ$Ä   HãÑ$ò   HÉ¯¯@ï∆HÖ¿ï¡@ÑŒtHÉ¯tHãD$(HâT$HçxËNÅ˛ˇHãT$LâˇHâT$Ë,Ä˛ˇHãT$ãå$  HãD$h1ÌÖ…Ñp¯ˇˇâ∆â«ÉÈLãÑ$   ¡Ô	¡Ó1˛!ŒâıH¡ÂLÔªønamespace System.Web.Mvc.Html {
+    using System;
+    using System.Collections.Generic;
+    using System.Web.Mvc.Resources;
+    using System.Web.Routing;
+
+    public static class LinkExtensions {
+        public static MvcHtmlString ActionLink(this HtmlHelper htmlHelper, string linkText, string actionName) {
+            return ActionLink(htmlHelper, linkText, actionName, null /* controllerName */, new RouteValueDictionary(), new RouteValueDictionary());
+        }
+
+        public static MvcHtmlString ActionLink(this HtmlHelper htmlHelper, string linkText, string actionName, object routeValues) {
+            return ActionLink(htmlHelper, linkText, actionName, null /* controllerName */, new RouteValueDictionary(routeValues), new RouteValueDictionary());
+        }
+
+        public static MvcHtmlString ActionLink(this HtmlHelper htmlHelper, string linkText, string actionName, object routeValues, object htmlAttributes) {
+            return ActionLink(htmlHelper, linkText, actionName, null /* controllerName */, new RouteValueDictionary(routeValues), HtmlHelper.AnonymousObjectToHtmlAttributes(htmlAttributes));
+        }
+
+        public static MvcHtmlString ActionLink(this HtmlHelper htmlHelper, string linkText, string actionName, RouteValueDictionary routeValues) {
+            return ActionLink(htmlHelper, linkText, actionName, null /* controllerName */, routeValues, new RouteValueDictionary());
+        }
+
+        public static MvcHtmlString ActionLink(this HtmlHelper htmlHelper, string linkText, string actionName, RouteValueDictionary routeValues, IDictionary<string, object> htmlAttributes) {
+            return ActionLink(htmlHelper, linkText, actionName, null /* controllerName */, routeValues, htmlAttributes);
+        }
+
+        public static MvcHtmlString ActionLink(this HtmlHelper htmlHelper, string linkText, string actionName, string controllerName) {
+            return ActionLink(htmlHelper, linkText, actionName, controllerName, new RouteValueDictionary(), new RouteValueDictionary());
+        }
+
+        public static MvcHtmlString ActionLink(this HtmlHelper htmlHelper, string linkText, string actionName, string controllerName, object routeValues, object htmlAttributes) {
+            return ActionLink(htmlHelper, linkText, actionName, controllerName, new RouteValueDictionary(routeValues), HtmlHelper.AnonymousObjectToHtmlAttributes(htmlAttributes));
+        }
+
+        public static MvcHtmlString ActionLink(this HtmlHelper htmlHelper, string linkText, string actionName, string controllerName, RouteValueDictionary routeValues, IDictionary<string, object> htmlAttributes) {
+            if (String.IsNullOrEmpty(linkText)) {
+                throw new ArgumentException(MvcResources.Common_NullOrEmpty, "linkText");
+            }
+            return MvcHtmlString.Create(HtmlHelper.GenerateLink(htmlHelper.ViewContext.RequestContext, htmlHelper.RouteCollection, linkText, null/* routeName */, actionName, controllerName, routeValues, htmlAttributes));
+        }
+
+        public static MvcHtmlString ActionLink(this HtmlHelper htmlHelper, string linkText, string actionName, string controllerName, string protocol, string hostName, string fragment, object routeValues, object htmlAttributes) {
+            return ActionLink(htmlHelper, linkText, actionName, controllerName, protocol, hostName, fragment, new RouteValueDictionary(routeValues), HtmlHelper.AnonymousObjectToHtmlAttributes(htmlAttributes));
+        }
+
+        public static MvcHtmlString ActionLink(this HtmlHelper htmlHelper, string linkText, string actionName, string controllerName, string protocol, string hostName, string fragment, RouteValueDictionary routeValues, IDictionary<string, object> htmlAttributes) {
+            if (String.IsNullOrEmpty(linkText)) {
+                throw new ArgumentException(MvcResources.Common_NullOrEmpty, "linkText");
+            }
+            return MvcHtmlString.Create(HtmlHelper.GenerateLink(htmlHelper.ViewContext.RequestContext, htmlHelper.RouteCollection, linkText, null /* routeName */, actionName, controllerName, protocol, hostName, fragment, routeValues, htmlAttributes));
+        }
+
+        public static MvcHtmlString RouteLink(this HtmlHelper htmlHelper, string linkText, object routeValues) {
+            return RouteLink(htmlHelper, linkText, new RouteValueDictionary(routeValues));
+        }
+
+        public static MvcHtmlString RouteLink(this HtmlHelper htmlHelper, string linkText, RouteValueDictionary routeValues) {
+            return RouteLink(htmlHelper, linkText, routeValues, new RouteValueDictionary());
+        }
+
+        public static MvcHtmlString RouteLink(this HtmlHelper htmlHelper, string linkText, string routeName) {
+            return RouteLink(htmlHelper, linkText, routeName, (object)null /* routeValues */ );
+        }
+
+        public static MvcHtmlString RouteLink(this HtmlHelper htmlHelper, string linkText, string routeName, object routeValues) {
+            return RouteLink(htmlHelper, linkText, routeName, new RouteValueDictionary(routeValues));
+        }
+
+        public static MvcHtmlString RouteLink(this HtmlHelper htmlHelper, string linkText, string routeName, RouteValueDictionary routeValues) {
+            return RouteLink(htmlHelper, linkText, routeName, routeValues, new RouteValueDictionary());
+        }
+
+        public static MvcHtmlString RouteLink(this HtmlHelper htmlHelper, string linkText, object routeValues, object htmlAttributes) {
+            return RouteLink(htmlHelper, linkText, new RouteValueDictionary(routeValues), HtmlHelper.AnonymousObjectToHtmlAttributes(htmlAttributes));
+        }
+
+        public static MvcHtmlString RouteLink(this HtmlHelper htmlHelper, string linkText, RouteValueDictionary routeValues, IDictionary<string, object> htmlAttributes) {
+            return RouteLink(htmlHelper, linkText, null /* routeName */, routeValues, htmlAttributes);
+        }
+
+        public static MvcHtmlString RouteLink(this HtmlHelper htmlHelper, string linkText, string routeName, object routeValues, object htmlAttributes) {
+            return RouteLink(htmlHelper, linkText, routeName, new RouteValueDictionary(routeValues), HtmlHelper.AnonymousObjectToHtmlAttributes(htmlAttributes));
+        }
+
+        public static MvcHtmlString RouteLink(this HtmlHelper htmlHelper, string linkText, string routeName, RouteValueDictionary routeValues, IDictionary<string, object> htmlAttributes) {
+            if (String.IsNullOrEmpty(linkText)) {
+                throw new ArgumentException(MvcResources.Common_NullOrEmpty, "linkText");
+            }
+            return MvcHtmlString.Create(HtmlHelper.GenerateRouteLink(htmlHelper.ViewContext.RequestContext, htmlHelper.RouteCollection, linkText, routeName, routeValues, htmlAttributes));
+        }
+
+        public static MvcHtmlString RouteLink(this HtmlHelper htmlHelper, string linkText, string routeName, string protocol, string hostName, string fragment, object routeValues, object htmlAttributes) {
+            return RouteLink(htmlHelper, linkText, routeName, protocol, hostName, fragment, new RouteValueDictionary(routeValues), HtmlHelper.AnonymousObjectToHtmlAttributes(htmlAttributes));
+        }
+
+        public static MvcHtmlString RouteLink(this HtmlHelper htmlHelper, string linkText, string routeName, string protocol, string hostName, string fragment, RouteValueDictionary routeValues, IDictionary<string, object> htmlAttributes) {
+            if (String.IsNullOrEmpty(linkText)) {
+                throw new ArgumentException(MvcResources.Common_NullOrEmpty, "linkText");
+            }
+            return MvcHtmlString.Create(HtmlHelper.GenerateRouteLink(htmlHelper.ViewContext.RequestContext, htmlHelper.RouteCollection, linkText, routeName, protocol, hostName, fragment, routeValues, htmlAttributes));
+        }
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                 //------------------------------------------------------------------------------
+// <copyright file="ProfilePropertySettingsCollection.cs" company="Microsoft">
+//     Copyright (c) Microsoft Corporation.  All rights reserved.
+// </copyright>
+//------------------------------------------------------------------------------
+
+namespace System.Web.Configuration {
+    using System;
+    using System.Xml;
+    using System.Configuration;
+    using System.Collections.Specialized;
+    using System.Collections;
+    using System.IO;
+    using System.Text;
+    using System.Web.Util;
+    using System.Security.Permissions;
+
+    [ConfigurationCollection(typeof(ProfilePropertySettings))]
+    public class ProfilePropertySettingsCollection : ConfigurationElementCollection {
+        private static ConfigurationPropertyCollection _properties;
+
+        static ProfilePropertySettingsCollection() {
+            // Property initialization
+            _properties = new ConfigurationPropertyCollection();
+        }
+
+        protected override ConfigurationPropertyCollection Properties {
+            get {
+                return _properties;
+            }
+        }
+
+        public ProfilePropertySettingsCollection() {
+        }
+
+        protected virtual bool AllowClear {
+            get {
+                return false;
+            }
+        }
+
+        protected override bool ThrowOnDuplicate {
+            get {
+                return true;
+            }
+        }
+
+        protected override bool OnDeserializeUnrecognizedElement(String elementName, XmlReader reader) {
+            if (!AllowClear) {
+                if (elementName == "clear") {
+                    throw new ConfigurationErrorsException(SR.GetString(SR.Clear_not_valid), reader);
+
+                }
+            }
+
+            if (elementName == "group") {
+                throw new ConfigurationErrorsException(SR.GetString(SR.Nested_group_not_valid), reader);
+            }
+
+            return base.OnDeserializeUnrecognizedElement(elementName, reader);
+        }
+
+        // public properties
+        public String[] AllKeys {
+            get {
+                return StringUtil.ObjectArrayToStringArray(BaseGetAllKeys());
+            }
+        }
+
+        public new ProfilePropertySettings this[string name] {
+            get {
+                return (ProfilePropertySettings)BaseGet(name);
+            }
+        }
+        
+        public ProfilePropertySettings this[int index] {
+            get {
+                return (ProfilePropertySettings)BaseGet(index);
+            }
+            set {
+                if (BaseGet(index) != null) {
+                    BaseRemoveAt(index);
+                }
+                BaseAdd(index, value);
+            }
+        }
+        // Protected Overrides
+        protected override ConfigurationElement CreateNewElement() {
+            return new ProfilePropertySettings();
+        }
+
+        protected override Object GetElementKey(ConfigurationElement element) {
+            return ((ProfilePropertySettings)element).Name;
+        }
+
+        public void Add(ProfilePropertySettings propertySettings) {
+            BaseAdd(propertySettings);
+        }
+        
+        public ProfilePropertySettings Get(int index) {
+            return (ProfilePropertySettings)BaseGet(index);
+        }
+        
+        public ProfilePropertySettings Get(string name) {
+            return (ProfilePropertySettings)BaseGet(name);
+        }
+
+        public String GetKey(int index) {
+            return (String) BaseGetKey(index);
+        }
+        
+        public void Remove(string name) {
+            BaseRemove(name);
+        }
+        
+        public void RemoveAt(int index) {
+            BaseRemoveAt(index);
+        }
+        
+        public void Set(ProfilePropertySettings propertySettings) {
+            BaseAdd(propertySettings, false);
+        }
+        
+        public int IndexOf(ProfilePropertySettings propertySettings) {
+            return BaseIndexOf(propertySettings);
+        }
+
+        public void Clear() {
+            BaseClear();
+        }
+    }
+}
+                                     

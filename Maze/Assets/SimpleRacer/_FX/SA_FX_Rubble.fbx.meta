@@ -1,0 +1,40 @@
+; RUN: opt -slp-vectorizer -slp-threshold=-6 -S -pass-remarks-output=%t <  %s | FileCheck %s
+; RUN: cat %t | FileCheck -check-prefix=YAML %s
+; RUN: opt -passes=slp-vectorizer -slp-threshold=-6 -S -pass-remarks-output=%t <  %s | FileCheck %s
+; RUN: cat %t | FileCheck -check-prefix=YAML %s
+
+
+; FIXME: The threshold is changed to keep this test case a bit smaller.
+; The AArch64 cost model should not give such high costs to select statements.
+
+target datalayout = "e-m:e-i64:64-i128:128-n32:64-S128"
+target triple = "aarch64--linux"
+
+; CHECK-LABEL: test_select
+; CHECK: load <4 x i32>
+; CHECK: load <4 x i32>
+; CHECK: select <4 x i1>
+
+; YAML:      --- !Passed
+; YAML-NEXT: Pass:            slp-vectorizer
+; YAML-NEXT: Name:            VectorizedHorizontalReduction
+; YAML-NEXT: Function:        test_select
+; YAML-NEXT: Args:
+; YAML-NEXT:   - String:          'Vectorized horizontal reduction with cost '
+; YAML-NEXT:   - Cost:            '4'
+; YAML-NEXT:   - String:          ' and with tree size '
+; YAML-NEXT:   - TreeSize:        '8'
+
+define i32 @test_select(i32* noalias nocapture readonly %blk1, i32* noalias nocapture readonly %blk2, i32 %lx, i32 %h) {
+entry:
+  %cmp.22 = icmp sgt i32 %h, 0
+  br i1 %cmp.22, label %for.body.lr.ph, label %for.end
+
+for.body.lr.ph:                                   ; preds = %entry
+  %idx.ext = sext i32 %lx to i64
+  br label %for.body
+
+for.body:                                         ; preds = %for.body, %for.body.lr.ph
+  %s.026 = phi i32 [ 0, %for.body.lr.ph ], [ %add27, %for.body ]
+  %j.025 = phi i32 [ 0, %for.body.lr.ph ], [ %inc, %for.body ]
+  %p2.024 = phi i32* [ %blk2, %for.body.lr.ph ], [ %add.pt

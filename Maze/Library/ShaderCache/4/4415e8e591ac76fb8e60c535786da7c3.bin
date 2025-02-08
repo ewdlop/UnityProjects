@@ -1,0 +1,221 @@
+Read (); // root
+			Assert.AreEqual ("xx", vr.ReadTypedValue ());
+			Assert.AreEqual (XmlNodeType.EndElement, vr.NodeType);
+		}
+
+		// If we normalize string before validating with facets,
+		// this test will fail. It will also fail if ReadTypedValue()
+		// ignores whitespace nodes.
+		[Test]
+		public void ReadTypedValueWhitespaces ()
+		{
+			string xml = "<root>  </root><!-- after -->";
+			string xsd = @"
+<xs:schema xmlns:xs='http://www.w3.org/2001/XMLSchema'>
+  <xs:element name='root'>
+    <xs:simpleType>
+      <xs:restriction base='xs:string'>
+        <xs:minLength value='2' />
+      </xs:restriction>
+    </xs:simpleType>
+  </xs:element>
+</xs:schema>";
+			XmlTextReader xir = 
+				new XmlTextReader (xml, XmlNodeType.Document, null);
+			XmlTextReader xsr =
+				new XmlTextReader (xsd, XmlNodeType.Document, null);
+			XmlValidatingReader vr = new XmlValidatingReader (xir);
+			vr.Schemas.Add (XmlSchema.Read (xsr, null));
+			vr.Read (); // root
+			Assert.AreEqual ("  ", vr.ReadTypedValue ());
+			Assert.AreEqual (XmlNodeType.EndElement, vr.NodeType);
+		}
+
+		[Test] // bug #77241
+		public void EmptyContentAllowWhitespace ()
+		{
+			string doc = @"
+<root>
+        <!-- some comment -->
+        <child/>
+</root>
+";
+			string schema = @"
+<xsd:schema xmlns:xsd=""http://www.w3.org/2001/XMLSchema"">
+    <xsd:element name=""root"">
+        <xsd:complexType>
+            <xsd:sequence>
+                <xsd:element name=""child"" type=""xsd:string"" />
+            </xsd:sequence>
+        </xsd:complexType>
+    </xsd:element>
+</xsd:schema>
+";
+			XmlValidatingReader reader = new XmlValidatingReader (
+				new XmlTextReader (new StringReader (doc)));
+			reader.Schemas.Add (null,
+				new XmlTextReader (new StringReader (schema)));
+			while (reader.Read ())
+				;
+		}
+
+		[Test] // bug #79650
+		// LAMESPEC: .NET does not throw XmlSchemaValidationException
+		[ExpectedException (typeof (XmlSchemaException))]
+		public void EnumerationFacetOnAttribute ()
+		{
+			string xml = "<test mode='NOT AN ENUMERATION VALUE' />";
+			XmlSchema schema = XmlSchema.Read (new XmlTextReader (TestResourceHelper.GetFullPathOfResource ("Test/XmlFiles/xsd/79650.xsd")), null);
+			XmlValidatingReader xvr = new XmlValidatingReader (xml, XmlNodeType.Document, null);
+			xvr.ValidationType = ValidationType.Schema;
+			xvr.Schemas.Add (schema);
+			while (!xvr.EOF)
+				xvr.Read ();
+		}
+
+		class XmlErrorResolver : XmlResolver
+		{
+			public override ICredentials Credentials {
+				set { }
+			}
+
+			public override object GetEntity (Uri uri, string role, Type type)
+			{
+				throw new Exception ();
+			}
+		}
+
+		[Test] // bug #79924
+		public void ValidationTypeNoneIgnoreSchemaLocations ()
+		{
+			string xml = "<project xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:noNamespaceSchemaLocation='nosuchschema.xsd'/>";
+			XmlValidatingReader vr = new XmlValidatingReader (
+				new XmlTextReader (new StringReader (xml)));
+			vr.ValidationType = ValidationType.None;
+			vr.XmlResolver = new XmlErrorResolver ();
+			while (!vr.EOF)
+				vr.Read ();
+		}
+
+		[Test] // bug #336625
+		public void ValidationTypeNoneIgnoreLocatedSchemaErrors ()
+		{
+			string xml = "<test xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:noNamespaceSchemaLocation='Test/XmlFiles/xsd/336625.xsd'/>";
+			XmlValidatingReader vr = new XmlValidatingReader (
+				new XmlTextReader (new StringReader (xml)));
+			vr.ValidationType = ValidationType.None;
+			while (!vr.EOF)
+				vr.Read ();
+		}
+
+		[Test]
+		public void Bug81360 ()
+		{
+			string schemaResource = "Test/XmlFiles/xsd/81360.xsd";
+			XmlTextReader treader = new XmlTextReader (TestResourceHelper.GetFullPathOfResource (schemaResource));
+			XmlSchema sc = XmlSchema.Read (treader, null);
+			sc.Compile (null);
+			string xml = @"<body xmlns='" + sc.TargetNamespace + "'><div></div></body>";
+			XmlTextReader reader = new XmlTextReader (new StringReader (xml));
+			XmlValidatingReader validator = new XmlValidatingReader (reader);
+			validator.Schemas.Add (sc);
+			validator.ValidationType = ValidationType.Schema;
+			while (!validator.EOF)
+				validator.Read ();
+		}
+
+		[Test]
+		public void Bug81460 ()
+		{
+			string xsd = "<xs:schema xmlns:xs='http://www.w3.org/2001/XMLSchema'><xs:element name='foo'><xs:complexType><xs:attribute name='a' default='x' /></xs:complexType></xs:element></xs:schema>";
+			string xml = "<foo/>";
+			XmlReaderSettings s = new XmlReaderSettings ();
+			s.ValidationType = ValidationType.Schema;
+			s.Schemas.Add (XmlSchema.Read (new StringReader (xsd), null));
+			XmlReader r = XmlReader.Create (new StringReader (xml), s);
+			r.Read ();
+			r.MoveToFirstAttribute (); // default attribute
+			Assert.AreEqual (String.Empty, r.Prefix);
+		}
+
+		[Test]
+		// annoyance
+		[ExpectedException (typeof (XmlSchemaValidationException))]
+		public void Bug82099 ()
+		{
+			string xsd = @"
+<xsd:schema xmlns:xsd='http://www.w3.org/2001/XMLSchema'>
+  <xsd:element name='Customer' type='CustomerType' />
+  <xsd:complexType name='CustomerType'>
+    <xsd:attribute name='name' type='xsd:string' />
+  </xsd:complexType>
+</xsd:schema>";
+			XmlSchema schema = XmlSchema.Read (new StringReader (xsd), null);
+
+			string xml = "<Customer name='Bob'> </Customer>";
+
+			XmlReaderSettings settings = new XmlReaderSettings ();
+			settings.Schemas.Add (schema);
+			settings.ValidationType = ValidationType.Schema;
+
+			XmlReader reader = XmlReader.Create (new StringReader (xml), settings);
+			
+			reader.Read ();
+			reader.Read ();
+			reader.Read ();
+		}
+
+		[Test]
+		public void Bug82010 ()
+		{
+			string xmlresource = "Test/XmlFiles/xsd/82010.xml";
+			string xsdresource = "Test/XmlFiles/xsd/82010.xsd";
+			XmlTextReader xr = null, xr2 = null;
+			try {
+				xr = new XmlTextReader (TestResourceHelper.GetFullPathOfResource (xsdresource));
+				xr2 = new XmlTextReader (TestResourceHelper.GetFullPathOfResource (xmlresource));
+				XmlValidatingReader xvr = new XmlValidatingReader (xr2);
+				xvr.Schemas.Add (XmlSchema.Read (xr, null));
+				while (!xvr.EOF)
+					xvr.Read ();
+			} finally {
+				if (xr2 != null)
+					xr2.Close ();
+				if (xr != null)
+					xr.Close ();
+			}
+		}
+
+		[Test]
+		public void Bug376395 ()
+		{
+			string xmlresource = "Test/XmlFiles/xsd/376395.xml";
+			string xsdresource = "Test/XmlFiles/xsd/376395.xsd";
+			XmlTextReader xr = null, xr2 = null;
+			try {
+				xr = new XmlTextReader (TestResourceHelper.GetFullPathOfResource (xsdresource));
+				xr2 = new XmlTextReader (TestResourceHelper.GetFullPathOfResource (xmlresource));
+				XmlValidatingReader xvr = new XmlValidatingReader (xr2);
+				xvr.Schemas.Add (XmlSchema.Read (xr, null));
+				while (!xvr.EOF)
+					xvr.Read ();
+			} finally {
+				if (xr2 != null)
+					xr2.Close ();
+				if (xr != null)
+					xr.Close ();
+			}
+		}
+
+		[Test]
+		public void ValidateMixedInsideXsdAny ()
+		{
+			string xml = @"<root xmlns='urn:foo'>
+  <X><Z>text</Z></X>
+  <Y><X><Z>text</Z></X></Y>
+</root>";
+			string xsd = @"
+<xs:schema xmlns:xs='http://www.w3.org/2001/XMLSchema'
+  targetNamespace='urn:foo' xmlns='urn:foo'>
+    <xs:complexType name='root-type'>
+    

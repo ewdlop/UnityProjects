@@ -1,0 +1,130 @@
+BuildMI(*AfterLoop, AfterLoop->begin(), DebugLoc(),
+                              TII.get(WebAssembly::END_LOOP));
+  LoopTops[End] = Begin;
+
+  assert((!ScopeTops[AfterLoop->getNumber()] ||
+          ScopeTops[AfterLoop->getNumber()]->getNumber() < MBB.getNumber()) &&
+         "With block sorting the outermost loop for a block should be first.");
+  if (!ScopeTops[AfterLoop->getNumber()])
+    ScopeTops[AfterLoop->getNumber()] = &MBB;
+}
+
+static unsigned
+GetDepth(const SmallVectorImpl<const MachineBasicBlock *> &Stack,
+         const MachineBasicBlock *MBB) {
+  unsigned Depth = 0;
+  for (auto X : reverse(Stack)) {
+    if (X == MBB)
+      break;
+    ++Depth;
+  }
+  assert(Depth < Stack.size() && "Branch destination should be in scope");
+  return Depth;
+}
+
+/// In normal assembly languages, when the end of a function is unreachable,
+/// because the function ends in an infinite loop or a noreturn call or similar,
+/// it isn't necessary to worry about the function return type at the end of
+/// the function, because it's never reached. However, in WebAssembly, blocks
+/// that end at the function end need to have a return type signature that
+/// matches the function signature, even though it's unreachable. This function
+/// checks for such cases and fixes up the signatures.
+static void FixEndsAtEndOfFunction(
+    MachineFunction &MF,
+    const WebAssemblyFunctionInfo &MFI,
+    DenseMap<const MachineInstr *, MachineInstr *> &BlockTops,
+    DenseMap<const MachineInstr *, MachineInstr *> &LoopTops) {
+  assert(MFI.getResults().size() <= 1);
+
+  if (MFI.getResults().empty())
+    return;
+
+  WebAssembly::ExprType retType;
+  switch (MFI.getResults().front().SimpleTy) {
+  case MVT::i32: retType = WebAssembly::ExprType::I32; break;
+  case MVT::i64: retType = WebAssembly::ExprType::I64; break;
+  case MVT::f32: retType = WebAssembly::ExprType::F32; break;
+  case MVT::f64: retType = WebAssembly::ExprType::F64; break;
+  case MVT::v16i8: retType = WebAssembly::ExprType::I8x16; break;
+  case MVT::v8i16: retType = WebAssembly::ExprType::I16x8; break;
+  case MVT::v4i32: retType = WebAssembly::ExprType::I32x4; break;
+  case MVT::v4f32: retType = WebAssembly::ExprType::F32x4; break;
+  default: llvm_unreachable("unexpected return type");
+  }
+
+  for (MachineBasicBlock &MBB : reverse(MF)) {
+    for (MachineInstr &MI : reverse(MBB)) {
+      if (MI.isPosition() || MI.isDebugValue())
+        continue;
+      if (MI.getOpcode() == WebAssembly::END_BLOCK) {
+        BlockTops[&MI]->getOperand(0).setImm(int32_t(retType));
+        continue;
+      }
+      if (MI.getOpcode() == WebAssembly::END_LOOP) {
+        LoopTops[&MI]->getOperand(0).setImm(int32_t(retType));
+        continue;
+      }
+      // Something other than an `end`. We're done.
+      return;
+    }
+  }
+}
+
+// WebAssembly functions end with an end instruction, as if the function body
+// were a block.
+static void AppendEndToFunction(
+    MachineFunction &MF,
+    const WebAssemblyInstrInfo &TII) {
+  BuildMI(MF.back(), MF.back().end(), DebugLoc(),
+          TII.get(WebAssembly::END_FUNCTION));
+}
+
+/// Insert LOOP and BLOCK markers at appropriate places.
+static void PlaceMarkers(MachineFunction &MF, const MachineLoopInfo &MLI,
+                         const WebAssemblyInstrInfo &TII,
+                         MachineDominatorTree &MDT,
+                         WebAssemblyFunctionInfo &MFI) {
+  // For each block whose label represents the end of a scope, record the block
+  // which holds the beginning of the scope. This will allow us to quickly skip
+  // over scoped regions when walking blocks. We allocate one more than the
+  // number of blocks in the function to accommodate for the possible fake block
+  // we may insert at the end.
+  SmallVector<MachineBasicBlock *, 8> ScopeTops(MF.getNumBlockIDs() + 1);
+
+  // For each LOOP_END, the corresponding LOOP.
+  DenseMap<const MachineInstr *, MachineInstr *> LoopTops;
+
+  // For each END_BLOCK, the corresponding BLOCK.
+  DenseMap<const MachineInstr *, MachineInstr *> BlockTops;
+
+  for (auto &MBB : MF) {
+    // Place the LOOP for MBB if MBB is the header of a loop.
+    PlaceLoopMarker(MBB, MF, ScopeTops, LoopTops, TII, MLI);
+
+    // Place the BLOCK for MBB if MBB is branched to from above.
+    PlaceBlockMarker(MBB, MF, ScopeTops, BlockTops, LoopTops, TII, MLI, MDT, MFI);
+  }
+
+  // Now rewrite references to basic blocks to be depth immediates.
+  SmallVector<const MachineBasicBlock *, 8> Stack;
+  for (auto &MBB : reverse(MF)) {
+    for (auto &MI : reverse(MBB)) {
+      switch (MI.getOpcode()) {
+      case WebAssembly::BLOCK:
+        assert(ScopeTops[Stack.back()->getNumber()]->getNumber() <= MBB.getNumber() &&
+               "Block should be balanced");
+        Stack.pop_back();
+        break;
+      case WebAssembly::LOOP:
+        assert(Stack.back() == &MBB && "Loop top should be balanced");
+        Stack.pop_back();
+        break;
+      case WebAssembly::END_BLOCK:
+        Stack.push_back(&MBB);
+        break;
+      case WebAssembly::END_LOOP:
+        Stack.push_back(LoopTops[&MI]->getParent());
+        break;
+      default:
+        if (MI.isTerminator()) {
+          // Rewrite MBB operands to be depth

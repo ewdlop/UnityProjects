@@ -1,0 +1,929 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+#pragma once
+
+#include "Chaos/Simplex.h"
+#include "Chaos/Capsule.h"
+#include "Chaos/Box.h"
+#include "Chaos/Sphere.h"
+#include "Chaos/EPA.h"
+#include "ChaosCheck.h"
+#include "ChaosLog.h"
+
+namespace Chaos
+{
+	
+	/** Determines if two convex geometries overlap.
+	 @A The first geometry
+	 @B The second geometry
+	 @BToATM The transform of B in A's local space
+	 @ThicknessA The amount of geometry inflation for Geometry A(for example if the surface distance of two geometries with thickness 0 would be 2, a thickness of 0.5 would give a distance of 1.5)
+	 @InitialDir The first direction we use to search the CSO
+	 @ThicknessB The amount of geometry inflation for Geometry B(for example if the surface distance of two geometries with thickness 0 would be 2, a thickness of 0.5 would give a distance of 1.5)
+	 @return True if the geometries overlap, False otherwise */
+
+	template <typename T, typename TGeometryA, typename TGeometryB>
+	bool GJKIntersection(const TGeometryA& A, const TGeometryB& B, const TRigidTransform<T, 3>& BToATM, const T InThicknessA = 0, const TVector<T, 3>& InitialDir = TVector<T, 3>(1, 0, 0), const T InThicknessB = 0)
+	{
+		TVector<T, 3> V = -InitialDir;
+		if (V.SafeNormalize() == 0)
+		{
+			V = TVec3<T>(-1, 0, 0);
+		}
+
+		FSimplex SimplexIDs;
+		TVector<T, 3> Simplex[4];
+		T Barycentric[4] = { -1,-1,-1,-1 };	//not needed, but compiler warns
+		const TRotation<T, 3> AToBRotation = BToATM.GetRotation().Inverse();
+		bool bTerminate;
+		bool bNearZero = false;
+		int NumIterations = 0;
+		T PrevDist2 = FLT_MAX;
+		const T ThicknessA = A.GetMargin() + InThicknessA;
+		const T ThicknessB = B.GetMargin() + InThicknessB;
+		const T Inflation = ThicknessA + ThicknessB + 1e-3;
+		const T Inflation2 = Inflation * Inflation;
+		do
+		{
+			if (!ensure(NumIterations++ < 32))	//todo: take this out
+			{
+				break;	//if taking too long just stop. This should never happen
+			}
+			const TVector<T, 3> NegV = -V;
+			const TVector<T, 3> SupportA = A.SupportCore(NegV);
+			const TVector<T, 3> VInB = AToBRotation * V;
+			const TVector<T, 3> SupportBLocal = B.SupportCore(VInB);
+			const TVector<T, 3> SupportB = BToATM.TransformPositionNoScale(SupportBLocal);
+			const TVector<T, 3> W = SupportA - SupportB;
+
+			if (TVector<T, 3>::DotProduct(V, W) > Inflation)
+			{
+				return false;
+			}
+
+			SimplexIDs[SimplexIDs.NumVerts] = SimplexIDs.NumVerts;
+			Simplex[SimplexIDs.NumVerts++] = W;
+
+			V = SimplexFindClosestToOrigin(Simplex, SimplexIDs, Barycentric);
+
+			T NewDist2 = V.SizeSquared();
+			bNearZero = NewDist2 < Inflation2;
+
+			//as simplices become degenerate we will stop making progress. This is a side-effect of precision, in that case take V as the current best approximation
+			//question: should we take previous v in case it's better?
+			const bool bMadeProgress = NewDist2 < PrevDist2;
+			bTerminate = bNearZero || !bMadeProgress;
+
+			PrevDist2 = NewDist2;
+
+			if (!bTerminate)
+			{
+				V /= FMath::Sqrt(NewDist2);
+			}
+
+		} while (!bTerminate);
+
+		return bNearZero;
+		
+	}
+
+	// Calculate the penetration depth of two geometries.
+	// OutClosestA and OutClosestB are the closest or deepest-penetrating points on the two core geometries, both in the space of A and ignoring the margin.
+	// This function will be faster if bNegativePenetrationAllowed is false, so don't use the feature if not required
+	// NOTE: OutPenetration is the penetration including the Thickness (i.e., the actual penetration depth), but the closest points
+	// returned are on the core shapes (i.e., ignoring the Thickness). If you want the closest positions on the shape surface (including
+	// the Thickness) use GJKPenetration().
+	template <bool bNegativePenetrationAllowed = false, typename T, typename TGeometryA, typename TGeometryB>
+	bool GJKPenetrationCore(const TGeometryA& A, const TGeometryB& B, const TRigidTransform<T, 3>& BToATM, T& OutPenetration, TVec3<T>& OutClosestA, TVec3<T>& OutClosestB, TVec3<T>& OutNormal, int32& OutClosestVertexIndexA, int32& OutClosestVertexIndexB, const T ThicknessA, const T ThicknessB, const TVector<T, 3>& InitialDir = TVector<T, 3>(1, 0, 0), const T EpsilonSq = 1.e-6)
+	{
+		int32 VertexIndexA = INDEX_NONE;
+		int32 VertexIndexB = INDEX_NONE;
+
+		auto SupportAFunc = [&A, &VertexIndexA](const TVec3<T>& V)
+		{
+			VertexIndexA = INDEX_NONE;
+			return A.SupportCore(V);
+		};
+
+		const TRotation<T, 3> AToBRotation = BToATM.GetRotation().Inverse();
+
+
+		auto SupportBFunc = [&B, &BToATM, &AToBRotation, &VertexIndexB](const TVec3<T>& V)
+		{
+			VertexIndexB = INDEX_NONE;
+			const TVector<T, 3> VInB = AToBRotation * V;
+			const TVector<T, 3> SupportBLocal = B.SupportCore(VInB);
+			return BToATM.TransformPositionNoScale(SupportBLocal);
+		};
+
+		//todo: refactor all of these similar functions
+		TVector<T, 3> V = -InitialDir;
+		if (V.SafeNormalize() == 0)
+		{
+			V = TVec3<T>(-1, 0, 0);
+		}
+
+		TVec3<T> As[4];
+		TVec3<T> Bs[4];
+
+		FSimplex SimplexIDs;
+		TVector<T, 3> Simplex[4];
+		T Barycentric[4] = { -1,-1,-1,-1 };	//not needed, but compiler warns
+		bool bTerminate;
+		bool bNearZero = false;
+		int NumIterations = 0;
+		T PrevDist2 = FLT_MAX;
+		const T Inflation = ThicknessA + ThicknessB + 1e-3;
+		const T Inflation2 = Inflation * Inflation;
+		do
+		{
+			if (!ensure(NumIterations++ < 32))	//todo: take this out
+			{
+				break;	//if taking too long just stop. This should never happen
+			}
+			const TVector<T, 3> NegV = -V;
+			const TVector<T, 3> SupportA = SupportAFunc(NegV);
+			const TVector<T, 3> SupportB = SupportBFunc(V);
+			const TVector<T, 3> W = SupportA - SupportB;
+
+			if (!bNegativePenetrationAllowed && TVector<T, 3>::DotProduct(V, W) > Inflation)
+			{
+				return false;
+			}
+
+			SimplexIDs[SimplexIDs.NumVerts] = SimplexIDs.NumVerts;
+			As[SimplexIDs.NumVerts] = SupportA;
+			Bs[SimplexIDs.NumVerts] = SupportB;
+			Simplex[SimplexIDs.NumVerts++] = W;
+
+			V = SimplexFindClosestToOrigin(Simplex, SimplexIDs, Barycentric, As, Bs);
+
+			T NewDist2 = V.SizeSquared();
+			bNearZero = NewDist2 < EpsilonSq;	//want to get the closest point for MTD
+
+			//as simplices become degenerate we will stop making progress. This is a side-effect of precision, in that case take V as the current best approximation
+			//question: should we take previous v in case it's better?
+			const bool bMadeProgress = NewDist2 < PrevDist2;
+			bTerminate = bNearZero || !bMadeProgress;
+
+			PrevDist2 = NewDist2;
+
+			if (!bTerminate)
+			{
+				V /= FMath::Sqrt(NewDist2);
+			}
+
+		} while (!bTerminate);
+
+		if (PrevDist2 > EpsilonSq)
+		{
+			//generally this happens when shapes are inflated.
+			TVector<T, 3> ClosestA(0);
+			TVector<T, 3> ClosestBInA(0);
+
+			for (int i = 0; i < SimplexIDs.NumVerts; ++i)
+			{
+				ClosestA += As[i] * Barycentric[i];
+				ClosestBInA += Bs[i] * Barycentric[i];
+			}
+
+			
+			const T PreDist = FMath::Sqrt(PrevDist2);
+			OutNormal = -V.GetUnsafeNormal();
+
+			T Penetration = ThicknessA + ThicknessB - PreDist;
+			if (!bNegativePenetrationAllowed)
+			{
+				if (Penetration < 0.0f) return false;
+			}
+			OutPenetration = Penetration;
+			OutClosestA = ClosestA;
+			OutClosestB = ClosestBInA;
+			OutClosestVertexIndexA = VertexIndexA;
+			OutClosestVertexIndexB = VertexIndexB;
+		}
+		else
+		{
+			TArray<TVec3<T>> VertsA;
+			TArray<TVec3<T>> VertsB;
+
+			VertsA.Reserve(8);
+			VertsB.Reserve(8);
+
+			for (int i = 0; i < SimplexIDs.NumVerts; ++i)
+			{
+				VertsA.Add(As[i]);
+				VertsB.Add(Bs[i]);
+			}
+
+			T Penetration;
+			TVec3<T> MTD, ClosestA, ClosestBInA;
+			if (EPA(VertsA, VertsB, SupportAFunc, SupportBFunc, Penetration, MTD, ClosestA, ClosestBInA) != EPAResult::BadInitialSimplex)
+			{
+				OutNormal = MTD;
+				OutPenetration = Penetration + ThicknessA + ThicknessB;
+				OutClosestA = ClosestA;
+				OutClosestB = ClosestBInA;
+				OutClosestVertexIndexA = VertexIndexA;
+				OutClosestVertexIndexB = VertexIndexB;
+			}
+			else
+			{
+				//assume touching hit
+
+				ClosestA = TVec3<T>(0);
+				ClosestBInA = TVec3<T>(0);
+
+				for (int i = 0; i < SimplexIDs.NumVerts; ++i)
+				{
+					ClosestA += As[i] * Barycentric[i];
+					ClosestBInA += Bs[i] * Barycentric[i];
+				}
+
+				OutPenetration = ThicknessA + ThicknessB;
+				OutNormal = MTD;
+				OutClosestA = ClosestA;
+				OutClosestB = ClosestBInA;
+				OutClosestVertexIndexA = VertexIndexA;
+				OutClosestVertexIndexB = VertexIndexB;
+				return OutPenetration > EpsilonSq;
+			}
+		}
+
+		return true;
+	}
+
+	// Calculate the penetration depth of two geometries.
+	// OutClosestA and OutClosestB are the closest or deepest-penetrating points on the two geometries, both in the space of A.
+	// This function will be faster if bNegativePenetrationAllowed is false, so don't use the feature if not required
+	template <bool bNegativePenetrationAllowed = false, typename T, typename TGeometryA, typename TGeometryB>
+	bool GJKPenetration(const TGeometryA& A, const TGeometryB& B, const TRigidTransform<T, 3>& BToATM, T& OutPenetration, TVec3<T>& OutClosestA, TVec3<T>& OutClosestB, TVec3<T>& OutNormal, int32& OutClosestVertexIndexA, int32& OutClosestVertexIndexB, const T InThicknessA = 0, const TVector<T, 3>& InitialDir = TVector<T, 3>(1, 0, 0), const T InThicknessB = 0, const T EpsilonSq = 1.e-6)
+	{
+		T NetThicknessA = InThicknessA + A.GetMargin();
+		T NetThicknessB = InThicknessB + B.GetMargin();
+		bool bCoreHit = GJKPenetrationCore<bNegativePenetrationAllowed, T, TGeometryA, TGeometryB>(A, B, BToATM, OutPenetration, OutClosestA, OutClosestB, OutNormal, OutClosestVertexIndexA, OutClosestVertexIndexB, NetThicknessA, NetThicknessB, InitialDir, EpsilonSq);
+		OutClosestA += OutNormal * NetThicknessA;
+		OutClosestB -= OutNormal * NetThicknessB;
+		return bCoreHit;
+	}
+
+
+	/** Sweeps one geometry against the other
+	 @A The first geometry
+	 @B The second geometry
+	 @StartTM B's starting configuration in A's local space
+	 @RayDir The ray's direction (normalized)
+	 @RayLength The ray's length
+	 @OutTime The time along the ray when the objects first overlap
+	 @OutPosition The first point of impact (in A's local space) when the objects first overlap. Invalid if time of impact is 0
+	 @OutNormal The impact normal (in A's local space) when the objects first overlap. Invalid if time of impact is 0
+	 @ThicknessA The amount of geometry inflation for Geometry A (for example if the surface distance of two geometries with thickness 0 would be 2, a thickness of 0.5 would give a distance of 1.5)
+	 @InitialDir The first direction we use to search the CSO
+	 @ThicknessB The amount of geometry inflation for Geometry B (for example if the surface distance of two geometries with thickness 0 would be 2, a thickness of 0.5 would give a distance of 1.5)
+	 @return True if the geometries overlap during the sweep, False otherwise 
+	 @note If A overlaps B at the start of the ray ("initial overlap" condition) then this function returns true, and sets OutTime = 0, but does not set any other output variables.
+	 */
+
+	template <typename T, typename TGeometryA, typename TGeometryB>
+	bool GJKRaycast(const TGeometryA& A, const TGeometryB& B, const TRigidTransform<T, 3>& StartTM, const TVector<T, 3>& RayDir, const T RayLength,
+		T& OutTime, TVector<T, 3>& OutPosition, TVector<T, 3>& OutNormal, const T ThicknessA = 0, const TVector<T, 3>& InitialDir = TVector<T, 3>(1, 0, 0), const T ThicknessB = 0)
+	{
+		ensure(FMath::IsNearlyEqual(RayDir.SizeSquared(), 1, KINDA_SMALL_NUMBER));
+		ensure(RayLength > 0);
+		check(A.IsConvex() && B.IsConvex());
+		const TVector<T, 3> StartPoint = StartTM.GetLocation();
+
+		TVector<T, 3> Simplex[4] = { TVector<T,3>(0), TVector<T,3>(0), TVector<T,3>(0), TVector<T,3>(0) };
+		TVector<T, 3> As[4] = { TVector<T,3>(0), TVector<T,3>(0), TVector<T,3>(0), TVector<T,3>(0) };
+		TVector<T, 3> Bs[4] = { TVector<T,3>(0), TVector<T,3>(0), TVector<T,3>(0), TVector<T,3>(0) };
+
+		T Barycentric[4] = { -1,-1,-1,-1 };	//not needed, but compiler warns
+
+		FSimplex SimplexIDs;
+		const TRotation<T, 3> BToARotation = StartTM.GetRotation();
+		const TRotation<T, 3> AToBRotation = BToARotation.Inverse();
+		TVector<T, 3> SupportA = A.Support(InitialDir, ThicknessA);	//todo: use Thickness on quadratic geometry
+		As[0] = SupportA;
+
+		const TVector<T, 3> InitialDirInB = AToBRotation * (-InitialDir);
+		const TVector<T, 3> InitialSupportBLocal = B.Support(InitialDirInB, ThicknessB);
+		TVector<T, 3> SupportB = BToARotation * InitialSupportBLocal;
+		Bs[0] = SupportB;
+
+		T Lambda = 0;
+		TVector<T, 3> X = StartPoint;
+		TVector<T, 3> Normal(0);
+		TVector<T, 3> V = X - (SupportA - SupportB);
+
+		bool bTerminate;
+		bool bNearZero = false;
+		bool bDegenerate = false;
+		int NumIterations = 0;
+		T InGJKPreDist2 = TNumericLimits<T>::Max();
+		do
+		{
+			//if (!ensure(NumIterations++ < 32))	//todo: take this out
+			if (!(NumIterations++ < 32))	//todo: take this out
+			{
+				break;	//if taking too long just stop. This should never happen
+			}
+
+			SupportA = A.Support(V, ThicknessA);	//todo: add thickness to quadratic geometry to avoid quadratic vs quadratic when possible
+			const TVector<T, 3> VInB = AToBRotation * (-V);
+			const TVector<T, 3> SupportBLocal = B.Support(VInB, ThicknessB);
+			SupportB = BToARotation * SupportBLocal;
+			const TVector<T, 3> P = SupportA - SupportB;
+			const TVector<T, 3> W = X - P;
+			SimplexIDs[SimplexIDs.NumVerts] = SimplexIDs.NumVerts;	//is this needed?
+			As[SimplexIDs.NumVerts] = SupportA;
+			Bs[SimplexIDs.NumVerts] = SupportB;
+
+			const T VDotW = TVector<T, 3>::DotProduct(V, W);
+			if (VDotW > 0)
+			{
+				const T VDotRayDir = TVector<T, 3>::DotProduct(V, RayDir);
+				if (VDotRayDir >= 0)
+				{
+					return false;
+				}
+
+				const T PreLambda = Lambda;	//use to check for no progress
+				// @todo(ccaulfield): this can still overflow - the comparisons against zero above should be changed (though not sure to what yet)
+				Lambda = Lambda - VDotW / VDotRayDir;
+				if (Lambda > PreLambda)
+				{
+					if (Lambda > RayLength)
+					{
+						return false;
+					}
+
+					const TVector<T, 3> OldX = X;
+					X = StartPoint + Lambda * RayDir;
+					Normal = V;
+
+					//Update simplex from (OldX - P) to (X - P)
+					const TVector<T, 3> XMinusOldX = X - OldX;
+					Simplex[0] += XMinusOldX;
+					Simplex[1] += XMinusOldX;
+					Simplex[2] += XMinusOldX;
+					Simplex[SimplexIDs.NumVerts++] = X - P;
+
+					InGJKPreDist2 = TNumericLimits<T>::Max();	//translated origin so restart gjk search
+				}
+			}
+			else
+			{
+				Simplex[SimplexIDs.NumVerts++] = W;	//this is really X - P which is what we need for simplex computation
+			}
+
+			V = SimplexFindClosestToOrigin(Simplex, SimplexIDs, Barycentric, As, Bs);
+
+			T NewDist2 = V.SizeSquared();	//todo: relative error
+			bNearZero = NewDist2 < 1e-6;
+			bDegenerate = NewDist2 >= InGJKPreDist2;
+			InGJKPreDist2 = NewDist2;
+			bTerminate = bNearZero || bDegenerate;
+
+		} while (!bTerminate);
+
+		OutTime = Lambda;
+
+		if (Lambda > 0)
+		{
+			OutNormal = Normal.GetUnsafeNormal();
+			TVector<T, 3> ClosestA(0);
+			TVector<T, 3> ClosestB(0);
+
+			for (int i = 0; i < SimplexIDs.NumVerts; ++i)
+			{
+				ClosestB += Bs[i] * Barycentric[i];
+			}
+			const TVector<T, 3> ClosestLocal = ClosestB;
+
+			OutPosition = StartPoint + RayDir * Lambda + ClosestLocal;
+		}
+
+		return true;
+	}
+
+
+	/** Sweeps one geometry against the other
+	 @A The first geometry
+	 @B The second geometry
+	 @StartTM B's starting configuration in A's local space
+	 @RayDir The ray's direction (normalized)
+	 @RayLength The ray's length
+	 @OutTime The time along the ray when the objects first overlap
+	 @OutPosition The first point of impact (in A's local space) when the objects first overlap. Invalid if time of impact is 0
+	 @OutNormal The impact normal (in A's local space) when the objects first overlap. Invalid if time of impact is 0
+	 @ThicknessA The amount of geometry inflation for Geometry A (for example a capsule with radius 5 could pass in its core segnment and a thickness of 5)
+	 @InitialDir The first direction we use to search the CSO
+	 @ThicknessB The amount of geometry inflation for Geometry B (for example a sphere with radius 5 could pass in its center point and a thickness of 5)
+	 @return True if the geometries overlap during the sweep, False otherwise 
+	 @note If A overlaps B at the start of the ray ("initial overlap" condition) then this function returns true, and sets OutTime = 0, but does not set any other output variables.
+	 */
+
+	template <typename T, typename TGeometryA, typename TGeometryB>
+	bool GJKRaycast2(const TGeometryA& A, const TGeometryB& B, const TRigidTransform<T, 3>& StartTM, const TVector<T, 3>& RayDir, const T RayLength,
+		T& OutTime, TVector<T, 3>& OutPosition, TVector<T, 3>& OutNormal, const T GivenThicknessA = 0, bool bComputeMTD = false, const TVector<T, 3>& InitialDir = TVector<T, 3>(1, 0, 0), const T GivenThicknessB = 0)
+	{
+		ensure(FMath::IsNearlyEqual(RayDir.SizeSquared(), 1, KINDA_SMALL_NUMBER));
+		ensure(RayLength > 0);
+		const T ThicknessA = A.GetMargin();
+		const T ThicknessB = B.GetMargin();
+
+		const TVector<T, 3> StartPoint = StartTM.GetLocation();
+
+		TVector<T, 3> Simplex[4] = { TVector<T,3>(0), TVector<T,3>(0), TVector<T,3>(0), TVector<T,3>(0) };
+		TVector<T, 3> As[4] = { TVector<T,3>(0), TVector<T,3>(0), TVector<T,3>(0), TVector<T,3>(0) };
+		TVector<T, 3> Bs[4] = { TVector<T,3>(0), TVector<T,3>(0), TVector<T,3>(0), TVector<T,3>(0) };
+
+		T Barycentric[4] = { -1,-1,-1,-1 };	//not needed, but compiler warns
+		const T Inflation = ThicknessA + ThicknessB;
+		const T Inflation2 = Inflation*Inflation + 1e-6;
+
+		FSimplex SimplexIDs;
+		const TRotation<T, 3> BToARotation = StartTM.GetRotation();
+		const TRotation<T, 3> AToBRotation = BToARotation.Inverse();
+
+		auto SupportAFunc = [&A](const TVec3<T>& V)
+		{
+			return A.SupportCore(V);
+		};
+
+		auto SupportBFunc = [&B, &AToBRotation, &BToARotation](const TVec3<T>& V)
+		{
+			const TVector<T, 3> VInB = AToBRotation * V;
+			const TVector<T, 3> SupportBLocal = B.SupportCore(VInB);
+			return BToARotation * SupportBLocal;
+		};
+
+		TVector<T, 3> SupportA = SupportAFunc(InitialDir);
+		As[0] = SupportA;
+
+		TVector<T, 3> SupportB = SupportBFunc(-InitialDir);
+		Bs[0] = SupportB;
+
+		T Lambda = 0;
+		TVector<T, 3> X = StartPoint;
+		TVector<T, 3> V = X - (SupportA - SupportB);
+		TVector<T, 3> Normal(0,0,1);
+
+		const T InitialPreDist2 = V.SizeSquared();
+		constexpr T Eps2 = 1e-6;
+		//mtd needs to find closest point even in inflation region, so can only skip if we found the closest points
+		bool bCloseEnough = InitialPreDist2 < Inflation2 && (!bComputeMTD || InitialPreDist2 < Eps2);
+		bool bDegenerate = false;
+		bool bTerminate = bCloseEnough;
+		bool bInflatedCloseEnough = bCloseEnough;
+		int NumIterations = 0;
+		T InGJKPreDist2 = TNumericLimits<T>::Max();
+		while (!bTerminate)
+		{
+			//if (!ensure(NumIterations++ < 32))	//todo: take this out
+			if (!(NumIterations++ < 32))	//todo: take this out
+			{
+				break;	//if taking too long just stop. This should never happen
+			}
+
+			V = V.GetUnsafeNormal();
+
+			SupportA = SupportAFunc(V);
+			SupportB = SupportBFunc(-V);
+			const TVector<T, 3> P = SupportA - SupportB;
+			const TVector<T, 3> W = X - P;
+			SimplexIDs[SimplexIDs.NumVerts] = SimplexIDs.NumVerts;	//is this needed?
+			As[SimplexIDs.NumVerts] = SupportA;
+			Bs[SimplexIDs.NumVerts] = SupportB;
+
+			const T VDotW = TVector<T, 3>::DotProduct(V, W);
+
+			if (VDotW > Inflation)
+			{
+				const T VDotRayDir = TVector<T, 3>::DotProduct(V, RayDir);
+				if (VDotRayDir >= 0)
+				{
+					return false;
+				}
+
+				const T PreLambda = Lambda;	//use to check for no progress
+				// @todo(ccaulfield): this can still overflow - the comparisons against zero above should be changed (though not sure to what yet)
+				Lambda = Lambda - (VDotW - Inflation) / VDotRayDir;
+				if (Lambda > PreLambda)
+				{
+					if (Lambda > RayLength)
+					{
+						return false;
+					}
+
+					const TVector<T, 3> OldX = X;
+					X = StartPoint + Lambda * RayDir;
+					Normal = V;
+
+					//Update simplex from (OldX - P) to (X - P)
+					const TVector<T, 3> XMinusOldX = X - OldX;
+					Simplex[0] += XMinusOldX;
+					Simplex[1] += XMinusOldX;
+					Simplex[2] += XMinusOldX;
+					Simplex[SimplexIDs.NumVerts++] = X - P;
+
+					InGJKPreDist2 = TNumericLimits<T>::Max();	//translated origin so restart gjk search
+					bInflatedCloseEnough = false;
+				}
+			}
+			else
+			{
+				Simplex[SimplexIDs.NumVerts++] = W;	//this is really X - P which is what we need for simplex computation
+			}
+
+			if (bInflatedCloseEnough && VDotW >= 0)
+			{
+				//Inflated shapes are close enough, but we want MTD so we need to find closest point on core shape
+				const T VDotW2 = VDotW * VDotW;
+				bCloseEnough = InGJKPreDist2 <= Eps2 + VDotW2;	//todo: relative error
+			}
+
+			if (!bCloseEnough)
+			{
+				V = SimplexFindClosestToOrigin(Simplex, SimplexIDs, Barycentric, As, Bs);
+				T NewDist2 = V.SizeSquared();	//todo: relative error
+				bCloseEnough = NewDist2 < Inflation2;
+				bDegenerate = NewDist2 >= InGJKPreDist2;
+				InGJKPreDist2 = NewDist2;
+
+
+				if (bComputeMTD && bCloseEnough && Lambda == 0 && InGJKPreDist2 > 1e-6 && Inflation2 > 1e-6 && SimplexIDs.NumVerts < 4)
+				{
+					//For mtd of inflated shapes we have to find the closest point, so we have to keep going
+					bCloseEnough = false;
+					bInflatedCloseEnough = true;
+				}
+			}
+			else
+			{
+				//It must be that we want MTD and we can terminate. However, we must make one final call to fixup the simplex
+				V = SimplexFindClosestToOrigin(Simplex, SimplexIDs, Barycentric, As, Bs);
+			}
+			bTerminate = bCloseEnough || bDegenerate;
+		}
+
+		OutTime = Lambda;
+
+		if (Lambda > 0)
+		{
+			OutNormal = Normal;
+			TVector<T, 3> ClosestB(0);
+
+			for (int i = 0; i < SimplexIDs.NumVerts; ++i)
+			{
+				ClosestB += Bs[i] * Barycentric[i];
+			}
+			const TVector<T, 3> ClosestLocal = ClosestB - OutNormal * ThicknessB;
+
+			OutPosition = StartPoint + RayDir * Lambda + ClosestLocal;
+		}
+		else if (bComputeMTD)
+		{
+			// If Inflation == 0 we would expect GJKPreDist2 to be 0
+			// However, due to precision we can still end up with GJK failing.
+			// When that happens fall back on EPA
+			if (Inflation > 0 && InGJKPreDist2 > 1e-6 && InGJKPreDist2 < TNumericLimits<T>::Max())
+			{
+				OutNormal = Normal;
+				TVector<T, 3> ClosestA(0);
+				TVector<T, 3> ClosestB(0);
+
+				if (NumIterations)
+				{
+					for (int i = 0; i < SimplexIDs.NumVerts; ++i)
+					{
+						ClosestA += As[i] * Barycentric[i];
+						ClosestB += Bs[i] * Barycentric[i];
+					}
+				}
+				else
+				{
+					//didn't even go into gjk loop
+					ClosestA = As[0];
+					ClosestB = Bs[0];
+				}
+				
+				const TVec3<T> ClosestBInA = StartPoint + ClosestB;
+				const T InGJKPreDist = FMath::Sqrt(InGJKPreDist2);
+				OutNormal = V.GetUnsafeNormal();
+
+				const T Penetration = FMath::Clamp<T>(ThicknessA + ThicknessB - InGJKPreDist, 0, TNumericLimits<T>::Max());
+				const TVector<T, 3> ClosestLocal = ClosestB - OutNormal * ThicknessB;
+
+				OutPosition = StartPoint + ClosestLocal + OutNormal * Penetration;
+				OutTime = -Penetration;
+			}
+			else
+			{
+				//use EPA
+				TArray<TVec3<T>> VertsA;
+				TArray<TVec3<T>> VertsB;
+
+				VertsA.Reserve(8);
+				VertsB.Reserve(8);
+
+				if (NumIterations)
+				{
+					for (int i = 0; i < SimplexIDs.NumVerts; ++i)
+					{
+						VertsA.Add(As[i]);
+						const TVec3<T> BAtOrigin = Bs[i] + X;
+						VertsB.Add(BAtOrigin);
+					}
+
+
+					auto SupportBAtOriginFunc = [&](const TVec3<T>& Dir)
+					{
+						const TVector<T, 3> DirInB = AToBRotation * Dir;
+						const TVector<T, 3> SupportBLocal = B.SupportCore(DirInB);
+						return StartTM.TransformPositionNoScale(SupportBLocal);
+					};
+
+					T Penetration;
+					TVec3<T> MTD, ClosestA, ClosestBInA;
+					if (EPA(VertsA, VertsB, SupportAFunc, SupportBAtOriginFunc, Penetration, MTD, ClosestA, ClosestBInA) != EPAResult::BadInitialSimplex)
+					{
+						OutNormal = MTD;
+						OutTime = -Penetration - Inflation;
+						OutPosition = ClosestA;
+					}
+					else
+					{
+						//assume touching hit
+						OutTime = -Inflation;
+						OutNormal = MTD;
+						OutPosition = As[0] + OutNormal * ThicknessA;
+					}
+				}
+				else
+				{
+					//didn't even go into gjk loop, touching hit
+					OutTime = -Inflation;
+					OutNormal = { 0,0,1 };
+					OutPosition = As[0] + OutNormal * ThicknessA;
+				}
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Used by GJKDistance. It must return a vector in the Minkowski sum A - B. In principle this can be the vector of any point
+	 * in A to any point in B, but some choices will cause GJK to minimize faster (e.g., for two spheres, we can easily calculate
+	 * the actual separating vector and GJK will converge immediately).
+	 */
+	template <typename T, typename TGeometryA, typename TGeometryB>
+	TVector<T, 3> GJKDistanceInitialV(const TGeometryA& A, const TGeometryB& B, const TRigidTransform<T, 3>& BToATM)
+	{
+		const TVec3<T> V(1, 0, 0);
+		const TVector<T, 3> SupportA = A.Support(-V, 0);
+		const TVector<T, 3> VInB = BToATM.GetRotation().Inverse() * V;
+		const TVector<T, 3> SupportBLocal = B.Support(VInB, 0);
+		const TVector<T, 3> SupportB = BToATM.TransformPositionNoScale(SupportBLocal);
+		return SupportA - SupportB;
+	}
+
+	/**
+	 * Used by GJKDistance. Specialization for sphere-sphere gives correct result immediately.
+	 */
+	template <typename T>
+	TVector<T, 3> GJKDistanceInitialV(const TSphere<T, 3>& A, const TSphere<T, 3>& B, const TRigidTransform<T, 3>& BToATM)
+	{
+		TVector<T, 3> Delta = A.GetCenter() - (B.GetCenter() + BToATM.GetTranslation());
+		T DeltaLen = Delta.Size();
+		T RadiusAB = A.GetRadius() + B.GetRadius();
+		if (DeltaLen > RadiusAB)
+		{
+			return Delta -  Delta * (RadiusAB / DeltaLen);
+		}
+		return TVector<T, 3>(0, 0, 0);
+	}
+
+	// Overloads for geometry types which don't have centroids.
+	template <typename T, typename TGeometryB>
+	TVector<T, 3> GJKDistanceInitialV(const FImplicitObject& A, const TGeometryB& B, const TRigidTransform<T, 3>& BToATM)
+	{
+		return -BToATM.GetTranslation();
+	}
+
+	template <typename T, typename TGeometryA>
+	TVector<T, 3> GJKDistanceInitialV(TGeometryA A, const FImplicitObject& B, const TRigidTransform<T, 3>& BToATM)
+	{
+		return -BToATM.GetTranslation();
+	}
+
+	/**
+	 * Find the distance and nearest points on two convex geometries A and B.
+	 * All calculations are performed in the local-space of object A, and the transform from B-space to A-space must be provided.
+	 * For algorithm see "A Fast and Robust GJK Implementation for Collision Detection of Convex Objects", Gino Van Deb Bergen, 1999.
+	 * @note This algorithm aborts if objects are overlapping and it does not initialize the out parameters.
+	 *
+	 * @param A The first object.
+	 * @param B The second object.
+	 * @param BToATM A transform taking vectors in B-space to A-space
+	 * @param B The second object.
+	 * @param OutDistance if returns true, the minimum distance between A and B, otherwise not modified.
+	 * @param OutNearestA if returns true, the near point on A in local-space, otherwise not modified.
+	 * @param OutNearestB if returns true, the near point on B in local-space, otherwise not modified.
+	 * @param Epsilon The algorithm terminates when the iterative distance reduction gets below this threshold.
+	 * @param MaxIts A limit on the number of iterations. Results may be approximate if this is too low.
+	 * @return true if we succeeded in calculating the distance, false otherwise (i.e., false if objects are overlapping).
+	 */
+	template <typename T, typename TGeometryA, typename TGeometryB>
+	bool GJKDistance(const TGeometryA& A, const TGeometryB& B, const TRigidTransform<T, 3>& BToATM, T& OutDistance, TVector<T, 3>& OutNearestA, TVector<T, 3>& OutNearestB, const T Epsilon = (T)1e-6, const int32 MaxIts = 16)
+	{
+		check(A.IsConvex() && B.IsConvex());
+
+		FSimplex SimplexIDs;
+		TVector<T, 3> Simplex[4], SimplexA[4], SimplexB[4];
+		T Barycentric[4] = { -1, -1, -1, -1 };
+
+		const TRotation<T, 3> AToBRotation = BToATM.GetRotation().Inverse();
+		T Mu = 0;
+
+		// Select an initial vector in A - B
+		TVector<T, 3> V = GJKDistanceInitialV(A, B, BToATM);
+		T VLen = V.Size();
+
+		int32 It = 0;
+		while (VLen > Epsilon)
+		{
+			// Find a new point in A-B that is closer to the origin
+			// NOTE: we do not use support thickness here. Thickness is used when separating objects
+			// so that GJK can find a solution, but that can be added in a later step.
+			const TVector<T, 3> SupportA = A.Support(-V, 0);
+			const TVector<T, 3> VInB = AToBRotation * V;
+			const TVector<T, 3> SupportBLocal = B.Support(VInB, 0);
+			const TVector<T, 3> SupportB = BToATM.TransformPositionNoScale(SupportBLocal);
+			const TVector<T, 3> W = SupportA - SupportB;
+
+			T D = TVector<T, 3>::DotProduct(V, W) / VLen;
+			Mu = FMath::Max(Mu, D);
+
+			// See if we are still making progress toward the origin
+			bool bCloseEnough = ((VLen - Mu) < Epsilon);
+			if (bCloseEnough || (++It > MaxIts))
+			{
+				// We have reached the minimum to within tolerance. Or we have reached max iterations, in which
+				// case we (probably) have a solution but with an error larger than Epsilon (technically we could be missing
+				// the fact that we were going to eventually find the origin, but it'll be a close call so the approximation
+				// is still good enough).
+				OutDistance = VLen;
+				if (SimplexIDs.NumVerts == 0)
+				{
+					// Our initial guess of V was already the minimum separating vector
+					OutNearestA = SupportA;
+					OutNearestB = SupportBLocal;
+				}
+				else
+				{
+					// The simplex vertices are the nearest point/line/face
+					OutNearestA = TVector<T, 3>(0, 0, 0);
+					OutNearestB = TVector<T, 3>(0, 0, 0);
+					for (int32 VertIndex = 0; VertIndex < SimplexIDs.NumVerts; ++VertIndex)
+					{
+						int32 WIndex = SimplexIDs[VertIndex];
+						check(Barycentric[WIndex] >= (T)0);
+						OutNearestA += Barycentric[WIndex] * SimplexA[WIndex];
+						OutNearestB += Barycentric[WIndex] * SimplexB[WIndex];
+					}
+				}
+				return true;
+			}
+
+			// Add the new vertex to the simplex
+			SimplexIDs[SimplexIDs.NumVerts] = SimplexIDs.NumVerts;
+			Simplex[SimplexIDs.NumVerts] = W;
+			SimplexA[SimplexIDs.NumVerts] = SupportA;
+			SimplexB[SimplexIDs.NumVerts] = SupportBLocal;
+			++SimplexIDs.NumVerts;
+
+			// Find the closest point to the origin on the simplex, and update the simplex to eliminate unnecessary vertices
+			V = SimplexFindClosestToOrigin(Simplex, SimplexIDs, Barycentric, SimplexA, SimplexB);
+			VLen = V.Size();
+		}
+
+		// Our geometries overlap - we did not produce the near points (and didn't set distance, which is zero)
+		return false;
+	}
+
+	// Assumes objects are already intersecting, computes a minimum translation
+	// distance, deepest penetration positions on each body, and approximates
+	// a penetration normal and minimum translation distance.
+	//
+	// TODO: We want to re-visit how these functions work. Probably should be
+	// embedded in GJKOverlap and GJKRaycast so that secondary queries are unnecessary.
+	template <typename T, typename TGeometryA, typename TGeometryB>
+	bool GJKPenetrationTemp(const TGeometryA& A, const TGeometryB& B, const TRigidTransform<T, 3>& BToATM, TVector<T, 3>& OutPositionA, TVector<T, 3>& OutPositionB, TVector<T, 3>& OutNormal, T& OutDistance, const T ThicknessA = 0, const TVector<T, 3>& InitialDir = TVector<T, 3>(1, 0, 0), const T ThicknessB = 0, const T Epsilon = (T)1e-6, const int32 MaxIts = 16)
+	{
+		//
+		// TODO: General case for MTD determination.
+		//
+		ensure(false);
+		OutPositionA = TVector<T, 3>(0.f);
+		OutPositionB = TVector<T, 3>(0.f);
+		OutNormal = TVector<T, 3>(0.f, 0.f, 1.f);
+		OutDistance = 0.f;
+		return GJKIntersection(A, B, BToATM, ThicknessA, InitialDir, ThicknessB);
+	}
+
+	// Specialization for when getting MTD against a capsule.
+	template <typename T, typename TGeometryA>
+	bool GJKPenetrationTemp(const TGeometryA& A, const TCapsule<T>& B, const TRigidTransform<T, 3>& BToATM, TVector<T, 3>& OutPositionA, TVector<T, 3>& OutPositionB, TVector<T, 3>& OutNormal, T& OutDistance, const T ThicknessA = 0, const TVector<T, 3>& InitialDir = TVector<T, 3>(1, 0, 0), const T ThicknessB = 0, const T Epsilon = (T)1e-6, const int32 MaxIts = 16)
+	{
+		float SegmentDistance;
+		const TSegment<T>& Segment = B.GetSegment();
+		const float MarginB = B.GetRadius();
+		TVector<float, 3> PositionBInB;
+		if (GJKDistance(A, Segment, BToATM, SegmentDistance, OutPositionA, PositionBInB, Epsilon, MaxIts))
+		{
+			OutPositionB = BToATM.TransformPosition(PositionBInB);
+			OutNormal
+				= ensure(SegmentDistance > TNumericLimits<T>::Min())
+				? (OutPositionB - OutPositionA) / SegmentDistance
+				: TVector<T, 3>(0.f, 0.f, 1.f);
+			OutPositionB -= OutNormal * MarginB;
+			OutDistance = SegmentDistance - MarginB;
+
+			if (OutDistance > 0.f)
+			{
+				// In this case, our distance calculation says we're not penetrating.
+				//
+				// TODO: check(false)! This shouldn't happen.
+				// It probably won't happen anymore if we warm-start GJKDistance
+				// with a polytope.
+				//
+				OutDistance = 0.f;
+				return false;
+			}
+
+			return true;
+		}
+		else
+		{
+			// TODO: Deep penetration - do EPA
+			ensure(false);
+			return true;
+		}
+
+		return false;
+	}
+
+}
+                                                                                                                 –f˜JN7r==ÆŸ∫õ*G\uÔ2aÚÔxH∞ï©7Å6 ≠ÄÕd≈ÓG õÄ¶HôÇAhÌ¨z‹±Ö◊b)ï√pëIÜ”tÖ“ÅõŒSQ≈üûàÑÇÑt¬¥áËŒ>ΩÅW :m/¶O¯sdÿ◊P\ƒa_z, Æ:£k–Ì˚‘·ü«Î ôˇ∂oKŒ†¢fjbX'd?ÇU∞ö=|Ö††uX⁄(∑Ã\~áì/DXzÁ¥Àe°Oÿc¸ãM¯Î//ΩÏÙbπ˙§˛◊°cÔ}¸T¢Özb˚ó≠	*P§uN)’^`dñl<#‰ÔÉ4 î•;ë÷¿∏s≥t	∂Õ≠i„shfêV&ˆ·J·5"S≈ÎO0DÁgÏX,‡fkßÌÂP2¶bÇ6òç«¶ìjn#>ô¬â“‰B*®'˛TPMïΩ¥•"ÇVfπaÅï
+›3√¿˛<)ø›ÜÕk˝√Ø 1ôJ, ñ5]¢èÌæ[ˇ@vq{C∫1SÔÎt2âTäh±:õ:+ö4t!π©&®≤èÆ]Bxﬂèg¬¿€Ò[åµbﬂÀ"dR–r≈<5ºY{,$œéëÒ--r4 ÀõÉ(Ü0`˜[…;¬
+}≥”-Ër†8¨V#VyvS"˚§!”ÿ’A•iÉ)πÙπ`å6{MpI∫∑û≈ó‹¨è°g ≥Æ?ú‚'8W€Ùè ˙™†Z¥gﬁib]Èx¥8∞∑ÁEY˝èw∫N{≤¡‚\	à≥®·!Ô-ˇ†¢◊—íL`PsËŒ}Æ‰ÊˇŸã±1$÷*x§_VègJöÁ„ùØÓu˚∫Ë‡∆>[Îv{8å≈Ç°dEÃ[8…)8h‹πa^⁄úÊk`Ê˚p~(∞Gõ5H»ﬁû]2–U˜&ãk*}_;›T»+µJË5ø8$¯sΩßö«¨1<Åöm?^¸îÿÃ&Iƒ»ä¡W–Ë&Ñ®¨OLéb`˜ä£k‰aılìÍÒWZv{ÓÁT}ADÇn
+ù∑x3xÆ$ør˜N#évy"|~π	£—ﬁ ¡≥O3Èn"RQPù∏L#|1K›Dc¸Ï0¶≈3≠l~˛ä*á=ı+?h6W~ÑëlC‘÷s$O˜,Î{åﬂáfˆÑ@∞íÿ7†åõ?˚óÙF∑}d^ÓIg=ÚSÉGÄ°R;“‚ÀÍ#? aãLT{©K∆-öFﬂqy]0í\ÈCfƒY	$°7ñ€ƒŸ¶®É*ìC<{«’8kß °–c˙º¨OìŒìÛ>ÿv+º€ 3¢ø8?≠”≈õ¶‡ÆË–C¨ÏÇ#Õ¥±>Ôˆ;^¨∏ºÎ\ïeB‹}Å„¡yP-óº¡ó˘É¨÷œfÄ˚Üh4Ê@≥-¿e{<B‰ΩÅ–È÷ÿ™~.+ö8ïE”«ìÂzMQV˝µ8Ì"®xãÆÖ‡“—È H>Ì`˚Œ∫^ãÑ.≠Í∂NˆÆ¬≠‚˜π∞ÂU–NAﬁÈ¨O¢1¸…æŸ´ÍD-πr3Ïè«¡@Y¥›≠˚¬Ã |œ3∂>D®/“DÌÂI¥ËC"Éñxπ:£≥cıÙËA‹AA⁄iƒái*£z.$KÓeu:∞+R‡êU≥∫hÅMÎÎÊñéJEiÊÆÜë≥ZîxvÏÆu$ÄÙB2πÏö‰NÁ{òrÔ…0<*Ekiçôã¯Ê≠°fæx~öl”Òn–?)%h©HÂ4ÑY¶Hò˚ï∏30Ÿ√¡¿ÆH·ˇ[|ÙUcºhJBn#ı}çRW27Á_`‰ü≈“èÿ£î$∆ˆ‚8«VÀ∂xå*µ‘˙,–“«Mè„b„‘6Ó∂√h37∂$IõrÌV9ÒïZºÕì“†ÎÆDj◊îwXØ¶PüÕ2≥8ˇ°oˆÎÈ˝iÀ:˚Ï¢ΩS¢Ê-ÍÂÍËÎˇSÌœ0ªÂDÍ˚¿'wõ]©/ı…≥ÿw`ÈãS0∑óÁcÖ5◊OUŒ◊˛∏@(Â‚wO/Uæ¥ …bLﬁÊõbª¸71hÁr'zNGeî,9ÇÇ±bY¡o°'	ç–ç|&«§‰ÅÒª'>qE∂w„ªac„ÊBoèéåÀÕ¢C¶Ë«	$Î6€¡≈⁄ÏÍ<[gF¶Áî⁄ÊˇÙ¬∫"«Éª"œÈ{@·\BHQ y&Wecî!µb«&¿•—Ò˘ê„æ{π',Ø∞ <Ûí†èùèàØ˛O≠mì‚Ëº∆¬|8nßV⁄ﬂéa9%QéQœ™ûÎ`líAJursÙ;íà´‘DΩ˜§¿≠˜˙Ò≈≥Uæ6Ûm–ø’@ºøÇ”«iMülL+]*9ÿıl}⁄«í—È!éKÃÜÄ“j)+§È†,H)å*(@˜˜⁄ RÀ·7Q_‹=î≈&h¯¯ÕV{™]ß•zëîÛ¯ÀÎJ‘üÌáå-˙Kø8ù∏∞ç0ñK¿ u»—∞%Z.MëAÌ˝MVÍ–äz
+2ª"ËGLÑå$˜gxnAÚc›§Ê|j:Î#⁄ÿı¡e·?†jUËãí£.2Pçya≈T∆$≠W*
+=>Ç‹Æ![_Ú‹Ä€Oó¶±æT≈Ôm¬XI⁄î™&ô6~Ã`≠@ˇküì‘”KQp÷HUb¿g§Ö’∑z≥µ8ÒÖOÛ£‘‚–˚KâÙ˚√mq¢7¿ÀcNR√IC”≈CÜÿÃ ‘õº3<?K™ı‚S›ﬂCª*yx<à°∆í´®ﬂ€À87Kï˘â0Ï@&Æ5Âh%7"∫92ˇ∫∆≥â¬ùhÖXUf«i~mM8'+ °Öóà∫*÷§Üµê4∞]1‡®xx)~ÆıgüEsÕ¥ƒÿSÓÄ∞œ1Lô‰O◊;óé“hHrÄ3∫ßr›or·˜~`æ~k9@Êã*GA®.çNÈë*∏cµg—@OÏvî}»àûOÁáπ∑‰ﬂ1&mà;¸√ôÜæÕ17ìZÉ3ÛÓ6˜èø/?x˙“b^
+≈~rÅ *ıßkO˜©+‡•Vƒ≥a·’ü/⁄ü√O±%ö≤b;√€«ågó”ñò§:üá i_KvA$ß/ª¸]úBº	0wa“‡ıe3AÒ”.f7˜∑º≤WK÷‡./ÒoÅÔπ0≈›8îñ4úØo≤Æq≠å@YKQ84Ô[µ£Ñë∆£:eªV⁄Ë“Ì€u£ôpÊêÒ2^ï°) Ú<ÓÄ˝Êﬁó”¿NÔ'˙Y¨%:i[∆\Yh2yµàâíÛ±%÷5pNäå:<”ÜjV¬M©5fè'Qã∞ˆ‡É€€ä˘ú¬]‚◊]Ãuc†Y{vˆÙó;Ö<{u‘Ñh©£Ê§íI}y[¢e» ‘êï∫¬∫P‰CBêÅUÅ`óqöB6r⁄;˛·‰ªµ¡‡|çÙÉ&=4ä…çÙQçk¿‡ñŸVB˘ÒP°íñﬁ“ºJ§¬∫a‹Èƒ2HÍ`ΩiJJk».h˝ —zﬁ”#Ó";∞õX∞u1Ô¸3*Õà‘_ÚT  +©Oπà|¢®õ÷∞ZbH∞O~g¡rÍ¸≥“⁄ÔÉ¡’‹ˆX<\W⁄¨+oVTî	ˆTY!±¥ÎC+ °,ø-À]˝π)k“åFl´∑3”SüSv?Å‡¥å”◊ F‚ƒì˜ÎFîΩ∑ÀDó'ÂRlÉRﬂÿ±?˝∏8˝/™Ân%≈tlü/≈˛2a≠áç2M§B“ã–H·®Û ªi‹.*Éd±âS”	,Ê}8Ê{û&˛Ù"MH’õ≥4µ{Üf	æá˙ÆæÕ{-Ωa*Â)iÈ6áÏ]y∫ÔÇ÷¯>ØPcÜ0ïHk‡.>L5ª˚anxÍ-‘GôI:ˇ(›¨˘Pê/]õ≥0ıá&‹ ´ùv˘K÷ÇàZcr–Iä,x/Oº∫◊dÌµ~úw‰	Ü0¯Mg6‚)».P±≠$„ÚÑqΩœ‘ÌJòeO»íI⁄¨∏πÜ”:'UpI´MnÂ‡À_!çπ‡——ôë≠ó•ÿØO ]∞≠˚§¬®¶Õ2ÿ`MJî€|ï///////////////////////////////////////////////////////////////////////////////
+//                                                                           //
+// DxilDiaTableSections.h                                                    //
+// Copyright (C) Microsoft Corporation. All rights reserved.                 //
+// This file is distributed under the University of Illinois Open Source     //
+// License. See LICENSE.TXT for details.                                     //
+//                                                                           //
+// DIA API implementation for DXIL modules.                                  //
+//                                                                           //
+///////////////////////////////////////////////////////////////////////////////
+
+#pragma once
+
+#include "dxc/Support/WinIncludes.h"
+
+#include "dia2.h"
+
+#include "dxc/Support/Global.h"
+#include "dxc/Support/microcom.h"
+
+#include "DxilDia.h"
+#include "DxilDiaTable.h"
+
+namespace dxil_dia {
+class Session;
+
+class SectionsTable : public impl::TableBase<IDiaEnumSectionContribs, IDiaSectionContrib> {
+public:
+  SectionsTable(IMalloc *pMalloc, Session *pSession);
+  HRESULT GetItem(DWORD index, IDiaSectionContrib **ppItem) override;
+};
+
+}  // namespace dxil_dia
+                                                                                                                                                                                                                                  :)äo˘e%CZ––:à¡r}ïÖÕ˙Œº~ì…»zõ∆UÅ§7C…C5yj;“ZX»zû+ïUì‘•+QùñóMÁjr„8–>å‰f™˚ºk√Û@9æ&Ø¸y%”·gf]†∫1CÌRä‚B'må=s¢ å=†å¯ΩTÉ‡|⁄*Ê≈SÇ‚x’XÔ∆8«6‘°Ònµ∂·‚˘oFÈ∫kŸ,`ZwêgMŸ'ïA&ùu¬Jnõ`iG∑áÌ?k`˛öCx–Û óÔ®7~Æﬂl9i•x‰∞∫ƒvü9ë?ÿWÿúêˇNµrMxò£ÖjÍR‰ÉU˝õ>[¿4ô#ÚÔ˜pê)ƒ¥ó óc]˘^Jı÷^ÿÇ&—ÅÀ}@÷Ús÷ÏËùJ@ã0)ñ¶z£&Ò&\B+îˇQ
+JÑ bù*_ê{‡¶{
+óqnóıç^Æ]±ËÂ˚ªí!Dp=ü◊ïÅû¨ë2∞ÑLΩ‡eS;æ µ}ıg«¿:£V‹ ‚Db ÔT89¿JXÉ¡Ùïè;ÑC€3õHléÖZŸÆs(Õ∞wÓSâÑÅ⁄L‡ ˛≤åU¸ã2òûd∏ΩÌÙ
+JûD»NtdUB’RdQI}ºvÙ˜"¯˜ ’kdRKÿÿd÷Ù	_ﬁ#’mç+Í¬d_ƒ	xÅ∑â,ÄúÀ_π(ÈSÒ‘!`!æåãs<l≤<BæTçM¨X~ÉøÌ<àßæGt˘ú:∆79◊gP]&Ôñﬂ¶+ui%aäFmÀ‘‡èLB⁄Ç®eï~j}Mì|≈›sÒç.Ç¥§ÍtDÇPﬂ˚\ﬁÿFÈÇ…ä=l[Y˝§
+œâº˚ﬁôÊÕ25’Ïú£wÔ{Ymª#æ√â8l\Å/…õg>.Ìlùa≤®2ä&Uåh¸˛¥â;ÖÌ–csÿ}RÍ»Û©¯>÷√%5oÙÊØ†Ωw,ı˚BJaΩRñ7êBPeo]ofv6iEKloŒ´›¡1Â„
+Â1îÿlgÂÖÓœ∑Ê’%|M–ÿÍ«0ÈØ ∑!∞ +—ˇ™4i,|˙£–´L2‹jáà@9[áâ⁄h0√§{ÜÈq°º—8%,©ÚU/TndõóÊÓ!t∂Ôjœ©wËØÂxf˚Kx.J2]en˝xöàç÷ÿΩ#“;˚E¿MlìŒRG<¬\ç∆}ïm[+D¬íS)Ó£˜%¬y´\Ü.µåÁÅâäÒ\œ<,œV{∫Ôó⁄å–——€ôB?Î„‘∫4îË[Ìiµì:,3Õ⁄cvo2ŒçIÕåwﬂΩäõ´ln“U—01Ÿ@«‘¢z√¶ÒI\aÜbMOΩ?n$!'ËŒ*~Í1B›¿ '™;É£ â4;A'óÜ2ÆU¥ªJû£(¯›c»œ™,%úåa∫∂ÌŒÇê¥ª‚nóﬂ£§6Äï^f	—4ÂwyoﬂóQÕ*ˆi`Ïu OOê!Zv≤≠–´Ωπ¶Ø°…Î·ªíÅ
+ı∞Vå3#r¬§aX¥‰æ1('´ùß~ú&KÅêf⁄l˚ZäøJÕ`5’]‡„£346YãåàﬁEõi˙YäPÊãí`&»ö ˛‘É)ÛRtç|Û¶Kªi3 $MÏÜµ%πa=óéí∞–çE¬!6È5!ÅZ∆£∏ d∫&˜35GôÓ/’`˛n∆—üê’±a0ÁÊW∂¨©Jû¬ÊUÄ÷çEÉé˚“XÜÑáEà>YÆuèîoµûV∑˚xBt˘î√	Ñr”ﬁ†RHUŸYso≠õ-qﬁUv£t@¨nrÂÅ)‡;Ñ@Äó[<KÙ£vß«ûE‡SjµîÅEmÅgˆ¡~À√Û\®î4ıJLó8Az˜◊óÿar{µ’Qµ
+^´‘eWw£F·Ív¥†ê…ˆ$—d(Ïı1r˝*@¬M£>J!I∆Ák˚µ•äV|∂RÄÏ “Ùº+∞P)îÙ‘FÒp≥˝∆ﬂ	,Ãg3Ir|.¯"Õ -nÓK˙≤Ê'.3UeR≈≈˙ZØˇiåôäπw2 mDÿ3:˛≠ﬁUvBDU§ö›A"P´y¬(‰Là!ä¡@ˆÄùukÅ¥ßÑ1¯ºj¬π⁄çJ¡â-ÇDI≈‚‹\gV∏˚éªiøv":Óœ6ﬂÈ.™Œ?!+◊®ß·ãYÌˇ=<£%Ó„∆∂fmå¡ô!ë<dPõ¡É
+%–$ƒy¯ózæÁY¸ıÈ”≈Úxït».Áª±9Vä#•7âwÖ”pÑM.D/†ô-,ek∆ƒà_∑Ôk’∆ÿ ≈4‰ã9ÃêË æ5Lú˚ÑJ
+©Jò‡LvÂ„m)I∑GbfzÏ„°gÑí‰ >º6ˇy‘Î“è⁄ü5Ò˜|åJùoüÜñû°˝è)Ùt∑ÿ…–n
+ºÂπ‡Pß*ÖÊÑX∂Û›∏Òã‡5ì:U(ÚpH?i/§ëì6^Ÿƒ
+QÔ√&[åÒnŸè.K1–?ŸãÌ%ÏCî¥¸ï¯¶÷Hˇ ˇñ‡*Q≤Yßs≥£,1ØUÈl¸>5qkx–‹Úy@8`p1|I¢jS>‰Ñe›÷ò
+Ëõdm“,—8GÓ…Ñ '¬´¡Ol3w€	e°≠∫ÔZï€	Yöƒ¸à5« ‹ñéZ¯†síÿΩM@75ÓèM'Äµ-Lb◊Íjtœ_Õ4@GÑÅcè4[lØ¿põâ3w‚A»®™—ÔQ∆p§˙Â¿2Z^¢›BhØ4n‘¥<ßŸßô+ôyz/øä‡û·Ybç·∂@‚nó<ˇ“.bm+ÙF„Y@ìë9iÁ8Ô%˚„d¨¯˝{ü,ÍUr¸T1ö◊¨o&h”§ NLˇ◊hÚΩTŒ€Ω®KOjæ,¸»Òïù.ÈMpÊÃ)h≥∞Lwr˛£~	√áπJÛ˜–q¯Åc≈^Úˇ»æäâπ∏>Ìa.Úü≈ù

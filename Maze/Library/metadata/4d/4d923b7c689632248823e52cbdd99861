@@ -1,0 +1,121 @@
+     f = FloatLike()
+        class IntLike(object):
+            def __int__(self):
+                return 2
+        i = IntLike()
+        # integers cannot be constructed from floats,
+        # but from integer-like objects
+        for t in signed_types + unsigned_types:
+            self.assertRaises(TypeError, t, 3.14)
+            self.assertRaises(TypeError, t, f)
+            self.assertEqual(t(i).value, 2)
+
+    def test_sizes(self):
+        for t in signed_types + unsigned_types + float_types + bool_types:
+            try:
+                size = struct.calcsize(t._type_)
+            except struct.error:
+                continue
+            # sizeof of the type...
+            self.assertEqual(sizeof(t), size)
+            # and sizeof of an instance
+            self.assertEqual(sizeof(t()), size)
+
+    def test_alignments(self):
+        for t in signed_types + unsigned_types + float_types:
+            code = t._type_ # the typecode
+            align = struct.calcsize("c%c" % code) - struct.calcsize(code)
+
+            # alignment of the type...
+            self.assertEqual((code, alignment(t)),
+                                 (code, align))
+            # and alignment of an instance
+            self.assertEqual((code, alignment(t())),
+                                 (code, align))
+
+    def test_int_from_address(self):
+        from array import array
+        for t in signed_types + unsigned_types:
+            # the array module doesn't support all format codes
+            # (no 'q' or 'Q')
+            try:
+                array(t._type_)
+            except ValueError:
+                continue
+            a = array(t._type_, [100])
+
+            # v now is an integer at an 'external' memory location
+            v = t.from_address(a.buffer_info()[0])
+            self.assertEqual(v.value, a[0])
+            self.assertEqual(type(v), t)
+
+            # changing the value at the memory location changes v's value also
+            a[0] = 42
+            self.assertEqual(v.value, a[0])
+
+
+    def test_float_from_address(self):
+        from array import array
+        for t in float_types:
+            a = array(t._type_, [3.14])
+            v = t.from_address(a.buffer_info()[0])
+            self.assertEqual(v.value, a[0])
+            self.assertIs(type(v), t)
+            a[0] = 2.3456e17
+            self.assertEqual(v.value, a[0])
+            self.assertIs(type(v), t)
+
+    def test_char_from_address(self):
+        from ctypes import c_char
+        from array import array
+
+        a = array('c', 'x')
+        v = c_char.from_address(a.buffer_info()[0])
+        self.assertEqual(v.value, a[0])
+        self.assertIs(type(v), c_char)
+
+        a[0] = '?'
+        self.assertEqual(v.value, a[0])
+
+    # array does not support c_bool / 't'
+    @unittest.skip('test disabled')
+    def test_bool_from_address(self):
+        from ctypes import c_bool
+        from array import array
+        a = array(c_bool._type_, [True])
+        v = t.from_address(a.buffer_info()[0])
+        self.assertEqual(v.value, a[0])
+        self.assertEqual(type(v) is t)
+        a[0] = False
+        self.assertEqual(v.value, a[0])
+        self.assertEqual(type(v) is t)
+
+    def test_init(self):
+        # c_int() can be initialized from Python's int, and c_int.
+        # Not from c_long or so, which seems strange, abc should
+        # probably be changed:
+        self.assertRaises(TypeError, c_int, c_long(42))
+
+    def test_float_overflow(self):
+        import sys
+        big_int = int(sys.float_info.max) * 2
+        for t in float_types + [c_longdouble]:
+            self.assertRaises(OverflowError, t, big_int)
+            if (hasattr(t, "__ctype_be__")):
+                self.assertRaises(OverflowError, t.__ctype_be__, big_int)
+            if (hasattr(t, "__ctype_le__")):
+                self.assertRaises(OverflowError, t.__ctype_le__, big_int)
+
+    @unittest.skip('test disabled')
+    def test_perf(self):
+        check_perf()
+
+from ctypes import _SimpleCData
+class c_int_S(_SimpleCData):
+    _type_ = "i"
+    __slots__ = []
+
+def run_test(rep, msg, func, arg=None):
+##    items = [None] * rep
+    items = range(rep)
+    from time import clock

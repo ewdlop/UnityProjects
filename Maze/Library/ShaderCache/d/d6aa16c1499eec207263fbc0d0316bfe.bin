@@ -1,0 +1,78 @@
+
+            return action!=MBCS_STATE_ILLEGAL;
+        }
+    }
+}
+
+U_CFUNC void
+ucnv_MBCSToUnicodeWithOffsets(UConverterToUnicodeArgs *pArgs,
+                          UErrorCode *pErrorCode) {
+    UConverter *cnv;
+    const uint8_t *source, *sourceLimit;
+    UChar *target;
+    const UChar *targetLimit;
+    int32_t *offsets;
+
+    const int32_t (*stateTable)[256];
+    const uint16_t *unicodeCodeUnits;
+
+    uint32_t offset;
+    uint8_t state;
+    int8_t byteIndex;
+    uint8_t *bytes;
+
+    int32_t sourceIndex, nextSourceIndex;
+
+    int32_t entry;
+    UChar c;
+    uint8_t action;
+
+    /* use optimized function if possible */
+    cnv=pArgs->converter;
+
+    if(cnv->preToULength>0) {
+        /*
+         * pass sourceIndex=-1 because we continue from an earlier buffer
+         * in the future, this may change with continuous offsets
+         */
+        ucnv_extContinueMatchToU(cnv, pArgs, -1, pErrorCode);
+
+        if(U_FAILURE(*pErrorCode) || cnv->preToULength<0) {
+            return;
+        }
+    }
+
+    if(cnv->sharedData->mbcs.countStates==1) {
+        if(!(cnv->sharedData->mbcs.unicodeMask&UCNV_HAS_SUPPLEMENTARY)) {
+            ucnv_MBCSSingleToBMPWithOffsets(pArgs, pErrorCode);
+        } else {
+            ucnv_MBCSSingleToUnicodeWithOffsets(pArgs, pErrorCode);
+        }
+        return;
+    }
+
+    /* set up the local pointers */
+    source=(const uint8_t *)pArgs->source;
+    sourceLimit=(const uint8_t *)pArgs->sourceLimit;
+    target=pArgs->target;
+    targetLimit=pArgs->targetLimit;
+    offsets=pArgs->offsets;
+
+    if((cnv->options&UCNV_OPTION_SWAP_LFNL)!=0) {
+        stateTable=(const int32_t (*)[256])cnv->sharedData->mbcs.swapLFNLStateTable;
+    } else {
+        stateTable=cnv->sharedData->mbcs.stateTable;
+    }
+    unicodeCodeUnits=cnv->sharedData->mbcs.unicodeCodeUnits;
+
+    /* get the converter state from UConverter */
+    offset=cnv->toUnicodeStatus;
+    byteIndex=cnv->toULength;
+    bytes=cnv->toUBytes;
+
+    /*
+     * if we are in the SBCS state for a DBCS-only converter,
+     * then load the DBCS state from the MBCS data
+     * (dbcsOnlyState==0 if it is not a DBCS-only converter)
+     */
+    if((state=(uint8_t)(cnv->mode))==0) {

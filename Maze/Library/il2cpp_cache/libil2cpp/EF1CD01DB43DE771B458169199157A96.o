@@ -1,0 +1,112 @@
+//------------------------------------------------------------------------------
+// <copyright file="UpWmlMobileTextWriter.cs" company="Microsoft">
+//     Copyright (c) Microsoft Corporation.  All rights reserved.
+// </copyright>                                                                
+//------------------------------------------------------------------------------
+
+using System;
+using System.Collections;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Text;
+using System.Web.Mobile;
+using System.Web.UI.MobileControls;
+using System.Security.Permissions;
+
+using SR=System.Web.UI.MobileControls.Adapters.SR;
+
+#if COMPILING_FOR_SHIPPED_SOURCE
+using Adapters=System.Web.UI.MobileControls.ShippedAdapterSource;
+namespace System.Web.UI.MobileControls.ShippedAdapterSource
+#else
+using Adapters=System.Web.UI.MobileControls.Adapters;
+namespace System.Web.UI.MobileControls.Adapters
+#endif    
+
+{
+    /*
+     * UpWmlMobileTextWriter class.
+     *
+     * Copyright (c) 2000 Microsoft Corporation
+     */
+
+    /// <include file='doc\UpWmlMobileTextWriter.uex' path='docs/doc[@for="UpWmlMobileTextWriter"]/*' />
+    [AspNetHostingPermission(SecurityAction.LinkDemand, Level=AspNetHostingPermissionLevel.Minimal)]
+    [AspNetHostingPermission(SecurityAction.InheritanceDemand, Level=AspNetHostingPermissionLevel.Minimal)]
+    [Obsolete("The System.Web.Mobile.dll assembly has been deprecated and should no longer be used. For information about how to develop ASP.NET mobile applications, see http://go.microsoft.com/fwlink/?LinkId=157231.")]
+    public class UpWmlMobileTextWriter : WmlMobileTextWriter
+    {
+        private int       _screenWidth;
+        private int       _screenHeight;
+        private bool      _inHyperlink = false;
+        private bool      _inPostBack = false;
+        private bool      _inSoftkey = false;
+        private Alignment _lastAlignment = Alignment.Left;
+        private Wrapping  _lastWrapping = Wrapping.Wrap;
+        private int       _currentCardIndex = -1;
+        private ArrayList _cards = new ArrayList();
+        private int       _currentCardAnchorCount = 0;
+        private int       _currentCardPostBacks = 0;
+        private int       _currentCardSubmits = 0;
+        private bool      _canRenderMixedSelects = false;
+        private bool      _requiresOptionSubmitCard = false;
+        private int       _optionSubmitCardIndex = 0;
+        private String    _optionMenuName = null;
+        
+        private String    _linkText = null;
+        private String    _targetUrl = null;
+        private String    _softkeyLabel = null;
+        private bool      _encodeUrl = false;
+        private bool      _useMenuOptionTitle = false;
+        
+        /// <include file='doc\UpWmlMobileTextWriter.uex' path='docs/doc[@for="UpWmlMobileTextWriter.UpWmlMobileTextWriter"]/*' />
+        public UpWmlMobileTextWriter(TextWriter writer, MobileCapabilities device, MobilePage page) 
+            : base(writer, device, page)
+        {
+            _screenWidth = device.ScreenCharactersWidth;
+            _screenHeight = device.ScreenCharactersHeight;
+            _canRenderMixedSelects = device.CanRenderMixedSelects;
+        }
+
+        private UpCard CurrentCard
+        {
+            get
+            {
+                return (UpCard)_cards[_currentCardIndex];
+            }
+        }
+
+        /// <include file='doc\UpWmlMobileTextWriter.uex' path='docs/doc[@for="UpWmlMobileTextWriter.BeginForm"]/*' />
+        public override void BeginForm(Form form)
+        {
+            ResetState();
+            if (AnalyzeMode)
+            {
+                AllocateNewCard();
+                base.BeginForm(form);
+            }
+            else
+            {
+                if (form == form.MobilePage.ActiveForm)
+                {
+                    PreRenderActiveForm();
+                }
+
+                base.BeginForm(form);
+                RenderCardOpening(0);
+            }
+        }
+
+        private static readonly int _filePathSuffixLength = 
+            Constants.UniqueFilePathSuffixVariableWithoutEqual.Length + 1;
+        private int _sessionCount = -1;
+        private int SessionCount
+        {
+            get
+            {
+                if (_sessionCount == -1)
+                {
+                    _sessionCount = 0;
+                    String filePathSuffix = 
+                        Page.Request.QueryString[Constants.UniqueFilePathSuffixVariableWithoutEq

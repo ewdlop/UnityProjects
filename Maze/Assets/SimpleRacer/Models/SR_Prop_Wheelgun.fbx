@@ -1,0 +1,359 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "Protocols/ImageSequenceProtocol.h"
+
+#include "Misc/CommandLine.h"
+#include "Misc/FileHelper.h"
+#include "HAL/RunnableThread.h"
+#include "Misc/ScopeLock.h"
+#include "Misc/FeedbackContext.h"
+#include "Misc/ScopedSlowTask.h"
+#include "Misc/DefaultValueHelper.h"
+#include "Modules/ModuleManager.h"
+#include "Async/Future.h"
+#include "Async/Async.h"
+#include "Templates/Casts.h"
+#include "MovieSceneCaptureModule.h"
+#include "MovieSceneCaptureSettings.h"
+#include "ImageWriteQueue.h"
+
+struct FImageFrameData : IFramePayload
+{
+	FString Filename;
+};
+
+UImageSequenceProtocol::UImageSequenceProtocol(const FObjectInitializer& ObjInit)
+	: Super(ObjInit)
+{
+	Format = EImageFormat::BMP;
+	ImageWriteQueue = nullptr;
+}
+
+void UImageSequenceProtocol::OnLoadConfigImpl(FMovieSceneCaptureSettings& InSettings)
+{
+	// Add .{frame} if it doesn't already exist
+	FString OutputFormat = InSettings.OutputFormat;
+
+	// Ensure the format string tries to always export a uniquely named frame so the file doesn't overwrite itself if the user doesn't add it.
+	bool bHasFrameFormat = OutputFormat.Contains(TEXT("{frame}")) || OutputFormat.Contains(TEXT("{shot_frame}"));
+	if (!bHasFrameFormat)
+	{
+		OutputFormat.Append(TEXT(".{frame}"));
+		InSettings.OutputFormat = OutputFormat;
+
+		UE_LOG(LogMovieSceneCapture, Display, TEXT("Automatically appended .{frame} to the format string as specified format string did not provide a way to differentiate between frames via {frame} or {shot_frame}!"));
+	}
+
+	Super::OnLoadConfigImpl(InSettings);
+}
+
+void UImageSequenceProtocol::OnReleaseConfigImpl(FMovieSceneCaptureSettings& InSettings)
+{
+	// Remove .{frame} if it exists. The "." before the {frame} is intentional because some media players denote frame numbers separated by "."
+	InSettings.OutputFormat = InSettings.OutputFormat.Replace(TEXT(".{frame}"), TEXT(""));
+
+	Super::OnReleaseConfigImpl(InSettings);
+}
+
+bool UImageSequenceProtocol::SetupImpl()
+{
+	ImageWriteQueue = &FModuleManager::Get().LoadModuleChecked<IImageWriteQueueModule>("ImageWriteQueue").GetWriteQueue();
+	FinalizeFence = TFuture<void>();
+
+	return Super::SetupImpl();
+}
+
+bool UImageSequenceProtocol::HasFinishedProcessingImpl() const
+{
+	return Super::HasFinishedProcessingImpl() && (!FinalizeFence.IsValid() || FinalizeFence.WaitFor(0));
+}
+
+void UImageSequenceProtocol::BeginFinalizeImpl()
+{
+	FinalizeFence = ImageWriteQueue->CreateFence();
+}
+
+void UImageSequenceProtocol::FinalizeImpl()
+{
+	if (FinalizeFence.IsValid())
+	{
+		double StartTime = FPlatformTime::Seconds();
+
+		FScopedSlowTask SlowTask(0, NSLOCTEXT("ImageSequenceProtocol", "Finalizing", "Finalizing write operations..."));
+		SlowTask.MakeDialogDelayed(.1f, true, true);
+
+		FTimespan HalfSecond = FTimespan::FromSeconds(0.5);
+		while ( !GWarn->ReceivedUserCancel() && !FinalizeFence.WaitFor(HalfSecond) )
+		{
+			// Tick the slow task
+			SlowTask.EnterProgressFrame(0);
+		}
+	}
+
+	Super::FinalizeImpl();
+}
+
+FFramePayloadPtr UImageSequenceProtocol::GetFramePayload(const FFrameMetrics& FrameMetrics)
+{
+	TSharedRef<FImageFrameData, ESPMode::ThreadSafe> FrameData = MakeShareable(new FImageFrameData);
+
+	const TCHAR* Extension = TEXT("");
+	switch(Format)
+	{
+	case EImageFormat::BMP:		Extension = TEXT(".bmp"); break;
+	case EImageFormat::PNG:		Extension = TEXT(".png"); break;
+	case EImageFormat::JPEG:	Extension = TEXT(".jpg"); break;
+	case EImageFormat::EXR:		Extension = TEXT(".exr"); break;
+	}
+
+	FrameData->Filename = GenerateFilenameImpl(FrameMetrics, Extension);
+	EnsureFileWritableImpl(FrameData->Filename);
+
+	// Add our custom formatting rules as well
+	// @todo: document these on the tooltip?
+	FrameData->Filename = FString::Format(*FrameData->Filename, StringFormatMap);
+
+	return FrameData;
+}
+
+void UImageSequenceProtocol::ProcessFrame(FCapturedFrameData Frame)
+{
+	check(Frame.ColorBuffer.Num() >= Frame.BufferSize.X * Frame.BufferSize.Y);
+
+	TUniquePtr<FImageWriteTask> ImageTask = MakeUnique<FImageWriteTask>();
+
+	// Move the color buffer into a raw image data container that we can pass to the write queue
+	ImageTask->PixelData = MakeUnique<TImagePixelData<FColor>>(Frame.BufferSize, TArray64<FColor>(MoveTemp(Frame.ColorBuffer)));
+	if (Format == EImageFormat::PNG)
+	{
+		// Always write full alpha for PNGs
+		ImageTask->PixelPreProcessors.Add(TAsyncAlphaWrite<FColor>(255));
+	}
+
+	switch (Format)
+	{
+	case EImageFormat::EXR:
+	case EImageFormat::PNG:
+	case EImageFormat::BMP:
+	case EImageFormat::JPEG:
+		ImageTask->Format = Format;
+		break;
+
+	default:
+		check(false);
+		break;
+	}
+
+	ImageTask->CompressionQuality = GetCompressionQuality();
+	ImageTask->Filename = Frame.GetPayload<FImageFrameData>()->Filename;
+
+	ImageWriteQueue->Enqueue(MoveTemp(ImageTask));
+}
+
+void UImageSequenceProtocol::AddFormatMappingsImpl(TMap<FString, FStringFormatArg>& FormatMappings) const
+{
+	FormatMappings.Add(TEXT("quality"), TEXT(""));
+}
+
+bool UCompressedImageSequenceProtocol::SetupImpl()
+{
+	FParse::Value( FCommandLine::Get(), TEXT( "-MovieQuality=" ), CompressionQuality );
+	CompressionQuality = FMath::Clamp<int32>(CompressionQuality, 1, 100);
+
+	return Super::SetupImpl();
+}
+
+void UCompressedImageSequenceProtocol::AddFormatMappingsImpl(TMap<FString, FStringFormatArg>& FormatMappings) const
+{
+	FormatMappings.Add(TEXT("quality"), CompressionQuality);
+}
+
+UImageSequenceProtocol_EXR::UImageSequenceProtocol_EXR(const FObjectInitializer& ObjInit)
+	: Super(ObjInit)
+{
+	Format = EImageFormat::EXR;
+	bCompressed = false;
+	CaptureGamut = HCGM_Rec709;
+}
+
+bool UImageSequenceProtocol_EXR::SetupImpl()
+{
+	{
+		int32 OverrideCaptureGamut = (int32)CaptureGamut;
+		FString CaptureGamutString;
+
+		if (FParse::Value(FCommandLine::Get(), TEXT("-CaptureGamut="), CaptureGamutString))
+		{
+			if (!FDefaultValueHelper::ParseInt(CaptureGamutString, OverrideCaptureGamut))
+			{
+				OverrideCaptureGamut = StaticEnum<EHDRCaptureGamut>()->GetValueByName(FName(*CaptureGamutString));
+			}
+			// Invalid CaptureGamut will crash (see UImageSequenceProtocol_EXR::AddFormatMappingsImpl), so only set if valid.
+			if (OverrideCaptureGamut > INDEX_NONE && OverrideCaptureGamut < EHDRCaptureGamut::HCGM_MAX)
+			{
+				CaptureGamut = (EHDRCaptureGamut)OverrideCaptureGamut;
+			}
+			else
+			{
+				UE_LOG(LogMovieSceneCapture, Warning, TEXT("The value for the command -CaptureGamut is invalid, using default value instead!"))
+			}
+		}
+	}
+
+	int32 HDRCompressionQuality = 0;
+	if ( FParse::Value( FCommandLine::Get(), TEXT( "-HDRCompressionQuality=" ), HDRCompressionQuality ) )
+	{
+		bCompressed = HDRCompressionQuality != (int32)EImageCompressionQuality::Uncompressed;
+	}
+
+	IConsoleVariable* CVarDumpGamut = IConsoleManager::Get().FindConsoleVariable(TEXT("r.HDR.Display.ColorGamut"));
+	IConsoleVariable* CVarDumpDevice = IConsoleManager::Get().FindConsoleVariable(TEXT("r.HDR.Display.OutputDevice"));
+
+	RestoreColorGamut = CVarDumpGamut->GetInt();
+	RestoreOutputDevice = CVarDumpDevice->GetInt();
+
+	if (CaptureGamut == HCGM_Linear)
+	{
+		CVarDumpGamut->Set(1);
+		CVarDumpDevice->Set(7);
+	}
+	else
+	{
+		CVarDumpGamut->Set(CaptureGamut);
+	}
+
+	return Super::SetupImpl();
+}
+
+void UImageSequenceProtocol_EXR::FinalizeImpl()
+{
+	Super::FinalizeImpl();
+
+	IConsoleVariable* CVarDumpGamut = IConsoleManager::Get().FindConsoleVariable(TEXT("r.HDR.Display.ColorGamut"));
+	IConsoleVariable* CVarDumpDevice = IConsoleManager::Get().FindConsoleVariable(TEXT("r.HDR.Display.OutputDevice"));
+
+	CVarDumpGamut->Set(RestoreColorGamut);
+	CVarDumpDevice->Set(RestoreOutputDevice);
+}
+
+void UImageSequenceProtocol_EXR::AddFormatMappingsImpl(TMap<FString, FStringFormatArg>& FormatMappings) const
+{
+	FormatMappings.Add(TEXT("quality"), bCompressed ? TEXT("Compressed") : TEXT("Uncompressed"));
+
+	const TCHAR* GamutString = TEXT("");
+	switch (CaptureGamut)
+	{
+		case HCGM_Rec709:  GamutString = TEXT("sRGB"); break;
+		case HCGM_P3DCI:   GamutString = TEXT("P3D65"); break;
+		case HCGM_Rec2020: GamutString = TEXT("Rec2020"); break;
+		case HCGM_ACES:    GamutString = TEXT("ACES"); break;
+		case HCGM_ACEScg:  GamutString = TEXT("ACEScg"); break;
+		case HCGM_Linear:  GamutString = TEXT("Linear"); break;
+		default: check(false); break;
+	}
+	FormatMappings.Add(TEXT("gamut"), GamutString);
+}
+                                                                                                                                                                                                                                                                                        ™Ğö¨	'a„yÆO==…0‡Í¿Û]±
+©õ‡›3òüë,kóxY^‡ûl4®2xãX>ò#TÜNdH>=ê2„<Ÿ‚4…‹K4³ñ¡4‚üö¬™Ak+™ç¾(ÿõ½Ú³X^=«ÒOƒöÄÌÄU3_W¿á_é:º¶m…kÍ?ëË¸çFŞ†’÷ò@¢¯,6JŞ¾B:·²lt.®<„#}I3¾‚¤š"cdª#¡ÂØrÒjX//U5˜û–ÛÆ^Ä ùg„KÑ@~[JÙ¼Y¨noò|ñ¶áÑ{#,r xrHşÑBwİßˆ¾sòM(!ûÒÎÒİİåeòvâ¬–fñ'3À‹£@/˜l7P0d‡8ˆ5§˜-ñÇDC,ÛÇÔªìé‘ÕÂÊ 1 òhAQN]X¢Q¾Œy‹Ä=ZÉ¬|Ú`‡£ñxp† ©!Œ¡˜Øç`	5VÚzÓáÀÜ&sé:O©
+°`ÌXDè°°ğ'tóƒÕyŒSˆö¤¶ÛƒÃ÷ß×è'Ù±bšœ»0‡³’Ád<pÉ¶Nİá'ônzØùJ+¦L¿ñÂRx#:¨õ£\1ÙØK–«1;XÃI¶ÂZë=å5ùBrÑ¹¢Cñ ÒÂ:s·›°"›éOøó)ß‡ôÌs¥Œo]¨(²Õ©‹€°¥‘^,°órà«Ö½—+Ú^¡î¥3)$9XiXùcñ’"çÕ‘$Q‹Å	.Ie˜BoKFOùÉº—›J½îec¨
+ëÛhz#ÿEn€zœlnjÜ¼¸J°%Mì¯·(è²å<°r#Nğ¡)rî&sqğïél…ün$Ué`ŸŠ^³X·M²lv„\0Æ]ïX5ÑÔÌ`£¿Xû³#v¾—ûlıú²¶şğŸ%©'w?şJË„İVÉ¶róZ2‹W”=mW£G_ÆŸ²{B×ßKZK’8éé–“¦{şI/Ğ5¯Ş¿¡Zr·³DãöK²×»mùtü_CÈè¥7cÛ[õs?YØ”ü0Ddš^»èÙë'QZÛ/ç	B yÿc(‰õ¿/.kâËÀƒG q–±RâM@‡†2múÔ^¸Mò²¥i‡}
+t†”Kó}M¿s‡Øš¢e®!®G)¼	—§ƒq!ñÕ³l¡áè´ş»ûƒ_uË-Ë
+‡ŒX£Cİ—>ìßÈO6Smì„
+µ3:‰Hy“{<öœ `Ş±6F¼“ÈQpÈÎë± ¸x)õ£G]¦UY»­½ÊÌ&>~}y“‚=’MØ*7âSW{6÷º(Ôo0“ÂbÛ âyLG®9Vš‚İ5Q”³À@+Ïïú¤ñ6ø?•_‹õ §õÏW·é[_SÚ˜™ŒÈšá‘cŸ*¤›İh7Õ0bœöÂüàäÍÚ5r;Öé½Ôî¿£UX\p‰.]İÎ¨¹KpEëmÅ(Å¶Ô¼.ã«nCGr¢MÈÅ¸×š<<0“¶Uçôìòú±œ¥fÕã ›¹²_QMÚuì#,uİ‹}¡_ÏEï7ú.ùûzrø3¬|7S‰K×İ7ÿó0.ÊVÜ,6…ølìQqBèÕ
+Ê¦tò €±kóÄ¹
+]	¡,±†ÛüÆLQş<†)áëÊß8C+b‹õ8íoú rÊªwtcwÀ´¢Á‹>®FÔydQ~Û¶ñ±‡cÈ	ãºs¤7!¹Œ=h;ÄtEµ"å„øJ…)®„0š¬‰À-’{ç$¯Wáà†eÉ¶¡¦êĞÓ·ó1íqµ ¶-¢áÏ4ÑŠrDå¢o¼Î’¿³×j€	YRê /)˜C{“¤W„©æ¬mp£	$¿eSR"qF5’+>Ç<ü¥W“aóŠVû2l·ıå	nşñUT,T˜¿­J’ÎÈf âd6ENÜt9¼ ®
+´çÃWçêX4×ØµœÒì8@BF‹¡tY|A,ş’!jÜƒ ®+·Ã$ónhàEhdìğƒ2Án©Hcn=
+LaÊ'ˆÉ'ØYSîCUÄºë—š8FÉ¼Í(¡ˆ9™ª[9r@£şp“àİ”9óuí“èÆ,š¡M‘JTµjP Q¾0—e¹vå‹ ä-²_—Âp5…"µİKÖ=ˆò´¨´gBpM:c÷ĞqğÖÓ®eO¸a€$‡_¢…PK¤gRqKê®>¿”e?•HÖ˜—îe¢Ù¥h›%H3¦½D>Ò»3.e‰5”¾C"i­ùfŒr9ÁÔØ®ãÁ:[tKÃ×;« šC£o&çş„¿~ö“r­ü†±µŞÄójîÔ™¦Îy'
+'@k	¨“Œ›Fññ…V®œöpºnemÑÏj¶|pØ]B}	ÊkuÊÕI—•¦î“ÿmMûÁ=½ª6p_…å¦m­ß5Bhéxb/g<g6·¼ıGˆ~	T˜ı‡4ÓM‹¤nÇÎı ŒÒgŒ,+Å`}ë×™uÁª,ß	C¼Ø+¿Ğw›Ä£ÃÎ›h]D’´¶fàb¨S,ù{”ğŒ… †@r#'Z]eD~ÀQŒ"fä†PU1™È”KAÒuŠ/ºóÌb'ô¬¹ÃFê)ïöNŠaª¹ò8ĞZ„²[é*÷“Ü\ÌzÀ‹â§Öœx0îŸÂìº¦9‡±9iõzpë%íÉHT7Séşå¹7ÀXõjêÕ×Ãm¥)Éî”ØR¹•ı;A]RSŠT|‡sQœ•–mµ«0F_ EÓºŠ(vL„Ñœ),ï—¦ŞœÀºòö‡XÓïhKC÷âêyò1IŸR4#ÜF]VÓŸO°¥’ğ]Y)nm¸‘yXœp©HkT-G©¤’ ¡ûWñ¡°5¸qø^Ääds7­’=wz%BÖGo­#Ûù©r)RQÄ‹£C¯Ú¯B^æ
+{‡ñuëš|ó‰X$›ZôßÓ[­öô„n¸ëÙ-€Øm€‡'báÖõhiO³Ç¬¨tt¥±6,–ÊL4ƒ.FÂó§	ù=*KæÊö‹›.ˆÉÂ´ÉÁ&k3@œñÀ&ÇÓ´&LˆıÎ¡6B`–ä”Ùî£°a[k!À 50­Qó[mÎgçƒ~’dÔU›
+	|úï|üõV$ªJ"úV·Øğ,jä¨îè}Õ¾n"‘Sü|8÷w@UÛñx´tLuRviP?˜ğÜô-‹àXd¬ÅP°9fB´Ÿã,üMdpÿş¼2vŒÖ€ÏÍÛĞ;Mƒ²ú98$ÓxÂKnb÷½ÉpŒŠ`íãkéû%Ê5÷li¦ì¢ÈïØ€bÑÈ×Qa#=œQËnü6˜Álò3*Õu+`JùÀâícĞØÃwÁ‚v~æÆŒ\
+5ù8IOJj=„œ—ëá!ğL`§êÌ“Dğºûâ}ï¾ÅÁJıĞæÅD€@ˆ¥aàÉè^Îa&Ü¤ókú3sXÜ}ËêWÊk
+3•8 vSÆóùîRÇ³‰Zœ¹wfA8ÔK@Áé=àMóä„»ì@‹F“#Î‹wb#È¥¼A2Í!åu]Ë„yb6S(šÂÓ·V7DAtÙV"¢,8˜•6XMg<6/DïUm*±d—ó‰l`ŠŸÌhøÛb÷d­{ò-Ë °Ç~’*¼Î_ñ0e¢Ü•Ç!*W­måJ«­÷Ae‹49°8 ğª3¿T3ø'ucå¶ÍyÇM¨<JNÎ$Œ1K [‘-nœ˜òß9Şª…U«Ö­:Ê5ÚÊ‹ÂxMÒ'd µ¯X|œÄù?iä+ğceÿãƒOŞBÿ{«–ÇLgmòbéjDo‹½"M	S¥Æ\eZèÂ$–bËbúâî/vMbÆ |cĞ¾é/}‘$“ÿèpÕUº½_gQˆÔÏ'2§‰$¾~À«ƒª{{nãD<æ¤Ìr8BT!í)€²nlLï9½p½½ÂUˆ<çÕH™nƒ \nNŠ›A‡â ¶•[úé·Ò~À@„¯ÎÂÆÅWÑÑˆDß9C\Ôìàé¯ğ7Y4Ğ¶·»?Tœ*sÛ’Áú^jˆ`YùSF˜G+&«²ùüHüª6S°GÙfÅ3Áú{öÎ[uéb£ù‡a­-´ñ+IcY9é~?a™	jRÓ-=BªæÍX^ºªö‹m´jls©Øã_@t1”Ôîù˜ËÑó¼Æ7woŠƒìŞ%ºˆDÛ{/OñËÇyö˜t`o:È"ÂQÀÖ‘dÁé^K˜9S8
+±ûôêÿ¹ÏøĞÆ¡wD?C=c÷Œ_ ]µŸßan—°B…l»Wói_ğò×”ÇSÍ`Qı[ZÖÔ#É|¼ÌôOæ2šÕë‘'¤°ÑseÕ¶°âã9\t)Şö–Ö^"rãDĞ×Xìù”êlWñ©ÛÎõ…ãGso¾S–,Í£ãğIhı¼½ˆ€
+<\!D)=a&$]Ùâ˜yN°a£"c|¥È7Ì‡êyã.7•6¶éÜıt7¤œm#J¨!öıÀŞŠÃZf0Ú'Âú„á‚µ.^ÊL*‘—É½ m±eäÓÿ¡Íí"²ÛÉ’T†u æŸ!œ ıŠr©×Ä‰PNG
+
+   IHDR         \r¨f   	pHYs  X•  X•Ùm7Ó   sRGB ®Îé   gAMA  ±üa  IDATxíİÏ¯]UÀñuc©s©§cm™ ’pë@´ F<¢‘ĞD)&š’`z‰šM €ñE£áaPhõ6"0AJĞ1‡ÂÌ-ÿ@İëİ}ÛËãı¸çœ½öÙ?¾Ÿää>‰RûŞÛk¯½ÖŞûˆ                 €œLÙ»víZã>¹ç÷Üä¿^ş³å×KÍÿºÖ^ñÏòŸµş?¿ï?ÛÉdÒ
+²F È„äË¬ƒüK+_/ùX.É qQá’ €D¹¯ƒûNYòå““K+ÏE‚Bš ‰p~*‹™ı„Ü˜ÙK¢ËçİósÁè #ñ)ı}î™ú§´sY„‹ÔÆA ˆÈë6d‘ÚO«æ²/â! ó3ı)aĞw¡K…sBf` `Àú©{ıPs÷l¹@ğœ 8@@¾r¯ëú©oMo­•E0xŒ¬ @ ¾‚F˜íc™YA€Vªøº¾ochİ3#ôG èh¥¨§ë{Òü4´î™É¢ƒpE°6ÀšøYhİó”çk! ¬Áş™0ğsÒ
+Kƒµ öá¾nË}RXãçªÁ¾ » ª_İXt7íÃOú”à:]ç»G×„Á_İŸñûÙ>ë·cÃ#ğÜ/†øtÖg_¶VX\W} ğ3Â³ÂŒ_›¹{î¯}YPõÀÏúoƒ¿FS÷¼íªUeÀ¬æRi6P]àÿ†0ëãã¦î¹à~7î“ÊT V*ü:óSèÃN{¶ÜïÈ“~×gªXø”_[{ kİs¬†%AñÀJÊß°F*)ø”ÿ!úÓHfR¨"€_Ã½$úÆ\
+í XïÃH+ÖŠªø;ùXïÃB#‹VanohÚW1Àûtæ§Å+,ŠƒÅì(" øj-ı}Ä²å/‰É^öÀÿ  ®3%¬‹€şpF€ñdİ&Ì6 0ø‘lƒ@–€Áe² ~$,» U `ğ#Yl ƒy8——“d ü&ŸgÈÇF& V¶÷9ÑwêÙK’°¤ {9·¦|€(Ù ÀàG!ZY$ßZœòV`]ó7ä­‘ÅİIJ2 øŠÿT€2Lõ²QIPrK ²Ã=(Qr¤€_÷kÅŸc½(QrEÁd€¿ÇÛ|PºV*
+¦T˜	ƒåk$¡­Id ìôC…’¨Œ è÷£RIÔRXĞïG´æ5zÖ;j ğ-¿© ušıú±Ñ– ´ü€m£.ÆÌ ¸Æy)0J ğUÿ© P£-¢/¨ú»Ò¥À‘Ø„ÆÈ tD# VéR ú¡¨€Ÿıß {Ñ[„æIì ÙsÑ@"¢fÑ€/üõjeÀ€OH$Ñ– î/¥©#…¹ëø=òÚëoˆ¥›núŒ¼ûÖ›ÛŸ9yşÏ‘“?ú±XùÎ·ï•ÍgµnpD"ˆ’øÙ¿‘mşÆşğêÕä·¿ÿƒäæñ_Û~où©]pYãÆL”¥@¬%@±/ô8|óÍòà¾/Ö6÷‡í@ı/ğ¡XÑÙÿğÍŸ“‚òwd˜2 ~ƒC#Ó™È:=×ÁúÑ™ä@ÿ¿ZÎş‡ß\òì¿¤ƒÿ!1#0ÿKŒMŒ,à…İ¬zÙnVå·.[±œıO>ğ½Ògÿ%ó,À´XÛEGo»İ|€Şñµ¯È+çÿ*©º|ù¹ëÄ=f@gÿwß²-º&fæ
+‚‰ë ª—yn>m™ñkÿ|cûIÕY—ú[Îşü¤øÔ'Ó,À, ”\ùß‹ÎÎw|õ+bíì¯Ól}éìÿÂ‹vÙ‰~¿óí{¤2:øï#–@•¯ò~ü—3±–j`˜6Ÿ©öuf'M@³ÿÒÑ/~!JA0µ,Àzö¯ í·İ0V€YÊ’ƒmÁÔ²€³´ı¬™dÔÁ€?ñ7•ŠÅj>øÃ4Å?\ ²œı¿ëÖıÏşKzF øY‹ ÊµÿN'ø¾›¹li/ğÁvÏ}l'ø°XÑÙÿt}•ÿ½Ï¬-ÀT°Ähê»1·[où­°í·ŸĞ-Á  æâßnb´Ç>(d¹åWª¶ıö£ƒÿN	(tPuño71ŠWc²ı_øÓŸ´%, PüÛfÖÁ±² ËÙ¿ò¶ß~¦!—!3€©`W1Ú‚±³ ë?´ıöì€]È Pü©¿¾b´uğÇÚ¤›~6»:ø™ı÷5•@‚œä¶ßƒé ½ãëß0?-¨W‡Y·Ïşê	³ô¿ÂÓ~}5“Éä}(Tp\°/Íÿ¹Ù©Îëü‘]O^éìo¹ö§í·¶	 T ˆv‹iÎîúÖ7ÍÛ‚Ö[„­·üÒö[ÛT¼ ıïF§^˜aÉêÒıŞfÀ^»ğêvïkûìĞW‰…È ¦‚µÅ8Ón•œ5nû1ø;¼ï&D oûa	Ğîá¿ãØ7MÛv¡³ ëÙÿİ½Iå¿»ó.¸[ AŒ«ÄCg–'iûõ6• Iùİå%ŠqZ0Ô Õ-¿Vo?ZşîôrhèE!C3€/	zÑ¶ uËK—Ïÿyø2ÀºíÇì?È 184 °ö@g>ë¶à#?;3¨Ö`yà‡¶_ƒÆàĞ ÀÛ~²Şó>ô åì¿ùt‘/öŒmĞì üõD¬ÿŠÑì{PÈrößÎ~¾f…z¹*lHôb‚šYŸì“˜oùå´_H½Çâ @úHŒ¶`×,àùÿj6ûow@(ü…4J@ H…u°îN>Ëã¾Zø{ğû“+C ÈİöiÁ_ÌÄ’êu#k ¸ú‘Í.EÚ~&né{KP¯ `q?9â´Oÿlÿ[Û-ßğCÛÏT#=ôÍ 	ëâØ+{uß-Âg9ëŸ«^‚ú : Fb\%¾× ·œı5»aö7Õ++'HĞæo0-îuPèô£3±BÛÏ\#= £-¸3Ğ÷û½ò÷WÅW|GÑ+èu€+^˜Ò¶İÑÛn7½3@ïXîÆ;úåÛMúşZøÓ?‡ `îÊd2ù¬tÔ9ğW€ÁXŒÓ‚ËãÂ–[~O>ğ=º%øóÒQŸ%@#ˆB7ÌX—Ç…-¯øñšt\gŸ€¢².=òè³ÙŸ¶_t[}@ç4ıY·­vüÅ8åˆOè<9“d@Û‚¹Ù|æIAtQ@#ˆJÛ‚§3J§iû¦‘ ™°>-Êv÷‚M?c‰’`1Ú‚!pÖT@ç@®×ø¶px4úB‘wÿıIoö];™LtùPÌŒõCĞöËK€ÌÄ8-Ø‡¾×¶_~ú,802İÁwôËiŞí—·è4¦É 2ã´`´ıòE©§×ÅìŸ2€J¤ÒäÍ¾y#ÈœfëÜôk¶_zÈ *³ùôx{îiûå  w¿G^{=îLÌìŸ&2€
+=şË™ÄöÂs6oB\}@+HŠnÂ‰ÙÔ¶Ÿş™HN+õY¼'œLNÌ¶ m¿dE9€i[0F@Û/iW¤#– Ùœ‡íçâİ~÷
+’% tşCe[7û–‡ P˜å‹>,pÚ/y­tÄ (G+‘ åˆR¸* RÔJG}À%"º @ÅZé¨s ˜L&­€ä¸±ù¾tÔw'  HK¯¥yß @ HK+=ô ­ HI+=ô ï€”Ì¥– @: K   ®¯èş0í iè=‡\B  Ò@  *6J ¸( RĞ{,ö ¾èÀ@`\Wú ÕĞKAY ã4‡€ó`LƒÆàĞ À@`\ãe ní1ê ÀXtı?¨âÅ s0†¹D  ò5¸" <' Æ0x/Îà àÏÌ@Ls=ß ¡^: 1iÁ‡
+ ,€¸^– ‚ ŸŠÌ@—B¤ÿ*T æ †sHÈ ğ” ˆ!ØIÜ`€n Å<Tú¯Bf *Xj`W[Pè  ©	g ­›ıƒvÜ‚ ¿Ø æXè@±' °ñ˜< øë‰æ ¤ Å¿%‹@T@å¶Ä€I ğ…´ „àÅ¿%«@ÑÂ˜‰Ë  ‹– 0ŒÙì¯Ì€o	’ ÃÌÄe ô| Y Ğéì¯>-†4¸víšf3A4Wÿû¡ æôDŒ¹ pÈ}¼çC`]:ûcÖK j@?3‰À<Xr™€f 8H”Ù_™g + ë˜I$Ñ2 å²€îc* ö¢÷ıİ*‘Ä S÷qA ìåˆÅ¡Ÿ½Ä\,ÏPv·sğ«¨€¢-ìªuÏ±Ø j |[ãÂÀÇÍb~=X¢ \§—}“Œ ÷ñ¶°@İ4#¾uŒÙ_E_,ù¿0KÔn6ÖàW£e K,P±ÑRÿ¥@#,PŸVF¨úï4Ú`ÉØ&ŒÚÌÆüjô  Ü7bKØ „zœ³¾èc]£/–ü!]
+4”«•EÕ?‰›²’	 Šz 
+7jËo7I,–¨ pI¬ûW% õ JÿS’˜¤– «Ø€‚ŒŞïßKÊ€¢ JĞJış½$ EAd®•„¿J: (n‘Å-BäF+ş—$aÉwòß@:ÈÍFêƒ_% ”ï‹Y*;ı’E PîÊ+ÆüÙsO¾°“«	œÒ”ÕàWÙ E@‚²ü*Ë  HH–ƒ_e A 	Èvğ«¬€"`DY~•} PŒàTŠ‡{º*" (6ÜÇ³ØÒ3ı§réó¤˜  ü¶á—„D°¡ƒÿX;üÖUT Pş ‘h§•Äöô‘ÍNÀuù½Æ\»Ê+”â€Ò”¿€a&À0zƒï±T.ñ­¸%ÀNnIpÊ}h—€ãÄè¢¨bß^Š Šº :j¥ÀõşnŠ\ìä·
+—â`ú;Räz7Ud «ü~]4ÜPEÊ¿Su@ù%nš
+°¨òß_Ë¬¿ªŠ%ÀN+]½e¨Èê.Ö²œõ«Xïï¦Ê`Ù@µæRé¬¿ªÊ`ÕJ6p¿,ª¿([õ³şªê3€U>Ğá† DZá¬ÔM=} vá*ºEP‚¹,Îî_|LõK€İøeî`Y·Ö=wûtŸÁ¿2€5°w ;šâŸËı¶ øs	 UÛß=O±Î_ #ÿÖâBF~O€XŒ®•ÅÀß  î6Å2ªúA ZÙG0²‚Ğt†ßÒÇüwA Œ3—Eš‘4?<€1ŸLeÑ=`cÑzæş¡¨gŒ ‘ÇeÑE˜
+VÍı£)şû‚( #YÉûÏÚî,Ô™}îªø#! $Â„;e±D8á?K:Àõ…çõ“
+~ ‰òo9Z…å““K+ÏÅ’Ş¦S@F|Pø¼Üh3ê3f`¸"7föÖj‹®%¥Ï  .0hPhd±lXılüåÜXR4üëÚ_/ùê×:ÈÿG±                  ®ÿ&ÉıƒÂ1-¿    IEND®B`‚                                                                                                                                               UAWAVAUATWVSHƒìXH¬$€   ƒ:L‹mHH‰ËD‰ÇD‰Î…Ê   L‹bM…ä„½   L‰áè½T …ÿu9ÆŒÑ   )ş9ğŒ÷   I‹4$H;5,' „–  D‹u@¶E1äL=2# AƒÎëe€    HKA|$èª ‰|$0HVE‰ñL‰l$(H‰ÁA¸   L‰|$ è'öÿÿH‹6H‰ÁH…À„„   ès H‰Ã¶ <;„•   <,t<]u]A‰ü<]u¸   ë€    H‹!Ş& èT&  H‰Áè”  1ÀHƒÄX[^_A\A]A^A_]ÃH!1# è,&  H‰Áèl  1ÀëÖ„     HR1# èÄ#  1Àë¾H1# èü%  H‰Áè<  1Àë¦„     è‹M H‰ÇH…ÀuëÍHVH‰ùèdX H‹6H…öuìHKÆEÄ AƒÄL}ÀÇGH   ÇEÀ   H‰}Èè… D‰d$0E1ÀE‰ñH‰ÁHÇ0# L‰l$(L‰úH‰D$ èşôÿÿL‰ùH‰Ãè“ 1ÀH…Û•ÀéÿÿÿfD  L‰áèèĞÿÿI‹4$éYşÿÿff.„     @ UAVAUATWVSH‰åHƒì0H8³) H¤  H³¨  L5[0# L-\°) H=Å±) èpò ¹   Hô²) A¸   f‰ç²) H0°) H‰A´) fD‰A´) HÇÊ²) Ÿ† Ç´)    Æ´) è ò Hé¯) A¹   Aº  HV±) HÇÏ¯) Ÿ† H‰,±) Ç±)    Æ±) fD‰±) fD‰£¯) èÎñ ë@ ‹SïÆCÿ…ÒuP¨u_HƒÃ8H9ŞtjL‹cçL‰áèä-  Hƒø‡r  L‰âH‰ÙèŸ-  ¶C¨u¿‰Âƒâ€úÒƒâşƒÂˆSÿ‹Sï…Òt°H‰ÚL‰éè’ô ¶C¨t¡H‰ÚH‰ùHƒÃ8è{ô H9Şu–HÇ{¤  "  è–{ ¹   HÇ®®     HÇÛ®      `z HÇû·     H˜H‰·  èMÎüÿH¯  I‰Äè L‰%‡¯  Çu¯     M…ätAƒD$L‰áèêìüÿèõJ HŞ°  H‰Ãèf H‰×°  ÇÅ°     H…ÛtƒCH¹   èâÍüÿH[¶  I‰Äè3 L‰%T¶  ÇB¶     M…ätAƒD$L‰áèìüÿH¸ÿÿÿÿÿÿÿÆEÿ"H‰Š±  HƒÀH‰·±  H‹X	' HÇ°      HÇº°     ‹ HÇå°     HÇ±     ƒèHÇ¬±  @   H˜H‰;¶  H‹4¨  HÇ9²      HÇf²     HÇ“²     HÇÀ²     HÇí²     HÇ³     HÇG³     HÇt³     HÇ¡³     HÇÎ³  	   HÇû³  
+   H…Àt€8 t+H¢§  è
+ HMÿº   ÇŠ§     èï H‰†§  HƒÄ0[^_A\A]A^]Ã€    L‰ñèà  ¹   èVf L‹cçésıÿÿff.„     fE1À‰ÊH”¯) éoÄşÿff.„     @ E1À‰ÊH´¬) éOÄşÿff.„     @ UAVAUATWVSH‰åHƒì L‹%H' A‹$A‰Í…ÒÛ   1öE1À¿   €    I‹D$L‹40E…À„   A‹†x  …À~Y1Ûë€    HƒÃA9x  ~AH‰ØHÁàI†ˆ  Hƒ8 tßE…ÀuÚH‹HE1ÀE1ÉD‰êèØ¹şÿE1À…ÀA•ÀHƒÃA9x  ¿ƒÇHƒÆA9<$yÿÿÿD‰ÀHƒÄ [^_A\A]A^]Ã€    I‹NE1ÀD‰êHƒÁ(èUÃşÿE1À…ÀI‹D$A•ÀL‹40éHÿÿÿE1Àë¸f„     UAWAVAUATH‰åHƒì0I‰ÏHV¢  I‰ÖM‰ÅÇEü    M‰Ìè1 Ç7¢     M…ÿ„^  L‰ùèæì H‰'¢  HP¢  è ÇA¢     M…ö„`  L‰ñè¸ì H‰1¢  HZ¢  èÕ ÇK¢     M…í„"  L‰éèŠì H‰;¢  Hd¢  è§ ÇU¢     M…ä„ä   L‰áè\ì H‰E¢  H‹®ğ& E1ÉE1ÀHUüH‹èÿÿ…ÀtÇEü   Hj¡  èU H–¡  ÇT¡     HÇQ¡      è4 H­¡  Çk¡     HÇh¡      è HÄ¡  Ç‚¡     HÇ¡      èò ‹Uü1ÀÇ›¡     HÇ˜¡      …Ò”ÀHƒÄ0A\A]A^A_]ÃD  HÇÍ       é¡şÿÿHÇe¡      éÿÿÿHÇ¡      éİşÿÿHÇÕ       éŸşÿÿUAUATH‰åHƒì0I‰ÌHê   ÇEü    I‰Õè[ ÇÑ      M…ä„À   L‰áèë H‰Á   H’¡  è- Çƒ¡     M…í„ª   L‰éèâê H‰s¡  H‹ø& E1ÉE1ÀHUüH‹è’ÿÿ…ÀtÇEü   H`   èÛ H4¡  ÇJ      HÇG       èº ‹Uü¸   Ç¡     HÇ¡      …Òu9HƒÄ0A\A]]Ã€    HÇ       é?ÿÿÿ„     HÇÍ       éUÿÿÿL‰áèˆ(  1ÀHƒÄ0A\A]]Ãff.„     UAVAUATHƒì8H¬$€   I‰ÎH£Ÿ  I‰ÕM‰ÄÇE¬    è Ç‡Ÿ     M…ö„ö   L‰ñèÆé H‰wŸ  HØŸ  èã ÇÉŸ     M…í„ğ   L‰éè˜é H‰¹Ÿ  HrŸ  èµ ÇcŸ     M…ä„²   L‰áèjé H‰SŸ  H‹¬ï& HU¬E1ÉE1ÀH‹èÿÿHó  èn HWŸ  Çİ     HÇÚ      èM Hş  Ç,Ÿ     HÇ)Ÿ      è, ÇÚ     HÇ×      HƒÄ8A\A]A^]Ã HÇ…      é	ÿÿÿ„     HÇ¥      éMÿÿÿHÇÍ      éÿÿÿUAVAUATHƒì8H¬$€   I‰ÎH3  I‰ÕM‰Äè¨ Ç     M…ö„õ   L‰ñè]è H‰  H§  èz Ç˜     M…í„ç   L‰éè/è H‰ˆ  H	  èL Çú     M…ä„©   L‰áèè H‰ê  H‹#õ& HU¬E1ÉE1ÀH‹è±ÿÿHŠ  è H&  Çt     HÇq      èä H•  Çû     HÇø      èÃ Çq     HÇn      HƒÄ8A\A]A^]ÃfHÇ      é
+ÿÿÿHÇE      éVÿÿÿHÇ¥      éÿÿÿUVSH‰åHƒì H‹1H‰ÓH…öt+HNè² H‹H‰H…ÉtHƒÁèn HƒÄ [^]ÃfD  ¸ÿÿÿÿëëf„     LÙ˜  HcÉI‰ÑHÍ    H)ÈHÁàI óoBAHÇB    ‹R…ÒtÃ€    IT H¥) éOê ff.„     @ UH‰åHƒì HcÉI‰ĞHk˜  HÍ    M‹HH)ÈI‹HÁàH‰LL‰L…ÉtHƒÄ ]Ã// Copyright 2014 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef CLASS_REQUIRES_TRACE_METHOD_H_
+#define CLASS_REQUIRES_TRACE_METHOD_H_
+
+#include "heap/stubs.h"
+
+namespace blink {
+
+class HeapObject;
+
+class PartObject {
+    DISALLOW_NEW();
+private:
+    Member<HeapObject> m_obj;
+};
+
+class HeapObject : public GarbageCollected<HeapObject> {
+private:
+    PartObject m_part;
+};
+
+class Mixin : public GarbageCollectedMixin {
+public:
+  virtual void Trace(Visitor*) override;
+  Member<Mixin> m_self;
+};
+
+class HeapObjectMixin : public GarbageCollected<HeapObjectMixin>, public Mixin {
+  USING_GARBAGE_COLLECTED_MIXIN(HeapObjectMixin);
+};
+
+class Mixin2 : public Mixin {
+public:
+  virtual void Trace(Visitor*) override;
+};
+
+class HeapObjectMixin2
+    : public GarbageCollected<HeapObjectMixin2>, public Mixin2 {
+  USING_GARBAGE_COLLECTED_MIXIN(HeapObjectMixin2);
+};
+
+class Mixin3 : public Mixin {
+public:
+  virtual void Trace(Visitor*) override;
+};
+
+class HeapObjectMixin3
+    : public GarbageCollected<HeapObjectMixin3>, public Mixin {
+  USING_GARBAGE_COLLECTED_MIXIN(HeapObjectMixin2);
+public:
+  virtual void Trace(Visitor*) override;
+};
+
+}
+
+#endif
+                                                                                                                                                                                                                                   DXáç>¡5Ù…È>ğ)l'o½a‡})½Tz™¤¿„0OÊcğ®¿ö®	zÃ&g]µz×éç4ŞJ2ªµµ†TœÄ?{7™B:JÕ:ÈòeÃ<|°ZP:ã¡†/kÀã’	*¶5QÂd¥¾‘j¬¤;5héÌŠı¹{Bü†¹¦ÇiËüíÿ¬Æí=+"W%ô[¹W_À_c@ÅQ‡?íxˆâ?–ìÅì³Ù‰L^Ç±Ba"ËÂ”ÎL&ª=¨ i«ÑZÁ8]_Ka)vºeU	ˆîû½/ñFsû#‰@ü®’9ñOÜŞ“ƒ{Åš— ~…¾ÆKş‡ø°
+‡ãMş	œ>	)â5ætJ2MØEõ©9§ #7±X.åÙÉNé×ä
+1_	O‹U"µáµã°·H¡[ŸĞ.´(îeÆw»Íä¡E¢Àf;6Í÷b½ò1¨ëAıÙp!š…SôÿÚşî¿Ôv< wÈÜò•Y™qxëÚZƒ¬Û¬ün¦Æ±«R•6`‰¼«|/n£5o–,-°‹D™:‘ëàCtôcŒú´\õ’Y3x5
+‡}ò‰•õ¢ç=?ñ™n†æî3–ô2ş¦Q+g^x	“|Á¬Op`–W˜´ºZ’uÿ£ó÷é-?»±€4< ±SºÇõ”oÅ`µ®ñÎw a$ğ(qíñßdá$ØğÎè¨;Z®ì!/«]Gmùê„éW§vÔèFšU•úìÓ²°=l…RmÔåñ”.PYÊÿ´~qQ·	Œ—4¬†Œg;éMj*pNV:Û—Ô!†L`†œóËe-ıÖ_-S(""7Õæ*K¹8<£®4Im+4s[KûÚtOŸ‡Mm\ñ—3ÿ0”°ëU¹'Šw8#ë6=y˜ß	™®#´‘ÔÁ|ı•ˆ$GQr*L¸+Bn_İgé¬*÷kDŞïë¸[|ôi7ÄóGôŠF‚
+èÑal«ğÂß}ÃÀõrWŞµØµô¼…âÒ”Z#Sà–ºFOJ,E±æFXøÓÍà\Ödàï?–+Á\@$Pe¹"QÍÂÍØ¢r!ñ™C êÒ`P¨Ñ'bß!ï’´îqh´½G×á{•û	{¬˜[ËœKi ş0|SÖlã•vúèLOr\fÔÉû„FÆåŞôœ|Í­~aîY¸í¨ĞÏöo,Tët'‚>€ŒÅp	frX |ºß»½—,IÒöÒJW÷¸“5w£<aãEäS·÷©ÊZ)È¸£Œ1ÿÏgwïftÚöZNc_¯.Gªœ8šç³N·s~«v—G Záÿ¼Ã¦ğl˜ØÂ)ÏØ Š¾Í«÷I·ÌI|
+äßvêğd	-MMÍšÄÅU-şÒ
+tøÙ,`êÖS]¸ÿBø+7eWë2¢O±ÛëREC(xº„_™d†ØD<Ü@îâ¾Æ\u;î‹Ù.SuSÂ °F$@Ëã`o_4W”tôãzH´q|¦Ñ8^°½/|ËsÙwšYÍv¸Ö&–K-•mR"Ë¥ö²¬õıÆı+–cóíÜ·ærñ¡F=±â3­c6t›iÒªQË|+• …ÊJ­$J4.b†^PXIOÆ×{'	ú
+ÅÄ|¯öÅ«:‰¹
+D³§ôŠ`¤ƒè'¤&çFƒİZ:¥7Ú-Ş2èÆtÂßLËQAz$?cÈ-âxLHÿƒ;Ç

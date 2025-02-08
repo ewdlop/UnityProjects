@@ -1,0 +1,50 @@
+
+        {
+            lock (this.syncRoot)
+            {
+                if (!this.initialized)
+                {
+                    Initialize();
+                }
+
+                this.wmiProviders.Add(className, wmiProvider);
+            }
+        }
+
+        IWmiProvider GetProvider(string className)
+        {
+            IWmiProvider wmiProvider;
+            lock (this.wmiProviders)
+            {
+                if (!this.wmiProviders.TryGetValue(className, out wmiProvider))
+                {
+                    wmiProvider = NoInstanceWMIProvider.Default;
+                }
+            }
+            return wmiProvider;
+        }
+
+        int WbemNative.IWbemProviderInit.Initialize(
+            string wszUser,
+            Int32 lFlags,
+            string wszNamespace,
+            string wszLocale,
+            WbemNative.IWbemServices wbemServices,
+            WbemNative.IWbemContext wbemContext,
+            WbemNative.IWbemProviderInitSink wbemSink
+            )
+        {
+            if (wbemServices == null || wbemContext == null || wbemSink == null)
+                return (int)WbemNative.WbemStatus.WBEM_E_INVALID_PARAMETER;
+
+            try
+            {
+                MTAExecute(new WaitCallback(this.RelocateWbemServicesRCWToMTA), wbemServices);
+                wbemSink.SetStatus((int)WbemNative.tag_WBEM_EXTRA_RETURN_CODES.WBEM_S_INITIALIZED, 0);
+            }
+            catch (WbemException e)
+            {
+                wbemSink.SetStatus(e.ErrorCode, 0);
+                return e.ErrorCode;
+            }
+#pragma warning suppress 56500 // cove

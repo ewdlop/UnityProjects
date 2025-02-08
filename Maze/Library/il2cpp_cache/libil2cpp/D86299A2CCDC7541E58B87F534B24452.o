@@ -1,0 +1,990 @@
+//-----------------------------------------------------------------------------
+// Copyright (c) Microsoft Corporation.  All rights reserved.
+//-----------------------------------------------------------------------------
+
+namespace System.ServiceModel.Dispatcher
+{
+    using System;
+    using System.Collections.Generic;
+    using System.Reflection;
+    using System.Runtime;
+    using System.Runtime.Remoting.Messaging;
+    using System.ServiceModel;
+    using System.ServiceModel.Channels;
+    using System.ServiceModel.Diagnostics.Application;
+    using System.Transactions;
+
+    class ImmutableClientRuntime
+    {
+        int correlationCount;
+        bool addTransactionFlowProperties;
+        IInteractiveChannelInitializer[] interactiveChannelInitializers;
+        IClientOperationSelector operationSelector;
+        IChannelInitializer[] channelInitializers;
+        IClientMessageInspector[] messageInspectors;
+        Dictionary<string, ProxyOperationRuntime> operations;
+        ProxyOperationRuntime unhandled;
+        bool useSynchronizationContext;
+        bool validateMustUnderstand;
+
+        internal ImmutableClientRuntime(ClientRuntime behavior)
+        {
+            this.channelInitializers = EmptyArray<IChannelInitializer>.ToArray(behavior.ChannelInitializers);
+            this.interactiveChannelInitializers = EmptyArray<IInteractiveChannelInitializer>.ToArray(behavior.InteractiveChannelInitializers);
+            this.messageInspectors = EmptyArray<IClientMessageInspector>.ToArray(behavior.MessageInspectors);
+
+            this.operationSelector = behavior.OperationSelector;
+            this.useSynchronizationContext = behavior.UseSynchronizationContext;
+            this.validateMustUnderstand = behavior.ValidateMustUnderstand;
+
+            this.unhandled = new ProxyOperationRuntime(behavior.UnhandledClientOperation, this);
+
+            this.addTransactionFlowProperties = behavior.AddTransactionFlowProperties;
+
+            this.operations = new Dictionary<string, ProxyOperationRuntime>();
+
+            for (int i = 0; i < behavior.Operations.Count; i++)
+            {
+                ClientOperation operation = behavior.Operations[i];
+                ProxyOperationRuntime operationRuntime = new ProxyOperationRuntime(operation, this);
+                this.operations.Add(operation.Name, operationRuntime);
+            }
+
+            this.correlationCount = this.messageInspectors.Length + behavior.MaxParameterInspectors;
+        }
+
+        internal int MessageInspectorCorrelationOffset
+        {
+            get { return 0; }
+        }
+
+        internal int ParameterInspectorCorrelationOffset
+        {
+            get { return this.messageInspectors.Length; }
+        }
+
+        internal int CorrelationCount
+        {
+            get { return this.correlationCount; }
+        }
+
+        internal IClientOperationSelector OperationSelector
+        {
+            get { return this.operationSelector; }
+        }
+
+        internal ProxyOperationRuntime UnhandledProxyOperation
+        {
+            get { return this.unhandled; }
+        }
+
+        internal bool UseSynchronizationContext
+        {
+            get { return this.useSynchronizationContext; }
+        }
+
+        internal bool ValidateMustUnderstand
+        {
+            get { return validateMustUnderstand; }
+            set { validateMustUnderstand = value; }
+        }
+
+        internal void AfterReceiveReply(ref ProxyRpc rpc)
+        {
+            int offset = this.MessageInspectorCorrelationOffset;
+            try
+            {
+                for (int i = 0; i < this.messageInspectors.Length; i++)
+                {
+                    this.messageInspectors[i].AfterReceiveReply(ref rpc.Reply, rpc.Correlation[offset + i]);
+                    if (TD.ClientMessageInspectorAfterReceiveInvokedIsEnabled())
+                    {
+                        TD.ClientMessageInspectorAfterReceiveInvoked(rpc.EventTraceActivity, this.messageInspectors[i].GetType().FullName);
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                if (Fx.IsFatal(e))
+                {
+                    throw;
+                }
+                if (ErrorBehavior.ShouldRethrowClientSideExceptionAsIs(e))
+                {
+                    throw;
+                }
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperCallback(e);
+            }
+        }
+
+        internal void BeforeSendRequest(ref ProxyRpc rpc)
+        {
+            int offset = this.MessageInspectorCorrelationOffset;
+            try
+            {
+                for (int i = 0; i < this.messageInspectors.Length; i++)
+                {
+                    rpc.Correlation[offset + i] = this.messageInspectors[i].BeforeSendRequest(ref rpc.Request, (IClientChannel)rpc.Channel.Proxy);
+                    if (TD.ClientMessageInspectorBeforeSendInvokedIsEnabled())
+                    {
+                        TD.ClientMessageInspectorBeforeSendInvoked(rpc.EventTraceActivity, this.messageInspectors[i].GetType().FullName);
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                if (Fx.IsFatal(e))
+                {
+                    throw;
+                }
+                if (ErrorBehavior.ShouldRethrowClientSideExceptionAsIs(e))
+                {
+                    throw;
+                }
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperCallback(e);
+            }
+
+            if (this.addTransactionFlowProperties)
+            {
+                SendTransaction(ref rpc);
+            }
+        }
+
+        internal void DisplayInitializationUI(ServiceChannel channel)
+        {
+            EndDisplayInitializationUI(BeginDisplayInitializationUI(channel, null, null));
+        }
+
+        internal IAsyncResult BeginDisplayInitializationUI(ServiceChannel channel, AsyncCallback callback, object state)
+        {
+            return new DisplayInitializationUIAsyncResult(channel, this.interactiveChannelInitializers, callback, state);
+        }
+
+        internal void EndDisplayInitializationUI(IAsyncResult result)
+        {
+            DisplayInitializationUIAsyncResult.End(result);
+        }
+
+        // this should not be inlined, since we want to JIT the reference to System.Transactions
+        // only if transactions are being flowed.
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+        static void SendTransaction(ref ProxyRpc rpc)
+        {
+            System.ServiceModel.Channels.TransactionFlowProperty.Set(Transaction.Current, rpc.Request);
+        }
+
+        internal void InitializeChannel(IClientChannel channel)
+        {
+            try
+            {
+                for (int i = 0; i < this.channelInitializers.Length; ++i)
+                {
+                    this.channelInitializers[i].Initialize(channel);
+                }
+            }
+            catch (Exception e)
+            {
+                if (Fx.IsFatal(e))
+                {
+                    throw;
+                }
+                if (ErrorBehavior.ShouldRethrowClientSideExceptionAsIs(e))
+                {
+                    throw;
+                }
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperCallback(e);
+            }
+        }
+
+        internal ProxyOperationRuntime GetOperation(MethodBase methodBase, object[] args, out bool canCacheResult)
+        {
+            if (this.operationSelector == null)
+            {
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new NotSupportedException
+                                                        (SR.GetString(SR.SFxNeedProxyBehaviorOperationSelector2,
+                                                                      methodBase.Name,
+                                                                      methodBase.DeclaringType.Name)));
+            }
+
+            try
+            {
+                if (operationSelector.AreParametersRequiredForSelection)
+                {
+                    canCacheResult = false;
+                }
+                else
+                {
+                    args = null;
+                    canCacheResult = true;
+                }
+                string operationName = operationSelector.SelectOperation(methodBase, args);
+                ProxyOperationRuntime operation;
+                if ((operationName != null) && this.operations.TryGetValue(operationName, out operation))
+                {
+                    return operation;
+                }
+                else
+                {
+                    // did not find the right operation, will not know how 
+                    // to invoke the method.
+                    return null;
+                }
+            }
+            catch (Exception e)
+            {
+                if (Fx.IsFatal(e))
+                {
+                    throw;
+                }
+                if (ErrorBehavior.ShouldRethrowClientSideExceptionAsIs(e))
+                {
+                    throw;
+                }
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperCallback(e);
+            }
+        }
+
+        internal ProxyOperationRuntime GetOperationByName(string operationName)
+        {
+            ProxyOperationRuntime operation = null;
+            if (this.operations.TryGetValue(operationName, out operation))
+                return operation;
+            else
+                return null;
+        }
+
+        class DisplayInitializationUIAsyncResult : System.Runtime.AsyncResult
+        {
+            ServiceChannel channel;
+            int index = -1;
+            IInteractiveChannelInitializer[] initializers;
+            IClientChannel proxy;
+
+            static AsyncCallback callback = Fx.ThunkCallback(new AsyncCallback(DisplayInitializationUIAsyncResult.Callback));
+
+            internal DisplayInitializationUIAsyncResult(ServiceChannel channel,
+                                                        IInteractiveChannelInitializer[] initializers,
+                                                        AsyncCallback callback, object state)
+                : base(callback, state)
+            {
+                this.channel = channel;
+                this.initializers = initializers;
+                this.proxy = channel.Proxy as IClientChannel;
+                this.CallBegin(true);
+            }
+
+            void CallBegin(bool completedSynchronously)
+            {
+                while (++this.index < initializers.Length)
+                {
+                    IAsyncResult result = null;
+                    Exception exception = null;
+
+                    try
+                    {
+                        result = this.initializers[this.index].BeginDisplayInitializationUI(
+                            this.proxy,
+                            DisplayInitializationUIAsyncResult.callback,
+                            this
+                        );
+                    }
+                    catch (Exception e)
+                    {
+                        if (Fx.IsFatal(e))
+                        {
+                            throw;
+                        }
+
+                        exception = e;
+                    }
+
+                    if (exception == null)
+                    {
+                        if (!result.CompletedSynchronously)
+                        {
+                            return;
+                        }
+
+                        this.CallEnd(result, out exception);
+                    }
+
+                    if (exception != null)
+                    {
+                        this.CallComplete(completedSynchronously, exception);
+                        return;
+                    }
+                }
+
+                this.CallComplete(completedSynchronously, null);
+            }
+
+            static void Callback(IAsyncResult result)
+            {
+                if (result.CompletedSynchronously)
+                {
+                    return;
+                }
+
+                DisplayInitializationUIAsyncResult outer = (DisplayInitializationUIAsyncResult)result.AsyncState;
+                Exception exception = null;
+
+                outer.CallEnd(result, out exception);
+
+                if (exception != null)
+                {
+                    outer.CallComplete(false, exception);
+                    return;
+                }
+
+                outer.CallBegin(false);
+            }
+
+            void CallEnd(IAsyncResult result, out Exception exception)
+            {
+                try
+                {
+                    this.initializers[this.index].EndDisplayInitializationUI(result);
+                    exception = null;
+                }
+                catch (Exception e)
+                {
+                    if (Fx.IsFatal(e))
+                    {
+                        throw;
+                    }
+
+                    exception = e;
+                }
+            }
+
+            void CallComplete(bool completedSynchronously, Exception exception)
+            {
+                this.Complete(completedSynchronously, exception);
+            }
+
+            internal static void End(IAsyncResult result)
+            {
+                System.Runtime.AsyncResult.End<DisplayInitializationUIAsyncResult>(result);
+            }
+        }
+    }
+}
+                                                                                                                 [0].IsStatic, "#L3b");
+			Assert.AreEqual (0, ctors [0].GetParameters ().Length, "#L3c");
+			Assert.IsFalse (ctors [0] is ConstructorBuilder, "#L3d");
+
+			flags = BindingFlags.Instance | BindingFlags.NonPublic |
+				BindingFlags.Public;
+
+			ctors = greenType.GetConstructors (flags);
+			Assert.AreEqual (1, ctors.Length, "#M1");
+			Assert.IsTrue (ctors [0].IsPublic, "#M2a");
+			Assert.IsFalse (ctors [0].IsStatic, "#M2b");
+			Assert.AreEqual (0, ctors [0].GetParameters ().Length, "#M2c");
+			Assert.IsFalse (ctors [0] is ConstructorBuilder, "#M2d");
+
+			ctors = redType.GetConstructors (flags);
+			Assert.AreEqual (6, ctors.Length, "#M3");
+			Assert.IsTrue (ctors [0].IsPrivate, "#M4a");
+			Assert.IsFalse (ctors [0].IsStatic, "#M4b");
+			Assert.AreEqual (2, ctors [0].GetParameters ().Length, "#M4c");
+			Assert.IsFalse (ctors [0] is ConstructorBuilder, "#M4d");
+			Assert.IsTrue (ctors [1].IsFamily, "#M5a");
+			Assert.IsFalse (ctors [1].IsStatic, "#M5b");
+			Assert.AreEqual (1, ctors [1].GetParameters ().Length, "#M5c");
+			Assert.IsFalse (ctors [1] is ConstructorBuilder, "#M5d");
+			Assert.IsTrue (ctors [2].IsFamilyAndAssembly, "#M6a");
+			Assert.IsFalse (ctors [2].IsStatic, "#M6b");
+			Assert.AreEqual (2, ctors [2].GetParameters ().Length, "#M6c");
+			Assert.IsFalse (ctors [2] is ConstructorBuilder, "#M6d");
+			Assert.IsTrue (ctors [3].IsFamilyOrAssembly, "#M7a");
+			Assert.IsFalse (ctors [3].IsStatic, "#M7b");
+			Assert.AreEqual (1, ctors [3].GetParameters ().Length, "#M7c");
+			Assert.IsFalse (ctors [3] is ConstructorBuilder, "#M7d");
+			Assert.IsTrue (ctors [4].IsPublic, "#M8a");
+			Assert.IsFalse (ctors [4].IsStatic, "#M8b");
+			Assert.AreEqual (2, ctors [4].GetParameters ().Length, "#M8c");
+			Assert.IsFalse (ctors [4] is ConstructorBuilder, "#M8d");
+			Assert.IsTrue (ctors [5].IsAssembly, "#M9a");
+			Assert.IsFalse (ctors [5].IsStatic, "#M9b");
+			Assert.AreEqual (2, ctors [5].GetParameters ().Length, "#M9c");
+			Assert.IsFalse (ctors [5] is ConstructorBuilder, "#M9d");
+
+			flags = BindingFlags.Static | BindingFlags.NonPublic |
+				BindingFlags.Public;
+
+			ctors = greenType.GetConstructors (flags);
+			Assert.AreEqual (0, ctors.Length, "#N1");
+
+			ctors = redType.GetConstructors (flags);
+			Assert.AreEqual (1, ctors.Length, "#N2");
+			Assert.IsTrue (ctors [0].IsPrivate, "#N3a");
+			Assert.IsTrue (ctors [0].IsStatic, "#N3b");
+			Assert.AreEqual (0, ctors [0].GetParameters ().Length, "#N3c");
+			Assert.IsFalse (ctors [0] is ConstructorBuilder, "#N3d");
+		}
+
+		[Test] // GetConstructors (BindingFlags)
+		[Category ("NotWusing System;
+using System.Reflection;
+
+class Tests {
+
+	public static int Main () {
+		return TestDriver.RunTests (typeof (Tests));
+	}
+	
+	static int test_0_beq () {
+		double a = 2.0;
+		if (a != 2.0)
+			return 1;
+		return 0;
+	}
+
+	static int test_0_bne_un () {
+		double a = 2.0;
+		if (a == 1.0)
+			return 1;
+		return 0;
+	}
+
+	static int test_0_conv_r8 () {
+		double a = 2;
+		if (a != 2.0)
+			return 1;
+		return 0;
+	}
+
+	static int test_0_conv_i () {
+		double a = 2.0;
+		int i = (int)a;
+		if (i != 2)
+			return 1;
+		uint ui = (uint)a;
+		if (ui != 2)
+			return 2;
+		short s = (short)a;
+		if (s != 2)
+			return 3;
+		ushort us = (ushort)a;
+		if (us != 2)
+			return 4;
+		byte b = (byte)a;
+		if (b != 2)
+			return 5;
+		return 0;
+	}
+
+	static int test_5_conv_r4 () {
+		int i = 5;
+		float f = (float)i;
+		return (int)f;
+	}
+
+	static int test_5_double_conv_r4 () {
+		double d = 5.0;
+		float f = (float)d;
+		return (int)f;
+	}
+
+	static int test_5_float_conv_r8 () {
+		float f = 5.0F;
+		double d = (double)f;
+		return (int)d;
+	}
+
+	static int test_5_conv_r8 () {
+		int i = 5;
+		double f = (double)i;
+		return (int)f;
+	}
+
+	static int test_5_add () {
+		double a = 2.0;
+		double b = 3.0;		
+		return (int)(a + b);
+	}
+
+	static int test_5_sub () {
+		double a = 8.0;
+		double b = 3.0;		
+		return (int)(a - b);
+	}	
+
+	static int test_24_mul () {
+		double a = 8.0;
+		double b = 3.0;		
+		return (int)(a * b);
+	}	
+
+	static int test_4_div () {
+		double a = 8.0;
+		double b = 2.0;		
+		return (int)(a / b);
+	}	
+
+	static int test_2_rem () {
+		double a = 8.0;
+		double b = 3.0;		
+		return (int)(a % b);
+	}	
+
+	static int test_2_neg () {
+		double a = -2.0;		
+		return (int)(-a);
+	}
+	
+	static int test_46_float_add_spill () {
+		// we overflow the FP stack
+		double a = 1;
+		double b = 2;
+		double c = 3;
+		double d = 4;
+		double e = 5;
+		double f = 6;
+		double g = 7;
+		double h = 8;
+		double i = 9;
+
+		return (int)(1.0 + (a + (b + (c + (d + (e + (f + (g + (h + i)))))))));
+	}
+
+	static int test_362880_float_mul_spill () {
+		// we overflow the FP stack
+		double a = 1;
+		double b = 2;
+		double c = 3;
+		double d = 4;
+		double e = 5;
+		double f = 6;
+		double g = 7;
+		double h = 8;
+		double i = 9;
+
+		return (int)(1.0 * (a * (b * (c * (d * (e * (f * (g * (h * i)))))))));
+	}
+
+	static int test_4_long_cast () {
+		long a = 1000;
+		double d = (double)a;
+		long b = (long)d;
+		if (b != 1000)
+			return 0;
+		return 4;
+	}
+
+	/* FIXME: This only works on little-endian machines */
+	/*
+	static unsafe int test_2_negative_zero () {
+		int result = 0;
+		double d = -0.0;
+		float f = -0.0f;
+
+		byte *ptr = (byte*)&d;
+		if (ptr [7] == 0)
+			return result;
+		result ++;
+
+		ptr = (byte*)&f;
+		if (ptr [3] == 0)
+			return result;
+		result ++;
+
+		return result;
+	}
+	*/
+
+	static int test_16_float_cmp () {
+		double a = 2.0;
+		double b = 1.0;
+		int result = 0;
+		bool val;
+		
+		val = a == a;
+		if (!val)
+			return result;
+		result++;
+
+		val = (a != a);
+		if (val)
+			return result;
+		result++;
+
+		val = a < a;
+		if (val)
+			return result;
+		result++;
+
+		val = a > a;
+		if (val)
+			return result;
+		result++;
+
+		val = a <= a;
+		if (!val)
+			return result;
+		result++;
+
+		val = a >= a;
+		if (!val)
+			return result;
+		result++;
+
+		val = b == a;
+		if (val)
+			return result;
+		result++;
+
+		val = b < a;
+		if (!val)
+			return result;
+		result++;
+
+		val = b > a;
+		if (val)
+			return result;
+		result++;
+
+		val = b <= a;
+		if (!val)
+			return result;
+		result++;
+
+		val = b >= a;
+		if (val)
+			return result;
+		result++;
+
+		val = a == b;
+		if (val)
+			return result;
+		result++;
+
+		val = a < b;
+		if (val)
+			return result;
+		result++;
+
+		val = a > b;
+		if (!val)
+			return result;
+		result++;
+
+		val = a <= b;
+		if (val)
+			return result;
+		result++;
+
+		val = a >= b;
+		if (!val)
+			return result;
+		result++;
+
+		return result;
+	}
+
+	static int test_15_float_cmp_un () {
+		double a = Double.NaN;
+		double b = 1.0;
+		int result = 0;
+		bool val;
+		
+		val = a == a;
+		if (val)
+			return result;
+		result++;
+
+		val = a < a;
+		if (val)
+			return result;
+		result++;
+
+		val = a > a;
+		if (val)
+			return result;
+		result++;
+
+		val = a <= a;
+		if (val)
+			return result;
+		result++;
+
+		val = a >= a;
+		if (val)
+			return result;
+		result++;
+
+		val = b == a;
+		if (val)
+			return result;
+		result++;
+
+		val = b < a;
+		if (val)
+			return result;
+		result++;
+
+		val = b > a;
+		if (val)
+			return result;
+		result++;
+
+		val = b <= a;
+		if (val)
+			return result;
+		result++;
+
+		val = b >= a;
+		if (val)
+			return result;
+		result++;
+
+		val = a == b;
+		if (val)
+			return result;
+		result++;
+
+		val = a < b;
+		if (val)
+			return result;
+		result++;
+
+		val = a > b;
+		if (val)
+			return result;
+		result++;
+
+		val = a <= b;
+		if (val)
+			return result;
+		result++;
+
+		val = a >= b;
+		if (val)
+			return result;
+		result++;
+
+		return result;
+	}
+
+	static int test_15_float_branch () {
+		double a = 2.0;
+		double b = 1.0;
+		int result = 0;
+		
+		if (!(a == a))
+			return result;
+		result++;
+
+		if (a < a)
+			return result;
+		result++;
+
+		if (a > a)
+			return result;
+		result++;
+
+		if (!(a <= a))
+			return result;
+		result++;
+
+		if (!(a >= a))
+			return result;
+		result++;
+
+		if (b == a)
+			return result;
+		result++;
+
+		if (!(b < a))
+			return result;
+		result++;
+
+		if (b > a)
+			return result;
+		result++;
+
+		if (!(b <= a))
+			return result;
+		result++;
+
+		if (b >= a)
+			return result;
+		result++;
+
+		if (a == b)
+			return result;
+		result++;
+
+		if (a < b)
+			return result;
+		result++;
+
+		if (!(a > b))
+			return result;
+		result++;
+
+		if (a <= b)
+			return result;
+		result++;
+
+		if (!(a >= b))
+			return result;
+		result++;
+
+		return result;
+	}
+
+	static int test_15_float_branch_un () {
+		double a = Double.NaN;
+		double b = 1.0;
+		int result = 0;
+		
+		if (a == a)
+			return result;
+		result++;
+
+		if (a < a)
+			return result;
+		result++;
+
+		if (a > a)
+			return result;
+		result++;
+
+		if (a <= a)
+			return result;
+		result++;
+
+		if (a >= a)
+			return result;
+		result++;
+
+		if (b == a)
+			return result;
+		result++;
+
+		if (b < a)
+			return result;
+		result++;
+
+		if (b > a)
+			return result;
+		result++;
+
+		if (b <= a)
+			return result;
+		result++;
+
+		if (b >= a)
+			return result;
+		result++;
+
+		if (a == b)
+			return result;
+		result++;
+
+		if (a < b)
+			return result;
+		result++;
+
+		if (a > b)
+			return result;
+		result++;
+
+		if (a <= b)
+			return result;
+		result++;
+
+		if (a >= b)
+			return result;
+		result++;
+
+		return result;
+	}
+
+}
+
+public class TestDriver {
+
+	static public int RunTests (Type type, string[] args) {
+		int failed = 0, ran = 0;
+		int result, expected, elen;
+		int i, j;
+		string name;
+		MethodInfo[] methods;
+		bool do_timings = false;
+		int tms = 0;
+		DateTime start, end = DateTime.Now;
+
+		if (args != null && args.Length > 0) {
+			for (j = 0; j < args.Length; j++) {
+				if (args [j] == "--time") {
+					do_timings = true;
+					string[] new_args = new string [args.Length - 1];
+					for (i = 0; i < j; ++i)
+						new_args [i] = args [i];
+					j++;
+					for (; j < args.Length; ++i, ++j)
+						new_args [i] = args [j];
+					args = new_args;
+					break;
+				}
+			}
+		}
+		methods = type.GetMethods (BindingFlags.Public|BindingFlags.NonPublic|BindingFlags.Static);
+		for (i = 0; i < methods.Length; ++i) {
+			name = methods [i].Name;
+			if (!name.StartsWith ("test_"))
+				continue;
+			if (args != null && args.Length > 0) {
+				bool found = false;
+				for (j = 0; j < args.Length; j++) {
+					if (name.EndsWith (args [j])) {
+						found = true;
+						break;
+					}
+				}
+				if (!found)
+					continue;
+			}
+			for (j = 5; j < name.Length; ++j)
+				if (!Char.IsDigit (name [j]))
+					break;
+			expected = Int32.Parse (name.Substring (5, j - 5));
+			start = DateTime.Now;
+			result = (int)methods [i].Invoke (null, null);
+			if (do_timings) {
+				end = DateTime.Now;
+				long tdiff = end.Ticks - start.Ticks;
+				int mdiff = (int)tdiff/10000;
+				tms += mdiff;
+				Console.WriteLine ("{0} took {1} ms", name, mdiff);
+			}
+			ran++;
+			if (result != expected) {
+				failed++;
+				Console.WriteLine ("{0} failed: got {1}, expected {2}", name, result, expected);
+			}
+		}
+		
+		if (do_timings) {
+			Console.WriteLine ("Total ms: {0}", tms);
+		}
+		Console.WriteLine ("Regression tests: {0} ran, {1} failed in {2}", ran, failed, type);
+		//Console.WriteLine ("Regression tests: {0} ran, {1} failed in [{2}]{3}", ran, failed, type.Assembly.GetName().Name, type);
+		return failed;
+	}
+	static public int RunTests (Type type) {
+		return RunTests (type, null);
+	}
+}
+
+                                                                                                                                                                                                                                                                                                            H‰„$ø   Aƒür'H¼$ð   ¹   H‰Úè    H‹¼$ð   D‰¤$ø   ëD‰¤$ø   H‰÷E…ätH‰ÚHÁâ1öè    fƒ|$P @ˆl$/L‰¤$À   H‰œ$¸   „Õ  ‹D$0H‰„$È   1ÒE1ÀH‹\$PH‰ßL‹|$xL‰¬$   D  I‹E H’H‹4È‹lÈ‹DÈ€|$L H‰”$°   ‰D$lt(L‰÷L‰ëE‰Å‰êè    H‹|$PE‰èI‰ÝH‰Æ‰ÕH‹”$°   ƒ|$0 „A  D‰„$˜   D‰ÀH‰„$Ð   E1íH‰´$Ø   ‰¬$œ   H‹„$Ð   B(M‹~H‰´$à   ‰¬$è   ‹D$l‰„$ì   H‹D$pL‹0I‹ è    I‹L‰÷H‰ÆÿQ0Ç$    ¶ÈE1ÀE1ÉL‰ÿL‰îL´$€   L‰òè    H‰„$  ‰”$  Aä ðÿÿ„$  D$„$à   $¶L$/¾j   L‰ÿL‹|$xL‰òL‹t$pM‰øE‰áè    ‹¬$œ   H‹´$Ø   H‹Œ$ð   HÁãH‰‰TIƒÅL9¬$È   …
+ÿÿÿD‹„$˜   DD$0L‹¬$   H‹\$PH‰ßH‹”$°   HƒÂH9ú…XþÿÿëE1ÀL‹|$xE‰ÄI‹~WÀ)„$    ¶L$/H”$    ¾0   M‰øè    I‰Ç‰ÕH‹´$    H…öH‹œ$¸   tH¼$    è    D;¤$À   slD‰à‰ÚD)âH‰ÁH÷ÑöÂtH‹”$ð   H‰ÆHÁæL‰<2‰l2HƒÀHÙt9H)ÃHÁà€    H‹Œ$ð   L‰<‰lH‹Œ$ð   L‰|‰lHƒÀ HƒÃþuÕI‹~L‹D$@H‹„$ð   ‹”$ø   ‹L$8H‰„$    H‰”$¨   „$    $H”$€   ¾h   é¬  H|$8„Étè    ëè    ‰Å€|$X tH|$Xè    ‰ÃŠL$XëH|$Xè    ‰Ã1ÉL‰¬$   1Ò‰l$l‰è÷óA‰ÄI‹~L‹D$`WÀ)„$ð   ¶ÉH”$ð   ¾0   è    I‰ÅA‰ÖH‹´$ð   H…ötH¼$ð   è    E‰çH”$   H‰”$ð   H¸       H‰„$ø   Aƒüv"H¼$ð   ¹   H‰ÖL‰úè    H‹„$ð   ëH‰ÐD‰¤$ø   ;\$lwiIÁçIWð‰ÖÁîƒÆH‰ÁHƒætWÀH‰ÁfHƒÁHƒÆÿuóHƒúpr5LøWÀ€    AA A0A@APA`ApHƒé€H9ÁuØL‹T$PfE…ÒL‹Œ$   „{  IJÿD‰ÐƒàHƒùs}1ÉH…À…  é[  ±‰L$L‰Áƒú…ªúÿÿD‰ãH”$   H‰”$ð   H¸       H‰„$ø   Aƒü‚*  H¼$ð   ¹   H‰ÖH‰Úè    H‹¼$ð   D‰¤$ø   é  M‰ÐI)À1ö1ÿ1É„     I‹Y H‹¬$ð   ‹T;‰T5H‹;H‰T5 I‹Q H‹¬$ð   ‹\:0‰\5H‹T:(H‰T5I‹Q H‹¬$ð   ‹\:X‰\5(H‹T:PH‰T5 I‹Q H‹¬$ð   ‹œ:€   ‰\58H‹T:xH‰T50HƒÁHÇ    HƒÆ@I9È…nÿÿÿH…ÀtCH‰ÊHÁâHÁáH‰H÷Ø€    I‹q H‹¼$ð   ‹\‰\H‹4H‰4HƒÂHƒÁ(HƒÀuÖD‰áD)ÑteD‰ÐöÁtD‰ÐH‹Œ$ð   HÁàL‰,D‰tABAƒÂE9Ôt8‰ÁH‹”$ð   HÁáL‰,
+D‰t
+HH‹”$ð   HÁáL‰,
+D‰t
+ƒÀD9àuÉH‹D$pH‹xL‹D$@H‹„$ð   H‰„$8  ‹„$ø   H‰„$@  ‹L$8„$8  $H”$€   ¾k   E1Éè    H‰Ã‰ÕH‹¼$ð   H„$   H9Çtè    H‹´$€   H…ötH¼$€   è    H‰Ø‰êHÄH  [A\A]A^A_]ÃD‰¤$ø   H‰×E…ätHÁã¾ÿ   H‰Úè    M‰ëƒ|$0 „ö  H‹„$ð   H‹L$0A‰Éƒù‡’   E1ÒL‰ÖH÷ÖAöÁtF‰C<H‹L$0B,‰<¨IƒÊLÎ„­  H‹L$0DÑH‰L$0EÔJ4HƒÆ1ÿD  I,:‰l¾üA<H‹L$0H9‰Ê‰ƒÅ‰,¾A<ƒÂƒÁ‰ˆI:HƒÁHƒÇL9ÉuÂéK  IqÿE1ÒH‹L$0‰Ï÷‚[ÿÿÿHÁî …QÿÿÿE‰ÊAƒâøfAnÄfpÀ IjøH‰ïHÁïHƒÇA‰øAƒàH…í„±   H‹L$0i»   H)ûLÃHƒÃÿfo    1ÿfo    fo    fo%    fo-    foñfþòó¸ót¸foøfþùfþðA49ó<°ót°foñfþófoùfþüót¸ ó|¸0fþðfþø4/ó4°ó|°HƒÇfþÍHƒÃu’ë
+fo    1ÿM…Àt2fo    fþÑó¸óT¸fþÈfþÐH‹L$049ó°óT°M9Ê…&þÿÿM‹~M‰õH‹D$@H‰D$pM‰ÞI‹C H‹0‹PD‹d$8L‰ïè    H‰Å‰ÓI‹F H‹p(‹P0L‰ïè    H‰„$(  ‰”$0  H‹„$ð   H‰„$  ‹„$ø   H‰„$   „$  D$„$(  $HŒ$€   L‰ÿD‰æH‹T$pI‰èA‰Ùè    éÞüÿÿ     UAWAVAUATSHì  H‰óI‰ýH‹F(‹L‹@ˆL$hL‰D$pH‹7H‹GH‹P0H¼$ø   è    Š„$   H‹Œ$  ˆD$@H‰L$HH|$@„Àtè    ëè    ‰D$0H‹C L‹ ‹h‹H‰L$4L‹p(L‹x0H‹s@H‰t$XH…ötH|$Xº   è    ‹C<‰D$`I‹D$(H‰éHÁáL‹DI‹u I‹UH‹R0‹H¼$ø   è    €¼$ø   uL‰ïL‰æ‰êè    I‰Ä‰T$,‰Õë‰è‰l$,‹\$0I‹D$(HÁåŠ(H‹D(ˆŒ$È   H‰„$Ð   I‹VPƒz @HRL‰d$8vH‹L‹"M…äu:L$@u„ÉuH;D$Hu!H‹\$8‹l$,é¾  „ÉtH¼$È   è    ëH¼$È   è    ‰Á‰Ý1ÒL‰àH÷õH…Ò‹T$4uL‰æI,‰ÉH9ÈsqI‹}L‹D$HH‹D$8H‰„$¸   ‹D$,‰„$À   ‰”$Ä   L‰´$è   L‰¼$ð   ‹L$@„$è   D$„$¸   $HT$X¾m   E1Éè    H‰Ã‰Õé
+  H”$  H‰”$ø   H¸       H‰„$   ƒûH‰¬$˜   r)H¼$ø   ¹   H‰ÖH‰êè    H‹¼$ø   ‰œ$   ë‰œ$   H‰×…ÛtH‹”$˜   HÁâ1öè    €|$h t!H|$hè    ‰Ã1í€|$h t"H|$hè    ë H|$hè    ‰ÃH‰Õ€|$h uÞH|$hè    L‰l$PM‹m…À‰D$xˆ\$+„ÿ   ‰ÀHÁàH‰„$    E1ö¶Ã‰D$|@ H‹D$8H‰„$¨   ‹D$,‰„$°   ‹D$4‰„$´   H‰ëH‹D$PH‹(I‹} è    H‹M H‰ïH‰ÝH‰ÆÿQ0Ç$    ¶ÈE1ÀE1ÉL‰ïL‰æH\$XH‰Úè    H‰„$Ø   ‰”$à   Aç ðÿÿ„$Ø   D$„$¨   $¾j   L‰ïH‰Ú‹L$|I‰èE‰ù

@@ -1,0 +1,134 @@
+﻿// Copyright (c) Microsoft Open Technologies, Inc. All rights reserved. See License.txt in the project root for license information.
+
+#if !NO_PERF
+using System;
+using System.Reactive.Concurrency;
+using System.Reactive.Disposables;
+
+namespace System.Reactive.Linq.ObservableImpl
+{
+    class Timeout<TSource> : Producer<TSource>
+    {
+        private readonly IObservable<TSource> _source;
+        private readonly TimeSpan? _dueTimeR;
+        private readonly DateTimeOffset? _dueTimeA;
+        private readonly IObservable<TSource> _other;
+        private readonly IScheduler _scheduler;
+
+        public Timeout(IObservable<TSource> source, TimeSpan dueTime, IObservable<TSource> other, IScheduler scheduler)
+        {
+            _source = source;
+            _dueTimeR = dueTime;
+            _other = other;
+            _scheduler = scheduler;
+        }
+
+        public Timeout(IObservable<TSource> source, DateTimeOffset dueTime, IObservable<TSource> other, IScheduler scheduler)
+        {
+            _source = source;
+            _dueTimeA = dueTime;
+            _other = other;
+            _scheduler = scheduler;
+        }
+
+        protected override IDisposable Run(IObserver<TSource> observer, IDisposable cancel, Action<IDisposable> setSink)
+        {
+            if (_dueTimeA.HasValue)
+            {
+                var sink = new TimeA(this, observer, cancel);
+                setSink(sink);
+                return sink.Run();
+            }
+            else
+            {
+                var sink = new TimeR(this, observer, cancel);
+                setSink(sink);
+                return sink.Run();
+            }
+        }
+
+        class TimeA : Sink<TSource>, IObserver<TSource>
+        {
+            private readonly Timeout<TSource> _parent;
+
+            public TimeA(Timeout<TSource> parent, IObserver<TSource> observer, IDisposable cancel)
+                : base(observer, cancel)
+            {
+                _parent = parent;
+            }
+
+            private SerialDisposable _subscription;
+            private object _gate;
+            private bool _switched;
+
+            public IDisposable Run()
+            {
+                _subscription = new SerialDisposable();
+                var original = new SingleAssignmentDisposable();
+
+                _subscription.Disposable = original;
+
+                _gate = new object();
+                _switched = false;
+
+                var timer = _parent._scheduler.Schedule(_parent._dueTimeA.Value, Timeout);
+
+                original.Disposable = _parent._source.SubscribeSafe(this);
+
+                return new CompositeDisposable(_subscription, timer);
+            }
+
+            private void Timeout()
+            {
+                var timerWins = false;
+
+                lock (_gate)
+                {
+                    timerWins = !_switched;
+                    _switched = true;
+                }
+
+                if (timerWins)
+                    _subscription.Disposable = _parent._other.SubscribeSafe(this.GetForwarder());
+            }
+
+            public void OnNext(TSource value)
+            {
+                lock (_gate)
+                {
+                    if (!_switched)
+                        base._observer.OnNext(value);
+                }
+            }
+
+            public void OnError(Exception error)
+            {
+                var onErrorWins = false;
+
+                lock (_gate)
+                {
+                    onErrorWins = !_switched;
+                    _switched = true;
+                }
+
+                if (onErrorWins)
+                {
+                    base._observer.OnError(error);
+                    base.Dispose();
+                }
+            }
+
+            public void OnCompleted()
+            {
+                var onCompletedWins = false;
+
+                lock (_gate)
+                {
+                    onCompletedWins = !_switched;
+                    _switched = true;
+                }
+
+                if (onCompletedWins)
+                {
+                    base._observer.OnCompleted();
+          

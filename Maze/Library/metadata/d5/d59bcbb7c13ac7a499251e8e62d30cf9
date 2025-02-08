@@ -1,0 +1,152 @@
+//
+// TestHelper.cs: Helper class for MWF unit tests.
+//
+// Author:
+//   Everaldo Canuto (ecanuto@novell.com)
+//   Andreia Gaita (avidigal@novell.com)
+//
+// (C) 2006 Novell, Inc. (http://www.novell.com)
+//
+
+using System;
+using System.ComponentModel;
+using System.Windows.Forms;
+using System.Drawing;
+using System.Reflection;
+using System.Collections;
+using NUnit.Framework;
+using System.IO;
+using System.Diagnostics;
+
+namespace MonoTests.System.Windows.Forms
+{
+	public class TestHelper
+	{
+		[SetUp]
+		protected virtual void SetUp ()
+		{
+		}
+		
+		[TearDown]
+		protected virtual void TearDown () {
+			int c = Application.OpenForms.Count;
+			if (c > 0) {
+				Console.WriteLine ("HEY! You created " + c.ToString () + " form(s) and you didn't dispose of them!");
+				Console.WriteLine ("Please modify your test to shut me up.");
+				Console.WriteLine ("Test: " + NUnit.Framework.TestContext.CurrentContext.Test.FullName);
+			}
+			for (int i = Application.OpenForms.Count - 1; i >= 0; i--) {
+				Application.OpenForms[i].Dispose ();
+			}
+		}		
+		
+		
+		
+		public class FormWatcher : Form
+		{
+			int[] watches;
+			public FormWatcher (int[] watches) : base () {
+				this.watches = watches;
+			}
+			protected override void WndProc (ref Message m)
+			{
+				foreach (int i in watches) {
+					if ((int)m.Msg == i) {
+						Console.WriteLine ((this.Name != "" && this.Name != null ? this.Name : "FormWatcher") + " received message " + m.ToString ());
+						break;
+					}
+				}
+				base.WndProc (ref m);
+			}
+		}
+		
+		public class ControlWatcher : Control
+		{
+			int[] watches;
+			public ControlWatcher (int[] watches) : base () {
+				this.watches = watches;
+			}
+			protected override void WndProc (ref Message m)
+			{				
+				foreach (int i in watches) {
+					if ((int)m.Msg == i) {
+						Console.WriteLine ((this.Name != "" && this.Name != null ? this.Name : "ControlWatcher") + " received message " + m.ToString ());
+						break;
+					}
+				}
+				base.WndProc (ref m);
+			}
+		}
+
+		public class ButtonWatcher : Button
+		{
+			int[] watches;
+			public ButtonWatcher (int[] watches) : base () {
+				this.watches = watches;
+				foreach (int i in this.watches) {
+					Console.WriteLine ("Listening to " + Enum.GetName (typeof(Msg), i));
+				}
+			}
+			
+			protected override void WndProc (ref Message m)
+			{
+				foreach (int i in watches) {
+					if ((int)m.Msg == i) {
+						Console.WriteLine ((this.Name != "" && this.Name != null ? this.Name : "ButtonWatcher") + " received message " + m.ToString ());
+						break;
+					}
+				}
+				base.WndProc (ref m);
+			}
+		}
+		
+		public static void DumpObject (object obj, string objName)
+		{
+			DumpObject (obj, obj.GetType (), objName, "#", int.MaxValue);
+		}
+
+		public static void DumpObject (object obj, string objName, int maxrecursive)
+		{
+			DumpObject (obj, obj.GetType (), objName, "#", maxrecursive);
+		}
+
+		public static void DumpObject (object obj, Type objType, string objName, string prefix, int maxrecursive)
+		{
+			using (StringWriter writer = new StringWriter ()) {
+				DumpObject (obj, objType, objName, writer, 0, prefix, new ArrayList (), maxrecursive, 0);
+				Debug.WriteLine (writer.ToString ());
+				//return writer.ToString ();
+			}
+		}
+		
+		public static void DumpObject (object obj, Type objType, string objName, StringWriter writer, int tabs, string prefix, ArrayList done, int maxrecursive, int level)
+		{
+			if (obj == null)
+				return;
+
+			for (int j = 0; j < done.Count; j++) {
+				if (!(obj.GetType ().IsClass || obj.GetType ().IsInterface))
+					continue;
+				if (done [j] == obj)
+					return;
+			}
+			if (obj.GetType ().IsClass || obj.GetType ().IsInterface)
+				done.Add (obj);
+			
+			
+			PropertyInfo [] properties = objType.GetProperties (BindingFlags.Public | BindingFlags.Instance);
+			FieldInfo [] fields = objType.GetFields (BindingFlags.Public | BindingFlags.Instance);
+			
+			Hashtable values = new Hashtable ();
+			Hashtable members = new Hashtable ();
+			
+			foreach (PropertyInfo property in properties) {
+				MethodInfo getter;
+				object value;
+				
+				getter = property.GetGetMethod ();
+				
+				if (getter == null)
+					continue;
+					
+				if (gette

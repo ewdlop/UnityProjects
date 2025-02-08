@@ -1,0 +1,99 @@
+ementary) {
+                                /* BMP-only codepages are stored without stage 1 entries for supplementary code points */
+                                /* callback(unassigned) */
+                                goto unassigned;
+                            }
+                            /* convert this supplementary code point */
+                            /* exit this condition tree */
+                        } else {
+                            /* this is an unmatched lead code unit (1st surrogate) */
+                            /* callback(illegal) */
+                            *pErrorCode=U_ILLEGAL_CHAR_FOUND;
+                            break;
+                        }
+                    } else {
+                        /* no more input */
+                        break;
+                    }
+                } else {
+                    /* this is an unmatched trail code unit (2nd surrogate) */
+                    /* callback(illegal) */
+                    *pErrorCode=U_ILLEGAL_CHAR_FOUND;
+                    break;
+                }
+            }
+
+            /* convert the Unicode code point in c into codepage bytes */
+            value=MBCS_SINGLE_RESULT_FROM_U(table, results, c);
+
+            /* is this code point assigned, or do we use fallbacks? */
+            if(value>=minValue) {
+                /* assigned, write the output character bytes from value and length */
+                /* length==1 */
+                /* this is easy because we know that there is enough space */
+                *target++=(uint8_t)value;
+                if(offsets!=NULL) {
+                    *offsets++=sourceIndex;
+                }
+                --targetCapacity;
+
+                /* normal end of conversion: prepare for a new character */
+                c=0;
+                sourceIndex=nextSourceIndex;
+            } else { /* unassigned */
+unassigned:
+                /* try an extension mapping */
+                pArgs->source=source;
+                c=_extFromU(cnv, cnv->sharedData,
+                            c, &source, sourceLimit,
+                            &target, target+targetCapacity,
+                            &offsets, sourceIndex,
+                            pArgs->flush,
+                            pErrorCode);
+                nextSourceIndex+=(int32_t)(source-pArgs->source);
+
+                if(U_FAILURE(*pErrorCode)) {
+                    /* not mappable or buffer overflow */
+                    break;
+                } else {
+                    /* a mapping was written to the target, continue */
+
+                    /* recalculate the targetCapacity after an extension mapping */
+                    targetCapacity=(int32_t)(pArgs->targetLimit-(char *)target);
+
+                    /* normal end of conversion: prepare for a new character */
+                    sourceIndex=nextSourceIndex;
+                }
+            }
+        } else {
+            /* target is full */
+            *pErrorCode=U_BUFFER_OVERFLOW_ERROR;
+            break;
+        }
+    }
+
+    /* set the converter state back into UConverter */
+    cnv->fromUChar32=c;
+
+    /* write back the updated pointers */
+    pArgs->source=source;
+    pArgs->target=(char *)target;
+    pArgs->offsets=offsets;
+}
+
+/*
+ * This version of ucnv_MBCSFromUnicode() is optimized for single-byte codepages
+ * that map only to and from the BMP.
+ * In addition to single-byte/state optimizations, the offset calculations
+ * become much easier.
+ * It would be possible to use the sbcsIndex for UTF-8-friendly tables,
+ * but measurements have shown that this diminishes performance
+ * in more cases than it improves it.
+ * See SVN revision 21013 (2007-feb-06) for the last version with #if switches
+ * for various MBCS and SBCS optimizations.
+ */
+static void
+ucnv_MBCSSingleFromBMPWithOffsets(UConverterFromUnicodeArgs *pArgs,
+                              UErrorCode *pErrorCode) {
+    UConverter *cnv;
+    const UChar *source, *sourc

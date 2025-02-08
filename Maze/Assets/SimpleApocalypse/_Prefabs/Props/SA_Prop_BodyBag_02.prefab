@@ -1,0 +1,126 @@
+ert(Kind == NearMissOperand);
+    return MissedOperand.Error;
+  }
+  // Index of the actual operand we were trying to match in the list of parsed
+  // operands.
+  unsigned getOperandIndex() const {
+    assert(Kind == NearMissOperand);
+    return MissedOperand.Index;
+  }
+
+private:
+  NearMissKind Kind;
+
+  // These two structs share a common prefix, so we can safely rely on the fact
+  // that they overlap in the union.
+  struct MissedOpInfo {
+    unsigned Class;
+    unsigned Opcode;
+    unsigned Error;
+    unsigned Index;
+  };
+
+  struct TooFewOperandsInfo {
+    unsigned Class;
+    unsigned Opcode;
+  };
+
+  union {
+    uint64_t Features;
+    unsigned PredicateError;
+    MissedOpInfo MissedOperand;
+    TooFewOperandsInfo TooFewOperands;
+  };
+
+  NearMissInfo() : Kind(NoNearMiss) {}
+};
+
+/// MCTargetAsmParser - Generic interface to target specific assembly parsers.
+class MCTargetAsmParser : public MCAsmParserExtension {
+public:
+  enum MatchResultTy {
+    Match_InvalidOperand,
+    Match_MissingFeature,
+    Match_MnemonicFail,
+    Match_Success,
+    Match_NearMisses,
+    FIRST_TARGET_MATCH_RESULT_TY
+  };
+
+protected: // Can only create subclasses.
+  MCTargetAsmParser(MCTargetOptions const &, const MCSubtargetInfo &STI,
+                    const MCInstrInfo &MII);
+
+  /// Create a copy of STI and return a non-const reference to it.
+  MCSubtargetInfo &copySTI();
+
+  /// AvailableFeatures - The current set of available features.
+  uint64_t AvailableFeatures = 0;
+
+  /// ParsingInlineAsm - Are we parsing ms-style inline assembly?
+  bool ParsingInlineAsm = false;
+
+  /// SemaCallback - The Sema callback implementation.  Must be set when parsing
+  /// ms-style inline assembly.
+  MCAsmParserSemaCallback *SemaCallback;
+
+  /// Set of options which affects instrumentation of inline assembly.
+  MCTargetOptions MCOptions;
+
+  /// Current STI.
+  const MCSubtargetInfo *STI;
+
+  const MCInstrInfo &MII;
+
+public:
+  MCTargetAsmParser(const MCTargetAsmParser &) = delete;
+  MCTargetAsmParser &operator=(const MCTargetAsmParser &) = delete;
+
+  ~MCTargetAsmParser() override;
+
+  const MCSubtargetInfo &getSTI() const;
+
+  uint64_t getAvailableFeatures() const { return AvailableFeatures; }
+  void setAvailableFeatures(uint64_t Value) { AvailableFeatures = Value; }
+
+  bool isParsingInlineAsm () { return ParsingInlineAsm; }
+  void setParsingInlineAsm (bool Value) { ParsingInlineAsm = Value; }
+
+  MCTargetOptions getTargetOptions() const { return MCOptions; }
+
+  void setSemaCallback(MCAsmParserSemaCallback *Callback) {
+    SemaCallback = Callback;
+  }
+
+  virtual bool ParseRegister(unsigned &RegNo, SMLoc &StartLoc,
+                             SMLoc &EndLoc) = 0;
+
+  /// Sets frame register corresponding to the current MachineFunction.
+  virtual void SetFrameRegister(unsigned RegNo) {}
+
+  /// ParseInstruction - Parse one assembly instruction.
+  ///
+  /// The parser is positioned following the instruction name. The target
+  /// specific instruction parser should parse the entire instruction and
+  /// construct the appropriate MCInst, or emit an error. On success, the entire
+  /// line should be parsed up to and including the end-of-statement token. On
+  /// failure, the parser is not required to read to the end of the line.
+  //
+  /// \param Name - The instruction name.
+  /// \param NameLoc - The source location of the name.
+  /// \param Operands [out] - The list of parsed operands, this returns
+  ///        ownership of them to the caller.
+  /// \return True on failure.
+  virtual bool ParseInstruction(ParseInstructionInfo &Info, StringRef Name,
+                                SMLoc NameLoc, OperandVector &Operands) = 0;
+  virtual bool ParseInstruction(ParseInstructionInfo &Info, StringRef Name,
+                                AsmToken Token, OperandVector &Operands) {
+    return ParseInstruction(Info, Name, Token.getLoc(), Operands);
+  }
+
+  /// ParseDirective - Parse a target specific assembler directive
+  ///
+  /// The parser is positioned following the directive name.  The target
+  /// specific directive parser should parse the entire directive doing or
+  /// recording any target specific work, or return true and do nothing if the
+  /// directive is not target specific. If the dir

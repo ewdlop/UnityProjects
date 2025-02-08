@@ -1,0 +1,89 @@
+ew,
+		FPreviousViewInfo* PreviousViewInfos,
+		const FSceneTextureParameters& SceneTextures,
+		const FDiffuseIndirectInputs& Inputs,
+		const FAmbientOcclusionRayTracingConfig Config) const override
+	{
+		RDG_GPU_STAT_SCOPE(GraphBuilder, DiffuseIndirectDenoiser);
+
+		FViewInfoPooledRenderTargets ViewInfoPooledRenderTargets;
+		SetupImaginaryReflectionViewInfoPooledRenderTargets(View, &ViewInfoPooledRenderTargets);
+
+		FSSDSignalTextures InputSignal;
+		InputSignal.Textures[0] = Inputs.Color;
+		InputSignal.Textures[1] = Inputs.RayHitDistance;
+
+		FSSDConstantPixelDensitySettings Settings;
+		Settings.FullResViewport = View.ViewRect;
+		Settings.SignalProcessing = ESignalProcessing::DiffuseAndAmbientOcclusion;
+		Settings.InputResolutionFraction = Config.ResolutionFraction;
+		Settings.ReconstructionSamples = FMath::Clamp(CVarGIReconstructionSampleCount.GetValueOnRenderThread(), 1, kStackowiakMaxSampleCountPerSet);
+		Settings.PreConvolutionCount = CVarGIPreConvolutionCount.GetValueOnRenderThread();
+		Settings.bUseTemporalAccumulation = CVarGITemporalAccumulation.GetValueOnRenderThread() != 0;
+		Settings.HistoryConvolutionSampleCount = CVarGIHistoryConvolutionSampleCount.GetValueOnRenderThread();
+		Settings.HistoryConvolutionKernelSpreadFactor = CVarGIHistoryConvolutionKernelSpreadFactor.GetValueOnRenderThread();
+		Settings.MaxInputSPP = Config.RayCountPerPixel;
+
+		TStaticArray<FScreenSpaceDenoiserHistory*, IScreenSpaceDenoiser::kMaxBatchSize> PrevHistories;
+		TStaticArray<FScreenSpaceDenoiserHistory*, IScreenSpaceDenoiser::kMaxBatchSize> NewHistories;
+		PrevHistories[0] = &PreviousViewInfos->ReflectedSkyLightHistory;
+		NewHistories[0] = View.ViewState ? &View.ViewState->PrevFrameViewInfo.ReflectedSkyLightHistory : nullptr;
+
+		FSSDSignalTextures SignalOutput;
+		DenoiseSignalAtConstantPixelDensity(
+			GraphBuilder, View, SceneTextures, ViewInfoPooledRenderTargets,
+			InputSignal, Settings,
+			PrevHistories,
+			NewHistories,
+			&SignalOutput);
+
+		FDiffuseIndirectOutputs GlobalIlluminationOutputs;
+		GlobalIlluminationOutputs.Color = SignalOutput.Textures[0];
+		return GlobalIlluminationOutputs;
+	}
+
+	FDiffuseIndirectHarmonic DenoiseDiffuseIndirectHarmonic(
+		FRDGBuilder& GraphBuilder,
+		const FViewInfo& View,
+		FPreviousViewInfo* PreviousViewInfos,
+		const FSceneTextureParameters& SceneTextures,
+		const FDiffuseIndirectHarmonic& Inputs,
+		const FAmbientOcclusionRayTracingConfig Config) const override
+	{
+		RDG_GPU_STAT_SCOPE(GraphBuilder, DiffuseIndirectDenoiser);
+
+		FViewInfoPooledRenderTargets ViewInfoPooledRenderTargets;
+		SetupSceneViewInfoPooledRenderTargets(View, &ViewInfoPooledRenderTargets);
+
+		FSSDSignalTextures InputSignal;
+		for (int32 i = 0; i < IScreenSpaceDenoiser::kSphericalHarmonicTextureCount; i++)
+			InputSignal.Textures[i] = Inputs.SphericalHarmonic[i];
+
+		FSSDConstantPixelDensitySettings Settings;
+		Settings.FullResViewport = View.ViewRect;
+		Settings.SignalProcessing = ESignalProcessing::DiffuseSphericalHarmonic;
+		Settings.InputResolutionFraction = Config.ResolutionFraction;
+		Settings.ReconstructionSamples = CVarGIReconstructionSampleCount.GetValueOnRenderThread();
+		Settings.bUseTemporalAccumulation = CVarGITemporalAccumulation.GetValueOnRenderThread() != 0;
+		Settings.MaxInputSPP = Config.RayCountPerPixel;
+
+		TStaticArray<FScreenSpaceDenoiserHistory*, IScreenSpaceDenoiser::kMaxBatchSize> PrevHistories;
+		TStaticArray<FScreenSpaceDenoiserHistory*, IScreenSpaceDenoiser::kMaxBatchSize> NewHistories;
+		PrevHistories[0] = &PreviousViewInfos->DiffuseIndirectHistory;
+		NewHistories[0] = View.ViewState ? &View.ViewState->PrevFrameViewInfo.DiffuseIndirectHistory : nullptr;
+
+		FSSDSignalTextures SignalOutput;
+		DenoiseSignalAtConstantPixelDensity(
+			GraphBuilder, View, SceneTextures, ViewInfoPooledRenderTargets,
+			InputSignal, Settings,
+			PrevHistories,
+			NewHistories,
+			&SignalOutput);
+
+		FDiffuseIndirectHarmonic GlobalIlluminationOutputs;
+		for (int32 i = 0; i < IScreenSpaceDenoiser::kSphericalHarmonicTextureCount; i++)
+			GlobalIlluminationOutputs.SphericalHarmonic[i] = SignalOutput.Textures[i];
+		return GlobalIlluminationOutputs;
+	}
+
+	bool SupportsScreenSpaceDiffuseIndirectDenoiser(EShaderPlatform Platform) const override

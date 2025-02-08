@@ -1,0 +1,49 @@
+ase build, Bounds Sanitizer, c++17
+if [[ ("$HAVE_CXX14" -ne "0" && "$HAVE_BOUNDS_SAN" -ne "0") ]]; then
+	echo
+	echo "************************************" | tee -a "$TEST_RESULTS"
+	echo "Testing: Release, c++17, Bounds Sanitizer" | tee -a "$TEST_RESULTS"
+	echo
+
+	"$MAKE" clean > /dev/null 2>&1
+	rm -f adhoc.cpp > /dev/null 2>&1
+
+	CXXFLAGS="$RELEASE_CXXFLAGS -std=c++17 -fsanitize=bounds-strict ${PLATFORM_CXXFLAGS[@]} $USER_CXXFLAGS ${DEPRECATED_CXXFLAGS[@]}"
+	CXX="$CXX" CXXFLAGS="$CXXFLAGS" "$MAKE" "${MAKEARGS[@]}" | tee -a "$TEST_RESULTS"
+
+	if [[ ("${PIPESTATUS[0]}" -ne "0") ]]; then
+		echo "ERROR: failed to make cryptest.exe" | tee -a "$TEST_RESULTS"
+	else
+		./cryptest.exe v 2>&1 | tee -a "$TEST_RESULTS"
+		if [[ ("${PIPESTATUS[0]}" -ne "0") ]]; then
+			echo "ERROR: failed to execute validation suite" | tee -a "$TEST_RESULTS"
+		fi
+		./cryptest.exe tv all 2>&1 | tee -a "$TEST_RESULTS"
+		if [[ ("${PIPESTATUS[0]}" -ne "0") ]]; then
+			echo "ERROR: failed to execute test vectors" | tee -a "$TEST_RESULTS"
+		fi
+	fi
+fi
+
+############################################
+# For Solaris, test under Sun Studio 12.2 - 12.5
+if [[ "$IS_SOLARIS" -ne "0" ]]; then
+
+	# If PLATFORM_CXXFLAGS is for SunCC, then use them
+	if [[ ("$SUNCC_510_OR_ABOVE" -ne "0") ]]; then
+		SUNCC_CXXFLAGS="${PLATFORM_CXXFLAGS[@]}"
+	fi
+
+	############################################
+	# Sun Studio 12.2/SunCC 5.11
+	if [[ (-e "/opt/solstudio12.2/bin/CC") ]]; then
+
+		# More workarounds... SunCC 5.11 only does SSSE3, http://github.com/weidai11/cryptopp/issues/228
+		SUNCC_SSE_CXXFLAGS=$(echo -n "${SUNCC_CXXFLAGS[@]}" | "$AWK" '/__(SSE2|SSE3|SSSE3)__/' ORS=' ' RS=' ')
+
+		if [[ $(echo -n "$SUNCC_SSE_CXXFLAGS" | "$GREP" -i -c "ssse3") != "0" ]]; then
+			SUNCC_SSE_CXXFLAGS="$SUNCC_SSE_CXXFLAGS -xarch=ssse3";
+		elif [[ $(echo -n "$SUNCC_SSE_CXXFLAGS" | "$GREP" -i -c "sse3") != "0" ]]; then
+			SUNCC_SSE_CXXFLAGS="$SUNCC_SSE_CXXFLAGS -xarch=sse3";
+		else
+			SUNCC_

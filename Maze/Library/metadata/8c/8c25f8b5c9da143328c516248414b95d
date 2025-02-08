@@ -1,0 +1,130 @@
+//=- AArch64RedundantCopyElimination.cpp - Remove useless copy for AArch64 -=//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+// This pass removes unnecessary copies/moves in BBs based on a dominating
+// condition.
+//
+// We handle three cases:
+// 1. For BBs that are targets of CBZ/CBNZ instructions, we know the value of
+//    the CBZ/CBNZ source register is zero on the taken/not-taken path. For
+//    instance, the copy instruction in the code below can be removed because
+//    the CBZW jumps to %bb.2 when w0 is zero.
+//
+//  %bb.1:
+//    cbz w0, .LBB0_2
+//  .LBB0_2:
+//    mov w0, wzr  ; <-- redundant
+//
+// 2. If the flag setting instruction defines a register other than WZR/XZR, we
+//    can remove a zero copy in some cases.
+//
+//  %bb.0:
+//    subs w0, w1, w2
+//    str w0, [x1]
+//    b.ne .LBB0_2
+//  %bb.1:
+//    mov w0, wzr  ; <-- redundant
+//    str w0, [x2]
+//  .LBB0_2
+//
+// 3. Finally, if the flag setting instruction is a comparison against a
+//    constant (i.e., ADDS[W|X]ri, SUBS[W|X]ri), we can remove a mov immediate
+//    in some cases.
+//
+//  %bb.0:
+//    subs xzr, x0, #1
+//    b.eq .LBB0_1
+//  .LBB0_1:
+//    orr x0, xzr, #0x1  ; <-- redundant
+//
+// This pass should be run after register allocation.
+//
+// FIXME: This could also be extended to check the whole dominance subtree below
+// the comparison if the compile time regression is acceptable.
+//
+// FIXME: Add support for handling CCMP instructions.
+// FIXME: If the known register value is zero, we should be able to rewrite uses
+//        to use WZR/XZR directly in some cases.
+//===----------------------------------------------------------------------===//
+#include "AArch64.h"
+#include "llvm/ADT/Optional.h"
+#include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/iterator_range.h"
+#include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/Support/Debug.h"
+
+using namespace llvm;
+
+#define DEBUG_TYPE "aarch64-copyelim"
+
+STATISTIC(NumCopiesRemoved, "Number of copies removed.");
+
+namespace {
+class AArch64RedundantCopyElimination : public MachineFunctionPass {
+  const MachineRegisterInfo *MRI;
+  const TargetRegisterInfo *TRI;
+
+  // DomBBClobberedRegs is used when computing known values in the dominating
+  // BB.
+  BitVector DomBBClobberedRegs;
+
+  // OptBBClobberedRegs is used when optimizing away redundant copies/moves.
+  BitVector OptBBClobberedRegs;
+
+public:
+  static char ID;
+  AArch64RedundantCopyElimination() : MachineFunctionPass(ID) {
+    initializeAArch64RedundantCopyEliminationPass(
+        *PassRegistry::getPassRegistry());
+  }
+
+  struct RegImm {
+    MCPhysReg Reg;
+    int32_t Imm;
+    RegImm(MCPhysReg Reg, int32_t Imm) : Reg(Reg), Imm(Imm) {}
+  };
+
+  bool knownRegValInBlock(MachineInstr &CondBr, MachineBasicBlock *MBB,
+                          SmallVectorImpl<RegImm> &KnownRegs,
+                          MachineBasicBlock::iterator &FirstUse);
+  bool optimizeBlock(MachineBasicBlock *MBB);
+  bool runOnMachineFunction(MachineFunction &MF) override;
+  MachineFunctionProperties getRequiredProperties() const override {
+    return MachineFunctionProperties().set(
+        MachineFunctionProperties::Property::NoVRegs);
+  }
+  StringRef getPassName() const override {
+    return "AArch64 Redundant Copy Elimination";
+  }
+};
+char AArch64RedundantCopyElimination::ID = 0;
+}
+
+INITIALIZE_PASS(AArch64RedundantCopyElimination, "aarch64-copyelim",
+                "AArch64 redundant copy elimination pass", false, false)
+
+/// Remember what registers the specified instruction modifies.
+static void trackRegDefs(const MachineInstr &MI, BitVector &ClobberedRegs,
+                         const TargetRegisterInfo *TRI) {
+  for (const MachineOperand &MO : MI.operands()) {
+    if (MO.isRegMask()) {
+      ClobberedRegs.setBitsNotInMask(MO.getRegMask());
+      continue;
+    }
+
+    if (!MO.isReg())
+      continue;
+    unsigned Reg = MO.getReg();
+    if (!Reg)
+      continue;
+    if (!MO.isDef())
+      continue;
+
+    for (MCRegAliasIterator AI(Reg, TRI, true); AI.isValid(); ++AI)
+    

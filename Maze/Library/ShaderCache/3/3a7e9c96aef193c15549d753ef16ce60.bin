@@ -1,0 +1,74 @@
+e string ExtractHostname(string uriPrefix, bool allowInvalidUriStrings)
+        {
+            if (Uri.IsWellFormedUriString(uriPrefix, UriKind.Absolute))
+            {
+                Uri hostUri = new Uri(uriPrefix);
+                return hostUri.Host;
+            }
+            else if (allowInvalidUriStrings)
+            {
+                int i = uriPrefix.IndexOf("://") + 3;
+                int j = i;
+
+                bool inSquareBrackets = false;
+                while(j < uriPrefix.Length && uriPrefix[j] != '/' && (uriPrefix[j] != ':' || inSquareBrackets)) 
+                {
+                    if (uriPrefix[j] == '[') 
+                    {
+                        if (inSquareBrackets) 
+                        {
+                            j = i;
+                            break;
+                        }
+                        inSquareBrackets = true;
+                    }
+                    if (inSquareBrackets && uriPrefix[j] == ']') 
+                    {
+                        inSquareBrackets = false;
+                    }
+                    j++;
+                }
+
+                return uriPrefix.Substring(i, j - i);
+            }
+
+            return null;
+        }
+
+        public string BuildSimpleServiceName(string uriPrefix)
+        {
+            string hostname = ExtractHostname(uriPrefix, false);
+
+            if (hostname != null)
+            {
+                return "HTTP/" + hostname;
+            }
+            else
+            {
+                return null;
+            }
+        }
+
+        public string[] BuildServiceNames(string uriPrefix)
+        {
+            string hostname = ExtractHostname(uriPrefix, true);
+
+            IPAddress ipAddress = null;
+            if (String.Compare(hostname, "*", StringComparison.InvariantCultureIgnoreCase) == 0 || 
+                String.Compare(hostname, "+", StringComparison.InvariantCultureIgnoreCase) == 0 ||
+                IPAddress.TryParse(hostname, out ipAddress)) 
+            {
+                // for a wildcard, register the machine name.  If the caller doesn't have DNS permission
+                // or the query fails for some reason, don't add an SPN.
+                try
+                {
+                    string machineName = Dns.GetHostEntry(String.Empty).HostName;
+                    return new string[] { "HTTP/" + machineName };
+                }
+                catch (System.Net.Sockets.SocketException)
+                {
+                    return new string[0];
+                }
+                catch (System.Security.SecurityException)
+                {
+                    return new s

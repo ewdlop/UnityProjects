@@ -1,0 +1,201 @@
+ate bool _standalone;
+        private int _nextEntityId = 1;
+        private ParsingMode _parsingMode;
+        private ReadState _readState = ReadState.Initial;
+        private IDtdEntityInfo _lastEntity;
+        private bool _afterResetState;
+        private int _documentStartBytePos;
+        private int _readValueOffset;
+
+        // Counters for security settings
+        private long _charactersInDocument;
+        private long _charactersFromEntities;
+
+        // All entities that are currently being processed
+        private Dictionary<IDtdEntityInfo, IDtdEntityInfo> _currentEntities;
+
+        // DOM helpers
+        private bool _disableUndeclaredEntityCheck;
+
+        // Outer XmlReader exposed to the user - either XmlTextReader or XmlTextReaderImpl (when created via XmlReader.Create).
+        // Virtual methods called from within XmlTextReaderImpl must be called on the outer reader so in case the user overrides
+        // some of the XmlTextReader methods we will call the overridden version.
+        private XmlReader _outerReader;
+
+        //indicate if the XmlResolver is explicit set
+        private bool _xmlResolverIsSet;
+
+        //
+        // Atomized string constants
+        //
+        private string _xml;
+        private string _xmlNs;
+
+        //
+        // Constants
+        //
+        private const int MaxBytesToMove = 128;
+        private const int ApproxXmlDeclLength = 80;
+        private const int NodesInitialSize = 8;
+        private const int InitialAttributesCount = 4;
+        private const int InitialParsingStateStackSize = 2;
+        private const int InitialParsingStatesDepth = 2;
+        private const int DtdChidrenInitialSize = 2;
+        private const int MaxByteSequenceLen = 6;  // max bytes per character
+        private const int MaxAttrDuplWalkCount = 250;
+        private const int MinWhitespaceLookahedCount = 4096;
+
+        private const string XmlDeclarationBeginning = "<?xml";
+
+        //
+        // Constructors
+        //
+
+        internal XmlTextReaderImpl()
+        {
+            _curNode = new NodeData();
+            _parsingFunction = ParsingFunction.NoData;
+        }
+
+        // Initializes a new instance of the XmlTextReaderImpl class with the specified XmlNameTable.
+        // This constructor is used when creating XmlTextReaderImpl for V1 XmlTextReader
+        internal XmlTextReaderImpl(XmlNameTable nt)
+        {
+            Debug.Assert(nt != null);
+
+            _v1Compat = true;
+            _outerReader = this;
+
+            _nameTable = nt;
+            nt.Add(string.Empty);
+
+            _xmlResolver = null;
+
+            _xml = nt.Add("xml");
+            _xmlNs = nt.Add("xmlns");
+
+            Debug.Assert(_index == 0);
+            _nodes = new NodeData[NodesInitialSize];
+            _nodes[0] = new NodeData();
+            _curNode = _nodes[0];
+
+            _stringBuilder = new StringBuilder();
+            _xmlContext = new XmlContext();
+
+            _parsingFunction = ParsingFunction.SwitchToInteractiveXmlDecl;
+            _nextParsingFunction = ParsingFunction.DocumentContent;
+
+            _entityHandling = EntityHandling.ExpandCharEntities;
+            _whitespaceHandling = WhitespaceHandling.All;
+            _closeInput = true;
+
+            _maxCharactersInDocument = 0;
+            // Breaking change: entity expansion is enabled, but limit it to 10,000,000 chars (like XLinq)
+            _maxCharactersFromEntities = (long)1e7;
+            _charactersInDocument = 0;
+            _charactersFromEntities = 0;
+
+            _ps.lineNo = 1;
+            _ps.lineStartPos = -1;
+        }
+
+        // This constructor is used when creating XmlTextReaderImpl reader via "XmlReader.Create(..)"
+        private XmlTextReaderImpl(XmlResolver resolver, XmlReaderSettings settings, XmlParserContext context)
+        {
+            _useAsync = settings.Async;
+            _v1Compat = false;
+            _outerReader = this;
+
+            _xmlContext = new XmlContext();
+
+            // create or get nametable and namespace manager from XmlParserContext
+            XmlNameTable nt = settings.NameTable;
+            if (context == null)
+            {
+                if (nt == null)
+                {
+                    nt = new NameTable();
+                    Debug.Assert(_nameTableFromSettings == false);
+                }
+                else
+                {
+                    _nameTableFromSettings = true;
+                }
+                _nameTable = nt;
+                _namespaceManager = new XmlNamespaceManager(nt);
+            }
+            else
+            {
+                SetupFromParserContext(context, settings);
+                nt = _nameTable;
+            }
+
+            nt.Add(string.Empty);
+            _xml = nt.Add("xml");
+            _xmlNs = nt.Add("xmlns");
+
+            _xmlResolver = resolver;
+
+            Debug.Assert(_index == 0);
+
+            _nodes = new NodeData[NodesInitialSize];
+            _nodes[0] = new NodeData();
+            _curNode = _nodes[0];
+
+            _stringBuilder = new StringBuilder();
+
+            // Needed only for XmlTextReader (reporting of entities)
+            _entityHandling = EntityHandling.ExpandEntities;
+
+            _xmlResolverIsSet = settings.IsXmlResolverSet;
+
+            _whitespaceHandling = (settings.IgnoreWhitespace) ? WhitespaceHandling.Significant : WhitespaceHandling.All;
+            _normalize = true;
+            _ignorePIs = settings.IgnoreProcessingInstructions;
+            _ignoreComments = settings.IgnoreComments;
+            _checkCharacters = settings.CheckCharacters;
+            _lineNumberOffset = settings.LineNumberOffset;
+            _linePositionOffset = settings.LinePositionOffset;
+            _ps.lineNo = _lineNumberOffset + 1;
+            _ps.lineStartPos = -_linePositionOffset - 1;
+            _curNode.SetLineInfo(_ps.LineNo - 1, _ps.LinePos - 1);
+            _dtdProcessing = settings.DtdProcessing;
+            _maxCharactersInDocument = settings.MaxCharactersInDocument;
+            _maxCharactersFromEntities = settings.MaxCharactersFromEntities;
+
+            _charactersInDocument = 0;
+            _charactersFromEntities = 0;
+
+            _fragmentParserContext = context;
+
+            _parsingFunction = ParsingFunction.SwitchToInteractiveXmlDecl;
+            _nextParsingFunction = ParsingFunction.DocumentContent;
+
+            switch (settings.ConformanceLevel)
+            {
+                case ConformanceLevel.Auto:
+                    _fragmentType = XmlNodeType.None;
+                    _fragment = true;
+                    break;
+                case ConformanceLevel.Fragment:
+                    _fragmentType = XmlNodeType.Element;
+                    _fragment = true;
+                    break;
+                case ConformanceLevel.Document:
+                    _fragmentType = XmlNodeType.Document;
+                    break;
+                default:
+                    Debug.Assert(false);
+                    goto case ConformanceLevel.Document;
+            }
+        }
+
+        // Initializes a new instance of the XmlTextReaderImpl class with the specified stream, baseUri and nametable
+        // This constructor is used when creating XmlTextReaderImpl for V1 XmlTextReader
+        internal XmlTextReaderImpl(Stream input) : this(string.Empty, input, new NameTable())
+        {
+        }
+        internal XmlTextReaderImpl(Stream input, XmlNameTable nt) : this(string.Empty, input, nt)
+        {
+        }
+        internal XmlTextReaderImpl(string

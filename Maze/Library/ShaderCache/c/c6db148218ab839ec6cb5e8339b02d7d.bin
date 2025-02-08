@@ -1,0 +1,56 @@
+using System;
+using System.Diagnostics;
+using System.Threading;
+#if !ES_BUILD_AGAINST_DOTNET_V35
+using Contract = System.Diagnostics.Contracts.Contract;
+#else
+using Contract = Microsoft.Diagnostics.Contracts.Internal.Contract;
+#endif
+
+#if ES_BUILD_STANDALONE
+namespace Microsoft.Diagnostics.Tracing
+#else    
+using System.Threading.Tasks;
+namespace System.Diagnostics.Tracing
+#endif
+{
+    /// <summary>
+    /// Tracks activities.  This is meant to be a singleton (accessed by the ActivityTracer.Instance static property)
+    ///  
+    /// Logically this is simply holds the m_current variable that holds the async local that holds the current ActivityInfo
+    /// An ActivityInfo is represents a activity (which knows its creator and thus knows its path). 
+    ///
+    /// Most of the magic is in the async local (it gets copied to new tasks)
+    /// 
+    /// On every start event call OnStart 
+    /// 
+    ///     Guid activityID;
+    ///     Guid relatedActivityID;
+    ///     if (OnStart(activityName, out activityID, out relatedActivityID, ForceStop, options))
+    ///         // Log Start event with activityID and relatedActivityID
+    ///     
+    /// On every stop event call OnStop
+    /// 
+    ///     Guid activityID;
+    ///     if (OnStop(activityName, ref activityID  ForceStop))
+    ///         // Stop event with activityID
+    ///            
+    /// On any normal event log the event with activityTracker.CurrentActivityId
+    /// </summary>
+    internal class ActivityTracker
+    {
+
+        /// <summary>
+        /// Called on work item begins.  The activity name = providerName + activityName without 'Start' suffix.
+        /// It updates CurrentActivityId to track.   
+        /// 
+        /// It returns true if the Start should be logged, otherwise (if it is illegal recurision) it return false. 
+        /// 
+        /// The start event should use as its activity ID the CurrentActivityId AFTER calling this routine and its
+        /// RelatedActivityID the CurrentActivityId BEFORE calling this routine (the creator).  
+        /// 
+        /// If activity tracing is not on, then activityId and relatedActivityId are not set
+        /// </summary>
+        public void OnStart(string providerName, string activityName, int task, ref Guid activityId, ref Guid relatedActivityId, EventActivityOptions options)
+        {
+            if (m_current == null) 

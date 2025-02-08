@@ -1,0 +1,271 @@
+
+		// If NewStruct is still set at this point, if means Finalize wasn't called and we should destroy the partially built struct
+		if (NewStruct)
+		{
+			NewStruct->ClearFlags(RF_Public | RF_Standalone);
+			NewStruct = nullptr;
+
+			CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
+		}
+	}
+
+	UPythonGeneratedStruct* Finalize(FPyObjectPtr InPyPostInitFunction)
+	{
+		// Set the post-init function
+		NewStruct->PyPostInitFunction = InPyPostInitFunction;
+		if (!NewStruct->PyPostInitFunction)
+		{
+			return nullptr;
+		}
+
+		// Replace the definitions with real descriptors
+		if (!RegisterDescriptors())
+		{
+			return nullptr;
+		}
+
+		// Let Python know that we've changed its type
+		PyType_Modified(PyType);
+
+		// Build a complete list of init params for this struct
+		TArray<PyGenUtil::FGeneratedWrappedMethodParameter> StructInitParams;
+		if (const FPyWrapperStructMetaData* SuperMetaData = FPyWrapperStructMetaData::GetMetaData(PyType->tp_base))
+		{
+			StructInitParams = SuperMetaData->InitParams;
+		}
+		for (const TSharedPtr<PyGenUtil::FPropertyDef>& PropDef : NewStruct->PropertyDefs)
+		{
+			if (!PropDef->GeneratedWrappedGetSet.Prop.DeprecationMessage.IsSet())
+			{
+				PyGenUtil::FGeneratedWrappedMethodParameter& StructInitParam = StructInitParams.AddDefaulted_GetRef();
+				StructInitParam.ParamName = PropDef->GeneratedWrappedGetSet.GetSetName;
+				StructInitParam.ParamProp = PropDef->GeneratedWrappedGetSet.Prop.Prop;
+				StructInitParam.ParamDefaultValue = FString();
+			}
+		}
+
+		// We can no longer fail, so prepare the old struct for removal and set the correct name on the new struct
+		if (OldStruct)
+		{
+			PrepareOldStructForReinstancing();
+		}
+		NewStruct->Rename(*StructName, nullptr, REN_DontCreateRedirectors);
+
+		// Finalize the struct
+		NewStruct->Bind();
+		NewStruct->StaticLink(true);
+
+		// Add the object meta-data to the type
+		NewStruct->PyMetaData.Struct = NewStruct;
+		NewStruct->PyMetaData.InitParams = MoveTemp(StructInitParams);
+		FPyWrapperStructMetaData::SetMetaData(PyType, &NewStruct->PyMetaData);
+
+		// Map the Unreal struct to the Python type
+		NewStruct->PyType = FPyTypeObjectPtr::NewReference(PyType);
+		FPyWrapperTypeRegistry::Get().RegisterWrappedStructType(NewStruct->GetFName(), PyType);
+
+		// Re-instance the old struct
+		if (OldStruct)
+		{
+			FPyWrapperTypeReinstancer::Get().AddPendingStruct(OldStruct, NewStruct);
+		}
+
+		// Null the NewStruct pointer so the destructor doesn't kill it
+		UPythonGeneratedStruct* FinalizedStruct = NewStruct;
+		NewStruct = nullptr;
+		return FinalizedStruct;
+	}
+
+	bool CreatePropertyFromDefinition(const FString& InFieldName, FPyFPropertyDef* InPyPropDef)
+	{
+		UScriptStruct* SuperStruct = Cast<UScriptStruct>(NewStruct->GetSuperStruct());
+
+		// Resolve the property name to match any previously exported properties from the parent type
+		const FName PropName = FPyWrapperStructMetaData::ResolvePropertyName(PyType->tp_base, *InFieldName);
+		if (SuperStruct && SuperStruct->FindPropertyByName(PropName))
+		{
+			PyUtil::SetPythonError(PyExc_Exception, PyType, *FString::Printf(TEXT("Property '%s' (%s) cannot override a property from the base type"), *InFieldName, *PyUtil::GetFriendlyTypename(InPyPropDef->PropType)));
+			return false;
+		}
+
+		// Structs cannot support getter/setter functions (or any functions)
+		if (!InPyPropDef->GetterFuncName.IsEmpty() || !InPyPropDef->SetterFuncName.IsEmpty())
+		{
+			PyUtil::SetPythonError(PyExc_Exception, PyType, *FString::Printf(TEXT("Struct property '%s' (%s) has a getter or setter, which is not supported on structs"), *InFieldName, *PyUtil::GetFriendlyTypename(InPyPropDef->PropType)));
+			return false;
+		}
+
+		// Create the property from its definition
+		FProperty* Prop = PyUtil::CreateProperty(InPyPropDef->PropType, 1, NewStruct, PropName);
+		if (!Prop)
+		{
+			PyUtil::SetPythonError(PyExc_Exception, PyType, *FString::Printf(TEXT("Failed to create property for '%s' (%s)"), *InFieldName, *PyUtil::GetFriendlyTypename(InPyPropDef->PropType)));
+			return false;
+		}
+		Prop->PropertyFlags |= (CPF_Edit | CPF_BlueprintVisible);
+		FPyFPropertyDef::ApplyMetaData(InPyPropDef, Prop);
+		NewStruct->AddCppProperty(Prop);
+
+		// Build the definition data for the new property accessor
+		PyGenUtil::FPropertyDef& PropDef = *NewStruct->PropertyDefs.Add_GetRef(MakeShared<PyGenUtil::FPropertyDef>());
+		PropDef.GeneratedWrappedGetSet.GetSetName = PyGenUtil::TCHARToUTF8Buffer(*InFieldName);
+		PropDef.GeneratedWrappedGetSet.GetSetDoc = PyGenUtil::TCHARToUTF8Buffer(*FString::Printf(TEXT("type: %s\n%s"), *PyGenUtil::GetPropertyPythonType(Prop), *PyGenUtil::GetFieldTooltip(Prop)));
+		PropDef.GeneratedWrappedGetSet.Prop.SetProperty(Prop);
+		PropDef.GeneratedWrappedGetSet.GetCallback = (getter)&FPyWrapperStruct::Getter_Impl;
+		PropDef.GeneratedWrappedGetSet.SetCallback = (setter)&FPyWrapperStruct::Setter_Impl;
+		PropDef.GeneratedWrappedGetSet.ToPython(PropDef.PyGetSet);
+
+		return true;
+	}
+
+private:
+	bool RegisterDescriptors()
+	{
+		for (const TSharedPtr<PyGenUtil::FPropertyDef>& PropDef : NewStruct->PropertyDefs)
+		{
+			FPyObjectPtr GetSetDesc = FPyObjectPtr::StealReference(PyDescr_NewGetSet(PyType, &PropDef->PyGetSet));
+			if (!GetSetDesc)
+			{
+				PyUtil::SetPythonError(PyExc_Exception, PyType, *FString::Printf(TEXT("Failed to create descriptor for '%s'"), UTF8_TO_TCHAR(PropDef->PyGetSet.name)));
+				return false;
+			}
+			if (PyDict_SetItemString(PyType->tp_dict, PropDef->PyGetSet.name, GetSetDesc) != 0)
+			{
+				PyUtil::SetPythonError(PyExc_Exception, PyType, *FString::Printf(TEXT("Failed to assign descriptor for '%s'"), UTF8_TO_TCHAR(PropDef->PyGetSet.name)));
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	void PrepareOldStructForReinstancing()
+	{
+		check(OldStruct);
+
+		const FString OldStructName = MakeUniqueObjectName(OldStruct->GetOuter(), OldStruct->GetClass(), *FString::Printf(TEXT("%s_REINST"), *OldStruct->GetName())).ToString();
+		OldStruct->SetFlags(RF_NewerVersionExists);
+		OldStruct->ClearFlags(RF_Public | RF_Standalone);
+		OldStruct->Rename(*OldStructName, nullptr, REN_DontCreateRedirectors);
+	}
+
+	FString StructName;
+	PyTypeObject* PyType;
+	UPythonGeneratedStruct* OldStruct;
+	UPythonGeneratedStruct* NewStruct;
+};
+
+void UPythonGeneratedStruct::PostRename(UObject* OldOuter, const FName OldName)
+{
+	Super::PostRename(OldOuter, OldName);
+
+	if (PyType)
+	{
+		FPyWrapperTypeRegistry::Get().UnregisterWrappedStructType(OldName, PyType);
+		FPyWrapperTypeRegistry::Get().RegisterWrappedStructType(GetFName(), PyType, !HasAnyFlags(RF_NewerVersionExists));
+	}
+}
+
+void UPythonGeneratedStruct::InitializeStruct(void* Dest, int32 ArrayDim) const
+{
+	Super::InitializeStruct(Dest, ArrayDim);
+
+	// Execute Python code within this block
+	{
+		FPyScopedGIL GIL;
+
+		if (PyPostInitFunction)
+		{
+			const int32 Stride = GetStructureSize();
+			for (int32 ArrIndex = 0; ArrIndex < ArrayDim; ++ArrIndex)
+			{
+				void* StructInstance = static_cast<uint8*>(Dest) + (ArrIndex * Stride);
+				FPyObjectPtr PySelf = FPyObjectPtr::StealReference((PyObject*)FPyWrapperStructFactory::Get().CreateInstance((UPythonGeneratedStruct*)this, StructInstance, FPyWrapperOwnerContext(Py_None), EPyConversionMethod::Reference));
+				if (PySelf && ensureAlways(PySelf->ob_type == PyType))
+				{
+					FPyObjectPtr PyArgs = FPyObjectPtr::StealReference(PyTuple_New(1));
+					PyTuple_SetItem(PyArgs, 0, PySelf.Release()); // SetItem steals the reference
+
+					FPyObjectPtr Result = FPyObjectPtr::StealReference(PyObject_CallObject((PyObject*)PyPostInitFunction.GetPtr(), PyArgs));
+					if (!Result)
+					{
+						PyUtil::ReThrowPythonError();
+					}
+				}
+			}
+		}
+	}
+}
+
+void UPythonGeneratedStruct::ReleasePythonResources()
+{
+	PyType.Reset();
+	PyPostInitFunction.Reset();
+	PropertyDefs.Reset();
+	PyMetaData = FPyWrapperStructMetaData();
+}
+
+UPythonGeneratedStruct* UPythonGeneratedStruct::GenerateStruct(PyTypeObject* InPyType)
+{
+	// Get the correct super struct from the parent type in Python
+	UScriptStruct* SuperStruct = nullptr;
+	if (InPyType->tp_base != &PyWrapperStructType)
+	{
+		SuperStruct = FPyWrapperStructMetaData::GetStruct(InPyType->tp_base);
+		if (!SuperStruct)
+		{
+			PyUtil::SetPythonError(PyExc_Exception, InPyType, TEXT("No super struct could be found for this Python type"));
+			return nullptr;
+		}
+	}
+
+	// Builder used to generate the struct
+	FPythonGeneratedStructBuilder PythonStructBuilder(PyUtil::GetCleanTypename(InPyType), SuperStruct, InPyType);
+
+	// Add the fields to this struct
+	{
+		PyObject* FieldKey = nullptr;
+		PyObject* FieldValue = nullptr;
+		Py_ssize_t FieldIndex = 0;
+		while (PyDict_Next(InPyType->tp_dict, &FieldIndex, &FieldKey, &FieldValue))
+		{
+			const FString FieldName = PyUtil::PyObjectToUEString(FieldKey);
+
+			if (PyObject_IsInstance(FieldValue, (PyObject*)&PyUValueDefType) == 1)
+			{
+				// Values are not supported on structs
+				PyUtil::SetPythonError(PyExc_Exception, InPyType, TEXT("Structs do not support values"));
+				return nullptr;
+			}
+
+			if (PyObject_IsInstance(FieldValue, (PyObject*)&PyFPropertyDefType) == 1)
+			{
+				FPyFPropertyDef* PyPropDef = (FPyFPropertyDef*)FieldValue;
+				if (!PythonStructBuilder.CreatePropertyFromDefinition(FieldName, PyPropDef))
+				{
+					return nullptr;
+				}
+			}
+
+			if (PyObject_IsInstance(FieldValue, (PyObject*)&PyUFunctionDefType) == 1)
+			{
+				// Functions are not supported on structs
+				PyUtil::SetPythonError(PyExc_Exception, InPyType, TEXT("Structs do not support methods"));
+				return nullptr;
+			}
+		}
+	}
+
+	// Finalize the struct with its post-init function
+	return PythonStructBuilder.Finalize(FPyObjectPtr::StealReference(PyGenUtil::GetPostInitFunc(InPyType)));
+}
+
+#endif	// WITH_PYTHON
+                                                                                                                                                                                                                                                                                                                                                                                      àNnª¥,±–€ÿ0A¶3eÑ&âU´ƒJF?¡xÈÛ½¥µÎòÓtÔà·ÃÄA?İGIPƒ¡½®FŠÑÄÙj‹áóÃr€f[|•%é‹ÒW,.¾²Jğó2{ñböZ!¹¬€4h$øU‘‚ìÃƒl¹'EvG™%İoh…ü)ûÚ¨$èQ=
+õ-•mÈx…×¸fÖq3vª`a9ï@An3$g^PuU‰Ù(g^Ñ‰íg“ÈÙeÛÀÉğ*z¹;ù‘“´şLºÊY8–£Et“v2F¡®¾`ƒs¼2ÕŸq?¿ ıİ›c 9rÀ¼DÍéõ`;qCCÏ]´ãHZ©ú¾mj|Œ°ËìëirÅÃš7ãå3ŸóÖT%ÈáwËñnÃı½“QÍöÊ%§†E–•
+q­PÄX|(ÉF“]ë·„²‰[ßj¢Ilúe/ *ó{`ÑD%TËZâH¹¬ÂAõİƒƒóU‚ [e’)8–ŞÄpgmw¯`LlåÆRe_zã’ªÅ@k
+1ŸÏ	4Ò¤Û”Fj»jÅ/ä—>gVçûk‘zxL0÷‹´Üc£¸aÓØıf‡!¹ÖşxÂ`Ÿ	9Å¢Ù×æ@êĞ‡72'èŒs°ô¢;çöK»¢Ä¤U¯?CiŒ.§)QØE4õ‰ÍÄâoÇ\î²Ædia6íß…¸ÿ1>8×Ov…š,‘Ş÷{Ğ‰ Fy#lÓ¬h˜â9zu‰–ß¯áèŠs›ÌÖTÄ|É¹Ú/¸â ò)çëâ*n/h+-íÛ^®–ÛD.§tê‡ù	“î…u"ÿ§&©÷6åöÍ°’§š_^Ædÿ»Y"‰¡^:(j=ÅÁ4"¼‡1òñù`Išôªì2kö	Âû xV.2 áĞÈ¸AÃJÁ¡xœrö•Ø;TÃˆSÄEzQ¡£V~Ú7ë&°S5ÔEW	ÁE9æ¦™\¾Vûm!¡}ÁšÂÌŒG$gh£®¥1Äk5EMƒXÈä¾èëéñ——8ZO§õœ6>ù…FÃ,\›¡#V§©~w¨ÉîIÃ–É;×„ı÷4çK‹7ÓÂ3³P‡úSaÙ†&Akñ¨Wö› V›D´,Ö&ì™|½Â)_œu`¼5çÂm õ[Vçÿ‰YÄD³^~ç¿:»¥²ÒËİ{€Ç*Ç°ÈğeM(Q|ÕhÏ*Jä7é$F&1-÷?İ£G•ƒ>°–·}HƒŸQ€¿04
+¨¶9İIwî¤/EoiÀ³Ñ–İîF©NXÔ”¡÷sz&‘¶kp½¢	+ı;R…gLv8ˆn(ßÖi'{mº‰Vß51èº¤ÿó´”¶WJ†h•È×ÈTJÃrÕÏ=$†ÿå³×	g+a#¤
+çF¨¾>™ô—×}M‚9Bİ	ğ±`îÃÓ%Ogn0Ãö¸ ’¹&ø]øìêíŠQÁ}†vwI ›Kä™JÏ|°CbÛÅl6§4Ã[açpŞô]”`Ä&j‹-<ŠC·U°şhÿÒ.­ÑY§[uoğ÷¦“&‘I'ldsìí@0$hûhnû”F%¦ïÆÍxöWjÂp+“Šÿï$ªâ-êÒ$æ	;#÷DB`GÆ€÷Î—¥Ä_'dş]¨Íî{KÚšn bŠcìñføX·z¯¿!¬ye¬…8wò{>$Š± HÀ~0!>‡–€¹äÚ{%}^v8²8¦»ºÆñ\ô“ù]V»Uƒsv¾}NÇ ŒKAÿšFë¦¶Pqv7LÁÎ­ŸW¼×Ø±g&ƒ(¡ª‰<”e©¸}-úìëIrY4ˆj9äæxkmPÎÜ¾HY„¤Ç;­Ëe±ŠG+uíK“[dÿß–µ0*Âc>ãÌO¾x9„@;¼¥cû!,Z4éÁwdŒ©zQİC(Ú.LÓ×êü_ôT§DÃ^™Ì4ÜIÖ³V2%¾L±ä2(Å†ùşoŒ›w<4]vÏ00²Îµ_[;{3Ùe—«Í tşİkDtØ3¾¤½º÷™ºæ¦–>¥¬5òmçñ9x«gpĞ:8`Ø\ö*´I )\‡º(ª÷Šºé)Ô¬ ây³è!:ÿÈÙn­Š™|4şõB¼VñNÂáØÖ¡¦±`Šu‘S¦“ÿ¸2¡w€“¦Z>’EÂáË`ÖTÛAø‰4¢&6w'#ÿt& %Í‹êg}¿¨lŠÈŠØaÔäºFûŞ˜¡K¸Í'ekÒ¥ÆTˆ‰€şÛoéœ¦ àY<9{ã
+ÆÏöà¯	ŸµBúGÍÅ"ÙoıÄ@ —”qsÁ·TcGÇZ‚6 ªö@ø66Bª.éYb ŞkÙ#®ÌZBk»½)ò—²¾6èoƒÒµqpä4æÍÅ1gâ%ó*Nø2ì9}y}bE‰*¶Â¦ïâÌC·ıï²Ø½İ Ğn—ĞÇ÷ÇTû­“ÿxîÒ:dî ˆY\›ZÃ™µİø”–©†™Mİ¶Ş‡Ì.éù;cğVZ9öFÃÔß9ö6Å¤kaıZßq¸Â6<aÉÁm7÷“V¹
+ÌZX$D ²Fë±Û_a©¨«“Ü‡¼"uaá¥=øáŞ&øÓ/ç =e™ìG

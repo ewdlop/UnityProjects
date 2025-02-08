@@ -1,0 +1,55 @@
+Tab) const;
+
+  static Expected<ELFFile> create(StringRef Object);
+
+  bool isMipsELF64() const {
+    return getHeader()->e_machine == ELF::EM_MIPS &&
+           getHeader()->getFileClass() == ELF::ELFCLASS64;
+  }
+
+  bool isMips64EL() const {
+    return isMipsELF64() &&
+           getHeader()->getDataEncoding() == ELF::ELFDATA2LSB;
+  }
+
+  Expected<Elf_Shdr_Range> sections() const;
+
+  Expected<Elf_Sym_Range> symbols(const Elf_Shdr *Sec) const {
+    if (!Sec)
+      return makeArrayRef<Elf_Sym>(nullptr, nullptr);
+    return getSectionContentsAsArray<Elf_Sym>(Sec);
+  }
+
+  Expected<Elf_Rela_Range> relas(const Elf_Shdr *Sec) const {
+    return getSectionContentsAsArray<Elf_Rela>(Sec);
+  }
+
+  Expected<Elf_Rel_Range> rels(const Elf_Shdr *Sec) const {
+    return getSectionContentsAsArray<Elf_Rel>(Sec);
+  }
+
+  Expected<std::vector<Elf_Rela>> android_relas(const Elf_Shdr *Sec) const;
+
+  /// \brief Iterate over program header table.
+  Expected<Elf_Phdr_Range> program_headers() const {
+    if (getHeader()->e_phnum && getHeader()->e_phentsize != sizeof(Elf_Phdr))
+      return createError("invalid e_phentsize");
+    if (getHeader()->e_phoff +
+            (getHeader()->e_phnum * getHeader()->e_phentsize) >
+        getBufSize())
+      return createError("program headers longer than binary");
+    auto *Begin =
+        reinterpret_cast<const Elf_Phdr *>(base() + getHeader()->e_phoff);
+    return makeArrayRef(Begin, Begin + getHeader()->e_phnum);
+  }
+
+  Expected<StringRef> getSectionStringTable(Elf_Shdr_Range Sections) const;
+  Expected<uint32_t> getSectionIndex(const Elf_Sym *Sym, Elf_Sym_Range Syms,
+                                     ArrayRef<Elf_Word> ShndxTable) const;
+  Expected<const Elf_Shdr *> getSection(const Elf_Sym *Sym,
+                                        const Elf_Shdr *SymTab,
+                                        ArrayRef<Elf_Word> ShndxTable) const;
+  Expected<const Elf_Shdr *> getSection(const Elf_Sym *Sym,
+                                        Elf_Sym_Range Symtab,
+                                        ArrayRef<Elf_Word> ShndxTable) const;
+  Expected<const Elf_Shdr *> getSection(uint

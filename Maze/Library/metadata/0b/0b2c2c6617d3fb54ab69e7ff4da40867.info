@@ -1,0 +1,161 @@
+eded to marshal signals from the network
+  // to signaling thread.
+  void OnSctpTransportReadyToSendData_n();
+  // This may be called with "false" if the direction of the m= section causes
+  // us to tear down the SCTP connection.
+  void OnSctpTransportReadyToSendData_s(bool ready);
+  void OnSctpTransportDataReceived_n(const cricket::ReceiveDataParams& params,
+                                     const rtc::CopyOnWriteBuffer& payload);
+  // Beyond just firing the signal to the signaling thread, listens to SCTP
+  // CONTROL messages on unused SIDs and processes them as OPEN messages.
+  void OnSctpTransportDataReceived_s(const cricket::ReceiveDataParams& params,
+                                     const rtc::CopyOnWriteBuffer& payload);
+  void OnSctpClosingProcedureStartedRemotely_n(int sid);
+  void OnSctpClosingProcedureComplete_n(int sid);
+
+  bool ValidateBundleSettings(const cricket::SessionDescription* desc);
+  bool HasRtcpMuxEnabled(const cricket::ContentInfo* content);
+  // Below methods are helper methods which verifies SDP.
+  RTCError ValidateSessionDescription(const SessionDescriptionInterface* sdesc,
+                                      cricket::ContentSource source);
+
+  // Check if a call to SetLocalDescription is acceptable with a session
+  // description of the given type.
+  bool ExpectSetLocalDescription(SdpType type);
+  // Check if a call to SetRemoteDescription is acceptable with a session
+  // description of the given type.
+  bool ExpectSetRemoteDescription(SdpType type);
+  // Verifies a=setup attribute as per RFC 5763.
+  bool ValidateDtlsSetupAttribute(const cricket::SessionDescription* desc,
+                                  SdpType type);
+
+  // Returns true if we are ready to push down the remote candidate.
+  // |remote_desc| is the new remote description, or NULL if the current remote
+  // description should be used. Output |valid| is true if the candidate media
+  // index is valid.
+  bool ReadyToUseRemoteCandidate(const IceCandidateInterface* candidate,
+                                 const SessionDescriptionInterface* remote_desc,
+                                 bool* valid);
+
+  // Returns true if SRTP (either using DTLS-SRTP or SDES) is required by
+  // this session.
+  bool SrtpRequired() const;
+
+  // JsepTransportController signal handlers.
+  void OnTransportControllerConnectionState(cricket::IceConnectionState state);
+  void OnTransportControllerGatheringState(cricket::IceGatheringState state);
+  void OnTransportControllerCandidatesGathered(
+      const std::string& transport_name,
+      const std::vector<cricket::Candidate>& candidates);
+  void OnTransportControllerCandidatesRemoved(
+      const std::vector<cricket::Candidate>& candidates);
+  void OnTransportControllerDtlsHandshakeError(rtc::SSLHandshakeError error);
+
+  const char* SessionErrorToString(SessionError error) const;
+  std::string GetSessionErrorMsg();
+
+  // Report the UMA metric SdpFormatReceived for the given remote offer.
+  void ReportSdpFormatReceived(const SessionDescriptionInterface& remote_offer);
+
+  // Report inferred negotiated SDP semantics from a local/remote answer to the
+  // UMA observer.
+  void ReportNegotiatedSdpSemantics(const SessionDescriptionInterface& answer);
+
+  // Invoked when TransportController connection completion is signaled.
+  // Reports stats for all transports in use.
+  void ReportTransportStats();
+
+  // Gather the usage of IPv4/IPv6 as best connection.
+  void ReportBestConnectionState(const cricket::TransportStats& stats);
+
+  void ReportNegotiatedCiphers(const cricket::TransportStats& stats,
+                               const std::set<cricket::MediaType>& media_types);
+
+  void NoteUsageEvent(UsageEvent event);
+  void ReportUsagePattern() const;
+
+  void OnSentPacket_w(const rtc::SentPacket& sent_packet);
+
+  const std::string GetTransportName(const std::string& content_name);
+
+  // Destroys and clears the BaseChannel associated with the given transceiver,
+  // if such channel is set.
+  void DestroyTransceiverChannel(
+      rtc::scoped_refptr<RtpTransceiverProxyWithInternal<RtpTransceiver>>
+          transceiver);
+
+  // Destroys the RTP data channel and/or the SCTP data channel and clears it.
+  void DestroyDataChannel();
+
+  // Destroys the given BaseChannel. The channel cannot be accessed after this
+  // method is called.
+  void DestroyBaseChannel(cricket::BaseChannel* channel);
+
+  // JsepTransportController::Observer override.
+  //
+  // Called by |transport_controller_| when processing transport information
+  // from a session description, and the mapping from m= sections to transports
+  // changed (as a result of BUNDLE negotiation, or m= sections being
+  // rejected).
+  bool OnTransportChanged(
+      const std::string& mid,
+      RtpTransportInternal* rtp_transport,
+      cricket::DtlsTransportInternal* dtls_transport) override;
+
+  // Returns the observer. Will crash on CHECK if the observer is removed.
+  PeerConnectionObserver* Observer() const;
+
+  sigslot::signal1<DataChannel*> SignalDataChannelCreated_;
+
+  // Storing the factory as a scoped reference pointer ensures that the memory
+  // in the PeerConnectionFactoryImpl remains available as long as the
+  // PeerConnection is running. It is passed to PeerConnection as a raw pointer.
+  // However, since the reference counting is done in the
+  // PeerConnectionFactoryInterface all instances created using the raw pointer
+  // will refer to the same reference count.
+  rtc::scoped_refptr<PeerConnectionFactory> factory_;
+  PeerConnectionObserver* observer_ = nullptr;
+
+  // The EventLog needs to outlive |call_| (and any other object that uses it).
+  std::unique_ptr<RtcEventLog> event_log_;
+
+  SignalingState signaling_state_ = kStable;
+  IceConnectionState ice_connection_state_ = kIceConnectionNew;
+  IceGatheringState ice_gathering_state_ = kIceGatheringNew;
+  PeerConnectionInterface::RTCConfiguration configuration_;
+
+  // TODO(zstein): |async_resolver_factory_| can currently be nullptr if it
+  // is not injected. It should be required once chromium supplies it.
+  std::unique_ptr<AsyncResolverFactory> async_resolver_factory_;
+  std::unique_ptr<cricket::PortAllocator> port_allocator_;
+  std::unique_ptr<rtc::SSLCertificateVerifier> tls_cert_verifier_;
+  int port_allocator_flags_ = 0;
+
+  // One PeerConnection has only one RTCP CNAME.
+  // https://tools.ietf.org/html/draft-ietf-rtcweb-rtp-usage-26#section-4.9
+  std::string rtcp_cname_;
+
+  // Streams added via AddStream.
+  rtc::scoped_refptr<StreamCollection> local_streams_;
+  // Streams created as a result of SetRemoteDescription.
+  rtc::scoped_refptr<StreamCollection> remote_streams_;
+
+  std::vector<std::unique_ptr<MediaStreamObserver>> stream_observers_;
+
+  // These lists store sender info seen in local/remote descriptions.
+  std::vector<RtpSenderInfo> remote_audio_sender_infos_;
+  std::vector<RtpSenderInfo> remote_video_sender_infos_;
+  std::vector<RtpSenderInfo> local_audio_sender_infos_;
+  std::vector<RtpSenderInfo> local_video_sender_infos_;
+
+  SctpSidAllocator sid_allocator_;
+  // label -> DataChannel
+  std::map<std::string, rtc::scoped_refptr<DataChannel>> rtp_data_channels_;
+  std::vector<rtc::scoped_refptr<DataChannel>> sctp_data_channels_;
+  std::vector<rtc::scoped_refptr<DataChannel>> sctp_data_channels_to_free_;
+
+  bool remote_peer_supports_msid_ = false;
+
+  std::unique_ptr<Call> call_;
+  std::unique_ptr<StatsCollector> stats_;  // A pointer is passed to senders_
+  rtc::scoped

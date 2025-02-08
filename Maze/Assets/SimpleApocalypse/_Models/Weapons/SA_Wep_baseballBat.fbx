@@ -1,0 +1,558 @@
+//Copyright 2010 Microsoft Corporation
+//
+//Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. 
+//You may obtain a copy of the License at 
+//
+//http://www.apache.org/licenses/LICENSE-2.0 
+//
+//Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an 
+//"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. 
+//See the License for the specific language governing permissions and limitations under the License.
+
+
+
+namespace System.Data.Services.Client
+{
+    #region Namespaces.
+
+    using System;
+    using System.Collections.Generic;
+    using System.Data.Services.Common;
+    using System.Diagnostics;
+    using System.Linq;
+    using System.Linq.Expressions;
+    using System.Reflection;
+
+    #endregion Namespaces.
+
+    [DebuggerDisplay("{ElementTypeName}")]
+    internal sealed class ClientType
+    {
+        internal readonly string ElementTypeName;
+
+        internal readonly Type ElementType;
+
+        internal readonly bool IsEntityType;
+
+        internal readonly int KeyCount;
+
+        #region static fields
+
+        private static readonly Dictionary<Type, ClientType> types = new Dictionary<Type, ClientType>(EqualityComparer<Type>.Default);
+
+        private static readonly Dictionary<TypeName, Type> namedTypes = new Dictionary<TypeName, Type>(new TypeNameEqualityComparer());
+        #endregion
+
+#if ASTORIA_OPEN_OBJECT
+        private readonly ClientProperty openProperties;
+#endif
+        private ArraySet<ClientProperty> properties;
+
+        private ClientProperty mediaDataMember;
+
+        private bool mediaLinkEntry;
+
+        private EpmSourceTree epmSourceTree;
+        
+        private EpmTargetTree epmTargetTree;
+
+        private ClientType(Type type, string typeName, bool skipSettableCheck)
+        {
+            Debug.Assert(null != type, "null type");
+            Debug.Assert(!String.IsNullOrEmpty(typeName), "empty typeName");
+
+            this.ElementTypeName = typeName;
+            this.ElementType = Nullable.GetUnderlyingType(type) ?? type;
+#if ASTORIA_OPEN_OBJECT
+            string openObjectPropertyName = null;
+#endif
+            if (!ClientConvert.IsKnownType(this.ElementType))
+            {
+#if ASTORIA_OPEN_OBJECT
+                #region OpenObject determined by walking type hierarchy and looking for [OpenObjectAttribute("PropertyName")]
+                Type openObjectDeclared = this.ElementType;
+                for (Type tmp = openObjectDeclared; (null != tmp) && (typeof(object) != tmp); tmp = tmp.BaseType)
+                {
+                    object[] attributes = openObjectDeclared.GetCustomAttributes(typeof(OpenObjectAttribute), false);
+                    if (1 == attributes.Length)
+                    {
+                        if (null != openObjectPropertyName)
+                        {
+                            throw Error.InvalidOperation(Strings.Clienttype_MultipleOpenProperty(this.ElementTypeName));
+                        }
+
+                        openObjectPropertyName = ((OpenObjectAttribute)attributes[0]).OpenObjectPropertyName;
+                        openObjectDeclared = tmp;
+                    }
+                }
+                #endregion
+#endif
+
+                Type keyPropertyDeclaredType = null;
+                bool isEntity = type.GetCustomAttributes(true).OfType<DataServiceEntityAttribute>().Any();
+                DataServiceKeyAttribute dska = type.GetCustomAttributes(true).OfType<DataServiceKeyAttribute>().FirstOrDefault();
+                foreach (PropertyInfo pinfo in type.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                {
+
+
+
+
+
+
+                    Type ptype = pinfo.PropertyType;                    ptype = Nullable.GetUnderlyingType(ptype) ?? ptype;
+
+                    if (ptype.IsPointer ||
+                        (ptype.IsArray && (typeof(byte[]) != ptype) && typeof(char[]) != ptype) ||
+                        (typeof(IntPtr) == ptype) ||
+                        (typeof(UIntPtr) == ptype))
+                    {
+                        continue;
+                    }
+
+                    Debug.Assert(!ptype.ContainsGenericParameters, "remove when test case is found that encounters this");
+
+                    if (pinfo.CanRead &&
+                        (!ptype.IsValueType || pinfo.CanWrite) &&
+                        !ptype.ContainsGenericParameters &&
+                        (0 == pinfo.GetIndexParameters().Length))
+                    {
+                        #region IsKey?
+                        bool keyProperty = dska != null ? dska.KeyNames.Contains(pinfo.Name) : false;
+
+                        if (keyProperty)
+                        {
+                            if (null == keyPropertyDeclaredType)
+                            {
+                                keyPropertyDeclaredType = pinfo.DeclaringType;
+                            }
+                            else if (keyPropertyDeclaredType != pinfo.DeclaringType)
+                            {
+                                throw Error.InvalidOperation(Strings.ClientType_KeysOnDifferentDeclaredType(this.ElementTypeName));
+                            }
+
+                            if (!ClientConvert.IsKnownType(ptype))
+                            {
+                                throw Error.InvalidOperation(Strings.ClientType_KeysMustBeSimpleTypes(this.ElementTypeName));
+                            }
+
+                            this.KeyCount++;
+                        }
+                        #endregion
+
+#if ASTORIA_OPEN_OBJECT
+                        #region IsOpenObjectProperty?
+                        bool openProperty = (openObjectPropertyName == pinfo.Name) &&
+                                              typeof(IDictionary<string, object>).IsAssignableFrom(ptype);
+                        Debug.Assert(keyProperty != openProperty || (!keyProperty && !openProperty), "key can't be open type");
+                        #endregion
+
+                        ClientProperty property = new ClientProperty(pinfo, ptype, keyProperty, openProperty);
+
+                        if (!property.OpenObjectProperty)
+#else
+                        ClientProperty property = new ClientProperty(pinfo, ptype, keyProperty);
+#endif
+                        {
+                            if (!this.properties.Add(property, ClientProperty.NameEquality))
+                            {
+                                int shadow = this.IndexOfProperty(property.PropertyName);
+                                if (!property.DeclaringType.IsAssignableFrom(this.properties[shadow].DeclaringType))
+                                {                                    this.properties.RemoveAt(shadow);
+                                    this.properties.Add(property, null);
+                                }
+                            }
+                        }
+#if ASTORIA_OPEN_OBJECT
+                        else
+                        {
+                            if (pinfo.DeclaringType == openObjectDeclared)
+                            {
+                                this.openProperties = property;
+                            }
+                        }
+#endif
+                    }
+                }
+
+                #region No KeyAttribute, discover key by name pattern { DeclaringType.Name+ID, ID }
+                if (null == keyPropertyDeclaredType)
+                {
+                    ClientProperty key = null;
+                    for (int i = this.properties.Count - 1; 0 <= i; --i)
+                    {
+                        string propertyName = this.properties[i].PropertyName;
+                        if (propertyName.EndsWith("ID", StringComparison.Ordinal))
+                        {
+                            string declaringTypeName = this.properties[i].DeclaringType.Name;
+                            if ((propertyName.Length == (declaringTypeName.Length + 2)) &&
+                                propertyName.StartsWith(declaringTypeName, StringComparison.Ordinal))
+                            {
+                                if ((null == keyPropertyDeclaredType) ||
+                                    this.properties[i].DeclaringType.IsAssignableFrom(keyPropertyDeclaredType))
+                                {
+                                    keyPropertyDeclaredType = this.properties[i].DeclaringType;
+                                    key = this.properties[i];
+                                }
+                            }
+                            else if ((null == keyPropertyDeclaredType) && (2 == propertyName.Length))
+                            {
+                                keyPropertyDeclaredType = this.properties[i].DeclaringType;
+                                key = this.properties[i];
+                            }
+                        }
+                    }
+
+                    if (null != key)
+                    {
+                        Debug.Assert(0 == this.KeyCount, "shouldn't have a key yet");
+                        key.KeyProperty = true;
+                        this.KeyCount++;
+                    }
+                }
+                else if (this.KeyCount != dska.KeyNames.Count)
+                {
+                    var m = (from string a in dska.KeyNames
+                             where null == (from b in this.properties
+                                            where b.PropertyName == a
+                                            select b).FirstOrDefault()
+                             select a).First<string>();
+                    throw Error.InvalidOperation(Strings.ClientType_MissingProperty(this.ElementTypeName, m));
+                }
+                #endregion
+
+                this.IsEntityType = (null != keyPropertyDeclaredType) || isEntity;
+                Debug.Assert(this.KeyCount == this.Properties.Where(k => k.KeyProperty).Count(), "KeyCount mismatch");
+
+                this.WireUpMimeTypeProperties();
+                this.CheckMediaLinkEntry();
+
+                if (!skipSettableCheck)
+                {
+#if ASTORIA_OPEN_OBJECT
+                    if ((0 == this.properties.Count) && (null == this.openProperties))
+#else
+                    if (0 == this.properties.Count)
+#endif
+                    {                        throw Error.InvalidOperation(Strings.ClientType_NoSettableFields(this.ElementTypeName));
+                    }
+                }
+            }
+
+            this.properties.TrimToSize();
+            this.properties.Sort<string>(ClientProperty.GetPropertyName, String.CompareOrdinal);
+
+#if ASTORIA_OPEN_OBJECT
+            #region Validate OpenObjectAttribute was used
+            if ((null != openObjectPropertyName) && (null == this.openProperties))
+            {
+                throw Error.InvalidOperation(Strings.ClientType_MissingOpenProperty(this.ElementTypeName, openObjectPropertyName));
+            }
+
+            Debug.Assert((null != openObjectPropertyName) == (null != this.openProperties), "OpenProperties mismatch");
+            #endregion
+#endif
+            this.BuildEpmInfo(type);
+        }
+
+        internal ArraySet<ClientProperty> Properties
+        {
+            get { return this.properties; }
+        }
+
+        internal ClientProperty MediaDataMember
+        {
+            get { return this.mediaDataMember; }
+        }
+
+        internal bool IsMediaLinkEntry
+        {
+            get { return this.mediaLinkEntry; }
+        }
+
+        internal EpmSourceTree EpmSourceTree
+        {
+            get
+            {
+                if (this.epmSourceTree == null)
+                {
+                    this.epmTargetTree = new EpmTargetTree();
+                    this.epmSourceTree = new EpmSourceTree(this.epmTargetTree);
+                }
+                
+                return this.epmSourceTree;
+            }
+        }
+
+        internal EpmTargetTree EpmTargetTree
+        {
+            get
+            {
+                Debug.Assert(this.epmTargetTree != null, "Must have valid target tree");
+                return this.epmTargetTree;
+            }
+        }
+
+        internal bool HasEntityPropertyMappings
+        {
+            get
+            {
+                return this.epmSourceTree != null;
+            }
+        }
+
+        internal bool EpmIsV1Compatible
+        {
+            get
+            {
+                return !this.HasEntityPropertyMappings || this.EpmTargetTree.IsV1Compatible;
+            }
+        }
+
+        internal static bool CanAssignNull(Type type)
+        {
+            Debug.Assert(type != null, "type != null");
+            return !type.IsValueType || (type.IsGenericType && (type.GetGenericTypeDefinition() == typeof(Nullable<>)));
+        }
+
+        internal static bool CheckElementTypeIsEntity(Type t)
+        {
+            t = TypeSystem.GetElementType(t);
+            t = Nullable.GetUnderlyingType(t) ?? t;
+            return ClientType.Create(t, false).IsEntityType;
+        }
+
+        internal static ClientType Create(Type type)
+        {
+            return Create(type, true );
+        }
+
+        internal static ClientType Create(Type type, bool expectModelType)
+        {
+            ClientType clientType;
+            lock (ClientType.types)
+            {
+                ClientType.types.TryGetValue(type, out clientType);
+            }
+
+            if (null == clientType)
+            {
+                bool skipSettableCheck = !expectModelType;
+                clientType = new ClientType(type, type.ToString(), skipSettableCheck); // ToString expands generic type name where as FullName does not
+                if (expectModelType)
+                {
+                    lock (ClientType.types)
+                    {
+                        ClientType existing;
+                        if (ClientType.types.TryGetValue(type, out existing))
+                        {
+                            clientType = existing;
+                        }
+                        else
+                        {
+                            ClientType.types.Add(type, clientType);
+                        }
+                    }
+                }
+            }
+
+            return clientType;
+        }
+
+#if !ASTORIA_LIGHT
+        internal static Type ResolveFromName(string wireName, Type userType)
+#else
+        internal static Type ResolveFromName(string wireName, Type userType, Type contextType)
+#endif
+        {
+            Type foundType;
+
+            TypeName typename;
+            typename.Type = userType;
+            typename.Name = wireName;
+
+            bool foundInCache;
+            lock (ClientType.namedTypes)
+            {
+                foundInCache = ClientType.namedTypes.TryGetValue(typename, out foundType);
+            }
+
+            if (!foundInCache)
+            {
+                string name = wireName;
+                int index = wireName.LastIndexOf('.');
+                if ((0 <= index) && (index < wireName.Length - 1))
+                {
+                    name = wireName.Substring(index + 1);
+                }
+
+                if (userType.Name == name)
+                {
+                    foundType = userType;
+                }
+                else
+                {
+#if !ASTORIA_LIGHT
+                    foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
+#else
+                    foreach (Assembly assembly in new Assembly[] { userType.Assembly, contextType.Assembly }.Distinct())
+#endif
+                    {
+                        Type found = assembly.GetType(wireName, false);
+                        ResolveSubclass(name, userType, found, ref foundType);
+
+                        if (null == found)
+                        {
+                            Type[] types = null;
+                            try
+                            {
+                                types = assembly.GetTypes();
+                            }
+                            catch (ReflectionTypeLoadException)
+                            {
+                            }
+
+                            if (null != types)
+                            {
+                                foreach (Type t in types)
+                                {
+                                    ResolveSubclass(name, userType, t, ref foundType);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                lock (ClientType.namedTypes)
+                {
+                    ClientType.namedTypes[typename] = foundType;
+                }
+            }
+
+            return foundType;
+        }
+
+        internal static Type GetImplementationType(Type propertyType, Type genericTypeDefinition)
+        {
+            if (IsConstructedGeneric(propertyType, genericTypeDefinition))
+            {   
+                return propertyType;
+            }
+            else
+            {
+                Type implementationType = null;
+                foreach (Type interfaceType in propertyType.GetInterfaces())
+                {
+                    if (IsConstructedGeneric(interfaceType, genericTypeDefinition))
+                    {
+                        if (null == implementationType)
+                        {   
+                            implementationType = interfaceType;
+                        }
+                        else
+                        {   
+                            throw Error.NotSupported(Strings.ClientType_MultipleImplementationNotSupported);
+                        }
+                    }
+                }
+
+                return implementationType;
+            }
+        }
+
+        internal static MethodInfo GetAddToCollectionMethod(Type collectionType, out Type type)
+        {
+            return GetCollectionMethod(collectionType, typeof(ICollection<>), "Add", out type);
+        }
+
+        internal static MethodInfo GetRemoveFromCollectionMethod(Type collectionType, out Type type)
+        {
+            return GetCollectionMethod(collectionType, typeof(ICollection<>), "Remove", out type);
+        }
+
+        internal static MethodInfo GetCollectionMethod(Type propertyType, Type genericTypeDefinition, string methodName, out Type type)
+        {
+            Debug.Assert(null != propertyType, "null propertyType");
+            Debug.Assert(null != genericTypeDefinition, "null genericTypeDefinition");
+            Debug.Assert(genericTypeDefinition.IsGenericTypeDefinition, "!IsGenericTypeDefinition");
+
+            type = null;
+
+            Type implementationType = GetImplementationType(propertyType, genericTypeDefinition);
+            if (null != implementationType)
+            {
+                Type[] genericArguments = implementationType.GetGenericArguments();
+                MethodInfo methodInfo = implementationType.GetMethod(methodName);
+                Debug.Assert(null != methodInfo, "should have found the method");
+
+#if DEBUG
+                Debug.Assert(null != genericArguments, "null genericArguments");
+                ParameterInfo[] parameters = methodInfo.GetParameters();
+                if (0 < parameters.Length)
+                {
+                    Debug.Assert(genericArguments.Length == parameters.Length, "genericArguments don't match parameters");
+                    for (int i = 0; i < genericArguments.Length; ++i)
+                    {
+                        Debug.Assert(genericArguments[i] == parameters[i].ParameterType, "parameter doesn't match generic argument");
+                    }
+                }
+#endif
+                type = genericArguments[genericArguments.Length - 1];
+                return methodInfo;
+            }
+
+            return null;
+        }
+
+        internal object CreateInstance()
+        {
+            return Activator.CreateInstance(this.ElementType);
+        }
+
+        internal ClientProperty GetProperty(string propertyName, bool ignoreMissingProperties)
+        {
+            int index = this.IndexOfProperty(propertyName);
+            if (0 <= index)
+            {
+                return this.properties[index];
+            }
+#if ASTORIA_OPEN_OBJECT
+            else if (null != this.openProperties)
+            {
+                return this.openProperties;
+            }
+#endif
+            else if (!ignoreMissingProperties)
+            {
+                throw Error.InvalidOperation(Strings.ClientType_MissingProperty(this.ElementTypeName, propertyName));
+            }
+
+            return null;
+        }
+
+       private static bool IsConstructedGeneric(Type type, Type genericTypeDefinition)
+        {
+            Debug.Assert(type != null, "type != null");
+            Debug.Assert(!type.ContainsGenericParameters, "remove when test case is found that encounters this");
+            Debug.Assert(genericTypeDefinition != null, "genericTypeDefinition != null");
+
+            return type.IsGenericType && (type.GetGenericTypeDefinition() == genericTypeDefinition) && !type.ContainsGenericParameters;
+        }
+
+        private static void ResolveSubclass(string wireClassName, Type userType, Type type, ref Type existing)
+        {
+            if ((null != type) && type.IsVisible && (wireClassName == type.Name) && userType.IsAssignableFrom(type))
+            {
+                if (null != existing)
+                {
+                    throw Error.InvalidOperation(Strings.ClientType_Ambiguous(wireClassName, userType));
+                }
+
+                existing = type;
+            }
+        }
+
+        private void BuildEpmInfo(Type type)
+        {
+            if (type.BaseType != null && type.BaseType != typeof(object))
+            {
+                this.B

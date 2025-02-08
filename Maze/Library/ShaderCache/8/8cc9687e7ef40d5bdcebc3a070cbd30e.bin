@@ -1,0 +1,67 @@
+< lb)
+          continue;
+        if ((uintptr_t) ShadowHstPtrAddr >= ub)
+          break;
+        DP("Restoring original host pointer value " DPxMOD " for host pointer "
+            DPxMOD "\n", DPxPTR(it->second.HstPtrVal),
+            DPxPTR(ShadowHstPtrAddr));
+        *ShadowHstPtrAddr = it->second.HstPtrVal;
+      }
+      Device.ShadowMtx.unlock();
+    }
+
+    if (arg_types[i] & OMP_TGT_MAPTYPE_TO) {
+      DP("Moving %" PRId64 " bytes (hst:" DPxMOD ") -> (tgt:" DPxMOD ")\n",
+          arg_sizes[i], DPxPTR(HstPtrBegin), DPxPTR(TgtPtrBegin));
+      Device.data_submit(TgtPtrBegin, HstPtrBegin, MapSize);
+
+      uintptr_t lb = (uintptr_t) HstPtrBegin;
+      uintptr_t ub = (uintptr_t) HstPtrBegin + MapSize;
+      Device.ShadowMtx.lock();
+      for (ShadowPtrListTy::iterator it = Device.ShadowPtrMap.begin();
+          it != Device.ShadowPtrMap.end(); ++it) {
+        void **ShadowHstPtrAddr = (void**) it->first;
+        if ((uintptr_t) ShadowHstPtrAddr < lb)
+          continue;
+        if ((uintptr_t) ShadowHstPtrAddr >= ub)
+          break;
+        DP("Restoring original target pointer value " DPxMOD " for target "
+            "pointer " DPxMOD "\n", DPxPTR(it->second.TgtPtrVal),
+            DPxPTR(it->second.TgtPtrAddr));
+        Device.data_submit(it->second.TgtPtrAddr,
+            &it->second.TgtPtrVal, sizeof(void *));
+      }
+      Device.ShadowMtx.unlock();
+    }
+  }
+}
+
+/// performs the same actions as data_begin in case arg_num is
+/// non-zero and initiates run of the offloaded region on the target platform;
+/// if arg_num is non-zero after the region execution is done it also
+/// performs the same action as data_update and data_end above. This function
+/// returns 0 if it was able to transfer the execution to a target and an
+/// integer different from zero otherwise.
+int target(int64_t device_id, void *host_ptr, int32_t arg_num,
+    void **args_base, void **args, int64_t *arg_sizes, int64_t *arg_types,
+    int32_t team_num, int32_t thread_limit, int IsTeamConstruct) {
+  DeviceTy &Device = Devices[device_id];
+
+  // Find the table information in the map or look it up in the translation
+  // tables.
+  TableMap *TM = 0;
+  TblMapMtx.lock();
+  HostPtrToTableMapTy::iterator TableMapIt = HostPtrToTableMap.find(host_ptr);
+  if (TableMapIt == HostPtrToTableMap.end()) {
+    // We don't have a map. So search all the registered libraries.
+    TrlTblMtx.lock();
+    for (HostEntriesBeginToTransTableTy::iterator
+             ii = HostEntriesBeginToTransTable.begin(),
+             ie = HostEntriesBeginToTransTable.end();
+         !TM && ii != ie; ++ii) {
+      // get the translation table (which contains all the good info).
+      TranslationTable *TransTable = &ii->second;
+      // iterate over all the host table entries to see if we can locate the
+      // host_ptr.
+      __tgt_offload_entry *begin = TransTable->HostTable.EntriesBegin;
+      __tgt_o

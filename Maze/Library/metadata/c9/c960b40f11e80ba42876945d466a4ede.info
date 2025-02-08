@@ -1,0 +1,272 @@
+Utility.ExceptionUtility.ThrowHelperArgumentNull("version");
+            }
+            SecurityBindingElement result;
+
+            if (version.SecurityVersion == SecurityVersion.WSSecurity10)
+            {
+                result = new AsymmetricSecurityBindingElement(
+                    new X509SecurityTokenParameters( // recipient
+                        X509KeyIdentifierClauseType.Any,
+                        SecurityTokenInclusionMode.Never, 
+                        false),
+                    new X509SecurityTokenParameters( // initiator
+                        X509KeyIdentifierClauseType.Any,
+                        SecurityTokenInclusionMode.AlwaysToRecipient, false),
+                    allowSerializedSigningTokenOnReply);
+            }
+            else
+            {
+                result = new SymmetricSecurityBindingElement(
+                    new X509SecurityTokenParameters( // protection
+                        X509KeyIdentifierClauseType.Thumbprint,
+                        SecurityTokenInclusionMode.Never));
+                result.EndpointSupportingTokenParameters.Endorsing.Add(
+                    new X509SecurityTokenParameters(
+                        X509KeyIdentifierClauseType.Thumbprint,
+                        SecurityTokenInclusionMode.AlwaysToRecipient, 
+                        false));
+                ((SymmetricSecurityBindingElement)result).RequireSignatureConfirmation = true;
+            }
+
+            result.MessageSecurityVersion = version;
+
+            return result;
+        }
+
+        // this method reverses CreateMutualCertificateDuplexBindingElement() logic
+
+        internal static bool IsMutualCertificateDuplexBinding(SecurityBindingElement sbe)
+        {
+
+            // Do not check MessageSecurityVersion: it maybe changed by the wrapper element and gets checked later in the SecuritySection.AreBindingsMatching()
+
+            AsymmetricSecurityBindingElement asbe = sbe as AsymmetricSecurityBindingElement;
+            if (asbe != null)
+            {
+                X509SecurityTokenParameters recipient = asbe.RecipientTokenParameters as X509SecurityTokenParameters;
+                if (recipient == null || (recipient.X509ReferenceStyle != X509KeyIdentifierClauseType.Any  && recipient.X509ReferenceStyle != X509KeyIdentifierClauseType.Thumbprint) || recipient.InclusionMode != SecurityTokenInclusionMode.AlwaysToInitiator)
+                    return false;
+
+                X509SecurityTokenParameters initiator = asbe.InitiatorTokenParameters as X509SecurityTokenParameters;
+                if (initiator == null || (initiator.X509ReferenceStyle != X509KeyIdentifierClauseType.Any && initiator.X509ReferenceStyle != X509KeyIdentifierClauseType.Thumbprint) || initiator.InclusionMode != SecurityTokenInclusionMode.AlwaysToRecipient)
+                    return false;
+
+                if (!sbe.EndpointSupportingTokenParameters.IsEmpty())
+                    return false;
+
+                return true;
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+        // this method reverses CreateMutualCertificateBindingElement() logic
+        internal static bool IsMutualCertificateBinding(SecurityBindingElement sbe, bool allowSerializedSigningTokenOnReply)
+        {
+
+            // Do not check MessageSecurityVersion: it maybe changed by the wrapper element and gets checked later in the SecuritySection.AreBindingsMatching()
+
+            AsymmetricSecurityBindingElement asbe = sbe as AsymmetricSecurityBindingElement;
+            if (asbe != null)
+            {
+                X509SecurityTokenParameters recipient = asbe.RecipientTokenParameters as X509SecurityTokenParameters;
+                if (recipient == null || recipient.X509ReferenceStyle != X509KeyIdentifierClauseType.Any || recipient.InclusionMode != SecurityTokenInclusionMode.Never)
+                    return false;
+
+                X509SecurityTokenParameters initiator = asbe.InitiatorTokenParameters as X509SecurityTokenParameters;
+                if (initiator == null || initiator.X509ReferenceStyle != X509KeyIdentifierClauseType.Any || initiator.InclusionMode != SecurityTokenInclusionMode.AlwaysToRecipient)
+                    return false;
+
+                if (!sbe.EndpointSupportingTokenParameters.IsEmpty())
+                    return false;
+            }
+            else
+            {
+                SymmetricSecurityBindingElement ssbe = sbe as SymmetricSecurityBindingElement;
+                if (ssbe == null)
+                    return false;
+
+                X509SecurityTokenParameters x509Parameters = ssbe.ProtectionTokenParameters as X509SecurityTokenParameters;
+                if (x509Parameters == null || x509Parameters.X509ReferenceStyle != X509KeyIdentifierClauseType.Thumbprint || x509Parameters.InclusionMode != SecurityTokenInclusionMode.Never)
+                    return false;
+
+                SupportingTokenParameters parameters = sbe.EndpointSupportingTokenParameters;
+                if (parameters.Signed.Count != 0 || parameters.SignedEncrypted.Count != 0 || parameters.Endorsing.Count != 1 || parameters.SignedEndorsing.Count != 0)
+                    return false;
+
+                x509Parameters = parameters.Endorsing[0] as X509SecurityTokenParameters;
+                if (x509Parameters == null || x509Parameters.X509ReferenceStyle != X509KeyIdentifierClauseType.Thumbprint || x509Parameters.InclusionMode != SecurityTokenInclusionMode.AlwaysToRecipient)
+                    return false;
+
+                if (!ssbe.RequireSignatureConfirmation)
+                    return false;
+
+            }
+            return true;
+        }
+
+        // If any changes are made to this method, please make sure that they are
+        // reflected in the corresponding IsAnonymousForCertificateBinding() method.
+        static public SymmetricSecurityBindingElement CreateAnonymousForCertificateBindingElement()
+        {
+            SymmetricSecurityBindingElement result;
+
+            result = new SymmetricSecurityBindingElement(
+                new X509SecurityTokenParameters( // protection
+                    X509KeyIdentifierClauseType.Thumbprint,
+                    SecurityTokenInclusionMode.Never));
+            result.MessageSecurityVersion = MessageSecurityVersion.WSSecurity11WSTrustFebruary2005WSSecureConversationFebruary2005WSSecurityPolicy11;
+            result.RequireSignatureConfirmation = true;
+
+            return result;
+        }
+
+        // this method reverses CreateAnonymousForCertificateBindingElement() logic
+        internal static bool IsAnonymousForCertificateBinding(SecurityBindingElement sbe)
+        {
+            SymmetricSecurityBindingElement ssbe = sbe as SymmetricSecurityBindingElement;
+            if (ssbe == null)
+                return false;
+
+            if (!ssbe.RequireSignatureConfirmation)
+                return false;
+
+            // Do not check MessageSecurityVersion: it maybe changed by the wrapper element and gets checked later in the SecuritySection.AreBindingsMatching()
+
+            X509SecurityTokenParameters x509Parameters = ssbe.ProtectionTokenParameters as X509SecurityTokenParameters;
+            if (x509Parameters == null || x509Parameters.X509ReferenceStyle != X509KeyIdentifierClauseType.Thumbprint || x509Parameters.InclusionMode != SecurityTokenInclusionMode.Never)
+                return false;
+
+            if (!sbe.EndpointSupportingTokenParameters.IsEmpty())
+                return false;
+
+            return true;
+        }
+
+        static public AsymmetricSecurityBindingElement CreateMutualCertificateDuplexBindingElement()
+        {
+            return CreateMutualCertificateDuplexBindingElement(MessageSecurityVersion.WSSecurity11WSTrustFebruary2005WSSecureConversationFebruary2005WSSecurityPolicy11);
+        }
+
+        static public AsymmetricSecurityBindingElement CreateMutualCertificateDuplexBindingElement(MessageSecurityVersion version)
+        {
+            if (version == null)
+            {
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgumentNull("version");
+            }
+            AsymmetricSecurityBindingElement result;
+
+            if (version.SecurityVersion == SecurityVersion.WSSecurity10)
+            {
+                result = new AsymmetricSecurityBindingElement(
+                    new X509SecurityTokenParameters( // recipient
+                        X509KeyIdentifierClauseType.Any,
+                        SecurityTokenInclusionMode.AlwaysToInitiator, 
+                        false),
+                    new X509SecurityTokenParameters( // initiator
+                        X509KeyIdentifierClauseType.Any,
+                        SecurityTokenInclusionMode.AlwaysToRecipient,
+                        false));
+            }
+            else
+            {
+                result = new AsymmetricSecurityBindingElement(
+                    new X509SecurityTokenParameters( // recipient
+                        X509KeyIdentifierClauseType.Thumbprint,
+                        SecurityTokenInclusionMode.AlwaysToInitiator, 
+                        false),
+                    new X509SecurityTokenParameters( // initiator
+                        X509KeyIdentifierClauseType.Thumbprint,
+                        SecurityTokenInclusionMode.AlwaysToRecipient,
+                        false));
+            }
+
+            result.MessageSecurityVersion = version;
+
+            return result;
+        }
+
+        // If any changes are made to this method, please make sure that they are
+        // reflected in the corresponding IsUserNameForCertificateBinding() method.
+        static public SymmetricSecurityBindingElement CreateUserNameForCertificateBindingElement()
+        {
+            SymmetricSecurityBindingElement result = new SymmetricSecurityBindingElement(
+                new X509SecurityTokenParameters(
+                    X509KeyIdentifierClauseType.Thumbprint,
+                    SecurityTokenInclusionMode.Never));
+            result.EndpointSupportingTokenParameters.SignedEncrypted.Add(
+                new UserNameSecurityTokenParameters());
+            result.MessageSecurityVersion = MessageSecurityVersion.WSSecurity11WSTrustFebruary2005WSSecureConversationFebruary2005WSSecurityPolicy11;
+
+            return result;
+        }
+
+        // this method reverses CreateMutualCertificateBindingElement() logic
+        internal static bool IsUserNameForCertificateBinding(SecurityBindingElement sbe)
+        {
+            // Do not check MessageSecurityVersion: it maybe changed by the wrapper element and gets checked later in the SecuritySection.AreBindingsMatching()
+
+            SymmetricSecurityBindingElement ssbe = sbe as SymmetricSecurityBindingElement;
+            if (ssbe == null)
+                return false;
+
+            X509SecurityTokenParameters x509Parameters = ssbe.ProtectionTokenParameters as X509SecurityTokenParameters;
+            if (x509Parameters == null || x509Parameters.X509ReferenceStyle != X509KeyIdentifierClauseType.Thumbprint || x509Parameters.InclusionMode != SecurityTokenInclusionMode.Never)
+                return false;
+
+            SupportingTokenParameters parameters = sbe.EndpointSupportingTokenParameters;
+            if (parameters.Signed.Count != 0 || parameters.SignedEncrypted.Count != 1 || parameters.Endorsing.Count != 0 || parameters.SignedEndorsing.Count != 0)
+                return false;
+
+            UserNameSecurityTokenParameters userNameParameters = parameters.SignedEncrypted[0] as UserNameSecurityTokenParameters;
+            if (userNameParameters == null)
+                return false;
+
+            return true;
+        }
+
+        // If any changes are made to this method, please make sure that they are
+        // reflected in the corresponding IsKerberosBinding() method.
+        static public SymmetricSecurityBindingElement CreateKerberosBindingElement()
+        {
+            SymmetricSecurityBindingElement result = new SymmetricSecurityBindingElement(
+                new KerberosSecurityTokenParameters());
+            result.DefaultAlgorithmSuite = SecurityAlgorithmSuite.KerberosDefault;
+            return result;
+        }
+
+        // this method reverses CreateMutualCertificateBindingElement() logic
+        internal static bool IsKerberosBinding(SecurityBindingElement sbe)
+        {
+            // do not check DefaultAlgorithmSuite match: it is often changed by the caller of CreateKerberosBindingElement
+            SymmetricSecurityBindingElement ssbe = sbe as SymmetricSecurityBindingElement;
+            if (ssbe == null)
+                return false;
+
+            KerberosSecurityTokenParameters parameters = ssbe.ProtectionTokenParameters as KerberosSecurityTokenParameters;
+            if (parameters == null)
+                return false;
+
+            if (!sbe.EndpointSupportingTokenParameters.IsEmpty())
+                return false;
+
+            return true;
+        }
+
+        static public SymmetricSecurityBindingElement CreateSspiNegotiationBindingElement()
+        {
+            return CreateSspiNegotiationBindingElement(SspiSecurityTokenParameters.defaultRequireCancellation);
+        }
+
+        // If any changes are made to this method, please make sure that they are
+        // reflected in the corresponding IsSspiNegotiationBinding() method.
+        static public SymmetricSecurityBindingElement CreateSspiNegotiationBindingElement(bool requireCancellation)
+        {
+            SymmetricSecurityBindingElement result = new SymmetricSecurityBindingElement(
+                new SspiSecurityTokenParameters(requireCancellation));
+            return result;
+        }
+
+        // this method reverses CreateMutualCertificateBindingEl

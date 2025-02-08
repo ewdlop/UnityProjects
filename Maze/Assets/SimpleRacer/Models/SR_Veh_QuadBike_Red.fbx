@@ -1,0 +1,1274 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "CoreTypes.h"
+#include "Templates/AreTypesEqual.h"
+#include "Templates/UnrealTemplate.h"
+#include "Templates/Decay.h"
+#include "Delegates/IntegerSequence.h"
+#include "Templates/Invoke.h"
+#include "Serialization/StructuredArchive.h"
+#include "Serialization/MemoryLayout.h"
+#include "Templates/TypeHash.h"
+#include "Templates/IsConstructible.h"
+
+// This workaround exists because Visual Studio causes false positives for code like this during static analysis:
+//
+// void TestFoo(TMap<int*, int>& Map)
+// {
+//     for (const TPair<int*, int>& Pair : Map)
+//     {
+//         if (*Pair.Key == 15 && Pair.Value != 15) // warning C6011: Dereferencing NULL pointer 'Pair.Key'
+//         {
+//         }
+//     }
+// }
+//
+// This seems to be a combination of the following:
+// - Dereferencing an iterator in a loop
+// - Iterator type is not a pointer.
+// - Key is a pointer type.
+// - Key and Value are members of a base class.
+// - Dereferencing is done as part of a compound boolean expression (removing '&& Pair.Value != 15' removes the warning)
+#if defined(_MSC_VER) && USING_CODE_ANALYSIS
+	#define UE4_TUPLE_STATIC_ANALYSIS_WORKAROUND 1
+#else
+	#define UE4_TUPLE_STATIC_ANALYSIS_WORKAROUND 0
+#endif
+
+class FArchive;
+
+template <typename... Types>
+struct TTuple;
+
+namespace UE4Tuple_Private
+{
+	enum EForwardingConstructor { ForwardingConstructor };
+	enum EOtherTupleConstructor { OtherTupleConstructor };
+
+	// This only exists to have something to expand a parameter pack into, for concept checking
+	template <typename... ArgTypes>
+	void ConceptCheckingHelper(ArgTypes&&...);
+
+	template <typename T, typename... Types>
+	struct TTypeCountInParameterPack;
+
+	template <typename T>
+	struct TTypeCountInParameterPack<T>
+	{
+		constexpr static uint32 Value = 0;
+	};
+
+	template <typename T, typename U, typename... Types>
+	struct TTypeCountInParameterPack<T, U, Types...>
+	{
+		constexpr static uint32 Value = TTypeCountInParameterPack<T, Types...>::Value + (std::is_same<T, U>::value ? 1 : 0);
+	};
+
+	template <typename T, uint32 Index, uint32 TupleSize>
+	struct TTupleBaseElement
+	{
+		template <
+			typename ArgType,
+			typename TEnableIf<TIsConstructible<T, ArgType&&>::Value>::Type* = nullptr
+		>
+		explicit TTupleBaseElement(EForwardingConstructor, ArgType&& Arg)
+			: Value(Forward<ArgType>(Arg))
+		{
+		}
+
+		TTupleBaseElement()
+			: Value()
+		{
+		}
+
+		TTupleBaseElement(TTupleBaseElement&&) = default;
+		TTupleBaseElement(const TTupleBaseElement&) = default;
+		TTupleBaseElement& operator=(TTupleBaseElement&&) = default;
+		TTupleBaseElement& operator=(const TTupleBaseElement&) = default;
+
+		T Value;
+	};
+
+	template <typename T>
+	struct TTupleBaseElement<T, 0, 2>
+	{
+		template <
+			typename ArgType,
+			typename TEnableIf<TIsConstructible<T, ArgType&&>::Value>::Type* = nullptr
+		>
+		explicit TTupleBaseElement(EForwardingConstructor, ArgType&& Arg)
+			: Key(Forward<ArgType>(Arg))
+		{
+		}
+
+		TTupleBaseElement()
+			: Key()
+		{
+		}
+
+		TTupleBaseElement(TTupleBaseElement&&) = default;
+		TTupleBaseElement(const TTupleBaseElement&) = default;
+		TTupleBaseElement& operator=(TTupleBaseElement&&) = default;
+		TTupleBaseElement& operator=(const TTupleBaseElement&) = default;
+
+		T Key;
+	};
+
+	template <uint32 Index, uint32 TupleSize>
+	struct TTupleElementGetterByIndex
+	{
+		template <typename DeducedType, typename TupleType>
+		static FORCEINLINE decltype(auto) GetImpl(const volatile TTupleBaseElement<DeducedType, Index, TupleSize>&, TupleType&& Tuple)
+		{
+			// Brackets are important here - we want a reference type to be returned, not object type
+			decltype(auto) Result = (ForwardAsBase<TupleType, TTupleBaseElement<DeducedType, Index, TupleSize>>(Tuple).Value);
+
+			// Keep tuple rvalue references to rvalue reference elements as rvalues, because that's how std::get() works, not how C++ struct member access works.
+			return static_cast<std::conditional_t<TAnd<TNot<TIsReferenceType<TupleType>>, TIsRValueReferenceType<DeducedType>>::Value, DeducedType, decltype(Result)>>(Result);
+		}
+
+		template <typename TupleType>
+		static FORCEINLINE decltype(auto) Get(TupleType&& Tuple)
+		{
+			return GetImpl(Tuple, Forward<TupleType>(Tuple));
+		}
+	};
+
+#if UE4_TUPLE_STATIC_ANALYSIS_WORKAROUND
+	template <>
+	struct TTupleElementGetterByIndex<0, 2>
+	{
+		template <typename TupleType>
+		static FORCEINLINE decltype(auto) Get(TupleType&& Tuple)
+		{
+			// Brackets are important here - we want a reference type to be returned, not object type
+			decltype(auto) Result = (Forward<TupleType>(Tuple).Key);
+
+			// Keep tuple rvalue references to rvalue reference elements as rvalues, because that's how std::get() works, not how C++ struct member access works.
+			return static_cast<std::conditional_t<TAnd<TNot<TIsReferenceType<TupleType>>, TIsRValueReferenceType<decltype(Tuple.Key)>>::Value, decltype(Tuple.Key), decltype(Result)>>(Result);
+		}
+	};
+	template <>
+	struct TTupleElementGetterByIndex<1, 2>
+	{
+		template <typename TupleType>
+		static FORCEINLINE decltype(auto) Get(TupleType&& Tuple)
+		{
+			// Brackets are important here - we want a reference type to be returned, not object type
+			decltype(auto) Result = (Forward<TupleType>(Tuple).Value);
+
+			// Keep tuple rvalue references to rvalue reference elements as rvalues, because that's how std::get() works, not how C++ struct member access works.
+			return static_cast<std::conditional_t<TAnd<TNot<TIsReferenceType<TupleType>>, TIsRValueReferenceType<decltype(Tuple.Value)>>::Value, decltype(Tuple.Value), decltype(Result)>>(Result);
+		}
+	};
+#else
+	template <>
+	struct TTupleElementGetterByIndex<0, 2>
+	{
+		template <typename TupleType>
+		static FORCEINLINE decltype(auto) Get(TupleType&& Tuple)
+		{
+			// Brackets are important here - we want a reference type to be returned, not object type
+			decltype(auto) Result = (ForwardAsBase<TupleType, TTupleBaseElement<decltype(Tuple.Key), 0, 2>>(Tuple).Key);
+
+			// Keep tuple rvalue references to rvalue reference elements as rvalues, because that's how std::get() works, not how C++ struct member access works.
+			return static_cast<std::conditional_t<TAnd<TNot<TIsReferenceType<TupleType>>, TIsRValueReferenceType<decltype(Tuple.Key)>>::Value, decltype(Tuple.Key), decltype(Result)>>(Result);
+		}
+	};
+#endif
+
+	template <typename Type, uint32 TupleSize>
+	struct TTupleElementGetterByType
+	{
+		template <uint32 DeducedIndex, typename TupleType>
+		static FORCEINLINE decltype(auto) GetImpl(const volatile TTupleBaseElement<Type, DeducedIndex, TupleSize>&, TupleType&& Tuple)
+		{
+			return TTupleElementGetterByIndex<DeducedIndex, TupleSize>::Get(Forward<TupleType>(Tuple));
+		}
+
+		template <typename TupleType>
+		static FORCEINLINE decltype(auto) Get(TupleType&& Tuple)
+		{
+			return GetImpl(Tuple, Forward<TupleType>(Tuple));
+		}
+	};
+
+	template <uint32 ArgCount, uint32 ArgToCompare>
+	struct FEqualityHelper
+	{
+		template <typename TupleType>
+		FORCEINLINE static bool Compare(const TupleType& Lhs, const TupleType& Rhs)
+		{
+			return Lhs.template Get<ArgToCompare>() == Rhs.template Get<ArgToCompare>() && FEqualityHelper<ArgCount, ArgToCompare + 1>::Compare(Lhs, Rhs);
+		}
+	};
+
+	template <uint32 ArgCount>
+	struct FEqualityHelper<ArgCount, ArgCount>
+	{
+		template <typename TupleType>
+		FORCEINLINE static bool Compare(const TupleType& Lhs, const TupleType& Rhs)
+		{
+			return true;
+		}
+	};
+
+	template <uint32 NumArgs, uint32 ArgToCompare = 0, bool Last = ArgToCompare + 1 == NumArgs>
+	struct TLessThanHelper
+	{
+		template <typename TupleType>
+		FORCEINLINE static bool Do(const TupleType& Lhs, const TupleType& Rhs)
+		{
+			return Lhs.template Get<ArgToCompare>() < Rhs.template Get<ArgToCompare>() || (!(Rhs.template Get<ArgToCompare>() < Lhs.template Get<ArgToCompare>()) && TLessThanHelper<NumArgs, ArgToCompare + 1>::Do(Lhs, Rhs));
+		}
+	};
+
+	template <uint32 NumArgs, uint32 ArgToCompare>
+	struct TLessThanHelper<NumArgs, ArgToCompare, true>
+	{
+		template <typename TupleType>
+		FORCEINLINE static bool Do(const TupleType& Lhs, const TupleType& Rhs)
+		{
+			return Lhs.template Get<ArgToCompare>() < Rhs.template Get<ArgToCompare>();
+		}
+	};
+
+	template <uint32 NumArgs>
+	struct TLessThanHelper<NumArgs, NumArgs, false>
+	{
+		template <typename TupleType>
+		FORCEINLINE static bool Do(const TupleType& Lhs, const TupleType& Rhs)
+		{
+			return false;
+		}
+	};
+
+	template <typename Indices, typename... Types>
+	struct TTupleBase;
+
+	template <uint32... Indices, typename... Types>
+	struct TTupleBase<TIntegerSequence<uint32, Indices...>, Types...> : TTupleBaseElement<Types, Indices, sizeof...(Types)>...
+	{
+		template <
+			typename... ArgTypes,
+			decltype(ConceptCheckingHelper(TTupleBaseElement<Types, Indices, sizeof...(Types)>(ForwardingConstructor, DeclVal<ArgTypes&&>())...))* = nullptr
+		>
+		explicit TTupleBase(EForwardingConstructor, ArgTypes&&... Args)
+			: TTupleBaseElement<Types, Indices, sizeof...(Types)>(ForwardingConstructor, Forward<ArgTypes>(Args))...
+		{
+		}
+
+		template <
+			typename TupleType,
+			decltype(ConceptCheckingHelper(TTupleBaseElement<Types, Indices, sizeof...(Types)>(ForwardingConstructor, DeclVal<TupleType&&>().template Get<Indices>())...))* = nullptr
+		>
+		explicit TTupleBase(EOtherTupleConstructor, TupleType&& Other)
+			: TTupleBaseElement<Types, Indices, sizeof...(Types)>(ForwardingConstructor, Forward<TupleType>(Other).template Get<Indices>())...
+		{
+		}
+
+		TTupleBase() = default;
+		TTupleBase(TTupleBase&& Other) = default;
+		TTupleBase(const TTupleBase& Other) = default;
+		TTupleBase& operator=(TTupleBase&& Other) = default;
+		TTupleBase& operator=(const TTupleBase& Other) = default;
+
+		template <uint32 Index, typename TEnableIf<(Index < sizeof...(Types))>::Type* = nullptr> FORCEINLINE decltype(auto) Get()               &  { return TTupleElementGetterByIndex<Index, sizeof...(Types)>::Get(static_cast<               TTupleBase& >(*this)); }
+		template <uint32 Index, typename TEnableIf<(Index < sizeof...(Types))>::Type* = nullptr> FORCEINLINE decltype(auto) Get() const         &  { return TTupleElementGetterByIndex<Index, sizeof...(Types)>::Get(static_cast<const          TTupleBase& >(*this)); }
+		template <uint32 Index, typename TEnableIf<(Index < sizeof...(Types))>::Type* = nullptr> FORCEINLINE decltype(auto) Get()       volatile&  { return TTupleElementGetterByIndex<Index, sizeof...(Types)>::Get(static_cast<      volatile TTupleBase& >(*this)); }
+		template <uint32 Index, typename TEnableIf<(Index < sizeof...(Types))>::Type* = nullptr> FORCEINLINE decltype(auto) Get() const volatile&  { return TTupleElementGetterByIndex<Index, sizeof...(Types)>::Get(static_cast<const volatile TTupleBase& >(*this)); }
+		template <uint32 Index, typename TEnableIf<(Index < sizeof...(Types))>::Type* = nullptr> FORCEINLINE decltype(auto) Get()               && { return TTupleElementGetterByIndex<Index, sizeof...(Types)>::Get(static_cast<               TTupleBase&&>(*this)); }
+		template <uint32 Index, typename TEnableIf<(Index < sizeof...(Types))>::Type* = nullptr> FORCEINLINE decltype(auto) Get() const         && { return TTupleElementGetterByIndex<Index, sizeof...(Types)>::Get(static_cast<const          TTupleBase&&>(*this)); }
+		template <uint32 Index, typename TEnableIf<(Index < sizeof...(Types))>::Type* = nullptr> FORCEINLINE decltype(auto) Get()       volatile&& { return TTupleElementGetterByIndex<Index, sizeof...(Types)>::Get(static_cast<      volatile TTupleBase&&>(*this)); }
+		template <uint32 Index, typename TEnableIf<(Index < sizeof...(Types))>::Type* = nullptr> FORCEINLINE decltype(auto) Get() const volatile&& { return TTupleElementGetterByIndex<Index, sizeof...(Types)>::Get(static_cast<const volatile TTupleBase&&>(*this)); }
+
+		template <typename T, typename TEnableIf<TTypeCountInParameterPack<T, Types...>::Value == 1>::Type* = nullptr> FORCEINLINE decltype(auto) Get()               &  { return TTupleElementGetterByType<T, sizeof...(Types)>::Get(static_cast<               TTupleBase& >(*this)); }
+		template <typename T, typename TEnableIf<TTypeCountInParameterPack<T, Types...>::Value == 1>::Type* = nullptr> FORCEINLINE decltype(auto) Get() const         &  { return TTupleElementGetterByType<T, sizeof...(Types)>::Get(static_cast<const          TTupleBase& >(*this)); }
+		template <typename T, typename TEnableIf<TTypeCountInParameterPack<T, Types...>::Value == 1>::Type* = nullptr> FORCEINLINE decltype(auto) Get()       volatile&  { return TTupleElementGetterByType<T, sizeof...(Types)>::Get(static_cast<      volatile TTupleBase& >(*this)); }
+		template <typename T, typename TEnableIf<TTypeCountInParameterPack<T, Types...>::Value == 1>::Type* = nullptr> FORCEINLINE decltype(auto) Get() const volatile&  { return TTupleElementGetterByType<T, sizeof...(Types)>::Get(static_cast<const volatile TTupleBase& >(*this)); }
+		template <typename T, typename TEnableIf<TTypeCountInParameterPack<T, Types...>::Value == 1>::Type* = nullptr> FORCEINLINE decltype(auto) Get()               && { return TTupleElementGetterByType<T, sizeof...(Types)>::Get(static_cast<               TTupleBase&&>(*this)); }
+		template <typename T, typename TEnableIf<TTypeCountInParameterPack<T, Types...>::Value == 1>::Type* = nullptr> FORCEINLINE decltype(auto) Get() const         && { return TTupleElementGetterByType<T, sizeof...(Types)>::Get(static_cast<const          TTupleBase&&>(*this)); }
+		template <typename T, typename TEnableIf<TTypeCountInParameterPack<T, Types...>::Value == 1>::Type* = nullptr> FORCEINLINE decltype(auto) Get()       volatile&& { return TTupleElementGetterByType<T, sizeof...(Types)>::Get(static_cast<      volatile TTupleBase&&>(*this)); }
+		template <typename T, typename TEnableIf<TTypeCountInParameterPack<T, Types...>::Value == 1>::Type* = nullptr> FORCEINLINE decltype(auto) Get() const volatile&& { return TTupleElementGetterByType<T, sizeof...(Types)>::Get(static_cast<const volatile TTupleBase&&>(*this)); }
+
+		template <typename FuncType, typename... ArgTypes>
+		decltype(auto) ApplyAfter(FuncType&& Func, ArgTypes&&... Args) const
+		{
+			return ::Invoke(Func, Forward<ArgTypes>(Args)..., this->template Get<Indices>()...);
+		}
+
+		template <typename FuncType, typename... ArgTypes>
+		decltype(auto) ApplyBefore(FuncType&& Func, ArgTypes&&... Args) const
+		{
+			return ::Invoke(Func, this->template Get<Indices>()..., Forward<ArgTypes>(Args)...);
+		}
+
+		FORCEINLINE friend FArchive& operator<<(FArchive& Ar, TTupleBase& Tuple)
+		{
+			// This should be implemented with a fold expression when our compilers support it
+			int Temp[] = { 0, (Ar << Tuple.template Get<Indices>(), 0)... };
+			(void)Temp;
+			return Ar;
+		}
+
+		FORCEINLINE friend void operator<<(FStructuredArchive::FSlot Slot, TTupleBase& Tuple)
+		{
+			// This should be implemented with a fold expression when our compilers support it
+			FStructuredArchive::FStream Stream = Slot.EnterStream();
+			int Temp[] = { 0, (Stream.EnterElement() << Tuple.template Get<Indices>(), 0)... };
+			(void)Temp;
+		}
+
+		FORCEINLINE friend bool operator==(const TTupleBase& Lhs, const TTupleBase& Rhs)
+		{
+			// This could be implemented with a fold expression when our compilers support it
+			return FEqualityHelper<sizeof...(Types), 0>::Compare(Lhs, Rhs);
+		}
+
+		FORCEINLINE friend bool operator!=(const TTupleBase& Lhs, const TTupleBase& Rhs)
+		{
+			return !(Lhs == Rhs);
+		}
+
+		FORCEINLINE friend bool operator<(const TTupleBase& Lhs, const TTupleBase& Rhs)
+		{
+			return TLessThanHelper<sizeof...(Types)>::Do(Lhs, Rhs);
+		}
+
+		FORCEINLINE friend bool operator<=(const TTupleBase& Lhs, const TTupleBase& Rhs)
+		{
+			return !(Rhs < Lhs);
+		}
+
+		FORCEINLINE friend bool operator>(const TTupleBase& Lhs, const TTupleBase& Rhs)
+		{
+			return Rhs < Lhs;
+		}
+
+		FORCEINLINE friend bool operator>=(const TTupleBase& Lhs, const TTupleBase& Rhs)
+		{
+			return !(Lhs < Rhs);
+		}
+	};
+
+#if UE4_TUPLE_STATIC_ANALYSIS_WORKAROUND
+	template <typename KeyType, typename ValueType>
+	struct TTupleBase<TIntegerSequence<uint32, 0, 1>, KeyType, ValueType>
+	{
+		KeyType   Key;
+		ValueType Value;
+
+		using DummyPairIdentifier = void;
+
+		template <
+			typename KeyArgType,
+			typename ValueArgType,
+			typename TEnableIf<TIsConstructible<KeyType,   KeyArgType  &&>::Value>::Type* = nullptr,
+			typename TEnableIf<TIsConstructible<ValueType, ValueArgType&&>::Value>::Type* = nullptr
+		>
+		explicit TTupleBase(EForwardingConstructor, KeyArgType&& KeyArg, ValueArgType&& ValueArg)
+			: Key  (Forward<KeyArgType  >(KeyArg  ))
+			, Value(Forward<ValueArgType>(ValueArg))
+		{
+		}
+
+		template <
+			typename TupleType,
+			typename TupleType::DummyPairIdentifier* = nullptr,
+			typename TEnableIf<TIsConstructible<KeyType,   decltype(DeclVal<TupleType&&>().Get<0>())>::Value>::Type* = nullptr,
+			typename TEnableIf<TIsConstructible<ValueType, decltype(DeclVal<TupleType&&>().Get<1>())>::Value>::Type* = nullptr
+		>
+		explicit TTupleBase(EOtherTupleConstructor, TupleType&& Other)
+			: Key  (Forward<TupleType>(Other).Get<0>())
+			, Value(Forward<TupleType>(Other).Get<1>())
+		{
+		}
+
+		TTupleBase() = default;
+		TTupleBase(TTupleBase&& Other) = default;
+		TTupleBase(const TTupleBase& Other) = default;
+		TTupleBase& operator=(TTupleBase&& Other) = default;
+		TTupleBase& operator=(const TTupleBase& Other) = default;
+
+		template <uint32 Index, typename TEnableIf<(Index < 2)>::Type* = nullptr> FORCEINLINE decltype(auto) Get()               &  { return TTupleElementGetterByIndex<Index, 2>::Get(static_cast<               TTupleBase& >(*this)); }
+		template <uint32 Index, typename TEnableIf<(Index < 2)>::Type* = nullptr> FORCEINLINE decltype(auto) Get() const         &  { return TTupleElementGetterByIndex<Index, 2>::Get(static_cast<const          TTupleBase& >(*this)); }
+		template <uint32 Index, typename TEnableIf<(Index < 2)>::Type* = nullptr> FORCEINLINE decltype(auto) Get()       volatile&  { return TTupleElementGetterByIndex<Index, 2>::Get(static_cast<      volatile TTupleBase& >(*this)); }
+		template <uint32 Index, typename TEnableIf<(Index < 2)>::Type* = nullptr> FORCEINLINE decltype(auto) Get() const volatile&  { return TTupleElementGetterByIndex<Index, 2>::Get(static_cast<const volatile TTupleBase& >(*this)); }
+		template <uint32 Index, typename TEnableIf<(Index < 2)>::Type* = nullptr> FORCEINLINE decltype(auto) Get()               && { return TTupleElementGetterByIndex<Index, 2>::Get(static_cast<               TTupleBase&&>(*this)); }
+		template <uint32 Index, typename TEnableIf<(Index < 2)>::Type* = nullptr> FORCEINLINE decltype(auto) Get() const         && { return TTupleElementGetterByIndex<Index, 2>::Get(static_cast<const          TTupleBase&&>(*this)); }
+		template <uint32 Index, typename TEnableIf<(Index < 2)>::Type* = nullptr> FORCEINLINE decltype(auto) Get()       volatile&& { return TTupleElementGetterByIndex<Index, 2>::Get(static_cast<      volatile TTupleBase&&>(*this)); }
+		template <uint32 Index, typename TEnableIf<(Index < 2)>::Type* = nullptr> FORCEINLINE decltype(auto) Get() const volatile&& { return TTupleElementGetterByIndex<Index, 2>::Get(static_cast<const volatile TTupleBase&&>(*this)); }
+
+		template <typename T, typename TEnableIf<TTypeCountInParameterPack<T, KeyType, ValueType>::Value == 1>::Type* = nullptr> FORCEINLINE decltype(auto) Get()               &  { return TTupleElementGetterByType<T, 2>::Get(static_cast<               TTupleBase& >(*this)); }
+		template <typename T, typename TEnableIf<TTypeCountInParameterPack<T, KeyType, ValueType>::Value == 1>::Type* = nullptr> FORCEINLINE decltype(auto) Get() const         &  { return TTupleElementGetterByType<T, 2>::Get(static_cast<const          TTupleBase& >(*this)); }
+		template <typename T, typename TEnableIf<TTypeCountInParameterPack<T, KeyType, ValueType>::Value == 1>::Type* = nullptr> FORCEINLINE decltype(auto) Get()       volatile&  { return TTupleElementGetterByType<T, 2>::Get(static_cast<      volatile TTupleBase& >(*this)); }
+		template <typename T, typename TEnableIf<TTypeCountInParameterPack<T, KeyType, ValueType>::Value == 1>::Type* = nullptr> FORCEINLINE decltype(auto) Get() const volatile&  { return TTupleElementGetterByType<T, 2>::Get(static_cast<const volatile TTupleBase& >(*this)); }
+		template <typename T, typename TEnableIf<TTypeCountInParameterPack<T, KeyType, ValueType>::Value == 1>::Type* = nullptr> FORCEINLINE decltype(auto) Get()               && { return TTupleElementGetterByType<T, 2>::Get(static_cast<               TTupleBase&&>(*this)); }
+		template <typename T, typename TEnableIf<TTypeCountInParameterPack<T, KeyType, ValueType>::Value == 1>::Type* = nullptr> FORCEINLINE decltype(auto) Get() const         && { return TTupleElementGetterByType<T, 2>::Get(static_cast<const          TTupleBase&&>(*this)); }
+		template <typename T, typename TEnableIf<TTypeCountInParameterPack<T, KeyType, ValueType>::Value == 1>::Type* = nullptr> FORCEINLINE decltype(auto) Get()       volatile&& { return TTupleElementGetterByType<T, 2>::Get(static_cast<      volatile TTupleBase&&>(*this)); }
+		template <typename T, typename TEnableIf<TTypeCountInParameterPack<T, KeyType, ValueType>::Value == 1>::Type* = nullptr> FORCEINLINE decltype(auto) Get() const volatile&& { return TTupleElementGetterByType<T, 2>::Get(static_cast<const volatile TTupleBase&&>(*this)); }
+
+		template <typename FuncType, typename... ArgTypes>
+		decltype(auto) ApplyAfter(FuncType&& Func, ArgTypes&&... Args) const
+		{
+			return ::Invoke(Func, Forward<ArgTypes>(Args)..., this->Key, this->Value);
+		}
+
+		template <typename FuncType, typename... ArgTypes>
+		decltype(auto) ApplyBefore(FuncType&& Func, ArgTypes&&... Args) const
+		{
+			return ::Invoke(Func, this->Key, this->Value, Forward<ArgTypes>(Args)...);
+		}
+
+		FORCEINLINE friend FArchive& operator<<(FArchive& Ar, TTupleBase& Tuple)
+		{
+			Ar << Tuple.Key;
+			Ar << Tuple.Value;
+			return Ar;
+		}
+
+		FORCEINLINE friend void operator<<(FStructuredArchive::FSlot Slot, TTupleBase& Tuple)
+		{
+			FStructuredArchive::FStream Stream = Slot.EnterStream();
+			Stream.EnterElement() << Tuple.Key;
+			Stream.EnterElement() << Tuple.Value;
+		}
+
+		FORCEINLINE friend bool operator==(const TTupleBase& Lhs, const TTupleBase& Rhs)
+		{
+			// This could be implemented with a fold expression when our compilers support it
+			return FEqualityHelper<2, 0>::Compare(Lhs, Rhs);
+		}
+
+		FORCEINLINE friend bool operator!=(const TTupleBase& Lhs, const TTupleBase& Rhs)
+		{
+			return !(Lhs == Rhs);
+		}
+
+		FORCEINLINE friend bool operator<(const TTupleBase& Lhs, const TTupleBase& Rhs)
+		{
+			return TLessThanHelper<2>::Do(Lhs, Rhs);
+		}
+
+		FORCEINLINE friend bool operator<=(const TTupleBase& Lhs, const TTupleBase& Rhs)
+		{
+			return !(Rhs < Lhs);
+		}
+
+		FORCEINLINE friend bool operator>(const TTupleBase& Lhs, const TTupleBase& Rhs)
+		{
+			return Rhs < Lhs;
+		}
+
+		FORCEINLINE friend bool operator>=(const TTupleBase& Lhs, const TTupleBase& Rhs)
+		{
+			return !(Lhs < Rhs);
+		}
+	};
+#endif
+
+	template <
+		typename LhsType,
+		typename RhsType,
+		uint32... Indices,
+		decltype(ConceptCheckingHelper((DeclVal<LhsType&>().template Get<Indices>() = DeclVal<RhsType&&>().template Get<Indices>(), 0)...))* = nullptr
+	>
+	static void Assign(LhsType& Lhs, RhsType&& Rhs, TIntegerSequence<uint32, Indices...>)
+	{
+		// This should be implemented with a fold expression when our compilers support it
+		int Temp[] = { 0, (Lhs.template Get<Indices>() = Forward<RhsType>(Rhs).template Get<Indices>(), 0)... };
+		(void)Temp;
+	}
+
+	template <typename... Types>
+	FORCEINLINE TTuple<typename TDecay<Types>::Type...> MakeTupleImpl(Types&&... Args)
+	{
+		return TTuple<typename TDecay<Types>::Type...>(Forward<Types>(Args)...);
+	}
+
+	template <typename IntegerSequence>
+	struct TTransformTuple_Impl;
+
+	template <uint32... Indices>
+	struct TTransformTuple_Impl<TIntegerSequence<uint32, Indices...>>
+	{
+		template <typename TupleType, typename FuncType>
+		static decltype(auto) Do(TupleType&& Tuple, FuncType Func)
+		{
+			return MakeTupleImpl(Func(Forward<TupleType>(Tuple).template Get<Indices>())...);
+		}
+	};
+
+	template <typename IntegerSequence>
+	struct TVisitTupleElements_Impl;
+
+	template <uint32... Indices>
+	struct TVisitTupleElements_Impl<TIntegerSequence<uint32, Indices...>>
+	{
+		// We need a second function to do the invocation for a particular index, to avoid the pack expansion being
+		// attempted on the indices and tuples simultaneously.
+		template <uint32 Index, typename FuncType, typename... TupleTypes>
+		FORCEINLINE static void InvokeFunc(FuncType&& Func, TupleTypes&&... Tuples)
+		{
+			::Invoke(Forward<FuncType>(Func), Forward<TupleTypes>(Tuples).template Get<Index>()...);
+		}
+
+		template <typename FuncType, typename... TupleTypes>
+		static void Do(FuncType&& Func, TupleTypes&&... Tuples)
+		{
+			// This should be implemented with a fold expression when our compilers support it
+			int Temp[] = { 0, (InvokeFunc<Indices>(Forward<FuncType>(Func), Forward<TupleTypes>(Tuples)...), 0)... };
+			(void)Temp;
+		}
+	};
+
+
+	template <typename TupleType>
+	struct TCVTupleArity;
+
+	template <typename... Types>
+	struct TCVTupleArity<const volatile TTuple<Types...>>
+	{
+		enum { Value = sizeof...(Types) };
+	};
+
+	template <typename Type, typename TupleType>
+	struct TCVTupleIndex
+	{
+		static_assert(sizeof(TupleType) == 0, "TTupleIndex instantiated with a non-tuple type");
+		static constexpr uint32 Value = 0;
+	};
+
+	template <typename Type, typename... TupleTypes>
+	struct TCVTupleIndex<Type, const volatile TTuple<TupleTypes...>>
+	{
+		static_assert(TTypeCountInParameterPack<Type, TupleTypes...>::Value >= 1, "TTupleIndex instantiated with a tuple which does not contain the type");
+		static_assert(TTypeCountInParameterPack<Type, TupleTypes...>::Value <= 1, "TTupleIndex instantiated with a tuple which contains multiple instances of the type");
+
+	private:
+		template <uint32 DeducedIndex>
+		static auto Resolve(TTupleBaseElement<Type, DeducedIndex, sizeof...(TupleTypes)>*) -> char(&)[DeducedIndex + 1];
+		static auto Resolve(...) -> char;
+
+	public:
+		static constexpr uint32 Value = sizeof(Resolve(DeclVal<TTuple<TupleTypes...>*>())) - 1;
+	};
+
+	template <uint32 Index, typename TupleType>
+	struct TCVTupleElement
+	{
+		static_assert(sizeof(TupleType) == 0, "TTupleElement instantiated with a non-tuple type");
+		using Type = void;
+	};
+
+	template <uint32 Index, typename... TupleTypes>
+	struct TCVTupleElement<Index, const volatile TTuple<TupleTypes...>>
+	{
+		static_assert(Index < sizeof...(TupleTypes), "TTupleElement instantiated with an invalid index");
+
+#ifdef __clang__
+		using Type = __type_pack_element<Index, TupleTypes...>;
+#else
+	private:
+		template <typename DeducedType>
+		static DeducedType Resolve(TTupleBaseElement<DeducedType, Index, sizeof...(TupleTypes)>*);
+		static void Resolve(...);
+
+	public:
+		using Type = decltype(Resolve(DeclVal<TTuple<TupleTypes...>*>()));
+#endif
+	};
+
+	template <uint32 ArgToCombine, uint32 ArgCount>
+	struct TGetTupleHashHelper
+	{
+		template <typename TupleType>
+		FORCEINLINE static uint32 Do(uint32 Hash, const TupleType& Tuple)
+		{
+			return TGetTupleHashHelper<ArgToCombine + 1, ArgCount>::Do(HashCombine(Hash, GetTypeHash(Tuple.template Get<ArgToCombine>())), Tuple);
+		}
+	};
+
+	template <uint32 ArgIndex>
+	struct TGetTupleHashHelper<ArgIndex, ArgIndex>
+	{
+		template <typename TupleType>
+		FORCEINLINE static uint32 Do(uint32 Hash, const TupleType& Tuple)
+		{
+			return Hash;
+		}
+	};
+
+	template <typename... Given, typename... Deduced>
+	std::enable_if_t<TAnd<TIsConstructible<Given, Deduced&&>...>::Value> ConstructibleConceptCheck(Deduced&&...);
+
+	template <typename... Given, typename... Deduced>
+	decltype(ConceptCheckingHelper((DeclVal<Given>() = DeclVal<Deduced&&>(), 0)...)) AssignableConceptCheck(Deduced&&...);
+}
+
+template <typename... Types>
+struct TTuple : UE4Tuple_Private::TTupleBase<TMakeIntegerSequence<uint32, sizeof...(Types)>, Types...>
+{
+private:
+	typedef UE4Tuple_Private::TTupleBase<TMakeIntegerSequence<uint32, sizeof...(Types)>, Types...> Super;
+
+public:
+	template <
+		typename... ArgTypes,
+		decltype(UE4Tuple_Private::ConstructibleConceptCheck<Types...>(DeclVal<ArgTypes&&>()...))* = nullptr
+	>
+	explicit TTuple(ArgTypes&&... Args)
+		: Super(UE4Tuple_Private::ForwardingConstructor, Forward<ArgTypes>(Args)...)
+	{
+	}
+
+	template <
+		typename... OtherTypes,
+		decltype(UE4Tuple_Private::ConstructibleConceptCheck<Types...>(DeclVal<OtherTypes&&>()...))* = nullptr
+	>
+	TTuple(TTuple<OtherTypes...>&& Other)
+		: Super(UE4Tuple_Private::OtherTupleConstructor, MoveTemp(Other))
+	{
+	}
+
+	template <
+		typename... OtherTypes,
+		decltype(UE4Tuple_Private::ConstructibleConceptCheck<Types...>(DeclVal<const OtherTypes&>()...))* = nullptr
+	>
+	TTuple(const TTuple<OtherTypes...>& Other)
+		: Super(UE4Tuple_Private::OtherTupleConstructor, Other)
+	{
+	}
+
+	TTuple() = default;
+	TTuple(TTuple&&) = default;
+	TTuple(const TTuple&) = default;
+	TTuple& operator=(TTuple&&) = default;
+	TTuple& operator=(const TTuple&) = default;
+
+	template <
+		typename... OtherTypes,
+		decltype(UE4Tuple_Private::AssignableConceptCheck<Types&...>(DeclVal<const OtherTypes&>()...))* = nullptr
+	>
+	TTuple& operator=(const TTuple<OtherTypes...>& Other)
+	{
+		UE4Tuple_Private::Assign(*this, Other, TMakeIntegerSequence<uint32, sizeof...(Types)>{});
+		return *this;
+	}
+
+	template <
+		typename... OtherTypes,
+		decltype(UE4Tuple_Private::AssignableConceptCheck<Types&...>(DeclVal<OtherTypes&&>()...))* = nullptr
+	>
+	TTuple& operator=(TTuple<OtherTypes...>&& Other)
+	{
+		UE4Tuple_Private::Assign(*this, MoveTemp(Other), TMakeIntegerSequence<uint32, sizeof...(OtherTypes)>{});
+		return *this;
+	}
+};
+
+template <typename... Types>
+FORCEINLINE uint32 GetTypeHash(const TTuple<Types...>& Tuple)
+{
+	return UE4Tuple_Private::TGetTupleHashHelper<1u, sizeof...(Types)>::Do(GetTypeHash(Tuple.template Get<0>()), Tuple);
+}
+
+FORCEINLINE uint32 GetTypeHash(const TTuple<>& Tuple)
+{
+	return 0;
+}
+
+namespace Freeze
+{
+	template<typename KeyType, typename ValueType>
+	void IntrinsicWriteMemoryImage(FMemoryImageWriter& Writer, const TTuple<KeyType, ValueType>& Object, const FTypeLayoutDesc&)
+	{
+		Writer.WriteObject(Object.Key);
+		Writer.WriteObject(Object.Value);
+	}
+
+	template<typename KeyType, typename ValueType>
+	void IntrinsicUnfrozenCopy(const FMemoryUnfreezeContent& Context, const TTuple<KeyType, ValueType>& Object, void* OutDst)
+	{
+		TTuple<KeyType, ValueType>* DstObject = (TTuple<KeyType, ValueType>*)OutDst;
+		Context.UnfreezeObject(Object.Key, &DstObject->Key);
+		Context.UnfreezeObject(Object.Value, &DstObject->Value);
+	}
+
+	template<typename KeyType, typename ValueType>
+	uint32 IntrinsicAppendHash(const TTuple<KeyType, ValueType>* DummyObject, const FTypeLayoutDesc& TypeDesc, const FPlatformTypeLayoutParameters& LayoutParams, FSHA1& Hasher)
+	{
+		return Freeze::AppendHashPair(StaticGetTypeLayoutDesc<KeyType>(), StaticGetTypeLayoutDesc<ValueType>(), LayoutParams, Hasher);
+	}
+
+	template<typename KeyType, typename ValueType>
+	uint32 IntrinsicGetTargetAlignment(const TTuple<KeyType, ValueType>* DummyObject, const FTypeLayoutDesc& TypeDesc, const FPlatformTypeLayoutParameters& LayoutParams)
+	{
+		const uint32 KeyAlignment = GetTargetAlignment(StaticGetTypeLayoutDesc<KeyType>(), LayoutParams);
+		const uint32 ValueAlignment = GetTargetAlignment(StaticGetTypeLayoutDesc<ValueType>(), LayoutParams);
+		return FMath::Min(FMath::Max(KeyAlignment, ValueAlignment), LayoutParams.MaxFieldAlignment);
+	}
+}
+
+DECLARE_TEMPLATE_INTRINSIC_TYPE_LAYOUT((template <typename KeyType, typename ValueType>), (TTuple<KeyType, ValueType>));
+
+/**
+ * Traits class which calculates the number of elements in a tuple.
+ */
+template <typename TupleType>
+struct TTupleArity : UE4Tuple_Private::TCVTupleArity<const volatile TupleType>
+{
+};
+
+
+/**
+ * Traits class which gets the tuple index of a given type from a given TTuple.
+ * If the type doesn't appear, or appears more than once, a compile error is generated.
+ *
+ * Given Type = char, and Tuple = TTuple<int, float, char>,
+ * TTupleIndex<Type, Tuple>::Value will be 2.
+ */
+template <typename Type, typename TupleType>
+using TTupleIndex = UE4Tuple_Private::TCVTupleIndex<Type, const volatile TupleType>;
+
+
+/**
+ * Traits class which gets the element type of a TTuple with the given index.
+ * If the index is out of range, a compile error is generated.
+ *
+ * Given Index = 1, and Tuple = TTuple<int, float, char>,
+ * TTupleElement<Index, Tuple>::Type will be float.
+ */
+template <uint32 Index, typename TupleType>
+using TTupleElement = UE4Tuple_Private::TCVTupleElement<Index, const volatile TupleType>;
+
+
+/**
+ * Makes a TTuple from some arguments.  The type of the TTuple elements are the decayed versions of the arguments.
+ *
+ * @param  Args  The arguments used to construct the tuple.
+ * @return A tuple containing a copy of the arguments.
+ *
+ * Example:
+ *
+ * void Func(const int32 A, FString&& B)
+ * {
+ *     // Equivalent to:
+ *     // TTuple<int32, const TCHAR*, FString> MyTuple(A, TEXT("Hello"), MoveTemp(B));
+ *     auto MyTuple = MakeTuple(A, TEXT("Hello"), MoveTemp(B));
+ * }
+ */
+template <typename... Types>
+FORCEINLINE TTuple<typename TDecay<Types>::Type...> MakeTuple(Types&&... Args)
+{
+	return UE4Tuple_Private::MakeTupleImpl(Forward<Types>(Args)...);
+}
+
+
+/**
+ * Creates a new TTuple by applying a functor to each of the elements.
+ *
+ * @param  Tuple  The tuple to apply the functor to.
+ * @param  Func   The functor to apply.
+ *
+ * @return A new tuple of the transformed elements.
+ *
+ * Example:
+ *
+ * float        Overloaded(int32 Arg);
+ * char         Overloaded(const TCHAR* Arg);
+ * const TCHAR* Overloaded(const FString& Arg);
+ *
+ * void Func(const TTuple<int32, const TCHAR*, FString>& MyTuple)
+ * {
+ *     // Equivalent to:
+ *     // TTuple<float, char, const TCHAR*> TransformedTuple(Overloaded(MyTuple.Get<0>()), Overloaded(MyTuple.Get<1>()), Overloaded(MyTuple.Get<2>())));
+ *     auto TransformedTuple = TransformTuple(MyTuple, [](const auto& Arg) { return Overloaded(Arg); });
+ * }
+ */
+template <typename FuncType, typename... Types>
+FORCEINLINE decltype(auto) TransformTuple(TTuple<Types...>&& Tuple, FuncType Func)
+{
+	return UE4Tuple_Private::TTransformTuple_Impl<TMakeIntegerSequence<uint32, sizeof...(Types)>>::Do(MoveTemp(Tuple), MoveTemp(Func));
+}
+
+template <typename FuncType, typename... Types>
+FORCEINLINE decltype(auto) TransformTuple(const TTuple<Types...>& Tuple, FuncType Func)
+{
+	return UE4Tuple_Private::TTransformTuple_Impl<TMakeIntegerSequence<uint32, sizeof...(Types)>>::Do(Tuple, MoveTemp(Func));
+}
+
+
+/**
+ * Visits each element in the specified tuples in parallel and applies them as arguments to the functor.
+ * All specified tuples must have the same number of elements.
+ *
+ * @param  Func    The functor to apply.
+ * @param  Tuples  The tuples whose elements are to be applied to the functor.
+ *
+ * Example:
+ *
+ * void Func(const TTuple<int32, const TCHAR*, FString>& Tuple1, const TTuple<bool, float, FName>& Tuple2)
+ * {
+ *     // Equivalent to:
+ *     // Functor(Tuple1.Get<0>(), Tuple2.Get<0>());
+ *     // Functor(Tuple1.Get<1>(), Tuple2.Get<1>());
+ *     // Functor(Tuple1.Get<2>(), Tuple2.Get<2>());
+ *     VisitTupleElements(Functor, Tuple1, Tuple2);
+ * }
+ */
+template <typename FuncType, typename FirstTupleType, typename... TupleTypes>
+FORCEINLINE void VisitTupleElements(FuncType&& Func, FirstTupleType&& FirstTuple, TupleTypes&&... Tuples)
+{
+	UE4Tuple_Private::TVisitTupleElements_Impl<TMakeIntegerSequence<uint32, TTupleArity<typename TDecay<FirstTupleType>::Type>::Value>>::Do(Forward<FuncType>(Func), Forward<FirstTupleType>(FirstTuple), Forward<TupleTypes>(Tuples)...);
+}
+
+/**
+ * Tie function for structured unpacking of tuples into individual variables.
+ *
+ * Example:
+ *
+ * TTuple<FString, float, TArray<int32>> SomeFunction();
+ *
+ * FString Ret1;
+ * float Ret2;
+ * TArray<int32> Ret3;
+ *
+ * Tie(Ret1, Ret2, Ret3) = SomeFunction();
+ *
+ * // Now Ret1, Ret2 and Ret3 contain the unpacked return values.
+ */
+template <typename... Types>
+FORCEINLINE TTuple<Types&...> Tie(Types&... Args)
+{
+	return TTuple<Types&...>(Args...);
+}
+                                                                                                                       ‰PNG
+
+   IHDR  ¸   Ò   8ÒÕ;   	pHYs  Ä  Ä•+  
+OiCCPPhotoshop ICC profile  xÚSgTSé=÷ŞôBKˆ€”KoR RB‹€‘&*!	Jˆ!¡ÙQÁEEÈ ˆ€ŒQ,Š
+Øä!¢ƒ£ˆŠÊûá{£kÖ¼÷æÍşµ×>ç¬ó³ÏÀ–H3Q5€©BàƒÇÄÆáä.@
+$p ³d!sı# ø~<<+"À¾ xÓ ÀM›À0‡ÿêB™\€„Àt‘8K€ @zB¦ @F€˜&S   `Ëcbã P- `'æÓ €ø™{ [”! ‘  eˆD h; ¬ÏVŠE X0 fKÄ9 Ø- 0IWfH °· ÀÎ²  0Qˆ…) { `È##x „™ FòW<ñ+®ç*  x™²<¹$9E[-qWW.(ÎI+6aaš@.Ây™24àóÌ   ‘àƒóıxÎ®ÎÎ6¶_-ê¿ÿ"bbãşåÏ«p@  át~Ñş,/³€;€mş¢%îh^ u÷‹f²@µ  éÚWópø~<<E¡¹ÙÙåääØJÄB[aÊW}şgÂ_ÀWılù~<ü÷õà¾â$2]GøàÂÌôL¥Ï’	„bÜæGü·ÿüÓ"ÄIb¹X*ãQqDšŒó2¥"‰B’)Å%Òÿdâß,û>ß5 °j>{‘-¨]cöK'XtÀâ÷  ò»oÁÔ(€hƒáÏwÿï?ıG % €fI’q  ^D$.TÊ³?Ç  D *°AôÁ,ÀÁÜÁü`6„B$ÄÂBB
+d€r`)¬‚B(†Í°*`/Ô@4ÀQh†“p.ÂU¸=púaÁ(¼	AÈa!ÚˆbŠX#™…ø!ÁH‹$ ÉˆQ"K‘5H1RŠT UHò=r9‡\Fº‘;È 2‚ü†¼G1”²Q=ÔµC¹¨7„F¢Ğdt1š ›Ğr´=Œ6¡çĞ«hÚ>CÇ0Àè3Äl0.ÆÃB±8,	“cË±"¬«Æ°V¬»‰õcÏ±wEÀ	6wB aAHXLXNØH¨ $4Ú	7	„QÂ'"“¨K´&ºùÄb21‡XH,#Ö/{ˆCÄ7$‰C2'¹I±¤TÒÒFÒnR#é,©›4H#“ÉÚdk²9”, +È…ääÃä3ää!ò[
+b@q¤øSâ(RÊjJåå4åe˜2AU£šRİ¨¡T5ZB­¡¶R¯Q‡¨4uš9ÍƒIK¥­¢•Óhh÷i¯ètºİ•N—ĞWÒËéGè—èôw†ƒÇˆg(›gw¯˜L¦Ó‹ÇT071ë˜ç™™oUX*¶*|‘Ê
+•J•&•*/T©ª¦ªŞªUóUËT©^S}®FU3Sã©	Ô–«UªPëSSg©;¨‡ªg¨oT?¤~Yı‰YÃLÃOC¤Q ±_ã¼Æ c³x,!k«†u5Ä&±ÍÙ|v*»˜ı»‹=ª©¡9C3J3W³Ró”f?ã˜qøœtN	ç(§—ó~ŠŞï)â)¦4L¹1e\kª–—–X«H«Q«Gë½6®í§¦½E»YûAÇJ'\'GgÎçSÙSİ§
+§M=:õ®.ªk¥¡»Dw¿n§î˜¾^€Lo§Şy½çú}/ıTımú§õGX³$ÛÎ<Å5qo</ÇÛñQC]Ã@C¥a•a—á„‘¹Ñ<£ÕFFŒiÆ\ã$ãmÆmÆ£&&!&KMêMîšRM¹¦)¦;L;LÇÍÌÍ¢ÍÖ™5›=1×2ç›ç›×›ß·`ZxZ,¶¨¶¸eI²äZ¦Yî¶¼n…Z9Y¥XUZ]³F­­%Ö»­»§§¹N“N«ÖgÃ°ñ¶É¶©·°åØÛ®¶m¶}agbg·Å®Ãî“½“}º}ı=‡Ù«Z~s´r:V:ŞšÎœî?}Åô–é/gXÏÏØ3ã¶Ë)ÄiS›ÓGgg¹sƒóˆ‹‰K‚Ë.—>.›ÆİÈ½äJtõq]ázÒõ›³›Âí¨Û¯î6îiî‡ÜŸÌ4Ÿ)Y3sĞÃÈCàQåÑ?Ÿ•0kß¬~OCOgµç#/c/‘W­×°·¥wª÷aï>ö>rŸã>ã<7Ş2ŞY_Ì7À·È·ËOÃo_…ßC#ÿdÿzÿÑ §€%g‰A[ûøz|!¿?:Ûeö²ÙíAŒ ¹AA‚­‚åÁ­!hÈì­!÷ç˜Î‘Îi…P~èÖĞaæa‹Ã~'…‡…W†?pˆXÑ1—5wÑÜCsßDúD–DŞ›g1O9¯-J5*>ª.j<Ú7º4º?Æ.fYÌÕXXIlK9.*®6nl¾ßüíó‡ââã{˜/È]py¡ÎÂô…§©.,:–@LˆN8”ğA*¨Œ%òw%
+yÂÂg"/Ñ6ÑˆØC\*NòH*Mz’ì‘¼5y$Å3¥,å¹„'©¼LLİ›:šv m2=:½1ƒ’‘qBª!M“¶gêgæfvË¬e…²şÅn‹·/•Ék³¬Y-
+¶B¦èTZ(×*²geWf¿Í‰Ê9–«+ÍíÌ³ÊÛ7œïŸÿíÂá’¶¥†KW-Xæ½¬j9²<qyÛ
+ã+†V¬<¸Š¶*mÕO«íW—®~½&zMk^ÁÊ‚ÁµkëU
+å…}ëÜ×í]OX/Yßµaú†>‰Š®Û—Ø(Üxå‡oÊ¿™Ü”´©«Ä¹dÏfÒféæŞ-[–ª—æ—nÙÚ´ßV´íõöEÛ/—Í(Û»ƒ¶C¹£¿<¸¼e§ÉÎÍ;?T¤TôTúT6îÒİµa×ønÑî{¼ö4ìÕÛ[¼÷ı>É¾ÛUUMÕfÕeûIû³÷?®‰ªéø–ûm]­NmqíÇÒı#¶×¹ÔÕÒ=TRÖ+ëGÇ¾şïw-6UœÆâ#pDyäé÷	ß÷:ÚvŒ{¬áÓvg/jBšòšF›Sšû[b[ºOÌ>ÑÖêŞzüGÛœ4<YyJóTÉiÚé‚Ó“gòÏŒ•}~.ùÜ`Û¢¶{çcÎßjoïºtáÒEÿ‹ç;¼;Î\ò¸tò²ÛåW¸Wš¯:_mêtê<ş“ÓOÇ»œ»š®¹\k¹îz½µ{f÷é7Îİô½yñÿÖÕ9=İ½ózo÷Å÷õßİ~r'ıÎË»Ùw'î­¼O¼_ô@íAÙCİ‡Õ?[şÜØïÜjÀw óÑÜG÷…ƒÏş‘õC™Ë††ë8>99â?rıéü§CÏdÏ&ş¢şË®/~øÕë×ÎÑ˜Ñ¡—ò—“¿m|¥ıêÀë¯ÛÆÂÆ¾Éx31^ôVûíÁwÜwï£ßOä| (ÿhù±õSĞ§û“““ÿ˜óüc3-Û    cHRM  z%  €ƒ  ùÿ  €é  u0  ê`  :˜  o’_ÅF  3aIDATxÚìİy|Tå½ÇñÏl™LÖÉB2™H!ì‹,J(*‹PõbÁ,•Ê­EÑª´ÖRˆ¢W[µX*¨•jÅX("
+‚ˆ,Av„ !û¾=“ÉÌÜ?r37!3 B~ï×‹™3gyæ7'óÍsæ9ç(l6<úè£Ÿ¢Ö¬Y£*!n¥„›èH²/	!n™€“$!!'„¸m{pB!„œ°Ójµ,^¼www)†BÜdêkYøø‹…æU6nÜÈéÓ§¯Kãú÷ïOYY999òâııı™4iF£‘šš8ÀÚÕ¦æM&Ë–-cİºu<øàƒèt:ÙÃ„¢³öà&OLtt4ıúõ£_¿~üş÷¿'==İş¼Bqõƒèúõë‡««+EEEm^¦=Û›1c§OŸæ{îá‘GaĞ Axzz¶«M—>vqqaöìÙnBÑ™{pMî»ï>¼½½[ôŒ}ôQ?Nxx8+W®$<<œ»ï¾ooorrrHHH ²²€&OŒ^¯çÂ…lÚ´‰ûî»ˆˆzõê…ÑhäìÙ³Ì;—W_}€€€ ~ùË_²|ùr‡Û3Ü{ï½èõzÎŸ?Ï–-[¨¯¯··Q£ÑàëëËÛo¿M`` ıû÷gÇTUU‘ÎèÑ£[-ÿı÷·hSPPP‹Ç?üğ¿ıíoyë­·puueöìÙìÛ·1cÆP[[Ë¦M›ÈÌÌ GL:777¾ıö[î¾ûn^yå @ll,Z­–ÔÔT¶lÙ‚Åb¹©;Ê…°~­««£°°=zÈo‘âöìÁ9£Õjùä“O˜3gÿùÏ˜2e
+Ÿ}öãÆãÌ™3ôêÕ‹šš\\\˜9s&[·nå®»î"++‹=zğñÇ“””Ä«¯¾Ê/ùK9À¿şõ¯ÛùğÃ[mï«¯¾bæÌ™|ùå—Ü}÷İäççDCCƒ}9³ÙÌùóçyşùç5j
+…‚óçÏsîÜ9 ‡Ë¯]»¶E›|òÉ÷ïßÀºuë¨««ÃÍÍ;w2oŞ<>ùä†NAA*•Šÿú¯ÿbÛ¶mŒ7ÜÜ\T*}ônnnL›67Şxƒ	& T*ñööÆjµŞÔ%((ˆ²²2L&&“‰‚‚|}}å7HqûÜ†ˆ‹‹ãÙgŸeæÌ™-Û¼y3ƒx€·ß~›>ø€;ï¼¥RIhh(Gµİk¯½Fdd$gÏåÌ™3?~???¼½½¹ã;2dÈÛÒ´½'Ÿ|…BÁéÓ§yä‘GğòòbàÀœ<y²Åü_|ñ™™™Ì=›G}”¨¨(ÂÃÃ™8q¢Óå›·éÎ;ïlñxÔ¨Q-Ö¯P(X·n­VKxx8Àh4¢T*yùå—‰ŒŒ¤®®ÀbV«•ââbbbbØ´i6làÌ™37uGquuÅÇÇ‡¢¢"rssñ÷÷ÇÃÃC~ƒ„·¬k>D9sæL²³³°ÙløøøğĞCÙŸE¡Pp×]w±xñb¬V+J¥’´´4ÊËËñğğ ¸¸­VKÏ=)--¥¢¢ÿ«jOhh((Š‡N³²²ÈÏÏo1oS/îñÇ§[·n¼ôÒK·yù¶ŠˆˆÀf³¡Ñhì¯¹¤¤«ÕJŸ>}P*ÿÿïŒššşõ¯1{öl@JJ
+‹¥ÅáÕ›Él6Ëo¢k\}}=&LÀËËËŞk¹TÏ=2dO=õß|ó?ıéOyà°ÙlTUUáåå…›› nnnRPPĞb&“	•JÕ¦A$•••TTTğØcÑ­[7ûôæß0hĞ ¶mÛÆàÁƒ±Ùl$%%Ñ½{wÎŸ?ÏàÁƒ/»üÕ²X,˜L&t:ÃÓ	t:õõõüë_ÿ"==^xèèh;vSw”ššJJJ0 ¡P(ìï›BÜv T*Q©T—}¾işÃ?Ìœ9s¨­­/L<™Ñ£G£V«¹ûî»©¬¬$%%…úúz‚‚‚P«ÕTTTPWWÇ˜1cP*•:ÔéöÒÓÓ™<y2<ğ îîîtëÖ²²²ìóTUU1`À <HEEnnn2„;w²mÛ6æÌ™ãpùæmj
+øæÛ"''ÆR©dàÀöç|||øùÏÎŠ+		A¯×“™™É±cÇ>|øMÛQÊÊÊğ÷÷·õ÷÷§¬¬LNq{Ü•¤¥¥qáÂ¾ûî;***HII!44ÔŞ3ûì³Ïøå/I=HKKãµ×^ÃjµrìØ1¦M›†««+‡bË–-¼òÊ+hµZvïŞít{Mëœ5k½zõââÅ‹lÜ¸‘ÂÂBì=’>úˆáÃ‡3hĞ 8zô(ÿûß1N—¿´MÍ'''·©&“‰õë×óÄOàååÅÙ³gíÏåææ²uëVæÌ™ƒ^¯'==O?ıôšN·¸‚ƒƒ[<vss“pBÜÒ—ŞM ½×üç?ÿÉ<Ğêğ]yy96l`îÜ¹@ã÷s»ví";;OOOBBBÈÌÌä  °°}ûöQUUEHH111h4rssÙµk={ödÔ¨Q¤§§“””ÀàÁƒÙ¿?sæÌiµ=h<Œ¶ÿ~ÊËËñòòbøğáÆí,..æàÁƒ””” V«éÕ«Ã†C©T:]şÒ65<tèPÖ®]ËÌ™3©¯¯oÑ¦¦ œ3gĞø½^RRQQQ¬Y³†Øç=uê'OÄl6c0;v,...vG“»
+!:]À‰«c4)//Çd21qâD´Z-Ó§OgÖ¬Y·åë•€BÜhj)ÁÍ¸éÓ§ãêêJvv6qqqJa„B®s;xğ ü1ÇÇl6Ó­[7bbb¤0B!×ùEEE%…Bˆ ·ËB!'„BtöQ”2zR!Äí iÔ¶RÂM!Äí¤)ÓsçÎ•pBqÛ‘ïà„BHÀ	!„pB!„œB!'„BHÀ	!„€B!$à„B	8!„BN!„¸vr?8!„¸MÔÕÕQPP€ÉdêĞíhµZĞétpB!:^AA.dÂ„	¨TªÙ†ÅbaÏ=¼úê«ôìÙSN!DÇ3™LŒ?’’,K‡lC¥R1zôhÔê[?>¶0((ˆ˜˜ƒì1BqÉËËc÷îİ9|Şl6ÓĞĞĞaÛohhÀl6wŠZ9d2qâD	7!„¸qï½÷:}Şf³İÃœ»»»ìEBqƒ:tˆÏ>ûŒo¿ı¶E M:•ùóç·é3Úf³aµZ[M¯««#!!???úõëÇwß}×âùaÃ†QXXHVVV‹éÓ§Ooõ}^g	¹[ú4êêj¾úê+Ùë…·½wß}—Ç¼E¸Aã!É÷Ş{Y³fQYYyÅõ\k¯ì¶ïÁ9›S§NQQQF£!44”ĞĞPÙ+…âmŞ¼™÷Ş{€ØØX-Z„Ñh¤²²’]»vñÆoššÊã?Î'Ÿ|rÅ€sÔƒsqqáÁ´?nşs“={2bÄˆVÓ/]_{.00ğğp´Z-Ğ8æüùóÜ:wøğa‚ƒƒ>|8ÕÕÕ:t­V{ÍßÕÙl6
+…ìáBˆ.ë7Ş à±Çkq(ÒÓÓ“©S§Ò»wo,X@jj*›7ofêÔ©N×eµZ ¬««cóæÍøúúÍ÷ßßâù¡C‡RTTÔêå<Ğê¥£ mN¡Pğãÿ˜1cÆàéé‰R©Àb±‚BZ¥Äb±RYYÉ÷ßÏ;:¬GØ¦€³X,ÔÔÔ`4Q(xxxĞ»woûHšòòrN:EMMİºu#::µZMII	)))ÔÖÖ¢×ë0` Z­–êêjöïßÑh¤¸¸˜±cÇrñâEN:Emm-~~~ôïßß¾ıÌÌLÎ;‡F£¡ÿşøøøÈo„â¶ğí·ßRYYIPPP‹pk®OŸ><ôĞC¼÷Ş{ìÚµëªÎb±`µZ[üsöü¥Ó¯Ô£knÈ!Ì˜1¥RùÁeã|f	ç³‹QîZG… sÓqÏ=÷p×]wñùçŸsäÈ‘›p*•
+???’““éÓ§F qÈè‘#GèÛ·/İºuãØ±c¤§§Nrr2ÑÑÑøúúrâÄ	Î;G¿~ıìËùúúÒ·o_8|ø0}ûö%  €'N––Fpp°}û±±±¤¥¥qúôibbbä·Bq[HMMM^Î°aÃxï½÷8sæÌ;$†ñ«T*~ò“ŸØ7ÿ¹I÷îİ2dH«0kKèLš4‰1cÆ`±X°Ùl¨UJ’¤áêæ†R¡D‚ú8p<Ñƒ{ÒğóMŸ>ÀÀ@¶nİÚb}?ÿùÏ/ûZ×®]{í×”Êiii:tzõêE`` ¥¥¥öc¾¸ººRVV†B¡àG?úĞx^†··7………-Ö@II	†    """¨ªª²Ï×t\¸pA~#„·ë²‹Åâğ<8“ÉÄÖ­[ñññ!**Š}ûöµx~Ğ A“““Óbú´iÓP*•W¸~ıú1räHªªª0›Í˜Íää“ğm
+šŸŞ3€ŠêZ¶|}…JÊZ1ĞµZF£aÄˆdddpúôéæ,ä®ní
+8•JEïŞ½‰ˆˆ ¤¤„“'Ob³Ù¨¯¯Çf³‘››kŸ·ië™3gÈÊÊB¡P`³Ùğòòr¸n“É„««k‹7ÚÃÃƒêêêó)•Ê+ûBˆÎ¤éhØ®]»œ¢„ÆÑ”ÍçooÎl6c±XìxiH5M»tºÙlnSÀùúú’ŸŸßâ:˜ù…%ÔÕÕá¢Òâé¦ÂÍÕšÚ*T*òJñĞıÿw{
+…ooo‡AviÈµ%ÜÚp•••äää…B¡ÀßßŸ
+1h4†Öb™’’²³³=z4îîîdgg·Áæ´Zm‹¢Ô××c2™ZU!n7ãÆ¸ì ’ÊÊJŞ}÷İó;cµZöàT*“'O¶?nşs“àà`Øj}—v,¬Vk«!GaÈ!Ô××SWW‡ÕjEïåJUe®|¸~/uuõX,Vêj«Ğ{¹P[[‹R©D£Ñ Óé8qâ„ÓŞZSÈµ5ÜÚpZ­–ÜÜ\Üİİ	¦¾¾ââbğõõÅl6“——‡Á` ªªŠ†††Æã¯j5Z­–ºº:§áØ¿ß+(( [·nœ9sFC÷îİeïBÜö‚‚‚ÈËËcéÒ¥TVVò³ŸıÌşÜ™3gX¶lyyyö“¾¯&àL&ß|óz½Ş½{óÃ?´x¾ÿş”––¶ú¬4iR«Î†£#iUUU|òÉ'Ì˜1›ÍFmm-®ÂC¼HÍ(ÃÒ`˜êˆõÅ]Û?...¸¸¸ßê¨İÕôÚÚp...6ŒÔÔTRSSQ©TÂÂÂP*•:”Ó§O“œœŒ»»;‘‘‘øùù¡×ëùöÛoqssÃßß¿ÕwpöF¨Õ2„Ó§OsòäIüıı‰ˆˆèğ[>!ÄÍTYYÉã?n?ü§¼÷Ş{DFFRYYi„âééÉë¯¿§§çe×éì;¸††ûË¦Ÿ/]®i$å¥Ëµå%4¹{ï½÷¸ë®»èŞ½;õõõLŠDØ¹\R/¡P(ˆ
+7Ğ§—¥ªñ»·ŒŒvìØÑ!×ÏTÌ;·Õ	¿şõ¯eÏBˆnM#%sss[ÀÔ©Syì±ÇZ|ÿ¶råÊVëLMMeÕªUdddthÛCCCY¸p!aaaNçÑétôë×°°0º¡Q« +………\¸päädjkk;¬r»!„¸	6oŞÜ"Ü¦NÊ’%K€ÆÃ’M#É###¯ØkkÎf³9ìaÕ××óí·ßâííMDD‡jñ|tt4¥¥¥äçç·˜~×]wµêÁµåÄìÚÚZ<ÈÁƒoZ%à„â&ˆŒŒtnĞxb÷Õrv©®¦!MÏ_RÍŸ¿tº£mt®¼¼ÜápM!„×Ç°aÃøøã©ªªj5
+ıJ.7ÃÙÅ5wİuW‹Ù¥‚ƒƒ[\EÊY uê€ûê«¯?~<İºu“½P!:ÈÕôÔšnxÚŞÜõÔ©®¨¨ˆÏ?ÿ\ö>!„èdnÄíln»Ûå!„¸µiµZöïßÏ¨Q£:t;‡î!çğ4!„O]]~±‹‹èt:éÁ	!„èx®®®r#êfäbB!$à„B	8!„BN!„€B!$à„BtMO°ÙlRVVæğÖçB!ÄµÒh4øøø€B¡¸1WPP@QQ‘T_!D‡1›Íb³Ù0×}ıQ–••Iå…BÜ•9®#n.„BÜÈÌ‘A&B!nK].àÂÂÂX·nO>ù¤¼ûB!×Úk¯½ÖjÚK/½Äºuë0-¦ÿıïgíÚµxzzŞô\RRÂêÕ«y÷İwIKK“=@!$à.n {öìÀ`0PWWgï1ùùù±gÏvíÚÕæc­1d ²²’¯¿şšŒŒüııeBˆÛT»o—ã,Ü öíÛÇ#<Â„	HLLÄ`00|øp 6nÜˆ——‘‘‘Ì;—ĞĞPÊÊÊHLLäë¯¿fğàÁüîw¿cÏ=DFFòå—_²yófÂÃÃÎ?räH~úi6lØ@dd$$''³bÅ
+jkkéÕ«—ÃåÂÂÂøŸÿùöîİË_ÿúWÙ„Bzp—7€‹/râÄ	†bï>œºº:¾şúkÂÃÃùãÿˆÁ`àı÷ß'??Ÿyóæ1pà@û:úõëG||<Ÿ}öWœÜ¸q$%%qüøq†ÊĞ¡Cñôô¼âreeerˆR!$à®nÍ{q*•Š#FàååEÏ=Ù¹s'&“‰I“&¡Óéxë­·øÛßşÆË/¿À=÷ÜCEE…½§÷×¿ş•ªª*&Oìtşªª* âããyíµ×øàƒ èÑ£tº\yy¹¼ëB!×¾pHJJÂl63aÂú÷ïÀşó¼½½	  ##£ÑˆJ¥¢¡¡£Ñh8›Í†ŸŸAAA]q~ ¼¼¼€Æ;Úúùù9]NNbB	¸v‡@MMGaìØ±Œ9’ŠŠ
+¾ûî;|}}).. $$ôz=jµšÜÜ\‡ƒO.7¿ÅbqÚ†¼¼¼vmG!ÄíçŠƒL{î¹v¯tïŞ½Œ1‚Q£F±~ız¬V+ŞŞŞìÛ·3f°páB6nÜHLL Ÿş9juë¦\n~•JåtûÛ·oç¿ÿû¿Û¼!„]°w5:Dmm- ÿş÷¿ñññA¡PpñâE–-[Fff&?ûÙÏğòòâµ×^cÃ†öCŒÍµwşæ=?gËùøøÈ».„]€bîÜ¹¶K'8qâšWlµZ9vìV«•ÈÈÈ'yWWW“••Emm-†€€ (//çÜ¹sĞ½{÷+Îß4Ò`0LMM§OŸF¯×ît¹¦ù|||èÕ«—ìBq“0 óœBq3N.¶,„â¶Ô¡#.¬V+&“‰ÚÚZêëë±ÙlRq!D—£P(pqqA§Ó¡ÕjQ*¥oÑ©ÎjµRYYI^^ÕÕÕRi!D—çîîNPPr5àšÂ-33[¤Ã;hÇ¸Kµ…]–éûjJd“™šI=$än€ë^İKÃÍï	7!D—§ãß;!Ø"•dffRYY‰Õj•ÂÜèÜµÜ·­ªªŠÂÂÂVáÖs¼œ&º¶aÃ†qèĞ!)Duag™=äJdS˜Yˆ^¯ÇÃÃCŠÓYzpÕÕÕTTTH¸	!D3MŸƒM!WQQ!ã:[À™L&û›(á&„C®ùç¥è×}‰S¢¿„j5÷Ş{/£G–KÉu"eeeìÛ·-[¶\õEÜåó²“œ¢}¦M›Æ¤I“¤ŒS¦LA©T²aÃ)È-HÆ¨
+q“İyç§Ûl¶÷=ëıÒƒ£[·nÌ=½^ÍfcÇìÚµËéü,^¼˜§Ÿ~ºÅÏ—8p ÷ß?*•ŠÚÚZÖ®]Kff&¾¾¾Ì›7×_€ØØX?Niii‡µùj\M»DçähÔò”)SÈÈÈ ""‚7Ú§'$$ğî»ïb³Ù¸ç{xòÉ'/;]Üœ÷OHÀ¡R©X¸p!			üğÃxxx°xñbòóó9sæÌU¯W«ÕòØc±lÙ2ŠŠŠˆæ‰'à¹ç£´´Ôn ãÆ#''§ÍAÒQm¾T{Û%n/‰‰‰$%%±|ùrû´ÜÜ\şò—¿€»»;?ü0ƒ"22ÒáôØØX)ä5xùå—ùè£ZLkËïøænL_#ìê×³gO,?üğĞxİÆí73‰‰aâÄ‰(•JvíÚÅöíÛÛp*•ŠššÆìÔ©S|ñÅ¨T*üüüì½¾9sæ`0˜7oü1'O¼â6ÛÒæI“&¡P(8qâñññDFFòĞC±téR fÍšEyy9gÎœáÁ¤  €ˆˆŠŠŠX¹r%?ûÙÏZµKˆcÇ··7 cÇå‡~ ¶¶Öát	¸kóÂ/ R©X³fM›—Ù¼Ó­ÅÿMÖ~hfí?ÍRÔ®p~~~·˜ÖF£‘éÓ§³dÉÌf3qqq;v¬Më­¨¨àË/¿dÉ’%ìÙ³‡¤¤$8Ğj¾?ü°°0Ö®]ËÙ³gn³¨¨¨Mm
+
+búôé,]º”êêj-ZDLLL«ù›dåÊ•TVVòÛßş–aÃ†µj—MLi4ûcFCee¥ÓéâÚ-^¼¥RÉ?şñ6Í?u|›wºâ³·Åôì²Şx5ƒÁ E½nÙA&QQQX,fÌ˜Á¬Y³P©T„„„´yùM›6ñúë¯c6›yê©§¸÷Ş{;|›QQQ$''SQQÅbaÿşıDGG_v™òòr***°Ùläææâëë+{¥7ÉÊ•+[M{î¹ç˜7o^›×ÑtxrğàÁö ùùùRà®Ôƒ+))Áßß¿Å´#FØÏîÏÍÍeÛ¶m lÛ¶’’’6]ÖÆÏÏÎ;Gbb"»wïæõ×_gÇW\ÖÑ6ÛÓææl6
+…‹Å‚B¡hSMÚ:Ÿèz<<<0›ÿÿ0—ÙlÆÃÃÃétÑ~+V¬Àb±°páÂV!×ô5D[4…šèÂ=¸. R©6lĞx+‰iÓ¦Q__Ojj*ÁÁÁ”––’••…Íf³§v%îîîÌŸ?ß~Ò¬‡‡‹ÅáÉ˜¸ºº´i›—ksJJ
+ÑÑÑö«„9’S§NQ\\ŒZ­µZMhhè_Cóv	#ƒO<ÉÅ‹ihh`÷îİ>Üétqõ½¸7ß|³ÕôgyFŠ#=¸¶³X,¬X±‚Ù³gsß}÷aµZÙºu«ı{§„„şy¬V+ÅÅÅ¼ÿşûmZoff&ñññüæ7¿A¥Ra±XXµjU‹¿r›ìß¿Ÿ_üâ¬^½š””‡Û¬««ks›×¯_Ï³Ï>‹B¡ 99™½{÷bµZùæ›oX²d	eee^ñ5\Ú.!‚ƒƒyæ™g˜5k6›»ï¾›ÿøÇö_GÓÅÕYµj ‹-ºªå27bîÜ¹­n³~Õ+LOO'==PÛ @®E)DgwX½zµçÑ§OŸçÏŸß¦Û¯~õ«VÓ=Úâ±Á`À`0pag Šc„……&…‡©ƒ\ªK!şÏõ<—U¾‡»ùäR]BÜd2¤_Ş?!'ÄmiÏ=R„NlïŞ½R„[”¢â&Û´ijµš#Fàåå%é$***8pà 			RŒ®pJ¥t
+…h††âãã‰—bt1òyÙÁõ½Ş+Ôjµ ˜¾o<ñ¹iÄBtuMŸ‡MŸMŸ—¢“œ»»;^^^”,È–BáV² ///Üİİ¥0èº¢Ôét„††’ššJÉ‚lüŞ	A;Æ]BNÈÛ¥]\S¸)ÏÚE§ÓIQ:SN¥R¡×ë‰ŒŒDyÖÖ¢''„n6"##Ñëõíº¾¥¸zp—†\FFùcÏI¥…]——¡‘¡n9àš‡œV«¥ºº“É„Õj•Š‹.Ëh4’››+…è‚”J%Z­wwwt:„[g¸¦kº‡]³kQ
+!:è)B	8!„BN!„€B!:>àd„Bˆ¥£2ÇaÀÉ¨G!„7JGeÃÓôz=
+…‚ªª*¤úB!® ©Õxxxàíí}ãN¡P ×ëÑëõòq”””&…â‘A&B!$à„B	8!„BN!„¸¾2±ÙlRVV†Ùl–*	!„¸î4>>> P(nLÀPTT$ÕBÑaÌf3………Øl6Ãu_¿ÃC”eeeRy!„7DGeÃ€““»…BÜ(•92ÈD!Äm©K\XXëÖ­ãÉ'Ÿ”=@!nSê«]ğµ×^ã¹çk5İÅÅ…éÓ§3jÔ(|||(**â«¯¾âë¯¿¾å^|YYiiiôêÕKö!„\c¸9óì³Ïrÿı÷söìYV®\Iii)óæÍcÄˆ7ìEuÄpS!„·yîráÁÀ9pà >ú(z½;wòŸÿü‡!C†˜˜ˆ¿¿?‘‘‘Ì™3‡îİ»SXXÈÇÌÑ£G9r$O?ı46l 22’ˆˆ’““Y±bµµµN—<x0¿ûİïØ³g‘‘‘|ùå—lŞ¼™#F0sæL)**bİºu$%%É».„Òƒk{¸°wï^<==	ÇÍÍ3fğ«_ıŠ‹/¢×ëyá…ğõõeõêÕ444°hÑ"4}=ãÆ#))‰ãÇ3tèP†Š——×—ë×¯ñññ|öÙghµZ-ZÀªU«Ğh4,\¸Pnæ*„Òƒk_¸(•yi6›ñôôä™gaÈ! ÔÔÔ0ş|F««+kÖ¬aË–-x{{3gÎ±X, ÄÇÇóæ›o2~üxî¸ãzôèB¡pº\ÓÓ7ò×¿ş•ÀÀ@|}}ùÃşÀ={¨®®¦GÜÿı¸ººÊÕY„B®íá`µZÆ&
+…‚„„>ÿüs–.]ŠR©äØ±c<òÈ# ,X°€Ø—õññ¡¶¶ÖşØßß/// \]]ñ÷÷wº\MMĞx‰1???‚‚‚P«ÕL™2…ßıîw”””àããÓø‚ÕjL&“¼óBq›»â!Ê¶†@NN #GÄjµröìYRRRì=3›ÍFii) qqqDDDØÿıóŸÿ´¤#N—kZs÷İwcÇå•W^aòäÉlŞ¼ÙşœÍf“w^!ºzÎÑ© Î¤¥¥qğàAFÅòåË¹páİ»wÇÓÓ“ÌÌL öíÛÇOúS~ó›ßĞ½{wÜÜÜ0` şóŸí=6G¶oßÎã?îp9GwW«_ÚÄ‰:t(Ó¦M/î)'„Òƒk··Şz‹U«VÂC=ÄÀÙ²e³fÍB­VSRRÂÒ¥K¹pá3gÎ$66–ÜÜ\233/ÛƒËÏÏwºœ£\bb"GeôèÑDGG³víZ zöì)'„]€bîÜ¹­>íOœ8qM+µZ­PRRB}}=jµ///ŒF#... TUU‘Mmm-jµwwwºwïNUUiii‚ƒƒ©©©áôéÓèõzÂÃÃ.WSSÃ¹sç {÷î Ô××sáÂª««Ñétx{{“——Gpp0^^^œ>}9Ñ[!n²t€B!nvÀÉÅ–…BÜ–$à„BHÀ	!„pB!„œBq}9<ÑÛÓÓS*#Äu6lØ0:$…BzpB!„œB!'„BN!„€B!nªÁƒÿéÒ‰/^¼ê¾øâ‹Œ7ï¾ûîŠóz{{ó·¿ıáÃ‡3~üxÆOß¾}9xğà5¿°ØØX***ZÜDõzğööfåÊ•X­VRSSíÓ
+Ë—/§gÏ>|øº·Í××—'x‚½{÷:'  €¸¸8¾úê«ËÖ9&&†¢¢"Š‹‹å7à2äååI!„pÀÑmÏ®•º#Ç‹/¾H\\ÜçµX,,Y²Äéó
+…âªno3nÜ8rrrì7X½’ölÇf³Ã–-[ìËDFF@ZZZ‡´­´´”×_ıªß“æu6,Z´ˆ+V••%¿YBˆÛ’º£VÜ»TïŞ½yä‘G(,,äüùó$&&2aÂbccQ©T>|˜/¾ø€ıèGÜ}÷İ(•JvïŞÍÖ­[™3gƒyóæññÇc6›yè¡‡Xºt) ³fÍ¢¼¼œ3gÎ´ÚNLL'ND©T²k×.¶oßî0,ÊÊÊèÓ§))) Œ3†ŒŒŒó9jó¥m;yò¤Ãm^Zƒƒ²xñb~úi§ën«ÜÜ\vìØÁøñãùè£œ¾æ|Áƒ£P(Øºu+»wïvZs!„è2×ÖS(ÄÆÆÚ=zh<ÙüÕW_¥ºº­VKŸ>}xé¥—°Z­,_¾œ¤¤$¬V+Ó¦MãOúf³™eË–qäÈ>üğCÂÂÂX»v-gÏ¥OŸ>N·ß|;F£‘éÓ§³dÉÌf3qqq;vŒ¢¢¢VË}÷İwŒ3†””t:}ûöeûöí„„„ 8mó¥ms¶ÍKÛ`ß¶³u›L¦6¿7yyyôïßßéöµZ-£Gæ¹çÃİİ'Ÿ|’ıû÷à°æòÛ$„è:×VZ­Öş³RÙ8î¥¼¼œêêj L&ÿş÷¿3fîîî@ã÷Jœ:uÊ>ßK/½D]]]»¶İ|;QQQX,fÌ˜€J¥"$$ÄaÀ:tˆéÓ§£Óé¸ã;8|ø0õõõöçµùÒC‚Î¶YUUÕ¢mÍ9[waaa›_·B¡¸ìöOŸ>MUU³gÏæøñã¼òÊ+444uÍ5BˆNpm9Di³ÙZŠğóókñ¸G<õÔS¬_¿¼¼<î¸ã‡ëªªªr8İb±Ø?Ğ¯$77—mÛ¶°mÛ6JJJÎ×ĞĞÀ¡C‡9r$111|øá‡-zŠmm³³m;¿=ëv&((ÈŞër´ıºº:–-[FŸ>}>|8÷İw/¿ür›k.„7[‡&pµß¿9û@ÏÊÊâûï¿'?? RRRèÛ·/:FÃ‹/¾ˆÁ`°««+ ÅÅÅøøø ÕjQ«Õ„††:ÜNjj*ÁÁÁ”––’••…Íf£¦¦Æi»¾ûî;¦L™‚Õj%''§Mm¾´míİæ•ÖİF£‘ñãÇ³sçN§Û8p ,àôéÓ|úé§èõz¼½½/[s!„¸í{p×3Ü ñ{¹qãÆGff&ÅÅÅèt:N<ÉæÍ›ùıïÀîİ»ÉÏÏ`ÿşıüâ¿`õêÕ¤¤¤ğÍ7ß°dÉÊÊÊœÊËÎÎ&!!çŸ«ÕJqq1ï¿ÿ¾ÓCpyyy”””Ø_´¥ÍÚæh›WSËQ©TöA6&“‰5kÖØ—:Ú~rr2C†±¿Û·o·ªuVs!„¸•(æÎÛjl|zzºTFˆëLî& „saaa×}r%!„·%	8!„pB!„œBquèyp‹…ÚÚZª««1™LX­V©¸è²êëëÉÍÍ•BtÅ„R‰V«ÅİİN‡J¥’¢tæ€³X,\¼x‘ŒŒ***¤Ò¢Ë“ÑÉÂËË‹ĞĞPôz½„\g¸¦pKMMÅÚ[á´cÜ¥ÚBˆ.Ëô}5%²IMM%22RBîFôœ;:ÜüŞ	‘pBtyÚ1îø½‚µ·‚ÔÔT.^¼ˆÅb‘Ât¦\mm-­Â­çx©¶èÒäDï®íÂÎ2{È•,È&##­VÛîKí‰›Øƒ«®®¦¢¢BÂM!šiúl
+¹ŠŠ
+‡w·pÀ5İ“LÂM!œ‡\óÏKÑ1®û!J9@ˆvşªÕÜ{ï½Œ=ùƒ°³(++cß¾}lÙ²…††ù¼ì
+'„hŸiÓ¦1iÒ$)D'ãããÃ”)SP*•lØ°A
+r’+™q“İyçíšßf³µëÜÒöÎ/:öı]¤çííÍŸÿüçWwøòË/Ù¿ÿ5¯{Îœ9äää°}ûöëÚærÿı÷£R©¨­­eíÚµdffŞ²í·>OOÏVÓ>ıôS>úè#¬V+ƒæå—_F­V3eÊ222ˆˆˆ`ãÆ­–[¼x1©©©¬_¿àŠó‹yÿ„ôà€Æóæ–,YÂ’%KxóÍ7ùùÏ~Ë›Õjµ<öØc¼óÎ;,Y²„„„xâ	Ù‹ÄuuşüyŞyç>ûì3ÉÈÈà«¯¾ 11‘>øÀárG%11±Å´ËÍ/.ïå—_¦OŸ>-şµÅænR<éÁµvñâEL&ŞŞŞTUU1aÂbccQ©T>|˜/¾ø‚Ş½{óàƒRPP@DDEEE¬\¹’úúz&MšÄøñã)++C©T’““@LL“&MB¡PpâÄ	âãã‰ˆˆà¡‡"77—Ş½{“Î?üÀ”)Spuuåİwß%##£UÀ©T*jjj 8uê_|ñ*•
+‹ÅBLL'ND©T²k×.{oÌÙtgí]›Ñhä‹/¾ÀÛÛ ƒÁ@UUÕe—±Z­,[¶ŒGy„½{÷J¯ƒ^x•JÅš5kÚ¼LS¸]rk?4³öŸf)jW8…BAll,
+…‚ˆˆrrrÈÍÍE«ÕÒ§O^zé%¬V+Ë—/'))	€ÀÀ@V®\Iee%¿ıío6lÜsÏ=üñ¤®®ç{€   ¦OŸÎÒ¥K©®®fÑ¢EÄÄÄPXXˆŸŸo¾ù&õõõ,_¾œªª*âââ?~<?ùÉOxûí·[´µ¢¢‚/¿ü’%K–°gÏ’’’8pà€ıCiúôé,Y²³ÙL\\ÇC£Ñ8î¨½Bèt:t:Ÿ~ú)ÉÉÉ”——ó“Ÿüä²ËÄÇÇÓ½{wÆ+w-^¼¥RÉ?şñ6Í?u|›wºâÓò=È.‹áW³0RÔ®p¡¡¡(
+BBBHKKÃf³a2™ø÷¿ÿÍ˜1cpwo<gÄÛÛ“ÉDyy¹ıKóÜÜ\|}}Ñh4œ:uÊş—nSo(**Šäädûüû÷ï'::šÂÂBÊËËíóçææ’šš
+@ff&±±±Û»iÓ&öïßÏwÜÁSO=Åîİ»Ù²eQQQX,fÌ˜€J¥"$$‡Ó===¶Wˆ&ÑÑÑxxxğöÛo“––F¿~ıÎW^^Î»ï¾ËÚµkå‚Î×håÊ•üú×¿n1­éÏö„ÀàÁƒ[LÏÏÏ—€ëjgµZùğÃÆC€ùË_HLLD§ÓñÔSO±~ızòòò¸ã;.’³ùÊ‡ l6
+…Âa;šÏãè"¨~~~øøøpîÜ9Ù½{7¯¿ş:;vì°‡ä¶mÛ Ø¶m%%%Œ5ÊáôÑ£G·©½¢ë©¬¬¤²²’Aƒ1hĞ RSSILLtp|ğJ¥’7ß|“¢¢"233yñÅ‰‹‹“b¶ÓŠ+°X,,\¸°UÈµçÂÈ—†›¸9n©ÓL&¸»»Ó£G²²²øşûïÉÏÏ¿âÀ“ôôtúöí‹««+*•
+£Ñ@JJ
+ÑÑÑxzz¢T*9r$§Nºªö¹»»3ş|ûÉ¸X,HMM%88˜ÒÒR²²²°ÙlÔÔÔ8î¬½B¤§§óğÃSYY‰ÕjåÔ©StïŞİéü?ü0«W¯fşüùL›6ƒÁÀc=&…¼†^Ü›o¾Ùjú3Ï<#Å‘Üµ)))!88˜£G2nÜ8âââÈÌÌ¤¸¸NçôÒ6çÏŸ'))‰?ıéO\¼x‘ÒÒR òòòX¿~=Ï>û,
+…‚äädöîİKxxx»Û–™™I||<¿ùÍoìKV­Z…Ùl&;;›„„şy¬V+ÅÅÅ¼ÿşûN§;k¯`Îœ9Ìœ9«ÕÊĞ¡CyğÁÎß­[7ºuë@QQ...ôèÑC
+yV­ZÀ¢E‹®jyGƒLÄ§˜;w®ÍÑ_×ò×gzz:¡¶A€\‹Rˆ&Îî&°zõj)Î-âÒSæÏŸß¦Û¯~õ«VÓ=Úâ±Á`À`0pag Šc„……&…‡©ƒ\ªK!şÏ™3g®Ûºä{¸›O.Õ%ÄMVYY)E÷OHÀ	qûÙ³g¡“óo]rˆRˆ›lÓ¦M¨ÕjFŒ———¤“¨¨¨àÀ$$$H1ºJÀ)•Ò)¢=ˆ'>>^ŠÑÅÈçe×÷z¯P«Õ`ú¾ñVìM#†„¢«kú<lú|lú¼$àÜİİñòò¢dA¶„œB8·’ÙxyyÙ/C(:Æu?D©Óé%55•’Ùø½‚vŒ»„œ8ä^]]S¸)ÏÚE§ÓIQ:SN¥R¡×ë‰ŒŒDyÖÖ¢''„n6"##Ñëõíº¾¥¸zp—†\FFùcÏI¥…]——¡‘¡n9àš‡œV«¥ºº“ÉÔâŠıBt5F£‘ÜÜ\)D¤T*Ñjµ¸»»£Óé$Ü:{À5…œ‡‡Çï DWàìZ”BˆúÃBJ „BN!„€B!$à„Bˆ8á#„âFé¨Ìqp2êQ!ÄÒQ™ãğ4½^B¡ ªªŠ††©¾Bˆë@j5x{{ß¸€S(èõzôz½¼B\'%%%„……I!„¸Ad‰B	8!„¢ÓÜš5kR!„·“5kÖ(”M?H9„BÜ.áğ¿ LÿÕçO~    IEND®B`‚                                                                                                                                                                                                                                                                                                                                                                                                                                                                          from __future__ import absolute_import, division
+
+import contextlib
+import itertools
+import logging
+import sys
+import time
+from signal import SIGINT, default_int_handler, signal
+
+from pip._vendor import six
+from pip._vendor.progress import HIDE_CURSOR, SHOW_CURSOR
+from pip._vendor.progress.bar import Bar, FillingCirclesBar, IncrementalBar
+from pip._vendor.progress.spinner import Spinner
+
+from pip._internal.utils.compat import WINDOWS
+from pip._internal.utils.logging import get_indentation
+from pip._internal.utils.misc import format_size
+from pip._internal.utils.typing import MYPY_CHECK_RUNNING
+
+if MYPY_CHECK_RUNNING:
+    from typing import Any, Iterator, IO
+
+try:
+    from pip._vendor import colorama
+# Lots of different errors can come from this, including SystemError and
+# ImportError.
+except Exception:
+    colorama = None
+
+logger = logging.getLogger(__name__)
+
+
+def _select_progress_class(preferred, fallback):
+    encoding = getattr(preferred.file, "encoding", None)
+
+    # If we don't know what encoding this file is in, then we'll just assume
+    # that it doesn't support unicode and use the ASCII bar.
+    if not encoding:
+        return fallback
+
+    # Collect all of the possible characters we want to use with the preferred
+    # bar.
+    characters = [
+        getattr(preferred, "empty_fill", six.text_type()),
+        getattr(preferred, "fill", six.text_type()),
+    ]
+    characters += list(getattr(preferred, "phases", []))
+
+    # Try to decode the characters we're using for the bar using the encoding
+    # of the given file, if this works then we'll assume that we can use the
+    # fancier bar and if not we'll fall back to the plaintext bar.
+    try:
+        six.text_type().join(characters).encode(encoding)
+    except UnicodeEncodeError:
+        return fallback
+    else:
+        return preferred
+
+
+_BaseBar = _select_progress_class(IncrementalBar, Bar)  # type: Any
+
+
+class InterruptibleMixin(object):
+    """
+    Helper to ensure that self.finish() gets called on keyboard interrupt.
+
+    This allows downloads to be interrupted without leaving temporary state
+    (like hidden cursors) behind.
+
+    This class is similar to the progress library's existing SigIntMixin
+    helper, but as of version 1.2, that helper has the following problems:
+
+    1. It calls sys.exit().
+    2. It discards the existing SIGINT handler completely.
+    3. It leaves its own handler in place even after an uninterrupted finish,
+       which will have unexpected delayed effects if the user triggers an
+       unrelated keyboard interrupt some time after a progress-displaying
+       download has already completed, for example.
+    """
+
+    def __init__(self, *args, **kwargs):
+        """
+        Save the original SIGINT handler for later.
+        """
+        super(InterruptibleMixin, self).__init__(*args, **kwargs)
+
+        self.original_handler = signal(SIGINT, self.handle_sigint)
+
+        # If signal() returns None, the previous handler was not installed from
+        # Python, and we cannot restore it. This probably should not happen,
+        # but if it does, we must restore something sensible instead, at least.
+        # The least bad option should be Python's default SIGINT handler, which
+        # just raises KeyboardInterrupt.
+        if self.original_handler is None:
+            self.original_handler = default_int_handler
+
+    def finish(self):
+        """
+        Restore the original SIGINT handler after finishing.
+
+        This should happen regardless of whether the progress display finishes
+        normally, or gets interrupted.
+        """
+        super(InterruptibleMixin, self).finish()
+        signal(SIGINT, self.original_handler)
+
+    def handle_sigint(self, signum, frame):
+        """
+        Call self.finish() before delegating to the original SIGINT handler.
+
+        This handler should only be in place while the progress display is
+        active.
+        """
+        self.finish()
+        self.original_handler(signum, frame)
+
+
+class SilentBar(Bar):
+
+    def update(self):
+        pass
+
+
+class BlueEmojiBar(IncrementalBar):
+
+    suffix = "%(percent)d%%"
+    bar_prefix = " "
+    bar_suffix = " "
+    phases = (u"\U0001F539", u"\U0001F537", u"\U0001F535")  # type: Any
+
+
+class DownloadProgressMixin(object):
+
+    def __init__(self, *args, **kwargs):
+        super(DownloadProgressMixin, self).__init__(*args, **kwargs)
+        self.message = (" " * (get_indentation() + 2)) + self.message
+
+    @property
+    def downloaded(self):
+        return format_size(self.index)
+
+    @property
+    def download_speed(self):
+        # Avoid zero division errors...
+        if self.avg == 0.0:
+            return "..."
+        return format_size(1 / self.avg) + "/s"
+
+    @property
+    def pretty_eta(self):
+        if self.eta:
+            return "eta %s" % self.eta_td
+        return ""
+
+    def iter(self, it, n=1):
+        for x in it:
+            yield x
+            self.next(n)
+        self.finish()
+
+
+class WindowsMixin(object):
+
+    def __init__(self, *args, **kwargs):
+        # The Windows terminal does not support the hide/show cursor ANSI codes
+        # even with colorama. So we'll ensure that hide_cursor is False on
+        # Windows.
+        # This call needs to go before the super() call, so that hide_cursor
+        # is set in time. The base progress bar class writes the "hide cursor"
+        # code to the terminal in its init, so if we don't set this soon
+        # enough, we get a "hide" with no corresponding "show"...
+        if WINDOWS and self.hide_cursor:
+            self.hide_cursor = False
+
+        super(WindowsMixin, self).__init__(*args, **kwargs)
+
+        # Check if we are running on Windows and we have the colorama module,
+        # if we do then wrap our file with it.
+        if WINDOWS and colorama:
+            self.file = colorama.AnsiToWin32(self.file)
+            # The progress code expects to be able to call self.file.isatty()
+            # but the colorama.AnsiToWin32() object doesn't have that, so we'll
+            # add it.
+            self.file.isatty = lambda: self.file.wrapped.isatty()
+            # The progress code expects to be able to call self.file.flush()
+            # but the colorama.AnsiToWin32() object doesn't have that, so we'll
+            # add it.
+            self.file.flush = lambda: self.file.wrapped.flush()
+
+
+class BaseDownloadProgressBar(WindowsMixin, InterruptibleMixin,
+                              DownloadProgressMixin):
+
+    file = sys.stdout
+    message = "%(percent)d%%"
+    suffix = "%(downloaded)s %(download_speed)s %(pretty_eta)s"
+
+# NOTE: The "type: ignore" comments on the following classes are there to
+#       work around https://github.com/python/typing/issues/241
+
+
+class DefaultDownloadProgressBar(BaseDownloadProgressBar,
+                                 _BaseBar):
+    pass
+
+
+class DownloadSilentBar(BaseDownloadProgressBar, SilentBar):  # type: ignore
+    pass
+
+
+class DownloadBar(BaseDownloadProgressBar,  # type: ignore
+                  Bar):
+    pass
+
+
+class DownloadFillingCirclesBar(BaseDownloadProgressBar,  # type: ignore
+                                FillingCirclesBar):
+    pass
+
+
+class DownloadBlueEmojiProgressBar(BaseDownloadProgressBar,  # type: ignore
+                                   BlueEmojiBar):
+    pass
+
+
+class DownloadProgressSpinner(WindowsMixin, InterruptibleMixin,
+                              DownloadProgressMixin, Spinner):
+
+    file = sys.stdout
+    suffix = "%(downloaded)s %(download_speed)s"
+
+    def next_phase(self):
+        if not hasattr(self, "_phaser"):
+            self._phaser = itertools.cycle(self.phases)
+        return next(self._phaser)
+
+    def update(self):
+        message = self.message % self
+        phase = self.next_phase()
+        suffix = self.suffix % self
+        line = ''.join([
+            message,
+            " " if message else "",
+            phase,
+            " " if suffix else "",
+            suffix,
+        ])
+
+        self.writeln(line)
+
+
+BAR_TYPES = {
+    "off": (DownloadSilentBar, DownloadSilentBar),
+    "on": (DefaultDownloadProgressBar, DownloadProgressSpinner),
+    "ascii": (DownloadBar, DownloadProgressSpinner),
+    "pretty": (DownloadFillingCirclesBar, DownloadProgressSpinner),
+    "emoji": (DownloadBlueEmojiProgressBar, DownloadProgressSpinner)
+}
+
+
+def DownloadProgressProvider(progress_bar, max=None):
+    if max is None or max == 0:
+        return BAR_TYPES[progress_bar][1]().iter
+    else:
+        return BAR_TYPES[progress_bar][0](max=max).iter
+
+
+################################################################
+# Generic "something is happening" spinners
+#
+# We don't even try using progress.spinner.Spinner here because it's actually
+# simpler to reimplement from scratch than to coerce their code into doing
+# what we need.
+################################################################
+
+@contextlib.contextmanager
+def hidden_cursor(file):
+    # type: (IO) -> Iterator[None]
+    # The Windows terminal does not support the hide/show cursor ANSI codes,
+    # even via colorama. So don't even try.
+    if WINDOWS:
+        yield
+    # We don't want to clutter the output with control characters if we're
+    # writing to a file, or if the user is running with --quiet.
+    # See https://github.com/pypa/pip/issues/3418
+    elif not file.isatty() or logger.getEffectiveLevel() > logging.INFO:
+        yield
+    else:
+        file.write(HIDE_CURSOR)
+        try:
+            yield
+        finally:
+            file.write(SHOW_CURSOR)
+
+
+class RateLimiter(object):
+    def __init__(self, min_update_interval_seconds):
+        # type: (float) -> None
+        self._min_update_interval_seconds = min_update_interval_seconds
+        self._last_update = 0  # type: float
+
+    def ready(self):
+        # type: () -> bool
+        now = time.time()
+        delta = now - self._last_update
+        return delta >= self._min_update_interval_seconds
+
+    def reset(self):
+        # type: () -> None
+        self._last_update = time.time()
+
+
+class SpinnerInterface(object):
+    def spin(self):
+        # type: () -> None
+        raise NotImplementedError()
+
+    def finish(self, final_status):
+        # type: (str) -> None
+        raise NotImplementedError()
+
+
+class InteractiveSpinner(SpinnerInterface):
+    def __init__(self, message, file=None, spin_chars="-\\|/",
+                 # Empirically, 8 updates/second looks nice
+                 min_update_interval_seconds=0.125):
+        self._message = message
+        if file is None:
+            file = sys.stdout
+        self._file = file
+        self._rate_limiter = RateLimiter(min_update_interval_seconds)
+        self._finished = False
+
+        self._spin_cycle = itertools.cycle(spin_chars)
+
+        self._file.write(" " * get_indentation() + self._message + " ... ")
+        self._width = 0
+
+    def _write(self, status):
+        assert not self._finished
+        # Erase what we wrote before by backspacing to the beginning, writing
+        # spaces to overwrite the old text, and then backspacing again
+        backup = "\b" * self._width
+        self._file.write(backup + " " * self._width + backup)
+        # Now we have a blank slate to add our status
+        self._file.write(status)
+        self._width = len(status)
+        self._file.flush()
+        self._rate_limiter.reset()
+
+    def spin(self):
+        # type: () -> None
+        if self._finished:
+            return
+        if not self._rate_limiter.ready():
+            return
+        self._write(next(self._spin_cycle))
+
+    def finish(self, final_status):
+        # type: (str) -> None
+        if self._finished:
+            return
+        self._write(final_status)
+        self._file.write("\n")
+        self._file.flush()
+        self._finished = True
+
+
+# Used for dumb terminals, non-interactive installs (no tty), etc.
+# We still print updates occasionally (once every 60 seconds by default) to
+# act as a keep-alive for systems like Travis-CI that take lack-of-output as
+# an indication that a task has frozen.
+class NonInteractiveSpinner(SpinnerInterface):
+    def __in

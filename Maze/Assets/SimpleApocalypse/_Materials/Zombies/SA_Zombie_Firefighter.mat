@@ -1,0 +1,65 @@
+//===- RTDyldObjectLinkingLayer.h - RTDyld-based jit linking  ---*- C++ -*-===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+//
+// Contains the definition for an RTDyld-based, in-process object linking layer.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef LLVM_EXECUTIONENGINE_ORC_RTDYLDOBJECTLINKINGLAYER_H
+#define LLVM_EXECUTIONENGINE_ORC_RTDYLDOBJECTLINKINGLAYER_H
+
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/ExecutionEngine/JITSymbol.h"
+#include "llvm/ExecutionEngine/RuntimeDyld.h"
+#include "llvm/Object/ObjectFile.h"
+#include "llvm/Support/Error.h"
+#include <algorithm>
+#include <cassert>
+#include <functional>
+#include <list>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace llvm {
+namespace orc {
+
+class RTDyldObjectLinkingLayerBase {
+public:
+
+  using ObjectPtr =
+    std::shared_ptr<object::OwningBinary<object::ObjectFile>>;
+
+protected:
+
+  /// @brief Holds an object to be allocated/linked as a unit in the JIT.
+  ///
+  /// An instance of this class will be created for each object added
+  /// via JITObjectLayer::addObject. Deleting the instance (via
+  /// removeObject) frees its memory, removing all symbol definitions that
+  /// had been provided by this instance. Higher level layers are responsible
+  /// for taking any action required to handle the missing symbols.
+  class LinkedObject {
+  public:
+    LinkedObject() = default;
+    LinkedObject(const LinkedObject&) = delete;
+    void operator=(const LinkedObject&) = delete;
+    virtual ~LinkedObject() = default;
+
+    virtual void finalize() = 0;
+
+    virtual JITSymbol::GetAddressFtor
+    getSymbolMaterializer(std::string Name) = 0;
+
+    virtual void mapSectionAddress(const void *LocalAddress,
+                                   JITTargetAddress TargetAddr) const = 0;
+

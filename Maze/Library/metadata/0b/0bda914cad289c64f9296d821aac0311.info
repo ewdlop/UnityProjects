@@ -1,0 +1,175 @@
+//===-- X86MCTargetDesc.cpp - X86 Target Descriptions ---------------------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+//
+// This file provides X86 specific target descriptions.
+//
+//===----------------------------------------------------------------------===//
+
+#include "X86MCTargetDesc.h"
+#include "InstPrinter/X86ATTInstPrinter.h"
+#include "InstPrinter/X86IntelInstPrinter.h"
+#include "X86MCAsmInfo.h"
+#include "llvm/ADT/Triple.h"
+#include "llvm/DebugInfo/CodeView/CodeView.h"
+#include "llvm/MC/MCInstrAnalysis.h"
+#include "llvm/MC/MCInstrInfo.h"
+#include "llvm/MC/MCRegisterInfo.h"
+#include "llvm/MC/MCStreamer.h"
+#include "llvm/MC/MCSubtargetInfo.h"
+#include "llvm/MC/MachineLocation.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/Host.h"
+#include "llvm/Support/TargetRegistry.h"
+
+#if _MSC_VER
+#include <intrin.h>
+#endif
+
+using namespace llvm;
+
+#define GET_REGINFO_MC_DESC
+#include "X86GenRegisterInfo.inc"
+
+#define GET_INSTRINFO_MC_DESC
+#include "X86GenInstrInfo.inc"
+
+#define GET_SUBTARGETINFO_MC_DESC
+#include "X86GenSubtargetInfo.inc"
+
+std::string X86_MC::ParseX86Triple(const Triple &TT) {
+  std::string FS;
+  if (TT.getArch() == Triple::x86_64)
+    FS = "+64bit-mode,-32bit-mode,-16bit-mode";
+  else if (TT.getEnvironment() != Triple::CODE16)
+    FS = "-64bit-mode,+32bit-mode,-16bit-mode";
+  else
+    FS = "-64bit-mode,-32bit-mode,+16bit-mode";
+
+  return FS;
+}
+
+unsigned X86_MC::getDwarfRegFlavour(const Triple &TT, bool isEH) {
+  if (TT.getArch() == Triple::x86_64)
+    return DWARFFlavour::X86_64;
+
+  if (TT.isOSDarwin())
+    return isEH ? DWARFFlavour::X86_32_DarwinEH : DWARFFlavour::X86_32_Generic;
+  if (TT.isOSCygMing())
+    // Unsupported by now, just quick fallback
+    return DWARFFlavour::X86_32_Generic;
+  return DWARFFlavour::X86_32_Generic;
+}
+
+void X86_MC::initLLVMToSEHAndCVRegMapping(MCRegisterInfo *MRI) {
+  // FIXME: TableGen these.
+  for (unsigned Reg = X86::NoRegister + 1; Reg < X86::NUM_TARGET_REGS; ++Reg) {
+    unsigned SEH = MRI->getEncodingValue(Reg);
+    MRI->mapLLVMRegToSEHReg(Reg, SEH);
+  }
+
+  // Mapping from CodeView to MC register id.
+  static const struct {
+    codeview::RegisterId CVReg;
+    MCPhysReg Reg;
+  } RegMap[] = {
+    { codeview::RegisterId::AL, X86::AL},
+    { codeview::RegisterId::CL, X86::CL},
+    { codeview::RegisterId::DL, X86::DL},
+    { codeview::RegisterId::BL, X86::BL},
+    { codeview::RegisterId::AH, X86::AH},
+    { codeview::RegisterId::CH, X86::CH},
+    { codeview::RegisterId::DH, X86::DH},
+    { codeview::RegisterId::BH, X86::BH},
+    { codeview::RegisterId::AX, X86::AX},
+    { codeview::RegisterId::CX, X86::CX},
+    { codeview::RegisterId::DX, X86::DX},
+    { codeview::RegisterId::BX, X86::BX},
+    { codeview::RegisterId::SP, X86::SP},
+    { codeview::RegisterId::BP, X86::BP},
+    { codeview::RegisterId::SI, X86::SI},
+    { codeview::RegisterId::DI, X86::DI},
+    { codeview::RegisterId::EAX, X86::EAX},
+    { codeview::RegisterId::ECX, X86::ECX},
+    { codeview::RegisterId::EDX, X86::EDX},
+    { codeview::RegisterId::EBX, X86::EBX},
+    { codeview::RegisterId::ESP, X86::ESP},
+    { codeview::RegisterId::EBP, X86::EBP},
+    { codeview::RegisterId::ESI, X86::ESI},
+    { codeview::RegisterId::EDI, X86::EDI},
+
+    { codeview::RegisterId::EFLAGS, X86::EFLAGS},
+
+    { codeview::RegisterId::ST0, X86::FP0},
+    { codeview::RegisterId::ST1, X86::FP1},
+    { codeview::RegisterId::ST2, X86::FP2},
+    { codeview::RegisterId::ST3, X86::FP3},
+    { codeview::RegisterId::ST4, X86::FP4},
+    { codeview::RegisterId::ST5, X86::FP5},
+    { codeview::RegisterId::ST6, X86::FP6},
+    { codeview::RegisterId::ST7, X86::FP7},
+
+    { codeview::RegisterId::XMM0, X86::XMM0},
+    { codeview::RegisterId::XMM1, X86::XMM1},
+    { codeview::RegisterId::XMM2, X86::XMM2},
+    { codeview::RegisterId::XMM3, X86::XMM3},
+    { codeview::RegisterId::XMM4, X86::XMM4},
+    { codeview::RegisterId::XMM5, X86::XMM5},
+    { codeview::RegisterId::XMM6, X86::XMM6},
+    { codeview::RegisterId::XMM7, X86::XMM7},
+
+    { codeview::RegisterId::XMM8, X86::XMM8},
+    { codeview::RegisterId::XMM9, X86::XMM9},
+    { codeview::RegisterId::XMM10, X86::XMM10},
+    { codeview::RegisterId::XMM11, X86::XMM11},
+    { codeview::RegisterId::XMM12, X86::XMM12},
+    { codeview::RegisterId::XMM13, X86::XMM13},
+    { codeview::RegisterId::XMM14, X86::XMM14},
+    { codeview::RegisterId::XMM15, X86::XMM15},
+
+    { codeview::RegisterId::SIL, X86::SIL},
+    { codeview::RegisterId::DIL, X86::DIL},
+    { codeview::RegisterId::BPL, X86::BPL},
+    { codeview::RegisterId::SPL, X86::SPL},
+    { codeview::RegisterId::RAX, X86::RAX},
+    { codeview::RegisterId::RBX, X86::RBX},
+    { codeview::RegisterId::RCX, X86::RCX},
+    { codeview::RegisterId::RDX, X86::RDX},
+    { codeview::RegisterId::RSI, X86::RSI},
+    { codeview::RegisterId::RDI, X86::RDI},
+    { codeview::RegisterId::RBP, X86::RBP},
+    { codeview::RegisterId::RSP, X86::RSP},
+    { codeview::RegisterId::R8, X86::R8},
+    { codeview::RegisterId::R9, X86::R9},
+    { codeview::RegisterId::R10, X86::R10},
+    { codeview::RegisterId::R11, X86::R11},
+    { codeview::RegisterId::R12, X86::R12},
+    { codeview::RegisterId::R13, X86::R13},
+    { codeview::RegisterId::R14, X86::R14},
+    { codeview::RegisterId::R15, X86::R15},
+    { codeview::RegisterId::R8B, X86::R8B},
+    { codeview::RegisterId::R9B, X86::R9B},
+    { codeview::RegisterId::R10B, X86::R10B},
+    { codeview::RegisterId::R11B, X86::R11B},
+    { codeview::RegisterId::R12B, X86::R12B},
+    { codeview::RegisterId::R13B, X86::R13B},
+    { codeview::RegisterId::R14B, X86::R14B},
+    { codeview::RegisterId::R15B, X86::R15B},
+    { codeview::RegisterId::R8W, X86::R8W},
+    { codeview::RegisterId::R9W, X86::R9W},
+    { codeview::RegisterId::R10W, X86::R10W},
+    { codeview::RegisterId::R11W, X86::R11W},
+    { codeview::RegisterId::R12W, X86::R12W},
+    { codeview::RegisterId::R13W, X86::R13W},
+    { codeview::RegisterId::R14W, X86::R14W},
+    { codeview::RegisterId::R15W, X86::R15W},
+    { codeview::RegisterId::R8D, X86::R8D},
+    { codeview::RegisterId::R9D, X86::R9D},
+    { codeview::RegisterId::R10D, X86::R10D},
+    { codeview::RegisterId::R11D, X86::R11D},
+    { codeview::RegisterId::R12D, X86:

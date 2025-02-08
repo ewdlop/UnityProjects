@@ -1,0 +1,1321 @@
+Ôªø//------------------------------------------------------------------------------
+// <copyright file="CoordinatorScratchpad.cs" company="Microsoft">
+//     Copyright (c) Microsoft Corporation.  All rights reserved.
+// </copyright>
+// <owner current="true" primary="true">Microsoft</owner>
+// <owner current="true" primary="false">Microsoft</owner>
+//------------------------------------------------------------------------------
+
+using System.Collections.Generic;
+using System.Data.Objects.ELinq;
+using System.Data.Query.InternalTrees;
+using System.Diagnostics;
+using System.Linq;
+using System.Linq.Expressions;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Security;
+using System.Security.Permissions;
+
+namespace System.Data.Common.Internal.Materialization
+{
+    /// <summary>
+    /// Used in the Translator to aggregate information about a (nested) reader 
+    /// coordinator. After the translator visits the columnMaps, it will compile
+    /// the coordinator(s) which produces an immutable CoordinatorFactory that 
+    /// can be shared amongst many query instances.
+    /// </summary>
+    internal class CoordinatorScratchpad
+    {
+        #region private state
+
+        private readonly Type _elementType;
+        private CoordinatorScratchpad _parent;
+        private readonly List<CoordinatorScratchpad> _nestedCoordinatorScratchpads;
+        /// <summary>
+        /// Map from original expressions to expressions with detailed error handling.
+        /// </summary>
+        private readonly Dictionary<Expression, Expression> _expressionWithErrorHandlingMap;
+        /// <summary>
+        /// Expressions that should be precompiled (i.e. reduced to constants in 
+        /// compiled delegates.
+        /// </summary>
+        private readonly HashSet<LambdaExpression> _inlineDelegates;
+
+        #endregion
+
+        #region constructor
+
+        internal CoordinatorScratchpad(Type elementType)
+        {
+            _elementType = elementType;
+            _nestedCoordinatorScratchpads = new List<CoordinatorScratchpad>();
+            _expressionWithErrorHandlingMap = new Dictionary<Expression, Expression>();
+            _inlineDelegates = new HashSet<LambdaExpression>();
+        }
+
+        #endregion
+
+        #region "public" surface area
+
+        /// <summary>
+        /// For nested collections, returns the parent coordinator.
+        /// </summary>
+        internal CoordinatorScratchpad Parent
+        {
+            get { return _parent; }
+        }
+
+        /// <summary>
+        /// Gets or sets an Expression setting key values (these keys are used
+        /// to determine when a collection has entered a new chapter) from the
+        /// underlying store data reader.
+        /// </summary>
+        internal Expression SetKeys { get; set; }
+
+        /// <summary>
+        /// Gets or sets an Expression returning 'true' when the key values for 
+        /// the current nested result (see SetKeys) are equal to the current key  
+        /// values on the underlying data reader.
+        /// </summary>
+        internal Expression CheckKeys { get; set; }
+
+        /// <summary>
+        /// Gets or sets an expression returning 'true' if the current row in 
+        /// the underlying data reader contains an element of the collection.
+        /// </summary>
+        internal Expression HasData { get; set; }
+
+        /// <summary>
+        /// Gets or sets an Expression yielding an element of the current collection
+        /// given values in the underlying data reader.
+        /// </summary>
+        internal Expression Element { get; set; }
+
+        /// <summary>
+        /// Gets or sets an Expression initializing the collection storing results from this coordinator.
+        /// </summary>
+        internal Expression InitializeCollection { get; set; }
+
+        /// <summary>
+        /// Indicates which Shaper.State slot is home for this collection's coordinator.
+        /// Used by Parent to pull out nested collection aggregators/streamers.
+        /// </summary>
+        internal int StateSlotNumber { get; set; }
+
+        /// <summary>
+        /// Gets or sets the depth of the current coordinator. A root collection has depth 0.
+        /// </summary>
+        internal int Depth { get; set; }
+
+        /// <summary>
+        /// List of all record types that we can return at this level in the query.
+        /// </summary>
+        private List<RecordStateScratchpad> _recordStateScratchpads;
+
+        /// <summary>
+        /// Allows sub-expressions to register an 'interest' in exceptions thrown when reading elements
+        /// for this coordinator. When an exception is thrown, we rerun the delegate using the slower
+        /// but more error-friendly versions of expressions (e.g. reader.GetValue + type check instead
+        /// of reader.GetInt32())
+        /// </summary>
+        /// <param name="expression">The lean and mean raw version of the expression</param>
+        /// <param name="expressionWithErrorHandling">The slower version of the same expression with better
+        /// error handling</param>
+        internal void AddExpressionWithErrorHandling(Expression expression, Expression expressionWithErrorHandling)
+        {
+            _expressionWithErrorHandlingMap[expression] = expressionWithErrorHandling;
+        }
+
+        /// <summary>
+        /// Registers a lambda expression for pre-compilation (i.e. reduction to a constant expression)
+        /// within materialization expression. Otherwise, the expression will be compiled every time
+        /// the enclosing delegate is invoked.
+        /// </summary>
+        /// <param name="expression">Lambda expression to register.</param>
+        internal void AddInlineDelegate(LambdaExpression expression)
+        {
+            _inlineDelegates.Add(expression);
+        }
+
+        /// <summary>
+        /// Registers a coordinator for a nested collection contained in elements of this collection.
+        /// </summary>
+        internal void AddNestedCoordinator(CoordinatorScratchpad nested)
+        {
+            Debug.Assert(nested.Depth == this.Depth + 1, "can only nest depth + 1");
+            nested._parent = this;
+            _nestedCoordinatorScratchpads.Add(nested);
+        }
+
+        /// <summary>
+        /// Use the information stored on the scratchpad to compile an immutable factory used
+        /// to construct the coordinators used at runtime when materializing results.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.NoOptimization)]
+        internal CoordinatorFactory Compile()
+        {
+            RecordStateFactory[] recordStateFactories;
+            if (null != _recordStateScratchpads)
+            {
+                recordStateFactories = new RecordStateFactory[_recordStateScratchpads.Count];
+                for (int i = 0; i < recordStateFactories.Length; i++)
+                {
+                    recordStateFactories[i] = _recordStateScratchpads[i].Compile();
+                }
+            }
+            else
+            {
+                recordStateFactories = new RecordStateFactory[0];
+            }
+
+            CoordinatorFactory[] nestedCoordinators = new CoordinatorFactory[_nestedCoordinatorScratchpads.Count];
+            for (int i = 0; i < nestedCoordinators.Length; i++)
+            {
+                nestedCoordinators[i] = _nestedCoordinatorScratchpads[i].Compile();
+            }
+
+            // compile inline delegates
+            ReplacementExpressionVisitor replacementVisitor = new ReplacementExpressionVisitor(null, this._inlineDelegates);
+            Expression element = new SecurityBoundaryExpressionVisitor().Visit(replacementVisitor.Visit(this.Element));
+
+            // substitute expressions that have error handlers into a new expression (used
+            // when a more detailed exception message is needed)
+            replacementVisitor = new ReplacementExpressionVisitor(this._expressionWithErrorHandlingMap, this._inlineDelegates);
+            Expression elementWithErrorHandling = new SecurityBoundaryExpressionVisitor().Visit(replacementVisitor.Visit(this.Element));
+
+            CoordinatorFactory result = (CoordinatorFactory)Activator.CreateInstance(typeof(CoordinatorFactory<>).MakeGenericType(_elementType), new object[] {
+                                                            this.Depth, 
+                                                            this.StateSlotNumber, 
+                                                            this.HasData, 
+                                                            this.SetKeys, 
+                                                            this.CheckKeys, 
+                                                            nestedCoordinators, 
+                                                            element,
+                                                            elementWithErrorHandling,
+                                                            this.InitializeCollection,
+                                                            recordStateFactories
+                                                            });
+            return result;
+        }
+
+        /// <summary>
+        /// Allocates a new RecordStateScratchpad and adds it to the list of the ones we're
+        /// responsible for; will create the list if it hasn't alread been created.
+        /// </summary>
+        internal RecordStateScratchpad CreateRecordStateScratchpad()
+        {
+            RecordStateScratchpad recordStateScratchpad = new RecordStateScratchpad();
+
+            if (null == _recordStateScratchpads)
+            {
+                _recordStateScratchpads = new List<RecordStateScratchpad>();
+            }
+            _recordStateScratchpads.Add(recordStateScratchpad);
+            return recordStateScratchpad;
+        }
+        #endregion
+
+        #region Nested types
+
+        /// <summary>
+        /// Visitor supporting (non-recursive) replacement of LINQ sub-expressions and
+        /// compilation of inline delegates.
+        /// </summary>
+        private class ReplacementExpressionVisitor : EntityExpressionVisitor
+        {
+            // Map from original expressions to replacement expressions.
+            private readonly Dictionary<Expression, Expression> _replacementDictionary;
+            private readonly HashSet<LambdaExpression> _inlineDelegates;
+
+            internal ReplacementExpressionVisitor(Dictionary<Expression, Expression> replacementDictionary,
+                HashSet<LambdaExpression> inlineDelegates)
+            {
+                this._replacementDictionary = replacementDictionary;
+                this._inlineDelegates = inlineDelegates;
+            }
+
+            internal override Expression Visit(Expression expression)
+            {
+                if (null == expression)
+                {
+                    return expression;
+                }
+
+                Expression result;
+
+                // check to see if a substitution has been provided for this expression
+                Expression replacement;
+                if (null != this._replacementDictionary && this._replacementDictionary.TryGetValue(expression, out replacement))
+                {
+                    // once a substitution is found, we stop walking the sub-expression and
+                    // return immediately (since recursive replacement is not needed or wanted)
+                    result = replacement;
+                }
+                else
+                {
+                    // check if we need to precompile an inline delegate
+                    bool preCompile = false;
+                    LambdaExpression lambda = null;
+
+                    if (expression.NodeType == ExpressionType.Lambda &&
+                        null != _inlineDelegates)
+                    {
+                        lambda = (LambdaExpression)expression;
+                        preCompile = _inlineDelegates.Contains(lambda);
+                    }
+
+                    if (preCompile)
+                    {
+                        // do replacement in the body of the lambda expression
+                        Expression body = Visit(lambda.Body);
+
+                        // compile to a delegate
+                        result = Expression.Constant(Translator.Compile(body.Type, body));
+                    }
+                    else
+                    {
+                        result = base.Visit(expression);
+                    }
+                }
+
+                return result;
+            }
+        }
+
+        /// <summary>
+        /// Used to replace references to user expressions with compiled delegates
+        /// which represent those expressions.
+        /// </summary>
+        /// <remarks>
+        /// The materialization delegate used to be one big function, which included
+        /// user-provided expressions in various places in the tree. Due to security reasons
+        /// (Dev11 311339), we need to separate this delegate into two pieces: trusted code,
+        /// run under a security assert, and untrusted code, run under the current AppDomain's
+        /// permission set.
+        /// 
+        /// This visitor does that separation by compiling the untrusted code into delegates
+        /// and re-inserting them back into the expression tree. When the untrusted code is
+        /// run, it will run in another stack frame that does not have a security assert
+        /// associated with it; therefore, any attempt to take advantage of MemberAccess
+        /// reflection permissions will be blocked by the CLR.
+        /// 
+        /// The compiled user delegates accept two parameters, one of type DbDataReader
+        /// to speed up access to the current reader, and the other of type object[],
+        /// which contains all other values that they might require to correctly materialize an object. Most of these
+        /// objects require the <see cref="Shaper"/>, so they must be run inside of trusted code.
+        /// </remarks>
+        private sealed class SecurityBoundaryExpressionVisitor : EntityExpressionVisitor
+        {
+            private static readonly MethodInfo s_userMaterializationFuncInvokeMethod = typeof(Func<DbDataReader, object[], object>).GetMethod("Invoke");
+            private ParameterExpression _values = Expression.Parameter(typeof(object[]), "values");
+            private ParameterExpression _reader = Expression.Parameter(typeof(DbDataReader), "reader");
+            private List<Expression> _initializationArguments = new List<Expression>();
+            private int _userExpressionDepth;
+
+            /// <summary>
+            /// Used to track the type of a constructor argument or member assignment
+            /// when it could be a special type we create (e.g., CompensatingCollection{T}
+            /// for collections and Grouping{K,V} for groups).
+            /// </summary>
+            private Type _userArgumentType;
+
+            internal override Expression Visit(Expression exp)
+            {
+                if (exp == null)
+                {
+                    return exp;
+                }
+
+                var nex = exp as NewExpression;
+                if (nex != null && _userExpressionDepth >= 1)
+                {
+                    // We are creating an internal type like CompensatingCollection<T> or Grouping<K, V>
+                    // and at this particular point we are sure that the user isn't creating these
+                    // since this.userArgumentType is not null.
+                    if (_userArgumentType != null && !nex.Type.IsPublic && nex.Type.Assembly == typeof(SecurityBoundaryExpressionVisitor).Assembly)
+                    {
+                        return this.CreateInitializationArgumentReplacement(nex, _userArgumentType);
+                    }
+
+                    var constructorParameters = nex.Constructor.GetParameters();
+                    var arguments = nex.Arguments;
+                    var newArguments = new List<Expression>();
+                    for (var i = 0; i < arguments.Count; ++i)
+                    {
+                        var argument = arguments[i];
+
+                        // Visit this argument because it itself could be a user expression e.g.
+                        // new { Argument = new SecureString { m_length = 32 } }
+                        _userArgumentType = constructorParameters[i].ParameterType;
+                        var visitedArgument = this.Visit(argument);
+
+                        // If it hasn't changed, it's trusted code. (Untrusted code would have its
+                        // Convert and MarkAsUserExpression expressions removed.)
+                        if (visitedArgument == argument)
+                        {
+                            var convert = this.CreateInitializationArgumentReplacement(argument);
+
+                            // Change the argument to access the values array.
+                            newArguments.Add(convert);
+                        }
+                        else
+                        {
+                            newArguments.Add(visitedArgument);
+                        }
+                    }
+
+                    nex = Expression.New(nex.Constructor, newArguments);
+
+                    if (_userExpressionDepth == 1)
+                    {
+                        var userMaterializationFunc = Expression.Lambda<Func<DbDataReader, object[], object>>(nex, _reader, _values).Compile();
+
+                        // Convert the constructor invocation into a func that runs without elevated permissions.
+                        return Expression.Convert(
+                            Expression.Call(
+                                Expression.Constant(userMaterializationFunc),
+                                s_userMaterializationFuncInvokeMethod,
+                                Translator.Shaper_Reader,
+                                Expression.NewArrayInit(typeof(object), _initializationArguments)),
+                            nex.Type);
+                    }
+
+                    return nex;
+                }
+
+                return base.Visit(exp);
+            }
+
+            internal override Expression VisitConditional(ConditionalExpression c)
+            {
+                if (_userExpressionDepth >= 1 && _userArgumentType != null)
+                {
+                    var test = c.Test as MethodCallExpression;
+                    var ifFalse = c.IfFalse as MethodCallExpression;
+
+                    // We can optimize the path that checks for DbNull and then
+                    // reads a value directly off the reader or invokes another user expression.
+                    if (test != null && test.Object != null
+                        && typeof(DbDataReader).IsAssignableFrom(test.Object.Type)
+                        && test.Method.Name == "IsDBNull")
+                    {
+                        if (ifFalse != null && (ifFalse.Object != null && typeof(DbDataReader).IsAssignableFrom(ifFalse.Object.Type) || IsUserExpressionMethod(ifFalse.Method)))
+                        {
+                            return base.VisitConditional(c);
+                        }
+                    }
+
+                    // If there's something more complicated then we have to replace it all.
+                    // We can't just replace the false expression because it may not be evaluated
+                    // if the test returns true.
+                    return this.CreateInitializationArgumentReplacement(c);
+                }
+
+                return base.VisitConditional(c);
+            }
+
+            internal override Expression VisitMemberAccess(MemberExpression m)
+            {
+                if (_userExpressionDepth >= 1)
+                {
+                    // Sometimes we will add expressions inside of a user expression that is actually
+                    // our code, but we need to rewrite it since it accesses the shaper's reader to check if a column is null.
+                    // e.g. Select(x => new { Y = new Entity { Name = x.Name } })
+                    // -> new f<>__AnonymousType`1(IIF($shaper.Reader.IsDbNull(0), null, new Entity { Name = $shaper.Reader.GetString(0) }))
+                    if (typeof(DbDataReader).IsAssignableFrom(m.Type))
+                    {
+                        var shaper = m.Expression as ParameterExpression;
+                        if (shaper != null && shaper == Translator.Shaper_Parameter)
+                        {
+                            return _reader;
+                        }
+                    }
+                }
+
+                return base.VisitMemberAccess(m);
+            }
+
+            internal override Expression VisitMemberInit(MemberInitExpression init)
+            {
+                if (_userExpressionDepth >= 1)
+                {
+                    var newMemberInit = base.VisitMemberInit(init);
+
+                    // Only compile into a delegate if this is the top-level user expression.
+                    if (newMemberInit != init && _userExpressionDepth == 1)
+                    {
+                        var userMaterializationFunc = Expression.Lambda<Func<DbDataReader, object[], object>>(newMemberInit, _reader, _values).Compile();
+
+                        // Convert the object initializer into a func that runs without elevated permissions.
+                        return Expression.Convert(
+                            Expression.Call(
+                                Expression.Constant(userMaterializationFunc),
+                                s_userMaterializationFuncInvokeMethod,
+                                Translator.Shaper_Reader,
+                                Expression.NewArrayInit(typeof(object), _initializationArguments)),
+                            init.Type);
+                    }
+                    else
+                    {
+                        return newMemberInit;
+                    }
+                }
+
+                return base.VisitMemberInit(init);
+            }
+
+            internal override MemberAssignment VisitMemberAssignment(MemberAssignment assignment)
+            {
+                if (_userExpressionDepth >= 1)
+                {
+                    var fieldInfo = assignment.Member as FieldInfo;
+                    var propertyInfo = assignment.Member as PropertyInfo;
+                    if (fieldInfo != null)
+                    {
+                        _userArgumentType = fieldInfo.FieldType;
+                    }
+                    else if (propertyInfo != null)
+                    {
+                        _userArgumentType = propertyInfo.PropertyType;
+                    }
+                }
+
+                return base.VisitMemberAssignment(assignment);
+            }
+
+            internal override Expression VisitMethodCall(MethodCallExpression m)
+            {
+                var method = m.Method;
+                if (IsUserExpressionMethod(method))
+                {
+                    Debug.Assert(
+                        m.Arguments.Count == 1,
+                        "m.Arguments.Count == 1",
+                        "There should be one expression argument provided to the user expression marker.");
+
+                    try
+                    {
+                        // Clear this type because we are about to process a user expression
+                        _userArgumentType = null;
+
+                        _userExpressionDepth++;
+                        return this.Visit(m.Arguments[0]);
+                    }
+                    finally
+                    {
+                        _userExpressionDepth--;
+                    }
+                }
+                else if (_userExpressionDepth >= 1)
+                {
+                    // If this method call is on a DbDataReader then we can replace it; otherwise,
+                    // assume it's something on the shaper and extract the value into the values array.
+                    if (m.Object != null && typeof(DbDataReader).IsAssignableFrom(m.Object.Type))
+                    {
+                        return base.VisitMethodCall(m);
+                    }
+
+                    return this.CreateInitializationArgumentReplacement(m);
+                }
+
+                return base.VisitMethodCall(m);
+            }
+
+            private Expression CreateInitializationArgumentReplacement(Expression original)
+            {
+                return this.CreateInitializationArgumentReplacement(original, original.Type);
+            }
+
+            private Expression CreateInitializationArgumentReplacement(Expression original, Type expressionType)
+            {
+                _initializationArguments.Add(Expression.Convert(original, typeof(object)));
+                
+                return Expression.Convert(
+                    Expression.MakeBinary(ExpressionType.ArrayIndex, _values, Expression.Constant(_initializationArguments.Count - 1)),
+                    expressionType);
+            }
+
+            private static bool IsUserExpressionMethod(MethodInfo method)
+            {
+                return method.IsGenericMethod && method.GetGenericMethodDefinition() == InitializerMetadata.UserExpressionMarker;
+            }
+        }
+        #endregion
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                </Docs>
+      <Excluded>0</Excluded>
+    </Member>
+    <Member MemberName="ToUInt16">
+      <MemberSignature Language="ILASM" Value=".method public hidebysig static unsigned int16 ToUInt16(unsigned int32 value)" />
+      <MemberSignature Language="C#" Value="public static ushort ToUInt16 (uint value);" />
+      <MemberSignature Language="ILAsm" Value=".method public static hidebysig unsigned int16 ToUInt16(unsigned int32 value) cil managed" />
+      <MemberType>Method</MemberType>
+      <AssemblyInfo>
+        <AssemblyVersion>1.0.5000.0</AssemblyVersion>
+        <AssemblyVersion>2.0.0.0</AssemblyVersion>
+        <AssemblyVersion>4.0.0.0</AssemblyVersion>
+      </AssemblyInfo>
+      <Attributes>
+        <Attribute>
+          <AttributeName>System.CLSCompliant(false)</AttributeName>
+        </Attribute>
+      </Attributes>
+      <ReturnValue>
+        <ReturnType>System.UInt16</ReturnType>
+      </ReturnValue>
+      <Parameters>
+        <Parameter Name="value" Type="System.UInt32" />
+      </Parameters>
+      <Docs>
+        <remarks>
+          <para>This member is not CLS-compliant. For a CLS-compliant alternative, use 
+   <see cref="M:System.Convert.ToInt32(System.Object)" />(<see cref="T:System.Int64" />).</para>
+        </remarks>
+        <exception cref="T:System.OverflowException">
+          <paramref name="value" /> is greater than <see cref="F:System.UInt16.MaxValue" />. </exception>
+        <summary>
+          <attribution license="cc4" from="Microsoft" modified="false" />
+          <para>Converts the value of the specified 32-bit unsigned integer to an equivalent 16-bit unsigned integer.</para>
+        </summary>
+        <returns>
+          <attribution license="cc4" from="Microsoft" modified="false" />
+          <para>A 16-bit unsigned integer that is equivalent to <paramref name="value" />.</para>
+        </returns>
+        <param name="value">
+          <attribution license="cc4" from="Microsoft" modified="false" />The 32-bit unsigned integer to convert. </param>
+      </Docs>
+      <Excluded>0</Excluded>
+    </Member>
+    <Member MemberName="ToUInt16">
+      <MemberSignature Language="ILASM" Value=".method public hidebysig static unsigned int16 ToUInt16(unsigned int64 value)" />
+      <MemberSignature Language="C#" Value="public static ushort ToUInt16 (ulong value);" />
+      <MemberSignature Language="ILAsm" Value=".method public static hidebysig unsigned int16 ToUInt16(unsigned int64 value) cil managed" />
+      <MemberType>Method</MemberType>
+      <AssemblyInfo>
+        <AssemblyVersion>1.0.5000.0</<html>
+  <head>
+    <title>Mono.DocTest.Widget.NestedClass.Double.Triple</title>
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+    <style>
+      a { text-decoration: none }
+
+      div.SideBar {
+        padding-left: 1em;
+        padding-right: 1em;
+        right: 0;
+        float: right;
+        border: thin solid black;
+        background-color: #f2f2f2;
+      }
+    
+      .CollectionTitle { font-weight: bold }
+      .PageTitle { font-size: 150%; font-weight: bold }
+
+      .Summary { }
+      .Signature { }          
+      .Remarks { }
+      .Members { }
+      .Copyright { }
+      
+      .Section { font-size: 125%; font-weight: bold }
+      p.Summary {
+        margin-left: 1em;
+      }
+      .SectionBox { margin-left: 2em }
+      .NamespaceName { font-size: 105%; font-weight: bold }
+      .NamespaceSumary { }
+      .MemberName { font-size: 115%; font-weight: bold; margin-top: 1em }
+      .Subsection { font-size: 105%; font-weight: bold }
+      .SubsectionBox { margin-left: 2em; margin-bottom: 1em }
+
+      .CodeExampleTable { background-color: #f5f5dd; border: thin solid black; padding: .25em; }
+      
+      .TypesListing {
+        border-collapse: collapse;
+      }
+
+      td {
+        vertical-align: top;
+      }
+      th {
+        text-align: left;
+      }
+
+      .TypesListing td { 
+        margin: 0px;  
+        padding: .25em;
+        border: solid gray 1px;
+      }
+
+      .TypesListing th { 
+        margin: 0px;  
+        padding: .25em;
+        background-color: #f2f2f2;
+        border: solid gray 1px;
+      }
+
+      div.Footer {
+        border-top: 1px solid gray;
+        margin-top: 1.5em;
+        padding-top: 0.6em;
+        text-align: center;
+        color: gray;
+      }
+
+      span.NotEntered /* Documentation for this section has not yet been entered */ {
+        font-style: italic;
+        color: red;	
+      }
+
+      div.Header {
+        background: #B0C4DE;
+        border: double;
+        border-color: white;
+        border-width: 7px;
+        padding: 0.5em;
+      }
+
+      div.Header * {
+        font-size: smaller;
+      }
+
+      div.Note {
+      }
+
+      i.ParamRef {
+      }
+
+      i.subtitle {
+      }
+
+      ul.TypeMembersIndex {
+        text-align: left;
+        background: #F8F8F8;
+      }
+
+      ul.TypeMembersIndex li {
+        display: inline;
+        margin:  0.5em;
+      }
+
+      table.HeaderTable {
+      }
+
+      table.SignatureTable {
+      }
+
+      table.Documentation, table.Enumeration, table.TypeDocumentation {
+        border-collapse: collapse;
+        width: 100%;
+      }
+
+      table.Documentation tr th, table.TypeMembers tr th, table.Enumeration tr th, table.TypeDocumentation tr th {
+        background: whitesmoke;
+        padding: 0.8em;
+        border: 1px solid gray;
+        text-align: left;
+        vertical-align: bottom;
+      }
+
+      table.Documentation tr td, table.TypeMembers tr td, table.Enumeration tr td, table.TypeDocumentation tr td {
+        padding: 0.5em;
+        border: 1px solid gray;
+        text-align: left;
+        vertical-align: top;
+      }
+
+      table.TypeMembers {
+        border: 1px solid #C0C0C0;
+        width: 100%;
+      }
+
+      table.TypeMembers tr td {
+        background: #F8F8F8;
+        border: white;
+      }
+
+      table.Documentation {
+      }
+
+      table.TypeMembers {
+      }
+
+      div.CodeExample {
+        width: 100%;
+        border: 1px solid #DDDDDD;
+        background-color: #F8F8F8;
+      }
+
+      div.CodeExample p {
+        margin: 0.5em;
+        border-bottom: 1px solid #DDDDDD;
+      }
+
+      div.CodeExample div {
+        margin: 0.5em;
+      }
+
+      h4 {
+        margin-bottom: 0;
+      }
+
+      div.Signature {
+        border: 1px solid #C0C0C0;
+        background: #F2F2F2;
+        padding: 1em;
+      }
+    </style>
+    <script type="text/JavaScript">
+      function toggle_display (block) {
+        var w = document.getElementById (block);
+        var t = document.getElementById (block + ":toggle");
+        if (w.style.display == "none") {
+          w.style.display = "block";
+          t.innerHTML = "‚äü";
+        } else {
+          w.style.display = "none";
+          t.innerHTML = "‚äû";
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div class="CollectionTitle">
+      <a href="../index.html">DocTest</a> : <a href="index.html">Mono.DocTest Namespace</a></div>
+    <div class="SideBar">
+      <p>
+        <a href="#T:Mono.DocTest.Widget.NestedClass.Double.Triple">Overview</a>
+      </p>
+      <p>
+        <a href="#T:Mono.DocTest.Widget.NestedClass.Double.Triple:Signature">Signature</a>
+      </p>
+      <p>
+        <a href="#T:Mono.DocTest.Widget.NestedClass.Double.Triple:Docs">Remarks</a>
+      </p>
+      <p>
+        <a href="#Members">Members</a>
+      </p>
+      <p>
+        <a href="#T:Mono.DocTest.Widget.NestedClass.Double.Triple:Members">Member Details</a>
+      </p>
+    </div>
+    <h1 class="PageTitle" id="T:Mono.DocTest.Widget.NestedClass.Double.Triple">Widget.NestedClass.Double.Triple  Class</h1>
+    <p class="Summary" id="T:Mono.DocTest.Widget.NestedClass.Double.Triple:Summary">
+      <span class="NotEntered">Documentation for this section has not yet been entered.</span>
+    </p>
+    <div>
+      <h2>Syntax</h2>
+      <div class="Signature" id="T:Mono.DocTest.Widget.NestedClass.Double.Triple:Signature">public class  <b>Widget.NestedClass.Double.Triple</b></div>
+    </div>
+    <div class="Remarks" id="T:Mono.DocTest.Widget.NestedClass.Double.Triple:Docs">
+      <h2 class="Section">Remarks</h2>
+      <div class="SectionBox" id="T:Mono.DocTest.Widget.NestedClass.Double.Triple:Docs:Remarks">
+        <tt>T:Mono.DocTest.Widget.NestedClass.Double.Triple</tt>.</div>
+      <h2 class="Section">Requirements</h2>
+      <div class="SectionBox" id="T:Mono.DocTest.Widget.NestedClass.Double.Triple:Docs:Version Information">
+        <b>Namespace: </b>Mono.DocTest<br /><b>Assembly: </b>DocTest (in DocTest.dll)<br /><b>Assembly Versions: </b>0.0.0.0</div>
+      <h2 class="Section" id="Members">Members</h2>
+      <div class="SectionBox" id="_Members">
+        <p>
+								See Also: Inherited members from
+								<a href="http://www.go-mono.com/docs/monodoc.ashx?link=T:System.Object">object</a>.
+							</p>
+        <h2 class="Section">Public Constructors</h2>
+        <div class="SectionBox" id="Public Constructors">
+          <div class="SubsectionBox">
+            <table class="TypeMembers">
+              <tr valign="top">
+                <td>
+                  <div>
+                  </div>
+                </td>
+                <td>
+                  <div>
+                    <b>
+                      <a href="#C:Mono.DocTest.Widget.NestedClass.Double.Triple()">Widget.NestedClass.Double.Triple</a>
+                    </b>()</div>
+                </td>
+                <td>
+                  <span class="NotEntered">Documentation for this section has not yet been entered.</span>
+                </td>
+              </tr>
+            </table>
+          </div>
+        </div>
+        <h2 class="Section">Extension Methods</h2>
+        <div class="SectionBox" id="Extension Methods">
+          <div class="SubsectionBox">
+            <table class="TypeMembers">
+              <tr valign="top">
+                <td>
+                  <div>static </div>
+                </td>
+                <td colspan="2">
+                  <b>
+                    <a href="../Mono.DocTest.Generic/Extensions.html#M:Mono.DocTest.Generic.Extensions.ToEnumerable``1(``0)">ToEnumerable&lt;T&gt;</a>
+                  </b>(<i>this</i> <i title="To be added.">T</i>)<nobr> : <a href="http://www.go-mono.com/docs/monodoc.ashx?link=T:System.Collections.Generic.IEnumerable`1">IEnumerable&lt;T&gt;</a></nobr><blockquote><tt>System.Object</tt> extension method</blockquote></td>
+              </tr>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="Members" id="T:Mono.DocTest.Widget.NestedClass.Double.Triple:Members">
+      <h2 class="Section" id="MemberDetails">Member Details</h2>
+      <div class="SectionBox" id="_MemberDetails">
+        <h3 id="C:Mono.DocTest.Widget.NestedClass.Double.Triple()">Widget.NestedClass.Double.Triple Constructor</h3>
+        <blockquote id="C:Mono.DocTest.Widget.NestedClass.Double.Triple():member">
+          <div class="msummary">
+            <span class="NotEntered">Documentation for this section has not yet been entered.</span>
+          </div>
+          <h2>Syntax</h2>
+          <div class="Signature">public  <b>Widget.NestedClass.Double.Triple</b> ()</div>
+          <h2 class="Section">Remarks</h2>
+          <div class="SectionBox" id="C:Mono.DocTest.Widget.NestedClass.Double.Triple():Remarks">
+            <span class="NotEntered">Documentation for this section has not yet been entered.</span>
+          </div>
+          <h2 class="Section">Requirements</h2>
+          <div class="SectionBox" id="C:Mono.DocTest.Widget.NestedClass.Double.Triple():Version Information">
+            <b>Namespace: </b>Mono.DocTest<br /><b>Assembly: </b>DocTest (in DocTest.dll)<br /><b>Assembly Versions: </b>0.0.0.0</div>
+          <hr size="1" />
+        </blockquote>
+      </div>
+    </div>
+    <hr size="1" />
+    <div class="Copyright">
+    </div>
+  </body>
+</html>                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                ä      Ã      /      ∞                      4"      ë"      ‚"              ?#      ê#                      ˝#      $                              =$                      ]$              â                                                                                                                                                          0                      0                     0                                          %                                                         -                                   %                                                         -                                  %                             %                             %                             -                                                                   %                               /               ,                              1                      À                                                                                                                                     ∫                                                 N                                    Ê                                                                   *                      /               -               1                                                                           È      "                      -               1                             .                                                                                                                                   ˇ                                                 N                                                         À                                                                   *                      /               -               1                                                                N                                                                                                        *                      /               -               1               -                                                          Õ      "                      -               1                             Ø                                           Ä                                                                                                                          "                                                                                                         //-----------------------------------------------------------------------------
+// Copyright (c) Microsoft Corporation.  All rights reserved.
+//-----------------------------------------------------------------------------
+namespace System.ServiceModel.ComIntegration
+{
+    using System;
+    using System.ServiceModel;
+    using System.Transactions;
+    using System.Diagnostics;
+    using System.ServiceModel.Diagnostics;
+    using System.Runtime.InteropServices;
+    using SR = System.ServiceModel.SR;
+
+    class TransactionProxyBuilder : IProxyCreator
+    {
+        ComProxy comProxy = null;
+        TransactionProxy txProxy = null;
+
+        private TransactionProxyBuilder(TransactionProxy proxy)
+        {
+            this.txProxy = proxy;
+        }
+        void IDisposable.Dispose()
+        {
+
+        }
+
+        ComProxy IProxyCreator.CreateProxy(IntPtr outer, ref Guid riid)
+        {
+            if ((riid != typeof(ITransactionProxy).GUID))
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new InvalidCastException(SR.GetString(SR.NoInterface, riid)));
+            if (outer == IntPtr.Zero)
+            {
+                // transactions require failfasts to prevent corruption
+                DiagnosticUtility.FailFast("OuterProxy cannot be null");
+            }
+
+            if (comProxy == null)
+            {
+                comProxy = ComProxy.Create(outer, txProxy, null);
+                return comProxy;
+
+            }
+            else
+                return comProxy.Clone();
+        }
+
+        bool IProxyCreator.SupportsErrorInfo(ref Guid riid)
+        {
+            if ((riid != typeof(ITransactionProxy).GUID))
+                return false;
+            else
+                return true;
+
+        }
+
+        bool IProxyCreator.SupportsDispatch()
+        {
+            return false;
+        }
+
+        bool IProxyCreator.SupportsIntrinsics()
+        {
+            return false;
+        }
+
+        public static IntPtr CreateTransactionProxyTearOff(TransactionProxy txProxy)
+        {
+            IProxyCreator txProxyBuilder = new TransactionProxyBuilder(txProxy);
+            IProxyManager proxyManager = new ProxyManager(txProxyBuilder);
+            Guid iid = typeof(ITransactionProxy).GUID;
+            return OuterProxyWrapper.CreateOuterProxyInstance(proxyManager, ref iid);
+        }
+
+    }
+
+    class TransactionProxy : ITransactionProxy,
+                             IExtension<InstanceContext>
+    {
+        Transaction currentTransaction;
+        VoterBallot currentVoter;
+        object syncRoot;
+        Guid appid;
+        Guid clsid;
+        int instanceID = 0;
+
+        public TransactionProxy(Guid appid, Guid clsid)
+        {
+            this.syncRoot = new object();
+            this.appid = appid;
+            this.clsid = clsid;
+        }
+
+        public Transaction CurrentTransaction
+        {
+            get
+            {
+                return this.currentTransaction;
+            }
+        }
+        public Guid AppId
+        {
+            get
+            {
+                return this.appid;
+            }
+        }
+        public Guid Clsid
+        {
+            get
+            {
+                return this.clsid;
+            }
+        }
+        public int InstanceID
+        {
+            get
+            {
+                return this.instanceID;
+            }
+            set
+            {
+                this.instanceID = value;
+            }
+        }
+        public void SetTransaction(Transaction transaction)
+        {
+            lock (this.syncRoot)
+            {
+                if (transaction == null)
+                {
+                    // transactions require failfasts to prevent corruption
+                    DiagnosticUtility.FailFast("Attempting to set transaction to NULL");
+                }
+
+                if (this.currentTransaction == null)
+                {
+                    ProxyEnlistment enlistment;
+                    enlistment = new ProxyEnlistment(this, transaction);
+                    transaction.EnlistVolatile(enlistment, EnlistmentOptions.None);
+                    this.currentTransaction = transaction;
+                    if (this.currentVoter != null)
+                    {
+                        this.currentVoter.SetTransaction(this.currentTransaction);
+                    }
+                }
+                else if (this.currentTransaction != transaction)
+                {
+                    throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(Error.TransactionMismatch());
+                }
+            }
+        }
+
+        // IExtension<ServiceInstance>
+        public void Attach(InstanceContext owner) { }
+        public void Detach(InstanceContext owner) { }
+
+        // ITransactionProxy
+        public void Commit(Guid guid)
+        {
+            // transactions require failfasts to prevent corruption
+            DiagnosticUtility.FailFast("Commit not supported: BYOT only!");
+        }
+
+        public void Abort()
+        {
+            if (this.currentTransaction != null)
+            {
+                this.currentTransaction.Rollback();
+            }
+        }
+
+        public IDtcTransaction Promote()
+        {
+            EnsureTransaction();
+            return TransactionInterop.GetDtcTransaction(
+                this.currentTransaction);
+        }
+
+        public void CreateVoter(
+            ITransactionVoterNotifyAsync2 voterNotification,
+            IntPtr voterBallot)
+        {
+            if (IntPtr.Zero == voterBallot)
+                throw DiagnosticUtility.ExceptionUtility.ThrowHelperArgumentNull("voterBallot");
+
+            lock (this.syncRoot)
+            {
+                if (this.currentVoter != null)
+                {
+                    // transactions require failfasts to prevent corruption
+                    DiagnosticUtility.FailFast("Assumption: proxy only needs one voter");
+                }
+
+                VoterBallot voter = new VoterBallot(voterNotification, this);
+                if (this.currentTransaction != null)
+                {
+                    voter.SetTransaction(this.currentTransaction);
+                }
+
+                this.currentVoter = voter;
+
+                IntPtr ppv = InterfaceHelper.GetInterfacePtrForObject(typeof(ITransactionVoterBallotAsync2).GUID, this.currentVoter);
+
+                Marshal.WriteIntPtr(voterBallot, ppv);
+            }
+        }
+
+        public DtcIsolationLevel GetIsolationLevel()
+        {
+            DtcIsolationLevel retVal;
+            switch (this.currentTransaction.IsolationLevel)
+            {
+                case IsolationLevel.Serializable:
+                    retVal = DtcIsolationLevel.ISOLATIONLEVEL_SERIALIZABLE;
+                    break;
+                case IsolationLevel.RepeatableRead:
+                    retVal = DtcIsolationLevel.ISOLATIONLEVEL_REPEATABLEREAD;
+                    break;
+                case IsolationLevel.ReadCommitted:
+                    retVal = DtcIsolationLevel.ISOLATIONLEVEL_READCOMMITTED;
+                    break;
+                case IsolationLevel.ReadUncommitted:
+                    retVal = DtcIsolationLevel.ISOLATIONLEVEL_READUNCOMMITTED;
+                    break;
+                default:
+                    retVal = DtcIsolationLevel.ISOLATIONLEVEL_SERIALIZABLE;
+                    break;
+            }
+            return retVal;
+        }
+
+        public Guid GetIdentifier()
+        {
+            return this.currentTransaction.TransactionInformation.DistributedIdentifier;
+        }
+
+        // ITransactionProxy2
+        public bool IsReusable()
+        {
+            return true;
+        }
+
+        void ClearTransaction(ProxyEnlistment enlistment)
+        {
+            lock (this.syncRoot)
+            {
+                if (this.currentTransaction == null)
+                {
+                    // transactions require failfasts to prevent corruption
+                    DiagnosticUtility.FailFast("Clearing inactive TransactionProxy");
+                }
+                if (enlistment.Transaction != this.currentTransaction)
+                {
+                    // transactions require failfasts to prevent corruption
+                    DiagnosticUtility.FailFast("Incorrectly working on multiple transactions");
+                }
+                this.currentTransaction = null;
+                this.currentVoter = null;
+            }
+        }
+
+        void EnsureTransaction()
+        {
+            lock (this.syncRoot)
+            {
+                if (this.currentTransaction == null)
+                    throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new COMException(null, HR.CONTEXT_E_NOTRANSACTION));
+
+            }
+        }
+
+        class ProxyEnlistment : IEnlistmentNotification
+        {
+            TransactionProxy proxy;
+            Transaction transaction;
+
+            public ProxyEnlistment(TransactionProxy proxy,
+                                   Transaction transaction)
+            {
+                this.proxy = proxy;
+                this.transaction = transaction;
+            }
+
+            public Transaction Transaction
+            {
+                get { return this.transaction; }
+            }
+
+            public void Prepare(PreparingEnlistment preparingEnlistment)
+            {
+                this.proxy.ClearTransaction(this);
+                this.proxy = null;
+                preparingEnlistment.Done();
+
+            }
+
+            public void Commit(Enlistment enlistment)
+            {
+                // transactions require failfasts to prevent corruption
+                DiagnosticUtility.FailFast("Should have voted read only");
+            }
+
+            public void Rollback(Enlistment enlistment)
+            {
+                this.proxy.ClearTransaction(this);
+                this.proxy = null;
+                enlistment.Done();
+            }
+
+            public void InDoubt(Enlistment enlistment)
+            {
+                // transactions require failfasts to prevent corruption
+                DiagnosticUtility.FailFast("Should have voted read only");
+            }
+        }
+
+        class VoterBallot : ITransactionVoterBallotAsync2, IEnlistmentNotification
+        {
+            const int S_OK = 0;
+
+            ITransactionVoterNotifyAsync2 notification;
+            Transaction transaction;
+            Enlistment enlistment;
+            PreparingEnlistment preparingEnlistment;
+            TransactionProxy proxy;
+
+            public VoterBallot(ITransactionVoterNotifyAsync2 notification, TransactionProxy proxy)
+            {
+                this.notification = notification;
+                this.proxy = proxy;
+            }
+
+            public void SetTransaction(Transaction transaction)
+            {
+                if (this.transaction != null)
+                {
+                    // transactions require failfasts to prevent corruption
+                    DiagnosticUtility.FailFast("Already have a transaction in the ballot!");
+                }
+                this.transaction = transaction;
+                this.enlistment = transaction.EnlistVolatile(
+                    this,
+                    EnlistmentOptions.None);
+            }
+
+
+            public void Prepare(PreparingEnlistment enlistment)
+            {
+                this.preparingEnlistment = enlistment;
+                this.notification.VoteRequest();
+            }
+
+            public void Rollback(Enlistment enlistment)
+            {
+                enlistment.Done();
+                this.notification.Aborted(0, false, 0, S_OK);
+                ComPlusTxProxyTrace.Trace(TraceEventType.Verbose, TraceCode.ComIntegrationTxProxyTxAbortedByTM,
+                        SR.TraceCodeComIntegrationTxProxyTxAbortedByTM, proxy.AppId, proxy.Clsid, transaction.TransactionInformation.DistributedIdentifier, proxy.InstanceID);
+                Marshal.ReleaseComObject(this.notification);
+                this.notification = null;
+            }
+
+            public void Commit(Enlistment enlistment)
+            {
+                enlistment.Done();
+                this.notification.Committed(false, 0, S_OK);
+                ComPlusTxProxyTrace.Trace(TraceEventType.Verbose, TraceCode.ComIntegrationTxProxyTxCommitted,
+                            SR.TraceCodeComIntegrationTxProxyTxCommitted, proxy.AppId, proxy.Clsid, transaction.TransactionInformation.DistributedIdentifier, proxy.InstanceID);
+                Marshal.ReleaseComObject(this.notification);
+                this.notification = null;
+            }
+
+            public void InDoubt(Enlistment enlistment)
+            {
+                enlistment.Done();
+                this.notification.InDoubt();
+                Marshal.ReleaseComObject(this.notification);
+                this.notification = null;
+            }
+
+            public void VoteRequestDone(int hr, int reason)
+            {
+                if (this.preparingEnlistment == null)
+                {
+                    throw DiagnosticUtility.ExceptionUtility.ThrowHelperError(new InvalidOperationException(
+                        SR.GetString(SR.NoVoteIssued)));
+                }
+
+                if (S_OK == hr)
+                {
+                    this.preparingEnlistment.Prepared();
+                }
+                else
+                {
+
+                    this.preparingEnlistment.ForceRollback();
+                    ComPlusTxProxyTrace.Trace(TraceEventType.Verbose, TraceCode.ComIntegrationTxProxyTxAbortedByContext,
+                            SR.TraceCodeComIntegrationTxProxyTxAbortedByContext, proxy.AppId, proxy.Clsid, transaction.TransactionInformation.DistributedIdentifier, proxy.InstanceID);
+                }
+            }
+        }
+    }
+}
+                                                                                                                                                                                                                                                             	-ˇê-ˇ¨	-ˇ™-ˇ´	-ˇê-ˇ™	-ˇ®-ˇ©	-ˇê-ˇ®	-ˇ¶-ˇß	-ˇê-ˇ¶	-ˇ§-ˇ•	-ˇê-ˇ§	-ˇ¢-ˇ£	-ˇê-ˇ¢	-ˇ†-ˇ°	-ˇê-ˇ†	-ˇû-ˇü	-ˇê-ˇû	-ˇú-ˇù	-ˇê-ˇú	-ˇö-ˇõ	-ˇê-ˇö	-ˇó-ˇô	-ˇó-ˇò	-ˇê-ˇó	-ˇï-ˇñ	-ˇê-ˇï	-ˇì-ˇî	-ˇê-ˇì	-ˇë-ˇí	-ˇê-ˇë	-ˇç-ˇé	-ˇ]-ˇç	-ˇä-ˇå	-ˇä-ˇã	-ˇ]-ˇä	-ˇá-ˇâ	-ˇá-ˇà	-ˇ]-ˇá	-ˇÖ-ˇÜ	-ˇ]-ˇÖ	-ˇÉ-ˇÑ	-ˇ]-ˇÉ	-ˇÅ-ˇÇ	-ˇ]-ˇÅ	-ˇ-ˇÄ	-ˇ]-ˇ	-ˇ|-ˇ~	-ˇ|-ˇ}	-ˇ]-ˇ|	-ˇy-ˇ{	-ˇy-ˇz	-ˇ]-ˇy	-ˇw-ˇx	-ˇ]-ˇw	-ˇu-ˇv	-ˇ]-ˇu	-ˇs-ˇt	-ˇ]-ˇs	-ˇq-ˇr	-ˇ]-ˇq	-ˇo-ˇp	-ˇ]-ˇo	-ˇm-ˇn	-ˇ]-ˇm	-ˇk-ˇl	-ˇ]-ˇk	-ˇi-ˇj	-ˇ]-ˇi	-ˇg-ˇh	-ˇ]-ˇg	-ˇd-ˇf	-ˇd-ˇe	-ˇ]-ˇd	-ˇb-ˇc gU    ‹ELòútÂâÀd„èá
+vK∏ lbXND:0&˛ÙÍ‡÷Ã¬∏Æ§öêÜ|rh^TJ@6,"˙Ê‹“»æ¥™†ñåÇxndZPF<2(
+ 
+ˆ
+Ï
+‚
+ÿ
+Œ
+ƒ
+∫
+∞
+¶
+ú
+í
+à
+~
+t
+j
+`
+V
+L
+B
+8
+.
+$
+
+
+	¸	Ú	Ë	ﬁ	‘	 	¿	∂	¨	¢	ò	é	Ñ	z	p	f	\	R	H	>	4	*	 			¯Ó‰⁄–∆º≤®ûîäÄvlbXND:0&˛ÙÍ‡÷Ã¬∏Æ§öêÜ

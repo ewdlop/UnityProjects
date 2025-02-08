@@ -1,0 +1,60 @@
+.GetByteCount(name) + 3 + prefixSize + suffixSize;
+            var metadata = new byte[metadataSize];
+            ushort totalSize = checked((ushort)(metadataSize + additionalSize));
+            metadata[0] = unchecked((byte)totalSize);
+            metadata[1] = unchecked((byte)(totalSize >> 8));
+            Encoding.UTF8.GetBytes(name, 0, name.Length, metadata, 2 + prefixSize);
+            return metadata;
+        }
+
+        /// <summary>
+        /// Serialize the low 28 bits of the tags value into the metadata stream,
+        /// starting at the index given by pos. Updates pos. Writes 1 to 4 bytes,
+        /// depending on the value of the tags variable. Usable for event tags and
+        /// field tags.
+        /// 
+        /// Note that 'metadata' can be null, in which case it only updates 'pos'.
+        /// This is useful for a two pass approach where you figure out how big to
+        /// make the array, and then you fill it in.   
+        /// </summary>
+        public static void EncodeTags(int tags, ref int pos, byte[] metadata)
+        {
+            // We transmit the low 28 bits of tags, high bits first, 7 bits at a time.
+            var tagsLeft = tags & 0xfffffff;
+            bool more;
+            do
+            {
+                byte current = (byte)((tagsLeft >> 21) & 0x7f);
+                more = (tagsLeft & 0x1fffff) != 0;
+                current |= (byte)(more ? 0x80 : 0x00);
+                tagsLeft = tagsLeft << 7;
+
+                if (metadata != null)
+                {
+                    metadata[pos] = current;
+                }
+                pos += 1;
+            }
+            while (more);
+        }
+
+        public static byte Combine(
+            int settingValue,
+            byte defaultValue)
+        {
+            unchecked
+            {
+                return (byte)settingValue == settingValue
+                    ? (byte)settingValue
+                    : defaultValue;
+            }
+        }
+
+        public static byte Combine(
+            int settingValue1,
+            int settingValue2,
+            byte defaultValue)
+        {
+            unchecked
+            {
+                return (byte)settingValue1 == set

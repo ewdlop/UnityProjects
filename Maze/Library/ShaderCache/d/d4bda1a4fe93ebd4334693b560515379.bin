@@ -1,0 +1,81 @@
+ty) {
+                    /* each branch falls through to the next one */
+                case 3:
+                    *target++=(uint8_t)(value>>16);
+                    if(offsets!=NULL) {
+                        *offsets++=sourceIndex;
+                    }
+                case 2: /*fall through*/
+                    *target++=(uint8_t)(value>>8);
+                    if(offsets!=NULL) {
+                        *offsets++=sourceIndex;
+                    }
+                case 1: /*fall through*/
+                    *target++=(uint8_t)value;
+                    if(offsets!=NULL) {
+                        *offsets++=sourceIndex;
+                    }
+                default:
+                    /* will never occur */
+                    break;
+                }
+
+                /* target overflow */
+                targetCapacity=0;
+                *pErrorCode=U_BUFFER_OVERFLOW_ERROR;
+                c=0;
+                break;
+            }
+
+            /* normal end of conversion: prepare for a new character */
+            c=0;
+            if(offsets!=NULL) {
+                prevSourceIndex=sourceIndex;
+                sourceIndex=nextSourceIndex;
+            }
+            continue;
+        } else {
+            /* target is full */
+            *pErrorCode=U_BUFFER_OVERFLOW_ERROR;
+            break;
+        }
+    }
+
+    /*
+     * the end of the input stream and detection of truncated input
+     * are handled by the framework, but for EBCDIC_STATEFUL conversion
+     * we need to emit an SI at the very end
+     *
+     * conditions:
+     *   successful
+     *   EBCDIC_STATEFUL in DBCS mode
+     *   end of input and no truncated input
+     */
+    if( U_SUCCESS(*pErrorCode) &&
+        outputType==MBCS_OUTPUT_2_SISO && prevLength==2 &&
+        pArgs->flush && source>=sourceLimit && c==0
+    ) {
+        /* EBCDIC_STATEFUL ending with DBCS: emit an SI to return the output stream to SBCS */
+        if(targetCapacity>0) {
+            *target++=(uint8_t)siBytes[0];
+            if (siLength == 2) {
+                if (targetCapacity<2) {
+                    cnv->charErrorBuffer[0]=(uint8_t)siBytes[1];
+                    cnv->charErrorBufferLength=1;
+                    *pErrorCode=U_BUFFER_OVERFLOW_ERROR;
+                } else {
+                    *target++=(uint8_t)siBytes[1];
+                }
+            }
+            if(offsets!=NULL) {
+                /* set the last source character's index (sourceIndex points at sourceLimit now) */
+                *offsets++=prevSourceIndex;
+            }
+        } else {
+            /* target is full */
+            cnv->charErrorBuffer[0]=(uint8_t)siBytes[0];
+            if (siLength == 2) {
+                cnv->charErrorBuffer[1]=(uint8_t)siBytes[1];
+            }
+            cnv->charErrorBufferLength=siLength;
+       

@@ -1,0 +1,122 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	DeferredShadingRenderer.h: Scene rendering definitions.
+=============================================================================*/
+
+#pragma once
+
+#include "CoreMinimal.h"
+#include "Stats/Stats.h"
+#include "RendererInterface.h"
+#include "StaticBoundShaderState.h"
+#include "ScenePrivateBase.h"
+#include "LightSceneInfo.h"
+#include "SceneRendering.h"
+#include "DepthRendering.h"
+#include "TranslucentRendering.h"
+#include "ScreenSpaceDenoise.h"
+#include "RenderGraphUtils.h"
+
+enum class ERayTracingPrimaryRaysFlag : uint32;
+enum class EVelocityPass : uint32;
+
+class FSceneTextureParameters;
+class FDistanceFieldAOParameters;
+class UStaticMeshComponent;
+class FExponentialHeightFogSceneInfo;
+class FRaytracingLightDataPacked;
+struct FSceneWithoutWaterTextures;
+struct FHeightFogRenderingParameters;
+struct FRayTracingReflectionOptions;
+struct FHairStrandsTransmittanceMaskData;
+struct FHairStrandsRenderingData;
+
+/**
+ * Scene renderer that implements a deferred shading pipeline and associated features.
+ */
+class FDeferredShadingSceneRenderer : public FSceneRenderer
+{
+public:
+
+	/** Defines which objects we want to render in the EarlyZPass. */
+	EDepthDrawingMode EarlyZPassMode;
+	bool bEarlyZPassMovable;
+	bool bDitheredLODTransitionsUseStencil;
+	int32 StencilLODMode = 0;
+	
+	const FRHITransition* TranslucencyLightingVolumeClearEndTransition = nullptr;
+
+	FDeferredShadingSceneRenderer(const FSceneViewFamily* InViewFamily,FHitProxyConsumer* HitProxyConsumer);
+
+	/** Clears a view */
+	void ClearView(FRHICommandListImmediate& RHICmdList);
+
+	/** Clears LPVs for all views */
+	void ClearLPVs(FRDGBuilder& GraphBuilder);
+
+	/** Propagates LPVs for all views */
+	void UpdateLPVs(FRHICommandListImmediate& RHICmdList);
+
+	/**
+	 * Renders the scene's prepass for a particular view
+	 * @return true if anything was rendered
+	 */
+	void RenderPrePassView(FRHICommandList& RHICmdList, const FViewInfo& View);
+
+	/**
+	 * Renders the scene's prepass for a particular view in parallel
+	 * @return true if the depth was cleared
+	 */
+	bool RenderPrePassViewParallel(const FViewInfo& View, FRHICommandListImmediate& ParentCmdList,TFunctionRef<void()> AfterTasksAreStarted, bool bDoPrePre);
+
+	/** 
+	 * Culls local lights and reflection probes to a grid in frustum space, builds one light list and grid per view in the current Views.  
+	 * Needed for forward shading or translucency using the Surface lighting mode, and clustered deferred shading. 
+	 */
+	void GatherLightsAndComputeLightGrid(FRDGBuilder& GraphBuilder, bool bNeedLightGrid, FSortedLightSetSceneInfo &SortedLightSet);
+
+	void RenderBasePass(
+		FRDGBuilder& GraphBuilder,
+		FExclusiveDepthStencil::Type BasePassDepthStencilAccess,
+		FRDGTextureRef SceneColorTexture,
+		FRDGTextureRef SceneDepthTexture,
+		ERenderTargetLoadAction SceneDepthLoadAction,
+		FRDGTextureRef ForwardShadowMaskTexture);
+
+	void RenderBasePassInternal(
+		FRDGBuilder& GraphBuilder,
+		const FRenderTargetBindingSlots& BasePassRenderTargets,
+		FExclusiveDepthStencil::Type BasePassDepthStencilAccess,
+		FRDGTextureRef ForwardScreenSpaceShadowMask,
+		bool bParallelBasePass,
+		bool bRenderLightmapDensity);
+
+	bool ShouldRenderAnisotropyPass() const;
+
+	void RenderAnisotropyPass(
+		FRDGBuilder& GraphBuilder,
+		FRDGTextureRef SceneDepthTexture,
+		bool bDoParallelPass);
+
+	void RenderSingleLayerWater(
+		FRDGBuilder& GraphBuilder,
+		FRDGTextureMSAA SceneColorTexture,
+		FRDGTextureMSAA SceneDepthTexture,
+		TRDGUniformBufferRef<FSceneTextureUniformParameters> SceneTexturesUniformBuffer,
+		bool bShouldRenderVolumetricCloud,
+		FSceneWithoutWaterTextures& SceneWithoutWaterTextures);
+	
+	void RenderSingleLayerWaterInner(
+		FRDGBuilder& GraphBuilder,
+		FRDGTextureMSAA SceneColorTexture,
+		FRDGTextureMSAA SceneDepthTexture,
+		const FSceneWithoutWaterTextures& SceneWithoutWaterTextures);
+
+	void RenderSingleLayerWaterReflections(
+		FRDGBuilder& GraphBuilder,
+		FRDGTextureRef SceneColorTexture,
+		const FSceneWithoutWaterTextures& SceneWithoutWaterTextures);
+
+	void RenderOcclusion(
+		FRDGBuilder& GraphBuilder

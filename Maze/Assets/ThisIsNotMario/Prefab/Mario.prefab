@@ -1,0 +1,121 @@
+#! /usr/bin/env python
+
+"""The Tab Nanny despises ambiguous indentation.  She knows no mercy.
+
+tabnanny -- Detection of ambiguous indentation
+
+For the time being this module is intended to be called as a script.
+However it is possible to import it into an IDE and use the function
+check() described below.
+
+Warning: The API provided by this module is likely to change in future
+releases; such changes may not be backward compatible.
+"""
+
+# Released to the public domain, by Tim Peters, 15 April 1998.
+
+# XXX Note: this is now a standard library module.
+# XXX The API needs to undergo changes however; the current code is too
+# XXX script-like.  This will be addressed later.
+
+__version__ = "6"
+
+import os
+import sys
+import getopt
+import tokenize
+if not hasattr(tokenize, 'NL'):
+    raise ValueError("tokenize.NL doesn't exist -- tokenize module too old")
+
+__all__ = ["check", "NannyNag", "process_tokens"]
+
+verbose = 0
+filename_only = 0
+
+def errprint(*args):
+    sep = ""
+    for arg in args:
+        sys.stderr.write(sep + str(arg))
+        sep = " "
+    sys.stderr.write("\n")
+
+def main():
+    global verbose, filename_only
+    try:
+        opts, args = getopt.getopt(sys.argv[1:], "qv")
+    except getopt.error, msg:
+        errprint(msg)
+        return
+    for o, a in opts:
+        if o == '-q':
+            filename_only = filename_only + 1
+        if o == '-v':
+            verbose = verbose + 1
+    if not args:
+        errprint("Usage:", sys.argv[0], "[-v] file_or_directory ...")
+        return
+    for arg in args:
+        check(arg)
+
+class NannyNag(Exception):
+    """
+    Raised by process_tokens() if detecting an ambiguous indent.
+    Captured and handled in check().
+    """
+    def __init__(self, lineno, msg, line):
+        self.lineno, self.msg, self.line = lineno, msg, line
+    def get_lineno(self):
+        return self.lineno
+    def get_msg(self):
+        return self.msg
+    def get_line(self):
+        return self.line
+
+def check(file):
+    """check(file_or_dir)
+
+    If file_or_dir is a directory and not a symbolic link, then recursively
+    descend the directory tree named by file_or_dir, checking all .py files
+    along the way. If file_or_dir is an ordinary Python source file, it is
+    checked for whitespace related problems. The diagnostic messages are
+    written to standard output using the print statement.
+    """
+
+    if os.path.isdir(file) and not os.path.islink(file):
+        if verbose:
+            print "%r: listing directory" % (file,)
+        names = os.listdir(file)
+        for name in names:
+            fullname = os.path.join(file, name)
+            if (os.path.isdir(fullname) and
+                not os.path.islink(fullname) or
+                os.path.normcase(name[-3:]) == ".py"):
+                check(fullname)
+        return
+
+    try:
+        f = open(file)
+    except IOError, msg:
+        errprint("%r: I/O Error: %s" % (file, msg))
+        return
+
+    if verbose > 1:
+        print "checking %r ..." % file
+
+    try:
+        process_tokens(tokenize.generate_tokens(f.readline))
+
+    except tokenize.TokenError, msg:
+        errprint("%r: Token Error: %s" % (file, msg))
+        return
+
+    except IndentationError, msg:
+        errprint("%r: Indentation Error: %s" % (file, msg))
+        return
+
+    except NannyNag, nag:
+        badline = nag.get_lineno()
+        line = nag.get_line()
+        if verbose:
+            print "%r: *** Line %d: trouble in tab city! ***" % (file, badline)
+            pr

@@ -1,0 +1,79 @@
+= 0;
+      LocalSymbolData.push_back(MSD);
+    } else {
+      MSD.SectionIndex = SectionIndexMap.lookup(&Symbol.getSection());
+      assert(MSD.SectionIndex && "Invalid section index!");
+      LocalSymbolData.push_back(MSD);
+    }
+  }
+
+  // External and undefined symbols are required to be in lexicographic order.
+  std::sort(ExternalSymbolData.begin(), ExternalSymbolData.end());
+  std::sort(UndefinedSymbolData.begin(), UndefinedSymbolData.end());
+
+  // Set the symbol indices.
+  Index = 0;
+  for (auto *SymbolData :
+       {&LocalSymbolData, &ExternalSymbolData, &UndefinedSymbolData})
+    for (MachSymbolData &Entry : *SymbolData)
+      Entry.Symbol->setIndex(Index++);
+
+  for (const MCSection &Section : Asm) {
+    for (RelAndSymbol &Rel : Relocations[&Section]) {
+      if (!Rel.Sym)
+        continue;
+
+      // Set the Index and the IsExtern bit.
+      unsigned Index = Rel.Sym->getIndex();
+      assert(isInt<24>(Index));
+      if (IsLittleEndian)
+        Rel.MRE.r_word1 = (Rel.MRE.r_word1 & (~0U << 24)) | Index | (1 << 27);
+      else
+        Rel.MRE.r_word1 = (Rel.MRE.r_word1 & 0xff) | Index << 8 | (1 << 4);
+    }
+  }
+}
+
+void MachObjectWriter::computeSectionAddresses(const MCAssembler &Asm,
+                                               const MCAsmLayout &Layout) {
+  uint64_t StartAddress = 0;
+  for (const MCSection *Sec : Layout.getSectionOrder()) {
+    StartAddress = alignTo(StartAddress, Sec->getAlignment());
+    SectionAddress[Sec] = StartAddress;
+    StartAddress += Layout.getSectionAddressSize(Sec);
+
+    // Explicitly pad the section to match the alignment requirements of the
+    // following one. This is for 'gas' compatibility, it shouldn't
+    /// strictly be necessary.
+    StartAddress += getPaddingSize(Sec, Layout);
+  }
+}
+
+void MachObjectWriter::executePostLayoutBinding(MCAssembler &Asm,
+                                                const MCAsmLayout &Layout) {
+  computeSectionAddresses(Asm, Layout);
+
+  // Create symbol data for any indirect symbols.
+  bindIndirectSymbols(Asm);
+}
+
+bool MachObjectWriter::isSymbolRefDifferenceFullyResolvedImpl(
+    const MCAssembler &Asm, const MCSymbol &A, const MCSymbol &B,
+    bool InSet) const {
+  // FIXME: We don't handle things like
+  // foo = .
+  // creating atoms.
+  if (A.isVariable() || B.isVariable())
+    return false;
+  return MCObjectWriter::isSymbolRefDifferenceFullyResolvedImpl(Asm, A, B,
+                                                                InSet);
+}
+
+bool MachObjectWriter::isSymbolRefDifferenceFullyResolvedImpl(
+    const MCAssembler &Asm, const MCSymbol &SymA, const MCFragment &FB,
+    bool InSet, bool IsPCRel) const {
+  if (InSet)
+    return true;
+
+  // The effective address is
+  //     addr(atom(A)) + of

@@ -1,0 +1,193 @@
+oat)vAxis.GetPosition(point.YValues[5]), seriesZPosition+seriesDepth/2f);
+					area.matrix3D.TransformPoints(points);
+
+					if( common.ProcessModePaint )
+					{
+						// Check if chart is partially in the data scaleView
+						bool	clipRegionSet = false;
+						if(xValue == hAxis.ViewMinimum || xValue == hAxis.ViewMaximum )
+						{
+							// Set clipping region for line drawing 
+							graph.SetClip( area.PlotAreaPosition.ToRectangleF() );
+							clipRegionSet = true;
+						}
+
+						// Define line color
+						Color	lineColor = point.BorderColor;
+						if(lineColor == Color.Empty)
+						{
+							lineColor = point.Color;
+						}
+
+						// Start Svg Selection mode
+						graph.StartHotRegion( point );
+
+						// Draw lower whisker line
+						graph.DrawLineRel( 
+							lineColor, 
+							point.BorderWidth, 
+							point.BorderDashStyle, 
+							points[0].PointF,
+							points[2].PointF,
+							ser.ShadowColor, 
+							ser.ShadowOffset );
+
+						// Draw upper whisker line
+						graph.DrawLineRel( 
+							lineColor, 
+							point.BorderWidth, 
+							point.BorderDashStyle, 
+							points[1].PointF,
+							points[3].PointF,
+							ser.ShadowColor, 
+							ser.ShadowOffset );
+
+						// Draw Box
+						RectangleF	rectSize = RectangleF.Empty;
+						rectSize.X = (float)(points[0].X - width/2);
+						rectSize.Width = (float)(width);
+						rectSize.Y = (float)points[3].Y;
+						rectSize.Height = (float)Math.Abs(rectSize.Y - points[2].Y);
+						graph.FillRectangleRel( rectSize, 
+							point.Color, 
+							point.BackHatchStyle, 
+							point.BackImage, 
+							point.BackImageWrapMode, 
+							point.BackImageTransparentColor,
+							point.BackImageAlignment,
+							point.BackGradientStyle, 
+							point.BackSecondaryColor, 
+							point.BorderColor, 
+							point.BorderWidth, 
+							point.BorderDashStyle, 
+							ser.ShadowColor, 
+							ser.ShadowOffset,
+							PenAlignment.Inset );
+
+						// Check if average line should be drawn
+						bool	showAverage = true;
+						if(point.IsCustomPropertySet(CustomPropertyName.BoxPlotShowAverage) || ser.IsCustomPropertySet(CustomPropertyName.BoxPlotShowAverage))
+						{
+							string showAverageValue = ser[CustomPropertyName.BoxPlotShowAverage];
+							if(point.IsCustomPropertySet(CustomPropertyName.BoxPlotShowAverage))
+							{
+								showAverageValue = point[CustomPropertyName.BoxPlotShowAverage];
+							}
+							if(String.Compare(showAverageValue, "True", StringComparison.OrdinalIgnoreCase) == 0)
+							{
+								// default - do nothing
+							}
+							else if(String.Compare(showAverageValue, "False", StringComparison.OrdinalIgnoreCase) == 0)
+							{
+								showAverage = false;
+							}
+							else
+							{
+								throw(new InvalidOperationException(SR.ExceptionCustomAttributeValueInvalid(point[CustomPropertyName.BoxPlotShowAverage], "BoxPlotShowAverage")));
+							}
+						}
+
+						// Draw average line
+						Color	markerLinesColor = lineColor;
+						if(markerLinesColor == point.Color)
+						{
+							double brightness = Math.Sqrt(point.Color.R * point.Color.R + point.Color.G * point.Color.G + point.Color.B * point.Color.B);
+							if(brightness > 220)
+							{
+								markerLinesColor = ChartGraphics.GetGradientColor(point.Color, Color.Black, 0.4);
+							}
+							else
+							{
+								markerLinesColor = ChartGraphics.GetGradientColor(point.Color, Color.White, 0.4);
+							}
+						}
+						if(!double.IsNaN(point.YValues[4]) && showAverage)
+						{
+							graph.DrawLineRel( 
+								markerLinesColor, 
+								1, 
+								ChartDashStyle.Solid, 
+								new PointF(rectSize.Left, (float)points[4].Y), 
+								new PointF(rectSize.Right, (float)points[4].Y),
+								Color.Empty, 
+								0 );
+						}
+
+						// Check if median line should be drawn
+						bool	showMedian = true;
+						if(point.IsCustomPropertySet(CustomPropertyName.BoxPlotShowMedian) || ser.IsCustomPropertySet(CustomPropertyName.BoxPlotShowMedian))
+						{
+							string showMedianValue = ser[CustomPropertyName.BoxPlotShowMedian];
+							if(point.IsCustomPropertySet(CustomPropertyName.BoxPlotShowMedian))
+							{
+								showMedianValue = point[CustomPropertyName.BoxPlotShowMedian];
+							}
+							if(String.Compare( showMedianValue, "True", StringComparison.OrdinalIgnoreCase ) == 0)
+							{
+								// default - do nothing
+							}
+							else if(String.Compare(showMedianValue, "False", StringComparison.OrdinalIgnoreCase ) == 0)
+							{
+								showMedian = false;
+							}
+							else
+							{
+								throw(new InvalidOperationException(SR.ExceptionCustomAttributeValueInvalid(point[CustomPropertyName.BoxPlotShowMedian], "BoxPlotShowMedian")));
+							}
+						}
+
+						// Draw median line
+						if(!double.IsNaN(point.YValues[5]) && showMedian)
+						{
+							float	medianValue = (float)points[5].Y;
+							float	dashWidth = rectSize.Width / 9f;
+
+							// Dash width should not be less than 2 pixels
+							SizeF	minSize = graph.GetRelativeSize(new SizeF(2, 2));
+							dashWidth = Math.Max(dashWidth, minSize.Width);
+
+							for(float curPosition = rectSize.Left; curPosition < rectSize.Right; curPosition += dashWidth * 2f)
+							{
+								graph.DrawLineRel( 
+									markerLinesColor, 
+									1, 
+									ChartDashStyle.Solid, 
+									new PointF(curPosition, medianValue), 
+									new PointF((float) Math.Min(rectSize.Right, curPosition + dashWidth), medianValue),
+									Color.Empty, 
+									0 );
+							}
+						}
+
+						// Draw Box Plot marks
+						DrawBoxPlotMarks3D(graph, area, ser, point, xPosition, width, seriesZPosition, seriesDepth);
+						xPosition = points[0].X;
+						high = points[0].Y;
+						low = points[1].Y;
+
+						// End Svg Selection mode
+						graph.EndHotRegion( );
+
+						// Reset Clip Region
+						if(clipRegionSet)
+						{
+							graph.ResetClip();
+						}
+					}
+
+					if( common.ProcessModeRegions )
+					{
+						xPosition = points[0].X;
+						high = points[0].Y;
+						low = points[1].Y;
+
+						// Calculate rect around the error bar marks
+						RectangleF	areaRect = RectangleF.Empty;
+						areaRect.X = xPosition - width / 2f;
+						areaRect.Y = (float)Math.Min(high, low);
+						areaRect.Width = width;
+						areaRect.Height = (float)Math.Max(high, low) - areaRect.Y;
+
+						// Add area
+						common.HotRegionsList.AddHotRegion( areaRect, point, ser.Name, index - 1 );
+				

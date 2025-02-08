@@ -1,0 +1,174 @@
+tcltest::DebugPuts --
+#
+#     Prints the specified string if the current debug level is
+#     higher than the provided level argument.
+#
+# Arguments:
+#     level   The lowest debug level triggering the output
+#     string  The string to print out.
+#
+# Results:
+#     Prints the string. Nothing else is allowed.
+#
+# Side Effects:
+#     None.
+#
+
+proc tcltest::DebugPuts {level string} {
+    variable debug
+    if {$debug >= $level} {
+	puts $string
+    }
+    return
+}
+
+# tcltest::DebugPArray --
+#
+#     Prints the contents of the specified array if the current
+#       debug level is higher than the provided level argument
+#
+# Arguments:
+#     level           The lowest debug level triggering the output
+#     arrayvar        The name of the array to print out.
+#
+# Results:
+#     Prints the contents of the array. Nothing else is allowed.
+#
+# Side Effects:
+#     None.
+#
+
+proc tcltest::DebugPArray {level arrayvar} {
+    variable debug
+
+    if {$debug >= $level} {
+	catch {upvar 1 $arrayvar $arrayvar}
+	parray $arrayvar
+    }
+    return
+}
+
+# Define our own [parray] in ::tcltest that will inherit use of the [puts]
+# defined in ::tcltest.  NOTE: Ought to construct with [info args] and
+# [info default], but can't be bothered now.  If [parray] changes, then
+# this will need changing too.
+auto_load ::parray
+proc tcltest::parray {a {pattern *}} [info body ::parray]
+
+# tcltest::DebugDo --
+#
+#     Executes the script if the current debug level is greater than
+#       the provided level argument
+#
+# Arguments:
+#     level   The lowest debug level triggering the execution.
+#     script  The tcl script executed upon a debug level high enough.
+#
+# Results:
+#     Arbitrary side effects, dependent on the executed script.
+#
+# Side Effects:
+#     None.
+#
+
+proc tcltest::DebugDo {level script} {
+    variable debug
+
+    if {$debug >= $level} {
+	uplevel 1 $script
+    }
+    return
+}
+
+#####################################################################
+
+proc tcltest::Warn {msg} {
+    puts [outputChannel] "WARNING: $msg"
+}
+
+# tcltest::mainThread
+#
+#     Accessor command for tcltest variable mainThread.
+#
+proc tcltest::mainThread { {new ""} } {
+    variable mainThread
+    if {[llength [info level 0]] == 1} {
+	return $mainThread
+    }
+    set mainThread $new
+}
+
+# tcltest::testConstraint --
+#
+#	sets a test constraint to a value; to do multiple constraints,
+#       call this proc multiple times.  also returns the value of the
+#       named constraint if no value was supplied.
+#
+# Arguments:
+#	constraint - name of the constraint
+#       value - new value for constraint (should be boolean) - if not
+#               supplied, this is a query
+#
+# Results:
+#	content of tcltest::testConstraints($constraint)
+#
+# Side effects:
+#	none
+
+proc tcltest::testConstraint {constraint {value ""}} {
+    variable testConstraints
+    variable Option
+    DebugPuts 3 "entering testConstraint $constraint $value"
+    if {[llength [info level 0]] == 2} {
+	return $testConstraints($constraint)
+    }
+    # Check for boolean values
+    if {[catch {expr {$value && $value}} msg]} {
+	return -code error $msg
+    }
+    if {[limitConstraints] && ($constraint ni $Option(-constraints))} {
+	set value 0
+    }
+    set testConstraints($constraint) $value
+}
+
+# tcltest::interpreter --
+#
+#	the interpreter name stored in tcltest::tcltest
+#
+# Arguments:
+#	executable name
+#
+# Results:
+#	content of tcltest::tcltest
+#
+# Side effects:
+#	None.
+
+proc tcltest::interpreter { {interp ""} } {
+    variable tcltest
+    if {[llength [info level 0]] == 1} {
+	return $tcltest
+    }
+    set tcltest $interp
+}
+
+#####################################################################
+
+# tcltest::AddToSkippedBecause --
+#
+#	Increments the variable used to track how many tests were
+#       skipped because of a particular constraint.
+#
+# Arguments:
+#	constraint     The name of the constraint to be modified
+#
+# Results:
+#	Modifies tcltest::skippedBecause; sets the variable to 1 if
+#       didn't previously exist - otherwise, it just increments it.
+#
+# Side effects:
+#	None.
+
+proc tcltest::AddToSkippedBecause { constraint {value 1}} {
+    # add the constraint to the list of

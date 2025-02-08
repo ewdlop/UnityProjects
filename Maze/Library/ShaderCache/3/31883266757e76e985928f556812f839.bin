@@ -1,0 +1,83 @@
+c block count change detected (counter mismatch)";
+  case instrprof_error::counter_overflow:
+    return "Counter overflow";
+  case instrprof_error::value_site_count_mismatch:
+    return "Function value site count change detected (counter mismatch)";
+  case instrprof_error::compress_failed:
+    return "Failed to compress data (zlib)";
+  case instrprof_error::uncompress_failed:
+    return "Failed to uncompress data (zlib)";
+  case instrprof_error::empty_raw_profile:
+    return "Empty raw profile file";
+  case instrprof_error::zlib_unavailable:
+    return "Profile uses zlib compression but the profile reader was built without zlib support";
+  }
+  llvm_unreachable("A value of instrprof_error has no message.");
+}
+
+namespace {
+
+// FIXME: This class is only here to support the transition to llvm::Error. It
+// will be removed once this transition is complete. Clients should prefer to
+// deal with the Error value directly, rather than converting to error_code.
+class InstrProfErrorCategoryType : public std::error_category {
+  const char *name() const noexcept override { return "llvm.instrprof"; }
+
+  std::string message(int IE) const override {
+    return getInstrProfErrString(static_cast<instrprof_error>(IE));
+  }
+};
+
+} // end anonymous namespace
+
+static ManagedStatic<InstrProfErrorCategoryType> ErrorCategory;
+
+const std::error_category &llvm::instrprof_category() {
+  return *ErrorCategory;
+}
+
+namespace {
+
+const char *InstrProfSectNameCommon[] = {
+#define INSTR_PROF_SECT_ENTRY(Kind, SectNameCommon, SectNameCoff, Prefix)      \
+  SectNameCommon,
+#include "llvm/ProfileData/InstrProfData.inc"
+};
+
+const char *InstrProfSectNameCoff[] = {
+#define INSTR_PROF_SECT_ENTRY(Kind, SectNameCommon, SectNameCoff, Prefix)      \
+  SectNameCoff,
+#include "llvm/ProfileData/InstrProfData.inc"
+};
+
+const char *InstrProfSectNamePrefix[] = {
+#define INSTR_PROF_SECT_ENTRY(Kind, SectNameCommon, SectNameCoff, Prefix)      \
+  Prefix,
+#include "llvm/ProfileData/InstrProfData.inc"
+};
+
+} // namespace
+
+namespace llvm {
+
+std::string getInstrProfSectionName(InstrProfSectKind IPSK,
+                                    Triple::ObjectFormatType OF,
+                                    bool AddSegmentInfo) {
+  std::string SectName;
+
+  if (OF == Triple::MachO && AddSegmentInfo)
+    SectName = InstrProfSectNamePrefix[IPSK];
+
+  if (OF == Triple::COFF)
+    SectName += InstrProfSectNameCoff[IPSK];
+  else
+    SectName += InstrProfSectNameCommon[IPSK];
+
+  if (OF == Triple::MachO && IPSK == IPSK_data && AddSegmentInfo)
+    SectName += ",regular,live_support";
+
+  return SectName;
+}
+
+void SoftInstrProfErrors::addError(instrprof_error IE) {
+  if (IE 

@@ -1,0 +1,79 @@
+/*
+ * test-mono-callspec.c: Unit test for the callspec parsing and evaluation.
+ *
+ * Copyright (C) 2017 vFunction, Inc.
+ *
+ */
+
+// Embedders do not have the luxury of our config.h, so skip it here.
+//#include "config.h"
+
+// But we need MONO_INSIDE_RUNTIME to get MonoError mangled correctly
+// because we also test unexported functions (mono_class_from_name_checked).
+#define MONO_INSIDE_RUNTIME 1
+
+#include "mono/utils/mono-publib.h"
+
+// Allow to test external_only w/o deprecation error.
+#undef MONO_RT_EXTERNAL_ONLY
+#define MONO_RT_EXTERNAL_ONLY /* nothing */
+
+#include <glib.h>
+#include <mono/metadata/metadata.h>
+#include <mono/metadata/callspec.h>
+#include <mono/metadata/assembly.h>
+#include <mono/metadata/assembly-internals.h>
+#include <mono/metadata/class-internals.h>
+#include <mono/metadata/appdomain.h>
+#include <mono/metadata/debug-helpers.h>
+#include <mono/mini/jit.h>
+#include <mono/utils/mono-error-internals.h>
+
+#define TESTPROG "callspec.exe"
+
+GArray *test_methods = NULL;
+
+enum test_method_enums {
+	FOO_BAR,
+	FOO_BARP,
+	GOO_BAR,
+	FOO2_BAR,
+	CONSOLE_WRITELINE,
+};
+
+struct {
+	int method;
+	const char *callspec;
+	gboolean expect_match;
+} test_entries[] = {
+    /* program tests */
+    {FOO_BAR, "program", TRUE},
+    {CONSOLE_WRITELINE, "program", FALSE},
+    {FOO_BAR, "all,-program", FALSE},
+    {CONSOLE_WRITELINE, "all,-program", TRUE},
+
+    /* assembly tests */
+    {FOO_BAR, "mscorlib", FALSE},
+    {CONSOLE_WRITELINE, "mscorlib", TRUE},
+    {FOO_BAR, "all,-mscorlib", TRUE},
+    {CONSOLE_WRITELINE, "all,-mscorlib", FALSE},
+
+    /* class tests */
+    {FOO_BAR, "T:Baz.Foo", TRUE},
+    {CONSOLE_WRITELINE, "T:Baz.Foo", FALSE},
+    {FOO_BAR, "all,-T:Baz.Foo", FALSE},
+    {CONSOLE_WRITELINE, "all,-T:Baz.Foo", TRUE},
+
+    /* namespace tests */
+    {FOO_BAR, "N:Baz", TRUE},
+    {CONSOLE_WRITELINE, "N:Baz", FALSE},
+    {FOO_BAR, "all,-N:Baz", FALSE},
+    {CONSOLE_WRITELINE, "all,-N:Baz", TRUE},
+
+    /* method tests without parameters */
+    {FOO_BAR, "M:Baz.Foo:Bar", TRUE},
+    {FOO_BARP, "M:Baz.Foo:Bar", TRUE},
+    {GOO_BAR, "M:Baz.Foo:Bar", FALSE},
+    {FOO2_BAR, "M:Baz.Foo:Bar", FALSE},
+    {CONSOLE_WRITELINE, "M:Baz.Foo:Bar", FALSE},
+    {F

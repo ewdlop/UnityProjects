@@ -1,0 +1,263 @@
+owTemporalAccumulation1"),
+	TEXT("ShadowTemporalAccumulation2"),
+	TEXT("ShadowTemporalAccumulation3"),
+
+	// PolychromaticPenumbraHarmonic
+	TEXT("PolychromaticPenumbraHistory0"),
+	TEXT("PolychromaticPenumbraHistory1"),
+	nullptr,
+	nullptr,
+
+	// Reflections
+	TEXT("ReflectionsTemporalAccumulation0"),
+	TEXT("ReflectionsTemporalAccumulation1"),
+	nullptr,
+	nullptr,
+
+	// AmbientOcclusion
+	TEXT("AOTemporalAccumulation0"),
+	nullptr,
+	nullptr,
+	nullptr,
+
+	// DiffuseIndirect
+	TEXT("DiffuseIndirectTemporalAccumulation0"),
+	TEXT("DiffuseIndirectTemporalAccumulation1"),
+	nullptr,
+	nullptr,
+
+	// DiffuseSphericalHarmonic
+	TEXT("DiffuseHarmonicTemporalAccumulation0"),
+	TEXT("DiffuseHarmonicTemporalAccumulation1"),
+	TEXT("DiffuseHarmonicTemporalAccumulation2"),
+	TEXT("DiffuseHarmonicTemporalAccumulation3"),
+
+	// ScreenSpaceDiffuseIndirect
+	TEXT("SSGITemporalAccumulation0"),
+	TEXT("SSGITemporalAccumulation1"),
+	nullptr,
+	nullptr,
+};
+
+const TCHAR* const kHistoryConvolutionResourceNames[] = {
+	// ShadowVisibilityMask
+	TEXT("ShadowHistoryConvolution0"),
+	TEXT("ShadowHistoryConvolution1"),
+	TEXT("ShadowHistoryConvolution2"),
+	TEXT("ShadowHistoryConvolution3"),
+
+	// PolychromaticPenumbraHarmonic
+	nullptr,
+	nullptr,
+	nullptr,
+	nullptr,
+
+	// Reflections
+	TEXT("ReflectionsHistoryConvolution0"),
+	TEXT("ReflectionsHistoryConvolution1"),
+	nullptr,
+	nullptr,
+
+	// AmbientOcclusion
+	TEXT("AOHistoryConvolution0"),
+	nullptr,
+	nullptr,
+	nullptr,
+
+	// DiffuseIndirect
+	TEXT("DiffuseIndirectHistoryConvolution0"),
+	TEXT("DiffuseIndirectHistoryConvolution1"),
+	nullptr,
+	nullptr,
+
+	// DiffuseSphericalHarmonic
+	nullptr,
+	nullptr,
+	nullptr,
+	nullptr,
+
+	// ScreenSpaceDiffuseIndirect
+	nullptr,
+	nullptr,
+	nullptr,
+	nullptr,
+};
+
+const TCHAR* const kDenoiserOutputResourceNames[] = {
+	// ShadowVisibilityMask
+	TEXT("ShadowDenoiserOutput0"),
+	TEXT("ShadowDenoiserOutput1"),
+	TEXT("ShadowDenoiserOutput2"),
+	TEXT("ShadowDenoiserOutput3"),
+
+	// PolychromaticPenumbraHarmonic
+	nullptr,
+	nullptr,
+	nullptr,
+	nullptr,
+
+	// Reflections
+	nullptr,
+	nullptr,
+	nullptr,
+	nullptr,
+
+	// AmbientOcclusion
+	nullptr,
+	nullptr,
+	nullptr,
+	nullptr,
+
+	// DiffuseIndirect
+	nullptr,
+	nullptr,
+	nullptr,
+	nullptr,
+
+	// DiffuseSphericalHarmonic
+	nullptr,
+	nullptr,
+	nullptr,
+	nullptr,
+
+	// ScreenSpaceDiffuseIndirect
+	nullptr,
+	nullptr,
+	nullptr,
+	nullptr,
+};
+
+static_assert(UE_ARRAY_COUNT(kReconstructionResourceNames) == int32(ESignalProcessing::MAX) * kMaxBufferProcessingCount, "You forgot me!");
+static_assert(UE_ARRAY_COUNT(kRejectionPreConvolutionResourceNames) == int32(ESignalProcessing::MAX) * kMaxBufferProcessingCount, "You forgot me!");
+static_assert(UE_ARRAY_COUNT(kTemporalAccumulationResourceNames) == int32(ESignalProcessing::MAX) * kMaxBufferProcessingCount, "You forgot me!");
+static_assert(UE_ARRAY_COUNT(kHistoryConvolutionResourceNames) == int32(ESignalProcessing::MAX) * kMaxBufferProcessingCount, "You forgot me!");
+static_assert(UE_ARRAY_COUNT(kDenoiserOutputResourceNames) == int32(ESignalProcessing::MAX) * kMaxBufferProcessingCount, "You forgot me!");
+
+
+/** Returns whether should compile pipeline for a given shader platform.*/
+bool ShouldCompileSignalPipeline(ESignalProcessing SignalProcessing, EShaderPlatform Platform)
+{
+	if (SignalProcessing == ESignalProcessing::ScreenSpaceDiffuseIndirect)
+	{
+		return Platform == SP_PCD3D_SM5 || Platform == SP_PS4 || Platform == SP_XBOXONE_D3D12 || Platform == SP_METAL_SM5;
+	}
+	else if (
+		SignalProcessing == ESignalProcessing::Reflections ||
+		SignalProcessing == ESignalProcessing::DiffuseSphericalHarmonic)
+	{
+		return Platform == SP_PCD3D_SM5 || RHISupportsRayTracingShaders(Platform);
+	}
+	else if (
+		SignalProcessing == ESignalProcessing::ShadowVisibilityMask ||
+		SignalProcessing == ESignalProcessing::AmbientOcclusion ||
+		SignalProcessing == ESignalProcessing::DiffuseAndAmbientOcclusion)
+	{
+		// Only for ray tracing denoising.
+		return RHISupportsRayTracingShaders(Platform);
+	}
+	else if (SignalProcessing == ESignalProcessing::PolychromaticPenumbraHarmonic)
+	{
+		return false;
+	}
+	check(0);
+	return false;
+}
+
+
+/** Shader parameter structure used for all shaders. */
+BEGIN_SHADER_PARAMETER_STRUCT(FSSDCommonParameters, )
+	SHADER_PARAMETER(FIntPoint, ViewportMin)
+	SHADER_PARAMETER(FIntPoint, ViewportMax)
+	SHADER_PARAMETER(FVector4, ThreadIdToBufferUV)
+	SHADER_PARAMETER(FVector4, BufferSizeAndInvSize)
+	SHADER_PARAMETER(FVector4, BufferBilinearUVMinMax)
+	SHADER_PARAMETER(FVector2D, BufferUVToOutputPixelPosition)
+	SHADER_PARAMETER(float, WorldDepthToPixelWorldRadius)
+	SHADER_PARAMETER(FVector4, BufferUVToScreenPosition)
+	SHADER_PARAMETER(FMatrix, ScreenToView)
+	SHADER_PARAMETER(FVector2D, BufferUVBilinearCorrection)
+
+	SHADER_PARAMETER_STRUCT_INCLUDE(FSceneTextureParameters, SceneTextures)
+
+	SHADER_PARAMETER_RDG_TEXTURE_ARRAY(Texture2D<uint>, CompressedMetadata, [kCompressedMetadataTextures])
+
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, EyeAdaptationTexture)
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2D<uint>, TileClassificationTexture)
+	SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
+	
+	SHADER_PARAMETER_STRUCT_REF(FHaltonIteration, HaltonIteration)
+	SHADER_PARAMETER_STRUCT_REF(FHaltonPrimes, HaltonPrimes)
+	SHADER_PARAMETER_STRUCT_REF(FBlueNoise, BlueNoise)
+END_SHADER_PARAMETER_STRUCT()
+
+/** Shader parameter structure use to bind all signal generically. */
+BEGIN_SHADER_PARAMETER_STRUCT(FSSDSignalTextures, )
+	SHADER_PARAMETER_RDG_TEXTURE_ARRAY(Texture2D, Textures, [kMaxBufferProcessingCount])
+END_SHADER_PARAMETER_STRUCT()
+
+BEGIN_SHADER_PARAMETER_STRUCT(FSSDSignalSRVs, )
+	SHADER_PARAMETER_RDG_TEXTURE_SRV_ARRAY(Texture2D, Textures, [kMaxBufferProcessingCount])
+END_SHADER_PARAMETER_STRUCT()
+
+BEGIN_SHADER_PARAMETER_STRUCT(FSSDSignalUAVs, )
+	SHADER_PARAMETER_RDG_TEXTURE_UAV_ARRAY(Texture2D, UAVs, [kMaxBufferProcessingCount])
+END_SHADER_PARAMETER_STRUCT()
+
+/** Shader parameter structure to have all information to spatial filtering. */
+BEGIN_SHADER_PARAMETER_STRUCT(FSSDConvolutionMetaData, )
+	SHADER_PARAMETER_ARRAY(FVector4, LightPositionAndRadius, [IScreenSpaceDenoiser::kMaxBatchSize])
+	SHADER_PARAMETER_ARRAY(FVector4, LightDirectionAndLength, [IScreenSpaceDenoiser::kMaxBatchSize])
+	SHADER_PARAMETER_ARRAY(float, HitDistanceToWorldBluringRadius, [IScreenSpaceDenoiser::kMaxBatchSize])
+	SHADER_PARAMETER_ARRAY(uint32, LightType, [IScreenSpaceDenoiser::kMaxBatchSize])
+END_SHADER_PARAMETER_STRUCT()
+
+
+FSSDSignalTextures CreateMultiplexedTextures(
+	FRDGBuilder& GraphBuilder,
+	int32 TextureCount,
+	const TStaticArray<FRDGTextureDesc, kMaxBufferProcessingCount>& DescArray,
+	const TCHAR* const* TextureNames)
+{
+	check(TextureCount <= kMaxBufferProcessingCount);
+	FSSDSignalTextures SignalTextures;
+	for (int32 i = 0; i < TextureCount; i++)
+	{
+		const TCHAR* TextureName = TextureNames[i];
+		SignalTextures.Textures[i] = GraphBuilder.CreateTexture(DescArray[i], TextureName);
+	}
+	return SignalTextures;
+}
+
+FSSDSignalSRVs CreateMultiplexedUintSRVs(FRDGBuilder& GraphBuilder, const FSSDSignalTextures& SignalTextures)
+{
+	FSSDSignalSRVs SRVs;
+	for (int32 i = 0; i < kMaxBufferProcessingCount; i++)
+	{
+		if (SignalTextures.Textures[i])
+		{
+			EPixelFormat Format = SignalTextures.Textures[i]->Desc.Format;
+			int32 Bytes = GPixelFormats[Format].BlockBytes;
+
+			EPixelFormat UIntFormat = PF_Unknown;
+			if (Bytes == 1)
+				UIntFormat = PF_R8_UINT;
+			else if (Bytes == 2)
+				UIntFormat = PF_R16_UINT;
+			else if (Bytes == 4)
+				UIntFormat = PF_R32_UINT;
+			else if (Bytes == 8)
+				UIntFormat = PF_R32G32_UINT;
+			else if (Bytes == 16)
+				UIntFormat = PF_R32G32B32A32_UINT;
+			else
+			{
+				check(0);
+			}
+
+			SRVs.Textures[i] = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::CreateWithPixelFormat(SignalTextures.Textures[i], UIntFormat));
+		}
+	}
+	return SRVs;
+}
+
+FSSDSignalUAVs CreateMultiplexedUAVs(FRDGBuilder& GraphBuilder, const FSSDSignalTextures& SignalTex

@@ -1,0 +1,49 @@
+x,
+            flush,
+            pErrorCode)
+    ) {
+        return 0; /* an extension mapping handled the input */
+    }
+
+    /* GB 18030 */
+    if((cnv->options&_MBCS_OPTION_GB18030)!=0) {
+        const uint32_t *range;
+        int32_t i;
+
+        range=gb18030Ranges[0];
+        for(i=0; i<sizeof(gb18030Ranges)/sizeof(gb18030Ranges[0]); range+=4, ++i) {
+            if(range[0]<=(uint32_t)cp && (uint32_t)cp<=range[1]) {
+                /* found the Unicode code point, output the four-byte sequence for it */
+                uint32_t linear;
+                char bytes[4];
+
+                /* get the linear value of the first GB 18030 code in this range */
+                linear=range[2]-LINEAR_18030_BASE;
+
+                /* add the offset from the beginning of the range */
+                linear+=((uint32_t)cp-range[0]);
+
+                /* turn this into a four-byte sequence */
+                bytes[3]=(char)(0x30+linear%10); linear/=10;
+                bytes[2]=(char)(0x81+linear%126); linear/=126;
+                bytes[1]=(char)(0x30+linear%10); linear/=10;
+                bytes[0]=(char)(0x81+linear);
+
+                /* output this sequence */
+                ucnv_fromUWriteBytes(cnv,
+                                     bytes, 4, (char **)target, (char *)targetLimit,
+                                     offsets, sourceIndex, pErrorCode);
+                return 0;
+            }
+        }
+    }
+
+    /* no mapping */
+    *pErrorCode=U_INVALID_CHAR_FOUND;
+    return cp;
+}
+
+/*
+ * Input sequence: cnv->toUBytes[0..length[
+ * @return if(U_FAILURE) return the length (toULength, byteIndex) for the input
+ *         else return 0

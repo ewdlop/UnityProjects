@@ -1,0 +1,141 @@
+int, TArray<FString>& OutErrors)
+{
+	FString DummyFilename(TEXT("/Engine/Private/RemoveUnusedOutputs.usf"));
+	FRemoveUnusedOutputs Data(InUsedOutputs, InExceptions);
+	Data.EntryPoint = EntryPoint;
+	auto Lambda = [&Data](CrossCompiler::FLinearAllocator* Allocator, CrossCompiler::TLinearArray<CrossCompiler::AST::FNode*>& ASTNodes)
+	{
+		Data.Allocator = Allocator;
+		Data.RemoveUnusedOutputs(ASTNodes);
+		if (!Data.bSuccess)
+		{
+			int i = 0;
+			++i;
+		}
+	};
+	CrossCompiler::FCompilerMessages Messages;
+	if (!CrossCompiler::Parser::Parse(InOutSourceCode, DummyFilename, Messages, Lambda))
+	{
+		Data.Errors.Add(FString(TEXT("RemoveUnusedOutputs: Failed to compile!")));
+		OutErrors = Data.Errors;
+		for (auto& Message : Messages.MessageList)
+		{
+			OutErrors.Add(Message.Message);
+		}
+		return false;
+	}
+
+	for (auto& Message : Messages.MessageList)
+	{
+		OutErrors.Add(Message.Message);
+	}
+
+	if (Data.bSuccess)
+	{
+		InOutSourceCode += (TCHAR)'\n';
+		InOutSourceCode += Data.GeneratedCode;
+		EntryPoint = Data.EntryPoint;
+
+		return true;
+	}
+
+	OutErrors = Data.Errors;
+	return false;
+}
+
+struct FRemoveUnusedInputs : FRemoveAlgorithm
+{
+	const TArray<FString>& UsedInputs;
+
+	struct FInputsBodyContext : FBodyContext
+	{
+		CrossCompiler::AST::FStructSpecifier* NewInputStruct;
+
+		const TCHAR* InputVariableName;
+		const TCHAR* InputTypeName;
+
+		FInputsBodyContext() :
+			NewInputStruct(nullptr),
+			InputVariableName(TEXT("OptimizedInput")),
+			InputTypeName(TEXT("FOptimizedInput"))
+		{
+		}
+	};
+
+	FRemoveUnusedInputs(const TArray<FString>& InUsedInputs) :
+		UsedInputs(InUsedInputs)
+	{
+	}
+
+	void RemoveUnusedInputs(CrossCompiler::TLinearArray<CrossCompiler::AST::FNode*>& ASTNodes)
+	{
+		using namespace CrossCompiler::AST;
+
+		// Find Entry point from original AST nodes
+		TArray<FStructSpecifier*> MiniSymbolTable;
+		FString Test;
+		FFunctionDefinition* EntryFunction = FindEntryPointAndPopulateSymbolTable(ASTNodes, MiniSymbolTable, &Test);
+		if (!EntryFunction)
+		{
+			Errors.Add(FString::Printf(TEXT("RemoveUnused: Unable to find entry point %s"), *EntryPoint));
+			bSuccess = false;
+			return;
+		}
+
+		SourceInfo = EntryFunction->SourceInfo;
+
+		FInputsBodyContext BodyContext;
+
+		// Setup the call to the original entry point
+		BodyContext.CallToOriginalFunction = new(Allocator) FFunctionExpression(Allocator, SourceInfo, MakeIdentifierExpression(Allocator, *EntryPoint, SourceInfo));
+
+		if (!SetupInputAndReturnType(EntryFunction, MiniSymbolTable, BodyContext))
+		{
+			bSuccess = false;
+			return;
+		}
+
+		if (!ProcessOriginalParameters(EntryFunction, MiniSymbolTable, BodyContext))
+		{
+			bSuccess = false;
+			return;
+		}
+
+		// Real call statement
+		if (BodyContext.FinalInstruction)
+		{
+			auto* JumpStatement = BodyContext.FinalInstruction->AsJumpStatement();
+			if (JumpStatement)
+			{
+				JumpStatement->OptionalExpression = BodyContext.CallToOriginalFunction;
+			}
+		}
+		else
+		{
+			BodyContext.FinalInstruction = new(Allocator) CrossCompiler::AST::FExpressionStatement(Allocator, BodyContext.CallToOriginalFunction, SourceInfo);
+		}
+
+		auto* Body = AddStatementsToBody(BodyContext, nullptr);
+
+		if (BodyContext.NewInputStruct->Members.Num() > 0)
+		{
+			// If the input struct is not empty, add this as an argument to the new entry function
+			FParameterDeclarator* Declarator = new(Allocator) FParameterDeclarator(Allocator, SourceInfo);
+			Declarator->Type = MakeSimpleType(BodyContext.InputTypeName);
+			Declarator->Identifier = BodyContext.InputVariableName;
+			BodyContext.NewFunctionParameters.Add(Declarator);
+		}
+
+		FFunctionDefinition* NewEntryFunction = CreateNewEntryFunction(Body, EntryFunction->Prototype->ReturnType, BodyContext.NewFunctionParameters);
+		NewEntryFunction->Prototype->ReturnSemantic = EntryFunction->Prototype->ReturnSemantic;
+
+		WriteGeneratedInCode(NewEntryFunction, BodyContext.NewStructs, GeneratedCode);
+
+		EntryPoint = NewEntryFunction->Prototype->Identifier;
+		bSuccess = true;
+	}
+
+	bool ProcessOriginalParameters(CrossCompiler::AST::FFunctionDefinition* EntryFunction, TArray<CrossCompiler::AST::FStructSpecifier*>& MiniSymbolTable, FInputsBodyContext& BodyContext)
+	{
+		using namespace CrossCompiler::AST;
+		for (FNod

@@ -1,0 +1,98 @@
+#
+# Author: Zoltan Varga (vargaz@gmail.com)
+# License: MIT/X11
+#
+
+#
+# This is a mono support mode for a python-enabled gdb:
+# http://sourceware.org/gdb/wiki/PythonGdb
+# Usage:
+# - copy/symlink this file, plus mono-gdbinit to the directory where the mono 
+#   executable lives.
+# - run mono under gdb, or attach to a mono process using gdb
+# - Type 'xdb' in gdb to load/reload the debugging info emitted by the runtime.
+# - The debug info is emitted to a file called xdb.s in the current working directory.
+#   When attaching to a mono process, make sure you are in the same directory.
+#
+
+from __future__ import print_function
+import os
+
+class StringPrinter:
+    "Print a C# string"
+
+    def __init__(self, val):
+        self.val = val
+
+    def to_string(self):
+        if int(self.val.cast (gdb.lookup_type ("guint64"))) == 0:
+            return "null"
+
+        obj = self.val.cast (gdb.lookup_type ("MonoString").pointer ()).dereference ()
+        len = obj ['length']
+        chars = obj ['chars']
+        i = 0
+        res = ['"']
+        while i < len:
+            val = (chars.cast(gdb.lookup_type ("gint64")) + (i * 2)).cast(gdb.lookup_type ("gunichar2").pointer ()).dereference ()
+            if val >= 256:
+                c = "\u%X".format (val)
+            else:
+                c = chr (val)
+            res.append (c)
+            i = i + 1
+        res.append ('"')
+        return ''.join (res)
+
+def stringify_class_name(ns, name):
+    if ns == "System":
+        if name == "Byte":
+            return "byte"
+        if name == "String":
+            return "string"
+    if ns == "":
+        return name
+    else:
+        return "{0}.{1}".format (ns, name)
+
+class ArrayPrinter:
+    "Print a C# array"
+
+    def __init__(self, val, class_ns, class_name):
+        self.val = val
+        self.class_ns = class_ns
+        self.class_name = class_name
+
+    def to_string(self):
+        obj = self.val.cast (gdb.lookup_type ("MonoArray").pointer ()).dereference ()
+        length = obj ['max_length']
+        return "{0} [{1}]".format (stringify_class_name (self.class_ns, self.class_name [0:len (self.class_name) - 2]), int (length))
+        
+class ObjectPrinter:
+    "Print a C# object"
+
+    def __init__(self, val):
+        if str(val.type)[-1] == "&":
+            self.val = val.address.cast (gdb.lookup_type ("MonoObject").pointer ())
+        else:
+            self.val = val.cast (gdb.lookup_type ("MonoObject").pointer ())
+
+    class _iterator:
+        def __init__(self,obj):
+            self.obj = obj
+            self.iter = self.obj.type.fields ().__iter__ ()
+            pass
+
+        def __iter__(self):
+            return self
+
+        def next(self):
+            field = self.iter.next ()
+            try:
+                if str(self.obj [field.name].type) == "object":
+                    # Avoid recursion
+                    return (field.name, self.obj [field.name].cast (gdb.lookup_type ("void").pointer ()))
+                else:
+                    return (field.name, self.obj [field.name])
+            except:
+   
