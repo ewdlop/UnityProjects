@@ -62,7 +62,7 @@ Injured is the one that - 啞巴吃黃蓮，有苦難說。
 
 ### Dyson Sphere
 
-[Dyson Sphere-GGJ - Azure Devops]((https://dev.azure.com/ray810815/_git/GGJ))
+[Dyson Sphere-GGJ - Azure Devops](https://dev.azure.com/ray810815/_git/GGJ)
 
 [Dyson Sphere-GGJ- GitHub](https://github.com/ewdlop/Chicken-Dinner-GGJ)
 
