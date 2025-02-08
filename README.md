@@ -28,7 +28,7 @@ WebGL builds deploy to [itch.io](https://ewdlop.itch.io/)
 
 ### With Legav and Injured(MyAlias)
 
-### Backpack-Simulator
+#### Backpack-Simulator
 
 Injured contributed the dad jokes and I followed up with more.
 
@@ -40,13 +40,23 @@ Injured is the one that - 啞巴吃黃蓮，有苦難說。
 
 [Chicken-Dinner-GGJ-Github](https://github.com/ewdlop/Chicken-Dinner-GGJ)
 
-[Chicken-Dinner-GGJ-Azure Devops](https://dev.azure.com/ray810815/_git/GGJ)
+~[Chicken-Dinner-GGJ-Azure Devops](https://dev.azure.com/ray810815/_git/GGJ)~
+
+#### Help-desk
 
 #### Manual Breathing
 
-#### Dyson Sphere
+## GGJ
 
-#### Help-desk
+## Chicken-Dinner
+
+[Chicken-Dinner](https://github.com/danhuynh0803/Chicken-Dinner)
+
+[Chicken Dinner - Azure Devops]()
+
+### Dyson Sphere
+
+[Dyson Sphere-GGJ - Azure Devops]((https://dev.azure.com/ray810815/_git/GGJ))
 
 ### Me(MyAlias>=50%)
 
