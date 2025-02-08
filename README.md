@@ -48,13 +48,13 @@ Injured is the one that - 啞巴吃黃蓮，有苦難說。
 
 ## GGJ
 
-## Chicken-Dinner
+### Chicken-Dinner
 
 ~[Chicken-Dinner](https://github.com/ewdlop/Chicken-Dinner)~
 
 ~[Chicken-Dinner](https://github.com/danhuynh0803/Chicken-Dinner)~
 
-[Chicken Dinner][(https://github.com/ewdlop/Chicken-Dinner-GGJ)
+[Chicken Dinner](https://github.com/ewdlop/Chicken-Dinner-GGJ)
 
 [Chicken Dinner - Azure Devops]()
 
