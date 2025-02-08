@@ -52,7 +52,7 @@ Injured is the one that - 啞巴吃黃蓮，有苦難說。
 
 ### Backpack-Simulator-EX(MyAlias>=50%)
 
-[Procedural Generated Hex Grid](https://www.redblobgames.com/grids/hexagons/) + [Perlin Noise](https://catlikecoding.com/unity/tutorials/pseudorandom-noise/perlin-noise/#:~:text=The%20idea%20of%20Perlin%20noise,the%20positive%20or%20negative%20version) 
+C# implemntation of [Procedural Generated Hex Grid](https://www.redblobgames.com/grids/hexagons/) + [Perlin Noise](https://catlikecoding.com/unity/tutorials/pseudorandom-noise/perlin-noise/#:~:text=The%20idea%20of%20Perlin%20noise,the%20positive%20or%20negative%20version) 
 
 Private Repo: [Backpack-Simulator-EX]([https://dev.azure.com/ray810815/Backpack-Simulator-EX](https://dev.azure.com/ray810815/LD42-Backpack-Simulator))
 
