@@ -36,7 +36,7 @@ Injured contributed the dad jokes and I followed up with more.
 
 Injured is the one that - 啞巴吃黃蓮，有苦難說。
 
-#### Chicken Dinner
+~#### Chicken Dinner~
 
 ~[Chicken-Dinner](https://github.com/danhuynh0803/Chicken-Dinner)~
 
@@ -46,7 +46,11 @@ Injured is the one that - 啞巴吃黃蓮，有苦難說。
 
 #### Help-desk
 
-#### Manual Breathing
+~### Dyson Sphere~
+
+#### Manual Breathing(Not Unity. It is Unreal.)
+
+[Manual-Breathing](https://github.com/danhuynh0803/Manual-Breathing)
 
 ## GGJ
 
