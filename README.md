@@ -24,7 +24,9 @@ WebGL builds deploy to [itch.io](https://ewdlop.itch.io/)
 
 #### SpaceProject(>=50%)
 
-### https://legav.itch.io/occupational-hazard
+### Ocupational Hazard
+
+#### https://legav.itch.io/occupational-hazard
 
 ### With Legav and Injured(MyAlias)
 
