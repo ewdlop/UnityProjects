@@ -54,13 +54,16 @@ Injured is the one that - 啞巴吃黃蓮，有苦難說。
 
 ~[Chicken-Dinner](https://github.com/danhuynh0803/Chicken-Dinner)~
 
-[Chicken Dinner](https://github.com/ewdlop/Chicken-Dinner-GGJ)
+[Chicken Dinner - GitHub](https://github.com/ewdlop/Chicken-Dinner-GGJ)
 
 [Chicken Dinner - Azure Devops]()
 
 ### Dyson Sphere
 
 [Dyson Sphere-GGJ - Azure Devops]((https://dev.azure.com/ray810815/_git/GGJ))
+
+[Dyson Sphere-GGJ- GitHub](https://github.com/ewdlop/Chicken-Dinner-GGJ)
+
 
 ### Me(MyAlias>=50%)
 
