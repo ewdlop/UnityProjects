@@ -24,6 +24,12 @@ WebGL builds deploy to [itch.io](https://ewdlop.itch.io/)
 
 [Unity Collaboration]()?
 
+[变态坑爹版马里奥 我大概死了589次就通关了](<https://www.youtube.com/watch?v=KdCfoteiJ1c&t=1020s>)
+
+[08:23 坑爹变态版马里奥！通关也就死了998次而已！｜This is not Mario](<https://www.youtube.com/watch?v=S3hiQ9cKHLY>)
+
+[【苏神】变态坑爹版马里奥 我大概只死了589次就通关了](<https://www.bilibili.com/video/BV1XW411F71p/?spm_id_from=333.337.search-card.all.click&vd_source=1063495a172853c2c3437f2ecc5b875b>)
+
 #### SpaceProject(>=50%)
 
 [Unity Collaboration]()?
