@@ -44,7 +44,7 @@ WebGL builds deploy to [itch.io](https://ewdlop.itch.io/)
 
 #### https://legav.itch.io/occupational-hazard
 
-### With Legav and Injured/CoderOfHammurabi(MyAlias)
+### With Legav and Injured/CoderOfHammurabi/https://github.com/ipsofacto537(MyAlias)
 
 #### Backpack-Simulator
 
@@ -71,7 +71,7 @@ Injured is the one that - 啞巴吃黃蓮，有苦難說。
 
 [Unity Collaboration]()?
 
-## Legav and Injured/CoderOfHammurabi(MyAlias?)
+## Legav and Injured/CoderOfHammurabi/https://github.com/ipsofacto537(MyAlias?)
 
 #### Help-desk - Phone
 
@@ -79,7 +79,7 @@ Injured is the one that - 啞巴吃黃蓮，有苦難說。
 
 ~### Dyson Sphere~
 
-## Legav and Injured/CoderOfHammurabi(MyAlias)
+## Legav and Injured/CoderOfHammurabi/https://github.com/ipsofacto537(MyAlias)
 
 #### Manual Breathing(Not Unity. It is Unreal.)
 
