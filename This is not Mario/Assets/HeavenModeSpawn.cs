@@ -23,7 +23,7 @@ public class HeavenModeSpawn : MonoBehaviour {
         int direction = random[Random.Range(0, random.Length)];
         clone = Instantiate(missile, new Vector3(230f+300f*direction, Random.Range(0,250f), -2f), Quaternion.identity);
         Rigidbody2D rigid=clone.GetComponent<Rigidbody2D>();
-        rigid.velocity = new Vector3(-1*direction*140f, 0, 0);
+        rigid.linearVelocity = new Vector3(-1*direction*140f, 0, 0);
         clone.transform.localScale = new Vector3(50*direction, 50, 1);
     }
     void SpawnsmallMissile()
@@ -31,7 +31,7 @@ public class HeavenModeSpawn : MonoBehaviour {
         int direction = random[Random.Range(0, random.Length)];
         clone = Instantiate(smallmissile, new Vector3(230f + 300f * direction, Random.Range(0, 250f), -2f), Quaternion.identity);
         Rigidbody2D rigid = clone.GetComponent<Rigidbody2D>();
-        rigid.velocity = new Vector3(-1 * direction * 140f, 0, 0);
+        rigid.linearVelocity = new Vector3(-1 * direction * 140f, 0, 0);
         clone.transform.localScale = new Vector3(10*direction, 10, 1);
     }
 
@@ -40,7 +40,7 @@ public class HeavenModeSpawn : MonoBehaviour {
         int direction = random[Random.Range(0, random.Length)];
         clone = Instantiate(clouds, new Vector3(230f + 300f * direction, Random.Range(0, 250f), -2f), Quaternion.identity);
         Rigidbody2D rigid = clone.GetComponent<Rigidbody2D>();
-        rigid.velocity = new Vector3(-1 * direction * 140f, 0, 0);
+        rigid.linearVelocity = new Vector3(-1 * direction * 140f, 0, 0);
         clone.transform.localScale = new Vector3(20 * direction, 16, 1);
     }
 

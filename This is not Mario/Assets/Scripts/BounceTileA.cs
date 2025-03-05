@@ -9,7 +9,7 @@ public class BounceTileA : MonoBehaviour
     {
         if (!touched && collision.gameObject.tag == "Player")
         {
-            GetComponent<Rigidbody2D>().velocity = new Vector2(50f, 0);
+            GetComponent<Rigidbody2D>().linearVelocity = new Vector2(50f, 0);
             touched = true;
         }
 
@@ -19,7 +19,7 @@ public class BounceTileA : MonoBehaviour
     {
         if (!bounced && collision.gameObject == bounceGameObject)
         {
-            GetComponent<Rigidbody2D>().velocity = new Vector2(-50f, 0);
+            GetComponent<Rigidbody2D>().linearVelocity = new Vector2(-50f, 0);
             bounced = true;
         }
     }

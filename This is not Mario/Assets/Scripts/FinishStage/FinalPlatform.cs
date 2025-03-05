@@ -10,7 +10,7 @@ public class FinalPlatform : MonoBehaviour {
 
 
         rigid = GetComponent<Rigidbody2D>();
-        rigid.velocity = new Vector3(speed, 0, 0);
+        rigid.linearVelocity = new Vector3(speed, 0, 0);
     }
 	
 	
@@ -19,7 +19,7 @@ public class FinalPlatform : MonoBehaviour {
         {
 
             transform.position = new Vector3(-25.08f, transform.position.y,0);
-            rigid.velocity = new Vector3(-1*speed*10, 0, 0);
+            rigid.linearVelocity = new Vector3(-1*speed*10, 0, 0);
 
 
 

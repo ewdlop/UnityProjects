@@ -40,7 +40,7 @@ public class MovetoBegining : MonoBehaviour {
                     }
                 }
                 Rigidbody2D rigid = platform.GetComponent<Rigidbody2D>();
-                rigid.velocity = new Vector3(Mathf.Abs(rigid.velocity.x), 0, 0);
+                rigid.linearVelocity = new Vector3(Mathf.Abs(rigid.linearVelocity.x), 0, 0);
             }
         }
     }

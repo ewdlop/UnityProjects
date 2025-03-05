@@ -31,7 +31,7 @@ public class Forcewithyou : MonoBehaviour {
             box = GetComponents<BoxCollider2D>();
             foreach (BoxCollider2D b in box) b.enabled = true;
 
-            rigid.velocity = new Vector2(0, 0);
+            rigid.linearVelocity = new Vector2(0, 0);
         }
 
         /**if (Johncena == true)

@@ -15,7 +15,7 @@ public class ElevatorMode : MonoBehaviour {
             rigid2 = collision.gameObject.GetComponent<Rigidbody2D>();
             step = true;
             rigid.AddForce(new Vector2(0, 5000f));
-            rigid2.velocity=new Vector2(0f, 0f);
+            rigid2.linearVelocity=new Vector2(0f, 0f);
             rigid2.AddForce(new Vector2(0, 5000f));
 
 

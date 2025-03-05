@@ -13,7 +13,7 @@ public class SpawnGiantMissileBills : MonoBehaviour {
         {
             clone = Instantiate(GiantMissileBills, new Vector3(transform.position.x + 20f, transform.position.y, -3), Quaternion.identity);
             rigid = clone.GetComponent<Rigidbody2D>();
-            rigid.velocity = new Vector2(-100, 0);
+            rigid.linearVelocity = new Vector2(-100, 0);
             spawn = true;
             gameObject.SetActive(false);
         }

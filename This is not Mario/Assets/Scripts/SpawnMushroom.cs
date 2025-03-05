@@ -54,7 +54,7 @@ public class SpawnMushroom : MonoBehaviour
         {
             if (transform.position.y < height)
             {
-                rigid.velocity = new Vector2(0, 0);
+                rigid.linearVelocity = new Vector2(0, 0);
                 rigid.gravityScale = 0;
                 transform.position = new Vector2(transform.position.x, height);
             }
@@ -63,14 +63,14 @@ public class SpawnMushroom : MonoBehaviour
             {
                 if (transform.position.y >= height + 1.3f)
                 {
-                    rigid.velocity = new Vector2(0, 0);
+                    rigid.linearVelocity = new Vector2(0, 0);
                     rigid.gravityScale = 1.2f;
                 }
                 else
                 {
                     if (transform.position.y == height && Hit && create == false)
                     {
-                        rigid.velocity = new Vector2(0, 0);
+                        rigid.linearVelocity = new Vector2(0, 0);
                         rigid.gravityScale = 0;
                         if (poisonous)
                         {
@@ -135,7 +135,7 @@ public class SpawnMushroom : MonoBehaviour
                 Hit = true;
                 anim.SetBool("hit", true);
                 rigid.gravityScale = 1;
-                mariorigid.velocity = new Vector2(0, 0);
+                mariorigid.linearVelocity = new Vector2(0, 0);
                 mariorigid.AddForce(new Vector2(0, -500f));
                 mario.GetComponent<CharacterControllers>().ReturnMushroomQuestionBox = gameObject;
 

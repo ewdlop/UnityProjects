@@ -35,16 +35,16 @@ public class GoombaMovement : MonoBehaviour
                 {
                     if (gameObject.name == "GG")
                     {
-                        rigid.velocity = new Vector2(37 * turnaround, 0);
+                        rigid.linearVelocity = new Vector2(37 * turnaround, 0);
                     }
 
                 else {
-                    rigid.velocity = new Vector2(50 * turnaround, 0);
+                    rigid.linearVelocity = new Vector2(50 * turnaround, 0);
                 }
 
                 }
                 else {
-                    rigid.velocity = new Vector2(10 * turnaround, 0);
+                    rigid.linearVelocity = new Vector2(10 * turnaround, 0);
                 }
             }
             else
@@ -53,17 +53,17 @@ public class GoombaMovement : MonoBehaviour
                 {
                     if (gameObject.name == "GG")
                     {
-                        rigid.velocity = new Vector2(40* turnaround, 0);
+                        rigid.linearVelocity = new Vector2(40* turnaround, 0);
                     }
 
                     else
                     {
-                        rigid.velocity = new Vector2(-50 * turnaround, 0);
+                        rigid.linearVelocity = new Vector2(-50 * turnaround, 0);
                     }
                 }
                 else
                 {
-                    rigid.velocity = new Vector2(-10 * turnaround, 0);
+                    rigid.linearVelocity = new Vector2(-10 * turnaround, 0);
                 }
             }
 
@@ -76,7 +76,7 @@ public class GoombaMovement : MonoBehaviour
         if (collision.gameObject.tag == "Onfloor")
         {
             turnaround = turnaround*-1;
-            rigid.velocity = new Vector2(50 * turnaround, 0);
+            rigid.linearVelocity = new Vector2(50 * turnaround, 0);
             if (!notmirror)
             gameObject.transform.localScale = new Vector3(-1 *gameObject.transform.localScale.x, gameObject.transform.localScale.y, gameObject.transform.localScale.z);
         }

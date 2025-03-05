@@ -25,7 +25,7 @@ public class StopFlag : MonoBehaviour {
         {
             rigid=GetComponent<Rigidbody2D>();
             rigid.gravityScale = 0;
-            rigid.velocity = new Vector2(0, 0);
+            rigid.linearVelocity = new Vector2(0, 0);
             landed = true;
         }
 
@@ -82,7 +82,7 @@ public class StopFlag : MonoBehaviour {
             anim.SetFloat("Speed", 1);
             mario.transform.localScale = new Vector3(Mathf.Abs(mario.transform.localScale.x), mario.transform.localScale.y, mario.transform.localScale.z);
             mario.transform.position = new Vector3(mario.transform.position.x + 2.6f, 3.9f, -1);
-            mariorigid.velocity = new Vector2(25f, 0);
+            mariorigid.linearVelocity = new Vector2(25f, 0);
         }
         else
         if (GameControl.stage == 2)

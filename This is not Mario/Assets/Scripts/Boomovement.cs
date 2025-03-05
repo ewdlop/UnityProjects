@@ -33,7 +33,7 @@ public class Boomovement : MonoBehaviour
                 if (reversed)
                 {
                     anim.SetBool("hide", true);
-                    rigid.velocity = new Vector3(0, 0, 0);
+                    rigid.linearVelocity = new Vector3(0, 0, 0);
                     //if (clone2 && realone)
                     //{
                     //    clone = Instantiate(gameObject, new Vector3(transform.position.x + 5, transform.position.y + 5, -1), Quaternion.identity);
@@ -43,7 +43,7 @@ public class Boomovement : MonoBehaviour
                 }
                 else
                 {
-                    rigid.velocity = new Vector3((mario.transform.position.x - transform.position.x) * Time.deltaTime * 10f, (mario.transform.position.y - transform.position.y) * Time.deltaTime * 10f, 0);
+                    rigid.linearVelocity = new Vector3((mario.transform.position.x - transform.position.x) * Time.deltaTime * 10f, (mario.transform.position.y - transform.position.y) * Time.deltaTime * 10f, 0);
                     anim.SetBool("hide", false);
                     //clone2 = true;
                     transform.localScale = new Vector3(1.002f * transform.localScale.x, 1.002f * transform.localScale.y, transform.localScale.z);
@@ -51,7 +51,7 @@ public class Boomovement : MonoBehaviour
             }
             else if (reversed)
             {
-                rigid.velocity = new Vector3((mario.transform.position.x - transform.position.x) * Time.deltaTime * 10f, (mario.transform.position.y - transform.position.y) * Time.deltaTime * 10f, 0);
+                rigid.linearVelocity = new Vector3((mario.transform.position.x - transform.position.x) * Time.deltaTime * 10f, (mario.transform.position.y - transform.position.y) * Time.deltaTime * 10f, 0);
                 anim.SetBool("hide", false);
                 //clone2 = true;
                 transform.localScale = new Vector3(1.002f * transform.localScale.x, 1.002f * transform.localScale.y, transform.localScale.z);
@@ -59,7 +59,7 @@ public class Boomovement : MonoBehaviour
             else
             {
                 anim.SetBool("hide", true);
-                rigid.velocity = new Vector3(0, 0, 0);
+                rigid.linearVelocity = new Vector3(0, 0, 0);
                 //if (clone2 && realone)
                 //{
                 //    clone = Instantiate(gameObject, new Vector3(transform.position.x + 5, transform.position.y + 5, -1), Quaternion.identity);
@@ -79,7 +79,7 @@ public class Boomovement : MonoBehaviour
                 if (reversed)
                 {
                     anim.SetBool("hide", true);
-                    rigid.velocity = new Vector3(0, 0, 0);
+                    rigid.linearVelocity = new Vector3(0, 0, 0);
                     //if (clone2 && realone)
                     //{
                     //    clone = Instantiate(gameObject, new Vector3(transform.position.x + 5, transform.position.y + 5, -1), Quaternion.identity);
@@ -89,7 +89,7 @@ public class Boomovement : MonoBehaviour
                 }
                 else
                 {
-                    rigid.velocity = new Vector3((mario.transform.position.x - transform.position.x) * Time.deltaTime * 10f, (mario.transform.position.y - transform.position.y) * Time.deltaTime * 10f, 0);
+                    rigid.linearVelocity = new Vector3((mario.transform.position.x - transform.position.x) * Time.deltaTime * 10f, (mario.transform.position.y - transform.position.y) * Time.deltaTime * 10f, 0);
                     anim.SetBool("hide", false);
                     //clone2 = true;
                     transform.localScale = new Vector3(1.002f * transform.localScale.x, 1.002f * transform.localScale.y, transform.localScale.z);
@@ -97,7 +97,7 @@ public class Boomovement : MonoBehaviour
             }
             else if (reversed)
             {
-                rigid.velocity = new Vector3((mario.transform.position.x - transform.position.x) * Time.deltaTime * 10f, (mario.transform.position.y - transform.position.y) * Time.deltaTime * 10f, 0);
+                rigid.linearVelocity = new Vector3((mario.transform.position.x - transform.position.x) * Time.deltaTime * 10f, (mario.transform.position.y - transform.position.y) * Time.deltaTime * 10f, 0);
                 anim.SetBool("hide", false);
                 //clone2 = true;
                 transform.localScale = new Vector3(1.002f * transform.localScale.x, 1.002f * transform.localScale.y, transform.localScale.z);
@@ -105,7 +105,7 @@ public class Boomovement : MonoBehaviour
             else
             {
                 anim.SetBool("hide", true);
-                rigid.velocity = new Vector3(0, 0, 0);
+                rigid.linearVelocity = new Vector3(0, 0, 0);
                 //if (clone2 && realone)
                 //{
                 //    clone = Instantiate(gameObject, new Vector3(transform.position.x + 5, transform.position.y + 5, -1), Quaternion.identity);

@@ -88,11 +88,11 @@ public class CharacterControllers : MonoBehaviour
         {
             if (control.GetComponent<Control>().heavenmode)
             {
-                rigid.velocity = new Vector2(rigid.velocity.x * Mathf.Abs(transform.localScale.x / 16), rigid.velocity.y);
+                rigid.linearVelocity = new Vector2(rigid.linearVelocity.x * Mathf.Abs(transform.localScale.x / 16), rigid.linearVelocity.y);
             }
             else
             {
-                rigid.velocity = new Vector2(move * maxSpeed * Mathf.Abs(transform.localScale.x / 16), rigid.velocity.y);
+                rigid.linearVelocity = new Vector2(move * maxSpeed * Mathf.Abs(transform.localScale.x / 16), rigid.linearVelocity.y);
             }
             if (move > 0 && !facingRight && grounded)
             {
@@ -122,8 +122,8 @@ public class CharacterControllers : MonoBehaviour
                     }
                     else
                     {
-                        rigid.velocity = new Vector2(move * maxSpeed * Mathf.Abs(transform.localScale.x / 16), rigid.velocity.y);
-                        rigid.velocity = new Vector2(rigid.velocity.x, jumpforce * Mathf.Abs(transform.localScale.y / 16));
+                        rigid.linearVelocity = new Vector2(move * maxSpeed * Mathf.Abs(transform.localScale.x / 16), rigid.linearVelocity.y);
+                        rigid.linearVelocity = new Vector2(rigid.linearVelocity.x, jumpforce * Mathf.Abs(transform.localScale.y / 16));
                     }
                 }
             }
@@ -135,7 +135,7 @@ public class CharacterControllers : MonoBehaviour
             {
                 //Normal moving
                 anim.SetFloat("Speed", Mathf.Abs(move));
-                rigid.velocity = new Vector2(move * maxSpeed * Mathf.Abs(transform.localScale.x / 16), rigid.velocity.y);
+                rigid.linearVelocity = new Vector2(move * maxSpeed * Mathf.Abs(transform.localScale.x / 16), rigid.linearVelocity.y);
 
                 if (Input.GetKeyDown(KeyCode.Space) && move != 0)
                 {
@@ -143,7 +143,7 @@ public class CharacterControllers : MonoBehaviour
                     anim.SetFloat("Speed", 0);
                     anim.SetTrigger("Jump");
                     //rigid.AddForce(new Vector2(0, jumpforce));
-                    rigid.velocity = new Vector2(rigid.velocity.x, jumpforce * Mathf.Abs(transform.localScale.y / 16));
+                    rigid.linearVelocity = new Vector2(rigid.linearVelocity.x, jumpforce * Mathf.Abs(transform.localScale.y / 16));
                     //rigid.AddForce(new Vector2(0, 25f), ForceMode2D.Impulse);
                     bigjump.Play();
 
@@ -208,7 +208,7 @@ public class CharacterControllers : MonoBehaviour
             col.enabled = false;
             isDead = true;
             anim.SetTrigger("Die");
-            rigid.velocity = new Vector2(0, 0);
+            rigid.linearVelocity = new Vector2(0, 0);
             rigid.gravityScale = 4;
             rigid.AddForce(new Vector2(0, 1500));
             MarioDies.Play();
@@ -220,7 +220,7 @@ public class CharacterControllers : MonoBehaviour
             col.enabled = false;
             isDead = true;
             anim.SetTrigger("Die");
-            rigid.velocity = new Vector2(0, 0);
+            rigid.linearVelocity = new Vector2(0, 0);
             rigid.AddForce(new Vector2(0, 2000));
             MarioDies.Play();
             GameControl.instance.MarioDied();
@@ -245,7 +245,7 @@ public class CharacterControllers : MonoBehaviour
             col.enabled = false;
             isDead = true;
             anim.SetTrigger("Die");
-            rigid.velocity = new Vector2(0, 0);
+            rigid.linearVelocity = new Vector2(0, 0);
             rigid.AddForce(new Vector2(0, 1500));
             MarioDies.Play();
             GameControl.instance.MarioDied();
@@ -261,7 +261,7 @@ public class CharacterControllers : MonoBehaviour
             col.enabled = false;
             isDead = true;
             anim.SetTrigger("Die");
-            rigid.velocity = new Vector2(0, 0);
+            rigid.linearVelocity = new Vector2(0, 0);
             rigid.AddForce(new Vector2(0, 1500));
             MarioDies.Play();
             GameControl.instance.MarioDied();
@@ -276,7 +276,7 @@ public class CharacterControllers : MonoBehaviour
             col.enabled = false;
             isDead = true;
             anim.SetTrigger("Die");
-            rigid.velocity = new Vector2(0, 0);
+            rigid.linearVelocity = new Vector2(0, 0);
             rigid.AddForce(new Vector2(0, 1600));
             MarioDies.Play();
 

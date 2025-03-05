@@ -36,7 +36,7 @@ public class HardBrickHitCheck : MonoBehaviour {
             if (!fatal)
             {
                 CameraControl2.shake = true;
-                rigid.velocity = new Vector2(0, 0);
+                rigid.linearVelocity = new Vector2(0, 0);
                 rigid.AddForce(new Vector2(0, -80f));
             }
             else
@@ -50,7 +50,7 @@ public class HardBrickHitCheck : MonoBehaviour {
                 col.enabled = false;
                 CharacterControllers.isDead = true;
                 anim.SetTrigger("Die");
-                mariorigid.velocity = new Vector2(0, 0);
+                mariorigid.linearVelocity = new Vector2(0, 0);
                 mariorigid.gravityScale = 4;
                 mariorigid.AddForce(new Vector2(0, 1500));
                 MarioDies.Play();

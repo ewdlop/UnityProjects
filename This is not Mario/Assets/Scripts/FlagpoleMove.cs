@@ -23,7 +23,7 @@ public class FlagpoleMove : MonoBehaviour {
         if(collision.gameObject.tag=="Shell")
         {
             rigid = flagpole.GetComponent<Rigidbody2D>();
-            rigid.velocity = new Vector3(40f, 0, 0);
+            rigid.linearVelocity = new Vector3(40f, 0, 0);
             
             rigid.bodyType = RigidbodyType2D.Dynamic;
             flag.GetComponent<Rigidbody2D>().bodyType= RigidbodyType2D.Kinematic;

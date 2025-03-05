@@ -42,7 +42,7 @@ public class Stuckonelevator : MonoBehaviour {
             transform.position = new Vector3(transform.position.x, -6f, transform.position.z);
         }
         rigid = gameObject.GetComponent<Rigidbody2D>();
-        rigid.velocity = new Vector3(0, 10f, 0);
+        rigid.linearVelocity = new Vector3(0, 10f, 0);
     }
 
    
@@ -56,7 +56,7 @@ public class Stuckonelevator : MonoBehaviour {
             anim.SetFloat("Speed", 0);
             anim.SetTrigger("Land");
             
-            mariorigid.velocity = new Vector3(0, 0, 0);
+            mariorigid.linearVelocity = new Vector3(0, 0, 0);
         }
     }
 }

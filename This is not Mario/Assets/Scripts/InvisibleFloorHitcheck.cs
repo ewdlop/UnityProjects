@@ -31,7 +31,7 @@ public class InvisibleFloorHitcheck : MonoBehaviour {
             sprite.enabled = true;
             col.enabled = true;
             Hit = true;
-            rigid.velocity = new Vector2(0, 0);
+            rigid.linearVelocity = new Vector2(0, 0);
             rigid.AddForce(new Vector2(0,-3000f));
         }
     }

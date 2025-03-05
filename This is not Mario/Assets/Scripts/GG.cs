@@ -11,7 +11,7 @@ public class GG : MonoBehaviour {
         if(collision.gameObject.tag=="Player")
         {
             rigid = GetComponent<Rigidbody2D>();
-            rigid.velocity = new Vector3(50f, 0, 0);
+            rigid.linearVelocity = new Vector3(50f, 0, 0);
         }
     }
 

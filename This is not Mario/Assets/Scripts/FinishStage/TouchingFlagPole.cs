@@ -28,7 +28,7 @@ public class TouchingFlagPole : MonoBehaviour
             flag.transform.position = new Vector2(flag.transform.position.x, collision.transform.position.y);
             anim.SetFloat("Speed", 0);
             anim.SetBool("GrabPole", true);
-            MarioRigid.velocity = new Vector2(0, 0);
+            MarioRigid.linearVelocity = new Vector2(0, 0);
             flagRigid.gravityScale = 14;
             GameObject control = GameObject.Find("Control");
             if (GameControl.stage != 2)

@@ -20,7 +20,7 @@ public class VerticalBoost : MonoBehaviour
 
                 rigid = Mario.GetComponent<Rigidbody2D>();
 
-                rigid.velocity = new Vector2(0, 250f);
+                rigid.linearVelocity = new Vector2(0, 250f);
 
                 spawn = true;
 

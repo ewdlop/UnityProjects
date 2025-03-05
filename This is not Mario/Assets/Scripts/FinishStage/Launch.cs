@@ -26,7 +26,7 @@ public class Launch : MonoBehaviour
                 MarioRigid = collision.gameObject.GetComponent<Rigidbody2D>();
                 box = brickbox.GetComponent<BoxCollider2D>();
 
-                MarioRigid.velocity = new Vector3(100f, 0, 0);
+                MarioRigid.linearVelocity = new Vector3(100f, 0, 0);
 
                 box.enabled = false;
             }

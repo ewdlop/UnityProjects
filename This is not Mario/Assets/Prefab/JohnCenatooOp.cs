@@ -29,7 +29,7 @@ public class JohnCenatooOp : MonoBehaviour {
             {
                 rigid = GetComponent<Rigidbody2D>();
                 rigid.bodyType = RigidbodyType2D.Dynamic;
-                rigid.velocity = new Vector3(0, -30f, 0);
+                rigid.linearVelocity = new Vector3(0, -30f, 0);
             }
         }
     }

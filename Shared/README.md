@@ -2,7 +2,7 @@
 
 ## Ludum Dare Prep
 
-## Remove folder from tracking using Git
+## Removes folders from tracking using Git
 
 ```shell
 git rm -r --cached Logs/
