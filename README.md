@@ -1,6 +1,6 @@
 # README
 
-## I look narcissistic. I steal your shits. 事實我不知道。I guess I am not MyAlias?
+## I look narcissistic, but I did not steal their code. 事實我知道。
 
 ## Unity Projects
 
