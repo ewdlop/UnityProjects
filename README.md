@@ -1,6 +1,6 @@
 # README
 
-## I look narcissistic, but I did not steal their code. 事實我知道。
+## I did not steal their code. 事實我知道。
 
 ## Unity Projects
 
